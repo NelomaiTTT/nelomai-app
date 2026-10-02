@@ -420,6 +420,7 @@ pub(crate) struct SessionNativePair<I: PairIo, J: PairStore> {
     integrity_fault: Option<io::Error>,
 }
 impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
+    #[cfg(test)] // Legacy construction is covered for cleanup regressions only.
     pub(crate) fn new(scope: SessionScope, mut io: I, mut store: J) -> io::Result<Self> {
         if !scope.validate() {
             return Err(failed());

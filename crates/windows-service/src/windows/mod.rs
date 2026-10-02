@@ -12,6 +12,7 @@ mod member_carrier_coordinator;
 mod member_carrier_coordinator_rows;
 mod member_carrier_creator;
 mod member_carrier_creators;
+mod member_carrier_factory;
 mod member_carrier_guard;
 mod member_carrier_guard_attestor;
 mod member_carrier_guard_gate;

@@ -547,7 +547,7 @@ pub(crate) struct EngineCloseAck {
 /// existing original ACK is returned unchanged. Terminal entry permanently
 /// disables ordinary/emergency/Drop retries, including after error/unwind.
 /// No implementation/default based on closed flags or equal handles is sound.
-pub(super) unsafe trait TerminalNativeApi: NativeApi {
+pub(crate) unsafe trait TerminalNativeApi: NativeApi {
     fn enter_terminal_lane(&mut self);
     fn engine_origin(&self, kind: SessionKind) -> std::rc::Rc<()>;
     fn engine_close_ack(&self, kind: SessionKind) -> Result<std::rc::Rc<EngineCloseAck>>;

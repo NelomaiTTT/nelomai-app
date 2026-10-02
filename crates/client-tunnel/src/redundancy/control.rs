@@ -17,6 +17,12 @@ use nelomai_contracts::{
 use std::io;
 
 pub trait PairControl: NativePair {
+    /// Retained cold composition only, before initial Session publication.
+    /// No member/adapter/traffic effect is allowed here. Providers requiring
+    /// original creator/journal roots override this; other platforms are inert.
+    fn prepare_session(&mut self, _scope: &SessionScope) -> io::Result<()> {
+        Ok(())
+    }
     /// Explicit provider handoff AFTER actual acknowledged Running Session CAS,
     /// before evidence/native rebind is allowed. No successful default grant.
     fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()>;
@@ -120,7 +126,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             .as_mut()
             .expect("retained control")
             .driver
-            .persist_preparation()
+            .persist_preparation_with(|native, scope| native.prepare_session(scope))
     }
     /// A failed read-only physical discovery is not proof that the old network
     /// still exists. Suspend health and cancel old queries without native rebind

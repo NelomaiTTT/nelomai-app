@@ -22,8 +22,20 @@ pub(crate) trait CarrierPairFinalizer<I: CarrierPairIo, J: PairJournal> {
         scope: &SessionScope,
     ) -> io::Result<()>;
 }
+/// Caller-retained startup composition. It writes the same original Pair into
+/// `destination` before fallible Fresh publication. Partial startup owners stay
+/// in this provider; an error is never an owning Result or ordinary fallback.
+pub(crate) trait CarrierPairPreparation<I: CarrierPairIo, J: PairJournal> {
+    fn prepare_retained_into(
+        &mut self,
+        destination: &mut Option<CarrierNativePair<I, J>>,
+    ) -> io::Result<()>;
+}
 pub(crate) struct CarrierPairControl<I: CarrierPairIo, J: PairJournal, F> {
     pair: Option<CarrierNativePair<I, J>>,
+    preparation: Option<Box<dyn CarrierPairPreparation<I, J>>>,
+    preparation_attempted: bool,
+    preparation_completed: bool,
     scope: SessionScope,
     finalizer: F,
     closing: bool,
@@ -52,6 +64,25 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> CarrierPai
         let scope = pair.snapshot().scope.clone();
         Self {
             pair: Some(pair),
+            preparation: None,
+            preparation_attempted: true,
+            preparation_completed: true,
+            scope,
+            finalizer,
+            closing: false,
+            completed: false,
+        }
+    }
+    pub(crate) fn from_preparation(
+        scope: SessionScope,
+        preparation: Box<dyn CarrierPairPreparation<I, J>>,
+        finalizer: F,
+    ) -> Self {
+        Self {
+            pair: None,
+            preparation: Some(preparation),
+            preparation_attempted: false,
+            preparation_completed: false,
             scope,
             finalizer,
             closing: false,
@@ -59,16 +90,35 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> CarrierPai
         }
     }
     fn live(&self) -> io::Result<&CarrierNativePair<I, J>> {
-        if self.closing || self.completed {
+        if self.closing || self.completed || !self.preparation_completed {
             return Err(conflict());
         }
         self.pair.as_ref().ok_or_else(conflict)
     }
     fn live_mut(&mut self) -> io::Result<&mut CarrierNativePair<I, J>> {
-        if self.closing || self.completed {
+        if self.closing || self.completed || !self.preparation_completed {
             return Err(conflict());
         }
         self.pair.as_mut().ok_or_else(conflict)
+    }
+    fn initialize(&mut self) -> io::Result<()> {
+        if self.preparation_completed {
+            return Ok(());
+        }
+        if self.preparation_attempted {
+            return Err(conflict());
+        }
+        self.preparation_attempted = true; // before native/CAS/unwind; never replay Startup
+        self.preparation
+            .as_mut()
+            .ok_or_else(conflict)?
+            .prepare_retained_into(&mut self.pair)?;
+        let pair = self.pair.as_ref().ok_or_else(conflict)?;
+        if pair.snapshot().scope != self.scope {
+            return Err(conflict());
+        }
+        self.preparation_completed = true;
+        Ok(())
     }
 }
 impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> NativePair
@@ -97,6 +147,17 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> NativePair
         // Latch BEFORE any native or provider boundary, including an unwind.
         // Retry is scoped cleanup only; no method can reopen forward activity.
         self.closing = true;
+        if !self.preparation_attempted {
+            // Direct native users without SessionControl still need their
+            // cold owner. Product prepares it before Starting publication.
+            let preparation = self.initialize();
+            if self.pair.is_none() {
+                return preparation.and(Err(conflict()));
+            }
+        }
+        if self.pair.is_none() && !self.preparation_completed {
+            return Err(conflict());
+        }
         if let Some(original) = self.pair.as_mut() {
             original.close(scope)?;
         }
@@ -113,6 +174,12 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> NativePair
 impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> PairControl
     for CarrierPairControl<I, J, F>
 {
+    fn prepare_session(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if *scope != self.scope || self.closing || self.completed {
+            return Err(conflict());
+        }
+        self.initialize()
+    }
     fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
         self.live_mut()?.complete_start(scope)
     }
@@ -131,6 +198,10 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> PairContro
         member: &Member,
         options: &DesktopTunnelOptions,
     ) -> io::Result<()> {
+        if *scope != self.scope || self.closing || self.completed {
+            return Err(conflict());
+        }
+        self.initialize()?;
         self.live_mut()?.start_primary(scope, member, options)
     }
     fn attach(&mut self, scope: &SessionScope, member: &Member) -> io::Result<()> {

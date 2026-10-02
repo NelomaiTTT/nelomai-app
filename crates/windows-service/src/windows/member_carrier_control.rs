@@ -65,6 +65,7 @@ pub(crate) struct NativeCarrierPairFinalizer<'a> {
     published: bool,
     actor_released: bool,
     completed: bool,
+    completed_initial_noc: bool,
 }
 fn conflict() -> io::Error {
     io::Error::other("native_carrier_terminal_original_or_pending")
@@ -106,7 +107,16 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
             published: false,
             actor_released: false,
             completed: false,
+            completed_initial_noc: false,
         }
+    }
+    /// Scheduling distinction only, after this SAME finalizer acknowledged
+    /// native retirement. Initial DATA retirement still needs its opaque root.
+    pub(crate) fn completed_initial_noc(&self) -> io::Result<bool> {
+        if !self.completed {
+            return Err(conflict());
+        }
+        Ok(self.completed_initial_noc)
     }
     /// Original private layout must be selected BEFORE any full capture. This
     /// lane never consumes full-capture errors as a no-C/pregraph fallback.
@@ -301,6 +311,7 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                 self.selection.take();
                 self.coordinator.take();
                 self.actor.take();
+                self.completed_initial_noc = true;
                 self.completed = true;
                 return Ok(());
             }
@@ -430,6 +441,20 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
         self.modules.take();
         self.completed = true;
         Ok(())
+    }
+}
+
+impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
+    for Rc<RefCell<NativeCarrierPairFinalizer<'a>>>
+{
+    fn finish(
+        &mut self,
+        original: &mut Option<OriginalPair<'a>>,
+        scope: &SessionScope,
+    ) -> io::Result<()> {
+        self.try_borrow_mut()
+            .map_err(|_| conflict())?
+            .finish(original, scope)
     }
 }
 

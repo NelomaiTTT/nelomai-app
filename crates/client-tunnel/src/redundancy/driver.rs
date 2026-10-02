@@ -134,11 +134,18 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         }
     }
     pub(super) fn persist_preparation(&mut self) -> io::Result<()> {
+        self.persist_preparation_with(|_, _| Ok(()))
+    }
+    pub(super) fn persist_preparation_with(
+        &mut self,
+        prepare: impl FnOnce(&mut N, &SessionScope) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.preparation_attempted {
             self.fence_preparation();
             return Err(fenced());
         }
         self.preparation_attempted = true;
+        prepare(&mut self.native, &self.state.snapshot().scope)?;
         self.store.save(&self.state.snapshot())?;
         self.preparation_acknowledged = true;
         Ok(())

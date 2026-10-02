@@ -55,6 +55,7 @@ fn member(slot: Slot) -> Member {
         probe:RedundantHealthProbe {kind:nelomai_contracts::HealthProbeKind::DnsA,target_ipv4:"1.1.1.1".parse().unwrap(),query_name:"example.com".into(),timeout_ms:2000} }
 }
 struct State {
+    scope: SessionScope,
     disk: Option<Record>,
     guard: guard::Model,
     network: NetworkSnapshot,
@@ -176,7 +177,7 @@ impl PairSocket for Socket {
 }
 impl PairJournal for Disk {
     fn begin_cleanup(&mut self, scope: &SessionScope) -> io::Result<()> {
-        if *scope != self::scope() {
+        if *scope != self.0.borrow().scope {
             return Err(failed());
         }
         self.0.borrow_mut().cleanup_begun = true;
@@ -358,7 +359,8 @@ impl CarrierPairIo for Io {
         before: &guard::Model,
         after: &guard::Model,
     ) -> io::Result<guard::Model> {
-        guard::validate_session_exchange(&scope(), before, after, kind).map_err(|_| failed())?;
+        guard::validate_session_exchange(&self.0.borrow().scope, before, after, kind)
+            .map_err(|_| failed())?;
         assert_eq!(self.0.borrow().guard, *before);
         let mut actual = after.expected.clone();
         if !before.installed && after.installed {
@@ -615,9 +617,13 @@ impl CarrierPairIo for Io {
     }
 }
 fn fresh_state() -> Shared {
+    fresh_state_for(scope())
+}
+fn fresh_state_for(scope: SessionScope) -> Shared {
     Rc::new(RefCell::new(State {
+        scope: scope.clone(),
         disk: None,
-        guard: guard::Model::empty(scope()).unwrap(),
+        guard: guard::Model::empty(scope).unwrap(),
         network: NetworkSnapshot {
             routes: vec![],
             dns: None,
@@ -1358,6 +1364,310 @@ mod terminal_control {
             .start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
             .unwrap();
         (control, state, calls)
+    }
+    struct ColdPreparation {
+        state: Shared,
+        calls: Rc<Cell<usize>>,
+        io: Option<Io>,
+        journal: Option<Disk>,
+    }
+    impl crate::member_carrier_control::CarrierPairPreparation<Io, Disk> for ColdPreparation {
+        fn prepare_retained_into(
+            &mut self,
+            destination: &mut Option<CarrierNativePair<Io, Disk>>,
+        ) -> io::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            assert!(Rc::ptr_eq(&self.io.as_ref().unwrap().0, &self.state));
+            let scope = self.state.borrow().scope.clone();
+            CarrierNativePair::new_retained_into(
+                destination,
+                scope,
+                provenance(),
+                &mut self.io,
+                &mut self.journal,
+            )
+        }
+    }
+    fn cold_control() -> (Control, Shared, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        cold_control_for(scope())
+    }
+    fn cold_control_for(
+        scope: SessionScope,
+    ) -> (Control, Shared, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        let state = fresh_state_for(scope.clone());
+        let prepared = Rc::new(Cell::new(0));
+        let finished = Rc::new(Cell::new(0));
+        let control = CarrierPairControl::from_preparation(
+            scope,
+            Box::new(ColdPreparation {
+                state: state.clone(),
+                calls: prepared.clone(),
+                io: Some(Io(state.clone(), None)),
+                journal: Some(Disk(state.clone())),
+            }),
+            Finish {
+                retained: None,
+                originals: None,
+                calls: finished.clone(),
+                fail_once: false,
+                leave_live: false,
+                unwind_once: false,
+            },
+        );
+        (control, state, prepared, finished)
+    }
+    #[test]
+    fn cold_factory_control_publishes_fresh_only_after_actor_owns_preparation() {
+        let (mut control, state, prepared, finished) = cold_control();
+        assert_eq!(prepared.get(), 0);
+        assert!(state.borrow().disk.is_none());
+        control
+            .start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+            .unwrap();
+        assert_eq!(prepared.get(), 1);
+        assert_eq!(state.borrow().disk.as_ref().unwrap().phase, Phase::Running);
+        assert_eq!(state.borrow().carrier, Some(proof(33)));
+        control.close(&scope()).unwrap();
+        assert!(!control.cleanup_pending());
+        assert_eq!(finished.get(), 1);
+        assert!(state.borrow().carrier.is_none());
+    }
+    mod factory_entry {
+        use super::*;
+        use crate::{
+            member_actor::{CompositeBackend, PairFactory},
+            ServiceError, ServiceTunnelBackend, ServiceTunnelState,
+        };
+        use nelomai_client_tunnel::{
+            redundancy::{control::SessionControl, protocol::Command},
+            TunnelTransport,
+        };
+        #[derive(Default)]
+        struct Single(Rc<Cell<usize>>);
+        impl ServiceTunnelBackend for Single {
+            fn start(
+                &mut self,
+                _: &str,
+                _: &DesktopTunnelOptions,
+                _: TunnelTransport,
+            ) -> Result<ServiceTunnelState, ServiceError> {
+                self.0.set(self.0.get() + 1);
+                Ok(ServiceTunnelState::Running)
+            }
+            fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+                self.0.set(self.0.get() + 1);
+                Ok(ServiceTunnelState::Stopped)
+            }
+            fn status(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+                Ok(ServiceTunnelState::Stopped)
+            }
+        }
+        #[derive(Default)]
+        struct ExternalState {
+            worlds: Vec<Shared>,
+            prepared: Vec<Rc<Cell<usize>>>,
+            finalized: Vec<Rc<Cell<usize>>>,
+            sessions: Vec<SessionSnapshot>,
+            scopes: Vec<SessionScope>,
+            lose_starting_ack: bool,
+            fail_native: Option<(String, bool)>,
+            fail_fresh_ack: bool,
+        }
+        struct Factory(Rc<RefCell<ExternalState>>);
+        struct Store(Rc<RefCell<ExternalState>>);
+        impl SessionStore for Store {
+            fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
+                let mut state = self.0.borrow_mut();
+                state.sessions.push(snapshot.clone());
+                if snapshot.phase == SessionPhase::Starting
+                    && std::mem::take(&mut state.lose_starting_ack)
+                {
+                    return Err(failed());
+                }
+                Ok(())
+            }
+        }
+        impl PairFactory for Factory {
+            type Native = Control;
+            type Store = Store;
+            fn recover(&mut self, _: RuntimeSlot) -> Result<(), ServiceError> {
+                Ok(())
+            }
+            fn prepare(
+                &mut self,
+                runtime: RuntimeSlot,
+                command: &Command,
+                now: u64,
+            ) -> io::Result<SessionControl<Control, Store>> {
+                let mut destination = None;
+                self.prepare_retained_into(&mut destination, runtime, command, now)?;
+                destination.ok_or_else(failed)
+            }
+            fn prepare_retained_into(
+                &mut self,
+                destination: &mut Option<SessionControl<Control, Store>>,
+                runtime: RuntimeSlot,
+                command: &Command,
+                now: u64,
+            ) -> io::Result<()> {
+                command.validate(runtime)?;
+                let scope = command.scope().clone();
+                let (native, world, prepared, finalized) = cold_control_for(scope.clone());
+                {
+                    let mut external = self.0.borrow_mut();
+                    if external.scopes.contains(&scope) {
+                        return Err(failed());
+                    }
+                    external.scopes.push(scope);
+                    world.borrow_mut().fail = external.fail_native.take();
+                    if std::mem::take(&mut external.fail_fresh_ack) {
+                        world.borrow_mut().fail_save = Some((1, true));
+                    }
+                    external.worlds.push(world);
+                    external.prepared.push(prepared);
+                    external.finalized.push(finalized);
+                }
+                SessionControl::prepare_retained_into(
+                    destination,
+                    runtime,
+                    command,
+                    &mut Some(native),
+                    &mut Some(Store(self.0.clone())),
+                    now,
+                )
+            }
+        }
+        fn start(scope: SessionScope) -> Command {
+            Command::Start {
+                scope,
+                primary: member(Slot::A),
+                role_generation: 1,
+                membership_generation: 1,
+                warm_stop_v1: true,
+                options: DesktopTunnelOptions::default(),
+            }
+        }
+        type Fixture = (
+            CompositeBackend<Single, Factory>,
+            Rc<RefCell<ExternalState>>,
+            Rc<Cell<usize>>,
+        );
+        fn setup() -> Fixture {
+            let external = Rc::new(RefCell::new(ExternalState::default()));
+            let single = Rc::new(Cell::new(0));
+            (
+                CompositeBackend::new(
+                    RuntimeSlot::Stable,
+                    Single(single.clone()),
+                    Factory(external.clone()),
+                )
+                .unwrap(),
+                external,
+                single,
+            )
+        }
+        #[test]
+        fn carrier_factory_primary_start_stop_repeat_uses_fresh_session() {
+            // Real actor + SessionControl + cold CarrierPairControl/coordinator;
+            // only native IO/private storage/terminal SDK ACK are external doubles.
+            let (mut actor, external, single) = setup();
+            let first = actor.redundant(start(scope())).unwrap();
+            assert_eq!(first.session.phase, SessionPhase::Running);
+            actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            let mut next = scope();
+            next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+            next.connection_generation += 1;
+            let second = actor.redundant(start(next.clone())).unwrap();
+            assert_eq!(second.session.scope, next);
+            actor.redundant(Command::Stop { scope: next }).unwrap();
+            let state = external.borrow();
+            assert_eq!(state.worlds.len(), 2);
+            assert!(state.prepared.iter().all(|calls| calls.get() == 1));
+            assert!(state.finalized.iter().all(|calls| calls.get() == 1));
+            for world in &state.worlds {
+                let native = world.borrow();
+                assert_eq!(native.counts.get("carrier-ready"), Some(&1));
+                assert!(native.carrier.is_none());
+                assert!(native.members.iter().all(Option::is_none));
+                assert_eq!(native.network.routes.len(), 0);
+                assert!(native.disk.as_ref().unwrap().phase == Phase::Stopped);
+            }
+            assert_eq!(single.get(), 0);
+        }
+        #[test]
+        fn carrier_factory_partial_start_retains_cleanup_owner() {
+            for boundary in [
+                "starting",
+                "fresh-ack",
+                "carrier-ready",
+                "start-A",
+                "complete-start",
+            ] {
+                let (mut actor, external, single) = setup();
+                {
+                    let mut state = external.borrow_mut();
+                    if boundary == "starting" {
+                        state.lose_starting_ack = true;
+                    } else if boundary == "fresh-ack" {
+                        state.fail_fresh_ack = true;
+                    } else {
+                        state.fail_native = Some((boundary.into(), true));
+                    }
+                }
+                assert!(actor.redundant(start(scope())).is_err(), "{boundary}");
+                let snapshot = actor.current_redundancy_snapshot().unwrap();
+                if !snapshot.cleanup_pending {
+                    // SessionControl can already have completed exact Stop
+                    // on a failed member/Running publication; no fallback ran.
+                    assert_eq!(snapshot.session.phase, SessionPhase::Stopped, "{boundary}");
+                }
+                assert_eq!(snapshot.session.scope, scope());
+                if snapshot.cleanup_pending {
+                    assert!(actor
+                        .start(
+                            "ordinary",
+                            &DesktopTunnelOptions::default(),
+                            TunnelTransport::WireGuard
+                        )
+                        .is_err());
+                }
+                let mut foreign = scope();
+                foreign.connection_generation += 1;
+                assert!(actor.redundant(Command::Stop { scope: foreign }).is_err());
+                let stopped = actor.redundant(Command::Stop { scope: scope() });
+                if matches!(boundary, "fresh-ack" | "carrier-ready") {
+                    // Unknown original CAS ACK is deliberately not inferred from
+                    // matching bytes; same owner remains fenced and Pending.
+                    assert!(stopped.is_err());
+                    assert!(actor.current_redundancy_snapshot().unwrap().cleanup_pending);
+                    assert_eq!(external.borrow().finalized[0].get(), 0);
+                } else {
+                    assert!(
+                        !stopped
+                            .unwrap_or_else(|error| panic!(
+                                "{boundary}: {error:?}; events={:?}",
+                                external.borrow().worlds[0].borrow().events
+                            ))
+                            .cleanup_pending,
+                        "{boundary}"
+                    );
+                    assert_eq!(external.borrow().finalized[0].get(), 1);
+                }
+                assert_eq!(single.get(), 0);
+            }
+        }
+        #[test]
+        fn carrier_creator_is_rooted_before_lost_starting_ack_and_stopping_window() {
+            let (mut actor, external, _) = setup();
+            external.borrow_mut().lose_starting_ack = true;
+            assert!(actor.redundant(start(scope())).is_err());
+            // NativeCreator publication accepts only absent/Starting Session,
+            // never Stopping. The original cold composition must already exist.
+            assert_eq!(external.borrow().prepared[0].get(), 1);
+            actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            assert_eq!(external.borrow().prepared[0].get(), 1);
+        }
     }
     #[test]
     fn terminal_control_stopped_coordinator_does_not_publish_session_before_native_finalizer() {

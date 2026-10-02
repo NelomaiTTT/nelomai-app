@@ -893,7 +893,6 @@ fn source_readiness(m: &MemberRecord) -> io::Result<crate::member_source::Readin
     )
 }
 
-pub(crate) type NativeWindowsPair<F> = SessionNativePair<WindowsPairIo<F>, WindowsPairStore<F>>;
 pub(crate) struct NativePairFactory<F: SessionFiles> {
     files: F,
     runtime: RuntimeSlot,
@@ -1214,8 +1213,8 @@ impl<F: SessionFiles> NativePairFactory<F> {
     }
 }
 impl PairFactory for NativePairFactory<NativeSessionFiles> {
-    type Native = NativeWindowsPair<NativeSessionFiles>;
-    type Store = CompletedSessionStore<NativeSessionFiles>;
+    type Native = super::member_carrier_factory::NativeFactoryControl;
+    type Store = super::member_carrier_factory::NativeCarrierSessionStore;
     fn recover(&mut self, runtime: RuntimeSlot) -> Result<(), crate::ServiceError> {
         (|| {
             self.verify_service_owner()?;
@@ -1317,46 +1316,28 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         )?;
         self.files.claim(scope)?;
         self.verify_service_owner()?;
-        let (pair_store, old) =
-            WindowsPairStore::open(self.files.clone(), scope.clone(), RecordKind::Pair)?;
-        if old.is_some() {
+        if self.files.read(scope, RecordKind::Pair)?.is_some() {
             return Err(failed());
         }
-        let native = WindowsPairIo::open(
-            scope.clone(),
+        let (pair, store) = super::member_carrier_factory::select_carrier(
+            self.root.clone(),
             self.engine.clone(),
-            self.executor.clone(),
+            self.owner.clone(),
             self.files.clone(),
-            None,
+            scope.clone(),
+            primary.configuration.expose(),
+            self.cancelled.clone(),
         )?;
-        let pair = SessionNativePair::new(scope.clone(), native, pair_store)?;
-        let (store, old) =
-            WindowsSessionStore::open(self.files.clone(), scope.clone(), RecordKind::Session)?;
-        if old.is_some() {
-            return Err(failed());
-        }
         SessionControl::prepare_retained_into(
             destination,
             runtime,
             command,
             &mut Some(pair),
-            &mut Some(CompletedSessionStore {
-                store,
-                files: self.files.clone(),
-                scope: scope.clone(),
-                completion: CompletionState::default(),
-            }),
+            &mut Some(store),
             now,
         )
     }
 }
-pub(crate) struct CompletedSessionStore<F: SessionFiles> {
-    store: WindowsSessionStore<F>,
-    files: F,
-    scope: SessionScope,
-    completion: CompletionState,
-}
-
 /// Concrete initial-NoC completion ONLY. This is not a legacy-store upgrade or
 /// a native factory selector. The caller roots it before transferring the SAME
 /// Startup into the actor; only that Startup can bind completed native NoC.
@@ -1425,19 +1406,6 @@ impl SessionStore for NativeInitialDataSessionStore {
             self.original.take(); // only after ALL actual callbacks returned ACK
         }
         Ok(())
-    }
-}
-impl<F: SessionFiles> SessionStore for CompletedSessionStore<F> {
-    fn save(
-        &mut self,
-        snapshot: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
-    ) -> io::Result<()> {
-        self.completion.save(
-            &self.scope,
-            snapshot,
-            |snapshot| self.store.save(snapshot),
-            |scope| self.files.complete(scope),
-        )
     }
 }
 impl NativePairFactory<NativeSessionFiles> {
