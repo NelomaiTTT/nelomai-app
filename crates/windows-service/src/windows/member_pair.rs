@@ -1276,6 +1276,20 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         command: &Command,
         now: u64,
     ) -> io::Result<SessionControl<Self::Native, Self::Store>> {
+        let mut destination = None;
+        self.prepare_retained_into(&mut destination, runtime, command, now)?;
+        destination.ok_or_else(failed)
+    }
+    fn prepare_retained_into(
+        &mut self,
+        destination: &mut Option<SessionControl<Self::Native, Self::Store>>,
+        runtime: RuntimeSlot,
+        command: &Command,
+        now: u64,
+    ) -> io::Result<()> {
+        if destination.is_some() {
+            return Err(failed());
+        }
         self.execution.require_engine()?;
         require_factory_start_context(
             runtime,
@@ -1321,16 +1335,17 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         if old.is_some() {
             return Err(failed());
         }
-        SessionControl::prepare(
+        SessionControl::prepare_retained_into(
+            destination,
             runtime,
             command,
-            pair,
-            CompletedSessionStore {
+            &mut Some(pair),
+            &mut Some(CompletedSessionStore {
                 store,
                 files: self.files.clone(),
                 scope: scope.clone(),
                 completion: CompletionState::default(),
-            },
+            }),
             now,
         )
     }

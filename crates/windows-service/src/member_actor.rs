@@ -31,6 +31,24 @@ pub trait PairFactory {
         command: &Command,
         now: u64,
     ) -> io::Result<SessionControl<Self::Native, Self::Store>>;
+    /// Retain preparation in the actor before a fallible Starting publication.
+    /// Factories with fallible original-resource transfer override this method;
+    /// the compatibility path is for preparations that return no owner on Err.
+    fn prepare_retained_into(
+        &mut self,
+        destination: &mut Option<SessionControl<Self::Native, Self::Store>>,
+        runtime: RuntimeSlot,
+        command: &Command,
+        now: u64,
+    ) -> io::Result<()> {
+        if destination.is_some() {
+            return Err(io::Error::other(
+                "redundant_preparation_destination_occupied",
+            ));
+        }
+        *destination = Some(self.prepare(runtime, command, now)?);
+        Ok(())
+    }
 }
 
 pub struct CompositeBackend<B, F: PairFactory> {
@@ -198,15 +216,20 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
             if self.single.status()? != ServiceTunnelState::Stopped {
                 return Err(failed());
             }
-            let pair = self
-                .factory
-                .prepare(self.runtime, &command, self.now)
-                .map_err(|e| operation_failed("prepare", e))?;
-            // A partially failed native Start remains reachable by scoped Stop
-            // and shutdown. Never lose the owner by starting a local temporary.
-            self.pair = Some(pair);
+            // The prior pair is terminal and independently clean above. Root
+            // the NEW control here before its first fallible Starting save.
+            self.pair = None;
             self.physical_fingerprint = None;
             self.next_physical_sample = self.now;
+            if let Err(error) =
+                self.factory
+                    .prepare_retained_into(&mut self.pair, self.runtime, &command, self.now)
+            {
+                self.refresh();
+                return Err(operation_failed("prepare", error));
+            }
+            // Partial publication and native Start remain reachable by scoped
+            // Stop/shutdown. Never start a local temporary ownership graph.
             self.pair
                 .as_mut()
                 .ok_or_else(failed)?
@@ -385,6 +408,7 @@ mod tests {
         fail_close: bool,
         residual: bool,
         fail_save: bool,
+        lose_starting_ack: bool,
         lose_running_ack: bool,
         fail_diagnostics: bool,
         fingerprint: Option<String>,
@@ -640,6 +664,10 @@ mod tests {
                 return Err(io::Error::other("private disk"));
             }
             w.saved.push(s.clone());
+            if w.lose_starting_ack && s.phase == SessionPhase::Starting {
+                w.lose_starting_ack = false;
+                return Err(io::Error::other("lost Starting save ACK"));
+            }
             if w.lose_running_ack && s.phase == SessionPhase::Running {
                 w.lose_running_ack = false;
                 return Err(io::Error::other("lost save ACK"));
@@ -681,6 +709,30 @@ mod tests {
                 command,
                 Native(self.0.clone()),
                 Store(self.0.clone()),
+                now,
+            )
+        }
+        fn prepare_retained_into(
+            &mut self,
+            destination: &mut Option<SessionControl<Native, Store>>,
+            runtime: RuntimeSlot,
+            command: &Command,
+            now: u64,
+        ) -> io::Result<()> {
+            {
+                let mut w = self.0.borrow_mut();
+                w.events.push("prepare".into());
+                w.prepared.push((runtime, now));
+                if w.fail_prepare || w.saved.iter().any(|s| &s.scope == command.scope()) {
+                    return Err(io::Error::other("private factory/reused scope"));
+                }
+            }
+            SessionControl::prepare_retained_into(
+                destination,
+                runtime,
+                command,
+                &mut Some(Native(self.0.clone())),
+                &mut Some(Store(self.0.clone())),
                 now,
             )
         }
@@ -872,6 +924,29 @@ mod tests {
         w.borrow_mut().fail_close = false;
         a.shutdown().unwrap();
         assert_eq!(w.borrow().native, [false, false]);
+    }
+    #[test]
+    fn lost_starting_save_ack_keeps_exact_actor_owner_for_scoped_stop() {
+        let (mut actor, world) = setup();
+        world.borrow_mut().lose_starting_ack = true;
+        assert!(actor.redundant(start(scope())).is_err());
+        let snapshot = actor
+            .current_redundancy_snapshot()
+            .expect("retained Starting owner");
+        assert_eq!(snapshot.session.scope, scope());
+        assert!(snapshot.cleanup_pending);
+        assert_eq!(world.borrow().native, [false, false]);
+        assert!(single_start(&mut actor).is_err());
+        assert!(actor.redundant(start(scope())).is_err());
+        let stopped = actor.redundant(Command::Stop { scope: scope() }).unwrap();
+        assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+        assert!(!stopped.cleanup_pending);
+        assert_eq!(world.borrow().closed, [scope()]);
+        assert!(!world
+            .borrow()
+            .events
+            .iter()
+            .any(|event| event == "single stop"));
     }
     #[test]
     fn duplicate_foreign_and_stale_scope_never_repeat_effects() {
