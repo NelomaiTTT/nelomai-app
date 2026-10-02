@@ -1390,14 +1390,34 @@ fn validate_stage(
     }
     Ok(())
 }
+#[derive(Clone, Copy)]
+enum RetiredReadStage {
+    Cleanup,
+    Terminal,
+}
+fn validate_retired_read_stage(
+    record: &Record,
+    context: &Context,
+    binding: &Binding,
+    generation: u64,
+    stage: RetiredReadStage,
+) -> Result<()> {
+    match stage {
+        RetiredReadStage::Cleanup => {
+            validate_stage(record, context, binding, generation, false, Use::Cleanup)
+        }
+        RetiredReadStage::Terminal => validate_terminal_stage(record, context, binding, generation),
+    }
+}
 
 #[cfg(windows)]
 pub(crate) mod native {
     use super::{
         carrier_members, carrier_provider, compare_completed_capture_storage,
         compare_member_capture_binding, compare_member_generation_storage, member_rows_binding,
-        rows_binding, same_record, validate_rows_effect, validate_stage, validate_terminal_stage,
-        BracketFacts, CleanupWriteRoot, GenerationProjection, GenerationWriteSelection, Use,
+        rows_binding, same_record, validate_retired_read_stage, validate_rows_effect,
+        validate_stage, validate_terminal_stage, BracketFacts, CleanupWriteRoot,
+        GenerationProjection, GenerationWriteSelection, RetiredReadStage, Use,
     };
     use crate::member_carrier_native_ownership as receipts;
     use crate::windows::{
@@ -4442,11 +4462,12 @@ pub(crate) mod native {
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
                 .map_err(denied)?;
             let record = receipts::Record::decode(&bytes).map_err(denied)?;
-            validate_terminal_stage(
+            validate_retired_read_stage(
                 &record,
                 &self.scope.context,
                 &self.scope.binding,
                 self.scope.generation,
+                RetiredReadStage::Terminal,
             )
             .map_err(denied)?;
             self.deadline
@@ -4530,13 +4551,12 @@ pub(crate) mod native {
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
                 .map_err(denied)?;
             let record = receipts::Record::decode(&bytes).map_err(denied)?;
-            validate_stage(
+            validate_retired_read_stage(
                 &record,
                 &self.scope.context,
                 &self.scope.binding,
                 self.scope.generation,
-                false,
-                Use::Cleanup,
+                RetiredReadStage::Cleanup,
             )
             .map_err(denied)?;
             self.deadline
@@ -4989,6 +5009,21 @@ pub(crate) mod native {
             &self,
             original: &Rc<RetiredCarrierRead>,
         ) -> Result<()> {
+            self.verify_retired_read_original_in_call(original, RetiredReadStage::Terminal)
+        }
+        /// READONLY actual original identity for Closing before key restoration.
+        /// Caller still supplies exact Pair/Calling and full CloseACK/SDK bracket.
+        pub(crate) fn verify_retired_cleanup_original_in_call(
+            &self,
+            original: &Rc<RetiredCarrierRead>,
+        ) -> Result<()> {
+            self.verify_retired_read_original_in_call(original, RetiredReadStage::Cleanup)
+        }
+        fn verify_retired_read_original_in_call(
+            &self,
+            original: &Rc<RetiredCarrierRead>,
+            stage: RetiredReadStage,
+        ) -> Result<()> {
             let mut call = ClosedHistoryCall {
                 revoked: &self.shared.original.revoked,
                 succeeded: false,
@@ -5009,11 +5044,15 @@ pub(crate) mod native {
             )?;
             owner.runtime.verify(&owner.scope.context).map_err(denied)?;
             owner.image.verify_runtime(&owner.runtime).map_err(denied)?;
-            let before = original.terminal_revision()?;
+            let revision = || match stage {
+                RetiredReadStage::Cleanup => original.revision(),
+                RetiredReadStage::Terminal => original.terminal_revision(),
+            };
+            let before = revision()?;
             // No callback or SDK lookup is hidden in this identity check. An
             // error cannot replace the retained first reader or rearm forward.
             owner.verify_supervised()?;
-            if original.terminal_revision()? != before {
+            if revision()? != before {
                 return Err(Error::Conflict);
             }
             call.succeeded = true;

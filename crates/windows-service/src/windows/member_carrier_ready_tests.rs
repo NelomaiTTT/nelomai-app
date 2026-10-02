@@ -940,6 +940,42 @@ fn raw_unpublished_terminal_frame_never_acquires_a_carrier_identity() {
     compare_prepublication_terminal_origin(&context, &record, Some(proof)).unwrap();
 }
 
+// Closing9/10 must inspect an actually closed pregraph C without requiring
+// Closing12 key restoration. These comparison facts grant no native authority.
+#[test]
+fn pregraph_native_empty_is_disjoint_from_terminal_key_restoration() {
+    use crate::{member_carrier_guard as g, member_carrier_pair as p};
+    let (context, mut record, proof) = full_cleanup_fixture();
+    record.carrier = None;
+    record.members = [None, None];
+    record.network = None;
+    record.guard = g::Model::empty(record.scope.clone()).unwrap();
+    for (stage, effect) in [(9, p::Effect::NativeEmpty), (10, p::Effect::Guard)] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        compare_pregraph_native_empty_frame(&context, &record, proof).unwrap();
+        assert!(compare_prepublication_terminal_frame(&context, &record, proof).is_err());
+        for fault in 0..7 {
+            let mut bad = record.clone();
+            let mut original = proof;
+            match fault {
+                0 => bad.pending = Some(p::Effect::FullEmpty),
+                1 => bad.stop_stage = 12,
+                2 => bad.phase = p::Phase::Stopped,
+                3 => bad.addresses.clear(),
+                4 => original.luid = 0,
+                5 => original.guid = [8; 16],
+                _ => bad.carrier = Some(crate::member_owner::InterfaceProof { index: 99, ..proof }),
+            }
+            assert!(compare_pregraph_native_empty_frame(&context, &bad, original).is_err());
+        }
+    }
+    record.stop_stage = 12;
+    record.pending = Some(p::Effect::FullEmpty);
+    assert!(compare_pregraph_native_empty_frame(&context, &record, proof).is_err());
+    compare_prepublication_terminal_frame(&context, &record, proof).unwrap();
+}
+
 // Break: genuine Stopped is routed as Closing12, or a stopped row/frame grants
 // permission without its original SDK reader. This is a strict comparison only.
 #[test]

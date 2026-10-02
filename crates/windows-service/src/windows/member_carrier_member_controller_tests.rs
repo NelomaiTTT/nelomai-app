@@ -2311,6 +2311,48 @@ fn closing12_unstarted_frame_rejects_live_history_foreign_context_and_other_effe
     }
 }
 
+#[test]
+fn pregraph_native_empty_prepared_originals_do_not_require_closing12() {
+    use crate::member_carrier_pair as pair;
+    use nelomai_contracts::dispatcher::TunnelSlot;
+    let (context, mut record, intent) = operation_fixture();
+    record.phase = pair::Phase::Closing;
+    record.options = Some(nelomai_client_tunnel::DesktopTunnelOptions::default());
+    record.operation = None;
+    record.active = None;
+    for (stage, effect) in [(9, pair::Effect::NativeEmpty), (10, pair::Effect::Guard)] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        validate_pregraph_native_empty_unstarted(&context, &record, TunnelSlot::A, Some(&intent))
+            .unwrap();
+        assert!(
+            validate_closing12_unstarted(&context, &record, TunnelSlot::A, Some(&intent)).is_err()
+        );
+        assert!(
+            validate_pregraph_native_empty_unstarted(&context, &record, TunnelSlot::A, None)
+                .is_err()
+        );
+        let mut started = record.clone();
+        started.members[0].as_mut().unwrap().owner.phase = crate::member_owner::Phase::Running;
+        assert!(validate_pregraph_native_empty_unstarted(
+            &context,
+            &started,
+            TunnelSlot::A,
+            Some(&intent)
+        )
+        .is_err());
+    }
+    record.stop_stage = 12;
+    record.pending = Some(pair::Effect::FullEmpty);
+    assert!(validate_pregraph_native_empty_unstarted(
+        &context,
+        &record,
+        TunnelSlot::A,
+        Some(&intent)
+    )
+    .is_err());
+}
+
 // Break: moving C creation before actual readonly preparation/full absence.
 #[test]
 fn before_carrier_preflight_is_only_exact_primary_preparation_not_start_or_attach() {

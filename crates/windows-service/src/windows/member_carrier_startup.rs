@@ -339,6 +339,14 @@ fn inspect_bootstrap_empty(
     origin: BootstrapOrigin,
     mut read: impl FnMut() -> Result<crate::member_carrier_guard::Snapshot>,
 ) -> Result<()> {
+    read_bootstrap_empty(context, expected, origin, &mut read).map(|_| ())
+}
+fn read_bootstrap_empty(
+    context: &Context,
+    expected: &crate::member_carrier_pair::Record,
+    origin: BootstrapOrigin,
+    mut read: impl FnMut() -> Result<crate::member_carrier_guard::Snapshot>,
+) -> Result<crate::member_carrier_guard::Snapshot> {
     compare_bootstrap_empty_frame(context, expected, origin)?;
     let actual = read()?;
     if actual != expected.guard.expected
@@ -350,7 +358,7 @@ fn inspect_bootstrap_empty(
     {
         return Err(Error::Conflict);
     }
-    Ok(())
+    Ok(actual)
 }
 fn compare_bootstrap_empty_frame(
     context: &Context,
@@ -502,6 +510,22 @@ fn inspect_prepublication_full_empty(
             verify_originals()?;
             sampled
         });
+    verify_originals()?;
+    result
+}
+fn inspect_prepublication_native_empty(
+    context: &Context,
+    expected: &crate::member_carrier_pair::Record,
+    mut verify_originals: impl FnMut() -> Result<()>,
+    mut read: impl FnMut() -> Result<crate::member_carrier_guard::Snapshot>,
+) -> Result<crate::member_carrier_guard::Snapshot> {
+    verify_originals()?;
+    let result = read_bootstrap_empty(context, expected, BootstrapOrigin::CreatedRetired, || {
+        verify_originals()?;
+        let sampled = read();
+        verify_originals()?;
+        sampled
+    });
     verify_originals()?;
     result
 }
@@ -2815,6 +2839,16 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
+            self.read_prepublication_empty_root(original, expected, false)
+        }
+        // The boolean selects disjoint readonly stages, never native authority.
+        // Both paths require actual pristine graph and original closed C/rows.
+        fn read_prepublication_empty_root(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            native_empty: bool,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
             if !self.create_attempted
                 || self.attach_attempted
                 || self.terminal_attempted
@@ -2860,20 +2894,27 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)?;
                 let prepared = &self.prepared;
                 let mut inspect = || {
-                    inspect_prepublication_full_empty(
-                        &context,
-                        expected,
-                        || {
+                    let verify = || {
+                        if native_empty {
+                            never.verify_pregraph_native_empty_originals(
+                                prepared, &runtime, &context, expected,
+                            )
+                        } else {
                             never.verify_prepublication_full_empty_originals(
                                 prepared, &runtime, &context, expected,
                             )
-                        },
-                        || {
-                            absence
-                                .read_snapshot(&expected.scope)
-                                .map_err(|_| Error::Conflict)
-                        },
-                    )
+                        }
+                    };
+                    let read = || {
+                        absence
+                            .read_snapshot(&expected.scope)
+                            .map_err(|_| Error::Conflict)
+                    };
+                    if native_empty {
+                        inspect_prepublication_native_empty(&context, expected, verify, read)
+                    } else {
+                        inspect_prepublication_full_empty(&context, expected, verify, read)
+                    }
                 };
                 let carrier = self.carrier.as_mut().ok_or(Error::Pending)?;
                 let actual = match origin {
@@ -2881,10 +2922,24 @@ pub(crate) mod native {
                         if !Rc::ptr_eq(&pin, &carrier.retired_pin()?) {
                             return Err(Error::Conflict);
                         }
-                        carrier
-                            .inspect_pregraph_terminal_in_call(original, expected, |_| inspect())?
+                        if native_empty {
+                            carrier.inspect_pregraph_native_empty_in_call(
+                                original,
+                                expected,
+                                |_| inspect(),
+                            )?
+                        } else {
+                            carrier.inspect_pregraph_terminal_in_call(original, expected, |_| {
+                                inspect()
+                            })?
+                        }
                     }
                     PrepublicationTerminalRead::Unpublished(_pin) => {
+                        // No Closing9/10 authority is inferred for an unknown
+                        // identity/creator outcome. Its distinct channel remains Pending.
+                        if native_empty {
+                            return Err(Error::Pending);
+                        }
                         carrier.inspect_unpublished_terminal_in_call(original, expected, inspect)?
                     }
                 };
@@ -2908,6 +2963,18 @@ pub(crate) mod native {
             let context = self.context.clone();
             if self.terminal_attempted || self.lock.is_none() {
                 return Err(Error::Retired);
+            }
+            if self.create_attempted
+                && !self
+                    .graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .construction_attempted
+                    .get()
+            {
+                return self
+                    .read_prepublication_empty_root(original, expected, true)
+                    .map(|_| ());
             }
             if !self.create_attempted {
                 self.bind_initial_noc_cleanup()?;

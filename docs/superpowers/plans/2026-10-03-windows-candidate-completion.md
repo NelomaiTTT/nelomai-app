@@ -54,11 +54,11 @@
 
 **Interfaces:** сохранить `PairFactory::prepare(runtime, command, now)` и `PairFactory::recover(runtime)` как внешнюю границу; использовать существующие `NativeStartupRoot::from_claim_into` и `into_pair_retained_into`. Изменения внутренних сигнатур вносить вместе с их потребителями.
 
-- [ ] Один раз снять воспроизводимый baseline: fmt, service tests, strict host Clippy; отдельно native Windows compile/test. Зафиксировать реальные ошибки, не старые счётчики PASS.
-- [ ] Составить короткую таблицу реального маршрута: factory → retained Startup → C → primary → reserve → switch → Stop → terminal retirement. Для каждого ребра — producer, consumer, владелец при Err. Не переписывать весь ownership-граф в документ.
+- [x] Один раз снять воспроизводимый baseline: fmt, service tests, strict host Clippy; отдельно native Windows compile/test. Зафиксировать реальные ошибки, не старые счётчики PASS. `6a848f7`; native baseline `fe1dcd5`/CI37070103148, включая query-only metadata denial. Текущий SHA требует отдельного свежего CI.
+- [x] Составить короткую таблицу реального маршрута: factory → retained Startup → C → primary → reserve → switch → Stop → terminal retirement. Для каждого ребра — producer, consumer, владелец при Err. Таблица в `.superpowers/sdd/2026-10-03-windows-candidate-completion/progress.md`, интеграция `3e64d40`.
 - [ ] Добавить `carrier_factory_selects_new_path_for_supported_pair`: пройти production selector, убедиться, что для допускаемой пары вызывается carrier composition, а не старый addressed-member путь. Подмена допускается на внешней OS-границе, не самого selector/coordinator.
-- [ ] Устранить ошибки текущего WIP, включая незавершённый metadata supplier/его использование; не глушить warnings широкими allow. Затем подключать ребро factory в рамках задачи 2, сохраняя runtime preflight.
-- [ ] Commit проверенного baseline. Выход: конечный список интеграционных разрывов с тестом на каждый, а не очередной новый архитектурный план.
+- [x] Устранить ошибки текущего WIP, включая незавершённый metadata supplier/его использование; не глушить warnings широкими allow. Factory подключён `3e64d40`, bounded native metadata supplier и original-key consumer `fe1dcd5`. Это НЕ issuer удаления surviving key.
+- [x] Commit проверенного baseline. Конкретные открытые разрывы: surviving-key disposition; module-only/before-C terminal release; partial cold preparation до Pair; recovery/installer acceptance; actual native factory execution. Типовой selector-test не заменяет фактическое исполнение, предыдущий checkbox открыт.
 
 ## Задача 2. Один primary: полный Start → Stop → Start
 
@@ -66,8 +66,8 @@
 
 **Interfaces:** реальный `PairFactory::prepare` возвращает существующий `SessionControl` с carrier-backed native/store, а не тестовую параллельную реализацию. Сохранить caller-retained передачу Startup→Pair и исходные terminal receipts. DLL process anchor не владеет session KeyLock/Pair/DATA.
 
-- [ ] RED: `carrier_factory_primary_start_stop_repeat_uses_fresh_session` — реальный dispatcher/factory/coordinator с контролируемыми внешними вызовами; C один, A addressless, DNS на C, permits только после проверки, Stop очищает, повторный Start создаёт новую сессию.
-- [ ] RED: table-driven `carrier_factory_partial_start_retains_cleanup_owner` — до DLL, после load без C, после C, после member creation, перед/после publication. Ошибка/потеря ACK не теряет handle, не публикует успех и не удаляет чужое.
+- [x] RED: `carrier_factory_primary_start_stop_repeat_uses_fresh_session` — actual actor/SessionControl/carrier coordinator `3e64d40`; external IO/store/native-finalizer ACK doubles. Один C и новая session, не нативное доказательство SDK release.
+- [ ] RED: table-driven `carrier_factory_partial_start_retains_cleanup_owner` — Starting/Fresh/C/member/Running publication покрыты `3e64d40`; до DLL и load без C не объявлены закрытыми. Ошибка/потеря ACK не теряет handle, не публикует успех и не удаляет чужое.
 - [ ] Соединить resident module pin, actual loader ACK и удержание владельцев до fallible публикации. PIN подтверждает lifetime кода, но не rundown ресурсов; не требовать выгрузки pinned DLL при каждом Stop.
 - [ ] Закрыть конкретный terminal key path: SDK-deleted original key + подтверждённая parent-relative absence + close ACK; оставшийся созданный ключ требует отдельного доказанного exact-owned disposition. Недостаток прав/SACL, подмена или неоднозначность остаются Pending, не разрешают recursive deletion. Штатный успешный путь обязан действительно завершаться, не вечно Pending по конструкции.
 - [ ] Провести очистку всех частичных состояний и normal Stop через тех же владельцев; withdraw/readback permits до освобождения sockets, восстановление rows/DNS, A/C cleanup, затем records/tombstone. Повторный Stop идемпотентен.

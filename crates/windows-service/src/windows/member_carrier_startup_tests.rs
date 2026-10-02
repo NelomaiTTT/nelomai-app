@@ -931,6 +931,83 @@ fn bootstrap_fixture() -> (Context, crate::member_carrier_pair::Record) {
     (context, record)
 }
 
+#[test]
+fn pregraph_native_empty_join_brackets_both_reads_without_terminal_projection() {
+    use crate::member_carrier_pair::Effect;
+    use std::cell::Cell;
+    let (context, mut record) = bootstrap_fixture();
+    let empty = record.guard.expected.clone();
+    for (stage, effect) in [(9, Effect::NativeEmpty), (10, Effect::Guard)] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        let checks = Cell::new(0);
+        let reads = Cell::new(0);
+        let actual = inspect_prepublication_native_empty(
+            &context,
+            &record,
+            || {
+                checks.set(checks.get() + 1);
+                Ok(())
+            },
+            || {
+                reads.set(reads.get() + 1);
+                Ok(empty.clone())
+            },
+        )
+        .unwrap();
+        assert_eq!(actual, empty);
+        assert_eq!(reads.get(), 2);
+        assert_eq!(checks.get(), 6);
+        let valid = Cell::new(true);
+        reads.set(0);
+        assert_eq!(
+            inspect_prepublication_native_empty(
+                &context,
+                &record,
+                || {
+                    if valid.get() {
+                        Ok(())
+                    } else {
+                        Err(Error::Retired)
+                    }
+                },
+                || {
+                    reads.set(reads.get() + 1);
+                    valid.set(false);
+                    Ok(empty.clone())
+                }
+            ),
+            Err(Error::Retired)
+        );
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            inspect_prepublication_native_empty(
+                &context,
+                &record,
+                || Ok(()),
+                || Err(Error::Pending)
+            ),
+            Err(Error::Pending)
+        );
+        assert!(inspect_prepublication_full_empty(
+            &context,
+            &record,
+            || Ok(()),
+            || Ok(empty.clone())
+        )
+        .is_err());
+    }
+    record.stop_stage = 12;
+    record.pending = Some(Effect::FullEmpty);
+    assert!(inspect_prepublication_native_empty(
+        &context,
+        &record,
+        || Ok(()),
+        || Ok(empty.clone())
+    )
+    .is_err());
+}
+
 // Break: a full/interrupted graph or a wrong Closing effect is routed through
 // bootstrap C-only cleanup. This is a factual dispatcher, NOT effect permission.
 #[test]

@@ -439,6 +439,18 @@ fn validate_closing12_unstarted(
     slot: nelomai_contracts::dispatcher::TunnelSlot,
     original: Option<&crate::member_owner::Intent>,
 ) -> crate::member_carrier::Result<()> {
+    use crate::{member_carrier::CarrierError as Error, member_carrier_pair as pair};
+    if current.stop_stage != 12 || current.pending != Some(pair::Effect::FullEmpty) {
+        return Err(Error::Conflict);
+    }
+    validate_prepublication_unstarted_origin(context, current, slot, original)
+}
+fn validate_prepublication_unstarted_origin(
+    context: &crate::member_carrier_native_ownership::Context,
+    current: &crate::member_carrier_pair::Record,
+    slot: nelomai_contracts::dispatcher::TunnelSlot,
+    original: Option<&crate::member_owner::Intent>,
+) -> crate::member_carrier::Result<()> {
     use crate::{
         member_carrier::CarrierError as Error, member_carrier_pair as pair, member_owner::Phase,
     };
@@ -448,8 +460,6 @@ fn validate_closing12_unstarted(
     if current.scope != context.intent.scope
         || current.provenance != context.provenance
         || current.phase != pair::Phase::Closing
-        || current.stop_stage != 12
-        || current.pending != Some(pair::Effect::FullEmpty)
         || current.pending_guard.is_some()
         || current.active.is_some()
         || current.operation.is_some()
@@ -476,6 +486,24 @@ fn validate_closing12_unstarted(
         return Err(Error::Conflict);
     }
     Ok(())
+}
+
+fn validate_pregraph_native_empty_unstarted(
+    context: &crate::member_carrier_native_ownership::Context,
+    current: &crate::member_carrier_pair::Record,
+    slot: nelomai_contracts::dispatcher::TunnelSlot,
+    original: Option<&crate::member_owner::Intent>,
+) -> crate::member_carrier::Result<()> {
+    use crate::{member_carrier::CarrierError as Error, member_carrier_pair as pair};
+    if !matches!(
+        (current.stop_stage, current.pending),
+        (9, Some(pair::Effect::NativeEmpty)) | (10, Some(pair::Effect::Guard))
+    ) || current.addresses != context.intent.addresses
+        || current.options.is_none()
+    {
+        return Err(Error::Conflict);
+    }
+    validate_prepublication_unstarted_origin(context, current, slot, original)
 }
 
 fn validate_never_bootstrap_native_frame(
@@ -1929,6 +1957,27 @@ pub(crate) mod native {
             context: &Context,
             expected: &PairRecord,
         ) -> Result<()> {
+            self.verify_prepublication_originals(prepared, runtime, context, expected, false)
+        }
+        /// SAME private prepared origins for readonly Closing9/10. Never a
+        /// substitute Never ledger after attempted C creation or a key ACK.
+        pub(crate) fn verify_pregraph_native_empty_originals(
+            self: &Rc<Self>,
+            prepared: &[Option<NativePreparedMember>; 2],
+            runtime: &RuntimeRead,
+            context: &Context,
+            expected: &PairRecord,
+        ) -> Result<()> {
+            self.verify_prepublication_originals(prepared, runtime, context, expected, true)
+        }
+        fn verify_prepublication_originals(
+            self: &Rc<Self>,
+            prepared: &[Option<NativePreparedMember>; 2],
+            runtime: &RuntimeRead,
+            context: &Context,
+            expected: &PairRecord,
+            native_empty: bool,
+        ) -> Result<()> {
             if context != &self.input.context
                 || !self.input.runtime.same_original_runtime(runtime)
                 || !self
@@ -1947,7 +1996,11 @@ pub(crate) mod native {
                     TunnelSlot::B
                 };
                 let original = prepared.as_ref().map(|p| &p.origin.intent);
-                validate_closing12_unstarted(context, expected, slot, original)?;
+                if native_empty {
+                    validate_pregraph_native_empty_unstarted(context, expected, slot, original)?;
+                } else {
+                    validate_closing12_unstarted(context, expected, slot, original)?;
+                }
                 if let Some(prepared) = prepared {
                     self.terminal_prepared_origin(&prepared.origin, index, runtime, context)?;
                     if prepared.live_source.is_some()

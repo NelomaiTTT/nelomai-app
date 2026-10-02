@@ -1829,6 +1829,69 @@ fn terminal_revision_accepts_only_stopped_restored_native_keys_and_original_birt
 }
 
 #[test]
+fn pregraph_native_empty_original_revision_keeps_cleanup_keys_until_later_stage() {
+    let mut closing = record();
+    closing.phase = Phase::Closing;
+    validate_retired_read_stage(
+        &closing,
+        &closing.context,
+        &closing.context.bindings[0],
+        10,
+        RetiredReadStage::Cleanup,
+    )
+    .unwrap();
+    assert!(validate_retired_read_stage(
+        &closing,
+        &closing.context,
+        &closing.context.bindings[0],
+        10,
+        RetiredReadStage::Terminal
+    )
+    .is_err());
+    let mut restored = closing.clone();
+    restored.phase = Phase::Stopped;
+    for key in &mut restored.keys {
+        key.phase = KeyPhase::Clean;
+        key.current = Value::Absent;
+    }
+    validate_retired_read_stage(
+        &restored,
+        &restored.context,
+        &restored.context.bindings[0],
+        10,
+        RetiredReadStage::Terminal,
+    )
+    .unwrap();
+    assert!(validate_retired_read_stage(
+        &restored,
+        &restored.context,
+        &restored.context.bindings[0],
+        10,
+        RetiredReadStage::Cleanup
+    )
+    .is_err());
+    for fault in 0..5 {
+        let mut bad = closing.clone();
+        let mut context = closing.context.clone();
+        match fault {
+            0 => bad.keys[0].new_key_ack = false,
+            1 => bad.keys[0].pending = Some(Value::Absent),
+            2 => bad.keys[0].current = Value::Absent,
+            3 => context.provenance.network_epoch += 1,
+            _ => bad.phase = Phase::Preparing,
+        }
+        assert!(validate_retired_read_stage(
+            &bad,
+            &context,
+            &context.bindings[0],
+            10,
+            RetiredReadStage::Cleanup
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn slow_authentication_cannot_accept_a_different_protected_revision() {
     let before = record();
     assert!(same_record(&before, record()).is_ok());
