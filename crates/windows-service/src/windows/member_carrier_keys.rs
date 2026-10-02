@@ -467,6 +467,9 @@ pub(crate) unsafe trait NativeKeyTerminalFence {
 const PARENT: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
 const VALUE: &str = "IPAutoconfigurationEnabled";
 const MAX_NAME: usize = 2048;
+// Native pacing is 25ms, at most forty waits (1s). The caller's independent
+// hard deadline and original terminal fence remain mandatory around each read.
+const MAX_TERMINAL_KEY_READS: usize = 41;
 pub(crate) fn decode_value(kind: u32, bytes: &[u8]) -> Result<NativeValue> {
     if bytes.len() > 256 {
         return Err(Error::Invalid);
@@ -598,6 +601,11 @@ pub(crate) trait RegistryKernel {
     fn original_key_info_status(&mut self, _handle: &Self::Handle) -> Result<u32> {
         Err(Error::Pending)
     }
+    /// Optional bounded pacing for an SDK's asynchronous key deletion. False
+    /// means do not wait. This supplies no absence or disposition permission.
+    fn pause_original_delete_read(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     /// Read DATA only, into a caller-owned capture. Unsupported full security
     /// observation denies; neither status nor metadata grants key disposition.
     fn original_key_metadata(
@@ -691,6 +699,7 @@ pub(crate) struct OriginalKeyRootObligation<H> {
     observation: OriginalReadState,
     observed_deleted: std::cell::Cell<bool>,
     first_terminal_status: std::cell::Cell<Option<u32>>,
+    terminal_status_history: std::cell::RefCell<Vec<u32>>,
     terminal: OriginalReadState,
     terminal_complete: std::cell::Cell<bool>,
     parent_closed: std::cell::RefCell<Option<Rc<KeyHandleClosed>>>,
@@ -717,6 +726,7 @@ impl<H> OriginalKeyRootObligation<H> {
             observation: OriginalReadState::default(),
             observed_deleted: std::cell::Cell::new(false),
             first_terminal_status: std::cell::Cell::new(None),
+            terminal_status_history: std::cell::RefCell::new(Vec::new()),
             terminal: OriginalReadState::default(),
             terminal_complete: std::cell::Cell::new(false),
             parent_closed: std::cell::RefCell::new(None),
@@ -924,6 +934,99 @@ impl<H> OriginalKeyRootObligation<H> {
     }
 }
 impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
+    /// Shared production selector; only the external registry and the actual
+    /// terminal fence are supplied by the native caller (or OS-boundary tests).
+    fn close_terminal<K: RegistryKernel<Handle = H>>(
+        self: &Rc<Self>,
+        original: &NewKeyAck<Held<H>>,
+        kernel: &mut K,
+        check: impl Fn() -> Result<()>,
+        retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+    ) -> Result<()> {
+        let held = original.retained_handle();
+        let mut selection = self.selection.begin()?;
+        if self.selection_attempted.replace(true) {
+            return Err(Error::Conflict);
+        }
+        self.verify_original(original)?;
+        receipt::validate_context(&held.context)?;
+        if held.context.bindings.get(held.binding.role as usize) != Some(&held.binding)
+            || !parent_valid(&held.parent)
+            || !held
+                .binding
+                .registry_path
+                .ends_with(&format!("\\{}", held.child))
+        {
+            return Err(Error::Conflict);
+        }
+        let mut status = 0;
+        for index in 0..MAX_TERMINAL_KEY_READS {
+            check()?;
+            self.check_health()?;
+            status = kernel.original_key_info_status(self.handle())?;
+            // Actual syscall outputs retained before every fallible postflight,
+            // wait or subsequent read. A present result is not KEY_DELETED.
+            self.terminal_status_history
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .push(status);
+            if index == 0 {
+                self.first_terminal_status.set(Some(status));
+            }
+            check()?;
+            self.check_health()?;
+            if status != 0 || index + 1 == MAX_TERMINAL_KEY_READS {
+                break;
+            }
+            if !kernel.pause_original_delete_read()? {
+                break;
+            }
+            check()?;
+            self.check_health()?;
+        }
+        if status == 1018 {
+            self.close_sdk_deleted(
+                original,
+                kernel,
+                || {
+                    check()?;
+                    self.selection.check()
+                },
+                retain,
+            )?;
+        } else {
+            if status != 0 {
+                return Err(Error::Pending);
+            }
+            if !kernel
+                .name(self.handle())?
+                .eq_ignore_ascii_case(&format!("{}\\{}", held.parent, held.child))
+                || kernel.value(self.handle())? != NativeValue::Absent
+            {
+                return Err(Error::Conflict);
+            }
+            self.kind
+                .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
+            // Closing the HKEY does not dispose the surviving registry root.
+            // It would destroy the SAME original needed by any subsequent
+            // exact-owned disposition, leaving permanent cleanup-pending.
+            // Keep both originals open; metadata is retained DATA only.
+            let capture = Rc::new(registry_metadata::RegistryMetadataCapture::new());
+            *self
+                .present_metadata
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)? = Some(capture.clone());
+            check()?;
+            self.selection.check()?;
+            kernel.original_key_metadata(self.handle(), &capture)?;
+            check()?;
+            self.selection.check()?;
+            return Err(Error::Pending);
+        }
+        self.selection.check()?;
+        selection.complete = true;
+        Ok(())
+    }
     fn close_sdk_deleted<K: RegistryKernel<Handle = H>>(
         self: &Rc<Self>,
         original: &NewKeyAck<Held<H>>,
@@ -1583,70 +1686,12 @@ pub(crate) fn close_terminal_original_key(
     retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
 ) -> Result<()> {
     let held = original.retained_handle();
-    let mut selection = held.handle.selection.begin()?;
-    if held.handle.selection_attempted.replace(true) {
-        return Err(Error::Conflict);
-    }
-    let result = (|| {
-        receipt::validate_context(&held.context)?;
-        if held.context.bindings.get(held.binding.role as usize) != Some(&held.binding)
-            || !parent_valid(&held.parent)
-            || !held
-                .binding
-                .registry_path
-                .ends_with(&format!("\\{}", held.child))
-        {
-            return Err(Error::Conflict);
-        }
-        fence.verify_original_terminal(&held.context, &held.binding)?;
-        held.handle.selection.check()?;
-        let mut kernel = win32::Kernel;
-        let status = kernel.original_key_info_status(held.handle())?;
-        held.handle.first_terminal_status.set(Some(status));
-        if status == 1018 {
-            return held.handle.close_sdk_deleted(
-                original,
-                &mut kernel,
-                || {
-                    fence.verify_original_terminal(&held.context, &held.binding)?;
-                    held.handle.selection.check()
-                },
-                retain,
-            );
-        }
-        if status != 0 {
-            return Err(Error::Pending);
-        }
-        if !kernel
-            .name(held.handle())?
-            .eq_ignore_ascii_case(&format!("{}\\{}", held.parent, held.child))
-            || kernel.value(held.handle())? != NativeValue::Absent
-        {
-            return Err(Error::Conflict);
-        }
-        held.handle
-            .kind
-            .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
-        held.handle().close_terminal(
-            || {
-                fence.verify_original_terminal(&held.context, &held.binding)?;
-                held.handle.selection.check()
-            },
-            |ack| {
-                held.handle
-                    .record_closed_handle_ack(ack.clone(), |h, ack| h.close.verify_ack(ack))?;
-                retain(ack)
-            },
-            || {
-                fence.verify_original_terminal(&held.context, &held.binding)?;
-                held.handle.selection.check()
-            },
-        )
-    })();
-    result?;
-    held.handle.selection.check()?;
-    selection.complete = true;
-    Ok(())
+    held.handle.close_terminal(
+        original,
+        &mut win32::Kernel,
+        || fence.verify_original_terminal(&held.context, &held.binding),
+        retain,
+    )
 }
 #[cfg(windows)]
 pub(crate) fn verify_terminal_original_key_closed(
@@ -1742,6 +1787,10 @@ pub(crate) mod win32 {
     }
     impl RegistryKernel for Kernel {
         type Handle = Handle;
+        fn pause_original_delete_read(&mut self) -> Result<bool> {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            Ok(true)
+        }
         fn original_key_metadata(
             &mut self,
             h: &Handle,

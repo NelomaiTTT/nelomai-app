@@ -228,6 +228,8 @@ struct State {
     drift_value_after: Option<usize>,
     original_info_status: Option<u32>,
     original_info_reads: usize,
+    delete_after_reads: Option<usize>,
+    delete_waits: usize,
 }
 type Shared = Rc<RefCell<State>>;
 struct Kernel(Shared);
@@ -340,7 +342,17 @@ impl RegistryKernel for Kernel {
             "must query actual returned original"
         );
         s.original_info_reads += 1;
+        if s.delete_after_reads
+            .is_some_and(|n| s.original_info_reads >= n)
+        {
+            return Ok(1018);
+        }
         s.original_info_status.ok_or(Error::Pending)
+    }
+    fn pause_original_delete_read(&mut self) -> Result<bool> {
+        let mut s = self.0.borrow_mut();
+        s.delete_waits += 1;
+        Ok(s.delete_after_reads.is_some())
     }
 }
 
@@ -1126,6 +1138,9 @@ impl RegistryKernel for DropTrackedKernel {
         }
         self.registry.original_key_info_status(&h.id)
     }
+    fn pause_original_delete_read(&mut self) -> Result<bool> {
+        self.registry.pause_original_delete_read()
+    }
 }
 
 #[test]
@@ -1445,6 +1460,163 @@ fn sdk_deleted_original_requires_both_actual_close_acks_before_inert_disposition
     drop(pin);
     drop(io);
     assert_eq!(closes.get(), 2, "both native wrappers' Drop is inert");
+}
+
+#[test]
+fn terminal_selector_keeps_surviving_original_open_without_disposition() {
+    let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
+    shared.borrow_mut().original_info_status = Some(0);
+    let pin = terminal_original_key_obligation(&ack);
+    let before = closes.get();
+    let result = pin.close_terminal(
+        &ack,
+        &mut io.kernel,
+        || Ok(()),
+        |_| {
+            panic!("surviving root has no disposition: must not close original");
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(closes.get(), before);
+    assert!(pin.closed_handle_ack().is_err());
+    assert!(!pin.handle().close.was_attempted());
+    assert!(!pin.parent_handle().close.was_attempted());
+    assert_eq!(io.kernel.original_key_info_status(pin.handle()), Ok(0));
+    assert!(pin.require_root_absent().is_err());
+}
+
+#[test]
+fn terminal_selector_sdk_deleted_completes_same_original_and_parent() {
+    let (mut io, _, ack, closes) = sdk_deleted_tracked_original();
+    let pin = terminal_original_key_obligation(&ack);
+    pin.close_terminal(&ack, &mut io.kernel, || Ok(()), |_| Ok(()))
+        .unwrap();
+    assert_eq!(closes.get(), 2);
+    pin.require_root_absent().unwrap();
+    assert!(pin
+        .close_terminal(&ack, &mut io.kernel, || Ok(()), |_| Ok(()))
+        .is_err());
+    assert_eq!(closes.get(), 2);
+}
+
+#[test]
+fn terminal_selector_waits_for_actual_sdk_delete_without_losing_original() {
+    let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
+    {
+        let mut state = shared.borrow_mut();
+        state.original_info_status = Some(0);
+        state.delete_after_reads = Some(4);
+    }
+    let pin = terminal_original_key_obligation(&ack);
+    let checks = std::cell::Cell::new(0);
+    pin.close_terminal(
+        &ack,
+        &mut io.kernel,
+        || {
+            checks.set(checks.get() + 1);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(pin.first_terminal_status.get(), Some(0));
+    assert_eq!(shared.borrow().delete_waits, 3);
+    assert_eq!(shared.borrow().original_info_reads, 6);
+    assert!(checks.get() > shared.borrow().original_info_reads);
+    assert_eq!(closes.get(), 2);
+    pin.require_root_absent().unwrap();
+    assert_eq!(*pin.terminal_status_history.borrow(), [0, 0, 0, 1018]);
+}
+
+#[test]
+fn terminal_selector_wait_is_bounded_and_never_disposes_surviving_root() {
+    let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
+    {
+        let mut state = shared.borrow_mut();
+        state.original_info_status = Some(0);
+        state.delete_after_reads = Some(MAX_TERMINAL_KEY_READS + 1);
+    }
+    let pin = terminal_original_key_obligation(&ack);
+    assert!(pin
+        .close_terminal(
+            &ack,
+            &mut io.kernel,
+            || Ok(()),
+            |_| {
+                panic!("timeout is not native disposal");
+            }
+        )
+        .is_err());
+    assert_eq!(shared.borrow().original_info_reads, MAX_TERMINAL_KEY_READS);
+    assert_eq!(shared.borrow().delete_waits, MAX_TERMINAL_KEY_READS - 1);
+    assert_eq!(
+        pin.terminal_status_history.borrow().len(),
+        MAX_TERMINAL_KEY_READS
+    );
+    assert!(pin.present_metadata_capture().is_some());
+    assert!(!pin.handle().close.was_attempted());
+    assert!(!pin.parent_handle().close.was_attempted());
+    assert!(pin.closed_handle_ack().is_err());
+    assert!(pin.require_root_absent().is_err());
+    assert_eq!(closes.get(), 0);
+}
+
+#[test]
+fn terminal_selector_wait_stops_on_fence_loss_before_next_native_read() {
+    let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
+    shared.borrow_mut().original_info_status = Some(0);
+    shared.borrow_mut().delete_after_reads = Some(2);
+    let pin = terminal_original_key_obligation(&ack);
+    assert!(pin
+        .close_terminal(
+            &ack,
+            &mut io.kernel,
+            || {
+                if shared.borrow().delete_waits == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Conflict)
+                }
+            },
+            |_| panic!("lost fence must not close")
+        )
+        .is_err());
+    assert_eq!(*pin.terminal_status_history.borrow(), [0]);
+    assert_eq!(shared.borrow().original_info_reads, 1);
+    assert_eq!(closes.get(), 0);
+    assert!(pin
+        .close_terminal(&ack, &mut io.kernel, || Ok(()), |_| Ok(()))
+        .is_err());
+    assert_eq!(shared.borrow().original_info_reads, 1);
+}
+
+#[test]
+fn terminal_selector_foreign_original_or_native_error_never_waits_or_closes() {
+    for fault in 0..4 {
+        let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
+        let (_, _, foreign, _) = sdk_deleted_tracked_original();
+        let pin = terminal_original_key_obligation(&ack);
+        shared.borrow_mut().delete_after_reads = Some(1000);
+        shared.borrow_mut().original_info_status = match fault {
+            0 => Some(1018),
+            1 => Some(2),
+            2 => Some(5),
+            _ => None,
+        };
+        assert!(pin
+            .close_terminal(
+                if fault == 0 { &foreign } else { &ack },
+                &mut io.kernel,
+                || Ok(()),
+                |_| panic!("not disposal")
+            )
+            .is_err());
+        assert_eq!(shared.borrow().delete_waits, 0);
+        assert_eq!(shared.borrow().original_info_reads, usize::from(fault != 0));
+        assert_eq!(closes.get(), 0);
+        assert!(!pin.handle().close.was_attempted());
+        assert!(!pin.parent_handle().close.was_attempted());
+    }
 }
 
 #[test]
