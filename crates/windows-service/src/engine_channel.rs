@@ -10,6 +10,7 @@ use std::{
     cell::RefCell,
     io::{self, BufRead, BufReader, Read, Write},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender},
         Arc, Mutex,
     },
@@ -31,10 +32,29 @@ pub struct InputRouter {
     frames: SyncSender<ChannelEvent>,
     replies: SyncSender<io::Result<bool>>,
     state: Arc<Mutex<State>>,
+    cancelled: Arc<AtomicBool>,
 }
 pub struct PrimitiveClient {
     replies: Receiver<io::Result<bool>>,
     state: Arc<Mutex<State>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl PrimitiveClient {
+    /// SAME process-owned reader/owner cancellation origin. This is a forward
+    /// stop signal only, never a native cleanup or authorization capability.
+    pub fn cancellation(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+}
+impl Drop for PrimitiveClient {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+impl Drop for InputRouter {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
 }
 
 fn failed() -> io::Error {
@@ -47,14 +67,20 @@ pub fn channel() -> (InputRouter, Receiver<ChannelEvent>, PrimitiveClient) {
     let (frame_tx, frames) = mpsc::sync_channel(1);
     let (reply_tx, replies) = mpsc::sync_channel(1);
     let state = Arc::new(Mutex::new(State::Idle));
+    let cancelled = Arc::new(AtomicBool::new(false));
     (
         InputRouter {
             frames: frame_tx,
             replies: reply_tx,
             state: state.clone(),
+            cancelled: cancelled.clone(),
         },
         frames,
-        PrimitiveClient { replies, state },
+        PrimitiveClient {
+            replies,
+            state,
+            cancelled,
+        },
     )
 }
 
@@ -66,6 +92,7 @@ struct PrimitiveAck {
 
 impl InputRouter {
     fn poison(&self) -> io::Error {
+        self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut state) = self.state.lock() {
             *state = State::Failed;
         }
@@ -108,6 +135,9 @@ impl InputRouter {
     /// Wake a primitive waiter before sending the terminal frame event. This
     /// ordering also allows a full frame queue to drain on fatal input failure.
     pub fn finish(&mut self, error: Option<io::Error>) {
+        // Publish BEFORE mutex acquisition / the bounded terminal queue send:
+        // a busy native owner must see cancellation without draining frames.
+        self.cancelled.store(true, Ordering::SeqCst);
         if let Ok(mut state) = self.state.lock() {
             if error.is_some() || *state == State::Failed {
                 *state = State::Failed;
@@ -223,6 +253,7 @@ pub fn request_primitive(action: EnginePrimitive, writer: &mut impl Write) -> io
             Ok(true) => Ok(()),
             Ok(false) => Err(io::Error::other("dispatcher_primitive_failed")),
             Err(error) => {
+                client.cancelled.store(true, Ordering::SeqCst);
                 if let Ok(mut state) = client.state.lock() {
                     *state = State::Failed;
                 }

@@ -6,6 +6,459 @@ use crate::member_carrier_native_ownership::{
     self as receipt, Binding, Context, KeyPhase, KeyPresence, NativeFacts, NativeKeyIo,
     NativeValue, NewKeyAck, Phase, Record, Value, ValueCas,
 };
+use std::rc::Rc;
+
+// Measurement-only capsule. It is deliberately absent from every production
+// build: no NativeOwnership issuer, factory seam or deletion permission exists.
+#[cfg(test)]
+mod relative_txr_probe {
+    use super::{Error, Result};
+    use std::{
+        cell::{Cell, RefCell},
+        mem::ManuallyDrop,
+        rc::Rc,
+    };
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct Metadata {
+        pub name: String,
+        pub class: String,
+        pub subkeys: u32,
+        pub values: u32,
+        pub last_write: (u32, u32),
+        pub security: Vec<u8>,
+    }
+    /// External IO contract for the opt-in OWN-HKCU measurement, NOT a native
+    /// carrier permission. Capture CREATED_NEW only; derive ONLY by an empty
+    /// relative open of that retained original in the actual transaction. No
+    /// parent/name opens or replacement imports. Delete ONLY the derived HKEY.
+    /// # Safety
+    /// Preserve returned/uncertain original handles in owning IO slots before
+    /// any fallible checks; no IO/implicit retry in Drop. Native success must be
+    /// actual syscall ACK, never inferred from name/absence/metadata equality.
+    pub(super) unsafe trait Kernel {
+        type Key;
+        type Transaction;
+        fn create_original(&mut self) -> Result<Self::Key>;
+        fn metadata(&mut self, key: &Self::Key) -> Result<Metadata>;
+        fn begin(&mut self) -> Result<Self::Transaction>;
+        fn derive_empty(
+            &mut self,
+            original: &Self::Key,
+            tx: &Self::Transaction,
+        ) -> Result<Self::Key>;
+        fn delete_derived(&mut self, derived: &Self::Key, tx: &Self::Transaction) -> Result<()>;
+        fn commit(&mut self, tx: &Self::Transaction) -> Result<()>;
+        fn rollback(&mut self, tx: &Self::Transaction) -> Result<()>;
+        fn close_key(&mut self, key: &Self::Key) -> Result<()>;
+        fn close_transaction(&mut self, tx: &Self::Transaction) -> Result<()>;
+        fn close_parent(&mut self) -> Result<()>;
+        fn probe_path_absent(&mut self) -> Result<bool>;
+    }
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    pub(super) enum Phase {
+        Stage,
+        Commit,
+        Rollback,
+        CloseDerived,
+        CloseOriginal,
+        CloseTransaction,
+        CloseParent,
+    }
+    impl Phase {
+        pub(super) const CLOSES: [Self; 4] = [
+            Self::CloseDerived,
+            Self::CloseOriginal,
+            Self::CloseTransaction,
+            Self::CloseParent,
+        ];
+        fn index(self) -> usize {
+            self as usize
+        }
+        fn forward(self) -> bool {
+            matches!(self, Self::Stage | Self::Commit)
+        }
+    }
+    pub(super) struct Binding {
+        origin: Rc<()>,
+    }
+    pub(super) struct Ack {
+        origin: Rc<()>,
+        phase: Phase,
+    }
+    struct State<K: Kernel> {
+        io: K,
+        original: Option<K::Key>,
+        tx: Option<K::Transaction>,
+        derived: Option<K::Key>,
+        baseline: Option<Metadata>,
+    }
+    pub(super) struct Capsule<K: Kernel> {
+        state: ManuallyDrop<RefCell<State<K>>>,
+        origin: Rc<()>,
+        binding: RefCell<Option<Rc<Binding>>>,
+        busy: Cell<bool>,
+        failed: Cell<bool>,
+        attempted: [Cell<bool>; 7],
+        acks: [RefCell<Option<Rc<Ack>>>; 7],
+    }
+    // Any unwound/failed preflight, native call, retention or postflight closes
+    // forward use. Cleanup phases remain explicit and independently one-shot.
+    struct Flight<'a> {
+        busy: &'a Cell<bool>,
+        failed: &'a Cell<bool>,
+        complete: bool,
+    }
+    impl Drop for Flight<'_> {
+        fn drop(&mut self) {
+            if !self.complete {
+                self.failed.set(true);
+            }
+            self.busy.set(false);
+        }
+    }
+    impl<K: Kernel> Drop for Capsule<K> {
+        fn drop(&mut self) {
+            if Phase::CLOSES
+                .iter()
+                .all(|p| self.acks[p.index()].get_mut().is_some())
+            {
+                // IO contract forbids native Drop. Only all real close ACKs
+                // allow inert owning wrapper disposal, not registry absence.
+                unsafe {
+                    ManuallyDrop::drop(&mut self.state);
+                }
+            }
+            // Unknown handles/transactions retain their SAME owning IO slots;
+            // no rollback, close, lookup, implicit retry or synthetic ACK.
+        }
+    }
+    impl<K: Kernel> Capsule<K> {
+        pub(super) fn capture_into(slot: &mut Option<Rc<Self>>, io: K) -> Result<()> {
+            if slot.is_some() {
+                return Err(Error::Conflict);
+            }
+            let c = Rc::new(Self {
+                state: ManuallyDrop::new(RefCell::new(State {
+                    io,
+                    original: None,
+                    tx: None,
+                    derived: None,
+                    baseline: None,
+                })),
+                origin: Rc::new(()),
+                binding: RefCell::new(None),
+                busy: Cell::new(false),
+                failed: Cell::new(false),
+                attempted: std::array::from_fn(|_| Cell::new(false)),
+                acks: std::array::from_fn(|_| RefCell::new(None)),
+            });
+            // WHOLE same kernel/owning outputs rooted before the first syscall.
+            *slot = Some(c.clone());
+            let mut flight = c.enter()?;
+            let mut s = c.state.borrow_mut();
+            s.original = Some(s.io.create_original()?);
+            let State {
+                io,
+                original,
+                tx,
+                derived,
+                baseline,
+            } = &mut *s;
+            let original = original.as_ref().ok_or(Error::Pending)?;
+            let before = io.metadata(original)?;
+            Self::empty(&before)?;
+            *baseline = Some(before);
+            *tx = Some(io.begin()?);
+            *derived = Some(io.derive_empty(original, tx.as_ref().ok_or(Error::Pending)?)?);
+            let after = io.metadata(derived.as_ref().ok_or(Error::Pending)?)?;
+            if Some(&after) != baseline.as_ref() {
+                return Err(Error::Conflict);
+            }
+            drop(s);
+            *c.binding.borrow_mut() = Some(Rc::new(Binding {
+                origin: c.origin.clone(),
+            }));
+            flight.complete = true;
+            Ok(())
+        }
+        fn empty(m: &Metadata) -> Result<()> {
+            if m.values != 0 || m.subkeys != 0 || m.name.is_empty() || m.security.is_empty() {
+                Err(Error::Conflict)
+            } else {
+                Ok(())
+            }
+        }
+        fn enter(&self) -> Result<Flight<'_>> {
+            if self.busy.replace(true) {
+                self.failed.set(true);
+                return Err(Error::Conflict);
+            }
+            Ok(Flight {
+                busy: &self.busy,
+                failed: &self.failed,
+                complete: false,
+            })
+        }
+        pub(super) fn binding(&self) -> Result<Rc<Binding>> {
+            self.binding
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)
+        }
+        fn perform(
+            &self,
+            phase: Phase,
+            io: impl FnOnce(&mut State<K>) -> Result<()>,
+            retain: impl FnOnce(Rc<Ack>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            let mut flight = self.enter()?;
+            if (phase.forward() && self.failed.get()) || self.attempted[phase.index()].replace(true)
+            {
+                return Err(Error::Conflict);
+            }
+            io(&mut self.state.borrow_mut())?;
+            let ack = Rc::new(Ack {
+                origin: self.origin.clone(),
+                phase,
+            });
+            *self.acks[phase.index()].borrow_mut() = Some(ack.clone());
+            // Real native ACK retained before caller callback/postflight;
+            // failed/unwound callers retain facts without continuation grant.
+            retain(ack)?;
+            post()?;
+            if phase.forward() && self.failed.get() {
+                return Err(Error::Conflict);
+            }
+            flight.complete = true;
+            Ok(())
+        }
+        pub(super) fn stage(
+            &self,
+            binding: &Rc<Binding>,
+            retain: impl FnOnce(Rc<Ack>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            self.perform(
+                Phase::Stage,
+                |s| {
+                    let original = self.binding()?;
+                    if !Rc::ptr_eq(binding, &original) || !Rc::ptr_eq(&binding.origin, &self.origin)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    let derived = s.derived.as_ref().ok_or(Error::Pending)?;
+                    let current = s.io.metadata(derived)?;
+                    Self::empty(&current)?;
+                    if Some(&current) != s.baseline.as_ref() {
+                        return Err(Error::Conflict);
+                    }
+                    // Only actual original-relative derived handle. No name,
+                    // parent, replacement or namespace lookup enters this call.
+                    s.io.delete_derived(derived, s.tx.as_ref().ok_or(Error::Pending)?)
+                },
+                retain,
+                post,
+            )
+        }
+        pub(super) fn commit(
+            &self,
+            retain: impl FnOnce(Rc<Ack>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            self.perform(
+                Phase::Commit,
+                |s| {
+                    self.read_ack(Phase::Stage)?;
+                    if self.attempted[Phase::Rollback.index()].get() {
+                        return Err(Error::Conflict);
+                    }
+                    s.io.commit(s.tx.as_ref().ok_or(Error::Pending)?)
+                },
+                retain,
+                post,
+            )
+        }
+        pub(super) fn rollback(
+            &self,
+            retain: impl FnOnce(Rc<Ack>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            self.perform(
+                Phase::Rollback,
+                |s| {
+                    if self.read_ack(Phase::Commit).is_ok() {
+                        return Err(Error::Conflict);
+                    }
+                    s.io.rollback(s.tx.as_ref().ok_or(Error::Pending)?)
+                },
+                retain,
+                post,
+            )
+        }
+        pub(super) fn close(
+            &self,
+            phase: Phase,
+            retain: impl FnOnce(Rc<Ack>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            if !Phase::CLOSES.contains(&phase) {
+                self.failed.set(true);
+                return Err(Error::Conflict);
+            }
+            self.perform(
+                phase,
+                |s| {
+                    if self.read_ack(Phase::Commit).is_err()
+                        && self.read_ack(Phase::Rollback).is_err()
+                    {
+                        return Err(Error::Pending);
+                    }
+                    match phase {
+                        Phase::CloseDerived => {
+                            s.io.close_key(s.derived.as_ref().ok_or(Error::Pending)?)
+                        }
+                        Phase::CloseOriginal => {
+                            s.io.close_key(s.original.as_ref().ok_or(Error::Pending)?)
+                        }
+                        Phase::CloseTransaction => {
+                            s.io.close_transaction(s.tx.as_ref().ok_or(Error::Pending)?)
+                        }
+                        Phase::CloseParent => s.io.close_parent(),
+                        _ => Err(Error::Conflict),
+                    }
+                },
+                retain,
+                post,
+            )
+        }
+        pub(super) fn read_ack(&self, phase: Phase) -> Result<Rc<Ack>> {
+            self.acks[phase.index()]
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)
+        }
+        pub(super) fn verify_ack(&self, phase: Phase, ack: &Rc<Ack>) -> Result<()> {
+            let actual = self.read_ack(phase)?;
+            if Rc::ptr_eq(&self.origin, &ack.origin)
+                && phase == ack.phase
+                && Rc::ptr_eq(&actual, ack)
+            {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            }
+        }
+        /// Measurement result ONLY. Never a NativeOwnership/absence/effect
+        /// capability; includes fresh external post-close lookup for test data.
+        pub(super) fn measurement_complete(&self) -> Result<()> {
+            if self.busy.get() {
+                self.failed.set(true);
+                return Err(Error::Conflict);
+            }
+            if self.failed.get() {
+                return Err(Error::Conflict);
+            }
+            self.read_ack(Phase::Stage)?;
+            self.read_ack(Phase::Commit)?;
+            for phase in Phase::CLOSES {
+                self.read_ack(phase)?;
+            }
+            // Missing historical facts are Pending, not a native operation or
+            // a latch-reset. Only the complete chain permits this SDK read.
+            let mut flight = self.enter()?;
+            if !self.state.borrow_mut().io.probe_path_absent()? {
+                return Err(Error::Conflict);
+            }
+            flight.complete = true;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+use super::member_carrier_module as release_policy;
+#[cfg(not(windows))]
+use crate::member_carrier_module as release_policy;
+
+/// Actual once-close ACK, neither a key-restore record nor effect permission.
+pub(crate) struct KeyHandleClosed {
+    origin: Rc<()>,
+}
+struct KeyHandleClose {
+    original: Rc<()>,
+    release: release_policy::ModuleRelease,
+    closed: std::cell::RefCell<Option<Rc<KeyHandleClosed>>>,
+}
+impl KeyHandleClose {
+    fn new() -> Self {
+        Self {
+            original: Rc::new(()),
+            release: release_policy::ModuleRelease::new(),
+            closed: std::cell::RefCell::new(None),
+        }
+    }
+    fn was_attempted(&self) -> bool {
+        self.release.was_attempted()
+    }
+    fn run(
+        &self,
+        check: impl FnOnce() -> Result<()>,
+        native: impl FnOnce() -> Result<()>,
+        retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+        post: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let error = std::cell::Cell::new(None);
+        let mapped = |value: Result<()>| {
+            value.map_err(|e| {
+                error.set(Some(e));
+                release_policy::Error::Conflict
+            })
+        };
+        self.release
+            .run(
+                || mapped(check()),
+                || {
+                    mapped(native())?;
+                    // Native returned success. Root the factual ACK before ANY caller
+                    // callback or postflight can fail/unwind. No raw handle is exposed.
+                    let ack = Rc::new(KeyHandleClosed {
+                        origin: self.original.clone(),
+                    });
+                    *self.closed.borrow_mut() = Some(ack.clone());
+                    mapped(retain(ack))
+                },
+                || mapped(post()),
+            )
+            .map_err(|_| error.get().unwrap_or(Error::Conflict))
+    }
+    fn read_ack(&self) -> Result<Rc<KeyHandleClosed>> {
+        let ack = self.closed.try_borrow().map_err(|_| Error::Conflict)?;
+        ack.as_ref().cloned().ok_or(Error::Pending)
+    }
+    fn verify_ack(&self, ack: &Rc<KeyHandleClosed>) -> Result<()> {
+        let actual = self.read_ack()?;
+        if !Rc::ptr_eq(&self.original, &ack.origin) || !Rc::ptr_eq(&actual, ack) {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+}
+
+/// Concrete canonical terminal caller only; no record-based native permission.
+/// # Safety
+/// Verify SAME runtime/lease, original Stopped publication and active Pair/
+/// Retired/Calling brackets plus native full absence before AND after close.
+/// Postflight must not query the released handle. Preserve all actual originals
+/// and returned ACKs outside fallible callbacks. Never use this for a live key.
+#[cfg(windows)]
+pub(crate) unsafe trait NativeKeyTerminalFence {
+    fn verify_original_terminal(&self, context: &Context, binding: &Binding) -> Result<()>;
+}
 
 const PARENT: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
 const VALUE: &str = "IPAutoconfigurationEnabled";
@@ -97,15 +550,26 @@ pub(crate) fn effect_matches_storage(
                         Value::Absent
                     )
                 ) || fresh
+                    && binding.role != receipt::Role::RoleCarrier
                     && matches!(
                         (pending.phase, key.phase, value.expected, value.desired),
                         (
                             Phase::Preparing,
-                            KeyPhase::DisablePending,
-                            Value::Absent,
-                            Value::DwordZero
+                            KeyPhase::RestorePending,
+                            Value::DwordZero,
+                            Value::Absent
                         )
-                    ))
+                    )
+                    || fresh
+                        && matches!(
+                            (pending.phase, key.phase, value.expected, value.desired),
+                            (
+                                Phase::Preparing,
+                                KeyPhase::DisablePending,
+                                Value::Absent,
+                                Value::DwordZero
+                            )
+                        ))
         }
     };
     if allowed {
@@ -124,20 +588,538 @@ pub(crate) trait RegistryKernel {
     fn zero(&mut self, handle: &Self::Handle) -> Result<()>;
     fn delete_value(&mut self, handle: &Self::Handle) -> Result<()>;
     fn flush(&mut self, handle: &Self::Handle) -> Result<()>;
+    /// Optional original-handle observation; an unsupported boundary DENIES
+    /// this lane. Only the native implementation returns RegQueryInfoKeyW's
+    /// actual status, never a path lookup or restored-value inference.
+    fn original_key_info_status(&mut self, _handle: &Self::Handle) -> Result<u32> {
+        Err(Error::Pending)
+    }
+}
+/// Sealed factual observation, never SDK absence/worker/effect permission.
+pub(crate) struct OriginalSdkDeletedKeyRead {
+    origin: Rc<()>,
+    statuses: [std::cell::Cell<Option<u32>>; 2],
+    last_status: std::cell::Cell<Option<u32>>,
+}
+#[derive(Default)]
+struct OriginalReadState {
+    busy: std::cell::Cell<bool>,
+    failed: std::cell::Cell<bool>,
+}
+struct OriginalReadCall<'a> {
+    state: &'a OriginalReadState,
+    complete: bool,
+}
+// Implemented only by the actual native handle below (and external-I/O test
+// handles). Callers cannot manufacture a root disposition with an Ok callback.
+pub(crate) trait TerminalKeyHandle {
+    fn close_original(
+        &self,
+        check: impl FnOnce() -> Result<()>,
+        retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+        post: impl FnOnce() -> Result<()>,
+    ) -> Result<()>;
+    fn verify_closed(&self, ack: &Rc<KeyHandleClosed>) -> Result<()>;
+}
+impl OriginalReadState {
+    fn begin(&self) -> Result<OriginalReadCall<'_>> {
+        if self.busy.replace(true) || self.failed.get() {
+            self.failed.set(true);
+            return Err(Error::Conflict);
+        }
+        Ok(OriginalReadCall {
+            state: self,
+            complete: false,
+        })
+    }
+    fn check(&self) -> Result<()> {
+        if self.failed.get() {
+            Err(Error::Conflict)
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for OriginalReadCall<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.state.failed.set(true);
+        }
+        self.state.busy.set(false);
+    }
+}
+/// Historical original ownership, NOT current path absence/full key emptiness.
+/// No variant can be minted by restored VALUE, closed HKEY or matching JSON as
+/// a KEY-root deletion/absence acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KeyRootObligationKind {
+    CreatedKeyRootRetained,
+    ValueRestoreObservedRootRetained,
+    OriginalHandleClosedRootRetained,
+    UncertainOriginalKeyRoot,
+}
+
+/// Owns the SAME handle returned with CREATED_NEW, rooted before create
+/// postflight. !Send/nonserializable; no raw-handle accessor or public ctor.
+/// Unknown abandonment preserves the original native obligation. A factual
+/// close ACK permits inert handle-wrapper destruction, never KEY-root absence.
+pub(crate) struct OriginalKeyRootObligation<H> {
+    handle: std::mem::ManuallyDrop<H>,
+    // SAME actual parent used by the native CREATED_NEW operation. A saved
+    // path or subsequently opened equal key cannot replace this origin. Root
+    // Unknown abandonment preserves BOTH descriptors; a child-close ACK alone
+    // does not authorize parent release or root disposition.
+    parent_handle: std::mem::ManuallyDrop<H>,
+    kind: std::cell::Cell<KeyRootObligationKind>,
+    closed: std::cell::RefCell<Option<Rc<KeyHandleClosed>>>,
+    origin: Rc<()>,
+    sdk_deleted: std::cell::RefCell<Option<Rc<OriginalSdkDeletedKeyRead>>>,
+    observation: OriginalReadState,
+    observed_deleted: std::cell::Cell<bool>,
+    first_terminal_status: std::cell::Cell<Option<u32>>,
+    terminal: OriginalReadState,
+    terminal_complete: std::cell::Cell<bool>,
+    parent_closed: std::cell::RefCell<Option<Rc<KeyHandleClosed>>>,
+    selection: OriginalReadState,
+    selection_attempted: std::cell::Cell<bool>,
+    sampling: OriginalReadState,
+}
+impl<H> OriginalKeyRootObligation<H> {
+    fn check_health(&self) -> Result<()> {
+        self.observation.check()?;
+        self.terminal.check()?;
+        self.selection.check()?;
+        self.sampling.check()
+    }
+    fn new(handle: H, parent_handle: H) -> Self {
+        Self {
+            handle: std::mem::ManuallyDrop::new(handle),
+            parent_handle: std::mem::ManuallyDrop::new(parent_handle),
+            kind: std::cell::Cell::new(KeyRootObligationKind::UncertainOriginalKeyRoot),
+            closed: std::cell::RefCell::new(None),
+            origin: Rc::new(()),
+            sdk_deleted: std::cell::RefCell::new(None),
+            observation: OriginalReadState::default(),
+            observed_deleted: std::cell::Cell::new(false),
+            first_terminal_status: std::cell::Cell::new(None),
+            terminal: OriginalReadState::default(),
+            terminal_complete: std::cell::Cell::new(false),
+            parent_closed: std::cell::RefCell::new(None),
+            selection: OriginalReadState::default(),
+            selection_attempted: std::cell::Cell::new(false),
+            sampling: OriginalReadState::default(),
+        }
+    }
+    fn handle(&self) -> &H {
+        &self.handle
+    }
+    fn parent_handle(&self) -> &H {
+        &self.parent_handle
+    }
+    pub(crate) fn classification(&self) -> KeyRootObligationKind {
+        self.kind.get()
+    }
+    pub(crate) fn verify_original(self: &Rc<Self>, ack: &NewKeyAck<Held<H>>) -> Result<()> {
+        if Rc::ptr_eq(self, &ack.retained_handle().handle) {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
+        }
+    }
+    /// ONLY the sealed SDK-deleted-original lane plus both original native
+    /// close ACKs completes this obligation. A surviving empty root is Pending.
+    pub(crate) fn require_root_absent(&self) -> Result<()> {
+        self.check_health()?;
+        let read = self.sdk_deleted_read()?;
+        if !Rc::ptr_eq(&read.origin, &self.origin)
+            || read.statuses.each_ref().map(|s| s.get()) != [Some(1018), Some(1018)]
+            || !self.observed_deleted.get()
+            || !self.terminal_complete.get()
+            || self.closed_handle_ack().is_err()
+            || self
+                .parent_closed
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_none()
+        {
+            return Err(Error::Pending);
+        }
+        Ok(())
+    }
+    pub(crate) fn sdk_deleted_read(&self) -> Result<Rc<OriginalSdkDeletedKeyRead>> {
+        self.sdk_deleted
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .as_ref()
+            .cloned()
+            .ok_or(Error::Pending)
+    }
+    /// Pure SAME-original factual read verification. Even success cannot grant
+    /// root disposal: require_root_absent additionally checks both close ACKs.
+    pub(crate) fn verify_sdk_deleted_read(
+        &self,
+        read: &Rc<OriginalSdkDeletedKeyRead>,
+    ) -> Result<()> {
+        self.check_health()?;
+        let original = self.sdk_deleted_read()?;
+        if !Rc::ptr_eq(&original, read)
+            || !Rc::ptr_eq(&self.origin, &read.origin)
+            || !self.observed_deleted.get()
+            || read.statuses.each_ref().map(|s| s.get()) != [Some(1018), Some(1018)]
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+    fn observe_sdk_deleted<K: RegistryKernel<Handle = H>>(
+        self: &Rc<Self>,
+        original: &NewKeyAck<Held<H>>,
+        kernel: &mut K,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Rc<OriginalSdkDeletedKeyRead>> {
+        let mut call = self.observation.begin()?;
+        self.selection.check()?;
+        self.verify_original(original)?;
+        if self
+            .closed
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .is_some()
+            || self
+                .parent_closed
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_some()
+        {
+            return Err(Error::Conflict);
+        }
+        let held = original.retained_handle();
+        receipt::validate_context(&held.context)?;
+        if !held.context.bindings.contains(&held.binding)
+            || !parent_valid(&held.parent)
+            || held.binding.registry_path != format!("{PARENT}\\{}", held.child)
+        {
+            return Err(Error::Conflict);
+        }
+        check()?;
+        self.check_health()?; // caught reentry must prevent even the next read
+        let read = {
+            let mut slot = self
+                .sdk_deleted
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            slot.get_or_insert_with(|| {
+                Rc::new(OriginalSdkDeletedKeyRead {
+                    origin: self.origin.clone(),
+                    statuses: std::array::from_fn(|_| std::cell::Cell::new(None)),
+                    last_status: std::cell::Cell::new(None),
+                })
+            })
+            .clone()
+        };
+        for status in &read.statuses {
+            // Root the actual result BEFORE validation, subsequent I/O or postflight.
+            let actual = kernel.original_key_info_status(self.handle())?;
+            read.last_status.set(Some(actual));
+            if status.get().is_none() {
+                status.set(Some(actual));
+            }
+            self.check_health()?;
+            if actual != 1018 {
+                return Err(Error::Pending);
+            }
+            if !kernel
+                .name(self.parent_handle())?
+                .eq_ignore_ascii_case(&held.parent)
+            {
+                return Err(Error::Conflict);
+            }
+            self.check_health()?;
+            if kernel.open(self.parent_handle(), &held.child)?.is_some() {
+                return Err(Error::Conflict);
+            }
+            self.check_health()?;
+        }
+        check()?;
+        self.check_health()?;
+        self.observed_deleted.set(true);
+        call.complete = true;
+        Ok(read)
+    }
+    pub(crate) fn closed_handle_ack(&self) -> Result<Rc<KeyHandleClosed>> {
+        self.closed
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .as_ref()
+            .cloned()
+            .ok_or(Error::Pending)
+    }
+    fn verify_parent_absent<K: RegistryKernel<Handle = H>>(
+        &self,
+        held: &Held<H>,
+        kernel: &mut K,
+    ) -> Result<()> {
+        if !kernel
+            .name(self.parent_handle())?
+            .eq_ignore_ascii_case(&held.parent)
+        {
+            return Err(Error::Conflict);
+        }
+        self.terminal.check()?;
+        self.selection.check()?;
+        if kernel.open(self.parent_handle(), &held.child)?.is_some() {
+            return Err(Error::Conflict);
+        }
+        self.terminal.check()?;
+        self.selection.check()?;
+        Ok(())
+    }
+    // Private: callers below hard-wire the SAME original Handle.close policy.
+    // No caller-provided success fence, JSON or path lookup can invoke this.
+    fn record_closed_handle_ack(
+        &self,
+        ack: Rc<KeyHandleClosed>,
+        verify: impl FnOnce(&H, &Rc<KeyHandleClosed>) -> Result<()>,
+    ) -> Result<()> {
+        verify(self.handle(), &ack)?;
+        *self.closed.borrow_mut() = Some(ack);
+        self.kind
+            .set(KeyRootObligationKind::OriginalHandleClosedRootRetained);
+        Ok(())
+    }
+}
+impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
+    fn close_sdk_deleted<K: RegistryKernel<Handle = H>>(
+        self: &Rc<Self>,
+        original: &NewKeyAck<Held<H>>,
+        kernel: &mut K,
+        check: impl Fn() -> Result<()>,
+        retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+    ) -> Result<()> {
+        let mut call = self.terminal.begin()?;
+        if self.terminal_complete.get() {
+            return Err(Error::Conflict);
+        }
+        self.observe_sdk_deleted(original, kernel, &check)?;
+        self.terminal.check()?;
+        let held = original.retained_handle();
+        self.handle().close_original(
+            || {
+                check()?;
+                self.terminal.check()
+            },
+            |ack| {
+                self.record_closed_handle_ack(ack.clone(), |h, a| h.verify_closed(a))?;
+                retain(ack)?;
+                self.terminal.check()
+            },
+            || {
+                check()?;
+                self.terminal.check()
+            },
+        )?;
+        // Do not query the now-closed child. Recheck SAME original parent and
+        // relative name, never reopen a replacement parent/path.
+        check()?;
+        self.check_health()?;
+        self.verify_parent_absent(held, kernel)?;
+        self.check_health()?;
+        self.parent_handle().close_original(
+            // No HKEY query once close.run marks the handle attempted. The
+            // actual original fence and relative reads ran immediately above.
+            || self.check_health(),
+            |ack| {
+                self.parent_handle().verify_closed(&ack)?;
+                *self
+                    .parent_closed
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)? = Some(ack);
+                Ok(())
+            },
+            || {
+                check()?;
+                self.terminal.check()
+            },
+        )?;
+        self.observation.check()?;
+        self.terminal.check()?;
+        self.terminal_complete.set(true);
+        call.complete = true;
+        Ok(())
+    }
+}
+impl<H> Drop for OriginalKeyRootObligation<H> {
+    fn drop(&mut self) {
+        if self.closed.get_mut().is_some() {
+            // Set ONLY after this SAME native Handle.close.verify_ack succeeds.
+            // Native Handle Drop is now inert (its explicit close was attempted).
+            unsafe {
+                std::mem::ManuallyDrop::drop(&mut self.handle);
+            }
+        }
+        if self.parent_closed.get_mut().is_some() {
+            // SAME native parent close receipt, not child-close inference.
+            unsafe {
+                std::mem::ManuallyDrop::drop(&mut self.parent_handle);
+            }
+        }
+        // Otherwise ManuallyDrop preserves the original, without implicit
+        // RegCloseKey, native retry, effect grant or inference from absence.
+    }
+}
+/// PURE owning handoff to Main/Pauli. Caller roots this SAME Rc before any
+/// fallible terminal inspection. No Source/Authority/journal/native entry,
+/// importing from equal metadata or handle/DLL reconstruction occurs here.
+pub(crate) fn terminal_original_key_obligation<H>(
+    original: &NewKeyAck<Held<H>>,
+) -> Rc<OriginalKeyRootObligation<H>> {
+    original.retained_handle().handle.clone()
 }
 /// Actual owning create ACK handle, not Clone, serde or a numeric journal key.
 pub(crate) struct Held<H> {
-    handle: H,
+    handle: Rc<OriginalKeyRootObligation<H>>,
     parent: String,
     child: String,
     context: Context,
     binding: Binding,
 }
+impl<H> Held<H> {
+    fn handle(&self) -> &H {
+        self.handle.handle()
+    }
+}
+/// Read-only continuity of the SAME retained NEW-key ACK at the last NIC-create
+/// seam. Does not create a capability or authenticate a runtime/claim/lock;
+/// the concrete module authority must independently hold/recheck all of those.
+/// Only original handles are read, no path adoption or registry mutation.
+pub(crate) fn reattest_disabled_original_key<K: RegistryKernel>(
+    kernel: &mut K,
+    record: &Record,
+    binding: &Binding,
+    ack: &NewKeyAck<Held<K::Handle>>,
+) -> Result<()> {
+    receipt::validate_carrier_create_stage(record, &record.context, binding, record.generation)?;
+    read_original_disabled_key(kernel, record, binding, ack)
+}
+
+/// Shared native contents only. Both entry points validate their OWN exact
+/// lifecycle and role before entering this private reader.
+fn read_original_disabled_key<K: RegistryKernel>(
+    kernel: &mut K,
+    record: &Record,
+    binding: &Binding,
+    ack: &NewKeyAck<Held<K::Handle>>,
+) -> Result<()> {
+    let held = ack.retained_handle();
+    let child = binding
+        .registry_path
+        .strip_prefix(PARENT)
+        .and_then(|s| s.strip_prefix('\\'))
+        .filter(|s| s.len() == 38 && !s.contains('\\'))
+        .ok_or(Error::Invalid)?;
+    if held.context != record.context || held.binding != *binding || held.child != child {
+        return Err(Error::Conflict);
+    }
+    let parent = kernel.interfaces()?;
+    let parent_name = kernel.name(&parent)?;
+    if !parent_valid(&parent_name) || !held.parent.eq_ignore_ascii_case(&parent_name) {
+        return Err(Error::Conflict);
+    }
+    let current = kernel.open(&parent, child)?.ok_or(Error::Conflict)?;
+    let expected = format!("{parent_name}\\{child}");
+    for _ in 0..2 {
+        if !kernel.name(held.handle())?.eq_ignore_ascii_case(&expected)
+            || !kernel.name(&current)?.eq_ignore_ascii_case(&expected)
+            || !kernel.name(&parent)?.eq_ignore_ascii_case(&parent_name)
+            || kernel.value(held.handle())? != NativeValue::Dword(0)
+            || kernel.value(&current)? != NativeValue::Dword(0)
+        {
+            return Err(Error::Conflict);
+        }
+    }
+    Ok(())
+}
+/// Separate member prerequisite; never broadens the existing C-only API.
+pub(crate) fn reattest_disabled_original_member_key<K: RegistryKernel>(
+    kernel: &mut K,
+    record: &Record,
+    context: &Context,
+    binding: &Binding,
+    generation: u64,
+    ack: &NewKeyAck<Held<K::Handle>>,
+) -> Result<()> {
+    receipt::validate_record(record)?;
+    let index = match binding.role {
+        receipt::Role::MemberA => 1,
+        receipt::Role::MemberB => 2,
+        receipt::Role::RoleCarrier => return Err(Error::Conflict),
+    };
+    let key = &record.keys[index];
+    if record.context != *context
+        || generation == 0
+        || record.generation != generation
+        || record.phase != Phase::Preparing
+        || context.bindings[index] != *binding
+        || key.role != binding.role
+        || key.phase != KeyPhase::Disabled
+        || !key.new_key_ack
+        || key.baseline != Value::Absent
+        || key.current != Value::DwordZero
+        || key.pending.is_some()
+    {
+        return Err(Error::Conflict);
+    }
+    read_original_disabled_key(kernel, record, binding, ack)
+}
+
 pub(crate) struct Keys<K: RegistryKernel, A: NativeAuthority> {
     kernel: K,
     authority: A,
     context: Context,
     poisoned: bool,
+    // SAME native NEW-create ACK, retained BEFORE any fallible postflight.
+    // Private read aliases cannot escape. An uncertain attempt is never adopted
+    // or retried; the owning assembly retains Keys and its original authority.
+    pending_key: Option<Rc<NewKeyAck<Held<K::Handle>>>>,
+}
+impl<K: RegistryKernel, A: NativeAuthority> Drop for Keys<K, A> {
+    fn drop(&mut self) {
+        if let Some(original) = self.pending_key.take() {
+            // No successful cleanup/transfer ACK: do not implicitly release the
+            // actual newly-created handle merely because postflight failed.
+            std::mem::forget(original);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<I: super::member_carrier_key_authority::OriginalCreatorInventory>
+    receipt::NativeKeyAttachment<
+        super::member_session::WindowsNativeCarrierReceiptStore<
+            super::member_session::NativeSessionFiles,
+        >,
+    > for Keys<win32::Kernel, super::member_carrier_key_authority::KeyAuthority<I>>
+{
+    fn assert_original_journal_lock(
+        &mut self,
+        journal: &super::member_session::WindowsNativeCarrierReceiptStore<
+            super::member_session::NativeSessionFiles,
+        >,
+        lock: &mut Self::MutationLock,
+        context: &Context,
+    ) -> Result<()> {
+        self.assert_serialized_lock(lock, context)?;
+        let runtime = self.authority.read_pin(lock)?;
+        if !runtime.fresh(context)? {
+            return Err(Error::Retired);
+        }
+        runtime.verify_same_session_files(context, journal.original_files(context)?)?;
+        self.assert_serialized_lock(lock, context)?;
+        if !runtime.fresh(context)? {
+            return Err(Error::Retired);
+        }
+        Ok(())
+    }
 }
 pub(crate) fn decode_name(bytes: &[u8], returned: usize) -> Result<String> {
     if !(6..=MAX_NAME).contains(&returned) || returned > bytes.len() {
@@ -175,7 +1157,19 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
             authority,
             context,
             poisoned: false,
+            pending_key: None,
         }
+    }
+    /// Actual CREATED_NEW returned but later capture postflight failed. This
+    /// retains the owning original floor only; it cannot adopt an unknown
+    /// native-create result or synthesize NativeOwnership's journal/NEW ACK.
+    pub(crate) fn pending_original_key_obligation(
+        &self,
+    ) -> Result<Rc<OriginalKeyRootObligation<K::Handle>>> {
+        self.pending_key
+            .as_ref()
+            .map(|ack| terminal_original_key_obligation(ack))
+            .ok_or(Error::Pending)
     }
     fn binding<'a>(&self, record: &'a Record, binding: &Binding) -> Result<&'a Binding> {
         receipt::validate_record(record)?;
@@ -216,7 +1210,18 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
         if self.poisoned {
             return Err(Error::Pending);
         }
-        self.observed_inner(lock, record, binding, retained, challenge)
+        let root = retained
+            .filter(|_| matches!(record.phase, Phase::Closing | Phase::Stopped))
+            .map(terminal_original_key_obligation);
+        let mut call = root.as_ref().map(|r| r.sampling.begin()).transpose()?;
+        let facts = self.observed_inner(lock, record, binding, retained, challenge)?;
+        if let Some(root) = &root {
+            root.check_health()?;
+        }
+        if let Some(call) = &mut call {
+            call.complete = true;
+        }
+        Ok(facts)
     }
     fn observed_inner(
         &mut self,
@@ -231,12 +1236,40 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
         if challenge == 0 {
             return Err(Error::Pending);
         }
-        let (parent, parent_name) = self.parent()?;
         let child = Self::child(binding)?;
+        let cleanup_original =
+            retained.filter(|_| matches!(record.phase, Phase::Closing | Phase::Stopped));
+        let fresh_parent = if cleanup_original.is_none() {
+            Some(self.parent()?)
+        } else {
+            None
+        };
+        let (parent, parent_name) = if let Some(ack) = cleanup_original {
+            let held = ack.retained_handle();
+            if held.context != self.context || held.binding != *binding || held.child != child {
+                return Err(Error::Conflict);
+            }
+            let name = self.kernel.name(held.handle.parent_handle())?;
+            if !parent_valid(&name) || !name.eq_ignore_ascii_case(&held.parent) {
+                return Err(Error::Conflict);
+            }
+            (held.handle.parent_handle(), name)
+        } else {
+            let (parent, name) = fresh_parent.as_ref().ok_or(Error::Conflict)?;
+            (parent, name.clone())
+        };
         let expected = format!("{parent_name}\\{child}");
-        let opened = self.kernel.open(&parent, child)?;
+        let opened = self.kernel.open(parent, child)?;
         let (key, value) = match (opened, retained) {
             (None, None) => (KeyPresence::Absent, NativeValue::Absent),
+            (None, Some(ack)) if cleanup_original.is_some() => {
+                let root = terminal_original_key_obligation(ack);
+                let authority = &mut self.authority;
+                root.observe_sdk_deleted(ack, &mut self.kernel, || {
+                    authority.verify(lock, &self.context)
+                })?;
+                (KeyPresence::OriginalSdkDeleted, NativeValue::Absent)
+            }
             (None, Some(_)) => return Err(Error::Conflict),
             (Some(opened), None) => {
                 if !self.kernel.name(&opened)?.eq_ignore_ascii_case(&expected) {
@@ -252,22 +1285,19 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
                     || !held.parent.eq_ignore_ascii_case(&parent_name)
                     || !self
                         .kernel
-                        .name(&held.handle)?
+                        .name(held.handle())?
                         .eq_ignore_ascii_case(&expected)
                     || !self.kernel.name(&opened)?.eq_ignore_ascii_case(&expected)
                 {
                     return Err(Error::Conflict);
                 }
-                let value = self.kernel.value(&held.handle)?;
+                let value = self.kernel.value(held.handle())?;
                 if value != self.kernel.value(&opened)?
                     || !self
                         .kernel
-                        .name(&held.handle)?
+                        .name(held.handle())?
                         .eq_ignore_ascii_case(&expected)
-                    || !self
-                        .kernel
-                        .name(&parent)?
-                        .eq_ignore_ascii_case(&parent_name)
+                    || !self.kernel.name(parent)?.eq_ignore_ascii_case(&parent_name)
                 {
                     return Err(Error::Conflict);
                 }
@@ -336,6 +1366,9 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         binding: &Binding,
         absent: &NativeFacts,
     ) -> Result<NewKeyAck<Self::Key>> {
+        if self.poisoned || self.pending_key.is_some() {
+            return Err(Error::Pending);
+        }
         Self::check_fact(pending, binding, absent)?;
         self.binding(pending, binding)?;
         if pending.phase != Phase::Preparing
@@ -352,6 +1385,9 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         }
         let (parent, parent_name) = self.parent()?;
         let child = Self::child(binding)?.to_owned();
+        // Complete allocating metadata BEFORE a native owning handle exists.
+        let key_context = self.context.clone();
+        let key_binding = binding.clone();
         self.assert_serialized_lock(lock, &pending.context)?;
         self.authority
             .authorize_effect(lock, pending, binding, Effect::Create)?;
@@ -365,26 +1401,46 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             return Err(Error::Pending);
         }
         let held = Held {
-            handle,
+            handle: Rc::new(OriginalKeyRootObligation::new(handle, parent)),
             parent: parent_name,
             child,
-            context: self.context.clone(),
-            binding: binding.clone(),
+            context: key_context,
+            binding: key_binding,
         };
-        let ack = NewKeyAck::from_native_created_new_key(disposition, held)?;
+        self.pending_key = Some(Rc::new(NewKeyAck::from_native_created_new_key(1, held)?));
+        let ack = self
+            .pending_key
+            .as_ref()
+            .expect("retained NEW-key ACK")
+            .clone();
         self.kernel
-            .flush(&parent)
+            .flush(ack.retained_handle().handle.parent_handle())
             .inspect_err(|_| self.poisoned = true)?;
         let read = self
-            .observed_inner(lock, pending, binding, Some(&ack), absent.challenge)
+            .observed_inner(lock, pending, binding, Some(ack.as_ref()), absent.challenge)
             .inspect_err(|_| self.poisoned = true)?;
         Self::check_fact(pending, binding, &read)?;
         if read.key != KeyPresence::ExactRetainedNewKey || read.value != NativeValue::Absent {
             self.poisoned = true;
             return Err(Error::Conflict);
         }
-        self.poisoned = false;
-        Ok(ack)
+        drop(ack);
+        let retained = self.pending_key.take().expect("retained NEW-key ACK");
+        match Rc::try_unwrap(retained) {
+            Ok(original) => {
+                original
+                    .retained_handle()
+                    .handle
+                    .kind
+                    .set(KeyRootObligationKind::CreatedKeyRootRetained);
+                self.poisoned = false;
+                Ok(original)
+            }
+            Err(original) => {
+                self.pending_key = Some(original);
+                Err(Error::Pending)
+            }
+        }
     }
     fn compare_exchange_value(
         &mut self,
@@ -398,29 +1454,34 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         self.binding(pending, binding)?;
         Self::check_fact(pending, binding, fresh)?;
         let key = Self::key_phase(pending, binding)?;
+        let phase_allows = matches!(
+            (
+                pending.phase,
+                key.phase,
+                mutation.expected,
+                mutation.desired
+            ),
+            (
+                Phase::Preparing,
+                KeyPhase::DisablePending,
+                Value::Absent,
+                Value::DwordZero
+            ) | (
+                Phase::Closing,
+                KeyPhase::RestorePending,
+                Value::DwordZero,
+                Value::Absent
+            )
+        ) || (pending.phase == Phase::Preparing
+            && binding.role != receipt::Role::RoleCarrier
+            && key.phase == KeyPhase::RestorePending
+            && mutation.expected == Value::DwordZero
+            && mutation.desired == Value::Absent);
         if mutation.value_name != VALUE
             || !key.new_key_ack
             || key.current != mutation.expected
             || key.pending != Some(mutation.desired)
-            || !matches!(
-                (
-                    pending.phase,
-                    key.phase,
-                    mutation.expected,
-                    mutation.desired
-                ),
-                (
-                    Phase::Preparing,
-                    KeyPhase::DisablePending,
-                    Value::Absent,
-                    Value::DwordZero
-                ) | (
-                    Phase::Closing,
-                    KeyPhase::RestorePending,
-                    Value::DwordZero,
-                    Value::Absent
-                )
-            )
+            || !phase_allows
         {
             return Err(Error::Invalid);
         }
@@ -446,7 +1507,11 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         // Windows offers no registry value CAS. Serialization is independently
         // mandatory; only our captured handle is written, never an opened path.
         self.poisoned = true;
-        let h = &retained.retained_handle().handle;
+        let original = &retained.retained_handle().handle;
+        original
+            .kind
+            .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
+        let h = original.handle();
         match mutation.desired {
             Value::DwordZero => self.kernel.zero(h)?,
             Value::Absent => self.kernel.delete_value(h)?,
@@ -461,13 +1526,100 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             return Err(Error::Conflict);
         }
         self.poisoned = false;
+        original.kind.set(if mutation.desired == Value::Absent {
+            KeyRootObligationKind::ValueRestoreObservedRootRetained
+        } else {
+            KeyRootObligationKind::CreatedKeyRootRetained
+        });
         Ok(())
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "member_carrier_keys_tests.rs"]
 mod tests;
+
+/// Actual retained NEW handle only, selected by NativeOwnership's terminal
+/// callback. The caller roots its returned close ACK before terminal postflight.
+#[cfg(windows)]
+pub(crate) fn close_terminal_original_key(
+    original: &NewKeyAck<Held<win32::Handle>>,
+    fence: &impl NativeKeyTerminalFence,
+    retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+) -> Result<()> {
+    let held = original.retained_handle();
+    let mut selection = held.handle.selection.begin()?;
+    if held.handle.selection_attempted.replace(true) {
+        return Err(Error::Conflict);
+    }
+    let result = (|| {
+        receipt::validate_context(&held.context)?;
+        if held.context.bindings.get(held.binding.role as usize) != Some(&held.binding)
+            || !parent_valid(&held.parent)
+            || !held
+                .binding
+                .registry_path
+                .ends_with(&format!("\\{}", held.child))
+        {
+            return Err(Error::Conflict);
+        }
+        fence.verify_original_terminal(&held.context, &held.binding)?;
+        held.handle.selection.check()?;
+        let mut kernel = win32::Kernel;
+        let status = kernel.original_key_info_status(held.handle())?;
+        held.handle.first_terminal_status.set(Some(status));
+        if status == 1018 {
+            return held.handle.close_sdk_deleted(
+                original,
+                &mut kernel,
+                || {
+                    fence.verify_original_terminal(&held.context, &held.binding)?;
+                    held.handle.selection.check()
+                },
+                retain,
+            );
+        }
+        if status != 0 {
+            return Err(Error::Pending);
+        }
+        if !kernel
+            .name(held.handle())?
+            .eq_ignore_ascii_case(&format!("{}\\{}", held.parent, held.child))
+            || kernel.value(held.handle())? != NativeValue::Absent
+        {
+            return Err(Error::Conflict);
+        }
+        held.handle
+            .kind
+            .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
+        held.handle().close_terminal(
+            || {
+                fence.verify_original_terminal(&held.context, &held.binding)?;
+                held.handle.selection.check()
+            },
+            |ack| {
+                held.handle
+                    .record_closed_handle_ack(ack.clone(), |h, ack| h.close.verify_ack(ack))?;
+                retain(ack)
+            },
+            || {
+                fence.verify_original_terminal(&held.context, &held.binding)?;
+                held.handle.selection.check()
+            },
+        )
+    })();
+    result?;
+    held.handle.selection.check()?;
+    selection.complete = true;
+    Ok(())
+}
+#[cfg(windows)]
+pub(crate) fn verify_terminal_original_key_closed(
+    original: &NewKeyAck<Held<win32::Handle>>,
+    ack: &Rc<KeyHandleClosed>,
+) -> Result<()> {
+    original.retained_handle().handle().close.verify_ack(ack)
+}
 
 /// Audited SDK boundary, not a custom FFI or numeric/path ownership surrogate.
 #[cfg(windows)]
@@ -481,14 +1633,54 @@ pub(crate) mod win32 {
             System::Registry::*,
         },
     };
-    pub(crate) struct Handle(HKEY);
+    pub(crate) struct Handle {
+        raw: HKEY,
+        pub(super) close: KeyHandleClose,
+    }
+    impl Handle {
+        fn new(raw: HKEY) -> Self {
+            Self {
+                raw,
+                close: KeyHandleClose::new(),
+            }
+        }
+        fn raw(&self) -> Result<HKEY> {
+            if self.raw.is_null() || self.close.was_attempted() {
+                return Err(Error::Pending);
+            }
+            Ok(self.raw)
+        }
+        pub(super) fn close_terminal(
+            &self,
+            check: impl FnOnce() -> Result<()>,
+            retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            let raw = self.raw()?;
+            self.close
+                .run(check, || status(unsafe { RegCloseKey(raw) }), retain, post)
+        }
+    }
     impl Drop for Handle {
         fn drop(&mut self) {
-            if !self.0.is_null() {
+            if !self.raw.is_null() && !self.close.was_attempted() {
                 unsafe {
-                    RegCloseKey(self.0);
+                    RegCloseKey(self.raw);
                 }
             }
+        }
+    }
+    impl TerminalKeyHandle for Handle {
+        fn close_original(
+            &self,
+            check: impl FnOnce() -> Result<()>,
+            retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+            post: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            self.close_terminal(check, retain, post)
+        }
+        fn verify_closed(&self, ack: &Rc<KeyHandleClosed>) -> Result<()> {
+            self.close.verify_ack(ack)
         }
     }
     pub(crate) struct Kernel;
@@ -506,15 +1698,35 @@ pub(crate) mod win32 {
         }
     }
     fn owned(rc: u32, handle: HKEY) -> Result<Handle> {
-        let h = Handle(handle);
+        let h = Handle::new(handle);
         status(rc)?;
-        if h.0.is_null() {
+        if h.raw.is_null() {
             return Err(Error::Pending);
         }
         Ok(h)
     }
     impl RegistryKernel for Kernel {
         type Handle = Handle;
+        fn original_key_info_status(&mut self, h: &Handle) -> Result<u32> {
+            // Status is factual even on failure; only exact KEY_DELETED from
+            // this still-open original can enter the sealed observer protocol.
+            Ok(unsafe {
+                RegQueryInfoKeyW(
+                    h.raw()?,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            })
+        }
         fn interfaces(&mut self) -> Result<Handle> {
             let p = wide(PARENT)?;
             let mut h = ptr::null_mut();
@@ -538,7 +1750,7 @@ pub(crate) mod win32 {
             let mut n = 0u32;
             let rc = unsafe {
                 NtQueryKey(
-                    h.0,
+                    h.raw()?,
                     KeyNameInformation,
                     buffer.as_mut_ptr().cast(),
                     MAX_NAME as u32,
@@ -557,7 +1769,7 @@ pub(crate) mod win32 {
             let mut h = ptr::null_mut();
             let rc = unsafe {
                 RegOpenKeyExW(
-                    parent.0,
+                    parent.raw()?,
                     child.as_ptr(),
                     REG_OPTION_OPEN_LINK,
                     KEY_QUERY_VALUE,
@@ -565,7 +1777,7 @@ pub(crate) mod win32 {
                 )
             };
             if rc == ERROR_FILE_NOT_FOUND {
-                let _h = Handle(h);
+                let _h = Handle::new(h);
                 return Ok(None);
             }
             owned(rc, h).map(Some)
@@ -576,7 +1788,7 @@ pub(crate) mod win32 {
             let mut disposition = 0;
             let rc = unsafe {
                 RegCreateKeyExW(
-                    parent.0,
+                    parent.raw()?,
                     child.as_ptr(),
                     0,
                     ptr::null(),
@@ -596,7 +1808,7 @@ pub(crate) mod win32 {
             let mut kind = 0;
             let rc = unsafe {
                 RegQueryValueExW(
-                    h.0,
+                    h.raw()?,
                     name.as_ptr(),
                     ptr::null(),
                     &mut kind,
@@ -616,14 +1828,16 @@ pub(crate) mod win32 {
         fn zero(&mut self, h: &Handle) -> Result<()> {
             let name = wide(VALUE)?;
             let bytes = 0u32.to_le_bytes();
-            status(unsafe { RegSetValueExW(h.0, name.as_ptr(), 0, REG_DWORD, bytes.as_ptr(), 4) })
+            status(unsafe {
+                RegSetValueExW(h.raw()?, name.as_ptr(), 0, REG_DWORD, bytes.as_ptr(), 4)
+            })
         }
         fn delete_value(&mut self, h: &Handle) -> Result<()> {
             let name = wide(VALUE)?;
-            status(unsafe { RegDeleteValueW(h.0, name.as_ptr()) })
+            status(unsafe { RegDeleteValueW(h.raw()?, name.as_ptr()) })
         }
         fn flush(&mut self, h: &Handle) -> Result<()> {
-            status(unsafe { RegFlushKey(h.0) })
+            status(unsafe { RegFlushKey(h.raw()?) })
         }
     }
 }

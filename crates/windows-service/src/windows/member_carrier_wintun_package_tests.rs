@@ -407,6 +407,660 @@ struct Fake {
     calls: Vec<&'static str>,
     fail_nth: Option<(&'static str, usize)>,
     change_on_signature: bool,
+    panic_nth: Option<(&'static str, usize)>,
+    events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+}
+
+struct Originals {
+    devices: Vec<Device>,
+    version: Option<u32>,
+    observations: usize,
+    disappear_after: Option<usize>,
+    panic_after: Option<usize>,
+    events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+}
+// SAFETY: Test-only replacement for native creator/source/runtime lease reads.
+// No fake may be used to construct a product package or grant native effects.
+unsafe impl OriginalDevices for Originals {
+    fn observe(&mut self) -> Result<(Option<u32>, Vec<Device>)> {
+        self.observations += 1;
+        self.events.borrow_mut().push("original");
+        if self.panic_after == Some(self.observations) {
+            panic!("injected original ACK read unwind");
+        }
+        if self.disappear_after == Some(self.observations) {
+            return Err(Error::Changed);
+        }
+        Ok((self.version, self.devices.clone()))
+    }
+}
+fn live_original() -> Device {
+    Device {
+        instance: r"SWD\WINTUN\{01010101-0101-0101-0101-010101010101}".into(),
+        status: 8,
+        problem: 0,
+    }
+}
+fn owned_package() -> (Checked<Fake>, Originals) {
+    let mut checked = check(Fake::good()).unwrap();
+    checked.kernel.calls.clear();
+    checked.kernel.events.borrow_mut().clear();
+    checked.kernel.inventory.service_state = 4;
+    checked.kernel.inventory.devices = vec![live_original()];
+    let originals = Originals {
+        devices: vec![live_original()],
+        version: Some(14),
+        observations: 0,
+        disappear_after: None,
+        panic_after: None,
+        events: std::rc::Rc::clone(&checked.kernel.events),
+    };
+    (checked, originals)
+}
+
+fn assert_forward_denied(checked: &mut Checked<Fake>, originals: &mut Originals) {
+    let events = checked.kernel.events.borrow().clone();
+    assert_eq!(checked.reattest(), Err(Error::Changed));
+    assert_eq!(checked.reattest_owned(originals), Err(Error::Changed));
+    assert_eq!(*checked.kernel.events.borrow(), events);
+    assert!(!checked.valid);
+}
+
+#[test]
+fn cleanup_outer_preserves_prior_validity_without_hidden_inner_resurrection() {
+    for outer_valid in [false, true] {
+        for inner_valid in [false, true] {
+            let (mut checked, mut originals) = owned_package();
+            checked.valid = inner_valid;
+            let pins = checked.pins.clone();
+            let mut valid = outer_valid;
+            refresh_original(
+                &mut checked,
+                &mut valid,
+                ReattestMode::Cleanup,
+                |kernel| {
+                    kernel.events.borrow_mut().push("authenticated_source");
+                    Ok(())
+                },
+                |checked| checked.reattest_owned_cleanup(&mut originals),
+            )
+            .unwrap();
+            assert_eq!(valid, outer_valid);
+            assert_eq!(checked.valid, outer_valid && inner_valid);
+            assert_eq!(checked.pins, pins);
+            assert_eq!(
+                checked.kernel.events.borrow().as_slice(),
+                [
+                    "authenticated_source",
+                    "original",
+                    "source",
+                    "inventory",
+                    "read",
+                    "read",
+                    "read",
+                    "read",
+                    "read",
+                    "signatures",
+                    "read",
+                    "read",
+                    "read",
+                    "read",
+                    "read",
+                    "inventory",
+                    "source",
+                    "original",
+                    "authenticated_source",
+                ]
+            );
+            if !outer_valid {
+                assert_eq!(
+                    refresh_original(
+                        &mut checked,
+                        &mut valid,
+                        ReattestMode::Forward,
+                        |_| panic!("denied outer must not verify source"),
+                        |_| panic!("denied outer must not refresh package"),
+                    ),
+                    Err(Error::Changed)
+                );
+            }
+            if !(outer_valid && inner_valid) {
+                assert_forward_denied(&mut checked, &mut originals);
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_outer_source_or_package_failure_and_unwind_poison_both_gates() {
+    for mode in [ReattestMode::Forward, ReattestMode::Cleanup] {
+        for previously_valid in [false, true] {
+            if mode == ReattestMode::Forward && !previously_valid {
+                continue;
+            }
+            for failed in 0..3 {
+                for unwind in [false, true] {
+                    let (mut checked, mut originals) = owned_package();
+                    let pins = checked.pins.clone();
+                    let source = checked.source.clone();
+                    let inventory = checked.inventory.clone();
+                    let files = checked.files.clone();
+                    let mut valid = previously_valid;
+                    let mut source_reads = 0;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        refresh_original(
+                            &mut checked,
+                            &mut valid,
+                            mode,
+                            |_| {
+                                let step = if source_reads == 0 { 0 } else { 2 };
+                                source_reads += 1;
+                                if step == failed {
+                                    if unwind {
+                                        panic!("injected authenticated source unwind");
+                                    }
+                                    return Err(Error::Changed);
+                                }
+                                Ok(())
+                            },
+                            |checked| {
+                                if failed == 1 {
+                                    if unwind {
+                                        checked.kernel.panic_nth = Some(("signatures", 1));
+                                    } else {
+                                        checked.kernel.fail_nth = Some(("signatures", 1));
+                                    }
+                                }
+                                if mode == ReattestMode::Cleanup {
+                                    checked.reattest_owned_cleanup(&mut originals)
+                                } else {
+                                    checked.reattest_owned(&mut originals)
+                                }
+                            },
+                        )
+                    }));
+                    if unwind {
+                        assert!(outcome.is_err(), "boundary {failed}");
+                    } else {
+                        assert!(outcome.unwrap().is_err());
+                    }
+                    assert!(!valid);
+                    assert!(!checked.valid, "boundary {failed}");
+                    assert_eq!(checked.pins, pins);
+                    assert_eq!(checked.source, source);
+                    assert_eq!(checked.inventory, inventory);
+                    assert_eq!(checked.files, files);
+                    checked.kernel.panic_nth = None;
+                    checked.kernel.fail_nth = None;
+                    assert_forward_denied(&mut checked, &mut originals);
+                    refresh_original(
+                        &mut checked,
+                        &mut valid,
+                        ReattestMode::Cleanup,
+                        |_| Ok(()),
+                        |checked| checked.reattest_owned_cleanup(&mut originals),
+                    )
+                    .unwrap();
+                    assert!(!valid);
+                    assert_forward_denied(&mut checked, &mut originals);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_owned_clean_facts_preserve_poison_and_all_original_pins() {
+    for previously_valid in [false, true] {
+        let (mut checked, mut originals) = owned_package();
+        let source = checked.source.clone();
+        let inventory = checked.inventory.clone();
+        let files = checked.files.clone();
+        let pins = checked.pins.clone();
+        if !previously_valid {
+            assert_eq!(checked.reattest(), Err(Error::Changed));
+        }
+        checked.kernel.calls.clear();
+        checked.kernel.events.borrow_mut().clear();
+        for _ in 0..2 {
+            assert_eq!(checked.reattest_owned_cleanup(&mut originals), Ok(()));
+            assert_eq!(checked.valid, previously_valid);
+            assert_eq!(checked.source, source);
+            assert_eq!(checked.inventory, inventory);
+            assert_eq!(checked.files, files);
+            assert_eq!(checked.pins, pins);
+        }
+        assert_eq!(
+            checked.kernel.events.borrow().as_slice(),
+            [
+                "original",
+                "source",
+                "inventory",
+                "read",
+                "read",
+                "read",
+                "read",
+                "read",
+                "signatures",
+                "read",
+                "read",
+                "read",
+                "read",
+                "read",
+                "inventory",
+                "source",
+                "original",
+                "original",
+                "source",
+                "inventory",
+                "read",
+                "read",
+                "read",
+                "read",
+                "read",
+                "signatures",
+                "read",
+                "read",
+                "read",
+                "read",
+                "read",
+                "inventory",
+                "source",
+                "original",
+            ]
+        );
+        assert!(!checked.kernel.calls.contains(&"open"));
+        if previously_valid {
+            checked.reattest_owned(&mut originals).unwrap();
+            assert_eq!(checked.reattest(), Err(Error::Changed));
+        }
+        assert_forward_denied(&mut checked, &mut originals);
+    }
+}
+
+#[test]
+fn cleanup_owned_errors_and_unwinds_at_every_boundary_deny_and_retain_pins() {
+    // The independently counted full bracket has 2 original reads, 2 source
+    // reads, 2 inventory reads, 10 pinned file reads and 1 trust call.
+    for (op, count) in [
+        ("original", 2),
+        ("source", 2),
+        ("inventory", 2),
+        ("read", 10),
+        ("signatures", 1),
+    ] {
+        for index in 1..=count {
+            for previously_valid in [false, true] {
+                for unwind in [false, true] {
+                    let (mut checked, mut originals) = owned_package();
+                    checked.valid = previously_valid;
+                    let pins = checked.pins.clone();
+                    let source = checked.source.clone();
+                    let inventory = checked.inventory.clone();
+                    let files = checked.files.clone();
+                    if op == "original" {
+                        if unwind {
+                            originals.panic_after = Some(index);
+                        } else {
+                            originals.disappear_after = Some(index);
+                        }
+                    } else if unwind {
+                        checked.kernel.panic_nth = Some((op, index));
+                    } else {
+                        checked.kernel.fail_nth = Some((op, index));
+                    }
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        checked.reattest_owned_cleanup(&mut originals)
+                    }));
+                    if unwind {
+                        assert!(outcome.is_err(), "{op} {index}");
+                    } else {
+                        assert!(outcome.unwrap().is_err(), "{op} {index}");
+                    }
+                    assert!(!checked.valid);
+                    assert_eq!(checked.pins, pins);
+                    assert_eq!(checked.source, source);
+                    assert_eq!(checked.inventory, inventory);
+                    assert_eq!(checked.files, files);
+                    checked.kernel.fail_nth = None;
+                    checked.kernel.panic_nth = None;
+                    originals.disappear_after = None;
+                    originals.panic_after = None;
+                    assert_forward_denied(&mut checked, &mut originals);
+                    checked.reattest_owned_cleanup(&mut originals).unwrap();
+                    assert_forward_denied(&mut checked, &mut originals);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_owned_keeps_every_cold_inventory_source_and_foreign_guard() {
+    for case in 0..24 {
+        let (mut checked, mut originals) = owned_package();
+        checked.valid = false;
+        match case {
+            0 => checked.kernel.inventory.native_amd64_win10_plus = false,
+            1 => checked.kernel.inventory.candidates[0].date += 1,
+            2 => checked.kernel.inventory.candidates[0].version += 1,
+            3 => checked.kernel.inventory.candidates[0].provider = "foreign".into(),
+            4 => checked.kernel.inventory.candidates[0].published_inf = "foreign".into(),
+            5 => checked.kernel.inventory.candidates[0].store_inf = "foreign".into(),
+            6 => checked.kernel.inventory.candidates[0].store_cat = "foreign".into(),
+            7 => checked.kernel.inventory.candidates[0].store_sys = "foreign".into(),
+            8 => checked
+                .kernel
+                .inventory
+                .candidates
+                .push(checked.inventory.candidates[0].clone()),
+            9 => checked.kernel.inventory.service_type = 16,
+            10 => checked.kernel.inventory.service_start = 2,
+            11 => checked.kernel.inventory.service_state = 2,
+            12 => checked.kernel.inventory.pending_maintenance = true,
+            13 => {
+                checked.kernel.inventory.pending.queues[0] =
+                    Some(pending_bytes(&[r"\??\C:\other.tmp", ""]))
+            }
+            14 => {
+                checked.kernel.inventory.pending.queues[1] =
+                    Some(pending_bytes(&[r"\??\C:\other.tmp", ""]))
+            }
+            15 => checked
+                .kernel
+                .inventory
+                .pending
+                .files
+                .push(("foreign".into(), checked.source.stamp.clone())),
+            16 => checked.kernel.inventory.system_sys = "foreign".into(),
+            17 => checked.kernel.source.stamp.id += 1,
+            18 => checked.kernel.source.bytes[0] ^= 1,
+            19 => checked.kernel.inventory.devices.push(Device {
+                instance: r"SWD\WINTUN\{02020202-0202-0202-0202-020202020202}".into(),
+                ..live_original()
+            }),
+            20 => originals.devices.push(live_original()),
+            21 => originals.devices[0].instance = r"ROOT\NET\0001".into(),
+            22 => originals.devices[0].problem = 1,
+            23 => originals.version = Some(15),
+            _ => unreachable!(),
+        }
+        assert!(
+            checked.reattest_owned_cleanup(&mut originals).is_err(),
+            "case {case}"
+        );
+        assert_forward_denied(&mut checked, &mut originals);
+    }
+}
+
+#[test]
+fn cleanup_owned_rejects_each_pinned_file_drift_and_changes_during_trust() {
+    for name in ["published", "inf", "cat", "sys", "system"] {
+        for stamp_only in [false, true] {
+            let (mut checked, mut originals) = owned_package();
+            checked.valid = false;
+            let original = checked.kernel.files[name].clone();
+            if stamp_only {
+                checked.kernel.files.get_mut(name).unwrap().stamp.id += 1;
+            } else {
+                checked.kernel.files.get_mut(name).unwrap().bytes[0] ^= 1;
+            }
+            assert_eq!(
+                checked.reattest_owned_cleanup(&mut originals),
+                Err(Error::Changed)
+            );
+            checked.kernel.files.insert(name.into(), original);
+            checked.reattest_owned_cleanup(&mut originals).unwrap();
+            assert_forward_denied(&mut checked, &mut originals);
+        }
+    }
+    let (mut checked, mut originals) = owned_package();
+    checked.valid = false;
+    checked.kernel.change_on_signature = true;
+    assert_eq!(
+        checked.reattest_owned_cleanup(&mut originals),
+        Err(Error::Changed)
+    );
+    assert_forward_denied(&mut checked, &mut originals);
+}
+
+#[test]
+fn actual_original_owned_arrival_keeps_original_file_pins_not_cold_adoption() {
+    let (mut checked, mut originals) = owned_package();
+    assert_eq!(checked.reattest_owned(&mut originals), Ok(()));
+    assert!(checked.valid);
+    assert_eq!(originals.observations, 2);
+    assert_eq!(
+        checked
+            .kernel
+            .calls
+            .iter()
+            .filter(|c| **c == "read")
+            .count(),
+        10
+    );
+    assert_eq!(
+        checked
+            .kernel
+            .calls
+            .iter()
+            .filter(|c| **c == "signatures")
+            .count(),
+        1
+    );
+    assert!(!checked.kernel.calls.contains(&"open"));
+    // The exact same device still cannot pass the ordinary cold gate.
+    assert_eq!(checked.reattest(), Err(Error::Changed));
+}
+#[test]
+fn original_owned_post_create_still_accepts_only_same_pinned_package() {
+    let (mut checked, mut originals) = owned_package();
+    assert_eq!(checked.reattest_owned(&mut originals), Ok(()));
+    checked.kernel.files.get_mut("system").unwrap().bytes[1] ^= 1;
+    assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+    checked.kernel.files.get_mut("system").unwrap().bytes[1] ^= 1;
+    let count = originals.observations;
+    assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+    assert_eq!(originals.observations, count);
+}
+#[test]
+fn original_owned_refresh_rechecks_creator_after_slow_trust_calls() {
+    let (mut checked, mut originals) = owned_package();
+    originals.disappear_after = Some(2);
+    assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+    assert_eq!(originals.observations, 2);
+    assert!(checked.kernel.calls.contains(&"signatures"));
+    assert!(!checked.valid);
+    originals.disappear_after = None;
+    assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+    assert_eq!(originals.observations, 2);
+}
+
+#[test]
+fn original_owned_foreign_legacy_duplicate_problem_and_unbound_driver_deny() {
+    for case in 0..14 {
+        let (mut checked, mut originals) = owned_package();
+        match case {
+            0 => checked.kernel.inventory.devices.clear(),
+            1 => checked.kernel.inventory.devices.push(Device {
+                instance: r"SWD\WINTUN\{02020202-0202-0202-0202-020202020202}".into(),
+                ..live_original()
+            }),
+            2 => originals.devices.clear(),
+            3 => originals.devices.push(live_original()),
+            4 => originals.devices[0].instance = r"ROOT\NET\0001".into(),
+            5 => {
+                originals.devices[0].instance =
+                    r"SWD\WINTUN\{00000000-0000-0000-0000-000000000000}".into()
+            }
+            6 => originals.devices[0].instance.push('\0'),
+            7 => originals.devices[0].instance = "界".repeat(20),
+            8 => originals.devices[0].status = 0,
+            9 => originals.devices[0].problem = 1,
+            10 => originals.version = None,
+            11 => originals.version = Some(15),
+            12 => checked.kernel.inventory.service_state = 2,
+            13 => originals.devices = vec![live_original(); 4],
+            _ => unreachable!(),
+        }
+        assert!(
+            checked.reattest_owned(&mut originals).is_err(),
+            "case {case}"
+        );
+        assert!(!checked.valid);
+        let calls = checked.kernel.calls.clone();
+        assert!(checked.reattest_owned(&mut originals).is_err());
+        assert_eq!(checked.kernel.calls, calls);
+    }
+}
+
+#[test]
+fn original_owned_package_platform_scm_queue_and_source_changes_deny() {
+    for case in 0..9 {
+        let (mut checked, mut originals) = owned_package();
+        match case {
+            0 => checked.kernel.inventory.native_amd64_win10_plus = false,
+            1 => checked.kernel.inventory.candidates[0].version += 1,
+            2 => checked.kernel.inventory.candidates[0].store_inf = "foreign".into(),
+            3 => checked.kernel.inventory.service_type = 16,
+            4 => checked.kernel.inventory.service_start = 2,
+            5 => checked.kernel.inventory.pending_maintenance = true,
+            6 => {
+                checked.kernel.inventory.pending.queues[0] =
+                    Some(pending_bytes(&[r"\??\C:\other.tmp", ""]))
+            }
+            7 => checked.kernel.inventory.system_sys = "replacement".into(),
+            8 => checked.kernel.source.stamp.id += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            checked.reattest_owned(&mut originals).is_err(),
+            "case {case}"
+        );
+        assert!(!checked.valid);
+    }
+}
+
+#[test]
+fn original_owned_each_actual_boundary_error_revokes_instead_of_caching() {
+    let (mut good, mut originals) = owned_package();
+    good.reattest_owned(&mut originals).unwrap();
+    for op in ["source", "inventory", "read", "signatures"] {
+        let count = good.kernel.calls.iter().filter(|call| **call == op).count();
+        for index in 1..=count {
+            let (mut checked, mut originals) = owned_package();
+            checked.kernel.fail_nth = Some((op, index));
+            assert!(
+                checked.reattest_owned(&mut originals).is_err(),
+                "{op} {index}"
+            );
+            assert!(!checked.valid);
+            checked.kernel.fail_nth = None;
+            assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+        }
+    }
+}
+
+#[test]
+fn original_owned_no_devices_can_finish_only_with_exact_driver_state() {
+    let mut checked = check(Fake::good()).unwrap();
+    let mut originals = Originals {
+        devices: vec![],
+        version: None,
+        observations: 0,
+        disappear_after: None,
+        panic_after: None,
+        events: std::rc::Rc::clone(&checked.kernel.events),
+    };
+    checked.reattest_owned(&mut originals).unwrap();
+    checked.reattest().unwrap();
+    checked.kernel.inventory.service_state = 4;
+    originals.version = Some(14);
+    checked.reattest_owned(&mut originals).unwrap();
+    // Running matching driver after close is NOT cold pre-load or no-load proof.
+    assert_eq!(checked.reattest(), Err(Error::Changed));
+}
+
+#[test]
+fn original_owned_unwind_at_every_package_read_permanently_revokes() {
+    let (mut good, mut originals) = owned_package();
+    good.reattest_owned(&mut originals).unwrap();
+    for op in ["source", "inventory", "read", "signatures"] {
+        let count = good.kernel.calls.iter().filter(|call| **call == op).count();
+        for index in 1..=count {
+            let (mut checked, mut originals) = owned_package();
+            checked.kernel.panic_nth = Some((op, index));
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    checked.reattest_owned(&mut originals)
+                }))
+                .is_err(),
+                "{op} {index}"
+            );
+            assert!(!checked.valid);
+            checked.kernel.panic_nth = None;
+            let calls = checked.kernel.calls.clone();
+            let observations = originals.observations;
+            assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+            assert_eq!(checked.kernel.calls, calls);
+            assert_eq!(originals.observations, observations);
+        }
+    }
+}
+
+#[test]
+fn original_owned_refresh_orders_originals_around_the_full_pinned_baseline() {
+    let (mut checked, mut originals) = owned_package();
+    checked.reattest_owned(&mut originals).unwrap();
+    assert_eq!(
+        *checked.kernel.events.borrow(),
+        [
+            "original",
+            "source",
+            "inventory",
+            "read",
+            "read",
+            "read",
+            "read",
+            "read",
+            "signatures",
+            "read",
+            "read",
+            "read",
+            "read",
+            "read",
+            "inventory",
+            "source",
+            "original",
+        ]
+    );
+}
+
+#[test]
+fn original_owned_error_or_unwind_at_either_ack_read_denies_both_refresh_paths() {
+    for index in [1, 2] {
+        for unwind in [false, true] {
+            let (mut checked, mut originals) = owned_package();
+            if unwind {
+                originals.panic_after = Some(index);
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    checked.reattest_owned(&mut originals)
+                }))
+                .is_err());
+            } else {
+                originals.disappear_after = Some(index);
+                assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+            }
+            assert!(!checked.valid);
+            assert_eq!(checked.kernel.events.borrow().last(), Some(&"original"));
+            let events = checked.kernel.events.borrow().clone();
+            originals.panic_after = None;
+            originals.disappear_after = None;
+            assert_eq!(checked.reattest_owned(&mut originals), Err(Error::Changed));
+            assert_eq!(checked.reattest(), Err(Error::Changed));
+            assert_eq!(*checked.kernel.events.borrow(), events);
+        }
+    }
 }
 impl Fake {
     fn good() -> Self {
@@ -428,6 +1082,8 @@ impl Fake {
             calls: vec![],
             fail_nth: None,
             change_on_signature: false,
+            panic_nth: None,
+            events: std::rc::Rc::new(std::cell::RefCell::new(vec![])),
             inventory: Inventory {
                 native_amd64_win10_plus: true,
                 candidates: vec![Candidate {
@@ -451,6 +1107,12 @@ impl Fake {
     }
     fn call(&mut self, n: &'static str) -> Result<()> {
         self.calls.push(n);
+        self.events.borrow_mut().push(n);
+        if self.panic_nth.is_some_and(|(name, index)| {
+            name == n && self.calls.iter().filter(|call| **call == n).count() == index
+        }) {
+            panic!("injected {n} unwind");
+        }
         if self.fail == Some(n)
             || self.fail_nth.is_some_and(|(name, index)| {
                 name == n && self.calls.iter().filter(|call| **call == n).count() == index

@@ -10,7 +10,7 @@ fn main() {
 fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
     use nelomai_windows_service::windows::{
         configure_exclusion, install, run_amneziawg_service, run_engine_mode, run_manager_service,
-        run_wireguard_service, uninstall, InstallOptions,
+        run_wireguard_service, uninstall, uninstall_from_bundle, uninstall_staged, InstallOptions,
     };
     use nelomai_windows_service::ServiceError;
     use std::path::PathBuf;
@@ -103,6 +103,12 @@ fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
             configure_exclusion(&client_path)
         }
         Some("uninstall") if arguments.next().is_none() => uninstall(),
+        Some("uninstall-staged") if arguments.next().is_none() => uninstall_staged(),
+        Some("uninstall-from-bundle") => {
+            let (manifest, signature) = bundle_helper_arguments(&arguments.collect::<Vec<_>>())
+                .map_err(|_| ServiceError::InvalidRequest)?;
+            uninstall_from_bundle(&manifest, &signature)
+        }
         _ => Err(ServiceError::InvalidRequest),
     }
 }
@@ -111,4 +117,57 @@ fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
 fn main() {
     eprintln!("nelomai-windows-service is only available on Windows");
     std::process::exit(1);
+}
+
+#[cfg(any(windows, test))]
+fn bundle_helper_arguments(
+    arguments: &[std::ffi::OsString],
+) -> Result<(std::path::PathBuf, std::path::PathBuf), ()> {
+    if arguments.len() != 4
+        || arguments[0] != "--manifest"
+        || arguments[2] != "--signature"
+        || arguments[1].is_empty()
+        || arguments[3].is_empty()
+    {
+        return Err(());
+    }
+    Ok((arguments[1].clone().into(), arguments[3].clone().into()))
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::bundle_helper_arguments;
+    use std::{ffi::OsString, path::PathBuf};
+
+    #[test]
+    fn signed_bundle_argument_paths_are_data_only_and_strictly_unambiguous() {
+        let args: Vec<OsString> = [
+            "--manifest",
+            "C:\\own stage\\manifest.json",
+            "--signature",
+            "C:\\own stage\\signature.sig",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            bundle_helper_arguments(&args).unwrap(),
+            (
+                PathBuf::from("C:\\own stage\\manifest.json"),
+                PathBuf::from("C:\\own stage\\signature.sig")
+            )
+        );
+        for length in [0, 1, 2, 3] {
+            assert!(bundle_helper_arguments(&args[..length]).is_err());
+        }
+        let mut duplicate = args.clone();
+        duplicate.extend([OsString::from("--manifest"), OsString::from("foreign.json")]);
+        assert!(bundle_helper_arguments(&duplicate).is_err());
+        let mut wrong = args.clone();
+        wrong[2] = OsString::from("--manifest");
+        assert!(bundle_helper_arguments(&wrong).is_err());
+        wrong = args;
+        wrong[1] = OsString::new();
+        assert!(bundle_helper_arguments(&wrong).is_err());
+    }
 }

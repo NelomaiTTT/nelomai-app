@@ -222,6 +222,13 @@ def verify_windows_update_helper(extracted, staged):
     if (len(helpers) != 1 or helpers[0].is_symlink() or not helpers[0].is_file()
             or verifier.digest(helpers[0]) != verifier.digest(expected)):
         raise ValueError("packaged Windows update helper differs from signed dispatcher")
+    for embedded, source in [("nelomai-update-manifest-v1.json", "container-manifest-v1.json"),
+                             ("nelomai-update-manifest-v1.sig", "container-manifest-v1.sig")]:
+        matches = list(extracted.rglob(embedded))
+        if (len(matches) != 1 or matches[0].parent != helpers[0].parent
+                or matches[0].is_symlink() or not matches[0].is_file()
+                or matches[0].read_bytes() != (staged / "runtime" / source).read_bytes()):
+            raise ValueError("packaged Windows update metadata differs from signed inputs")
 
 
 def restore_linux_signed_payload(extracted, staged, public_key, architecture):
@@ -295,6 +302,12 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         if helper.is_symlink() or not helper.is_file():
             raise ValueError("staged Windows update helper is missing or linked")
         environment["NELOMAI_WINDOWS_UPDATE_HELPER"] = str(helper.resolve())
+        for variable, name in [("NELOMAI_WINDOWS_UPDATE_MANIFEST", "container-manifest-v1.json"),
+                               ("NELOMAI_WINDOWS_UPDATE_SIGNATURE", "container-manifest-v1.sig")]:
+            metadata = staged / "runtime" / name
+            if metadata.is_symlink() or not metadata.is_file():
+                raise ValueError("staged Windows update metadata is missing or linked")
+            environment[variable] = str(metadata.resolve())
     if platform == "linux":
         # Keep the exact output plugin used by Tauri in a known private cache.
         environment["XDG_CACHE_HOME"] = str(output / "tools-cache")

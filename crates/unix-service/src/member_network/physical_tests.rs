@@ -68,6 +68,9 @@ impl NativePair for Native {
     }
 }
 impl PairControl for Native {
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.pair.complete_start(scope)
+    }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
         self.pair.physical_network_fingerprint()
     }
@@ -87,6 +90,9 @@ impl PairControl for Native {
     }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.pair.rebind_pair(scope)
+    }
+    fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.pair.complete_rebind(scope)
     }
     fn cleanup_pending(&self) -> bool {
         self.pair.cleanup_pending()

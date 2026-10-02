@@ -4,13 +4,18 @@
 #![allow(dead_code)]
 
 use super::member_carrier_keys::{effect_matches_storage, Effect, NativeAuthority};
-use super::member_session::{NativeSessionFiles, RecordKind, SessionFiles};
+use super::member_session::{
+    epoch::NativeExecutionRoot, NativeSessionFiles, RecordKind, SessionFiles,
+};
 use crate::member_carrier::{CarrierError as Error, Result};
 use crate::member_carrier_native_ownership::{Binding, Context, Record};
+use crate::member_serialized_lease::{ReadPin, SerializedLease};
 use nelomai_contracts::dispatcher::{EngineIdentity, Installation, MutationGuard};
 use std::{
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    rc::Rc,
+    sync::{Arc, Mutex},
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
@@ -27,30 +32,63 @@ static KEY_MUTATIONS: Mutex<()> = Mutex::new(());
 
 /// Borrow of an actual held file lock, not a lock bit, path or serialized token.
 /// Its constructor is private; only the independently authenticated owner below
-/// returns it. Keeping an Arc alive retains the same private locked File.
+/// returns it. BOTH original file lock and actual process-wide MutexGuard stay
+/// retained until the canonical lock AND all read-only pins have gone away.
 pub(crate) struct KeyLock {
-    owner: Arc<MutationGuard>,
-    // No Clone or Send: one actual process-wide borrow, held across all key
-    // inspections/effects and the before_adapter_create receipt borrow.
-    _serialized: MutexGuard<'static, ()>,
+    lease: SerializedLease<'static, Arc<MutationGuard>>,
 }
+/// No mutable lock/effect API. Created ONLY from a real authenticated KeyLock.
+pub(crate) struct KeyLockPin(ReadPin<'static, Arc<MutationGuard>>);
 impl KeyLock {
+    pub(super) fn pin(&self) -> KeyLockPin {
+        KeyLockPin(self.lease.pin())
+    }
+    pub(super) fn matches_pin(&self, pin: &KeyLockPin) -> bool {
+        self.lease.matches(&pin.0)
+    }
     pub(super) fn verify_source(
         &self,
         source: &super::member_carrier_payload::native::WintunSource,
     ) -> Result<()> {
-        source.verify_owner(&self.owner)
+        source.verify_owner(self.lease.owner())
     }
 }
-pub(crate) struct KeyAuthority<I> {
+impl KeyLockPin {
+    pub(super) fn read_pin(&self) -> Self {
+        Self(self.0.read_pin())
+    }
+    pub(super) fn verify_source(
+        &self,
+        source: &super::member_carrier_payload::native::WintunSource,
+    ) -> Result<()> {
+        source.verify_owner(self.0.owner())
+    }
+}
+struct Runtime {
     context: Context,
     identity: EngineIdentity,
     directory: PathBuf,
     executable: PathBuf,
     installation: Installation,
     owner: Arc<MutationGuard>,
+    lease: KeyLockPin,
     pin: Box<dyn Fn() -> Result<()>>,
+    files: RefCell<NativeSessionFiles>,
+    original_files: NativeSessionFiles,
+    execution: RefCell<Option<Rc<NativeExecutionRoot>>>,
+    forward_closed: Cell<bool>,
+}
+/// Fresh, independently authenticated READ-only runtime/context checks. Holds
+/// the SAME original serialized guard; cannot authorize native effects or read
+/// creator inventory recursively. No constructor from paths/context/JSON.
+pub(crate) struct RuntimeRead {
+    runtime: Rc<Runtime>,
+    lease: KeyLockPin,
+}
+pub(crate) struct KeyAuthority<I> {
+    runtime: Rc<Runtime>,
     files: NativeSessionFiles,
+    original_files: NativeSessionFiles,
     originals: I,
 }
 
@@ -65,6 +103,75 @@ impl<I: OriginalCreatorInventory> KeyAuthority<I> {
         context: Context,
         originals: I,
     ) -> Result<(Self, KeyLock)> {
+        let (runtime, mut lock) = RuntimeRead::new(root, owner, files, context)?;
+        let authority = Self::from_read(&runtime, originals, &mut lock)?;
+        Ok((authority, lock))
+    }
+    /// Compose actual creator inventory only AFTER independent runtime pins
+    /// exist; no temporary always-empty inventory or recursive self-reference.
+    pub(super) fn from_read(read: &RuntimeRead, originals: I, lock: &mut KeyLock) -> Result<Self> {
+        if !read.matches_lock(lock) {
+            return Err(Error::Conflict);
+        }
+        read.verify(&read.runtime.context)?;
+        let files = read
+            .runtime
+            .files
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .clone();
+        let mut authority = Self {
+            runtime: read.runtime.clone(),
+            original_files: files.clone(),
+            files,
+            originals,
+        };
+        authority.verify(lock, &read.runtime.context)?;
+        Ok(authority)
+    }
+    fn runtime(&self, lock: &KeyLock, context: &Context) -> Result<()> {
+        if !lock.matches_pin(&self.runtime.lease) {
+            return Err(Error::Conflict);
+        }
+        self.runtime.verify(&lock.pin(), context)
+    }
+    pub(super) fn read_pin(&self, lock: &KeyLock) -> Result<RuntimeRead> {
+        self.runtime(lock, &self.runtime.context)?;
+        let read = RuntimeRead {
+            runtime: self.runtime.clone(),
+            lease: lock.pin(),
+        };
+        read.verify(&self.runtime.context)?;
+        Ok(read)
+    }
+}
+impl RuntimeRead {
+    /// Factual SAME held service-owner identity, not a freshness, SDK absence
+    /// or effect grant. Recovery must still verify the original runtime/lease.
+    pub(super) fn matches_owner(&self, owner: &Arc<MutationGuard>) -> bool {
+        Arc::ptr_eq(&self.runtime.owner, owner)
+    }
+    /// Identity of the original authenticated runtime and serialized lease;
+    /// comparison only, not permission derived from equal context metadata.
+    pub(super) fn same_original_runtime(&self, other: &RuntimeRead) -> bool {
+        Rc::ptr_eq(&self.runtime, &other.runtime) && self.lease.0.matches(&other.lease.0)
+    }
+    pub(super) fn read_pin(&self) -> Result<Self> {
+        self.verify(&self.runtime.context)?;
+        Ok(Self {
+            runtime: self.runtime.clone(),
+            lease: self.lease.read_pin(),
+        })
+    }
+    pub(super) fn matches_pin(&self, pin: &KeyLockPin) -> bool {
+        self.lease.0.matches(&pin.0)
+    }
+    pub(super) fn new(
+        root: &Path,
+        owner: Arc<MutationGuard>,
+        files: NativeSessionFiles,
+        context: Context,
+    ) -> Result<(Self, KeyLock)> {
         let serialized = KEY_MUTATIONS.try_lock().map_err(|_| Error::Conflict)?;
         owner
             .verify_at(&root.join("engine-owner.lock"))
@@ -76,28 +183,36 @@ impl<I: OriginalCreatorInventory> KeyAuthority<I> {
         let layout = installation
             .load_engine(&executable)
             .map_err(|_| Error::Conflict)?;
-        let mut authority = Self {
+        let lock = KeyLock {
+            lease: SerializedLease::new(owner.clone(), serialized),
+        };
+        let runtime = Rc::new(Runtime {
             context,
             identity: layout.identity,
             directory: layout.directory,
             executable,
             installation,
             owner: owner.clone(),
+            lease: lock.pin(),
             pin: Box::new(move || pinned.verify().map_err(|_| Error::Conflict)),
-            files,
-            originals,
+            files: RefCell::new(files.clone()),
+            original_files: files,
+            execution: RefCell::new(None),
+            forward_closed: Cell::new(false),
+        });
+        let read = Self {
+            runtime,
+            lease: lock.pin(),
         };
-        let mut lock = KeyLock {
-            owner,
-            _serialized: serialized,
-        };
-        let context = authority.context.clone();
-        authority.verify(&mut lock, &context)?;
-        Ok((authority, lock))
+        read.verify(&read.runtime.context)?;
+        Ok((read, lock))
     }
-    fn runtime(&self, lock: &KeyLock, context: &Context) -> Result<()> {
+}
+impl Runtime {
+    fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         if *context != self.context
-            || !Arc::ptr_eq(&lock.owner, &self.owner)
+            || !pin.0.matches(&self.lease.0)
+            || !Arc::ptr_eq(pin.0.owner(), &self.owner)
             || context.provenance.runtime != self.identity
         {
             return Err(Error::Conflict);
@@ -132,6 +247,332 @@ impl<I: OriginalCreatorInventory> KeyAuthority<I> {
             .map_err(|_| Error::Conflict)
     }
 }
+impl RuntimeRead {
+    /// Deferred until the actual common Starting CAS. The factory's fresh
+    /// claim has no Session ACK yet and cannot mint an execution selection.
+    /// Retain this SAME original root before view/postflight can fail; it is
+    /// storage lineage only, never evidence of native readiness or SDK authority.
+    pub(super) fn bind_native_execution_birth(
+        &self,
+        context: &Context,
+    ) -> Result<Rc<NativeExecutionRoot>> {
+        if self.runtime.forward_closed.get() {
+            return Err(Error::Conflict);
+        }
+        self.verify(context)?;
+        if self
+            .runtime
+            .execution
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .is_some()
+        {
+            return Err(Error::Conflict);
+        }
+        let files = self
+            .runtime
+            .files
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .clone();
+        let origin = files
+            .session_ack_root(&context.intent.scope)
+            .map_err(|_| Error::Journal)?;
+        let ack = origin
+            .inspect(|facts| Ok(facts.ack.clone()))
+            .map_err(|_| Error::Conflict)?;
+        let execution = Rc::new(
+            origin
+                .bind_native_birth(context, &ack)
+                .map_err(|_| Error::Conflict)?,
+        );
+        *self
+            .runtime
+            .execution
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)? = Some(execution.clone());
+        let view = files
+            .native_birth_view(&execution)
+            .map_err(|_| Error::Conflict)?;
+        *self
+            .runtime
+            .files
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)? = view;
+        self.verify(context)?;
+        Ok(execution)
+    }
+    /// Factual original lineage access BEFORE explicit epoch renewal. Do not
+    /// require the old selected Session ACK to be current here: the common owner
+    /// has just persisted n+1. Full runtime/signature/boot/lease checks bracket
+    /// this getter; only actor's native proof may authorize subsequent effects.
+    pub(super) fn native_execution_root(
+        &self,
+        context: &Context,
+    ) -> Result<Rc<NativeExecutionRoot>> {
+        if self.runtime.forward_closed.get() {
+            return Err(Error::Conflict);
+        }
+        self.runtime.verify(&self.lease, context)?;
+        let root = self
+            .runtime
+            .execution
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .as_ref()
+            .ok_or(Error::Conflict)?
+            .clone();
+        self.runtime.verify(&self.lease, context)?;
+        Ok(root)
+    }
+    /// Resolve only THIS runtime's canonical native view and SAME claimed
+    /// storage origin. Readers created before Starting keep their original ACK,
+    /// but must not keep an unbound epoch view after explicit execution binding.
+    pub(super) fn native_files_for_original(
+        &self,
+        context: &Context,
+        original: &NativeSessionFiles,
+    ) -> Result<NativeSessionFiles> {
+        self.verify(context)?;
+        let canonical = self
+            .runtime
+            .files
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .clone();
+        if !canonical.same_original_backend(original) {
+            return Err(Error::Conflict);
+        }
+        let execution = self
+            .runtime
+            .execution
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?;
+        if let Some(root) = execution.as_ref() {
+            if !root.matches_origin(original) && !root.matches_native_view(original) {
+                return Err(Error::Conflict);
+            }
+        }
+        drop(execution);
+        self.verify(context)?;
+        Ok(canonical)
+    }
+    /// Explicit authenticated Stop entry: only SAME original private storage.
+    /// No Closing ACK is required to write the first Closing record; native
+    /// actions STILL require that actual returned ACK in independent gates.
+    /// Once entered, no failure or retry may re-enable forward selection.
+    pub(super) fn begin_native_cleanup_storage(
+        &self,
+        context: &Context,
+        original: &NativeSessionFiles,
+    ) -> Result<NativeSessionFiles> {
+        if *context != self.runtime.context
+            || !self.runtime.original_files.same_original_backend(original)
+        {
+            return Err(Error::Conflict);
+        }
+        self.runtime.forward_closed.set(true);
+        self.runtime.verify(&self.lease, context)?;
+        let execution = self
+            .runtime
+            .execution
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?;
+        let mut view = if let Some(root) = execution.as_ref() {
+            if !root.matches_origin(original) && !root.matches_native_view(original) {
+                return Err(Error::Conflict);
+            }
+            root.native_cleanup_view(&self.runtime.original_files)
+                .map_err(|_| Error::Conflict)?
+                .into_files()
+        } else {
+            let mut files = self.runtime.original_files.clone();
+            files
+                .recovery_view(context.intent.scope.runtime)
+                .map_err(|_| Error::Journal)?
+                .ok_or(Error::Conflict)?
+                .0
+        };
+        drop(execution);
+        let access = view
+            .native_carrier_access(&context.intent.scope)
+            .map_err(|_| Error::Journal)?;
+        access
+            .require_native_context(context)
+            .map_err(|_| Error::Conflict)?;
+        if access.is_fresh() {
+            return Err(Error::Conflict);
+        }
+        *self
+            .runtime
+            .files
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)? = view;
+        self.verify(context)?;
+        self.runtime
+            .files
+            .try_borrow()
+            .map(|files| files.clone())
+            .map_err(|_| Error::Conflict)
+    }
+    pub(super) fn native_birth_files(&self, context: &Context) -> Result<NativeSessionFiles> {
+        let execution = self.native_execution_root(context)?;
+        let lease = execution.current_lease().map_err(|_| Error::Conflict)?;
+        let facts = execution
+            .verify_current(&lease)
+            .map_err(|_| Error::Conflict)?;
+        if facts.context != *context {
+            return Err(Error::Conflict);
+        }
+        self.verify(context)?;
+        self.runtime
+            .files
+            .try_borrow()
+            .map(|files| files.clone())
+            .map_err(|_| Error::Conflict)
+    }
+    pub(super) fn verify(&self, context: &Context) -> Result<()> {
+        self.runtime.verify(&self.lease, context)?;
+        self.runtime
+            .files
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)?
+            .native_carrier_access(&context.intent.scope)
+            .map_err(|_| Error::Journal)?
+            .require_native_context(context)
+            .map_err(|_| Error::Conflict)?;
+        self.runtime.verify(&self.lease, context)
+    }
+    /// Bind storage to THIS retained authenticated runtime and shared backend,
+    /// not an independent reopen with equal directory/scope/JSON. Identity
+    /// comparison is bracketed by actual lease, private-root/runtime and current
+    /// protected-context reads. It supplies no native effect or freshness grant.
+    pub(super) fn verify_same_session_files(
+        &self,
+        context: &Context,
+        files: &NativeSessionFiles,
+    ) -> Result<()> {
+        self.verify(context)?;
+        if !self
+            .runtime
+            .files
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .same_original_backend(files)
+        {
+            return Err(Error::Conflict);
+        }
+        self.native_files_for_original(context, files)?
+            .native_carrier_access(&context.intent.scope)
+            .map_err(|_| Error::Journal)?
+            .require_native_context(context)
+            .map_err(|_| Error::Conflict)?;
+        self.verify(context)
+    }
+    pub(super) fn matches_lock(&self, lock: &KeyLock) -> bool {
+        lock.matches_pin(&self.lease)
+    }
+    pub(super) fn verify_source(
+        &self,
+        source: &super::member_carrier_payload::native::WintunSource,
+    ) -> Result<()> {
+        self.verify(&self.runtime.context)?;
+        self.lease.verify_source(source)?;
+        if source.identity() != &self.runtime.identity {
+            return Err(Error::Conflict);
+        }
+        self.verify(&self.runtime.context)
+    }
+    /// Actual signed member sources, not member service/NIC ownership or effect
+    /// permission. Compare the SAME held serialized owner, not equal JSON or a
+    /// separately acquired installation lock, before/after current claim reads.
+    pub(super) fn verify_member_source(
+        &self,
+        context: &Context,
+        source: &super::member_carrier_payload::native::MemberSource,
+    ) -> Result<()> {
+        self.verify(context)?;
+        source.verify_owner(self.lease.0.owner())?;
+        if source.identity() != &self.runtime.identity {
+            return Err(Error::Conflict);
+        }
+        self.verify(context)?;
+        source.verify_owner(self.lease.0.owner())?;
+        self.verify(context)
+    }
+    /// Current SAME runtime/source and the actual retained member intent, not
+    /// a service name or caller path. This is factual comparison, never Start.
+    pub(super) fn verify_member_intent(
+        &self,
+        context: &Context,
+        source: &super::member_carrier_payload::native::MemberSource,
+        intent: &crate::member_owner::Intent,
+    ) -> Result<()> {
+        self.verify_member_source(context, source)?;
+        if intent.engine != self.runtime.executable
+            || intent.scope != context.intent.scope
+            || intent.transport != source.transport()
+        {
+            return Err(Error::Conflict);
+        }
+        self.verify_member_source(context, source)
+    }
+    /// Query current protected claim, not a retained permission bit. This alone
+    /// is NOT effect authorization; exact durable generation/phase and actual
+    /// original-creator/native ordering remain separate mandatory gates.
+    pub(super) fn fresh(&self, context: &Context) -> Result<bool> {
+        crate::member_fresh_read::read(
+            || self.verify(context),
+            || {
+                if self.runtime.forward_closed.get() {
+                    return Ok(false);
+                }
+                let access = self
+                    .runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?;
+                access
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)?;
+                Ok(access.is_fresh())
+            },
+        )
+    }
+    pub(super) fn record(&self, context: &Context, kind: RecordKind) -> Result<Vec<u8>> {
+        self.optional_record(context, kind)?.ok_or(Error::Journal)
+    }
+    /// Factual authenticated absence only. No fresh permission is inferred from
+    /// an absent file; the same private claim/context and runtime fence remain
+    /// mandatory around the actual read. Native effect gates separately require
+    /// live original receipts and exact lifecycle/guard/resource ordering.
+    pub(super) fn optional_record(
+        &self,
+        context: &Context,
+        kind: RecordKind,
+    ) -> Result<Option<Vec<u8>>> {
+        crate::member_fresh_read::read(
+            || self.verify(context),
+            || {
+                let mut files = self
+                    .runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?;
+                files
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)?;
+                files
+                    .read(&context.intent.scope, kind)
+                    .map_err(|_| Error::Journal)
+            },
+        )
+    }
+}
 fn actual_executable() -> Result<PathBuf> {
     std::fs::canonicalize(std::env::current_exe().map_err(|_| Error::Native)?)
         .map_err(|_| Error::Native)
@@ -140,6 +581,11 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
     type Lock = KeyLock;
     fn verify(&mut self, lock: &mut KeyLock, context: &Context) -> Result<()> {
         self.runtime(lock, context)?;
+        let read = RuntimeRead {
+            runtime: self.runtime.clone(),
+            lease: lock.pin(),
+        };
+        self.files = read.native_files_for_original(context, &self.original_files)?;
         self.files
             .native_carrier_access(&context.intent.scope)
             .map_err(|_| Error::Journal)?
@@ -202,8 +648,9 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
             return Err(Error::Conflict);
         }
         self.originals.assert_absent(&pending.context, binding)?;
-        self.owner
-            .verify_at(&self.installation.root.join("engine-owner.lock"))
+        self.runtime
+            .owner
+            .verify_at(&self.runtime.installation.root.join("engine-owner.lock"))
             .map_err(|_| Error::Conflict)
     }
     fn nic_absence(

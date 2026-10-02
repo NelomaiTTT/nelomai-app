@@ -68,6 +68,61 @@ fn route(destination: &str, interface: u32) -> NetworkValue {
 }
 
 #[test]
+fn factual_journal_read_view_keeps_pending_and_stopping_without_io_or_authority() {
+    let a = route("9.9.9.9/32", 10);
+    let b = route("9.9.9.9/32", 20);
+    let journal: NetworkJournal = serde_json::from_value(serde_json::json!({
+        "owned":[{"original":null,"current":a}],"active":"A","stopping":true,
+        "pending":{"target":[{"original":null,"current":b}],"active":"B"}
+    }))
+    .unwrap();
+    let view = journal.read_view().unwrap();
+    assert_eq!(view.current().cloned().collect::<Vec<_>>(), vec![a]);
+    assert_eq!(
+        view.pending().unwrap().cloned().collect::<Vec<_>>(),
+        vec![b]
+    );
+    assert_eq!(view.recorded_active(), Some(Slot::A));
+    assert_eq!(view.pending_active(), Some(Slot::B));
+    assert!(view.stopping());
+    let empty = NetworkJournal::default();
+    assert!(empty.read_view().unwrap().current().next().is_none());
+    assert!(empty.read_view().unwrap().pending().is_none());
+}
+
+#[test]
+fn factual_journal_view_validates_both_complete_lists_before_exporting() {
+    for pending in [false, true] {
+        for fault in 0..4 {
+            let value = route("9.9.9.9/32", 10);
+            let mut entries = serde_json::json!([{"original":null,"current":value}]);
+            match fault {
+                0 => {
+                    let duplicate = entries[0].clone();
+                    entries.as_array_mut().unwrap().push(duplicate);
+                }
+                1 => entries[0]["current"]["Route"]["interface"] = serde_json::json!(0),
+                2 => entries[0]["original"] = serde_json::to_value(&value).unwrap(),
+                _ => {
+                    entries[0]["current"]["Route"]["destination"] = serde_json::json!("9.9.9.9/24")
+                }
+            }
+            let valid = serde_json::json!([{"original":null,"current":value}]);
+            let journal: NetworkJournal = serde_json::from_value(serde_json::json!({
+                "owned":if pending {valid.clone()} else {entries.clone()},
+                "active":"A","stopping":false,
+                "pending":{"target":if pending {entries} else {valid},"active":"B"}
+            }))
+            .unwrap();
+            assert!(
+                journal.read_view().is_err(),
+                "pending={pending}, fault={fault}"
+            );
+        }
+    }
+}
+
+#[test]
 fn excluded_routes_retains_exact_committed_and_pending_rows_without_io() {
     let mut a = route("203.0.113.7/32", 10);
     if let NetworkValue::Route(r) = &mut a {

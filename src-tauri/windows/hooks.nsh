@@ -13,6 +13,16 @@ Var NelomaiDefenderExclusionPath
 !else
   !define NelomaiUpdateHelper "$%NELOMAI_WINDOWS_UPDATE_HELPER%"
 !endif
+!if "$%NELOMAI_WINDOWS_UPDATE_MANIFEST%" == ""
+  !define NelomaiUpdateManifest "${__FILEDIR__}\..\platform-runtime\desktop-bundle\runtime\container-manifest-v1.json"
+!else
+  !define NelomaiUpdateManifest "$%NELOMAI_WINDOWS_UPDATE_MANIFEST%"
+!endif
+!if "$%NELOMAI_WINDOWS_UPDATE_SIGNATURE%" == ""
+  !define NelomaiUpdateSignature "${__FILEDIR__}\..\platform-runtime\desktop-bundle\runtime\container-manifest-v1.sig"
+!else
+  !define NelomaiUpdateSignature "$%NELOMAI_WINDOWS_UPDATE_SIGNATURE%"
+!endif
 
 ; One exact-path ownership implementation is shared with privileged runtime
 ; copying and repair. Embed it in both installer and uninstaller, never load
@@ -121,11 +131,14 @@ Var NelomaiDefenderExclusionPath
     ; Recover the old, authenticated owned lifetime with the NEW implementation.
     ; A broken installed helper must not prevent delivery of its own repair.
     ; The signed staging/packaging gates bind these embedded bytes to the new
-    ; dispatcher. Its existing uninstall command still fails closed on unknown
-    ; ownership or incomplete cleanup; no journal is manually discarded here.
+    ; dispatcher. The temporary bootstrap only stages signed DATA; native cleanup
+    ; runs in a fresh protected child, never with a relaxed temporary-path ACL.
+    ; Unknown ownership/incomplete cleanup still fail closed; journals retained.
     InitPluginsDir
     File "/oname=$PLUGINSDIR\nelomai-update-helper.exe" "${NelomaiUpdateHelper}"
-    ExecWait '"$PLUGINSDIR\nelomai-update-helper.exe" uninstall' $0
+    File "/oname=$PLUGINSDIR\nelomai-update-manifest-v1.json" "${NelomaiUpdateManifest}"
+    File "/oname=$PLUGINSDIR\nelomai-update-manifest-v1.sig" "${NelomaiUpdateSignature}"
+    ExecWait '"$PLUGINSDIR\nelomai-update-helper.exe" uninstall-from-bundle --manifest "$PLUGINSDIR\nelomai-update-manifest-v1.json" --signature "$PLUGINSDIR\nelomai-update-manifest-v1.sig"' $0
     ${If} $0 <> 0
       MessageBox MB_ICONSTOP "Не удалось остановить предыдущую службу подключения Nelomai." /SD IDOK
       Abort

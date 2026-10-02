@@ -3,6 +3,39 @@ use nelomai_contracts::RuntimeSlot;
 use std::{cell::RefCell, rc::Rc};
 
 #[test]
+fn factory_preclaim_decision_denies_dead_owner_channel_and_keeps_runtime_checks() {
+    // Break: EOF during recovery permits a new durable claim/native Start, or
+    // cancellation replaces rather than preserves original runtime constraints.
+    for (requested, owned, in_async, cancelled, allowed) in [
+        (RuntimeSlot::Stable, RuntimeSlot::Stable, false, false, true),
+        (RuntimeSlot::Stable, RuntimeSlot::Stable, false, true, false),
+        (RuntimeSlot::Stable, RuntimeSlot::Stable, true, false, false),
+        (
+            RuntimeSlot::Latest,
+            RuntimeSlot::Stable,
+            false,
+            false,
+            false,
+        ),
+        (
+            RuntimeSlot::Stable,
+            RuntimeSlot::Latest,
+            false,
+            false,
+            false,
+        ),
+        (RuntimeSlot::Latest, RuntimeSlot::Latest, false, false, true),
+        (RuntimeSlot::Latest, RuntimeSlot::Latest, true, true, false),
+    ] {
+        assert_eq!(
+            require_factory_start_context(requested, owned, in_async, cancelled).is_ok(),
+            allowed,
+            "{requested:?}/{owned:?}, async={in_async}, cancelled={cancelled}"
+        );
+    }
+}
+
+#[test]
 fn verified_dos_engine_accepts_only_its_canonical_prefix_variant() {
     use std::path::Path;
     let dos = Path::new(r"C:\Program Files\Nelomai\engine.exe");
@@ -285,6 +318,188 @@ fn terminal_completion_follows_durable_stop_and_failed_ack_is_not_success() {
             &other,
             |_| panic!("terminal cannot resume"),
             |_| panic!("terminal cannot resume")
+        )
+        .is_err());
+}
+
+#[test]
+fn initial_data_completion_orders_original_retirement_between_stop_ack_and_completion() {
+    use nelomai_client_tunnel::redundancy::session::SessionState;
+    let mut state = SessionState::new(scope(), Slot::B, 7, 9).unwrap();
+    state.begin_stop(&scope()).unwrap();
+    state.stopped(&scope()).unwrap();
+    let stopped = state.snapshot();
+    let events = RefCell::new(vec![]);
+    let mut gate = InitialDataCompletionState::default();
+    gate.save(
+        &scope(),
+        &stopped,
+        |s| {
+            assert_eq!(s, &stopped);
+            events.borrow_mut().push("persist_stop_ack");
+            Ok(())
+        },
+        || {
+            events.borrow_mut().push("retire_original_data_ack");
+            Ok(())
+        },
+        |s| {
+            assert_eq!(s, &scope());
+            events.borrow_mut().push("complete_index_ack");
+            Ok(())
+        },
+        || {
+            events.borrow_mut().push("release_original_aliases");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        *events.borrow(),
+        [
+            "persist_stop_ack",
+            "retire_original_data_ack",
+            "complete_index_ack",
+            "release_original_aliases"
+        ]
+    );
+    gate.save(
+        &scope(),
+        &stopped,
+        |_| panic!("duplicate"),
+        || panic!("duplicate"),
+        |_| panic!("duplicate"),
+        || panic!("duplicate"),
+    )
+    .unwrap();
+    let mut foreign = stopped.clone();
+    foreign.scope.connection_generation += 1;
+    assert!(gate
+        .save(
+            &scope(),
+            &foreign,
+            |_| panic!("foreign"),
+            || panic!("foreign"),
+            |_| panic!("foreign"),
+            || panic!("foreign")
+        )
+        .is_err());
+}
+
+#[test]
+fn initial_data_completion_lost_ack_and_unwind_never_rearm_retirement() {
+    use nelomai_client_tunnel::redundancy::session::SessionState;
+    let mut state = SessionState::new(scope(), Slot::A, 7, 9).unwrap();
+    state.begin_stop(&scope()).unwrap();
+    state.stopped(&scope()).unwrap();
+    let stopped = state.snapshot();
+    for failed_edge in 0..4 {
+        for unwind in [false, true] {
+            let mut gate = InitialDataCompletionState::default();
+            let events = RefCell::new(vec![]);
+            let call = |edge| -> io::Result<()> {
+                events.borrow_mut().push(edge);
+                if edge == failed_edge {
+                    if unwind {
+                        panic!("lost ACK");
+                    }
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gate.save(
+                    &scope(),
+                    &stopped,
+                    |_| call(0),
+                    || call(1),
+                    |_| call(2),
+                    || call(3),
+                )
+            }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(*events.borrow(), (0..=failed_edge).collect::<Vec<_>>());
+            assert!(gate
+                .save(
+                    &scope(),
+                    &stopped,
+                    |_| panic!("rearmed"),
+                    || panic!("rearmed"),
+                    |_| panic!("rearmed"),
+                    || panic!("rearmed")
+                )
+                .is_err());
+        }
+    }
+}
+
+#[test]
+fn initial_data_completion_live_record_never_retire_or_complete() {
+    use nelomai_client_tunnel::redundancy::session::SessionState;
+    let state = SessionState::new(scope(), Slot::A, 7, 9).unwrap();
+    let live = state.snapshot();
+    let mut gate = InitialDataCompletionState::default();
+    let persisted = std::cell::Cell::new(false);
+    gate.save(
+        &scope(),
+        &live,
+        |_| {
+            persisted.set(true);
+            Ok(())
+        },
+        || panic!("live retirement"),
+        |_| panic!("live completion"),
+        || panic!("live release"),
+    )
+    .unwrap();
+    assert!(persisted.get());
+}
+
+#[test]
+fn initial_data_completion_failed_terminal_edge_cannot_resume_live_persistence() {
+    use nelomai_client_tunnel::redundancy::session::SessionState;
+    let mut state = SessionState::new(scope(), Slot::A, 7, 9).unwrap();
+    let live = state.snapshot();
+    state.begin_stop(&scope()).unwrap();
+    state.stopped(&scope()).unwrap();
+    let stopped = state.snapshot();
+    let mut gate = InitialDataCompletionState::default();
+    let mut foreign = stopped.clone();
+    foreign.scope.connection_generation += 1;
+    assert!(gate
+        .save(
+            &scope(),
+            &foreign,
+            |_| panic!("foreign persist"),
+            || panic!("foreign retire"),
+            |_| panic!("foreign complete"),
+            || panic!("foreign release"),
+        )
+        .is_err());
+    // Rejection before the bound scope's entry does not claim an ACK or consume
+    // that legitimate entry. Actual terminal entry does consume it before IO.
+    assert!(gate
+        .save(
+            &scope(),
+            &stopped,
+            |_| Ok(()),
+            || Err(io::ErrorKind::Interrupted.into()),
+            |_| panic!("retirement unknown"),
+            || panic!("retirement unknown"),
+        )
+        .is_err());
+    assert!(gate
+        .save(
+            &scope(),
+            &live,
+            |_| panic!("live persistence after terminal entry"),
+            || panic!("live retire"),
+            |_| panic!("live complete"),
+            || panic!("live release"),
         )
         .is_err());
 }
@@ -1962,6 +2177,16 @@ mod retained_owner_seam {
     }
     struct NativeIo(NativeState);
     impl MemberIo for NativeIo {
+        fn revoke_original(&mut self) {}
+        fn inspect_original(
+            &mut self,
+            _: &owner::Intent,
+            _: &owner::NativeProof,
+        ) -> owner::Result<owner::Observation> {
+            // This pair OS double models ordinary lifecycle only, not retained
+            // NEW native handles. It cannot grant the original-read capability.
+            Err(owner::OwnerError::Retired)
+        }
         fn inspect(
             &mut self,
             intent: &owner::Intent,

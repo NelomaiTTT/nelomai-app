@@ -1154,6 +1154,76 @@ fn two_slot_process_fixture() -> (TempDir, SigningKey) {
 
 #[cfg(unix)]
 #[test]
+fn stable_selection_authenticates_latest_dispatcher_not_stable_engine_copy() {
+    let (source, key) = two_slot_process_fixture();
+    let latest = source
+        .path()
+        .join("engines/latest/0.2.17/nelomai-unix-service");
+    let stable = source
+        .path()
+        .join("engines/stable/0.2.16/nelomai-unix-service");
+    let stable_bytes = fs::read(&stable).unwrap();
+    let mut latest_bytes = fs::read(&latest).unwrap();
+    latest_bytes.extend_from_slice(b"\n# distinct signed latest dispatcher\n");
+    fs::write(&latest, &latest_bytes).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(source.path().join(MANIFEST_NAME)).unwrap()).unwrap();
+    let entry = &mut manifest["slots"][0]["manifest"]["files"][0];
+    entry["size_bytes"] = json!(latest_bytes.len());
+    entry["sha256"] = json!(digest(&latest_bytes));
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let mut message = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+    message.extend(&bytes);
+    fs::write(source.path().join(MANIFEST_NAME), bytes).unwrap();
+    fs::write(
+        source.path().join(SIGNATURE_NAME),
+        key.sign(&message).to_bytes(),
+    )
+    .unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let installation = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &RealInstallIo,
+        )
+        .unwrap();
+    let layout = installation
+        .load_slot(nelomai_contracts::RuntimeSlot::Stable)
+        .unwrap();
+    assert_eq!(fs::read(layout.engine_path()).unwrap(), stable_bytes);
+    assert_eq!(fs::read(layout.dispatcher_path()).unwrap(), latest_bytes);
+    assert_eq!(
+        layout.dispatcher_payload_identity(),
+        (latest_bytes.len() as u64, digest(&latest_bytes).as_str())
+    );
+    assert_ne!(digest(&stable_bytes), digest(&latest_bytes));
+    // A correctly signed engine from the other slot is still the wrong
+    // dispatcher image. Selecting Stable must not authorize this substitution.
+    fs::set_permissions(
+        layout.dispatcher_path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(layout.dispatcher_path(), &stable_bytes).unwrap();
+    assert!(installation
+        .load_slot(nelomai_contracts::RuntimeSlot::Stable)
+        .is_err());
+    assert!(installation
+        .load_slot(nelomai_contracts::RuntimeSlot::Latest)
+        .is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn signed_stable_engine_can_start_only_after_previous_owner_stops() {
     let (source, key) = two_slot_process_fixture();
     let target = tempfile::tempdir().unwrap();

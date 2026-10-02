@@ -16,6 +16,12 @@ struct World {
     save_error: bool,
     switch_error: bool,
     integrity_error: bool,
+    native_drops: usize,
+    store_drops: usize,
+    saves: Vec<SessionSnapshot>,
+    lost_save_ack: bool,
+    panic_save: bool,
+    close_error: bool,
 }
 fn ix(s: Slot) -> usize {
     if s == Slot::A {
@@ -57,6 +63,11 @@ impl ProbeDatagram for Socket {
     }
 }
 struct Pair(Rc<RefCell<World>>);
+impl Drop for Pair {
+    fn drop(&mut self) {
+        self.0.borrow_mut().native_drops += 1;
+    }
+}
 impl NativePair for Pair {
     type Socket = Socket;
     fn check_integrity(&mut self) -> io::Result<()> {
@@ -97,15 +108,29 @@ impl NativePair for Pair {
     }
     fn close(&mut self, _: &SessionScope) -> io::Result<()> {
         self.0.borrow_mut().closed += 1;
-        Ok(())
+        if self.0.borrow().close_error {
+            Err(io::Error::other("original close unacknowledged"))
+        } else {
+            Ok(())
+        }
     }
 }
 struct Store(Rc<RefCell<World>>);
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.0.borrow_mut().store_drops += 1;
+    }
+}
 impl SessionStore for Store {
-    fn save(&mut self, _: &SessionSnapshot) -> io::Result<()> {
+    fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
         if self.0.borrow().save_error {
             Err(io::Error::other("disk"))
         } else {
+            self.0.borrow_mut().saves.push(snapshot.clone());
+            assert!(!self.0.borrow().panic_save, "original save unwind");
+            if self.0.borrow().lost_save_ack {
+                return Err(io::Error::other("original write ACK lost"));
+            }
             Ok(())
         }
     }
@@ -117,6 +142,154 @@ fn scope() -> SessionScope {
         session_id: "11111111-1111-4111-8111-111111111111".into(),
         connection_generation: 7,
     }
+}
+
+#[test]
+fn retained_driver_starting_save_error_lost_ack_and_unwind_keep_same_cleanup_owner() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    for fault in 0..3 {
+        let world = Rc::new(RefCell::new(World::default()));
+        {
+            let mut w = world.borrow_mut();
+            w.save_error = fault == 0;
+            w.lost_save_ack = fault == 1;
+            w.panic_save = fault == 2;
+        }
+        let mut native = Some(Pair(world.clone()));
+        let mut store = Some(Store(world.clone()));
+        let mut retained = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            SessionDriver::prepare_retained_into(
+                &mut retained,
+                SessionState::new(scope(), Slot::A, 1, 1).unwrap(),
+                &mut native,
+                &mut store,
+                0,
+            )
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(native.is_none() && store.is_none());
+        let owner = retained.as_mut().expect("lost same retained owner");
+        assert_eq!(owner.state().snapshot().scope, scope());
+        assert_eq!(owner.state().snapshot().phase, SessionPhase::Starting);
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+        assert_eq!(world.borrow().closed, 0, "preparation cannot auto-close");
+        assert!(!owner.network_validated());
+        assert!(owner
+            .start_primary(
+                &scope(),
+                |_| panic!("native Start"),
+                |_| { panic!("Start completion") }
+            )
+            .is_err());
+        assert!(owner.network_changed(&scope(), 1, true).is_err());
+        assert!(owner.tick(0).is_err());
+        assert!(!owner.recovery_stop_eligible(0));
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            owner.native_mut();
+        }))
+        .is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            owner.native();
+        }))
+        .is_err());
+        {
+            let mut w = world.borrow_mut();
+            w.save_error = false;
+            w.lost_save_ack = false;
+            w.panic_save = false;
+            w.close_error = true;
+        }
+        assert!(owner.stop(&scope()).is_err());
+        assert_eq!(owner.state().snapshot().phase, SessionPhase::Stopping);
+        world.borrow_mut().close_error = false;
+        owner.stop(&scope()).unwrap();
+        assert_eq!(owner.state().snapshot().phase, SessionPhase::Stopped);
+        assert!(owner.network_changed(&scope(), 2, true).is_err());
+        assert!(owner.tick(2).is_err());
+        assert_eq!(world.borrow().closed, 2);
+        assert!(world
+            .borrow()
+            .saves
+            .iter()
+            .skip(1)
+            .all(|s| s.phase != SessionPhase::Starting));
+        drop(retained);
+        assert_eq!(world.borrow().native_drops, 1);
+        assert_eq!(world.borrow().store_drops, 1);
+    }
+}
+
+#[test]
+fn retained_driver_rejects_nonstarting_and_missing_inputs_before_any_io() {
+    for fault in 0..3 {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut native = (fault != 1).then(|| Pair(world.clone()));
+        let mut store = (fault != 2).then(|| Store(world.clone()));
+        let mut state = SessionState::new(scope(), Slot::A, 1, 1).unwrap();
+        if fault == 0 {
+            state.primary_started(&scope()).unwrap();
+        }
+        let mut destination = None;
+        assert!(SessionDriver::prepare_retained_into(
+            &mut destination,
+            state,
+            &mut native,
+            &mut store,
+            0
+        )
+        .is_err());
+        assert!(destination.is_none());
+        assert_eq!(native.is_some(), fault != 1);
+        assert_eq!(store.is_some(), fault != 2);
+        assert!(world.borrow().saves.is_empty());
+        assert_eq!(world.borrow().closed, 0);
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+    }
+}
+
+#[test]
+fn retained_driver_duplicate_preparation_cannot_select_new_scope_or_recover_forward() {
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    let mut retained = None;
+    SessionDriver::prepare_retained_into(
+        &mut retained,
+        SessionState::new(scope(), Slot::B, 1, 1).unwrap(),
+        &mut native,
+        &mut store,
+        0,
+    )
+    .unwrap();
+    assert_eq!(world.borrow().saves.len(), 1);
+    assert!(retained.as_ref().unwrap().network_validated());
+    let mut foreign_scope = scope();
+    foreign_scope.connection_generation += 1;
+    let foreign = Rc::new(RefCell::new(World::default()));
+    let mut other_native = Some(Pair(foreign.clone()));
+    let mut other_store = Some(Store(foreign.clone()));
+    assert!(SessionDriver::prepare_retained_into(
+        &mut retained,
+        SessionState::new(foreign_scope.clone(), Slot::A, 1, 1).unwrap(),
+        &mut other_native,
+        &mut other_store,
+        0
+    )
+    .is_err());
+    let original = retained.as_mut().unwrap();
+    assert_eq!(original.state().snapshot().scope, scope());
+    assert_eq!(original.state().snapshot().active, Slot::B);
+    assert!(original.stop(&foreign_scope).is_err());
+    assert_eq!(world.borrow().closed, 0);
+    assert!(other_native.is_some() && other_store.is_some());
+    assert!(foreign.borrow().saves.is_empty());
+    original.stop(&scope()).unwrap();
+    assert_eq!(world.borrow().closed, 1);
+    assert!(!original.network_validated());
+    assert!(original.tick(0).is_err());
 }
 fn setup() -> (SessionDriver<Pair, Store>, Rc<RefCell<World>>) {
     let w = Rc::new(RefCell::new(World::default()));
@@ -306,15 +479,21 @@ fn primary_native_start_is_owned_before_effect_and_failure_remains_stoppable() {
     assert!(!d.tick(0).unwrap().primary_ready);
     assert_eq!(w.borrow().tx, [0, 0]);
     assert!(d
-        .start_primary(&scope(), |_| Err(io::Error::other(
-            "native partial failure"
-        )))
+        .start_primary(
+            &scope(),
+            |_| Err(io::Error::other("native partial failure")),
+            |_| panic!("no completion after failed native Start")
+        )
         .is_err());
     assert_eq!(d.state().snapshot().phase, SessionPhase::Stopped);
     assert_eq!(d.state().warm_slot(), None);
     assert_eq!(w.borrow().closed, 1);
     assert!(d
-        .start_primary(&scope(), |_| panic!("late Start after Stop"))
+        .start_primary(
+            &scope(),
+            |_| panic!("late Start after Stop"),
+            |_| panic!("no late completion")
+        )
         .is_err());
 }
 
@@ -323,7 +502,7 @@ fn primary_start_success_is_not_yet_data_plane_ready() {
     let w = Rc::new(RefCell::new(World::default()));
     let s = SessionState::new(scope(), Slot::A, 1, 1).unwrap();
     let mut d = SessionDriver::new(s, Pair(w.clone()), Store(w.clone()), 0).unwrap();
-    d.start_primary(&scope(), |_| Ok(())).unwrap();
+    d.start_primary(&scope(), |_| Ok(()), |_| Ok(())).unwrap();
     assert!(!d.tick(0).unwrap().primary_ready);
     assert!(d.tick(100).unwrap().primary_ready);
 }
@@ -387,7 +566,11 @@ fn prepare_stop_fences_outstanding_install_tickets_without_native_close() {
     assert!(d.standby_installed(ticket.clone(), 2, 101).is_err());
     assert!(d.candidate_installed(ticket, 101).is_err());
     assert!(d
-        .start_primary(&scope(), |_| panic!("frozen Start must not execute"))
+        .start_primary(
+            &scope(),
+            |_| panic!("frozen Start must not execute"),
+            |_| panic!("no frozen completion")
+        )
         .is_err());
     assert_eq!(d.state().snapshot(), frozen);
     assert_eq!(w.borrow().closed, 0);

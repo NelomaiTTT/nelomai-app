@@ -14,6 +14,10 @@
 use crate::member_carrier::{CarrierError as Error, Intent, Provenance, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 const VERSION: u32 = 2;
 const MAX_RECORD_BYTES: usize = 65_536;
@@ -198,6 +202,9 @@ pub(crate) struct RetainedKeys<K> {
 pub(crate) enum KeyPresence {
     Absent,
     ExactRetainedNewKey,
+    /// Factual original open handle returned KEY_DELETED, bracketed by SAME
+    /// retained parent's relative absence. Not a close/root/effect receipt.
+    OriginalSdkDeleted,
     Foreign,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -274,6 +281,388 @@ pub(crate) trait NativeKeyIo {
         mutation: ValueCas,
     ) -> Result<()>;
 }
+
+/// Attachment-only native seam. Independently verify that THIS original
+/// journal's private files/runtime pins and key IO share the SAME actual held
+/// serialized lock. Equal Context/Record/path data are never identity proof.
+/// No SDK/registry/native effect is allowed here. No successful default exists.
+pub(crate) trait NativeKeyAttachment<J: NativeJournal>: NativeKeyIo {
+    fn assert_original_journal_lock(
+        &mut self,
+        journal: &J,
+        lock: &mut Self::MutationLock,
+        context: &Context,
+    ) -> Result<()>;
+}
+
+struct InitialHealth {
+    healthy: Cell<bool>,
+    busy: Cell<bool>,
+    attempted: Cell<bool>,
+    initial_stage: Cell<bool>,
+    initial_cleanup: Cell<bool>,
+    initial_retirement: Cell<bool>,
+}
+// Outside the journal RefCell: a nested callback must permanently fence the
+// outer operation even while the original journal is mutably borrowed.
+struct InitialOperation<'a> {
+    health: &'a InitialHealth,
+    completed: bool,
+}
+impl InitialHealth {
+    fn enter(&self) -> Result<InitialOperation<'_>> {
+        if !self.healthy.get() {
+            return Err(Error::Retired);
+        }
+        if self.busy.replace(true) {
+            self.healthy.set(false);
+            return Err(Error::Conflict);
+        }
+        Ok(InitialOperation {
+            health: self,
+            completed: false,
+        })
+    }
+}
+impl InitialOperation<'_> {
+    fn finish(mut self) -> Result<()> {
+        if !self.health.healthy.get() {
+            return Err(Error::Retired);
+        }
+        self.completed = true;
+        Ok(())
+    }
+}
+impl Drop for InitialOperation<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.health.healthy.set(false);
+        }
+        self.health.busy.set(false);
+    }
+}
+struct InitialJournal<J> {
+    journal: J,
+    context: Context,
+    initial: Option<Record>,
+}
+impl<J: NativeJournal> InitialJournal<J> {
+    fn verify(&mut self, context: &Context) -> Result<Record> {
+        if context != &self.context {
+            return Err(Error::Conflict);
+        }
+        let initial = self.initial.as_ref().ok_or(Error::Pending)?;
+        // A retained publication receipt is necessary. Never adopt matching
+        // JSON after an Err/lost ACK or manufacture a receipt from saved data.
+        if self.journal.load(context)?.as_ref() != Some(initial) {
+            return Err(Error::Conflict);
+        }
+        Ok(initial.clone())
+    }
+}
+/// Opaque journal handoff; only PendingNativeOwnership can construct it. The
+/// actual original J remains here after attachment and while any InitialRead
+/// exists. No independent copy/import/reopen or journal extraction API.
+pub(crate) struct InitializedJournal<J> {
+    shared: Rc<RefCell<InitialJournal<J>>>,
+    health: Rc<InitialHealth>,
+}
+impl<J: NativeJournal> NativeJournal for InitializedJournal<J> {
+    fn load(&mut self, context: &Context) -> Result<Option<Record>> {
+        if self.health.initial_retirement.get() {
+            return Err(Error::Retired);
+        }
+        let operation = self.health.enter()?;
+        let mut original = self.shared.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        if context != &original.context {
+            return Err(Error::Conflict);
+        }
+        let result = original.journal.load(context)?;
+        operation.finish()?;
+        Ok(result)
+    }
+    fn compare_exchange(
+        &mut self,
+        context: &Context,
+        expected: Option<&Record>,
+        desired: &Record,
+    ) -> Result<()> {
+        if self.health.initial_cleanup.get() {
+            return Err(Error::Retired);
+        }
+        let operation = self.health.enter()?;
+        let mut original = self.shared.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        if context != &original.context {
+            return Err(Error::Conflict);
+        }
+        if original.initial.as_ref() != Some(desired) {
+            // Any attempt to advance/close retires bootstrap reads BEFORE the
+            // fallible CAS. A later initial callback cannot restart bootstrap
+            // or poison legitimate key preparation/restoration merely because
+            // the owner has intentionally left the initial stage.
+            self.health.initial_stage.set(false);
+        }
+        original
+            .journal
+            .compare_exchange(context, expected, desired)?;
+        operation.finish()
+    }
+}
+/// READ-only original initialization capability for bootstrap callbacks. Holds
+/// the SAME original journal/context and its runtime/serialized pins. No public
+/// constructor, deserialization, key IO, lock/effect API, or native authority.
+/// Record copies returned by verify are factual comparison data only.
+pub(crate) struct InitialRead<J> {
+    shared: Rc<RefCell<InitialJournal<J>>>,
+    health: Rc<InitialHealth>,
+}
+impl<J: NativeJournal> InitialRead<J> {
+    /// One SDK-free retirement callback on the SAME acknowledged initial J.
+    /// The concrete receiver must authenticate the completed original NoC
+    /// owning outcome and retain its actual index-CAS/readback ACK. This generic
+    /// callback's return supplies NO native/disposal/completion authority.
+    /// Re-read exact initial bytes before retirement; afterward the active
+    /// journal is intentionally unreadable. Permanently retire every journal
+    /// channel BEFORE the callback, retaining original J through uncertainty.
+    pub(crate) fn retire_original_initial_data<T>(
+        &self,
+        context: &Context,
+        retire: impl FnOnce(&mut J, &Record) -> Result<T>,
+    ) -> Result<T> {
+        if !self.health.initial_cleanup.get() {
+            return Err(Error::Retired);
+        }
+        if self.health.initial_retirement.replace(true) {
+            self.health.healthy.set(false);
+            return Err(Error::Retired);
+        }
+        let operation = self.health.enter()?;
+        let mut original = self.shared.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        let acknowledged = original.verify(context)?;
+        let result = retire(&mut original.journal, &acknowledged)?;
+        operation.finish()?;
+        Ok(result)
+    }
+    /// Permanently leave bootstrap for an SDK-free cleanup-view handoff of
+    /// the SAME J. The callback may select its authenticated original backend
+    /// view, but must not write records or invoke key/SDK effects. It runs only
+    /// with the retained successful initial publication ACK and exact context;
+    /// it must independently authenticate that view before returning. Fresh
+    /// original bytes are checked afterward. No callback result supplies native
+    /// authority. Err, unwind, drift and reentry permanently fence this channel.
+    /// An owner that already advanced beyond bootstrap cannot select this path.
+    pub(crate) fn inspect_original_initial_cleanup<T>(
+        &self,
+        context: &Context,
+        inspect: impl FnOnce(&mut J, &Record) -> Result<T>,
+    ) -> Result<T> {
+        if self.health.initial_retirement.get() {
+            return Err(Error::Retired);
+        }
+        // Select this SDK-free channel before any validation/callback. An
+        // initial stage already retired by real key/owner advancement cannot
+        // be relabelled no-C. Subsequent cleanup inspections never rearm it.
+        if !self.health.initial_cleanup.get() {
+            if !self.health.initial_stage.replace(false) {
+                return Err(Error::Retired);
+            }
+            self.health.initial_cleanup.set(true);
+        }
+        let operation = self.health.enter()?;
+        let mut original = self.shared.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        if context != &original.context {
+            return Err(Error::Conflict);
+        }
+        let acknowledged = original.initial.clone().ok_or(Error::Pending)?;
+        // The actual successful initial CAS ACK is retained here. The old
+        // forward view may be unusable after Closing; the SAME J must first
+        // select its independently authenticated cleanup view, without SDK or
+        // record effects. Current bytes are verified immediately afterward.
+        let result = inspect(&mut original.journal, &acknowledged)?;
+        if original.verify(context)? != acknowledged {
+            return Err(Error::Conflict);
+        }
+        operation.finish()?;
+        Ok(result)
+    }
+    /// Checked immutable access to ORIGINAL J for independent actual private
+    /// backend/runtime checks. The callback must be READ-only: no SDK, HKEY or
+    /// other native effects. Both sides re-read exact initial data. Callback
+    /// Err/unwind/reentry is sticky, even when a nested denial is swallowed.
+    pub(crate) fn inspect_initial<T>(
+        &self,
+        context: &Context,
+        inspect: impl FnOnce(&J, &Record) -> Result<T>,
+    ) -> Result<T> {
+        if !self.health.initial_stage.get() {
+            return Err(Error::Retired);
+        }
+        let operation = self.health.enter()?;
+        let mut original = self.shared.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        let record = original.verify(context)?;
+        let result = inspect(&original.journal, &record)?;
+        original.verify(context)?;
+        operation.finish()?;
+        Ok(result)
+    }
+    /// Re-read the original protected journal each time. Valid only while the
+    /// acknowledged generation1 ALL-Unstarted record is still exact. Denial,
+    /// busy reentry and unwind permanently fence shared health, including the
+    /// outer caller; repairing/equal JSON cannot rearm it.
+    pub(crate) fn verify(&self, context: &Context) -> Result<Record> {
+        self.inspect_initial(context, |_, record| Ok(record.clone()))
+    }
+}
+/// One caller-retained initial publication slot, created BEFORE DLL/keys
+/// authority. Keep it outside fallible supervisor returns. new is effect-free
+/// and infallible so it cannot drop a moved original J on validation failure.
+/// NativeJournal must independently authenticate the fresh claim, private
+/// handles/full context and serialized runtime; absence is never permission.
+pub(crate) struct PendingNativeOwnership<J> {
+    journal: InitializedJournal<J>,
+    attach_attempted: bool,
+}
+impl<J: NativeJournal> PendingNativeOwnership<J> {
+    pub(crate) fn new(context: Context, journal: J) -> Self {
+        Self {
+            journal: InitializedJournal {
+                shared: Rc::new(RefCell::new(InitialJournal {
+                    journal,
+                    context,
+                    initial: None,
+                })),
+                health: Rc::new(InitialHealth {
+                    healthy: Cell::new(true),
+                    busy: Cell::new(false),
+                    attempted: Cell::new(false),
+                    initial_stage: Cell::new(true),
+                    initial_cleanup: Cell::new(false),
+                    initial_retirement: Cell::new(false),
+                }),
+            },
+            attach_attempted: false,
+        }
+    }
+    /// Exactly one attempt, fenced BEFORE validation/load/CAS. Requires exact
+    /// None, a genuine successful original CAS ACK AND exact fresh readback.
+    /// Lost/false/unreadable/foreign ACK never yields a completed receipt.
+    /// This path has no NativeKeyIo/SDK/HKEY/native-effect dependency.
+    pub(crate) fn initialize(&mut self) -> Result<Record> {
+        if self.journal.health.attempted.replace(true) {
+            return Err(Error::Retired);
+        }
+        let operation = self.journal.health.enter()?;
+        let mut original = self
+            .journal
+            .shared
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)?;
+        validate_context(&original.context)?;
+        let context = original.context.clone();
+        if original.journal.load(&context)?.is_some() {
+            return Err(Error::Retired);
+        }
+        let record = initial(&original.context);
+        original
+            .journal
+            .compare_exchange(&record.context, None, &record)?;
+        if original.journal.load(&record.context)?.as_ref() != Some(&record) {
+            return Err(Error::Conflict);
+        }
+        operation.finish()?;
+        original.initial = Some(record.clone());
+        Ok(record)
+    }
+    pub(crate) fn verify_initial(&self) -> Result<Record> {
+        let context = self
+            .journal
+            .shared
+            .try_borrow()
+            .map_err(|_| {
+                self.journal.health.healthy.set(false);
+                Error::Conflict
+            })?
+            .context
+            .clone();
+        InitialRead {
+            shared: self.journal.shared.clone(),
+            health: self.journal.health.clone(),
+        }
+        .verify(&context)
+    }
+    /// Retain this opaque pin (or Rc<InitialRead<J>>) through bootstrap load,
+    /// compose and take callbacks. It continues using the same J after attach.
+    pub(crate) fn read_pin(&self) -> Result<InitialRead<J>> {
+        self.verify_initial()?;
+        Ok(InitialRead {
+            shared: self.journal.shared.clone(),
+            health: self.journal.health.clone(),
+        })
+    }
+    /// One-shot attachment. Every fallible/native-identity check runs with J
+    /// still in pending and I still in io. Err/unwind retain BOTH original pins
+    /// and permanently deny rearm. An occupied output is never overwritten.
+    /// After all checks succeed only infallible moves remain; read pins retain
+    /// the exact J shared with the resulting NativeOwnership.current receipt.
+    pub(crate) fn attach<I: NativeKeyAttachment<J>>(
+        pending: &mut Option<Self>,
+        io: &mut Option<I>,
+        owner: &mut Option<NativeOwnership<InitializedJournal<J>, I>>,
+        lock: &mut I::MutationLock,
+    ) -> Result<()> {
+        let slot = pending.as_mut().ok_or(Error::Retired)?;
+        if std::mem::replace(&mut slot.attach_attempted, true) {
+            return Err(Error::Retired);
+        }
+        if !slot.journal.health.initial_stage.get() {
+            return Err(Error::Retired);
+        }
+        let operation = slot.journal.health.enter()?;
+        if owner.is_some() {
+            return Err(Error::Conflict);
+        }
+        let keys = io.as_mut().ok_or(Error::Pending)?;
+        let record = {
+            let mut original = slot
+                .journal
+                .shared
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            let context = original.context.clone();
+            keys.assert_original_journal_lock(&original.journal, lock, &context)?;
+            keys.assert_serialized_lock(lock, &context)?;
+            let record = original.verify(&context)?;
+            keys.assert_original_journal_lock(&original.journal, lock, &context)?;
+            // Factual backend/lock callbacks are not a protected transaction:
+            // an external writer may have changed the journal during the last
+            // check. Re-read AFTER it before moving either original slot.
+            if original.verify(&context)? != record {
+                return Err(Error::Conflict);
+            }
+            record
+        };
+        let context = record.context.clone();
+        operation.finish()?;
+        // Presence was checked above; no fallible calls, callbacks or dropped
+        // owning resources between take and installation into the caller slot.
+        let slot = pending.take().expect("validated pending slot");
+        let io = io.take().expect("validated key IO slot");
+        *owner = Some(NativeOwnership {
+            context,
+            journal: slot.journal,
+            io,
+            current: Some(record),
+            retained: RetainedKeys {
+                keys: [None, None, None],
+            },
+            cleanup_only: false,
+            attempted: [false; 3],
+            consumed: [false; 3],
+            member_retirements: std::array::from_fn(|_| None),
+        });
+        Ok(())
+    }
+}
 /// Borrowed prerequisite evidence only; not adapter/address readiness, DAD,
 /// full-row authority or permission to enable the disconnected factory.
 pub(crate) struct PrecreationReceipt<'a, K, L> {
@@ -293,9 +682,20 @@ pub(crate) struct NativeOwnership<J, I: NativeKeyIo> {
     cleanup_only: bool,
     attempted: [bool; 3],
     consumed: [bool; 3],
+    member_retirements: [Option<Rc<MemberKeyRetirement>>; 3],
 }
 
-fn validate_context(context: &Context) -> Result<()> {
+/// Process-only original value-restoration acknowledgement, not a new key or
+/// a native member close capability. The actual registry/native gates remain
+/// mandatory. No recovery/JSON/default constructor and no ownership cycle.
+pub(crate) struct MemberKeyRetirement {
+    context: Context,
+    role: Role,
+    generation: u64,
+    consumed: Cell<bool>,
+}
+
+pub(crate) fn validate_context(context: &Context) -> Result<()> {
     // Reuse the existing pure logical intent/provenance validation. This does
     // not reinterpret its v1 rows or confer native authority on its proof.
     crate::member_carrier::validate_record_shape(&crate::member_carrier::Record {
@@ -337,6 +737,33 @@ fn validate_context(context: &Context) -> Result<()> {
     }
     Ok(())
 }
+/// Exact durable preparation data only. NEVER a native-create capability:
+/// callers still require the actual retained NEW-key token, original source,
+/// SAME live serialized lock, fresh protected claim and independent absence.
+pub(crate) fn validate_carrier_create_stage(
+    record: &Record,
+    context: &Context,
+    binding: &Binding,
+    generation: u64,
+) -> Result<()> {
+    validate_record(record)?;
+    if generation == 0
+        || record.context != *context
+        || record.generation != generation
+        || record.phase != Phase::Preparing
+        || binding.role != Role::RoleCarrier
+        || context.bindings[0] != *binding
+        || record.keys[0].phase != KeyPhase::Disabled
+        || !record.keys[0].new_key_ack
+        || record.keys[0].baseline != Value::Absent
+        || record.keys[0].current != Value::DwordZero
+        || record.keys[0].pending.is_some()
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_record(record: &Record) -> Result<()> {
     validate_context(&record.context)?;
     if record.version != VERSION || record.generation == 0 {
@@ -371,7 +798,8 @@ pub(crate) fn validate_record(record: &Record) -> Result<()> {
         };
         if !shape
             || record.phase == Phase::Preparing
-                && matches!(key.phase, KeyPhase::RestorePending | KeyPhase::Clean)
+                && (key.phase == KeyPhase::Clean
+                    || key.phase == KeyPhase::RestorePending && key.role == Role::RoleCarrier)
             || record.phase == Phase::Stopped && key.phase != KeyPhase::Clean
         {
             return Err(Error::Invalid);
@@ -441,13 +869,22 @@ pub(crate) fn validate_transition(
         return Err(Error::Invalid);
     }
     let allowed = match old.phase {
-        Phase::Preparing if !cleanup => matches!(
-            (a.phase, b.phase),
-            (KeyPhase::Unstarted, KeyPhase::CreatePending)
-                | (KeyPhase::CreatePending, KeyPhase::Captured)
-                | (KeyPhase::Captured, KeyPhase::DisablePending)
-                | (KeyPhase::DisablePending, KeyPhase::Disabled)
-        ),
+        Phase::Preparing if !cleanup => {
+            matches!(
+                (a.phase, b.phase),
+                (KeyPhase::Unstarted, KeyPhase::CreatePending)
+                    | (KeyPhase::CreatePending, KeyPhase::Captured)
+                    | (KeyPhase::Captured, KeyPhase::DisablePending)
+                    | (KeyPhase::DisablePending, KeyPhase::Disabled)
+            ) || (a.role != Role::RoleCarrier
+                && a.new_key_ack
+                && b.new_key_ack
+                && matches!(
+                    (a.phase, b.phase),
+                    (KeyPhase::Disabled, KeyPhase::RestorePending)
+                        | (KeyPhase::RestorePending, KeyPhase::Captured)
+                ))
+        }
         Phase::Closing => {
             a.new_key_ack == b.new_key_ack
                 && matches!(
@@ -528,6 +965,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             cleanup_only: false,
             attempted: [false; 3],
             consumed: [false; 3],
+            member_retirements: std::array::from_fn(|_| None),
         })
     }
     pub(crate) fn recover(
@@ -566,6 +1004,82 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         }
         Ok(record)
     }
+    /// Borrow SAME retained NEW-key originals after actual value restoration
+    /// and independent native absence. The caller must supply its concrete
+    /// terminal Calling/G fence for explicit handle closure; this method cannot
+    /// mint a close receipt, reconstruct a handle, or authorize any SDK effect.
+    /// Postflight uses current original journal/lock, NOT a closed HKEY query.
+    pub(crate) fn with_terminal_original_keys<T>(
+        &mut self,
+        lock: &mut I::MutationLock,
+        inspect: impl FnOnce(&Record, [Option<&NewKeyAck<I::Key>>; 3], &mut I) -> Result<T>,
+    ) -> Result<T> {
+        self.cleanup_only = true;
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        let record = self.current.as_ref().ok_or(Error::Pending)?.clone();
+        self.require_current(&record)?;
+        if record.phase != Phase::Stopped {
+            return Err(Error::Conflict);
+        }
+        self.verify_clean(&record, lock)?;
+        for (index, original) in self.retained.keys.iter().enumerate() {
+            if record.keys[index].new_key_ack != original.is_some()
+                || original.as_ref().is_some_and(|key| {
+                    key.context != self.context || key.binding != self.context.bindings[index]
+                })
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let keys = self
+            .retained
+            .keys
+            .each_ref()
+            .map(|key| key.as_ref().map(|key| &key.ack));
+        let result = inspect(&record, keys, &mut self.io);
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        self.require_current(&record)?;
+        result
+    }
+    /// Factual SAME-original key ACK read for final G AFTER explicit closes.
+    /// No HKEY queries, native absence assertions or effect/Drop permission.
+    /// G must match every actual native close ACK and independently inspect the
+    /// whole terminal universe. Equal Clean JSON cannot create missing keys.
+    pub(crate) fn with_terminal_original_key_reads<T>(
+        &mut self,
+        lock: &mut I::MutationLock,
+        inspect: impl FnOnce(&Record, [Option<&NewKeyAck<I::Key>>; 3]) -> Result<T>,
+    ) -> Result<T> {
+        self.cleanup_only = true;
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        let record = self.current.as_ref().ok_or(Error::Pending)?.clone();
+        self.require_current(&record)?;
+        if record.phase != Phase::Stopped {
+            return Err(Error::Conflict);
+        }
+        for (index, original) in self.retained.keys.iter().enumerate() {
+            let key = &record.keys[index];
+            if key.phase != KeyPhase::Clean
+                || key.current != Value::Absent
+                || key.pending.is_some()
+                || key.new_key_ack != original.is_some()
+                || original.as_ref().is_some_and(|key| {
+                    key.context != self.context || key.binding != self.context.bindings[index]
+                })
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let keys = self
+            .retained
+            .keys
+            .each_ref()
+            .map(|key| key.as_ref().map(|key| &key.ack));
+        let result = inspect(&record, keys);
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        self.require_current(&record)?;
+        result
+    }
     pub(crate) fn prepare_role(
         &mut self,
         role: Role,
@@ -577,6 +1091,132 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         self.io.assert_serialized_lock(lock, &self.context)?;
         self.attempted[role.index()] = true;
         let result = self.prepare_inner(role, lock);
+        if result.is_err() {
+            self.cleanup_only = true;
+        }
+        result
+    }
+    pub(crate) fn restore_member_key(
+        &mut self,
+        expected: &Record,
+        role: Role,
+        retirement: &mut Option<Rc<MemberKeyRetirement>>,
+        lock: &mut I::MutationLock,
+    ) -> Result<Record> {
+        let result = (|| {
+            let i = role.index();
+            if self.cleanup_only
+                || role == Role::RoleCarrier
+                || retirement.as_ref().is_some_and(|returned| {
+                    !returned.consumed.get()
+                        || self.member_retirements[i]
+                            .as_ref()
+                            .is_none_or(|original| !Rc::ptr_eq(original, returned))
+                })
+            {
+                return Err(Error::Retired);
+            }
+            self.io.assert_serialized_lock(lock, &self.context)?;
+            self.require_current(expected)?;
+            if expected.phase != Phase::Preparing
+                || expected.keys[i].phase != KeyPhase::Disabled
+                || !expected.keys[i].new_key_ack
+                || !self.consumed[i]
+                || self.member_retirements[i]
+                    .as_ref()
+                    .is_some_and(|r| !r.consumed.get())
+            {
+                return Err(Error::Retired);
+            }
+            let facts = self.observe(expected, role, lock)?;
+            require_nic_absent(&facts)?;
+            require_owned(&facts)?;
+            require_value(&facts, Value::DwordZero)?;
+            let mut pending = next(expected)?;
+            pending.keys[i].phase = KeyPhase::RestorePending;
+            pending.keys[i].pending = Some(Value::Absent);
+            self.persist(Some(expected), &pending, lock)?;
+            self.write_value(&pending, role, Value::DwordZero, Value::Absent, lock)?;
+            let mut restored = next(&pending)?;
+            restored.keys[i].phase = KeyPhase::Captured;
+            restored.keys[i].current = Value::Absent;
+            restored.keys[i].pending = None;
+            self.persist(Some(&pending), &restored, lock)?;
+            let token = Rc::new(MemberKeyRetirement {
+                context: self.context.clone(),
+                role,
+                generation: restored.generation,
+                consumed: Cell::new(false),
+            });
+            // Root actual return before every later current/native check.
+            self.member_retirements[i] = Some(token.clone());
+            *retirement = Some(token);
+            let facts = self.observe(&restored, role, lock)?;
+            require_nic_absent(&facts)?;
+            require_owned(&facts)?;
+            require_value(&facts, Value::Absent)?;
+            Ok(restored)
+        })();
+        if result.is_err() {
+            self.cleanup_only = true;
+        }
+        result
+    }
+    pub(crate) fn redisable_member_key(
+        &mut self,
+        expected: &Record,
+        role: Role,
+        retirement: &MemberKeyRetirement,
+        lock: &mut I::MutationLock,
+    ) -> Result<Record> {
+        let result = (|| {
+            let i = role.index();
+            if self.cleanup_only
+                || role == Role::RoleCarrier
+                || self.member_retirements[i]
+                    .as_ref()
+                    .is_none_or(|r| !std::ptr::eq(r.as_ref(), retirement))
+                || retirement.context != self.context
+                || retirement.role != role
+            {
+                return Err(Error::Retired);
+            }
+            if retirement.consumed.replace(true) {
+                return Err(Error::Retired);
+            }
+            self.io.assert_serialized_lock(lock, &self.context)?;
+            self.require_current(expected)?;
+            if expected.phase != Phase::Preparing
+                || expected.generation < retirement.generation
+                || expected.keys[i].phase != KeyPhase::Captured
+                || !expected.keys[i].new_key_ack
+                || !self.consumed[i]
+            {
+                return Err(Error::Retired);
+            }
+            let facts = self.observe(expected, role, lock)?;
+            require_nic_absent(&facts)?;
+            require_owned(&facts)?;
+            require_value(&facts, Value::Absent)?;
+            let mut pending = next(expected)?;
+            pending.keys[i].phase = KeyPhase::DisablePending;
+            pending.keys[i].pending = Some(Value::DwordZero);
+            self.persist(Some(expected), &pending, lock)?;
+            self.write_value(&pending, role, Value::Absent, Value::DwordZero, lock)?;
+            let mut disabled = next(&pending)?;
+            disabled.keys[i].phase = KeyPhase::Disabled;
+            disabled.keys[i].current = Value::DwordZero;
+            disabled.keys[i].pending = None;
+            self.persist(Some(&pending), &disabled, lock)?;
+            let facts = self.observe(&disabled, role, lock)?;
+            require_nic_absent(&facts)?;
+            require_owned(&facts)?;
+            require_value(&facts, Value::DwordZero)?;
+            // The same owner can issue exactly one new creation prerequisite
+            // only after the actual restore/redisable cycle acknowledged above.
+            self.consumed[i] = false;
+            Ok(disabled)
+        })();
         if result.is_err() {
             self.cleanup_only = true;
         }
@@ -685,6 +1325,29 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         require_nic_absent(&facts)?;
         require_value(&facts, Value::DwordZero)
     }
+    /// Publish cleanup intent ONLY; restoration/absence are separate effects.
+    /// The enclosing actor uses this before permit withdrawal so native G can
+    /// consume the actual Closing record without restoring keys under live NICs.
+    pub(crate) fn begin_cleanup(
+        &mut self,
+        expected: &Record,
+        lock: &mut I::MutationLock,
+    ) -> Result<Record> {
+        // Even a rejected cleanup request retires forward creation. A bad lock
+        // or stale record is not authority to mutate the journal, but must not
+        // leave this original owner usable for another forward effect.
+        self.cleanup_only = true;
+        self.consumed = [true; 3];
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        self.require_current(expected)?;
+        if expected.phase != Phase::Preparing {
+            return Ok(expected.clone());
+        }
+        let mut closing = next(expected)?;
+        closing.phase = Phase::Closing;
+        self.persist(Some(expected), &closing, lock)?;
+        Ok(closing)
+    }
     /// Restoration only; no adapter adoption, resumption, key/tree deletion or
     /// recovery-created handle. Ambiguous CreatePending stays pending forever.
     pub(crate) fn cleanup(
@@ -692,20 +1355,10 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         expected: &Record,
         lock: &mut I::MutationLock,
     ) -> Result<Record> {
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        self.cleanup_only = true;
-        self.consumed = [true; 3];
-        self.require_current(expected)?;
-        let mut record = expected.clone();
+        let mut record = self.begin_cleanup(expected, lock)?;
         if record.phase == Phase::Stopped {
             self.verify_clean(&record, lock)?;
             return Ok(record);
-        }
-        if record.phase != Phase::Closing {
-            let mut closing = next(&record)?;
-            closing.phase = Phase::Closing;
-            self.persist(Some(&record), &closing, lock)?;
-            record = closing;
         }
         for role in [Role::RoleCarrier, Role::MemberA, Role::MemberB] {
             record = self.clean_key(record, role, lock)?;
@@ -729,6 +1382,42 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         }
         let mut facts = self.observe(&record, role, lock)?;
         require_nic_absent(&facts)?;
+        // Cleanup-only factual lane: SAME retained NEW original was deleted by
+        // SDK. No value effect on that handle and no native ACK adoption. Only
+        // publish our next Clean obligation through the ordinary exact CAS.
+        if record.keys[i].new_key_ack && facts.key == KeyPresence::OriginalSdkDeleted {
+            require_value(&facts, Value::Absent)?;
+            if matches!(
+                record.keys[i].phase,
+                KeyPhase::Disabled | KeyPhase::DisablePending
+            ) {
+                let mut pending = next(&record)?;
+                if record.keys[i].phase == KeyPhase::Disabled {
+                    pending.keys[i].phase = KeyPhase::RestorePending;
+                    pending.keys[i].pending = Some(Value::Absent);
+                } else {
+                    pending.keys[i].phase = KeyPhase::Captured;
+                    pending.keys[i].pending = None;
+                }
+                self.persist(Some(&record), &pending, lock)?;
+                record = pending;
+                let reread = self.observe(&record, role, lock)?;
+                require_nic_absent(&reread)?;
+                require_value(&reread, Value::Absent)?;
+                if reread.key != KeyPresence::OriginalSdkDeleted {
+                    return Err(Error::Conflict);
+                }
+            }
+            if record.keys[i].phase != KeyPhase::Clean {
+                let mut clean = next(&record)?;
+                clean.keys[i].phase = KeyPhase::Clean;
+                clean.keys[i].current = Value::Absent;
+                clean.keys[i].pending = None;
+                self.persist(Some(&record), &clean, lock)?;
+                record = clean;
+            }
+            return Ok(record);
+        }
         if record.keys[i].new_key_ack {
             require_owned(&facts)?;
         } else if facts.key != KeyPresence::Absent {
@@ -792,7 +1481,9 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             require_nic_absent(&facts)?;
             require_value(&facts, Value::Absent)?;
             if record.keys[role.index()].new_key_ack {
-                require_owned(&facts)?;
+                if facts.key != KeyPresence::OriginalSdkDeleted {
+                    require_owned(&facts)?;
+                }
             } else if facts.key != KeyPresence::Absent {
                 return Err(Error::Conflict);
             }

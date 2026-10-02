@@ -60,18 +60,30 @@ struct World {
     dead: [bool; 2],
     native: [bool; 2],
     fail_start: bool,
+    fail_complete_start: bool,
+    panic_complete_start: bool,
     fail_attach: bool,
     fail_remove: bool,
     fail_close: bool,
     fail_select: bool,
     fail_save: bool,
+    fail_save_epoch: Option<u64>,
     lose_save_ack: bool,
+    lose_save_ack_epoch: Option<u64>,
     closed_scopes: Vec<SessionScope>,
     fail_rebind: bool,
+    fail_complete_rebind: bool,
     validated: bool,
     drops: usize,
     drops_by_slot: [usize; 2],
     removals: Vec<(Slot, SessionSnapshot, [usize; 2])>,
+    panic_save: bool,
+    native_drops: usize,
+    store_drops: usize,
+    save_hook: Option<Box<dyn FnOnce() -> io::Result<()>>>,
+    fail_save_phase: Option<SessionPhase>,
+    lose_save_ack_phase: Option<SessionPhase>,
+    panic_save_phase: Option<SessionPhase>,
 }
 struct Socket {
     world: Rc<RefCell<World>>,
@@ -108,6 +120,11 @@ impl ProbeDatagram for Socket {
     }
 }
 struct Pair(Rc<RefCell<World>>);
+impl Drop for Pair {
+    fn drop(&mut self) {
+        self.0.borrow_mut().native_drops += 1;
+    }
+}
 impl NativePair for Pair {
     type Socket = Socket;
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
@@ -151,6 +168,18 @@ impl NativePair for Pair {
     }
 }
 impl PairControl for Pair {
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+        let mut world = self.0.borrow_mut();
+        let saved = world.saved.last().unwrap();
+        assert_eq!(saved.scope, *scope);
+        assert_eq!(saved.phase, SessionPhase::Running);
+        world.events.push("complete start".into());
+        assert!(!world.panic_complete_start, "startup handoff unwind");
+        if world.fail_complete_start {
+            return Err(io::Error::other("startup handoff failed"));
+        }
+        Ok(())
+    }
     fn metrics(&self, slot: Slot) -> io::Result<nelomai_client_tunnel::TunnelMetrics> {
         self.0.borrow_mut().events.push(format!("metrics {slot:?}"));
         Ok(nelomai_client_tunnel::TunnelMetrics {
@@ -212,28 +241,482 @@ impl PairControl for Pair {
             Ok(world.validated)
         }
     }
+    fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()> {
+        let mut world = self.0.borrow_mut();
+        let saved = world.saved.last().unwrap();
+        assert_eq!(saved.scope, *scope);
+        assert_eq!(saved.phase, SessionPhase::Running);
+        let epoch = saved.network_epoch;
+        world.events.push(format!("complete rebind epoch {epoch}"));
+        if world.fail_complete_rebind {
+            return Err(io::Error::other("completion acknowledgement failed"));
+        }
+        Ok(())
+    }
     fn cleanup_pending(&self) -> bool {
         let w = self.0.borrow();
         w.fail_close && w.native.iter().any(|v| *v)
     }
 }
 struct Store(Rc<RefCell<World>>);
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.0.borrow_mut().store_drops += 1;
+    }
+}
 impl SessionStore for Store {
     fn save(&mut self, state: &SessionSnapshot) -> io::Result<()> {
         let mut world = self.0.borrow_mut();
         world.events.push(format!("save {:?}", state.phase));
-        if world.fail_save {
+        if world.fail_save
+            || world.fail_save_epoch == Some(state.network_epoch)
+            || world.fail_save_phase == Some(state.phase)
+        {
             return Err(io::Error::other("save failed"));
         }
         world.saved.push(state.clone());
-        if world.lose_save_ack {
+        assert!(
+            !world.panic_save && world.panic_save_phase != Some(state.phase),
+            "save postflight unwind"
+        );
+        if world.lose_save_ack
+            || world.lose_save_ack_epoch == Some(state.network_epoch)
+            || world.lose_save_ack_phase == Some(state.phase)
+        {
             world.lose_save_ack = false;
+            world.lose_save_ack_epoch = None;
             return Err(io::Error::other("save acknowledgement lost"));
+        }
+        let hook = world.save_hook.take();
+        drop(world);
+        if let Some(hook) = hook {
+            hook()?;
         }
         Ok(())
     }
 }
 type Owner = SessionControl<Pair, Store>;
+
+#[test]
+fn retained_control_initial_persist_fault_keeps_same_pair_store_and_denies_forward() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    for fault in 0..3 {
+        let world = Rc::new(RefCell::new(World::default()));
+        {
+            let mut w = world.borrow_mut();
+            w.fail_save = fault == 0;
+            w.lose_save_ack = fault == 1;
+            w.panic_save = fault == 2;
+        }
+        let mut native = Some(Pair(world.clone()));
+        let mut store = Some(Store(world.clone()));
+        let mut retained = None;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            Owner::prepare_retained_into(
+                &mut retained,
+                RuntimeSlot::Latest,
+                &start(true),
+                &mut native,
+                &mut store,
+                0,
+            )
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(native.is_none() && store.is_none());
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+        assert!(!world.borrow().events.iter().any(|event| event == "close"));
+        let owner = retained.as_mut().unwrap();
+        assert!(owner.snapshot().cleanup_pending);
+        assert_eq!(owner.snapshot().session.scope, scope());
+        assert!(!owner.network_validated());
+        assert!(owner
+            .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+            .is_err());
+        assert!(owner
+            .execute(Command::NetworkChanged { scope: scope() }, 0)
+            .is_err());
+        assert!(owner.tick(0).is_err());
+        assert!(owner.invalidate_network(&scope(), 0).is_err());
+        assert!(owner.metrics().is_err());
+        assert!(owner.physical_network_fingerprint().is_err());
+        assert_eq!(owner.warm_slot(), None);
+        assert_eq!(world.borrow().events, vec!["save Starting"]);
+        {
+            let mut w = world.borrow_mut();
+            w.fail_save = false;
+            w.panic_save = false;
+            w.fail_close = true;
+        }
+        assert!(owner.execute(Command::Stop { scope: scope() }, 1).is_err());
+        assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopping);
+        assert!(owner.snapshot().cleanup_pending);
+        world.borrow_mut().fail_close = false;
+        owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
+        assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+        assert!(!owner.snapshot().cleanup_pending);
+        assert!(owner.tick(3).is_err());
+        assert!(owner
+            .execute(Command::NetworkChanged { scope: scope() }, 3)
+            .is_err());
+        assert_eq!(world.borrow().closed_scopes, vec![scope(), scope()]);
+        drop(retained);
+        assert_eq!(world.borrow().native_drops, 1);
+        assert_eq!(world.borrow().store_drops, 1);
+    }
+}
+
+#[test]
+fn retained_control_stop_postflight_error_never_reports_completed_cleanup() {
+    let world = Rc::new(RefCell::new(World::default()));
+    world.borrow_mut().lose_save_ack = true;
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    let mut retained = None;
+    assert!(Owner::prepare_retained_into(
+        &mut retained,
+        RuntimeSlot::Latest,
+        &start(true),
+        &mut native,
+        &mut store,
+        0
+    )
+    .is_err());
+    let owner = retained.as_mut().unwrap();
+    // Native close ACK is genuine, but the preceding Stopping save ACK is lost.
+    world.borrow_mut().lose_save_ack = true;
+    assert!(owner.execute(Command::Stop { scope: scope() }, 1).is_err());
+    assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+    assert!(
+        owner.snapshot().cleanup_pending,
+        "lost save ACK is not completed cleanup"
+    );
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
+    assert!(!owner.snapshot().cleanup_pending);
+    assert!(owner.tick(2).is_err());
+}
+
+#[test]
+fn retained_control_validates_without_consuming_inputs_and_never_replaces_occupied_root() {
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    let mut retained = None;
+    let mut invalid = start(true);
+    if let Command::Start { primary, .. } = &mut invalid {
+        primary.lease_id = "invalid".into();
+    }
+    for (runtime, command) in [
+        (RuntimeSlot::Stable, start(true)),
+        (RuntimeSlot::Latest, Command::Status { scope: scope() }),
+        (RuntimeSlot::Latest, invalid),
+    ] {
+        assert!(Owner::prepare_retained_into(
+            &mut retained,
+            runtime,
+            &command,
+            &mut native,
+            &mut store,
+            0
+        )
+        .is_err());
+        assert!(retained.is_none());
+        assert!(native.is_some() && store.is_some());
+        assert!(world.borrow().events.is_empty());
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+    }
+    Owner::prepare_retained_into(
+        &mut retained,
+        RuntimeSlot::Latest,
+        &start(true),
+        &mut native,
+        &mut store,
+        0,
+    )
+    .unwrap();
+    let prior = retained.as_ref().unwrap() as *const Owner;
+    let foreign = Rc::new(RefCell::new(World::default()));
+    let mut foreign_native = Some(Pair(foreign.clone()));
+    let mut foreign_store = Some(Store(foreign.clone()));
+    assert!(Owner::prepare_retained_into(
+        &mut retained,
+        RuntimeSlot::Latest,
+        &start(true),
+        &mut foreign_native,
+        &mut foreign_store,
+        0
+    )
+    .is_err());
+    assert_eq!(retained.as_ref().unwrap() as *const Owner, prior);
+    assert!(foreign_native.is_some() && foreign_store.is_some());
+    assert!(foreign.borrow().events.is_empty());
+    let owner = retained.as_mut().unwrap();
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    let mut wrong = scope();
+    wrong.connection_generation += 1;
+    assert!(owner.execute(Command::Stop { scope: wrong }, 0).is_err());
+    assert!(world.borrow().closed_scopes.is_empty());
+    owner.execute(Command::Stop { scope: scope() }, 1).unwrap();
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+}
+
+#[test]
+fn retained_control_terminal_save_error_lost_ack_and_unwind_keep_closed_original_pending() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    for fault in 0..3 {
+        let world = Rc::new(RefCell::new(World::default()));
+        world.borrow_mut().fail_save = true;
+        world.borrow_mut().native = [true, true];
+        let mut native = Some(Pair(world.clone()));
+        let mut store = Some(Store(world.clone()));
+        let mut retained = None;
+        assert!(Owner::prepare_retained_into(
+            &mut retained,
+            RuntimeSlot::Latest,
+            &start(true),
+            &mut native,
+            &mut store,
+            0
+        )
+        .is_err());
+        {
+            let mut w = world.borrow_mut();
+            w.fail_save = false;
+            w.fail_save_phase = (fault == 0).then_some(SessionPhase::Stopped);
+            w.lose_save_ack_phase = (fault == 1).then_some(SessionPhase::Stopped);
+            w.panic_save_phase = (fault == 2).then_some(SessionPhase::Stopped);
+        }
+        let owner = retained.as_mut().unwrap();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            owner.execute(Command::Stop { scope: scope() }, 1)
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert_eq!(
+            world.borrow().native,
+            [false, false],
+            "actual native close acknowledged first"
+        );
+        assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+        assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+        assert!(owner.snapshot().cleanup_pending);
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+        assert!(owner.tick(2).is_err());
+        {
+            let mut w = world.borrow_mut();
+            w.fail_save_phase = None;
+            w.lose_save_ack_phase = None;
+            w.panic_save_phase = None;
+        }
+        owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
+        assert!(!owner.snapshot().cleanup_pending);
+        assert!(owner
+            .execute(Command::NetworkChanged { scope: scope() }, 3)
+            .is_err());
+    }
+}
+
+#[test]
+fn retained_control_acknowledged_prepare_preserves_primary_and_completion_order() {
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    let mut retained = None;
+    Owner::prepare_retained_into(
+        &mut retained,
+        RuntimeSlot::Latest,
+        &start(false),
+        &mut native,
+        &mut store,
+        0,
+    )
+    .unwrap();
+    assert!(native.is_none() && store.is_none());
+    assert_eq!(world.borrow().events, vec!["save Starting"]);
+    let owner = retained.as_mut().unwrap();
+    assert!(!owner.snapshot().cleanup_pending);
+    owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    let events = world.borrow().events.clone();
+    let save = events
+        .iter()
+        .position(|event| event == "save Running")
+        .unwrap();
+    let completed = events
+        .iter()
+        .position(|event| event == "complete start")
+        .unwrap();
+    assert!(completed > save);
+    assert_eq!(world.borrow().closed_scopes.len(), 0);
+    assert!(owner.tick(0).is_ok());
+}
+
+#[test]
+fn retained_control_missing_input_is_not_an_empty_or_replacement_owner() {
+    for missing_native in [false, true] {
+        let world = Rc::new(RefCell::new(World::default()));
+        let mut native = (!missing_native).then(|| Pair(world.clone()));
+        let mut store = missing_native.then(|| Store(world.clone()));
+        let mut retained = None;
+        assert!(Owner::prepare_retained_into(
+            &mut retained,
+            RuntimeSlot::Latest,
+            &start(true),
+            &mut native,
+            &mut store,
+            0
+        )
+        .is_err());
+        assert!(retained.is_none());
+        assert_eq!(native.is_some(), !missing_native);
+        assert_eq!(store.is_some(), missing_native);
+        assert!(world.borrow().events.is_empty());
+        assert_eq!(world.borrow().native_drops, 0);
+        assert_eq!(world.borrow().store_drops, 0);
+    }
+}
+
+#[test]
+fn retained_control_safe_actor_reentry_error_keeps_original_after_saved_starting() {
+    let root = Rc::new(RefCell::new(None::<Owner>));
+    let world = Rc::new(RefCell::new(World::default()));
+    let weak = Rc::downgrade(&root);
+    world.borrow_mut().save_hook = Some(Box::new(move || {
+        let root = weak.upgrade().unwrap();
+        // Safe Rust forbids reentry into the borrowed actual caller slot.
+        // The external store must report its failed callback/ACK, not swallow it.
+        let mut destination = root
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("actor reentry"))?;
+        let mut native = None;
+        let mut store = None;
+        Owner::prepare_retained_into(
+            &mut destination,
+            RuntimeSlot::Latest,
+            &start(true),
+            &mut native,
+            &mut store,
+            0,
+        )
+    }));
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    assert!(Owner::prepare_retained_into(
+        &mut root.borrow_mut(),
+        RuntimeSlot::Latest,
+        &start(true),
+        &mut native,
+        &mut store,
+        0
+    )
+    .is_err());
+    assert_eq!(world.borrow().saved[0].phase, SessionPhase::Starting);
+    assert_eq!(world.borrow().native_drops, 0);
+    let mut destination = root.borrow_mut();
+    let owner = destination.as_mut().unwrap();
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    owner.execute(Command::Stop { scope: scope() }, 1).unwrap();
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+}
+
+#[test]
+fn retained_control_lost_starting_ack_blocks_all_forward_commands_even_after_equal_data_repair() {
+    let world = Rc::new(RefCell::new(World::default()));
+    world.borrow_mut().lose_save_ack = true;
+    world.borrow_mut().native = [true, true]; // Original partial native resources.
+    let mut native = Some(Pair(world.clone()));
+    let mut store = Some(Store(world.clone()));
+    let mut retained = None;
+    assert!(Owner::prepare_retained_into(
+        &mut retained,
+        RuntimeSlot::Latest,
+        &start(true),
+        &mut native,
+        &mut store,
+        0
+    )
+    .is_err());
+    let owner = retained.as_mut().unwrap();
+    let before = owner.snapshot();
+    let response = response(owner);
+    for command in [
+        start(true),
+        Command::Attach {
+            scope: scope(),
+            member: member(Slot::B),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            expected_membership_generation: 0,
+            membership_generation: 1,
+        },
+        Command::StageCandidate {
+            scope: scope(),
+            member: member(Slot::B),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            expected_membership_generation: 0,
+        },
+        Command::RemoveStandby {
+            scope: scope(),
+            slot: Slot::B,
+            lease_id: B.into(),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            expected_membership_generation: 0,
+        },
+        Command::RetireInactive {
+            scope: scope(),
+            slot: Slot::B,
+            lease_id: B.into(),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            expected_membership_generation: 0,
+        },
+        Command::CommitCandidate {
+            scope: scope(),
+            slot: Slot::B,
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            session: view(&before, true),
+        },
+        Command::ConfirmRole {
+            scope: scope(),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+            response,
+        },
+        Command::NetworkChanged { scope: scope() },
+        Command::PrepareRecoveryStop {
+            scope: scope(),
+            expected_revision: 1,
+            expected_network_epoch: 1,
+        },
+    ] {
+        command.validate(RuntimeSlot::Latest).unwrap();
+        // Re-publishing equal authenticated DATA cannot rearm process-local ACK.
+        world.borrow_mut().saved = vec![before.session.clone()];
+        assert!(owner.execute(command, 0).is_err());
+        assert_eq!(owner.snapshot(), before);
+    }
+    assert_eq!(world.borrow().events, vec!["save Starting"]);
+    assert_eq!(world.borrow().tx, [0, 0]);
+    assert_eq!(world.borrow().native, [true, true]);
+    owner.execute(Command::Stop { scope: scope() }, 1).unwrap();
+    assert_eq!(world.borrow().native, [false, false]);
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+}
 fn prepared(warm: bool) -> (Owner, Rc<RefCell<World>>) {
     let world = Rc::new(RefCell::new(World::default()));
     let owner = Owner::prepare(
@@ -252,6 +735,74 @@ fn running() -> (Owner, Rc<RefCell<World>>) {
         .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
         .unwrap();
     (owner, world)
+}
+
+#[test]
+fn startup_native_handoff_is_after_actual_running_save_before_start_returns() {
+    let (mut owner, world) = prepared(true);
+    owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    let world = world.borrow();
+    let running = world
+        .events
+        .iter()
+        .position(|event| event == "save Running")
+        .unwrap();
+    let complete = world
+        .events
+        .iter()
+        .position(|event| event == "complete start")
+        .expect("missing explicit Running native handoff");
+    assert!(complete > running);
+    assert_eq!(world.tx, [0, 0]);
+}
+
+#[test]
+fn failed_startup_handoff_is_scoped_stoppable_and_never_queries() {
+    let (mut owner, world) = prepared(true);
+    world.borrow_mut().fail_complete_start = true;
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    assert!(!owner.network_validated());
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+    owner.tick(100).unwrap();
+    assert_eq!(world.borrow().tx, [0, 0]);
+}
+
+#[test]
+fn lost_running_save_ack_never_invokes_startup_handoff() {
+    let (mut owner, world) = prepared(true);
+    world.borrow_mut().lose_save_ack = true;
+    assert!(owner
+        .start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    assert!(!world
+        .borrow()
+        .events
+        .iter()
+        .any(|event| event == "complete start"));
+    assert_eq!(world.borrow().tx, [0, 0]);
+}
+
+#[test]
+fn startup_handoff_unwind_keeps_health_suspended_without_implicit_native_release() {
+    let (mut owner, world) = prepared(true);
+    world.borrow_mut().panic_complete_start = true;
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.start_primary(&member(Slot::A), &DesktopTunnelOptions::default())
+    }))
+    .is_err());
+    assert!(!owner.network_validated());
+    assert!(world.borrow().native[0]);
+    assert!(world.borrow().closed_scopes.is_empty());
+    owner.tick(100).unwrap();
+    assert_eq!(world.borrow().tx, [0, 0]);
+    owner
+        .execute(Command::Stop { scope: scope() }, 101)
+        .unwrap();
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
 }
 
 #[test]
@@ -1070,7 +1621,7 @@ fn primary_first_persists_starting_before_native_and_readiness_needs_tick() {
         .unwrap();
     assert_eq!(
         world.borrow().events,
-        ["save Starting", "start A", "save Running"]
+        ["save Starting", "start A", "save Running", "complete start"]
     );
     assert_eq!(snapshot.session.installed, [true, false]);
     assert_eq!(snapshot.session.role_generation, 0);
@@ -1815,11 +2366,94 @@ fn validated_network_rebind_advances_epoch_twice_and_requires_fresh_evidence() {
         .execute(Command::NetworkChanged { scope: scope() }, 200)
         .unwrap();
     assert_eq!(snapshot.session.network_epoch, 3);
+    assert!(world
+        .borrow()
+        .events
+        .iter()
+        .any(|event| event == "complete rebind epoch 3"));
     assert!(!snapshot.primary_ready);
     for now in (300..=5000).step_by(100) {
         owner.tick(now).unwrap();
     }
     assert!(owner.snapshot().primary_ready);
+}
+
+#[test]
+fn failed_native_completion_keeps_new_epoch_and_health_suspended() {
+    let (mut owner, world) = running();
+    owner.tick(0).unwrap();
+    owner.tick(100).unwrap();
+    world.borrow_mut().validated = true;
+    world.borrow_mut().fail_complete_rebind = true;
+    assert!(owner
+        .execute(Command::NetworkChanged { scope: scope() }, 200)
+        .is_err());
+    assert_eq!(owner.snapshot().session.network_epoch, 3);
+    assert!(!owner.network_validated());
+    assert!(!owner.snapshot().primary_ready);
+    let sent = world.borrow().tx;
+    for now in (300..=5000).step_by(100) {
+        assert!(!owner.tick(now).unwrap().primary_ready);
+    }
+    assert_eq!(world.borrow().tx, sent);
+}
+
+#[test]
+fn missing_native_rebind_or_failed_completion_save_cannot_call_completion() {
+    for fail in [false, true] {
+        let (mut owner, world) = running();
+        world.borrow_mut().validated = fail;
+        if fail {
+            world.borrow_mut().fail_save_epoch = Some(3);
+        }
+        let result = owner.execute(Command::NetworkChanged { scope: scope() }, 200);
+        assert_eq!(result.is_err(), fail);
+        assert!(!owner.network_validated());
+        assert!(!world
+            .borrow()
+            .events
+            .iter()
+            .any(|e| e.starts_with("complete rebind")));
+    }
+}
+
+#[test]
+fn consecutive_rebinds_complete_each_current_epoch_without_old_evidence() {
+    let (mut owner, world) = running();
+    world.borrow_mut().validated = true;
+    for (now, epoch) in [(200, 3), (300, 5)] {
+        let snapshot = owner
+            .execute(Command::NetworkChanged { scope: scope() }, now)
+            .unwrap();
+        assert_eq!(snapshot.session.network_epoch, epoch);
+        assert!(!snapshot.primary_ready);
+        assert!(world
+            .borrow()
+            .events
+            .contains(&format!("complete rebind epoch {epoch}")));
+    }
+}
+
+#[test]
+fn lost_second_epoch_ack_closes_native_without_completing_rebind_or_resuming_queries() {
+    let (mut owner, world) = running();
+    world.borrow_mut().validated = true;
+    world.borrow_mut().lose_save_ack_epoch = Some(3);
+    assert!(owner
+        .execute(Command::NetworkChanged { scope: scope() }, 200)
+        .is_err());
+    assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+    assert!(!owner.snapshot().primary_ready);
+    assert!(!owner.network_validated());
+    assert_eq!(world.borrow().native, [false; 2]);
+    assert!(!world
+        .borrow()
+        .events
+        .iter()
+        .any(|e| e.starts_with("complete rebind")));
+    let sent = world.borrow().tx;
+    owner.tick(300).unwrap();
+    assert_eq!(world.borrow().tx, sent);
 }
 
 #[test]

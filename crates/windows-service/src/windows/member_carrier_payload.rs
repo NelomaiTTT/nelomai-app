@@ -6,10 +6,44 @@ use nelomai_contracts::{
     dispatcher::EngineIdentity, RuntimeFileRole, RuntimeFileV1, VerifiedContainerManifest,
 };
 
+/// Compiled runtime resources, never an IPC path or DLL-search fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LibraryKind {
+    Wintun,
+    WireGuard,
+    Tunnel,
+    AmneziaWgTunnel,
+}
+impl LibraryKind {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Wintun => "wintun.dll",
+            Self::WireGuard => "wireguard.dll",
+            Self::Tunnel => "tunnel.dll",
+            Self::AmneziaWgTunnel => "amneziawg-tunnel.dll",
+        }
+    }
+}
+fn member_libraries(transport: nelomai_client_tunnel::TunnelTransport) -> [LibraryKind; 2] {
+    use nelomai_client_tunnel::TunnelTransport;
+    match transport {
+        TunnelTransport::WireGuard => [LibraryKind::WireGuard, LibraryKind::Tunnel],
+        TunnelTransport::AmneziaWg3 => [LibraryKind::Wintun, LibraryKind::AmneziaWgTunnel],
+    }
+}
+
 fn wintun_entry(
     manifest: &VerifiedContainerManifest,
     manifest_digest: &str,
     identity: &EngineIdentity,
+) -> Result<RuntimeFileV1> {
+    library_entry(manifest, manifest_digest, identity, LibraryKind::Wintun)
+}
+fn library_entry(
+    manifest: &VerifiedContainerManifest,
+    manifest_digest: &str,
+    identity: &EngineIdentity,
+    kind: LibraryKind,
 ) -> Result<RuntimeFileV1> {
     let selected = manifest.selected(identity.slot).ok_or(Error::Conflict)?;
     if identity.manifest_sha256 != manifest_digest
@@ -22,7 +56,7 @@ fn wintun_entry(
     let entry = selected
         .files
         .iter()
-        .find(|entry| entry.path == "wintun.dll")
+        .find(|entry| entry.path == kind.path())
         .ok_or(Error::Invalid)?;
     if entry.role != RuntimeFileRole::SharedLibrary
         || entry.size_bytes == 0
@@ -41,13 +75,14 @@ pub(crate) mod native {
     use std::{
         fs::File,
         path::{Path, PathBuf},
+        rc::Rc,
         sync::Arc,
     };
 
     /// No path/name/manifest/identity supplied by IPC can construct this.
     /// Holds the SAME actual runtime owner lock and non-replaceable source
     /// handles. A borrow is still NOT permission to execute the module.
-    pub(crate) struct WintunSource {
+    struct LibrarySource {
         installation: Installation,
         identity: EngineIdentity,
         directory: PathBuf,
@@ -55,9 +90,10 @@ pub(crate) mod native {
         owner: Arc<MutationGuard>,
         root: Box<dyn Fn() -> Result<()>>,
         payload: PinnedPayload,
+        kind: LibraryKind,
     }
-    impl WintunSource {
-        pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {
+    impl LibrarySource {
+        fn new(root: &Path, owner: Arc<MutationGuard>, kind: LibraryKind) -> Result<Self> {
             owner
                 .verify_at(&root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
@@ -67,10 +103,10 @@ pub(crate) mod native {
             let layout = installation
                 .load_engine(&executable)
                 .map_err(|_| Error::Conflict)?;
-            let entry = read_signed_entry(&layout.directory, &layout.identity)?;
+            let entry = read_signed_entry(&layout.directory, &layout.identity, kind)?;
             // Fixed sibling of the authenticated kernel executable, NEVER a
             // caller path or a platform DLL-search fallback.
-            let path = layout.engine_path().with_file_name("wintun.dll");
+            let path = layout.engine_path().with_file_name(kind.path());
             let payload = pin_runtime_payload(&path, entry.size_bytes, &entry.sha256)
                 .map_err(|_| Error::Conflict)?;
             let source = Self {
@@ -81,11 +117,12 @@ pub(crate) mod native {
                 owner,
                 root: Box::new(move || root_pin.verify().map_err(|_| Error::Conflict)),
                 payload,
+                kind,
             };
             source.verify()?;
             Ok(source)
         }
-        pub(crate) fn verify(&self) -> Result<()> {
+        fn verify(&self) -> Result<()> {
             self.owner
                 .verify_at(&self.installation.root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
@@ -100,7 +137,7 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)?;
             if layout.identity != self.identity
                 || layout.directory != self.directory
-                || layout.engine_path().with_file_name("wintun.dll") != self.payload.path()
+                || layout.engine_path().with_file_name(self.kind.path()) != self.payload.path()
             {
                 return Err(Error::Conflict);
             }
@@ -115,29 +152,178 @@ pub(crate) mod native {
         }
         /// The module actor must retain the SAME original privileged lease,
         /// not another correctly named lock or a deserialized runtime identity.
-        pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
+        fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
             if !Arc::ptr_eq(&self.owner, owner) {
                 return Err(Error::Conflict);
             }
             self.verify()
         }
-        pub(crate) fn file(&self) -> Result<&File> {
+        fn file(&self) -> Result<&File> {
             self.verify()?;
             Ok(self.payload.file())
         }
-        pub(crate) fn path(&self) -> Result<&Path> {
+        fn path(&self) -> Result<&Path> {
             self.verify()?;
             Ok(self.payload.path())
         }
-        pub(crate) fn identity(&self) -> &EngineIdentity {
+        fn identity(&self) -> &EngineIdentity {
             &self.identity
+        }
+    }
+    /// Actual original Wintun source; preserves the existing opaque API.
+    pub(crate) struct WintunSource(LibrarySource);
+    impl WintunSource {
+        pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {
+            LibrarySource::new(root, owner, LibraryKind::Wintun).map(Self)
+        }
+        pub(crate) fn verify(&self) -> Result<()> {
+            self.0.verify()
+        }
+        pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
+            self.0.verify_owner(owner)
+        }
+        /// Repeat-load comparison only. Both independently authenticated held
+        /// sources must identify the SAME original file and engine owner. Never
+        /// construct a source/module/permission from path, digest or file ID.
+        pub(in crate::windows) fn verify_process_anchor_origin(
+            &self,
+            original: &Self,
+        ) -> Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            };
+            if self.0.directory != original.0.directory
+                || self.0.executable != original.0.executable
+                || self.0.payload.path() != original.0.payload.path()
+            {
+                return Err(Error::Conflict);
+            }
+            let id = |source: &Self| -> Result<(u32, u32, u32)> {
+                let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    GetFileInformationByHandle(source.0.payload.file().as_raw_handle(), &mut info)
+                } == 0
+                {
+                    return Err(Error::Native);
+                }
+                Ok((
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow,
+                ))
+            };
+            original.verify()?;
+            self.verify()?;
+            let held = id(original)?;
+            let compare = |current| {
+                super::super::member_carrier_module::compare_process_source_origin(
+                    &original.0.owner,
+                    &self.0.owner,
+                    &original.0.identity,
+                    &self.0.identity,
+                    held,
+                    current,
+                )
+                .map_err(|_| Error::Conflict)
+            };
+            compare(id(self)?)?;
+            original.verify()?;
+            self.verify()?;
+            if id(original)? != held {
+                return Err(Error::Conflict);
+            }
+            compare(id(self)?)?;
+            Ok(())
+        }
+        pub(crate) fn file(&self) -> Result<&File> {
+            self.0.file()
+        }
+        pub(crate) fn path(&self) -> Result<&Path> {
+            self.0.path()
+        }
+        pub(crate) fn identity(&self) -> &EngineIdentity {
+            self.0.identity()
+        }
+    }
+
+    /// Signed member DLLs retained under the SAME real owner as C. This is
+    /// readonly source retention, NOT an original service/NIC ACK, permission
+    /// to load/execute/install a driver, or authorization of native effects.
+    /// AWG keeps the actual original C Wintun source, never a reopened substitute.
+    pub(crate) struct MemberSource {
+        transport: nelomai_client_tunnel::TunnelTransport,
+        carrier: Rc<WintunSource>,
+        libraries: Vec<LibrarySource>,
+    }
+    impl MemberSource {
+        pub(crate) fn new(
+            root: &Path,
+            owner: Arc<MutationGuard>,
+            transport: nelomai_client_tunnel::TunnelTransport,
+            carrier: &Rc<WintunSource>,
+        ) -> Result<Self> {
+            carrier.verify_owner(&owner)?;
+            let mut libraries = Vec::with_capacity(2);
+            for kind in member_libraries(transport) {
+                if kind != LibraryKind::Wintun {
+                    libraries.push(LibrarySource::new(root, owner.clone(), kind)?);
+                }
+            }
+            let source = Self {
+                transport,
+                carrier: carrier.clone(),
+                libraries,
+            };
+            source.verify_owner(&owner)?;
+            Ok(source)
+        }
+        pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
+            self.carrier.verify_owner(owner)?;
+            let wanted = member_libraries(self.transport);
+            let expected = wanted
+                .into_iter()
+                .filter(|kind| *kind != LibraryKind::Wintun)
+                .collect::<Vec<_>>();
+            if self.libraries.len() != expected.len() {
+                return Err(Error::Conflict);
+            }
+            for (library, kind) in self.libraries.iter().zip(expected) {
+                if library.kind != kind || library.identity() != self.carrier.identity() {
+                    return Err(Error::Conflict);
+                }
+                library.verify_owner(owner)?;
+            }
+            // Repeat every actual pin after the complete signed-runtime reads.
+            // A later failure does not turn this source into native authority.
+            self.carrier.verify_owner(owner)?;
+            for library in &self.libraries {
+                library.verify_owner(owner)?;
+            }
+            self.carrier.verify_owner(owner)
+        }
+        pub(crate) fn identity(&self) -> &EngineIdentity {
+            self.carrier.identity()
+        }
+        pub(crate) fn transport(&self) -> nelomai_client_tunnel::TunnelTransport {
+            self.transport
+        }
+        pub(in crate::windows) fn matches_carrier(&self, carrier: &Rc<WintunSource>) -> bool {
+            Rc::ptr_eq(&self.carrier, carrier)
+        }
+        pub(crate) fn verify(&self) -> Result<()> {
+            self.verify_owner(&self.carrier.0.owner)
         }
     }
     fn actual_executable() -> Result<PathBuf> {
         std::fs::canonicalize(std::env::current_exe().map_err(|_| Error::Native)?)
             .map_err(|_| Error::Native)
     }
-    fn read_signed_entry(directory: &Path, identity: &EngineIdentity) -> Result<RuntimeFileV1> {
+    fn read_signed_entry(
+        directory: &Path,
+        identity: &EngineIdentity,
+        kind: LibraryKind,
+    ) -> Result<RuntimeFileV1> {
         let bytes = d::read_bounded(&directory.join(d::MANIFEST_NAME), 1024 * 1024)
             .map_err(|_| Error::Conflict)?;
         let signature =
@@ -147,7 +333,7 @@ pub(crate) mod native {
             &bytes, &signature, &key, "windows", "x86_64",
         )
         .map_err(|_| Error::Conflict)?;
-        wintun_entry(&manifest, &d::digest(&bytes), identity)
+        library_entry(&manifest, &d::digest(&bytes), identity, kind)
     }
 }
 

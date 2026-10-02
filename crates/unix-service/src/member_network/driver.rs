@@ -204,6 +204,25 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
             .remove_standby(scope, slot)
             .map_err(|e| self.network.operation_error(Stage::RemoveStandby, e))
     }
+    fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.check_scope(scope)?;
+        for slot in [Slot::A, Slot::B] {
+            if self.network.members().view(slot).is_some() {
+                self.network
+                    .members()
+                    .check_live(scope, slot)
+                    .map_err(|e| self.network.operation_error(Stage::NetworkChanged, e))?;
+            }
+        }
+        if self.network.active().is_none() || self.network.cleanup_pending() {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.check_scope(scope)?;
+        self.check_integrity()
+    }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.check_scope(scope)?;
         let options = self.options.as_ref().ok_or_else(failed)?;

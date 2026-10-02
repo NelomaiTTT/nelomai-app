@@ -211,7 +211,48 @@ pub struct NetworkJournal {
     stopping: bool,
 }
 
+/// Validated borrowed comparison DATA only. This exposes the complete durable
+/// lists to an independent native readback; it does not establish ownership,
+/// permission to resume, applied ACKs, or absence of foreign native resources.
+/// There is no mutation, serialization, construction or effect API on the view.
+pub struct NetworkReadView<'a> {
+    journal: &'a NetworkJournal,
+}
+impl NetworkReadView<'_> {
+    pub fn current(&self) -> impl Iterator<Item = &NetworkValue> {
+        self.journal.owned.iter().map(|entry| &entry.current)
+    }
+    pub fn pending(&self) -> Option<impl Iterator<Item = &NetworkValue>> {
+        self.journal
+            .pending
+            .as_ref()
+            .map(|pending| pending.target.iter().map(|entry| &entry.current))
+    }
+    /// Recorded metadata, including during ambiguous/stopping transitions.
+    /// Never use this as the usable/published active role; NetworkOwner::active
+    /// keeps its existing cleanup fence unchanged.
+    pub fn recorded_active(&self) -> Option<Slot> {
+        self.journal.active
+    }
+    pub fn pending_active(&self) -> Option<Slot> {
+        self.journal
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.active)
+    }
+    pub fn stopping(&self) -> bool {
+        self.journal.stopping
+    }
+}
+
 impl NetworkJournal {
+    pub fn read_view(&self) -> io::Result<NetworkReadView<'_>> {
+        validate_entries(&self.owned)?;
+        if let Some(pending) = &self.pending {
+            validate_entries(&pending.target)?;
+        }
+        Ok(NetworkReadView { journal: self })
+    }
     /// Only the Windows factory, after proving a different boot, may retire
     /// these nonpersistent IP Helper route rows without querying reused indices.
     /// Never discard a saved baseline, global DNS, or another platform's state.

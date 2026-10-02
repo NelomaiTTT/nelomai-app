@@ -29,6 +29,85 @@ impl Write for ReplyWriter<'_> {
 fn ack(value: bool) -> Vec<u8> {
     d::encode_frame(&serde_json::json!({"primitive_ok":value})).unwrap()
 }
+
+#[test]
+fn same_channel_cancellation_origin_is_sticky_after_eof_error_or_poison() {
+    use std::sync::{atomic::Ordering, Arc};
+    // Break: a replacement never-cancelled token or a reader terminal event
+    // which leaves native forward work enabled while the owner is still busy.
+    for terminal in 0..3 {
+        let (mut router, frames, client) = channel::channel();
+        let cancelled = client.cancellation();
+        assert!(Arc::ptr_eq(&cancelled, &client.cancellation()));
+        assert!(!cancelled.load(Ordering::SeqCst));
+        router.route_frame(tick()).unwrap();
+        assert!(!cancelled.load(Ordering::SeqCst));
+        frames.try_recv().unwrap();
+        match terminal {
+            0 => router.finish(None),
+            1 => router.finish(Some(io::ErrorKind::BrokenPipe.into())),
+            _ => assert!(router.route_frame(ack(true)).is_err()),
+        }
+        assert!(cancelled.load(Ordering::SeqCst), "terminal {terminal}");
+        drop(router);
+        assert!(cancelled.load(Ordering::SeqCst));
+        drop(client);
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+}
+
+#[test]
+fn same_channel_cancellation_does_not_confuse_negative_native_ack_with_pipe_failure() {
+    use std::sync::atomic::Ordering;
+    let (mut router, _frames, client) = channel::channel();
+    let cancelled = client.cancellation();
+    channel::with_owner(client, || {
+        let mut writer = ReplyWriter {
+            router: &mut router,
+            replies: vec![ack(false)],
+            bytes: vec![],
+        };
+        assert!(channel::request_primitive(EnginePrimitive::RebindService, &mut writer).is_err());
+        assert!(!cancelled.load(Ordering::SeqCst));
+        writer.replies.push(ack(true));
+        channel::request_primitive(EnginePrimitive::RebindService, &mut writer).unwrap();
+        assert!(!cancelled.load(Ordering::SeqCst));
+    })
+    .unwrap();
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "owner teardown cancels its token"
+    );
+}
+
+#[test]
+fn same_channel_cancellation_marks_lost_reader_and_failed_broker_write() {
+    use std::sync::atomic::Ordering;
+    let (router, _frames, client) = channel::channel();
+    let cancelled = client.cancellation();
+    drop(router);
+    assert!(cancelled.load(Ordering::SeqCst));
+
+    struct BrokenWriter;
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            unreachable!("failed write must not flush")
+        }
+    }
+    let (_router, _frames, client) = channel::channel();
+    let cancelled = client.cancellation();
+    channel::with_owner(client, || {
+        assert!(
+            channel::request_primitive(EnginePrimitive::RebindService, &mut BrokenWriter).is_err()
+        );
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(channel::ensure_healthy().is_err());
+    })
+    .unwrap();
+}
 fn tick() -> Vec<u8> {
     d::encode_frame(&serde_json::json!({"dispatcher_control":"tick"})).unwrap()
 }

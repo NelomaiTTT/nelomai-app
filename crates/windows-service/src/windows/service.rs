@@ -335,11 +335,20 @@ pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
                 .map_err(|_| ServiceError::UnsafePath)?,
         )
         .map_err(|_| ServiceError::UnauthorizedClient)?;
-    let _lease = d::MutationGuard::at(&root.join("engine-owner.lock"))
-        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let lease = std::sync::Arc::new(
+        d::MutationGuard::at(&root.join("engine-owner.lock"))
+            .map_err(|_| ServiceError::UnauthorizedClient)?,
+    );
+    // One actual reader/owner cancellation origin, created before the native
+    // factory. EOF/poison during construction cannot leave a fresh false token.
+    let (frames, client) =
+        engine_channel::spawn_input(std::io::stdin()).map_err(|_| ServiceError::InvalidRequest)?;
     let factory = super::member_pair::NativePairFactory::from_service(
+        root,
         layout.identity.clone(),
         &layout.engine_path(),
+        lease,
+        client.cancellation(),
     )
     .map_err(|_| ServiceError::Backend("member_runtime_factory_failed".into()))?;
     let backend = crate::member_actor::CompositeBackend::new(
@@ -353,8 +362,6 @@ pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
         shutting_down: false,
         stopped: false,
     };
-    let (frames, client) =
-        engine_channel::spawn_input(std::io::stdin()).map_err(|_| ServiceError::InvalidRequest)?;
     // This function returns directly to engine main, which must exit: the sole
     // detached reader may remain blocked in the process-owned input pipe.
     engine_channel::with_owner(client, || {

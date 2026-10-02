@@ -40,6 +40,20 @@ pub(crate) fn canonical_engine_matches(
         && trusted.as_os_str() == std::ffi::OsStr::new(dos)
 }
 
+// Comparison-only preclaim decision. The native caller still verifies the SAME
+// installation owner, validates the command and performs journaled recovery.
+pub(crate) fn require_factory_start_context(
+    requested: nelomai_contracts::RuntimeSlot,
+    owned: nelomai_contracts::RuntimeSlot,
+    in_async_runtime: bool,
+    cancelled: bool,
+) -> io::Result<()> {
+    if requested != owned || in_async_runtime || cancelled {
+        return Err(io::Error::other("native_pair_start_context_conflict"));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemberRecord {
@@ -54,7 +68,7 @@ pub(crate) struct MemberRecord {
     pub peer: [u8; 32],
     pub started_epoch_ms: u64,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DnsRecord {
     pub baseline: DnsSnapshot,
@@ -146,6 +160,53 @@ pub(crate) fn verify_retired_slot(
 #[derive(Default)]
 pub(crate) struct CompletionState {
     completed: Option<nelomai_client_tunnel::redundancy::session::SessionSnapshot>,
+}
+
+/// Scheduling only for original initial-NoC DATA completion. Concrete native
+/// callbacks independently authenticate the SAME completed NoC outcome/index.
+/// Any lost ACK/Err/unwind permanently retains the caller's originals; a retry
+/// cannot rerun retirement or infer success from a Stopped snapshot.
+#[derive(Default)]
+pub(crate) struct InitialDataCompletionState {
+    attempted: bool,
+    completed: Option<nelomai_client_tunnel::redundancy::session::SessionSnapshot>,
+}
+impl InitialDataCompletionState {
+    pub(crate) fn save(
+        &mut self,
+        scope: &SessionScope,
+        snapshot: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+        persist: impl FnOnce(
+            &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+        ) -> io::Result<()>,
+        retire: impl FnOnce() -> io::Result<()>,
+        complete: impl FnOnce(&SessionScope) -> io::Result<()>,
+        release: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if &snapshot.scope != scope || !scope.validate() {
+            return Err(failed());
+        }
+        if let Some(acknowledged) = &self.completed {
+            return if acknowledged == snapshot {
+                Ok(())
+            } else {
+                Err(failed())
+            };
+        }
+        if self.attempted {
+            return Err(failed());
+        }
+        if snapshot.phase != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped {
+            return persist(snapshot);
+        }
+        self.attempted = true; // BEFORE any fallible ACK boundary or unwind
+        persist(snapshot)?;
+        retire()?;
+        complete(scope)?;
+        release()?;
+        self.completed = Some(snapshot.clone());
+        Ok(())
+    }
 }
 impl CompletionState {
     pub(crate) fn save(
@@ -976,6 +1037,10 @@ impl<I: PairIo, J: PairStore> NativePair for SessionNativePair<I, J> {
     }
 }
 impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.check(scope)?;
+        self.check_integrity()
+    }
     fn metrics(&self, slot: Slot) -> io::Result<TunnelMetrics> {
         if self.record.active != Some(slot) {
             return Err(failed());
@@ -1084,6 +1149,10 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
             return Err(error);
         }
         Ok(())
+    }
+    fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.check(scope)?;
+        self.check_integrity()
     }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.check(scope)?;

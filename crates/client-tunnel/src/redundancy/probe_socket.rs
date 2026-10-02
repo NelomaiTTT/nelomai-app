@@ -46,6 +46,55 @@ impl NativeProbeSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.local_addr()
     }
+
+    /// Fresh readback from THIS retained kernel socket, not a tuple cache.
+    /// Windows only: checks exclusive binding, IPv4 UDP protocol, network-order
+    /// IP_UNICAST_IF, exact source/peer and the actual nonzero ephemeral port.
+    /// This returns comparison data, never interface or firewall authority.
+    pub fn attest_binding(
+        &self,
+        index: u32,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> io::Result<SocketAddrV4> {
+        #[cfg(windows)]
+        {
+            binding_read::verify(exclusive::read_binding(&self.0)?, index, source, target)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (index, source, target);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    /// Close THIS owned handle with a native acknowledgement. On failure the
+    /// caller receives the same socket back and must retain its obligation.
+    /// Not a claim of port/table absence; other cloned handles must be retired
+    /// separately before calling this on the last original handle.
+    #[allow(clippy::result_large_err)] // Error must retain the actual original resource.
+    pub fn close_checked(self) -> Result<(), (Self, io::Error)> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+            use windows_sys::Win32::Networking::WinSock::{
+                closesocket, WSAGetLastError, SOCKET_ERROR,
+            };
+            let raw = self.0.into_raw_socket();
+            if unsafe { closesocket(raw as _) } == SOCKET_ERROR {
+                let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+                // A failed close grants no permission to lose the handle.
+                let socket = unsafe { UdpSocket::from_raw_socket(raw) };
+                Err((Self(socket), error))
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Err((self, io::ErrorKind::Unsupported.into()))
+        }
+    }
 }
 
 impl ProbeDatagram for NativeProbeSocket {
@@ -54,6 +103,104 @@ impl ProbeDatagram for NativeProbeSocket {
     }
     fn receive(&mut self, packet: &mut [u8]) -> io::Result<usize> {
         self.0.recv(packet)
+    }
+}
+
+#[cfg(any(windows, test))]
+mod binding_read {
+    use super::*;
+
+    /// Readback data only. Its producer must query the retained socket itself.
+    pub(super) struct Observed {
+        pub local: SocketAddr,
+        pub peer: SocketAddr,
+        pub exclusive: i32,
+        pub network_order_index: u32,
+        pub family: i32,
+        pub socket_type: i32,
+        pub protocol: i32,
+    }
+
+    pub(super) fn verify(
+        observed: Observed,
+        index: u32,
+        source: Ipv4Addr,
+        target: Ipv4Addr,
+    ) -> io::Result<SocketAddrV4> {
+        match observed.local {
+            SocketAddr::V4(local)
+                if index != 0
+                    && observed.exclusive == 1
+                    && observed.network_order_index == index.to_be()
+                    && observed.family == 2
+                    && observed.socket_type == 2
+                    && observed.protocol == 17
+                    && *local.ip() == source
+                    && local.port() != 0
+                    && observed.peer == SocketAddrV4::new(target, 53).into() =>
+            {
+                Ok(local)
+            }
+            _ => Err(io::ErrorKind::InvalidData.into()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn observed() -> Observed {
+            Observed {
+                local: SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 2), 49152).into(),
+                peer: SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 53).into(),
+                exclusive: 1,
+                network_order_index: 0x01020304_u32.to_be(),
+                family: 2,
+                socket_type: 2,
+                protocol: 17,
+            }
+        }
+        fn checked(o: Observed) -> io::Result<SocketAddrV4> {
+            verify(
+                o,
+                0x01020304,
+                Ipv4Addr::new(10, 8, 0, 2),
+                Ipv4Addr::new(9, 9, 9, 9),
+            )
+        }
+
+        #[test]
+        fn reattestation_rejects_changed_kernel_options_and_tuple() {
+            for case in 0..10 {
+                let mut o = observed();
+                match case {
+                    0 => o.exclusive = 0,
+                    1 => o.exclusive = -1,
+                    2 => o.network_order_index = 0x01020304,
+                    3 => o.family = 23,
+                    4 => o.socket_type = 1,
+                    5 => o.protocol = 6,
+                    6 => o.local = SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 3), 49152).into(),
+                    7 => o.local = SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 2), 0).into(),
+                    8 => o.peer = SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 54).into(),
+                    9 => o.peer = SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53).into(),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    checked(o).unwrap_err().kind(),
+                    io::ErrorKind::InvalidData,
+                    "case {case}"
+                );
+            }
+        }
+
+        #[test]
+        fn exact_kernel_readback_exposes_actual_ephemeral_port() {
+            assert_eq!(
+                checked(observed()).unwrap(),
+                SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 2), 49152)
+            );
+        }
     }
 }
 
@@ -142,6 +289,11 @@ mod exclusive {
     }
 
     #[cfg(windows)]
+    pub(super) fn read_binding(socket: &UdpSocket) -> io::Result<super::binding_read::Observed> {
+        native::read_binding(socket)
+    }
+
+    #[cfg(windows)]
     mod native {
         use super::*;
         use std::{
@@ -150,13 +302,44 @@ mod exclusive {
             ptr,
         };
         use windows_sys::Win32::Networking::WinSock::{
-            bind, setsockopt, WSAGetLastError, WSASocketW, AF_INET, INVALID_SOCKET, IN_ADDR,
-            IN_ADDR_0, IPPROTO_IP, IPPROTO_UDP, IP_UNICAST_IF, SOCKADDR_IN, SOCKET_ERROR,
-            SOCK_DGRAM, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, WSA_FLAG_NO_HANDLE_INHERIT,
-            WSA_FLAG_OVERLAPPED,
+            bind, getsockopt, setsockopt, WSAGetLastError, WSASocketW, AF_INET, INVALID_SOCKET,
+            IN_ADDR, IN_ADDR_0, IPPROTO_IP, IPPROTO_UDP, IP_UNICAST_IF, SOCKADDR_IN, SOCKET_ERROR,
+            SOCK_DGRAM, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, SO_PROTOCOL_INFOW, WSAPROTOCOL_INFOW,
+            WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
         };
 
         pub(super) struct WinSock;
+        pub(super) fn read_binding(
+            socket: &UdpSocket,
+        ) -> io::Result<super::super::binding_read::Observed> {
+            fn option<T: Default>(socket: &UdpSocket, level: i32, option: i32) -> io::Result<T> {
+                let mut value = T::default();
+                let mut length = size_of::<T>() as i32;
+                check(unsafe {
+                    getsockopt(
+                        socket.as_raw_socket() as _,
+                        level,
+                        option,
+                        (&mut value as *mut T).cast(),
+                        &mut length,
+                    )
+                })?;
+                if length != size_of::<T>() as i32 {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                Ok(value)
+            }
+            let protocol: WSAPROTOCOL_INFOW = option(socket, SOL_SOCKET, SO_PROTOCOL_INFOW)?;
+            Ok(super::super::binding_read::Observed {
+                local: socket.local_addr()?,
+                peer: socket.peer_addr()?,
+                exclusive: option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE)?,
+                network_order_index: option(socket, IPPROTO_IP, IP_UNICAST_IF)?,
+                family: protocol.iAddressFamily,
+                socket_type: protocol.iSocketType,
+                protocol: protocol.iProtocol,
+            })
+        }
         impl SocketApi for WinSock {
             type Socket = UdpSocket;
 

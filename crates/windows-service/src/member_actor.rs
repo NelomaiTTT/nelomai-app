@@ -560,6 +560,10 @@ mod tests {
         }
     }
     impl PairControl for Native {
+        fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+            assert_eq!(self.0.borrow().saved.last().unwrap().scope, *scope);
+            self.check_integrity()
+        }
         fn start_primary(
             &mut self,
             scope: &SessionScope,
@@ -596,6 +600,10 @@ mod tests {
                 return Err(io::Error::other("private rebind detail"));
             }
             Ok(!w.unvalidated_rebind)
+        }
+        fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()> {
+            assert_eq!(self.0.borrow().saved.last().unwrap().scope, *scope);
+            self.check_integrity()
         }
         fn cleanup_pending(&self) -> bool {
             let w = self.0.borrow();

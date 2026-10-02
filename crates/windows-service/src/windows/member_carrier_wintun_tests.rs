@@ -4,11 +4,102 @@
 #[cfg(windows)]
 include!("../lib.rs");
 #[cfg(not(windows))]
+#[path = "../member_interface_description.rs"]
+mod member_interface_description;
+#[cfg(not(windows))]
 #[path = "member_carrier_wintun.rs"]
 mod subject;
 #[cfg(all(test, not(windows)))]
 mod tests {
+    use super::subject;
     use super::subject::*;
+
+    // Break: discarding the actual reference ACK on postflight Err/unwind,
+    // repeating an effect after a lost return, or accepting a suppressed reentry.
+    #[test]
+    fn closed_reference_release_retains_returned_ack_before_fault_and_is_once() {
+        for unwind in [false, true] {
+            let state = ClosedReferenceRelease::new();
+            let effects = std::cell::Cell::new(0);
+            let retained = std::cell::Cell::new(false);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.run(
+                    || Ok(()),
+                    || {
+                        effects.set(effects.get() + 1);
+                        Ok(())
+                    },
+                    || {
+                        assert!(state.acknowledged());
+                        retained.set(true);
+                        if unwind {
+                            panic!("reference ACK postflight");
+                        }
+                        Err(Error::Conflict)
+                    },
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(effects.get(), 1);
+            assert!(retained.get());
+            assert!(state.acknowledged());
+            assert!(state
+                .run(
+                    || panic!("duplicate check"),
+                    || panic!("duplicate effect"),
+                    || Ok(())
+                )
+                .is_err());
+            assert_eq!(effects.get(), 1);
+        }
+    }
+
+    #[test]
+    fn closed_reference_failed_or_unwound_effect_never_becomes_an_ack() {
+        for unwind in [false, true] {
+            let state = ClosedReferenceRelease::new();
+            let effects = std::cell::Cell::new(0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.run(
+                    || Ok(()),
+                    || {
+                        effects.set(effects.get() + 1);
+                        if unwind {
+                            panic!("native reference return lost");
+                        }
+                        Err(Error::Native)
+                    },
+                    || panic!("must not mint ACK"),
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(!state.acknowledged());
+            assert!(state.was_attempted());
+            assert!(state
+                .run(|| Ok(()), || panic!("must not repeat"), || Ok(()))
+                .is_err());
+            assert_eq!(effects.get(), 1);
+        }
+    }
+
+    #[test]
+    fn closed_reference_reentry_caught_by_callback_still_denies_effect() {
+        let state = ClosedReferenceRelease::new();
+        assert!(state
+            .run(
+                || {
+                    assert!(state
+                        .run(|| Ok(()), || panic!("recursive effect"), || Ok(()))
+                        .is_err());
+                    Ok(())
+                },
+                || panic!("tainted effect"),
+                || Ok(())
+            )
+            .is_err());
+        assert!(!state.acknowledged());
+    }
+
     use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::atomic::AtomicBool};
     #[derive(Clone, Debug)]
     struct FullRow {
@@ -41,6 +132,15 @@ mod tests {
         fail_after_receive: bool,
         fail_after_start: bool,
         index_identity: Option<Identity>,
+        initial_description: Option<String>,
+        observed_stages: Vec<Stage>,
+        call_resources_held: bool,
+        panic_end: bool,
+        panic_start: bool,
+        fail_after_end: bool,
+        end_pin: Option<SessionEndRead>,
+        cancel_at_stage: Option<(Stage, Rc<AtomicBool>)>,
+        cancel_after_end: Option<Rc<AtomicBool>>,
     }
     #[derive(Clone)]
     struct Native(Rc<RefCell<State>>);
@@ -87,8 +187,21 @@ mod tests {
         type MutationLock = ();
         type Prerequisite<'p> = TestPrerequisite;
         fn verify(&mut self, _: &Binding, stage: Stage) -> Result<()> {
+            // Native installation resources acquired at an effect seam must
+            // remain held through the call, not through the session lifetime.
+            if matches!(
+                stage,
+                Stage::BeforeCreate | Stage::BeforeSession | Stage::BeforeEnd | Stage::BeforeClose
+            ) {
+                self.0.borrow_mut().call_resources_held = true;
+            }
             self.call("verify")?;
             self.0.borrow_mut().calls.push(format!("{stage:?}"));
+            if let Some((at, cancel)) = &self.0.borrow().cancel_at_stage {
+                if *at == stage {
+                    cancel.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
             if self.0.borrow().fail_stage == Some(stage) {
                 return Err(Error::Conflict);
             }
@@ -111,10 +224,14 @@ mod tests {
             Self::Key: 'p,
             Self::MutationLock: 'p,
         {
+            assert!(self.0.borrow().call_resources_held);
             self.call("create")?;
             let mut s = self.0.borrow_mut();
             s.present = true;
             s.row = Some(row());
+            if let Some(description) = s.initial_description.clone() {
+                s.row.as_mut().unwrap().identity.description = description;
+            }
             s.version = Some(14);
             Ok(Handle(1))
         }
@@ -139,13 +256,16 @@ mod tests {
         fn identity(&self, row: &FullRow) -> Result<Identity> {
             Ok(row.identity.clone())
         }
-        fn attest(&mut self, _: &Binding, _: &Identity) -> Result<()> {
+        fn attest(&mut self, _: &Binding, _: &Identity, stage: Stage) -> Result<()> {
+            self.0.borrow_mut().observed_stages.push(stage);
             self.call("provider")
         }
         fn start(&mut self, adapter: &Handle, capacity: u32) -> Result<Handle> {
+            assert!(self.0.borrow().call_resources_held);
             assert_eq!(adapter.0, 1);
             assert_eq!(capacity, 0x20000);
             self.call("start")?;
+            assert!(!self.0.borrow().panic_start, "unknown start return");
             if self.0.borrow().fail_after_start {
                 self.0.borrow_mut().fail = Some("row_luid");
             }
@@ -183,13 +303,25 @@ mod tests {
             self.0.borrow().clock
         }
         fn end(&mut self, session: Handle) {
+            assert!(self.0.borrow().call_resources_held);
             assert_eq!(session.0, 2);
             let mut s = self.0.borrow_mut();
             s.calls.push("end".into());
             s.ended += 1;
             s.clock += s.end_duration;
+            if let Some(pin) = &s.end_pin {
+                assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            }
+            if let Some(cancel) = &s.cancel_after_end {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if s.fail_after_end {
+                s.fail = Some("row_luid");
+            }
+            assert!(!s.panic_end, "unknown end return");
         }
         fn close(&mut self, adapter: Handle) {
+            assert!(self.0.borrow().call_resources_held);
             assert_eq!(adapter.0, 1);
             let mut s = self.0.borrow_mut();
             s.calls.push("close".into());
@@ -199,6 +331,9 @@ mod tests {
         }
         fn release_module(&mut self) -> Result<()> {
             self.call("unpin_module")
+        }
+        fn release_call_resources(&mut self) {
+            self.0.borrow_mut().call_resources_held = false;
         }
     }
     fn setup() -> (Native, Carrier<Native>) {
@@ -213,6 +348,491 @@ mod tests {
         fn close(&mut self) -> Result<()> {
             self.close_bounded(&AtomicBool::new(false), 1000)
         }
+    }
+
+    #[test]
+    fn acknowledged_end_retry_requires_fresh_authority_and_original_observation() {
+        // Break: an old VOID ACK bypasses a changed pending intent or native identity.
+        for authority_denied in [false, true] {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            let pin = c.session_end_read();
+            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            let ack = pin.acknowledged().unwrap();
+            if authority_denied {
+                n.0.borrow_mut().fail_stage = Some(Stage::BeforeEnd);
+            } else {
+                n.0.borrow_mut().drift = true;
+            }
+            assert_eq!(
+                c.end_session_bounded(&AtomicBool::new(false), 100),
+                Err(Error::Conflict)
+            );
+            pin.verify_acknowledged(&ack).unwrap(); // retained fact, not fresh permission
+            assert_eq!(n.0.borrow().ended, 1);
+            assert_eq!(n.0.borrow().closed, 0);
+            assert!(!n.0.borrow().call_resources_held);
+        }
+    }
+
+    #[test]
+    fn original_session_state_pin_distinguishes_live_unknown_and_consumed_outcomes() {
+        let (n, mut c) = setup();
+        let pin = c.session_end_read();
+        let alias = pin.read_pin();
+        pin.verify_never_started().unwrap();
+        alias.verify_no_live_session().unwrap();
+        assert_eq!(pin.verify_endable(), Err(Error::Pending));
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        assert_eq!(pin.verify_never_started(), Err(Error::Pending));
+        assert_eq!(alias.verify_no_live_session(), Err(Error::Pending));
+        pin.verify_endable().unwrap();
+        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        alias.verify_no_live_session().unwrap();
+        pin.verify_endable().unwrap();
+        assert_eq!(pin.verify_never_started(), Err(Error::Pending));
+        let ack = pin.acknowledged().unwrap();
+        alias.verify_acknowledged(&ack).unwrap();
+        c.close().unwrap();
+        pin.verify_no_live_session().unwrap();
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 1);
+    }
+
+    #[test]
+    fn registered_original_session_tracks_its_actual_carrier_and_rejects_replacement() {
+        let (_, mut c) = setup();
+        let (_, mut foreign) = setup();
+        let mut read = OriginalSessionRead::new();
+        assert_eq!(read.no_live_session(), Err(Error::Pending));
+        read.retain(c.session_end_read());
+        read.no_live_session().unwrap();
+        assert_eq!(read.endable(), Err(Error::Pending));
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        read.endable().unwrap();
+        assert_eq!(read.no_live_session(), Err(Error::Pending));
+        foreign.create(TestPrerequisite).unwrap();
+        foreign.start().unwrap();
+        foreign
+            .end_session_bounded(&AtomicBool::new(false), 100)
+            .unwrap();
+        // A foreign equal identity with a real end ACK cannot replace ours.
+        read.retain(foreign.session_end_read());
+        assert_eq!(read.no_live_session(), Err(Error::Pending));
+        assert_eq!(read.endable(), Err(Error::Pending));
+        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        assert_eq!(read.no_live_session(), Err(Error::Pending)); // sticky invalid
+    }
+    #[test]
+    fn upgraded_gate_retains_same_live_bootstrap_session_without_restarting_or_adopting() {
+        let (n, mut carrier) = setup();
+        carrier.create(TestPrerequisite).unwrap();
+        carrier.start().unwrap();
+        let original = carrier.session_end_read();
+        let mut gate = OriginalSessionRead::new();
+        gate.retain_handoff(original.read_pin());
+        gate.live().unwrap();
+        assert_eq!(gate.no_live_session(), Err(Error::Pending));
+        carrier
+            .end_session_bounded(&AtomicBool::new(false), 100)
+            .unwrap();
+        gate.endable().unwrap();
+        gate.no_live_session().unwrap();
+        assert_eq!(gate.live(), Err(Error::Pending));
+        let mut ended = OriginalSessionRead::new();
+        ended.retain_handoff(original.read_pin());
+        ended.endable().unwrap();
+        assert_eq!(ended.live(), Err(Error::Pending));
+        ended.retain_handoff(original); // even SAME replacement remains denied
+        assert_eq!(ended.endable(), Err(Error::Pending));
+        let (_, never) = setup();
+        let mut unknown = OriginalSessionRead::new();
+        unknown.retain_handoff(never.session_end_read());
+        assert_eq!(unknown.endable(), Err(Error::Pending));
+        assert_eq!(n.0.borrow().ended, 1);
+    }
+
+    #[test]
+    fn registered_original_session_requires_initial_state_and_stays_bound_after_end() {
+        for late in [false, true] {
+            let (_, mut c) = setup();
+            let mut read = OriginalSessionRead::new();
+            if !late {
+                read.retain(c.session_end_read());
+            }
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            if late {
+                read.retain(c.session_end_read());
+                assert_eq!(read.no_live_session(), Err(Error::Pending));
+            } else {
+                read.no_live_session().unwrap();
+                read.endable().unwrap();
+                c.close().unwrap();
+                read.no_live_session().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn original_session_state_pin_never_promotes_unknown_start_or_end_to_absence() {
+        for unknown_start in [true, false] {
+            let (n, mut c) = setup();
+            let pin = c.session_end_read();
+            c.create(TestPrerequisite).unwrap();
+            if unknown_start {
+                n.0.borrow_mut().panic_start = true;
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.start())).is_err()
+                );
+            } else {
+                c.start().unwrap();
+                n.0.borrow_mut().panic_end = true;
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || c.end_session_bounded(&AtomicBool::new(false), 100)
+                ))
+                .is_err());
+            }
+            assert_eq!(pin.verify_never_started(), Err(Error::Pending));
+            assert_eq!(pin.verify_no_live_session(), Err(Error::Pending));
+            assert_eq!(pin.verify_endable(), Err(Error::Pending));
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            assert_eq!(n.0.borrow().closed, 0);
+        }
+    }
+
+    #[test]
+    fn foreign_equal_session_without_native_start_cannot_mask_original_live_session() {
+        let (_, mut original) = setup();
+        let (_, foreign) = setup();
+        let pin = original.session_end_read();
+        let foreign_pin = foreign.session_end_read();
+        original.create(TestPrerequisite).unwrap();
+        original.start().unwrap();
+        foreign_pin.verify_never_started().unwrap();
+        foreign_pin.verify_no_live_session().unwrap();
+        assert_eq!(pin.verify_no_live_session(), Err(Error::Pending));
+        pin.verify_endable().unwrap();
+    }
+
+    #[test]
+    fn separate_end_retains_original_adapter_and_module_then_close_never_reends() {
+        // Break: authorizing CloseAdapter from the durable EndSession operation.
+        let (n, mut c) = setup();
+        let pin = c.session_end_read();
+        let alias = pin.read_pin();
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        n.0.borrow_mut().end_pin = Some(alias.read_pin());
+        n.0.borrow_mut().calls.clear();
+        n.0.borrow_mut().observed_stages.clear();
+        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        let ack = pin.acknowledged().unwrap();
+        alias.verify_acknowledged(&ack).unwrap();
+        assert_eq!(c.phase(), Phase::Closing);
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 0);
+        assert!(n.0.borrow().present);
+        assert!(!n
+            .0
+            .borrow()
+            .calls
+            .iter()
+            .any(|s| s == "unpin_module" || s == "BeforeClose"));
+        assert_eq!(n.0.borrow().observed_stages, [Stage::CleanupObserve; 2]);
+        assert_eq!(c.captured().unwrap().identity, row().identity);
+        assert!(!n.0.borrow().call_resources_held);
+        let observations = n.0.borrow().observed_stages.len();
+        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        assert_eq!(n.0.borrow().observed_stages.len(), observations + 1);
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 0);
+        assert_eq!(c.start(), Err(Error::Pending));
+        assert_eq!(
+            c.drain(&AtomicBool::new(false), 100, 1),
+            Err(Error::Pending)
+        );
+        c.close().unwrap();
+        c.close().unwrap();
+        pin.verify_acknowledged(&ack).unwrap();
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 1);
+        assert_eq!(
+            n.0.borrow()
+                .calls
+                .iter()
+                .filter(|s| *s == "unpin_module")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn separate_end_deadline_after_void_return_preserves_ack_and_original_adapter() {
+        // Break: a post-return timeout hides actual native completion or closes.
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        let pin = c.session_end_read();
+        n.0.borrow_mut().end_duration = 100;
+        assert_eq!(
+            c.end_session_bounded(&AtomicBool::new(false), 100),
+            Err(Error::Deadline)
+        );
+        let ack = pin.acknowledged().unwrap();
+        pin.verify_acknowledged(&ack).unwrap();
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 0);
+        assert!(n.0.borrow().present);
+        assert!(!n.0.borrow().call_resources_held);
+        assert!(!n.0.borrow().calls.iter().any(|s| s == "unpin_module"));
+        c.close().unwrap();
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 1);
+    }
+
+    #[test]
+    fn separate_end_fallible_postflight_or_cancel_cannot_erase_void_ack() {
+        for postflight_error in [true, false] {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            let pin = c.session_end_read();
+            let cancel = Rc::new(AtomicBool::new(false));
+            if postflight_error {
+                n.0.borrow_mut().fail_after_end = true;
+            } else {
+                n.0.borrow_mut().cancel_after_end = Some(cancel.clone());
+            }
+            assert_eq!(
+                c.end_session_bounded(&cancel, 100),
+                Err(if postflight_error {
+                    Error::Native
+                } else {
+                    Error::Cancelled
+                })
+            );
+            let ack = pin.acknowledged().unwrap();
+            pin.verify_acknowledged(&ack).unwrap();
+            assert_eq!(n.0.borrow().closed, 0);
+            assert!(!n.0.borrow().call_resources_held);
+            n.0.borrow_mut().fail = None;
+            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.close().unwrap();
+            assert_eq!(n.0.borrow().ended, 1);
+            assert_eq!(n.0.borrow().closed, 1);
+        }
+    }
+
+    #[test]
+    fn separate_end_before_end_denial_and_pre_effect_cancellation_have_no_effects() {
+        for mode in 0..4 {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            let pin = c.session_end_read();
+            let cancel = Rc::new(AtomicBool::new(mode == 2));
+            let expected = match mode {
+                0 => {
+                    n.0.borrow_mut().fail_stage = Some(Stage::BeforeEnd);
+                    Error::Conflict
+                }
+                1 => {
+                    n.0.borrow_mut().fail_stage = Some(Stage::CleanupObserve);
+                    Error::Conflict
+                }
+                _ => Error::Cancelled,
+            };
+            if mode == 3 {
+                n.0.borrow_mut().cancel_at_stage = Some((Stage::BeforeEnd, cancel.clone()));
+            }
+            assert_eq!(c.end_session_bounded(&cancel, 100), Err(expected));
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            assert_eq!(n.0.borrow().ended, 0);
+            assert_eq!(n.0.borrow().closed, 0);
+            assert!(!n.0.borrow().call_resources_held);
+            assert!(!n.0.borrow().calls.iter().any(|s| s == "unpin_module"));
+            n.0.borrow_mut().fail_stage = None;
+            n.0.borrow_mut().cancel_at_stage = None;
+            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.close().unwrap();
+            assert_eq!(n.0.borrow().ended, 1);
+        }
+    }
+
+    #[test]
+    fn caught_kernel_end_unwind_stays_pending_and_refuses_end_and_close() {
+        // Break: session.take() + Closing falsely becomes a successful end ACK.
+        for separate in [false, true] {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            let pin = c.session_end_read();
+            n.0.borrow_mut().panic_end = true;
+            n.0.borrow_mut().end_pin = Some(pin.read_pin());
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if separate {
+                    c.end_session_bounded(&AtomicBool::new(false), 100)
+                } else {
+                    c.close()
+                }
+            }));
+            assert!(caught.is_err());
+            assert!(!n.0.borrow().call_resources_held);
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            n.0.borrow_mut().panic_end = false;
+            assert_eq!(
+                c.end_session_bounded(&AtomicBool::new(false), 100),
+                Err(Error::Pending)
+            );
+            assert_eq!(c.close(), Err(Error::Pending));
+            assert_eq!(n.0.borrow().ended, 1);
+            assert_eq!(n.0.borrow().closed, 0);
+            assert!(n.0.borrow().present);
+            let calls = n.0.borrow().calls.clone();
+            drop(c);
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            assert_eq!(n.0.borrow().calls, calls);
+        }
+    }
+
+    #[test]
+    fn foreign_end_ack_cannot_complete_unended_original_or_its_read_alias() {
+        // Numeric identities are deliberately equal; only the private Rc agrees.
+        let (n, mut c) = setup();
+        let (_, mut foreign) = setup();
+        for owner in [&mut c, &mut foreign] {
+            owner.create(TestPrerequisite).unwrap();
+            owner.start().unwrap();
+        }
+        let pin = c.session_end_read();
+        let alias = pin.read_pin();
+        let foreign_pin = foreign.session_end_read();
+        foreign
+            .end_session_bounded(&AtomicBool::new(false), 100)
+            .unwrap();
+        let foreign_ack = foreign_pin.acknowledged().unwrap();
+        assert_eq!(pin.verify_acknowledged(&foreign_ack), Err(Error::Conflict));
+        assert_eq!(
+            alias.verify_acknowledged(&foreign_ack),
+            Err(Error::Conflict)
+        );
+        assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+        assert!(matches!(alias.acknowledged(), Err(Error::Pending)));
+        assert_eq!(n.0.borrow().ended, 0);
+        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        let ack = alias.acknowledged().unwrap();
+        assert_eq!(foreign_pin.verify_acknowledged(&ack), Err(Error::Conflict));
+        pin.verify_acknowledged(&ack).unwrap();
+    }
+
+    #[test]
+    fn never_started_partial_bootstrap_closes_without_fabricating_session_end_ack() {
+        for created in [false, true] {
+            let (n, mut c) = setup();
+            let pin = c.session_end_read();
+            if created {
+                c.create(TestPrerequisite).unwrap();
+            }
+            assert_eq!(
+                c.end_session_bounded(&AtomicBool::new(false), 100),
+                Err(Error::Pending)
+            );
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            c.close().unwrap();
+            assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+            assert_eq!(n.0.borrow().ended, 0);
+            assert_eq!(n.0.borrow().closed, u32::from(created));
+        }
+    }
+
+    #[test]
+    fn unknown_session_start_cannot_be_treated_as_never_started_cleanup() {
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        n.0.borrow_mut().panic_start = true;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.start()));
+        assert!(caught.is_err());
+        assert_eq!(c.close(), Err(Error::Pending));
+        assert_eq!(n.0.borrow().closed, 0);
+        assert_eq!(n.0.borrow().ended, 0);
+        assert!(matches!(
+            c.session_end_read().acknowledged(),
+            Err(Error::Pending)
+        ));
+    }
+
+    #[test]
+    fn returned_start_failure_without_native_session_preserves_adapter_only_cleanup() {
+        // Kernel::start returned Err before starting (native equivalent: NULL),
+        // so close must retain its established never-started cleanup behavior.
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        let pin = c.session_end_read();
+        n.0.borrow_mut().fail = Some("start");
+        assert_eq!(c.start(), Err(Error::Native));
+        n.0.borrow_mut().fail = None;
+        assert_eq!(c.start(), Err(Error::Pending));
+        c.close().unwrap();
+        assert_eq!(n.0.borrow().ended, 0);
+        assert_eq!(n.0.borrow().closed, 1);
+        assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
+    }
+
+    #[test]
+    fn separate_end_invalid_bounds_never_reach_effects() {
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        let calls = n.0.borrow().calls.clone();
+        for ms in [0, 1001] {
+            assert_eq!(
+                c.end_session_bounded(&AtomicBool::new(false), ms),
+                Err(Error::Invalid)
+            );
+            assert_eq!(n.0.borrow().calls, calls);
+        }
+    }
+
+    #[test]
+    fn owned_authority_holder_retains_local_resource_and_delegates_to_same_owner_after_move() {
+        // Portable test of the production holder, NOT native authority proof.
+        // Losing ownership or delegating to a replacement would break this test.
+        struct Resource<'a> {
+            pin: Rc<()>,
+            calls: &'a std::cell::Cell<u32>,
+        }
+        let calls = std::cell::Cell::new(0);
+        let pin = Rc::new(());
+        let weak = Rc::downgrade(&pin);
+        let holder = {
+            let owner = Resource { pin, calls: &calls };
+            subject::AuthorityHolder::Owned(owner)
+        };
+        let mut moved = holder;
+        for expected in [1, 2] {
+            let actual = moved.as_mut();
+            assert!(Rc::ptr_eq(&actual.pin, &weak.upgrade().unwrap()));
+            actual.calls.set(actual.calls.get() + 1);
+            assert_eq!(calls.get(), expected);
+        }
+        assert_eq!(weak.strong_count(), 1);
+        drop(moved);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn borrowed_authority_holder_returns_original_borrow_without_consuming_owner() {
+        let mut owner = Box::new(41_u32);
+        {
+            let mut holder = subject::AuthorityHolder::Borrowed(&mut owner);
+            **holder.as_mut() += 1;
+        }
+        assert_eq!(*owner, 42);
     }
 
     #[test]
@@ -236,6 +856,97 @@ mod tests {
             calls.iter().position(|s| s == "provider").unwrap()
                 < calls.iter().position(|s| s == "start").unwrap()
         );
+    }
+
+    #[test]
+    fn installation_resources_are_released_between_completed_carrier_operations() {
+        // Break: retaining Device+Driver locks for the carrier lifetime stalls
+        // independent member driver creation in the other process.
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        assert!(!n.0.borrow().call_resources_held);
+        c.start().unwrap();
+        assert!(!n.0.borrow().call_resources_held);
+        assert_eq!(c.phase(), Phase::Session);
+        c.close().unwrap();
+        assert!(!n.0.borrow().call_resources_held);
+        assert_eq!(n.0.borrow().closed, 1);
+    }
+
+    #[test]
+    fn failed_pre_effect_read_releases_installation_resources_without_closing_original() {
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        n.0.borrow_mut().fail = Some("row_luid");
+        assert!(c.start().is_err());
+        assert!(!n.0.borrow().call_resources_held);
+        assert_eq!(n.0.borrow().closed, 0);
+        assert_eq!(n.0.borrow().ended, 0);
+        assert_eq!(c.phase(), Phase::Created);
+    }
+
+    #[test]
+    fn call_resource_bracket_releases_real_lock_on_error_or_unwind_but_keeps_original_pin() {
+        // Exercise the production bracket with an actual host mutex/retained
+        // resource. This does not pretend to execute a Windows native lease.
+        struct Owner<'a> {
+            lease: Option<std::sync::MutexGuard<'a, ()>>,
+            original: Rc<()>,
+        }
+        impl subject::CallResources for Owner<'_> {
+            fn release_call_resources(&mut self) {
+                self.lease.take();
+            }
+        }
+        for unwind in [false, true] {
+            let mutex = std::sync::Mutex::new(());
+            let original = Rc::new(());
+            let weak = Rc::downgrade(&original);
+            let mut owner = Owner {
+                lease: Some(mutex.lock().unwrap()),
+                original,
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                subject::with_call_resources(&mut owner, |held| -> Result<()> {
+                    assert!(held.lease.is_some());
+                    assert!(matches!(
+                        mutex.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ));
+                    if unwind {
+                        panic!("uncertain native boundary");
+                    }
+                    Err(Error::Native)
+                })
+            }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), Err(Error::Native));
+            }
+            assert!(owner.lease.is_none());
+            assert!(!matches!(
+                mutex.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert!(Rc::ptr_eq(&owner.original, &weak.upgrade().unwrap()));
+            drop(owner);
+            assert!(weak.upgrade().is_none());
+        }
+    }
+    #[test]
+    fn original_duplicate_description_is_captured_whole_and_cannot_drift() {
+        let (n, mut c) = setup();
+        n.0.borrow_mut().initial_description = Some("Nelomai carrier Tunnel #2".into());
+        c.create(TestPrerequisite).unwrap();
+        assert_eq!(
+            c.captured().unwrap().identity.description,
+            "Nelomai carrier Tunnel #2"
+        );
+        c.start().unwrap();
+        n.0.borrow_mut().row.as_mut().unwrap().identity.description =
+            "Nelomai carrier Tunnel #3".into();
+        assert!(c.reattest().is_err());
     }
     #[test]
     fn independent_foreign_name_or_guid_never_creates_or_adopts() {
@@ -454,6 +1165,41 @@ mod tests {
         }
     }
     #[test]
+    fn independently_authorized_close_does_not_require_revoked_forward_observation() {
+        // A current Closing record authorizes only cleanup. Forward Observe
+        // must keep failing: clearing that denial to get Stop working is unsafe.
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        n.0.borrow_mut().fail_stage = Some(Stage::Observe);
+        assert_eq!(c.reattest().map(|_| ()), Err(Error::Conflict));
+        n.0.borrow_mut().observed_stages.clear();
+        c.close().unwrap();
+        assert_eq!(c.phase(), Phase::Closed);
+        assert_eq!(n.0.borrow().ended, 1);
+        assert_eq!(n.0.borrow().closed, 1);
+        assert_eq!(n.0.borrow().observed_stages, [Stage::CleanupObserve; 4]);
+        assert_eq!(c.reattest().map(|_| ()), Err(Error::Retired));
+    }
+
+    #[test]
+    fn cleanup_observation_denial_retains_original_session_and_adapter() {
+        let (n, mut c) = setup();
+        c.create(TestPrerequisite).unwrap();
+        c.start().unwrap();
+        n.0.borrow_mut().fail_stage = Some(Stage::CleanupObserve);
+        assert_eq!(c.close(), Err(Error::Conflict));
+        assert_eq!(n.0.borrow().ended, 0);
+        assert_eq!(n.0.borrow().closed, 0);
+        assert!(n.0.borrow().present);
+        // Cleanup failure must not permit any subsequent forward progress.
+        assert_eq!(
+            c.drain(&AtomicBool::new(false), 100, 2),
+            Err(Error::Pending)
+        );
+    }
+
+    #[test]
     fn native_drain_fault_is_permanently_cleanup_only_even_after_boundary_recovers() {
         for fault in [
             "verify",
@@ -532,6 +1278,33 @@ mod tests {
         assert_eq!(c.captured().unwrap().counters, [4; 20]);
     }
     #[test]
+    fn original_observation_failure_cannot_rearm_live_creator_after_native_recovers() {
+        for fault in ["verify", "luid", "row_luid", "row_index", "provider"] {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            c.start().unwrap();
+            n.0.borrow_mut().fail = Some(fault);
+            assert!(c.reattest().is_err(), "{fault}");
+            n.0.borrow_mut().fail = None;
+            let calls = n.0.borrow().calls.clone();
+            assert!(c.reattest().is_err(), "revocation {fault}");
+            assert_eq!(
+                n.0.borrow().calls,
+                calls,
+                "cached creator cannot be rearmed"
+            );
+            assert_eq!(
+                c.drain(&AtomicBool::new(false), 100, 2),
+                Err(Error::Pending)
+            );
+            // Cleanup still uses the SAME original handles and fresh capture,
+            // never the revoked live observation or reopening an interface.
+            c.close().unwrap();
+            assert_eq!(n.0.borrow().closed, 1);
+            assert_eq!(n.0.borrow().ended, 1);
+        }
+    }
+    #[test]
     fn each_immutable_identity_drift_and_index_query_disagreement_blocks_destruction() {
         let mut changes = vec![];
         for field in 0..7 {
@@ -599,7 +1372,7 @@ mod tests {
     #[test]
     fn every_teardown_authority_stage_retains_correct_remaining_capabilities() {
         for (stage, ended, closed) in [
-            (Stage::Observe, 0, 0),
+            (Stage::CleanupObserve, 0, 0),
             (Stage::BeforeEnd, 0, 0),
             (Stage::BeforeClose, 1, 0),
             (Stage::AfterClose, 1, 1),

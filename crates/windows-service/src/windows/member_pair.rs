@@ -899,12 +899,33 @@ pub(crate) struct NativePairFactory<F: SessionFiles> {
     runtime: RuntimeSlot,
     engine: PathBuf,
     executor: Rc<tokio::runtime::Runtime>,
+    root: PathBuf,
+    owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Discovery is retained BEFORE signed/private postflight. A failed native
+    // selection must never fall through the legacy recovery decoder.
+    recovery_entry: Option<Rc<super::member_carrier_recovery::native::NativeFactoryRecoveryEntry>>,
+    // Retain actual cleanup composition BEFORE its first static BFE effect.
+    // Full native emptiness/claim retirement remain independent requirements.
+    recovery_guard: Option<Rc<super::member_carrier_recovery_guard::NativeColdGuardCleanup>>,
+    execution: crate::install_recovery::RecoveryExecutable,
 }
 impl<F: SessionFiles> NativePairFactory<F> {
-    pub(crate) fn new(files: F, runtime: RuntimeSlot, trusted_engine: &Path) -> io::Result<Self> {
-        if tokio::runtime::Handle::try_current().is_ok() || !trusted_engine.is_absolute() {
+    pub(crate) fn new(
+        files: F,
+        runtime: RuntimeSlot,
+        trusted_engine: &Path,
+        root: &Path,
+        owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> io::Result<Self> {
+        if tokio::runtime::Handle::try_current().is_ok()
+            || !trusted_engine.is_absolute()
+            || !root.is_absolute()
+        {
             return Err(failed());
         }
+        owner.verify_at(&root.join("engine-owner.lock"))?;
         let engine = std::fs::canonicalize(trusted_engine)?;
         if !crate::member_pair::canonical_engine_matches(trusted_engine, &engine) {
             return Err(failed());
@@ -912,12 +933,23 @@ impl<F: SessionFiles> NativePairFactory<F> {
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        Ok(Self {
+        let factory = Self {
             files,
             runtime,
             engine,
             executor: Rc::new(executor),
-        })
+            root: root.to_owned(),
+            owner,
+            cancelled,
+            recovery_entry: None,
+            recovery_guard: None,
+            execution: crate::install_recovery::RecoveryExecutable::Engine,
+        };
+        factory.verify_service_owner()?;
+        Ok(factory)
+    }
+    fn verify_service_owner(&self) -> io::Result<()> {
+        self.owner.verify_at(&self.root.join("engine-owner.lock"))
     }
     fn complete_unrecorded_claim(
         &mut self,
@@ -1099,11 +1131,10 @@ impl<F: SessionFiles> NativePairFactory<F> {
         files.complete(scope)
     }
 }
-impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
-    type Native = NativeWindowsPair<F>;
-    type Store = CompletedSessionStore<F>;
-    fn recover(&mut self, runtime: RuntimeSlot) -> Result<(), crate::ServiceError> {
+impl<F: SessionFiles> NativePairFactory<F> {
+    fn recover_legacy(&mut self, runtime: RuntimeSlot) -> io::Result<()> {
         (|| -> io::Result<()> {
+            self.verify_service_owner()?;
             if runtime != self.runtime {
                 return Err(failed());
             }
@@ -1177,7 +1208,65 @@ impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
                 state_store.save(&stopped_after_cleanup(&scope, saved)?)?;
                 files.complete(&scope)?;
             }
-            self.retire_completed_members()
+            self.retire_completed_members()?;
+            self.verify_service_owner()
+        })()
+    }
+}
+impl PairFactory for NativePairFactory<NativeSessionFiles> {
+    type Native = NativeWindowsPair<NativeSessionFiles>;
+    type Store = CompletedSessionStore<NativeSessionFiles>;
+    fn recover(&mut self, runtime: RuntimeSlot) -> Result<(), crate::ServiceError> {
+        (|| {
+            self.verify_service_owner()?;
+            if runtime != self.runtime
+                || self.recovery_entry.is_some()
+                || self.recovery_guard.is_some()
+            {
+                return Err(failed());
+            }
+            let entry = Rc::new(
+                super::member_carrier_recovery::native::NativeFactoryRecoveryEntry::new(
+                    &self.root,
+                    self.owner.clone(),
+                    self.files.clone(),
+                    runtime,
+                    self.execution.clone(),
+                ),
+            );
+            self.recovery_entry = Some(entry.clone());
+            match entry.classify()? {
+                Some(super::member_carrier_recovery::RecoveryLayout::NativeCarrier) => {
+                    if entry.retained_facts()?.guard.is_some() {
+                        let cleanup = Rc::new(
+                            super::member_carrier_recovery_guard::NativeColdGuardCleanup::new(
+                                entry.clone(),
+                            )?,
+                        );
+                        self.recovery_guard = Some(cleanup.clone());
+                        cleanup.cleanup()?;
+                    }
+                    // Independent readonly FULL EMPTY, then original protected
+                    // index retirement only. No legacy projection or SDK ACK
+                    // reconstruction. Failure retains this SAME entry/root.
+                    entry.retire_cold_native()?;
+                    entry.verify()?;
+                    self.verify_service_owner()?;
+                    // Release the NEW current-engine hard-call owner only
+                    // after independent full EMPTY and storage retirement.
+                    self.recovery_guard.take();
+                    self.recovery_entry.take();
+                    return Ok(());
+                }
+                None
+                | Some(super::member_carrier_recovery::RecoveryLayout::LegacyOnly)
+                | Some(super::member_carrier_recovery::RecoveryLayout::UnpublishedClaim) => {}
+            }
+            self.recover_legacy(runtime)?;
+            entry.verify()?;
+            self.verify_service_owner()?;
+            self.recovery_entry.take();
+            Ok(())
         })()
         .map_err(|e| crate::member_actor::operation_failed("recovery", e))
     }
@@ -1187,9 +1276,14 @@ impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
         command: &Command,
         now: u64,
     ) -> io::Result<SessionControl<Self::Native, Self::Store>> {
-        if runtime != self.runtime || tokio::runtime::Handle::try_current().is_ok() {
-            return Err(failed());
-        }
+        self.execution.require_engine()?;
+        require_factory_start_context(
+            runtime,
+            self.runtime,
+            tokio::runtime::Handle::try_current().is_ok(),
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        )?;
+        self.verify_service_owner()?;
         command.validate(runtime)?;
         let Command::Start { scope, primary, .. } = command else {
             return Err(failed());
@@ -1199,7 +1293,16 @@ impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
             crate::ServiceError::PairOperation(failure) => io::Error::other(failure),
             _ => context("recovery", failed()),
         })?;
+        // Recovery can outlast an EOF delivered by the independent sole reader.
+        // Recheck before durable claim; cancellation never grants cleanup.
+        require_factory_start_context(
+            runtime,
+            self.runtime,
+            tokio::runtime::Handle::try_current().is_ok(),
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        )?;
         self.files.claim(scope)?;
+        self.verify_service_owner()?;
         let (pair_store, old) =
             WindowsPairStore::open(self.files.clone(), scope.clone(), RecordKind::Pair)?;
         if old.is_some() {
@@ -1238,6 +1341,77 @@ pub(crate) struct CompletedSessionStore<F: SessionFiles> {
     scope: SessionScope,
     completion: CompletionState,
 }
+
+/// Concrete initial-NoC completion ONLY. This is not a legacy-store upgrade or
+/// a native factory selector. The caller roots it before transferring the SAME
+/// Startup into the actor; only that Startup can bind completed native NoC.
+/// A Stopped snapshot schedules callbacks but cannot authenticate retirement.
+#[allow(dead_code)] // Factory remains disabled until the remaining native gates close.
+pub(crate) struct NativeInitialDataSessionStore {
+    store: WindowsSessionStore<NativeSessionFiles>,
+    files: NativeSessionFiles,
+    scope: SessionScope,
+    original: Option<Rc<super::member_carrier_startup::native::NativeNoCInitialDataRetirement>>,
+    completion: InitialDataCompletionState,
+}
+#[allow(dead_code)]
+impl NativeInitialDataSessionStore {
+    pub(crate) fn retain_from_startup_into(
+        startup: &super::member_carrier_startup::native::NativeStartupRoot,
+        store: WindowsSessionStore<NativeSessionFiles>,
+        files: NativeSessionFiles,
+        destination: &mut Option<Self>,
+    ) -> io::Result<()> {
+        if destination.is_some() {
+            return Err(failed());
+        }
+        let original = startup
+            .initial_data_retirement_root()
+            .map_err(|_| failed())?;
+        *destination = Some(Self {
+            scope: startup.context().intent.scope.clone(),
+            store,
+            files,
+            original: Some(original),
+            completion: InitialDataCompletionState::default(),
+        });
+        // The SAME backend/execution identity is authenticated by the actual
+        // original initial DATA pin during retirement, not equal scope alone.
+        Ok(())
+    }
+}
+impl SessionStore for NativeInitialDataSessionStore {
+    fn save(
+        &mut self,
+        snapshot: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+    ) -> io::Result<()> {
+        let original = self.original.as_ref().cloned();
+        self.completion.save(
+            &self.scope,
+            snapshot,
+            |snapshot| self.store.save(snapshot),
+            || {
+                original
+                    .as_ref()
+                    .ok_or_else(failed)?
+                    .retire()
+                    .map_err(|_| failed())
+            },
+            |scope| self.files.complete(scope),
+            || {
+                original
+                    .as_ref()
+                    .ok_or_else(failed)?
+                    .release_retired_originals()
+                    .map_err(|_| failed())
+            },
+        )?;
+        if snapshot.phase == nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped {
+            self.original.take(); // only after ALL actual callbacks returned ACK
+        }
+        Ok(())
+    }
+}
 impl<F: SessionFiles> SessionStore for CompletedSessionStore<F> {
     fn save(
         &mut self,
@@ -1252,16 +1426,49 @@ impl<F: SessionFiles> SessionStore for CompletedSessionStore<F> {
     }
 }
 impl NativePairFactory<NativeSessionFiles> {
-    /// Called by the authenticated engine owner while holding its mutation lock.
-    pub(crate) fn from_service(
+    /// Cleanup-only installer: source is derived from the validated installed
+    /// client location, never IPC. Actual classification rechecks its signed
+    /// package/current executable and the OLD full installed layout each edge.
+    pub(crate) fn from_installer_cleanup(
+        root: &Path,
         identity: nelomai_contracts::dispatcher::EngineIdentity,
         engine: &Path,
+        owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
+        execution: crate::install_recovery::RecoveryExecutable,
     ) -> io::Result<Self> {
+        if matches!(
+            execution,
+            crate::install_recovery::RecoveryExecutable::Engine
+        ) {
+            return Err(failed());
+        }
+        let mut factory = Self::from_service(
+            root,
+            identity,
+            engine,
+            owner,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )?;
+        factory.execution = execution;
+        Ok(factory)
+    }
+    /// Called by the authenticated engine owner while holding its mutation lock.
+    pub(crate) fn from_service(
+        root: &Path,
+        identity: nelomai_contracts::dispatcher::EngineIdentity,
+        engine: &Path,
+        owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> io::Result<Self> {
+        if !root.is_absolute() {
+            return Err(failed());
+        }
+        owner.verify_at(&root.join("engine-owner.lock"))?;
         let runtime = identity.slot;
         let boot = super::member_boot::boot_id()?;
         let files =
             ProtectedSessionFiles::new(MemberFiles::new().map_err(|_| failed())?, identity, boot)?;
-        Self::new(files, runtime, engine)
+        Self::new(files, runtime, engine, root, owner, cancelled)
     }
 }
 

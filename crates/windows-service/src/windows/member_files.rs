@@ -26,9 +26,11 @@ pub(crate) enum PrivateFile {
     Network,
     Carrier,
     NativeCarrierReceipts,
+    CarrierGuard,
     CarrierRows,
     MemberARows,
     MemberBRows,
+    NativeCreator,
     /// SHA256 of the canonical SessionScope, computed by the trusted adapter.
     /// Never accepts a path component or text from IPC.
     Completed([u8; 32]),
@@ -42,9 +44,11 @@ impl PrivateFile {
             Self::Network => "nelomai-redundant-network.json".into(),
             Self::Carrier => "nelomai-redundant-carrier.json".into(),
             Self::NativeCarrierReceipts => "nelomai-redundant-native-carrier-receipts.json".into(),
+            Self::CarrierGuard => "nelomai-redundant-carrier-guard.json".into(),
             Self::CarrierRows => "nelomai-redundant-carrier-rows.json".into(),
             Self::MemberARows => "nelomai-redundant-member-a-rows.json".into(),
             Self::MemberBRows => "nelomai-redundant-member-b-rows.json".into(),
+            Self::NativeCreator => "nelomai-redundant-native-creator.json".into(),
             Self::Completed(hash) => format!(
                 "nelomai-redundant-completed-{}.json",
                 hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -56,7 +60,9 @@ impl PrivateFile {
             Self::Index => 8192,
             Self::Completed(_) => 4096,
             Self::Carrier
+            | Self::NativeCreator
             | Self::NativeCarrierReceipts
+            | Self::CarrierGuard
             | Self::CarrierRows
             | Self::MemberARows
             | Self::MemberBRows => 64 * 1024,
@@ -340,6 +346,17 @@ fn prepare_journal_replace(
     decode_journal(slot, &bytes)?;
     Ok(bytes)
 }
+/// Storage-only terminal DATA plan, never native Stop/Closed ownership.
+/// Its production consumer requires the separate full cold native bracket.
+pub(crate) fn cold_member_retirement_payload(slot: TunnelSlot, original: &[u8]) -> Result<Vec<u8>> {
+    let mut record = decode_journal(slot, original)?;
+    record.phase = Phase::Stopped;
+    record.proof = None;
+    record.retired_proof = None;
+    let bytes = serde_json::to_vec(&record).map_err(|_| OwnerError::Journal)?;
+    decode_journal(slot, &bytes)?;
+    Ok(bytes)
+}
 fn canonical_config(bytes: &[u8]) -> Result<()> {
     if bytes.len() > crate::MAX_FRAME_SIZE || bytes.contains(&0) {
         return Err(OwnerError::Invalid);
@@ -399,7 +416,8 @@ fn exact_config_slot(
 
 #[cfg(windows)]
 pub(crate) use native::{
-    pin_private_directory, pin_recovery_marker, pin_runtime_payload, MemberFiles, PinnedPayload,
+    create_private_child, pin_private_directory, pin_recovery_marker, pin_runtime_payload,
+    ColdMemberStorageAck, MemberFiles, PinnedDirectory, PinnedPayload,
 };
 
 #[cfg(windows)]
@@ -684,6 +702,30 @@ mod native {
     pub(crate) fn pin_private_directory(root: &Path) -> Result<PinnedDirectory> {
         pin_directory_chain(root, Protection::Directory)
     }
+    /// Exclusively create one new child beneath an already private pinned root.
+    /// Existing paths are never adopted or chmod-repaired by this operation.
+    pub(crate) fn create_private_child(
+        parent: &PinnedDirectory,
+        path: &Path,
+    ) -> Result<PinnedDirectory> {
+        parent.verify()?;
+        let original = parent.0.last().ok_or(OwnerError::Invalid)?;
+        if original.protection != Protection::Directory
+            || path.parent() != Some(original.path.as_path())
+            || path.file_name().is_none()
+        {
+            return Err(OwnerError::Invalid);
+        }
+        let security = Security::new(DIRECTORY_SDDL)?;
+        let path_wide = wide(path)?;
+        if unsafe { CreateDirectoryW(path_wide.as_ptr(), &security.attributes()) } == 0 {
+            return Err(OwnerError::Native);
+        }
+        // The new directory is retained on any later failure; no recursive
+        // rollback can touch an existing/foreign tree.
+        parent.verify()?;
+        pin_private_directory(path)
+    }
     fn pin_directory_chain(root: &Path, leaf: Protection) -> Result<PinnedDirectory> {
         let paths: Vec<_> = root.ancestors().map(Path::to_path_buf).collect();
         let drive = wide(paths.last().ok_or(OwnerError::Invalid)?)?;
@@ -816,6 +858,24 @@ mod native {
         stamp: Stamp,
         acl: Acl,
     }
+    /// Original private rename attempt/ACK, not an imported native Stop ACK.
+    /// The caller retains this before rename; only successful MoveFileEx sets
+    /// acknowledged, before any target readback or directory postflight.
+    pub(crate) struct ColdMemberStorageAck {
+        acknowledged: std::cell::Cell<bool>,
+        _old_file: ReadFile,
+        archive: PinnedPayload,
+        source: ReadFile,
+    }
+    impl ColdMemberStorageAck {
+        pub(crate) fn verify_retained(&self, desired: &[u8]) -> Result<()> {
+            if !self.acknowledged.get() || self.source.bytes.as_slice() != desired {
+                return Err(OwnerError::Conflict);
+            }
+            self.archive.verify()?;
+            self.source.verify(MAX_JOURNAL)
+        }
+    }
     impl ReadFile {
         fn verify(&self, limit: usize) -> Result<()> {
             if stamp(&self.file, false, limit)? != self.stamp
@@ -843,6 +903,11 @@ mod native {
         directories: Vec<Directory>,
     }
     impl MemberFiles {
+        /// Captured state backend path only. No IO, private-directory pin,
+        /// native inventory, claim or mutation permission is supplied here.
+        pub(crate) fn original_state_root(&self) -> &Path {
+            &self.root
+        }
         pub(crate) fn new() -> Result<Self> {
             let root = state_directory().map_err(|_| OwnerError::Invalid)?;
             if !root.to_str().is_some_and(local_drive_path) {
@@ -1033,6 +1098,17 @@ mod native {
             bytes: &[u8],
             limit: usize,
         ) -> Result<()> {
+            self.publish_with_retention(slot, path, current, bytes, limit, |_, _| Ok(()))
+        }
+        fn publish_with_retention(
+            &self,
+            slot: TunnelSlot,
+            path: &Path,
+            current: Option<ReadFile>,
+            bytes: &[u8],
+            limit: usize,
+            mut retain: impl FnMut(&ReadFile, bool) -> Result<()>,
+        ) -> Result<()> {
             self.verify_directories()?;
             let (temp, mut file) = self.temporary(slot)?;
             let id = stamp(&file, false, 0)?.id;
@@ -1055,6 +1131,7 @@ mod native {
                 current.verify(limit)?;
             }
             self.verify_directories()?;
+            retain(&source, false)?; // retained attempt BEFORE irreversible cut
             let replace = current.is_some();
             drop(current); // destination read handle disallows delete until here.
             if unsafe {
@@ -1072,6 +1149,7 @@ mod native {
             {
                 return Err(OwnerError::Native); // may be a lost ACK: caller reloads.
             }
+            retain(&source, true)?; // actual native file-rename ACK before postflight
             let readback = self
                 .read(path, limit, FILE_SHARE_READ)?
                 .ok_or(OwnerError::Conflict)?;
@@ -1082,6 +1160,124 @@ mod native {
             {
                 return Err(OwnerError::Conflict);
             }
+            self.verify_directories()
+        }
+        /// Separate sealed FULL cold storage lane. Ordinary journal CAS and
+        /// native member validation are unchanged. No SCM/NIC/key/WFP effects.
+        pub(crate) fn retire_cold_member_data(
+            &mut self,
+            proof: &super::super::member_carrier_recovery::native::NativeColdMemberWriteRead<'_>,
+            slot: TunnelSlot,
+            original: &mut Option<PinnedPayload>,
+            history: &std::rc::Rc<std::cell::RefCell<Vec<std::rc::Rc<ColdMemberStorageAck>>>>,
+        ) -> Result<()> {
+            let expected = proof.expected();
+            let desired = proof.desired();
+            proof
+                .verify_write(&self.root, slot, expected, desired)
+                .map_err(|_| OwnerError::Conflict)?;
+            if cold_member_retirement_payload(slot, expected)?.as_slice() != desired {
+                return Err(OwnerError::Conflict);
+            }
+            self.ready()?;
+            let _lock = self.lock(slot)?;
+            let path = self.journal_path(slot);
+            let pin = original.as_ref().ok_or(OwnerError::Conflict)?;
+            pin.verify()?;
+            if pin.path != path {
+                return Err(OwnerError::Conflict);
+            }
+            // SAME original file ID stays held continuously while transferring
+            // from the external pin to the ordinary no-delete ReadFile.
+            let current = self
+                .read(&path, MAX_JOURNAL, FILE_SHARE_READ)?
+                .ok_or(OwnerError::Conflict)?;
+            let old = self
+                .read(&path, MAX_JOURNAL, FILE_SHARE_READ | FILE_SHARE_DELETE)?
+                .ok_or(OwnerError::Conflict)?;
+            if current.stamp != pin.stamp
+                || current.stamp != old.stamp
+                || current.bytes.as_slice() != expected
+                || old.bytes.as_slice() != expected
+            {
+                return Err(OwnerError::Conflict);
+            }
+            let digest = format!("{:x}", Sha256::digest(expected));
+            let archive_path = self.root.join(format!(
+                "nelomai-cold-member-{}-{digest}.json",
+                match slot {
+                    TunnelSlot::A => "a",
+                    TunnelSlot::B => "b",
+                }
+            ));
+            match self.read(&archive_path, MAX_JOURNAL, FILE_SHARE_READ)? {
+                Some(record) if record.bytes.as_slice() == expected => {}
+                Some(_) => return Err(OwnerError::Conflict),
+                None => self.publish(slot, &archive_path, None, expected, MAX_JOURNAL)?,
+            }
+            let archive = pin_runtime_payload(&archive_path, expected.len() as u64, &digest)?;
+            proof
+                .verify_write(&self.root, slot, expected, desired)
+                .map_err(|_| OwnerError::Conflict)?;
+            let mut old = Some(old);
+            let mut archive = Some(archive);
+            let mut attempted = None;
+            history
+                .try_borrow_mut()
+                .map_err(|_| OwnerError::Conflict)?
+                .try_reserve(1)
+                .map_err(|_| OwnerError::Native)?;
+            // current still denies delete after dropping external pin. The
+            // normal publish cut rechecks that SAME pinned file before rename.
+            drop(original.take());
+            self.publish_with_retention(
+                slot,
+                &path,
+                Some(current),
+                desired,
+                MAX_JOURNAL,
+                |source, published| {
+                    if !published {
+                        let source = ReadFile {
+                            file: source.file.try_clone().map_err(|_| OwnerError::Native)?,
+                            bytes: source.bytes.clone(),
+                            stamp: source.stamp.clone(),
+                            acl: source.acl.clone(),
+                        };
+                        let ack = std::rc::Rc::new(ColdMemberStorageAck {
+                            acknowledged: std::cell::Cell::new(false),
+                            _old_file: old.take().ok_or(OwnerError::Conflict)?,
+                            archive: archive.take().ok_or(OwnerError::Conflict)?,
+                            source,
+                        });
+                        history
+                            .try_borrow_mut()
+                            .map_err(|_| OwnerError::Conflict)?
+                            .push(ack.clone());
+                        attempted = Some(ack);
+                    } else {
+                        attempted
+                            .as_ref()
+                            .ok_or(OwnerError::Conflict)?
+                            .acknowledged
+                            .set(true);
+                    }
+                    Ok(())
+                },
+            )?;
+            let selected = pin_runtime_payload(
+                &path,
+                desired.len() as u64,
+                &format!("{:x}", Sha256::digest(desired)),
+            )?;
+            *original = Some(selected); // retain actual new file pin BEFORE proof postflight
+            attempted
+                .as_ref()
+                .ok_or(OwnerError::Conflict)?
+                .verify_retained(desired)?;
+            proof
+                .verify_write(&self.root, slot, expected, desired)
+                .map_err(|_| OwnerError::Conflict)?;
             self.verify_directories()
         }
     }
@@ -1263,4 +1459,4 @@ mod tests;
 // Exercise the protected session adapter against fake bytes on non-Windows.
 #[cfg(all(test, not(windows)))]
 #[path = "member_session.rs"]
-mod member_session;
+pub(crate) mod member_session;

@@ -9,23 +9,89 @@ pub use nelomai_contracts::dispatcher;
 mod install_recovery;
 pub mod member_actor;
 mod member_carrier;
+mod member_carrier_control;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_creator.rs"]
+mod member_carrier_creator;
 mod member_carrier_guard;
+#[cfg(any(windows, test))]
+mod member_cold_deadline;
+// Exercise the actual native guard codec/cleanup policy in normal host Cargo
+// tests. Native BFE effects remain cfg(windows); this is not a second algorithm.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_guard.rs"]
+mod member_carrier_guard_native;
 mod member_carrier_native_ownership;
+mod member_carrier_pair;
 mod member_carrier_rows;
 mod member_diagnostic;
+#[cfg(any(windows, test))]
+#[allow(dead_code)] // Factual bindings; actual carrier factory integration is gated.
+mod member_native_guid;
 pub use member_diagnostic::PairFailure;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_keys.rs"]
+mod assembly_keys;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_boot.rs"]
 mod member_boot;
 #[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_assembly.rs"]
+mod member_carrier_assembly;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_bootstrap.rs"]
+mod member_carrier_bootstrap;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_coordinator.rs"]
+mod member_carrier_coordinator;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_coordinator_rows.rs"]
+mod member_carrier_coordinator_rows;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_creators.rs"]
+mod member_carrier_creators;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_guard_attestor.rs"]
+mod member_carrier_guard_attestor;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_member_controller.rs"]
+mod member_carrier_member_controller;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_members.rs"]
+mod member_carrier_members;
+#[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_module.rs"]
 mod member_carrier_module;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_module_terminal_read.rs"]
+mod member_carrier_module_terminal_read;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_registry_metadata.rs"]
+mod member_carrier_registry_metadata;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_network.rs"]
+mod member_carrier_network;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_network_owner.rs"]
+mod member_carrier_network_owner;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_payload.rs"]
 mod member_carrier_payload;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_preload.rs"]
 mod member_carrier_preload;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_provider.rs"]
+mod member_carrier_provider;
+#[cfg(not(windows))]
+#[path = "windows/member_carrier_ready.rs"]
+mod member_carrier_ready;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_recovery.rs"]
+mod member_carrier_recovery;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_runtime.rs"]
+mod member_carrier_runtime;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_wintun_lock.rs"]
 mod member_carrier_wintun_lock;
@@ -36,14 +102,64 @@ mod member_dns;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_files.rs"]
 mod member_files;
+#[cfg(all(test, not(windows)))]
+use member_files::member_session;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_guard_gate.rs"]
+mod member_carrier_guard_gate;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_lifecycle_gate.rs"]
+mod member_carrier_lifecycle_gate;
+#[cfg(not(windows))]
+#[path = "windows/member_carrier_member_gate.rs"]
+mod member_carrier_member_gate;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_network_baseline.rs"]
+mod member_carrier_network_baseline;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_network_gate.rs"]
+mod member_carrier_network_gate;
+#[cfg(not(windows))]
+#[path = "windows/member_carrier_original_read.rs"]
+mod member_carrier_original_read;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_pair_io.rs"]
+mod member_carrier_pair_io;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_pair_store.rs"]
+mod member_carrier_pair_store;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_probe_gate.rs"]
+mod member_carrier_probe_gate;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_probes.rs"]
+mod member_carrier_probes;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_startup.rs"]
+mod member_carrier_startup;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_terminal_graph.rs"]
+mod member_carrier_terminal_graph;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_terminal_release.rs"]
+mod member_carrier_terminal_release;
+#[cfg(any(windows, test))]
+mod member_fresh_read;
 mod member_guard;
+mod member_interface_description;
 pub mod member_metrics;
+#[cfg(any(windows, test))]
+mod member_native_deadline;
+#[cfg(any(windows, test))]
+mod member_original;
 mod member_owner;
 mod member_pair;
 mod member_physical;
 pub mod member_plan;
 mod member_reboot;
 pub mod member_routes;
+#[cfg(any(windows, test))]
+mod member_serialized_lease;
 mod member_source;
 pub mod redundancy;
 #[cfg(any(windows, test))]

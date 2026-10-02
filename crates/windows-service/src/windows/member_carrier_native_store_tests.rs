@@ -29,6 +29,8 @@ struct State {
     race: Option<Vec<u8>>,
     meta_fault: Option<(PrivateFile, Fault)>,
     reads: Vec<PrivateFile>,
+    transaction_fault: Option<bool>,
+    after_transaction: Option<Box<dyn FnOnce()>>,
 }
 #[derive(Clone, Default)]
 struct Disk(Rc<RefCell<State>>);
@@ -107,7 +109,17 @@ impl SessionFileIo for Disk {
         &mut self,
         action: impl FnOnce(&mut dyn PrivateRecords) -> io::Result<T>,
     ) -> io::Result<T> {
-        action(self)
+        let fault = self.0.borrow_mut().transaction_fault.take();
+        let result = action(self);
+        let after = self.0.borrow_mut().after_transaction.take();
+        if let Some(after) = after {
+            after();
+        }
+        match fault {
+            Some(true) => panic!("protected initial cleanup postflight"),
+            Some(false) => Err(io::Error::other("protected initial cleanup postflight")),
+            None => result,
+        }
     }
 }
 fn scope() -> SessionScope {
@@ -157,6 +169,534 @@ fn next(record: &Record) -> Record {
     let mut r = record.clone();
     r.generation += 1;
     r
+}
+
+// Break: genuine initial journals cannot enter the SDK-free cleanup view, or
+// equal/reopened DATA manufactures their successful initialization ACK.
+#[test]
+fn original_initial_cleanup_retains_unborn_and_birth_bound_journal_without_writes() {
+    for bound in [false, true] {
+        let (disk, mut files) = fixture();
+        let c = context();
+        let mut journal = open(&files);
+        let record = initial(&c);
+        save(&mut journal, None, &record);
+        let execution = if bound {
+            WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
+                .unwrap()
+                .0
+                .save(
+                    &SessionState::new(scope(), Slot::A, 0, 0)
+                        .unwrap()
+                        .snapshot(),
+                )
+                .unwrap();
+            let history = files.session_ack_root(&scope()).unwrap();
+            let ack = history.acknowledgements().unwrap().last().unwrap().clone();
+            let root = history.bind_native_birth(&c, &ack).unwrap();
+            journal
+                .bind_original_native_view(files.native_birth_view(&root).unwrap())
+                .unwrap();
+            Some(root)
+        } else {
+            None
+        };
+        let canonical = match &execution {
+            Some(root) => root.native_cleanup_view(&files).unwrap().into_files(),
+            None => files.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0,
+        };
+        let before = disk.0.borrow().bytes.clone();
+        journal
+            .enter_original_initial_cleanup(canonical.clone())
+            .unwrap();
+        journal
+            .enter_original_initial_cleanup(canonical.clone())
+            .unwrap();
+        assert_eq!(journal.load(&c).unwrap(), Some(record.clone()));
+        assert_eq!(disk.0.borrow().bytes, before);
+        assert_eq!(journal.initial_ack.as_ref(), Some(&record));
+        assert!(journal.original_files(&c).is_err());
+        let mut forward = next(&record);
+        forward.keys[0].phase = KeyPhase::CreatePending;
+        assert!(journal
+            .compare_exchange(&c, Some(&record), &forward)
+            .is_err());
+        let mut reopened = open(&files);
+        assert!(reopened.enter_original_initial_cleanup(canonical).is_err());
+    }
+}
+
+#[test]
+fn original_initial_cleanup_denies_reopened_lost_ack_foreign_and_forward_views() {
+    for fault in 0..5 {
+        let (disk, mut files) = fixture();
+        let c = context();
+        let mut journal = open(&files);
+        let record = initial(&c);
+        if fault == 0 {
+            let mut foreign_journal = open(&files);
+            save(&mut foreign_journal, None, &record);
+        } else if fault == 1 {
+            disk.0.borrow_mut().fault = Some(Fault::Lost);
+            assert!(journal.compare_exchange(&c, None, &record).is_err());
+        } else {
+            save(&mut journal, None, &record);
+        }
+        let valid = files.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0;
+        let candidate = match fault {
+            2 => files.clone(),
+            3 => {
+                let (_, mut other) = fixture();
+                save(&mut open(&other), None, &record);
+                other.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0
+            }
+            4 => {
+                let mut other =
+                    ProtectedSessionFiles::new(disk.clone(), runtime(), [7; 16]).unwrap();
+                other.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0
+            }
+            _ => valid.clone(),
+        };
+        let before = disk.0.borrow().bytes.clone();
+        assert!(journal.enter_original_initial_cleanup(candidate).is_err());
+        assert!(journal.initial_cleanup_files.is_some()); // retained even on denial
+        assert!(journal.enter_original_initial_cleanup(valid).is_err());
+        assert!(journal.load(&c).is_err());
+        assert_eq!(disk.0.borrow().bytes, before);
+    }
+}
+
+#[test]
+fn original_initial_cleanup_error_unwind_or_replacement_keeps_selected_view_and_fence() {
+    for fault in 0..3 {
+        let (disk, mut files) = fixture();
+        let c = context();
+        let mut journal = open(&files);
+        let record = initial(&c);
+        save(&mut journal, None, &record);
+        let canonical = files.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0;
+        if fault < 2 {
+            disk.0.borrow_mut().transaction_fault = Some(fault == 1);
+        } else {
+            inject(&disk, &next(&record));
+        }
+        let before = disk.0.borrow().bytes.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journal.enter_original_initial_cleanup(canonical.clone())
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(journal
+            .initial_cleanup_files
+            .as_ref()
+            .unwrap()
+            .same_original_backend(&canonical));
+        assert_eq!(journal.initial_ack.as_ref(), Some(&record));
+        assert!(journal.enter_original_initial_cleanup(canonical).is_err());
+        assert!(journal.load(&c).is_err());
+        assert_eq!(disk.0.borrow().bytes, before);
+    }
+}
+
+fn noc_terminal_fixture_bound(
+    bound: bool,
+) -> (
+    Disk,
+    ProtectedSessionFiles<Disk>,
+    Store,
+    Option<epoch::ExecutionRoot<Disk>>,
+) {
+    let (disk, mut files) = fixture();
+    let c = context();
+    let mut journal = open(&files);
+    save(&mut journal, None, &initial(&c));
+    let execution = if bound {
+        WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
+            .unwrap()
+            .0
+            .save(
+                &SessionState::new(scope(), Slot::A, 0, 0)
+                    .unwrap()
+                    .snapshot(),
+            )
+            .unwrap();
+        let history = files.session_ack_root(&scope()).unwrap();
+        let root = history
+            .bind_native_birth(&c, history.acknowledgements().unwrap().last().unwrap())
+            .unwrap();
+        journal
+            .bind_original_native_view(files.native_birth_view(&root).unwrap())
+            .unwrap();
+        Some(root)
+    } else {
+        None
+    };
+    let mut session = SessionState::new(scope(), Slot::A, 0, 0)
+        .unwrap()
+        .snapshot();
+    session.phase = SessionPhase::Stopped;
+    WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
+        .unwrap()
+        .0
+        .save(&session)
+        .unwrap();
+    // Protected terminal Pair comparison DATA. Native NoC completion itself is
+    // doubled ONLY at the mandatory unsafe boundary below, never by this JSON.
+    let pair = crate::member_carrier_pair::Record {
+        version: 2,
+        scope: scope(),
+        provenance: c.provenance.clone(),
+        revision: 20,
+        phase: crate::member_carrier_pair::Phase::Stopped,
+        addresses: vec![],
+        dns: vec![],
+        carrier: None,
+        members: [None, None],
+        active: None,
+        options: None,
+        guard: crate::member_carrier_guard::Model::empty(scope()).unwrap(),
+        pending_guard: None,
+        pending: None,
+        network: None,
+        stop_stage: 12,
+        operation: None,
+    };
+    let payload = carrier_pair_store::encode_carrier_payload(&pair).unwrap();
+    let saved = SavedRecord {
+        version: PRIVATE_VERSION,
+        identity: SessionIdentity {
+            boot_id: [7; 16],
+            runtime: runtime(),
+            scope: scope(),
+        },
+        kind: RecordKind::Pair,
+        network_epoch: 1,
+        data: String::from_utf8(payload).unwrap(),
+    };
+    disk.0
+        .borrow_mut()
+        .bytes
+        .insert(PrivateFile::Pair, serde_json::to_vec(&saved).unwrap());
+    let canonical = match &execution {
+        Some(root) => root.native_cleanup_view(&files).unwrap().into_files(),
+        None => files.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0,
+    };
+    journal.enter_original_initial_cleanup(canonical).unwrap();
+    (disk, files, journal, execution)
+}
+fn noc_terminal_fixture() -> (Disk, ProtectedSessionFiles<Disk>, Store) {
+    let (disk, files, journal, _) = noc_terminal_fixture_bound(false);
+    (disk, files, journal)
+}
+struct CompletedNoC {
+    original: InitialNativeDataRead,
+    completed: bool,
+    attempted: std::cell::Cell<bool>,
+    failed: std::cell::Cell<bool>,
+    fail_at: usize,
+    reenter_at: usize,
+    panic_at: usize,
+    checks: std::cell::Cell<usize>,
+}
+impl CompletedNoC {
+    fn new(original: InitialNativeDataRead) -> Self {
+        Self {
+            original,
+            completed: true,
+            attempted: std::cell::Cell::new(false),
+            failed: std::cell::Cell::new(false),
+            fail_at: 0,
+            reenter_at: 0,
+            panic_at: 0,
+            checks: std::cell::Cell::new(0),
+        }
+    }
+}
+// SAFETY: explicit host double ONLY of native completed NoC issuer. Real
+// ProtectedSessionFiles, exact private transaction, initial CAS/ACK and reader
+// identity are exercised, not an alternate successful journal/provider.
+unsafe impl OriginalInitialNativeDataRetirement for CompletedNoC {
+    fn begin_retirement(&self, original: &InitialNativeDataRead) -> io::Result<()> {
+        if self.attempted.replace(true) || !self.completed || !self.original.same_original(original)
+        {
+            self.failed.set(true);
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn verify_retirement(
+        &self,
+        original: &InitialNativeDataRead,
+        _current: &ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        self.checks.set(self.checks.get() + 1);
+        if self.reenter_at == self.checks.get() {
+            assert!(self.begin_retirement(original).is_err()); // deliberately swallowed
+        }
+        assert_ne!(
+            self.panic_at,
+            self.checks.get(),
+            "original NoC issuer unwind"
+        );
+        if !self.completed
+            || self.failed.get()
+            || !self.original.same_original(original)
+            || self.fail_at == self.checks.get()
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn fail_retirement(&self) {
+        self.failed.set(true);
+    }
+}
+
+#[test]
+fn original_initial_data_retirement_preserves_preparing_and_permanent_replay_history() {
+    let (disk, mut files, mut journal) = noc_terminal_fixture();
+    let pin = journal.original_initial_data_read().unwrap();
+    let proof = CompletedNoC::new(pin.clone());
+    let old = disk.0.borrow().bytes.clone();
+    let retained = RefCell::new(None);
+    let ack = journal
+        .retire_original_initial_data(&proof, |ack| {
+            *retained.borrow_mut() = Some(ack);
+            Ok(())
+        })
+        .unwrap();
+    assert!(ack.matches_original(&pin));
+    assert!(Rc::ptr_eq(&ack, retained.borrow().as_ref().unwrap()));
+    for kind in RecordKind::OWNED {
+        assert_eq!(
+            disk.0.borrow().bytes.get(&kind.file()),
+            old.get(&kind.file())
+        );
+    }
+    assert_eq!(pin.acknowledged().phase, Phase::Preparing);
+    let saved = parse_record(KIND, &old[&FILE]).unwrap();
+    assert!(require_stopped_native(&saved).is_err()); // ordinary rule UNCHANGED
+    files.complete(&scope()).unwrap(); // exact already-retired acknowledgement
+    assert!(files.claim(&scope()).is_err());
+    let mut next = scope();
+    next.connection_generation += 1;
+    files.claim(&next).unwrap();
+    assert!(files.read(&next, KIND).unwrap().is_none()); // old DATA is not ownership
+    assert!(journal
+        .retire_original_initial_data(&proof, |_| Ok(()))
+        .is_err());
+}
+
+#[test]
+fn original_initial_data_retirement_bound_cleanup_requires_actual_live_registered_root() {
+    let (disk, mut files, mut journal, root) = noc_terminal_fixture_bound(true);
+    let root = root.unwrap();
+    let original = journal.original_initial_data_read().unwrap();
+    let proof = CompletedNoC::new(original.clone());
+    let bytes = disk.0.borrow().bytes[&FILE].clone();
+    journal
+        .retire_original_initial_data(&proof, |_| Ok(()))
+        .unwrap();
+    assert_eq!(disk.0.borrow().bytes[&FILE], bytes);
+    assert!(files.native_birth_view(&root).is_err()); // cleanup never re-arms
+    files.complete(&scope()).unwrap();
+
+    let (_, _, mut journal, root) = noc_terminal_fixture_bound(true);
+    let proof = CompletedNoC::new(journal.original_initial_data_read().unwrap());
+    drop(root); // registered Weak alone must not authenticate private cleanup
+    assert!(journal
+        .retire_original_initial_data(&proof, |_| Ok(()))
+        .is_err());
+    assert!(journal.initial_retirement_ack.is_none());
+}
+
+#[test]
+fn original_initial_data_retirement_missing_or_foreign_completed_outcome_never_writes() {
+    for foreign in [false, true] {
+        let (disk, _, mut journal) = noc_terminal_fixture();
+        let (_, _, other) = noc_terminal_fixture();
+        let pin = if foreign {
+            other.original_initial_data_read().unwrap()
+        } else {
+            journal.original_initial_data_read().unwrap()
+        };
+        let mut proof = CompletedNoC::new(pin);
+        proof.completed = foreign;
+        let before = disk.0.borrow().bytes.clone();
+        assert!(journal
+            .retire_original_initial_data(&proof, |_| Ok(()))
+            .is_err());
+        assert_eq!(disk.0.borrow().bytes, before);
+        assert!(journal.initial_retirement_ack.is_none());
+        assert!(journal
+            .retire_original_initial_data(&proof, |_| Ok(()))
+            .is_err());
+    }
+}
+
+#[test]
+fn original_initial_data_retirement_without_explicit_cleanup_fences_original_forward_journal() {
+    let (disk, files) = fixture();
+    let mut journal = open(&files);
+    let record = initial(&context());
+    save(&mut journal, None, &record);
+    let proof = CompletedNoC::new(journal.original_initial_data_read().unwrap());
+    let before = disk.0.borrow().bytes.clone();
+    assert!(journal
+        .retire_original_initial_data(&proof, |_| Ok(()))
+        .is_err());
+    let mut desired = next(&record);
+    desired.keys[0].phase = KeyPhase::CreatePending;
+    assert!(journal
+        .compare_exchange(&context(), Some(&record), &desired)
+        .is_err());
+    assert_eq!(disk.0.borrow().bytes, before);
+}
+
+#[test]
+fn original_initial_data_retirement_lost_marker_or_index_ack_is_not_imported() {
+    for target in [completed_file(&scope()).unwrap(), PrivateFile::Index] {
+        for fault in [
+            Fault::Fail,
+            Fault::Lost,
+            Fault::FalseSuccess,
+            Fault::Unreadable,
+        ] {
+            let (disk, _, mut journal) = noc_terminal_fixture();
+            let pin = journal.original_initial_data_read().unwrap();
+            let proof = CompletedNoC::new(pin);
+            let original = disk.0.borrow().bytes[&FILE].clone();
+            disk.0.borrow_mut().meta_fault = Some((target, fault));
+            assert!(journal
+                .retire_original_initial_data(&proof, |_| Ok(()))
+                .is_err());
+            assert!(journal.initial_retirement_ack.is_none());
+            assert_eq!(disk.0.borrow().bytes[&FILE], original);
+            assert!(journal
+                .retire_original_initial_data(&proof, |_| Ok(()))
+                .is_err());
+            assert!(proof.failed.get());
+        }
+    }
+}
+
+#[test]
+fn original_initial_data_retirement_retains_real_ack_before_postflight_error_or_unwind() {
+    for fault in 0..3 {
+        let (disk, _, mut journal) = noc_terminal_fixture();
+        let pin = journal.original_initial_data_read().unwrap();
+        let mut proof = CompletedNoC::new(pin.clone());
+        if fault == 2 {
+            proof.fail_at = 4;
+        }
+        let retained = RefCell::new(None);
+        let original = disk.0.borrow().bytes[&FILE].clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            journal.retire_original_initial_data(&proof, |ack| {
+                *retained.borrow_mut() = Some(ack);
+                match fault {
+                    0 => Err(failed()),
+                    1 => panic!("NoC ACK publication unwind"),
+                    _ => Ok(()),
+                }
+            })
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        let actual = journal.initial_retirement_ack.as_ref().unwrap();
+        assert!(actual.matches_original(&pin));
+        assert!(Rc::ptr_eq(actual, retained.borrow().as_ref().unwrap()));
+        assert_eq!(disk.0.borrow().bytes[&FILE], original);
+        assert!(journal
+            .retire_original_initial_data(&proof, |_| Ok(()))
+            .is_err());
+        assert!(proof.failed.get());
+    }
+}
+
+#[test]
+fn original_initial_data_retirement_changed_records_pending_keys_or_nonterminal_session_deny() {
+    for fault in 0..4 {
+        let (disk, _, mut journal) = noc_terminal_fixture();
+        let pin = journal.original_initial_data_read().unwrap();
+        let proof = CompletedNoC::new(pin);
+        match fault {
+            0 => {
+                let mut changed = next(&initial(&context()));
+                changed.keys[0].phase = KeyPhase::CreatePending;
+                inject(&disk, &changed);
+            }
+            1 => {
+                let raw = disk.0.borrow().bytes[&PrivateFile::Session].clone();
+                let mut saved = parse_record(RecordKind::Session, &raw).unwrap();
+                let mut session: SessionSnapshot = decode(&scope(), saved.data.as_bytes()).unwrap();
+                session.phase = SessionPhase::Stopping;
+                saved.data = serde_json::to_string(&Envelope {
+                    version: 1,
+                    scope: scope(),
+                    payload: session,
+                })
+                .unwrap();
+                disk.0
+                    .borrow_mut()
+                    .bytes
+                    .insert(PrivateFile::Session, serde_json::to_vec(&saved).unwrap());
+            }
+            2 => {
+                disk.0.borrow_mut().bytes.remove(&PrivateFile::Pair);
+            }
+            _ => {
+                let other = disk.clone();
+                disk.0.borrow_mut().after_transaction = Some(Box::new(move || {
+                    // SAME typed bytes but a different exact canonical envelope,
+                    // after the initial private frame completed: must not adopt.
+                    let raw = other.0.borrow().bytes[&PrivateFile::Pair].clone();
+                    let saved: SavedRecord = serde_json::from_slice(&raw).unwrap();
+                    other.0.borrow_mut().bytes.insert(
+                        PrivateFile::Pair,
+                        serde_json::to_vec_pretty(&saved).unwrap(),
+                    );
+                }));
+            }
+        }
+        let receipt = disk.0.borrow().bytes[&FILE].clone();
+        assert!(journal
+            .retire_original_initial_data(&proof, |_| Ok(()))
+            .is_err());
+        assert!(journal.initial_retirement_ack.is_none());
+        assert!(!disk
+            .0
+            .borrow()
+            .bytes
+            .contains_key(&completed_file(&scope()).unwrap()));
+        assert_eq!(disk.0.borrow().bytes[&FILE], receipt);
+        assert!(proof.failed.get());
+    }
+}
+
+#[test]
+fn original_initial_data_retirement_swallowed_reentry_and_issuer_unwind_remain_sticky() {
+    for at in [1, 4] {
+        for unwind in [false, true] {
+            let (disk, _, mut journal) = noc_terminal_fixture();
+            let pin = journal.original_initial_data_read().unwrap();
+            let mut proof = CompletedNoC::new(pin);
+            if unwind {
+                proof.panic_at = at;
+            } else {
+                proof.reenter_at = at;
+            }
+            let before = disk.0.borrow().bytes[&FILE].clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                journal.retire_original_initial_data(&proof, |_| Ok(()))
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(journal.initial_retirement_ack.is_some(), at == 4);
+            assert!(proof.failed.get());
+            assert!(journal
+                .retire_original_initial_data(&proof, |_| Ok(()))
+                .is_err());
+            assert_eq!(disk.0.borrow().bytes[&FILE], before);
+        }
+    }
 }
 fn sequence() -> Vec<Record> {
     let mut record = initial(&context());
@@ -212,6 +752,38 @@ fn open(f: &ProtectedSessionFiles<Disk>) -> Store {
     WindowsNativeCarrierReceiptStore::open(f.clone(), context())
         .unwrap()
         .0
+}
+
+#[test]
+fn initial_attachment_exposes_only_original_live_store_backend() {
+    let (disk, f) = fixture();
+    let mut store = open(&f);
+    assert!(store
+        .original_files(&context())
+        .unwrap()
+        .same_original_backend(&f));
+    save(&mut store, None, &initial(&context()));
+    assert!(store
+        .original_files(&context())
+        .unwrap()
+        .same_original_backend(&f));
+    let mut foreign = context();
+    foreign.provenance.network_epoch += 1;
+    assert!(store.original_files(&foreign).is_err());
+    assert!(
+        open(&f).original_files(&context()).is_err(),
+        "a reopened equal initial journal is cleanup-only"
+    );
+    disk.0.borrow_mut().fault = Some(Fault::Lost);
+    let mut pending = next(&initial(&context()));
+    pending.keys[0].phase = KeyPhase::CreatePending;
+    assert!(store
+        .compare_exchange(&context(), Some(&initial(&context())), &pending)
+        .is_err());
+    assert!(
+        store.original_files(&context()).is_err(),
+        "lost fresh CAS revokes original backend attachment"
+    );
 }
 fn save(store: &mut Store, old: Option<&Record>, desired: &Record) {
     store
@@ -1026,7 +1598,7 @@ fn retired_nonterminal_corrupt_or_unmarked_receipts_are_never_hidden_from_a_new_
 }
 
 #[test]
-fn all_eight_fixed_record_owners_survive_retirement_and_partial_overwrite_without_replay() {
+fn all_ten_fixed_record_owners_survive_retirement_and_partial_overwrite_without_replay() {
     let disk = Disk::default();
     let mut identities = vec![];
     for (i, kind) in RecordKind::OWNED.into_iter().enumerate() {
@@ -1035,6 +1607,21 @@ fn all_eight_fixed_record_owners_survive_retirement_and_partial_overwrite_withou
         let mut own = scope();
         own.connection_generation += i as u64;
         f.claim(&own).unwrap();
+        if kind == RecordKind::NativeCreator {
+            let mut context = context();
+            context.intent.scope = own.clone();
+            let creator = CreatorRecord::decode(
+                &serde_json::to_vec(&serde_json::json!({
+                    "version":1,"context":context,"process":{"pid":256,"creation_time":500}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            WindowsNativeCreatorStore::open(f.clone(), context)
+                .unwrap()
+                .publish(&creator)
+                .unwrap();
+        }
         clean_scope(&mut f, &own);
         if kind == RecordKind::Network {
             WindowsNetworkStore::open(f.clone(), own.clone(), kind)
@@ -1081,6 +1668,13 @@ fn all_eight_fixed_record_owners_survive_retirement_and_partial_overwrite_withou
                     .unwrap();
                 previous = Some(record);
             }
+        }
+        if kind == RecordKind::CarrierGuard {
+            let mut context = context();
+            context.intent.scope = own.clone();
+            let (mut guard, old) = WindowsCarrierGuardStore::open(f.clone(), context).unwrap();
+            assert!(old.is_none());
+            guard.initialize().unwrap();
         }
         let row_role = match kind {
             RecordKind::CarrierRows => Some(rows::Role::Carrier),
@@ -1226,7 +1820,8 @@ fn all_eight_fixed_record_owners_survive_retirement_and_partial_overwrite_withou
     }
     f.complete(&own).unwrap();
     let (_, index) = load_index(&mut disk.clone()).unwrap();
-    assert_eq!(index.completed.len(), 6);
+    assert_eq!(index.completed.len(), RecordKind::OWNED.len() - 2);
+    assert!(index.completed.contains(identities.last().unwrap())); // immutable Creator DATA survives partial overwrite
     for id in &identities {
         assert!(f.claim(&id.scope).is_err());
     } // compacted identities still permanently fenced

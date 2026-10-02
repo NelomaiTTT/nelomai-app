@@ -1,7 +1,8 @@
 # Windows hot standby: stable VIP carrier
 
-Status: proposed architecture, awaiting user review. No product implementation
-or additional hardware acceptance is implied by this document.
+Status: architecture under delegated overnight development (30 September).
+No product implementation or additional hardware acceptance is implied by this
+document. The native negative gates below must pass before factory enablement.
 
 ## Intent and scope
 
@@ -21,7 +22,106 @@ continuity separately, without promising lossless switching.
 Only Windows pair code changes. Ordinary single-tunnel behavior, Android,
 macOS/Linux, authentication, IPC authorization and production panel/agents stay
 unchanged. Use the existing main checkout; no branch, release, deployment,
-gate bypass or vendor modifications. Windows stays ON; heartbeat stays PAUSED.
+gate bypass or vendor modifications. The latest human annotation requires a
+normal Windows shutdown AFTER completed tests and verified owned cleanup, without
+`/f`; do not shut down while tests remain incomplete. Questions and review-agent
+dispatch are explicitly waived: implement/review inline in the existing checkout.
+
+### 30 September native gate findings
+
+05:55 scoped fresh-C/AWG IPv4 reply gate accepted: new retained-session C owns
+Preferred10.240.3.2/32; addressless unique AWGCarrier3 owns separate egress.
+Exact held UDP53 flow under ALE plus transport/packet/forward permits returned
+5/5valid DNSanswers. Triple withdrawal blocked at own transport; eight exact
+IDs and own C/B/service/routes/IP/APIPA values absent independently05:57.
+Whole wrapper exited0. Capture only own config before normalStop in bounded
+RAM, authenticate actual SYSTEM pipe client PID/exe/SID/creation, and permit
+application-managed config absence afterStop while rejecting replacement.
+AWG DLL itself NotSigned; authenticated candidate payload hash matches. This
+does not close IPv6/generaldata/two-peer/failover or productcrash ownership.
+Keep native factory gated. Earlier harness lifecycle/composition failures remain
+immutable evidence, not AWG protocol failures or native acceptance.
+
+04:37 actual Windows resolver narrow IPv4 gate: configured owned C and default
+DnsQueryEx (no explicit server list) both resolved through addressless WG B.
+With all active DNS permissions withdrawn, query timed out/cancelled and own
+ALE base drops6. The resolver owns its local port: this is ACTIVE DNS-only
+diagnostic authorization, not exclusive held-port standby authorization. Exact
+DNS metadata/automatic metric restored and eight WFP IDs plus own C/B resources
+absent independently04:39. Wrapper final CIM1018 remains a recorded failure,
+not overwritten by native acceptance. Full split/general DNS/AWG/TCP gates OPEN.
+
+03:43/03:53 narrow IPv4 source-selection gates now passed: native GetBestRoute2
+with default selection and no-send unbound UDP selected carrier C through a
+fresh addressless TESTNET egress; forcing only B without source bind failed.
+Separate real WG v4 wildcard-bound UDP, with neither VIP binding nor forced
+egress, automatically selected C10.240.5.2 and received5/5valid DNS replies
+through B. Withdrawal blocked; whole wrapper exit0 and independent all-five
+WFP/NIC/address/route/APIPA-value cleanup verified. Find-NetRoute's MI_RESULT6
+does not establish an ordinary source-selection failure. This does not close
+actual Windows resolver, AWG-new-carrier, TCP/default/split/general-data or
+pair/failover gates. Do not repeat completed bounded proofs or enable factory.
+
+03:07 bounded addressless-interface policy finding: disabling APIPA AFTER
+creation was ineffective on this host. Exact fresh per-interface
+IPAutoconfigurationEnabled DWORD0 BEFORE native creation yielded native
+LinkLocalAddressBehavior0 and28emptyIPv4snapshots over12sDOWN+12sUP. No global
+or physical registry changes are permitted. Native integration must journal
+precreation ownership for C/A/B, require fresh name/GUID/key absence and native
+RegCreateKeyEx CREATED_NEW_KEY acknowledgement, then flush/read back only the
+exact owned value. Lost create acknowledgement grants no key adoption/deletion
+authority. Restore only exact owned value to its recorded baseline; do not
+recursively delete interface keys. Portable logical address/weak rows alone do
+not represent this obligation or the complete native row metadata.
+
+03:21 fresh C77 with a single Preferred10.240.4.2/32 and addressless WG B75
+delivered5/5valid source-bound DNS replies under exact ALE/triple policy. Missing
+each layer's permit and withdrawal blocked the flow; native captured5IDs absent,
+created C/B/session/address/route cleanup verified. Diagnostic wrapper failed
+PS5 nested JSONarray decoding on registry restoration; independent guarded
+restoration03:30 confirmed exact owned values absent. Whole wrapper NOTPASS.
+Find-NetRoute automatic source selection returned CimException; actual Windows
+resolver remains unperformed. Bound health-probe success is not ordinary unbound
+application acceptance. Keep source-selection/resolver gate OPEN and revise the
+carrier routing proposal from native evidence before factory enablement.
+
+01:30/01:32 native mechanism evidence closes the static-object/dynamic-child
+lifetime hypothesis for IPv4/IPv6: static nonpersistent ALE base survives its
+creator engine close, independent dynamic child allow references its static
+sublayer; childkill removesallow and SAMEbase blocks heldUDP again. Exact object
+cleanup observed. This does not replace product protected-store/whole-policy
+recovery acceptance. New ALE probe requires8conditions and explicit documented
+INDEXED64 metadata, while legacy native reader supports7/flags0. Version the
+new representation, retain unknown-flag rejection, do not relax old decoder.
+Native sublayer read returned65531 after requested65534; preserve exact captured
+ownership and verify priority before enablement, never assume requested equals
+observed or accept later drift. Research holds failures, identities and hashes.
+
+The exact three-layer TEST-NET policy passed the wrong-destination UDP negative
+and positive UDP controls at23:29UTC. However, a TCP connection bound to the SAME
+source/held numeric port also reached the independent packet BLOCK sink while
+the transport/packet/forward bases recorded no drop. This is NOT an accepted
+wrong-protocol gate. Read-only event metadata retained separate timestamps but
+packet-layer events expose protocol0/no ports; attribution relies on the bounded
+single trial, not a claim that packet-layer metadata identifies TCP. Preserve the
+evidence and establish a safe additional authorization gate before integration.
+At23:38:56UTC an exact ALE_AUTH_CONNECT next-hop index/LUID + source-holder LUID
+TCP sentinel produced Winsock10013/ownALEdrop1; both UDP positive controls still
+reached only the independent sink and wrong destination remained blocked.
+All9 exact IDs and own NIC/routes/IPs were absent afterwards. This establishes
+an additional IPv4 authorization hypothesis, not a complete product policy:
+IPv6, active-data vs standby allowances, existing-flow route changes/re-auth,
+real WG/AWG and static/dynamic exit behavior remain unproved. It does not replace
+packet/forward/raw/ownership guards. The previously intended three-layer model
+alone is superseded as an enablement proposal; authorization must include the
+additional proven gate and its missing validation before integration.
+
+Fresh driver preflight also establishes cold-driver asymmetry: ordinary Stray
+has running Wintun14/WireGuard0; ordinary Tic has WireGuard65537/Wintun0. Requiring
+an already RUNNING Wintun driver is therefore insufficient for cold Tic support.
+Do not work around it with silent driver installation. Resolve existing trusted
+driver loading/lifetime or reject capability before effects; carrier activation
+and cold capability must be hardware-proven for BOTH protocols.
 
 ## Baseline and evidence
 
@@ -50,6 +150,34 @@ Native experiments in WINDOWS-SHARED-VIP-RESEARCH-2026-09-29.md established:
 
 ## Architecture and alternatives
 
+### 02 October: queued SDK callbacks and resident code lifetime
+
+Pinned Wintun0.14.1 (`bfef136abfa1665c2592be09a7e383d646cdbe6e`)
+queues private orphan-cleanup callbacks after Create/Open/Close. Resource absence
+and our own lease rundown cannot prove those callbacks have finished. Do not
+unmap their code based on either observation or a delay. Retired session closure
+must remain distinct from process code lifetime.
+
+Use an actual process-lifetime module pin before exposing any queue-producing
+SDK call. The native pin must be obtained from the SAME authenticated loaded
+image using `GetModuleHandleExW(PIN | FROM_ADDRESS)`, with its actual ACK retained
+before fallible postflight. Microsoft specifies that PIN keeps the module loaded
+until process termination even after FreeLibrary. This is a code-lifetime floor,
+NOT proof of worker completion, native-resource absence, or session cleanup.
+
+The process anchor must retain only the original immutable signed source and
+SAME engine MutationGuard owner, not a Session Runtime/KeyLock/Pair/DATA alias.
+Never unpin it or unload it on Drop. A repeated cold session may recognize only
+this actual original anchor with independent current source/engine-owner checks;
+foreign or merely equal basename/path/handle mappings still deny. Every session
+still needs its NEW actual LoadLibrary return and its own original receipts,
+permissions and terminal completion. Unknown pin outcomes deny SDK entry and
+remain retained; they cannot become an adopted anchor or cleanup ACK. Installer
+process termination remains the ordinary boundary for releasing pinned code.
+
+The implementation and native pin/repeat-start acceptance are pending. Factory
+remains OFF; no resident pin or SDK effect was executed for this decision.
+
 Choose one session-owned address-only carrier C and addressless native members
 A/B. Keep WG through the installed WireGuardNT path and AWG through the installed
 AWG service/DLL path. Do not substitute one backend API for the other.
@@ -62,9 +190,19 @@ platforms and protocol backends. None requires a new server allocation model.
 ### Carrier C
 
 Use the already installed, trusted Wintun DLL to create a dedicated carrier
-with a retained adapter/session handle. Require an already running Wintun driver;
-do not silently install, replace or remove a driver. A missing supported driver
-is a capability failure, not permission for a new installer action.
+with a retained adapter/session handle. Native00:56 proof closes the previously
+overstrict RUNNING-only condition for an existing matching package: signed
+DLL0.14.1 embedded-INF and installed oem111.inf both DriverVer10/13/2021,0.14.0.0,
+no foreign/legacy Wintun devices, runningversion0→14, Preferred address and finite
+close, unchanged signed driver/DLL hashes/package afterwards. Read embedded INF
+as data, inspect compatible packages and legacy/problem devices BEFORE loading
+the DLL (initialization performs legacy cleanup). Missing/mismatched/older
+packages or foreign cleanup obligations fail capability before effects.
+CreateAdapter invokes upstream DriverInstall; do not pretend the API universally
+avoids driver installation/upgrade or foreign adapter cleanup. Existing matching
+package loading is permitted; installation, replacement/removal and vendor/API
+patches are not. A missing supported driver is a capability failure, not
+permission for a new installer action. Full cold WG/AWG integration remains gated.
 
 Carrier names/GUIDs derive from the authenticated local runtime and full session
 scope in a new carrier domain, disjoint from member A/B names and GUIDs. Require
@@ -249,6 +387,35 @@ two independent fresh handshakes, source-bound primary/reserve traffic, bounded
 owned fault injection, role/WARM correctness, IPv4/IPv6/split/DNS/LAN/SSH,
 partial-failure cleanup and bounded Start-button observations. Measure UDP
 recovery and long-lived TCP behavior separately. No PASS from handshakes alone.
+
+## Installer recovery executable roles (02Oct integration finding)
+
+The kernel-reported engine path is authenticated against its full signed
+installed slot. A normal installer instead authenticates its colocated NEW
+helper/full incoming signed package, while OLD cleanup still uses the exact
+installed selected slot and retained lifetime lock. Neither role may fall back
+after failed authentication; installer factories cannot Start.
+
+The OLD manager's separate dispatcher/1 copy must also match the signed Latest
+helper entry, independently of selected engine slot. Its SCM path alone is not
+authorization. Retain the actual private payload/ancestry pin using the signed
+size/hash across SCM configuration verification, Stop and Delete; never derive
+an authorization hash from whichever bytes currently occupy that path.
+
+NSIS preinstall runs its NEW embedded helper from PLUGINSDIR before payload
+extraction. Temporary code must not receive native cleanup or Source authority.
+It may authenticate signed metadata + exact helper bytes as staging DATA only,
+then create a fresh private child of the existing pinned Nelomai privileged root
+and copy only those bytes. No SCM, DLL, registry, route or ownership-record
+changes occur in that bootstrap. Old directories/files are never overwritten.
+
+Only the bounded child launched from that protected stage performs cleanup.
+Its dedicated cleanup-only role verifies actual protected kernel executable,
+signed helper metadata, full OLD installed selected slot, SAME held owner,
+boot/private ancestry/record origin before and after. No temporary ACL relaxation
+or authorization from a phase, filename alone, absent Option or user-provided
+verification key. Failed stage and old obligations stay recoverable. Normal
+installer /S /UPDATE hardware evidence is still required after code/package gates.
 
 ## References
 

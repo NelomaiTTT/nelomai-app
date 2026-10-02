@@ -67,3 +67,96 @@ fn dll_source_never_falls_back_to_wrong_role_nested_path_or_unbounded_payload() 
         assert!(wintun_entry(&manifest, &id.manifest_sha256, &id).is_err());
     }
 }
+
+#[test]
+fn member_sources_select_only_compiled_signed_transport_libraries() {
+    use nelomai_client_tunnel::TunnelTransport;
+    assert_eq!(
+        member_libraries(TunnelTransport::WireGuard),
+        [LibraryKind::WireGuard, LibraryKind::Tunnel]
+    );
+    assert_eq!(
+        member_libraries(TunnelTransport::AmneziaWg3),
+        [LibraryKind::Wintun, LibraryKind::AmneziaWgTunnel]
+    );
+    for (kind, path) in [
+        (LibraryKind::Wintun, "wintun.dll"),
+        (LibraryKind::WireGuard, "wireguard.dll"),
+        (LibraryKind::Tunnel, "tunnel.dll"),
+        (LibraryKind::AmneziaWgTunnel, "amneziawg-tunnel.dll"),
+    ] {
+        let (manifest, id) = signed("shared_library", path, 1234);
+        assert_eq!(
+            library_entry(&manifest, &id.manifest_sha256, &id, kind)
+                .unwrap()
+                .path,
+            path
+        );
+        let mut foreign = id.clone();
+        foreign.runtime_version = "foreign".into();
+        assert!(library_entry(&manifest, &id.manifest_sha256, &foreign, kind).is_err());
+        for other in [
+            LibraryKind::Wintun,
+            LibraryKind::WireGuard,
+            LibraryKind::Tunnel,
+            LibraryKind::AmneziaWgTunnel,
+        ] {
+            if other != kind {
+                assert!(library_entry(&manifest, &id.manifest_sha256, &id, other).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn member_source_selection_cannot_substitute_role_path_or_signed_slot() {
+    for kind in [
+        LibraryKind::WireGuard,
+        LibraryKind::Tunnel,
+        LibraryKind::AmneziaWgTunnel,
+    ] {
+        for (role, path, size) in [
+            ("resource", kind.path().to_owned(), 1234),
+            ("shared_library", format!("nested/{}", kind.path()), 1234),
+            (
+                "shared_library",
+                kind.path().to_owned(),
+                16 * 1024 * 1024 + 1,
+            ),
+        ] {
+            let (manifest, id) = signed(role, &path, size);
+            assert!(library_entry(&manifest, &id.manifest_sha256, &id, kind).is_err());
+        }
+        let (manifest, id) = signed("shared_library", kind.path(), 1234);
+        for mutation in 0..5 {
+            let mut other = id.clone();
+            match mutation {
+                0 => other.slot = RuntimeSlot::Stable,
+                1 => other.runtime_version = "0.3.2".into(),
+                2 => other.runtime_contract_version = 2,
+                3 => other.container_version = "0.3.4".into(),
+                _ => other.manifest_sha256 = "d".repeat(64),
+            }
+            assert!(library_entry(&manifest, &id.manifest_sha256, &other, kind).is_err());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(dead_code)]
+fn actual_member_sources_require_the_same_original_runtime_and_carrier(
+    root: &std::path::Path,
+    owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
+    carrier: std::rc::Rc<native::WintunSource>,
+    runtime: &super::super::member_carrier_key_authority::RuntimeRead,
+    context: &crate::member_carrier_native_ownership::Context,
+    transport: nelomai_client_tunnel::TunnelTransport,
+) -> Result<()> {
+    // Compile-only actual owner composition, not Windows execution or a fake
+    // source/manifest/mutex permission. Pins remain after the caller's Rc drops.
+    let source = native::MemberSource::new(root, owner, transport, &carrier)?;
+    assert!(source.matches_carrier(&carrier));
+    drop(carrier);
+    runtime.verify_member_source(context, &source)?;
+    source.verify()
+}

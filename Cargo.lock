@@ -3069,6 +3069,7 @@ name = "nelomai-windows-service"
 version = "0.3.3"
 dependencies = [
  "async-trait",
+ "blake2",
  "ed25519-dalek",
  "ipnet",
  "nelomai-client-tunnel",
@@ -3082,6 +3083,7 @@ dependencies = [
  "windows 0.61.3",
  "windows-service",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "zeroize",
 ]
 

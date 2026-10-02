@@ -1,4 +1,4 @@
-//! Read-only, before-Wintun-load package observations. Not module/load authority.
+//! Read-only cold/original-owned package observations. Not module/load authority.
 #![allow(dead_code)] // Disconnected until main composes authenticated runtime authority.
 
 use sha2::{Digest, Sha256};
@@ -405,10 +405,10 @@ struct Candidate {
     store_sys: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Device {
-    instance: String,
-    status: u32,
-    problem: u32,
+pub(crate) struct Device {
+    pub(crate) instance: String,
+    pub(crate) status: u32,
+    pub(crate) problem: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Inventory {
@@ -449,6 +449,78 @@ struct Checked<K: Kernel> {
     files: [Observed; 5],
     pins: [K::Pin; 5],
     valid: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReattestMode {
+    Forward,
+    Cleanup,
+}
+
+// The outer authenticated-source bracket must revoke the inner gate even when
+// source verification fails/unwinds before it, or after its successful check.
+struct OriginalRefresh<'a, K: Kernel> {
+    checked: &'a mut Checked<K>,
+    valid: &'a mut bool,
+    complete: bool,
+}
+impl<K: Kernel> Drop for OriginalRefresh<'_, K> {
+    fn drop(&mut self) {
+        if !self.complete {
+            *self.valid = false;
+            self.checked.valid = false;
+        }
+    }
+}
+fn refresh_original<K: Kernel>(
+    checked: &mut Checked<K>,
+    valid: &mut bool,
+    mode: ReattestMode,
+    mut verify_source: impl FnMut(&K) -> Result<()>,
+    operation: impl FnOnce(&mut Checked<K>) -> Result<()>,
+) -> Result<()> {
+    let previously_valid = *valid;
+    if mode == ReattestMode::Forward && !previously_valid {
+        checked.valid = false;
+        return Err(Error::Changed);
+    }
+    let inner_previously_valid = checked.valid;
+    *valid = false;
+    let mut guard = OriginalRefresh {
+        checked,
+        valid,
+        complete: false,
+    };
+    if !previously_valid {
+        guard.checked.valid = false;
+    }
+    verify_source(&guard.checked.kernel)?;
+    operation(guard.checked)?;
+    verify_source(&guard.checked.kernel)?;
+    guard.checked.valid &= previously_valid && inner_previously_valid;
+    *guard.valid = previously_valid;
+    guard.complete = true;
+    Ok(())
+}
+
+/// Read-only original-creator observation. No default or effect permission.
+///
+/// # Safety
+/// Implementors MUST retain the actual original native NEW-create ACKs and
+/// live adapter/module/source handles, authenticate the signed source/runtime
+/// and SAME actual serialized owner lease before and after EVERY observation,
+/// and read the running driver version and exact native instance/status/problem
+/// from those retained originals and fresh native provider queries. The caller
+/// must hold that same serialized lease throughout the enclosing package check.
+/// The originals MUST be bound to the SAME WintunSource Rc retained by that
+/// package, not a separately authenticated source/runtime with equal metadata.
+/// Return the COMPLETE original device set (including zero after proven close),
+/// never a subset, metadata/name/GUID lookup adoption, durable replay, guessed
+/// version/status, cached success or a success default. Errors, ambiguity, lost
+/// ACK/source/runtime/lease continuity MUST fail. Matching Device fields alone
+/// cannot implement this contract or grant load/create/cleanup/effect authority.
+pub(crate) unsafe trait OriginalDevices {
+    fn observe(&mut self) -> Result<(Option<u32>, Vec<Device>)>;
 }
 fn validate_inventory(i: &Inventory) -> Result<&Candidate> {
     if !i.native_amd64_win10_plus {
@@ -812,6 +884,46 @@ fn check<K: Kernel>(mut kernel: K) -> Result<Checked<K>> {
     Ok(checked)
 }
 impl<K: Kernel> Checked<K> {
+    fn reattest_owned(&mut self, originals: &mut impl OriginalDevices) -> Result<()> {
+        self.reattest_owned_mode(originals, ReattestMode::Forward)
+    }
+    fn reattest_owned_cleanup(&mut self, originals: &mut impl OriginalDevices) -> Result<()> {
+        self.reattest_owned_mode(originals, ReattestMode::Cleanup)
+    }
+    fn reattest_owned_mode(
+        &mut self,
+        originals: &mut impl OriginalDevices,
+        mode: ReattestMode,
+    ) -> Result<()> {
+        let previously_valid = self.valid;
+        if mode == ReattestMode::Forward && !previously_valid {
+            return Err(Error::Changed);
+        }
+        self.valid = false;
+        let before = originals.observe()?;
+        if self.kernel.source()? != self.source {
+            return Err(Error::Changed);
+        }
+        original_inventory(&self.inventory, &self.kernel.inventory()?, &before)?;
+        for (pin, expected) in self.pins.iter().zip(&self.files) {
+            if self.kernel.read(pin)? != *expected {
+                return Err(Error::Changed);
+            }
+        }
+        self.kernel.signatures(&self.pins)?;
+        for (pin, expected) in self.pins.iter().zip(&self.files) {
+            if self.kernel.read(pin)? != *expected {
+                return Err(Error::Changed);
+            }
+        }
+        original_inventory(&self.inventory, &self.kernel.inventory()?, &before)?;
+        if self.kernel.source()? != self.source || originals.observe()? != before {
+            return Err(Error::Changed);
+        }
+        // Factual cleanup can inspect a poisoned observation, never rearm it.
+        self.valid = previously_valid;
+        Ok(())
+    }
     fn reattest(&mut self) -> Result<()> {
         if !self.valid {
             return Err(Error::Changed);
@@ -844,12 +956,77 @@ impl<K: Kernel> Checked<K> {
     }
 }
 
+fn original_inventory(
+    cold: &Inventory,
+    actual: &Inventory,
+    original: &(Option<u32>, Vec<Device>),
+) -> Result<()> {
+    // Only observations from ORIGINAL retained native creator capabilities may
+    // change the cold device universe. This function cannot construct one.
+    let (version, devices) = original;
+    if devices.len() > 3
+        || !matches!((version, actual.service_state), (Some(14), 4) | (None, 1))
+        || (version.is_none() && !devices.is_empty())
+    {
+        return Err(Error::Changed);
+    }
+    let mut expected = devices.clone();
+    for (i, device) in expected.iter().enumerate() {
+        if !original_instance(&device.instance)
+            || device.problem != 0
+            || device.status & 8 == 0 // actual CM DN_STARTED, not a guessed bool
+            || expected[..i].iter().any(|other| other.instance.eq_ignore_ascii_case(&device.instance))
+        {
+            return Err(Error::Changed);
+        }
+    }
+    expected.sort_by(|a, b| a.instance.cmp(&b.instance));
+    if actual.devices != expected {
+        return Err(Error::Changed);
+    }
+    // Explicitly account for ONLY the independently proven native device set
+    // and driver running state. Every other field remains the exact cold pin,
+    // including raw queue/file snapshots, platform, SCM type/start and package.
+    let mut immutable = actual.clone();
+    immutable.devices = cold.devices.clone();
+    immutable.service_state = cold.service_state;
+    if immutable != *cold {
+        return Err(Error::Changed);
+    }
+    Ok(())
+}
+fn original_instance(instance: &str) -> bool {
+    let prefix = b"SWD\\WINTUN\\{";
+    let bytes = instance.as_bytes();
+    if bytes.len() != prefix.len() + 36 + 1
+        || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+        || bytes[bytes.len() - 1] != b'}'
+    {
+        return false;
+    }
+    let guid = &bytes[prefix.len()..bytes.len() - 1];
+    let mut nonzero = false;
+    for (i, byte) in guid.iter().enumerate() {
+        if [8, 13, 18, 23].contains(&i) {
+            if *byte != b'-' {
+                return false;
+            }
+        } else if !byte.is_ascii_hexdigit() {
+            return false;
+        } else {
+            nonzero |= *byte != b'0';
+        }
+    }
+    nonzero
+}
+
 /// Actual Windows queries; nothing in this module loads Wintun as executable,
 /// calls a Wintun export, registers a device, installs/removes a package, changes
 /// the SCM, writes a registry value, or creates the upstream private namespace.
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
+    use crate::windows::member_carrier_payload::native::WintunSource;
     use std::{
         fs::{File, OpenOptions},
         mem::{offset_of, size_of},
@@ -1669,8 +1846,20 @@ pub(crate) mod native {
         };
         wintrust(&mut data)
     }
+    enum NativeSource<'a> {
+        Borrowed(&'a File),
+        Original(std::rc::Rc<WintunSource>),
+    }
+    impl NativeSource<'_> {
+        fn file(&self) -> Result<&File> {
+            match self {
+                Self::Borrowed(file) => Ok(file),
+                Self::Original(source) => source.file().map_err(|_| Error::Changed),
+            }
+        }
+    }
     struct Native<'a> {
-        source: &'a File,
+        source: NativeSource<'a>,
     }
     struct RegistryKey(HKEY);
     impl Drop for RegistryKey {
@@ -1842,7 +2031,7 @@ pub(crate) mod native {
     impl Kernel for Native<'_> {
         type Pin = Pin;
         fn source(&mut self) -> Result<Observed> {
-            let source = observe(self.source)?;
+            let source = observe(self.source.file()?)?;
             if hash(&source.bytes) != AUDITED_DLL_SHA256 {
                 return Err(Error::Changed);
             }
@@ -1860,7 +2049,7 @@ pub(crate) mod native {
             let devices = devices()?;
             let (service_type, service_start, service_state) = service(&system, &root)?;
             let (pending_maintenance, pending) =
-                pending_maintenance(self.source, &root, &system_root, &candidates)?;
+                pending_maintenance(self.source.file()?, &root, &system_root, &candidates)?;
             Ok(Inventory {
                 native_amd64_win10_plus,
                 candidates,
@@ -1944,6 +2133,81 @@ pub(crate) mod native {
             self.checked.reattest()
         }
     }
+
+    /// Owns the SAME original signed source Rc and all five cold package pins.
+    /// No source File clone/reopen, borrowed-source lifetime, metadata adoption,
+    /// module/effect authority, Clone or detached-thread transfer is available.
+    pub(crate) struct CheckedOriginalPackage {
+        checked: Checked<Native<'static>>,
+        valid: bool,
+    }
+    impl CheckedOriginalPackage {
+        /// Cold baseline only: live devices/running driver still deny.
+        pub(crate) fn reattest(&mut self) -> Result<()> {
+            self.refresh(ReattestMode::Forward, Checked::reattest)
+        }
+        /// Explicit original-native-ACK path; keeps the FULL cold source/file/
+        /// signature/package/queue baseline and checks originals on both sides.
+        pub(crate) fn reattest_owned(
+            &mut self,
+            originals: &mut impl OriginalDevices,
+        ) -> Result<()> {
+            self.refresh(ReattestMode::Forward, |checked| {
+                checked.reattest_owned(originals)
+            })
+        }
+        /// Fresh factual observation of the SAME retained owned package, usable
+        /// after forward denial. Never rearms a denied gate or grants native
+        /// close/effect permission; the original native ACK contract still applies.
+        pub(crate) fn reattest_owned_cleanup(
+            &mut self,
+            originals: &mut impl OriginalDevices,
+        ) -> Result<()> {
+            self.refresh(ReattestMode::Cleanup, |checked| {
+                checked.reattest_owned_cleanup(originals)
+            })
+        }
+        pub(crate) fn deny_forward(&mut self) {
+            self.valid = false;
+            self.checked.valid = false;
+        }
+        fn refresh(
+            &mut self,
+            mode: ReattestMode,
+            operation: impl FnOnce(&mut Checked<Native<'static>>) -> Result<()>,
+        ) -> Result<()> {
+            refresh_original(
+                &mut self.checked,
+                &mut self.valid,
+                mode,
+                |kernel| {
+                    let NativeSource::Original(source) = &kernel.source else {
+                        return Err(Error::Changed);
+                    };
+                    source.verify().map_err(|_| Error::Changed)
+                },
+                operation,
+            )
+        }
+    }
+
+    /// Retains the actual authenticated WintunSource, not only its File/hash.
+    /// Construction and every refresh bracket the ENTIRE package operation
+    /// with original source verification. Caller serializes on its SAME lease;
+    /// this read-only observation does not acquire or grant mutation authority.
+    pub(crate) fn from_original_source(
+        source: &std::rc::Rc<WintunSource>,
+    ) -> Result<CheckedOriginalPackage> {
+        source.verify().map_err(|_| Error::Changed)?;
+        let checked = check(Native {
+            source: NativeSource::Original(std::rc::Rc::clone(source)),
+        })?;
+        source.verify().map_err(|_| Error::Changed)?;
+        Ok(CheckedOriginalPackage {
+            checked,
+            valid: true,
+        })
+    }
     /// Required main interface: borrow its authenticated retained read-only File
     /// (`WintunSource::file()`), bracket this call and each reattestation with
     /// `WintunSource::verify()`, retain the ORIGINAL source object and runtime lock.
@@ -1961,7 +2225,10 @@ pub(crate) mod native {
     pub(crate) unsafe fn from_authenticated_source(
         source: &File,
     ) -> Result<CheckedExistingPackage<'_>> {
-        check(Native { source }).map(|checked| CheckedExistingPackage {
+        check(Native {
+            source: NativeSource::Borrowed(source),
+        })
+        .map(|checked| CheckedExistingPackage {
             checked,
             not_send: std::marker::PhantomData,
         })
@@ -1996,7 +2263,7 @@ pub(crate) mod native {
             ))
             .expect("retain installed data-only source");
             let inventory = Native {
-                source: &source.file,
+                source: NativeSource::Borrowed(&source.file),
             }
             .inventory()
             .expect("read cold inventory before validation");
@@ -2021,7 +2288,7 @@ pub(crate) mod native {
                 );
             }
             let mut observed = check(Native {
-                source: &source.file,
+                source: NativeSource::Borrowed(&source.file),
             })
             .expect("actual cold package data observations");
             observed

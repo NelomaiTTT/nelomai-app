@@ -17,6 +17,9 @@ use nelomai_contracts::{
 use std::io;
 
 pub trait PairControl: NativePair {
+    /// Explicit provider handoff AFTER actual acknowledged Running Session CAS,
+    /// before evidence/native rebind is allowed. No successful default grant.
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()>;
     /// Read-only native diagnostics. Never open a probe or fall back to an
     /// unowned/legacy backend. Platforms without a provider stay unsupported.
     fn metrics(&self, _slot: Slot) -> io::Result<TunnelMetrics> {
@@ -36,6 +39,10 @@ pub trait PairControl: NativePair {
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()>;
     /// True only after the physical network and both members were validated.
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool>;
+    /// Called immediately after the second, acknowledged Session epoch CAS,
+    /// before health is resumed. Native providers must join that ACK to their
+    /// retained validated rebind, not infer authorization from its epoch value.
+    fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()>;
     fn cleanup_pending(&self) -> bool;
 }
 
@@ -52,10 +59,74 @@ pub struct SessionControl<N: PairControl, S> {
 }
 
 impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
+    /// Validate without consuming the caller's originals, then retain THIS
+    /// full control/native/store before the first fallible Starting save.
+    /// Keep destination on Err/unwind for exact scoped Stop; no publication
+    /// retry, JSON recovery, automatic close or native grant is supplied here.
+    pub fn prepare_retained_into(
+        destination: &mut Option<Self>,
+        runtime: RuntimeSlot,
+        start: &Command,
+        native: &mut Option<N>,
+        store: &mut Option<S>,
+        now: u64,
+    ) -> io::Result<()> {
+        if let Some(original) = destination {
+            original.driver.fence_preparation();
+            original.clear_readiness();
+            return Err(fenced());
+        }
+        start.validate(runtime)?;
+        let Command::Start {
+            scope,
+            primary,
+            role_generation,
+            membership_generation,
+            warm_stop_v1,
+            ..
+        } = start
+        else {
+            return Err(fenced());
+        };
+        if native.is_none() || store.is_none() {
+            return Err(fenced());
+        }
+        let state = SessionState::new(
+            scope.clone(),
+            primary.slot,
+            *role_generation,
+            *membership_generation,
+        )
+        .map_err(|_| fenced())?;
+        let mut leases = [None, None];
+        leases[index(primary.slot)] = Some(primary.lease_id.clone());
+        *destination = Some(Self {
+            driver: SessionDriver::unpersisted(
+                state,
+                native.take().expect("validated native slot"),
+                store.take().expect("validated store slot"),
+                now,
+            ),
+            runtime,
+            current_leases: leases.clone(),
+            leases,
+            warm_stop_v1: *warm_stop_v1,
+            primary_ready: false,
+            standby_ready: false,
+            standby_failed: false,
+            stalled: false,
+        });
+        destination
+            .as_mut()
+            .expect("retained control")
+            .driver
+            .persist_preparation()
+    }
     /// A failed read-only physical discovery is not proof that the old network
     /// still exists. Suspend health and cancel old queries without native rebind
     /// or shutdown. The next validated discovery may retry NetworkChanged.
     pub fn invalidate_network(&mut self, scope: &SessionScope, now: u64) -> io::Result<()> {
+        self.driver.require_preparation()?;
         let state = self.driver.state().snapshot();
         if state.scope != *scope || state.phase != SessionPhase::Running {
             return Err(fenced());
@@ -73,6 +144,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     }
 
     pub fn metrics(&self) -> io::Result<TunnelMetrics> {
+        self.driver.require_preparation()?;
         let state = self.driver.state().snapshot();
         if state.phase != SessionPhase::Running || !state.installed[state.active.index()] {
             return Err(io::Error::other("redundant_diagnostics_not_running"));
@@ -81,6 +153,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     }
 
     pub fn physical_network_fingerprint(&self) -> io::Result<String> {
+        self.driver.require_preparation()?;
         let state = self.driver.state().snapshot();
         if state.phase != SessionPhase::Running || !state.installed[state.active.index()] {
             return Err(io::Error::other("redundant_diagnostics_not_running"));
@@ -160,6 +233,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
         member: &Member,
         options: &DesktopTunnelOptions,
     ) -> io::Result<Snapshot> {
+        self.driver.require_preparation()?;
         member.validate()?;
         options.validate().map_err(|_| fenced())?;
         let state = self.driver.state().snapshot();
@@ -170,9 +244,11 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             return Err(fenced());
         }
         self.clear_readiness();
-        self.driver.start_primary(&state.scope, |native| {
-            native.start_primary(&state.scope, member, options)
-        })?;
+        self.driver.start_primary(
+            &state.scope,
+            |native| native.start_primary(&state.scope, member, options),
+            |native| native.complete_start(&state.scope),
+        )?;
         Ok(self.snapshot())
     }
 
@@ -181,6 +257,12 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
         let state = self.driver.state().snapshot();
         if command.scope() != &state.scope {
             return Err(fenced());
+        }
+        if !matches!(
+            &command,
+            Command::Status { .. } | Command::Stop { .. } | Command::PrepareStop { .. }
+        ) {
+            self.driver.require_preparation()?;
         }
         let automatic = !matches!(
             &command,
@@ -450,7 +532,10 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
                 // rebind. Errors or an unvalidated result leave ticks suspended.
                 self.driver.network_changed(&scope, now, false)?;
                 if self.driver.native_mut().rebind_pair(&scope)? {
-                    self.driver.network_changed(&scope, now, true)?;
+                    self.driver
+                        .network_rebind_completed(&scope, now, |native| {
+                            native.complete_rebind(&scope)
+                        })?;
                     self.stalled = false;
                 }
             }
@@ -459,6 +544,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     }
 
     pub fn tick(&mut self, now: u64) -> io::Result<TickResult> {
+        self.driver.require_preparation()?;
         let prior_phase = self.driver.state().snapshot().phase;
         match self.driver.tick(now) {
             Ok(result) => {
@@ -499,8 +585,9 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     pub fn snapshot(&mut self) -> Snapshot {
         let session = self.driver.state().snapshot();
         let running = session.phase == SessionPhase::Running;
-        let cleanup_pending =
-            session.phase == SessionPhase::Stopping || self.driver.native_mut().cleanup_pending();
+        let cleanup_pending = session.phase == SessionPhase::Stopping
+            || self.driver.retained_cleanup_pending()
+            || self.driver.native_for_cleanup().cleanup_pending();
         Snapshot {
             session,
             leases: self.leases.clone(),
@@ -515,6 +602,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     }
 
     pub fn warm_slot(&self) -> Option<Slot> {
+        self.driver.require_preparation().ok()?;
         if self.warm_stop_v1 {
             self.driver.state().warm_slot()
         } else {

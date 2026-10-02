@@ -134,8 +134,24 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
     // Retain the registration across recovery/preflight failure. The prior
     // manager remains explicitly stopped and can be repaired/retried; only
     // activation below replaces its registration under the rollback path.
-    stop_manager_for_recovery()?;
-    recover_stale_engine(&installation)?;
+    // Resolve OLD layout only if a manager actually exists. After a successful
+    // PREINSTALL cleanup the old broker has been replaced by the new UI and
+    // its manager is absent; absence permits no SCM effect or identity fallback.
+    stop_manager_for_recovery(
+        || {
+            installation
+                .load()
+                .map(|layout| recovery_dispatcher_payload(&layout))
+                .map_err(|_| ServiceError::UnauthorizedClient)
+        },
+        false,
+    )?;
+    recover_stale_engine(
+        &installation,
+        crate::install_recovery::RecoveryExecutable::Installer {
+            source: source.clone(),
+        },
+    )?;
     let operations = DefenderInstallIo {
         root: &install_root,
         broker: &installed_client_path,
@@ -238,21 +254,190 @@ fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
 }
 
 pub fn uninstall() -> Result<(), ServiceError> {
-    stop_manager_for_recovery()?;
-    let install_root = installation_directory()?;
-    if install_root
+    let executable = fs::canonicalize(
+        env::current_exe()
+            .map_err(|error| platform_error("resolve uninstall executable", error))?,
+    )
+    .map_err(|error| platform_error("verify uninstall executable path", error))?;
+    let source = executable
+        .parent()
+        .ok_or(ServiceError::UnsafePath)?
+        .join("runtime");
+    uninstall_with_role(crate::install_recovery::RecoveryExecutable::Installer { source })
+}
+
+/// Dedicated role: never inferred by filename, cancellation or failed auth.
+pub fn uninstall_staged() -> Result<(), ServiceError> {
+    uninstall_with_role(crate::install_recovery::RecoveryExecutable::StagedInstaller)
+}
+
+/// The NSIS temporary process verifies/copies DATA only. Its protected child
+/// authenticates the cleanup-only role; no DLL/service/route/journal IO here.
+pub fn uninstall_from_bundle(manifest: &Path, signature: &Path) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let root = installation_directory()?;
+    let installation =
+        d::Installation::production(&root).map_err(|_| ServiceError::UnauthorizedClient)?;
+    let executable = fs::canonicalize(env::current_exe().map_err(|_| ServiceError::UnsafePath)?)
+        .map_err(|_| ServiceError::UnsafePath)?;
+    let payload = installation
+        .update_helper_payload(
+            &d::read_bounded(manifest, 1024 * 1024)
+                .map_err(|_| ServiceError::UnauthorizedClient)?,
+            &d::read_bounded(signature, 64).map_err(|_| ServiceError::UnauthorizedClient)?,
+            &executable,
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let parent = super::member_files::pin_private_directory(&root)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let staging_root = root.join("update-recovery");
+    let staging_parent = if staging_root
         .try_exists()
-        .map_err(|error| platform_error("inspect privileged layout", error))?
+        .map_err(|_| ServiceError::UnsafePath)?
     {
-        let installation = nelomai_contracts::dispatcher::Installation::production(&install_root)
-            .map_err(|_| ServiceError::UnauthorizedClient)?;
-        recover_stale_engine(&installation)?;
+        super::member_files::pin_private_directory(&staging_root)
+    } else {
+        super::member_files::create_private_child(&parent, &staging_root)
     }
-    remove_service(MANAGER_SERVICE_NAME)?;
+    .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ServiceError::UnsafePath)?
+        .as_nanos();
+    let stage = staging_root.join(format!("stage-{:08x}{nonce:032x}", std::process::id()));
+    let stage_pin = super::member_files::create_private_child(&staging_parent, &stage)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let child_executable = payload
+        .write_stage(&stage)
+        .map_err(|_| ServiceError::UnsafePath)?;
+    let child_pin = super::member_files::pin_runtime_payload(
+        &child_executable,
+        fs::metadata(&child_executable)
+            .map_err(|_| ServiceError::UnsafePath)?
+            .len(),
+        &d::file_digest(&child_executable).map_err(|_| ServiceError::UnsafePath)?,
+    )
+    .map_err(|_| ServiceError::UnauthorizedClient)?;
+    installation
+        .load_staged_installer_recovery(
+            &fs::canonicalize(&child_executable).map_err(|_| ServiceError::UnsafePath)?,
+            nelomai_contracts::RuntimeSlot::Latest,
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    parent
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    staging_parent
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    stage_pin
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    child_pin
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    // Retain the exact new child process. A timeout kills only this child and
+    // preserves stage/old journals; never retries or adopts another process.
+    let mut child = std::process::Command::new(&child_executable)
+        .arg("uninstall-staged")
+        .current_dir(&stage)
+        .spawn()
+        .map_err(|error| platform_error("launch protected update helper", error))?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                // No unbounded wait after a failed/slow termination. Unknown
+                // child rundown remains an error, never cleanup acceptance.
+                let rundown = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < rundown {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                return Err(ServiceError::Backend("update_helper_pending".into()));
+            }
+        }
+    };
+    parent
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    stage_pin
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    child_pin
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    if !status.success() {
+        return Err(ServiceError::Backend("update_helper_pending".into()));
+    }
+    Ok(())
+}
+
+fn uninstall_with_role(
+    execution: crate::install_recovery::RecoveryExecutable,
+) -> Result<(), ServiceError> {
+    let preserve_update_records = matches!(
+        execution,
+        crate::install_recovery::RecoveryExecutable::StagedInstaller
+    );
+    let install_root = installation_directory()?;
+    let pinned = super::member_files::pin_private_directory(&install_root)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let installation = nelomai_contracts::dispatcher::Installation::production(&install_root)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let executable = fs::canonicalize(env::current_exe().map_err(|_| ServiceError::UnsafePath)?)
+        .map_err(|_| ServiceError::UnsafePath)?;
+    // Authenticate the child and FULL old layout before the first SCM effect,
+    // even when no stale active marker remains.
+    let old_layout = execution
+        .load(
+            &installation,
+            &executable,
+            nelomai_contracts::RuntimeSlot::Latest,
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let executable_pin = super::member_files::pin_runtime_payload(
+        &executable,
+        fs::metadata(&executable)
+            .map_err(|_| ServiceError::UnsafePath)?
+            .len(),
+        &nelomai_contracts::dispatcher::file_digest(&executable)
+            .map_err(|_| ServiceError::UnsafePath)?,
+    )
+    .map_err(|_| ServiceError::UnauthorizedClient)?;
+    pinned
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    executable_pin
+        .verify()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let rechecked = execution
+        .load(
+            &installation,
+            &executable,
+            nelomai_contracts::RuntimeSlot::Latest,
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    if rechecked.identity != old_layout.identity
+        || rechecked.directory != old_layout.directory
+        || rechecked.broker != old_layout.broker
+    {
+        return Err(ServiceError::UnauthorizedClient);
+    }
+    stop_manager_for_recovery(|| Ok(recovery_dispatcher_payload(&old_layout)), false)?;
+    recover_stale_engine(&installation, execution)?;
+    stop_manager_for_recovery(|| Ok(recovery_dispatcher_payload(&old_layout)), true)?;
     remove_all_owned_tunnel_services()?;
     WindowsRouteManager::new()?.cleanup()?;
     let root = state_directory()?;
-    if root.exists() {
+    // Updating must retain the old authenticated journals/completed records.
+    // Only an explicit full uninstall retains the pre-existing state removal.
+    if !preserve_update_records && root.exists() {
         fs::remove_dir_all(&root)
             .map_err(|error| platform_error("remove service state directory", error))?;
     }
@@ -261,6 +446,7 @@ pub fn uninstall() -> Result<(), ServiceError> {
 
 fn recover_stale_engine(
     installation: &nelomai_contracts::dispatcher::Installation,
+    execution: crate::install_recovery::RecoveryExecutable,
 ) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
     if !installation
@@ -282,15 +468,18 @@ fn recover_stale_engine(
             &installation.root.join(d::ACTIVE_ENGINE_NAME),
         )
         .map_err(|_| d::blocked())?;
-        crate::install_recovery::recover(installation, |layout| {
+        crate::install_recovery::recover_with_owner(installation, |layout, owner| {
             use crate::member_actor::PairFactory;
             pinned.verify().map_err(|_| d::blocked())?;
             let engine = layout.engine_path();
             // Existing scoped cleanup validates durable owner identities,
             // interface proofs, ACLs, routes, DNS and WFP before retirement.
-            let mut pair = super::member_pair::NativePairFactory::from_service(
+            let mut pair = super::member_pair::NativePairFactory::from_installer_cleanup(
+                &installation.root,
                 layout.identity.clone(),
                 &engine,
+                owner,
+                execution.clone(),
             )?;
             pair.recover(layout.identity.slot)
                 .map_err(|_| d::blocked())?;
@@ -305,11 +494,28 @@ fn recover_stale_engine(
     result.map_err(|_| ServiceError::Backend("dispatcher_recovery_pending".into()))
 }
 
-fn stop_manager_for_recovery() -> Result<(), ServiceError> {
+fn recovery_dispatcher_payload(
+    layout: &nelomai_contracts::dispatcher::VerifiedLayout,
+) -> (PathBuf, u64, String) {
+    let (size, hash) = layout.dispatcher_payload_identity();
+    (layout.dispatcher_path(), size, hash.to_owned())
+}
+
+fn stop_manager_for_recovery(
+    expected: impl FnOnce() -> Result<(PathBuf, u64, String), ServiceError>,
+    delete: bool,
+) -> Result<(), ServiceError> {
     let manager = service_manager(ServiceManagerAccess::CONNECT)?;
     let service = match manager.open_service(
         MANAGER_SERVICE_NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+        ServiceAccess::QUERY_STATUS
+            | ServiceAccess::QUERY_CONFIG
+            | ServiceAccess::STOP
+            | if delete {
+                ServiceAccess::DELETE
+            } else {
+                ServiceAccess::empty()
+            },
     ) {
         Ok(service) => service,
         Err(windows_service::Error::Winapi(error))
@@ -319,12 +525,61 @@ fn stop_manager_for_recovery() -> Result<(), ServiceError> {
         }
         Err(error) => return Err(platform_error("open manager for recovery", error)),
     };
+    let (expected, size, hash) = expected()?;
+    // The expected hash comes from the independently verified signed OLD
+    // layout. Hold its exact private file/ancestry across every SCM effect;
+    // never learn an authorization digest from current untrusted file bytes.
+    let payload = super::member_files::pin_runtime_payload(&expected, size, &hash)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let verify = || -> Result<(), ServiceError> {
+        payload
+            .verify()
+            .map_err(|_| ServiceError::UnauthorizedClient)?;
+        let actual = service
+            .query_config()
+            .map_err(|error| platform_error("inspect manager recovery configuration", error))?;
+        crate::install_recovery::require_owned_manager_command(
+            &super::member_owner::command_arguments(actual.executable_path.as_os_str())
+                .map_err(|_| ServiceError::UnauthorizedClient)?,
+            Some(&expected),
+            actual.service_type == ServiceType::OWN_PROCESS,
+            actual.account_name.as_deref(),
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+        payload
+            .verify()
+            .map_err(|_| ServiceError::UnauthorizedClient)
+    };
+    verify()?;
     let status = service
         .query_status()
         .map_err(|error| platform_error("inspect manager for recovery", error))?;
     if status.current_state != ServiceState::Stopped {
         let _ = service.stop();
         wait_until_stopped(&service)?;
+    }
+    verify()?;
+    if delete {
+        service
+            .delete()
+            .map_err(|error| platform_error("delete owned manager", error))?;
+        drop(service);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match manager.open_service(MANAGER_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+                Err(windows_service::Error::Winapi(error))
+                    if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+                {
+                    return Ok(())
+                }
+                Err(windows_service::Error::Winapi(error))
+                    if error.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE as i32) => {}
+                Ok(service) => drop(service),
+                Err(error) => return Err(platform_error("verify owned manager deletion", error)),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        return Err(ServiceError::Backend("owned_manager_delete_pending".into()));
     }
     Ok(())
 }
@@ -500,44 +755,8 @@ impl SlotServiceControl for NativeSlotServices<'_> {
     }
 
     fn start(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
-        // Never replace/adopt either transport by name. The scoped owner has
-        // already journaled Prepared; CreateService also refuses a raced name.
-        for candidate in [TunnelTransport::WireGuard, TunnelTransport::AmneziaWg3] {
-            if open_slot_service(slot, candidate, ServiceAccess::QUERY_STATUS)?.is_some() {
-                return Err(ServiceError::InvalidRequest);
-            }
-        }
-        let path = slot_config_path(slot)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| platform_error("inspect slot configuration", error))?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || metadata.len() > crate::MAX_FRAME_SIZE as u64
-        {
-            return Err(ServiceError::UnsafePath);
-        }
-        let configuration = zeroize::Zeroizing::new(
-            fs::read_to_string(&path)
-                .map_err(|error| platform_error("read slot configuration", error))?,
-        );
-        if crate::redundancy::slot_configuration(&configuration)?.as_str() != configuration.as_str()
-            || nelomai_client_tunnel::detect_configuration_transport(&configuration) != transport
-        {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let spec = slot_service_spec(self.engine, &path, slot, transport)?;
-        let manager =
-            service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let service = create_service(&manager, &spec)?;
-        // The scoped owner retains Prepared on failure and must revalidate
-        // exact service/config evidence before cleanup. Never auto-stop here.
-        service
-            .set_config_service_sid_info(ServiceSidType::Unrestricted)
-            .map_err(|error| platform_error("set slot service SID", error))?;
-        service
-            .start(&[] as &[&str])
-            .map_err(|error| platform_error("start slot service", error))?;
-        wait_until_running(&service)
+        let service = create_fresh_slot_service(self.engine, slot, transport)?;
+        finish_created_slot_service(&service)
     }
 
     fn rebind(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
@@ -558,6 +777,83 @@ impl SlotServiceControl for NativeSlotServices<'_> {
             .map_err(|error| platform_error("restart slot", error))?;
         wait_until_running_until(&service, deadline)
     }
+}
+
+/// Returns the actual NEW CreateService handle before SID/start/wait or any
+/// post-create fallible work. The scoped owner stores it immediately; failures
+/// leave Prepared/native cleanup obligations, never implicit stop or deletion.
+pub(super) fn create_fresh_slot_service(
+    engine: &Path,
+    slot: TunnelSlot,
+    transport: TunnelTransport,
+) -> Result<Service, ServiceError> {
+    // Never replace/adopt either transport by name. The scoped owner has
+    // already journaled Prepared; CreateService also refuses a raced name.
+    for candidate in [TunnelTransport::WireGuard, TunnelTransport::AmneziaWg3] {
+        if open_slot_service(slot, candidate, ServiceAccess::QUERY_STATUS)?.is_some() {
+            return Err(ServiceError::InvalidRequest);
+        }
+    }
+    let path = slot_config_path(slot)?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| platform_error("inspect slot configuration", error))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > crate::MAX_FRAME_SIZE as u64
+    {
+        return Err(ServiceError::UnsafePath);
+    }
+    let configuration = zeroize::Zeroizing::new(
+        fs::read_to_string(&path)
+            .map_err(|error| platform_error("read slot configuration", error))?,
+    );
+    if crate::redundancy::slot_configuration(&configuration)?.as_str() != configuration.as_str()
+        || nelomai_client_tunnel::detect_configuration_transport(&configuration) != transport
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    let spec = slot_service_spec(engine, &path, slot, transport)?;
+    let manager =
+        service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+    // Keep QUERY_CONFIG local to fresh slot creation. Ordinary/global
+    // service creation and teardown retain their existing access/behavior.
+    let info = ServiceInfo {
+        name: OsString::from(&spec.name),
+        display_name: OsString::from(&spec.display_name),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::OnDemand,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: spec.executable_path,
+        launch_arguments: spec.arguments.iter().map(OsString::from).collect(),
+        dependencies: spec
+            .dependencies
+            .iter()
+            .map(|dependency| ServiceDependency::Service(OsString::from(dependency)))
+            .collect(),
+        account_name: None,
+        account_password: None,
+    };
+    manager
+        .create_service(
+            &info,
+            ServiceAccess::QUERY_CONFIG
+                | ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE
+                | ServiceAccess::CHANGE_CONFIG,
+        )
+        .map_err(|error| platform_error("create Windows service", error))
+}
+
+pub(super) fn finish_created_slot_service(service: &Service) -> Result<(), ServiceError> {
+    service
+        .set_config_service_sid_info(ServiceSidType::Unrestricted)
+        .map_err(|error| platform_error("set slot service SID", error))?;
+    service
+        .start(&[] as &[&str])
+        .map_err(|error| platform_error("start slot service", error))?;
+    wait_until_running(service)
 }
 
 pub(crate) fn installation_directory() -> Result<PathBuf, ServiceError> {

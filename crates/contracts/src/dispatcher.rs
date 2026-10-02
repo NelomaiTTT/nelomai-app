@@ -14,6 +14,8 @@ use std::{
 
 pub const MANIFEST_NAME: &str = "container-manifest-v1.json";
 pub const SIGNATURE_NAME: &str = "container-manifest-v1.sig";
+pub const UPDATE_HELPER_MANIFEST_NAME: &str = "nelomai-update-manifest-v1.json";
+pub const UPDATE_HELPER_SIGNATURE_NAME: &str = "nelomai-update-manifest-v1.sig";
 /// A root-owned atomic pointer containing the immutable generation basename.
 pub const POINTER_NAME: &str = "container-manifest.json";
 pub const ACTIVE_ENGINE_NAME: &str = "engine-active";
@@ -599,6 +601,29 @@ pub struct VerifiedLayout {
     pub identity: EngineIdentity,
     pub broker: BrokerPolicy,
     engine: PathBuf,
+    dispatcher_size: u64,
+    dispatcher_sha256: String,
+}
+/// Verified DATA for copying a cleanup helper. Not a runtime layout, execution
+/// permission, Source, native-empty receipt or authority over any old resource.
+pub struct VerifiedUpdateHelper {
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
+    helper: Vec<u8>,
+}
+impl VerifiedUpdateHelper {
+    /// Caller must exclusively create/pin a new private stage first. Create-new
+    /// files only; partial failure leaves the stage recoverable, never overwrites.
+    pub fn write_stage(&self, directory: &Path) -> io::Result<PathBuf> {
+        write_new(&directory.join(UPDATE_HELPER_MANIFEST_NAME), &self.manifest)?;
+        write_new(
+            &directory.join(UPDATE_HELPER_SIGNATURE_NAME),
+            &self.signature,
+        )?;
+        let helper = directory.join("nelomai-windows-service.exe");
+        write_new(&helper, &self.helper)?;
+        Ok(helper)
+    }
 }
 impl VerifiedLayout {
     pub fn engine_path(&self) -> PathBuf {
@@ -609,6 +634,11 @@ impl VerifiedLayout {
             .join("dispatcher/1")
             .join(self.engine.file_name().expect("verified engine filename"))
     }
+    /// Signed payload identity of the separate dispatcher copy, not a digest
+    /// learned from whichever file happens to occupy its current path.
+    pub fn dispatcher_payload_identity(&self) -> (u64, &str) {
+        (self.dispatcher_size, &self.dispatcher_sha256)
+    }
     pub fn authorize(&self, identity: &EngineIdentity) -> io::Result<()> {
         if identity != &self.identity {
             Err(blocked())
@@ -618,6 +648,53 @@ impl VerifiedLayout {
     }
 }
 impl Installation {
+    /// Staging DATA only. The temporary executable is never promoted to an
+    /// engine/Source or given cleanup rights by this signed-byte check.
+    pub fn update_helper_payload(
+        &self,
+        manifest: &[u8],
+        signature: &[u8],
+        kernel_executable: &Path,
+    ) -> io::Result<VerifiedUpdateHelper> {
+        if self.platform != "windows"
+            || manifest.len() > 1024 * 1024
+            || signature.len() != 64
+            || !kernel_executable.is_absolute()
+            || fs::canonicalize(kernel_executable)? != kernel_executable
+        {
+            return Err(blocked());
+        }
+        let verified = verify_container_manifest(
+            manifest,
+            signature,
+            &self.key,
+            &self.platform,
+            &self.architecture,
+        )
+        .map_err(|_| blocked())?;
+        let entry = verified
+            .latest()
+            .files
+            .iter()
+            .find(|entry| {
+                entry.path == self.engine_name() && entry.role == RuntimeFileRole::Executable
+            })
+            .ok_or_else(blocked)?;
+        if entry.size_bytes == 0 || entry.size_bytes > 16 * 1024 * 1024 {
+            return Err(blocked());
+        }
+        let helper = read_bounded(kernel_executable, 16 * 1024 * 1024)?;
+        if helper.len() as u64 != entry.size_bytes || digest(&helper) != entry.sha256 {
+            return Err(blocked());
+        }
+        // Retain the exact authenticated bytes; copying never reopens the
+        // untrusted temporary source after verification.
+        Ok(VerifiedUpdateHelper {
+            manifest: manifest.to_vec(),
+            signature: signature.to_vec(),
+            helper,
+        })
+    }
     pub fn production(root: &Path) -> io::Result<Self> {
         let mut installation = Self::for_owner(
             root,
@@ -628,6 +705,56 @@ impl Installation {
         );
         installation.strict_ancestors = true;
         Ok(installation)
+    }
+    /// Dedicated cleanup-only staged executable. Native callers additionally
+    /// retain actual private-directory and no-write/delete executable pins.
+    pub fn load_staged_installer_recovery(
+        &self,
+        kernel_executable: &Path,
+        slot: RuntimeSlot,
+    ) -> io::Result<VerifiedLayout> {
+        if !kernel_executable.is_absolute()
+            || fs::canonicalize(kernel_executable)? != kernel_executable
+            || kernel_executable.file_name() != Some(std::ffi::OsStr::new(self.engine_name()))
+        {
+            return Err(blocked());
+        }
+        let directory = kernel_executable.parent().ok_or_else(blocked)?;
+        let name = directory
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(blocked)?;
+        let nonce = name.strip_prefix("stage-").ok_or_else(blocked)?;
+        if !(16..=64).contains(&nonce.len())
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            || directory.parent()
+                != Some(
+                    fs::canonicalize(&self.root)?
+                        .join("update-recovery")
+                        .as_path(),
+                )
+        {
+            return Err(blocked());
+        }
+        self.trusted_ancestors(kernel_executable)?;
+        for path in [
+            directory.to_path_buf(),
+            kernel_executable.to_path_buf(),
+            directory.join(UPDATE_HELPER_MANIFEST_NAME),
+            directory.join(UPDATE_HELPER_SIGNATURE_NAME),
+        ] {
+            trusted(&path, self.owner)?;
+        }
+        self.update_helper_payload(
+            &read_bounded(&directory.join(UPDATE_HELPER_MANIFEST_NAME), 1024 * 1024)?,
+            &read_bounded(&directory.join(UPDATE_HELPER_SIGNATURE_NAME), 64)?,
+            kernel_executable,
+        )?;
+        // Signed new helper metadata grants no OLD resource identity. The old
+        // full signed selected runtime and broker remain independently required.
+        self.load_slot(slot)
     }
     /// Explicit trust/ownership injection used by owned test fixtures, never CLI input.
     pub fn for_owner(
@@ -745,6 +872,38 @@ impl Installation {
         }
         Ok(stable)
     }
+    /// Installer cleanup has a different kernel executable from the old engine.
+    /// Its incoming signed source never substitutes for the installed lifetime.
+    pub fn load_installer_recovery(
+        &self,
+        source: &Path,
+        kernel_executable: &Path,
+        slot: RuntimeSlot,
+    ) -> io::Result<VerifiedLayout> {
+        if !source.is_absolute() || !kernel_executable.is_absolute() {
+            return Err(blocked());
+        }
+        trusted(source, self.owner)?;
+        self.trusted_ancestors(source)?;
+        let source = fs::canonicalize(source)?;
+        let expected = source
+            .parent()
+            .ok_or_else(blocked)?
+            .join(self.engine_name());
+        trusted(&expected, self.owner)?;
+        self.trusted_ancestors(&expected)?;
+        if fs::canonicalize(&expected)? != kernel_executable {
+            return Err(blocked());
+        }
+        let (manifest, _) = self.verified_manifest(&source)?;
+        let signed_engine = self.verify_files(&source, &manifest)?;
+        if file_digest(&expected)? != file_digest(&signed_engine)? {
+            return Err(blocked());
+        }
+        // The NEW installer is authorized by its own full signed package; the
+        // OLD cleanup identity still comes only from the installed selected slot.
+        self.load_slot(slot)
+    }
     pub fn load_slot(&self, slot: RuntimeSlot) -> io::Result<VerifiedLayout> {
         self.trusted_ancestors(&self.root)?;
         trusted(&self.root, self.owner)?;
@@ -762,6 +921,30 @@ impl Installation {
         }
         let (verified, hash) = self.verified_manifest(&directory)?;
         let engine = self.verify_slot_files(&directory, &verified, slot)?;
+        // Installation always copies the Latest signed helper into dispatcher/1,
+        // including when an engine is later selected from Stable. A matching SCM
+        // path is not authority over a changed/unverified dispatcher executable.
+        let dispatcher_entry = verified
+            .selected(RuntimeSlot::Latest)
+            .ok_or_else(blocked)?
+            .files
+            .iter()
+            .find(|entry| {
+                entry.path == self.engine_name() && entry.role == RuntimeFileRole::Executable
+            })
+            .ok_or_else(blocked)?;
+        let dispatcher_dir = directory.join("dispatcher");
+        trusted(&dispatcher_dir, self.owner)?;
+        trusted(&dispatcher_dir.join("1"), self.owner)?;
+        let dispatcher = dispatcher_dir.join("1").join(self.engine_name());
+        trusted(&dispatcher, self.owner)?;
+        let metadata = reject_link(&dispatcher)?;
+        if !metadata.is_file()
+            || metadata.len() != dispatcher_entry.size_bytes
+            || file_digest(&dispatcher)? != dispatcher_entry.sha256
+        {
+            return Err(blocked());
+        }
         let broker: BrokerPolicy =
             serde_json::from_slice(&read_bounded(&directory.join(POLICY_NAME), 8192)?)
                 .map_err(|_| blocked())?;
@@ -777,6 +960,8 @@ impl Installation {
         Ok(VerifiedLayout {
             directory,
             engine,
+            dispatcher_size: dispatcher_entry.size_bytes,
+            dispatcher_sha256: dispatcher_entry.sha256.clone(),
             broker,
             identity: EngineIdentity {
                 slot,
