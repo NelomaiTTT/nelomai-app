@@ -796,7 +796,7 @@ fn rebind_ack_requires_same_nic_new_process_and_exact_retired_original() {
             scope: closing_record().scope,
             slot: nelomai_contracts::dispatcher::TunnelSlot::A,
             transport: nelomai_client_tunnel::TunnelTransport::WireGuard,
-            engine: std::path::PathBuf::from("/original/engine"),
+            engine: crate::test_engine_path("engine.exe"),
             config_sha256: [9; 32],
         },
         phase: Phase::Running,
@@ -814,6 +814,7 @@ fn rebind_ack_requires_same_nic_new_process_and_exact_retired_original() {
         retired_proof: None,
         previous_config_sha256: None,
     };
+    crate::member_owner::validate_record_shape(&prior).unwrap();
     let mut next = prior.clone();
     next.retired_proof = prior.proof;
     next.proof.as_mut().unwrap().process = ProcessProof {

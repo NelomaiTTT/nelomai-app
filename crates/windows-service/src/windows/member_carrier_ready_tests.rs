@@ -801,7 +801,7 @@ fn full_cleanup_fixture() -> (
                 scope: context.intent.scope.clone(),
                 slot: nelomai_contracts::dispatcher::TunnelSlot::A,
                 transport: nelomai_client_tunnel::TunnelTransport::WireGuard,
-                engine: std::path::PathBuf::from("/installed/engine.exe"),
+                engine: crate::test_engine_path("engine.exe"),
                 config_sha256: [4; 32],
             },
             phase: crate::member_owner::Phase::Stopping,
