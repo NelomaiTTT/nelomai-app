@@ -76,6 +76,10 @@ struct State {
     rebind_sealed: bool,
     cleanup_begun: bool,
     require_cleanup_entry: bool,
+    probe_replies: bool,
+    health_dead: [bool; 2],
+    tx: [u64; 2],
+    rx: [u64; 2],
 }
 type Shared = Rc<RefCell<State>>;
 struct Disk(Shared);
@@ -153,26 +157,58 @@ impl crate::member_owner::MemberIo for ConstructionOnly {
         Err(crate::member_owner::OwnerError::Native)
     }
 }
-pub(crate) struct Socket(Shared);
+pub(crate) struct Socket {
+    state: Shared,
+    slot: Slot,
+    query: Vec<u8>,
+    replied: bool,
+}
 impl Drop for Socket {
     fn drop(&mut self) {
-        let mut s = self.0.borrow_mut();
+        let mut s = self.state.borrow_mut();
         s.held -= 1;
         s.released += 1;
     }
 }
 impl ProbeDatagram for Socket {
     fn send(&mut self, packet: &[u8]) -> io::Result<usize> {
+        self.query = packet.to_vec();
+        self.state.borrow_mut().tx[idx(self.slot)] += 1;
         Ok(packet.len())
     }
-    fn receive(&mut self, _: &mut [u8]) -> io::Result<usize> {
-        Err(io::ErrorKind::WouldBlock.into())
+    fn receive(&mut self, packet: &mut [u8]) -> io::Result<usize> {
+        let mut state = self.state.borrow_mut();
+        if !state.probe_replies || state.health_dead[idx(self.slot)] || self.replied {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        // External UDP boundary only: real DNS parser, scheduler, evidence,
+        // SessionControl and carrier coordinator consume this scoped reply.
+        let mut reply = self.query.clone();
+        if reply.len() < 12 {
+            return Err(failed());
+        }
+        reply[2] = 0x81;
+        reply[3] = 0x80;
+        reply[7] = 1;
+        reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
+        if packet.len() < reply.len() {
+            return Err(failed());
+        }
+        packet[..reply.len()].copy_from_slice(&reply);
+        self.replied = true;
+        state.rx[idx(self.slot)] += 1;
+        Ok(reply.len())
     }
 }
 impl PairSocket for Socket {
     fn duplicate(&self) -> io::Result<Self> {
-        self.0.borrow_mut().held += 1;
-        Ok(Self(self.0.clone()))
+        self.state.borrow_mut().held += 1;
+        Ok(Self {
+            state: self.state.clone(),
+            slot: self.slot,
+            query: vec![],
+            replied: false,
+        })
     }
 }
 impl PairJournal for Disk {
@@ -494,7 +530,12 @@ impl CarrierPairIo for Io {
         result?;
         self.0.borrow_mut().unpublished -= 1;
         Ok((
-            Socket(self.0.clone()),
+            Socket {
+                state: self.0.clone(),
+                slot,
+                query: vec![],
+                replied: false,
+            },
             guard::ProbeTuple {
                 source: r.addresses[0].addr(),
                 source_port: 40100 + idx(slot) as u16,
@@ -577,22 +618,28 @@ impl CarrierPairIo for Io {
             Ok(())
         }
     }
-    fn observe(&mut self, _: &Record, _: Slot) -> io::Result<(TunnelMetrics, NativeHealthSample)> {
+    fn observe(
+        &mut self,
+        _: &Record,
+        slot: Slot,
+    ) -> io::Result<(TunnelMetrics, NativeHealthSample)> {
         self.effect("observe", |_| {})?;
+        let state = self.0.borrow();
+        let dead = state.health_dead[idx(slot)];
         Ok((
             TunnelMetrics::default(),
             NativeHealthSample {
-                admitted: true,
-                closed: false,
-                handshake_fresh: true,
-                tx_packets: 3,
-                rx_data_packets: 3,
+                admitted: !dead,
+                closed: dead,
+                handshake_fresh: !dead,
+                tx_packets: 3 + state.tx[idx(slot)],
+                rx_data_packets: 3 + state.rx[idx(slot)],
             },
         ))
     }
     fn fingerprint(&mut self, _: &Record) -> io::Result<String> {
         self.effect("fingerprint", |_| {})?;
-        Ok("physical".into())
+        Ok("a".repeat(64))
     }
     fn begin_rebind_execution(&mut self, _: &Record) -> io::Result<u64> {
         self.effect("execution-begin", |s| s.execution_epoch += 1)?;
@@ -645,6 +692,10 @@ fn fresh_state_for(scope: SessionScope) -> Shared {
         rebind_sealed: false,
         cleanup_begun: false,
         require_cleanup_entry: false,
+        probe_replies: false,
+        health_dead: [false; 2],
+        tx: [0; 2],
+        rx: [0; 2],
     }))
 }
 fn pair() -> (CarrierNativePair<Io, Disk>, Shared) {
@@ -1566,6 +1617,57 @@ mod terminal_control {
                 single,
             )
         }
+        fn view(
+            active: Slot,
+            role: u64,
+            membership: u64,
+            b: &str,
+        ) -> nelomai_contracts::RedundantSessionView {
+            let a = member(Slot::A).lease_id;
+            nelomai_contracts::RedundantSessionView {
+                session_id: scope().session_id,
+                state: nelomai_contracts::RedundantSessionState::Connected,
+                active_lease_id: Some(if active == Slot::A {
+                    a.clone()
+                } else {
+                    b.into()
+                }),
+                slot_a_lease_id: Some(a),
+                slot_b_lease_id: Some(b.into()),
+                standby_desired: true,
+                role_generation: role,
+                membership_generation: membership,
+                reason: None,
+            }
+        }
+        fn confirm_role(
+            actor: &mut CompositeBackend<Single, Factory>,
+            active: Slot,
+            generation: u64,
+        ) {
+            let current = actor.current_redundancy_snapshot().unwrap().session;
+            let session = view(
+                active,
+                generation,
+                current.membership_generation,
+                &member(Slot::B).lease_id,
+            );
+            let local_active_lease_id = session.active_lease_id.clone().unwrap();
+            actor
+                .redundant(Command::ConfirmRole {
+                    scope: scope(),
+                    expected_revision: current.local_revision,
+                    expected_network_epoch: current.network_epoch,
+                    response: nelomai_contracts::RedundantRoleResponse {
+                        api_version: nelomai_contracts::ApiVersion::V1,
+                        request_id: "software-fixture".into(),
+                        action: nelomai_contracts::RedundantRoleAction::Accepted,
+                        local_active_lease_id,
+                        session,
+                    },
+                })
+                .unwrap();
+        }
         #[test]
         fn carrier_factory_primary_start_stop_repeat_uses_fresh_session() {
             // Real actor + SessionControl + cold CarrierPairControl/coordinator;
@@ -1667,6 +1769,174 @@ mod terminal_control {
             assert_eq!(external.borrow().prepared[0].get(), 1);
             actor.redundant(Command::Stop { scope: scope() }).unwrap();
             assert_eq!(external.borrow().prepared[0].get(), 1);
+        }
+        #[test]
+        fn carrier_factory_attach_switch_replace_preserves_carrier() {
+            let (mut actor, external, single) = setup();
+            let first = actor.redundant(start(scope())).unwrap();
+            let world = external.borrow().worlds[0].clone();
+            world.borrow_mut().probe_replies = true;
+            let c = world.borrow().carrier;
+            let attached = actor
+                .redundant(Command::Attach {
+                    scope: scope(),
+                    member: member(Slot::B),
+                    expected_revision: first.session.local_revision,
+                    expected_network_epoch: first.session.network_epoch,
+                    expected_membership_generation: 1,
+                    membership_generation: 2,
+                })
+                .unwrap();
+            assert_eq!(attached.session.membership_generation, 2);
+            actor.tick(0).unwrap();
+            actor.tick(100).unwrap();
+            world.borrow_mut().health_dead[0] = true;
+            for now in (200..=3500).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            let switched = actor.current_redundancy_snapshot().unwrap();
+            assert_eq!(switched.session.active, Slot::B);
+            assert_eq!(world.borrow().disk.as_ref().unwrap().active, Some(Slot::B));
+            assert_eq!(world.borrow().carrier, c);
+            assert!(
+                world.borrow().rx[1] > 0,
+                "real evidence reducer consumed fake UDP only"
+            );
+            confirm_role(&mut actor, Slot::B, 2);
+            world.borrow_mut().health_dead = [false, true];
+            for now in (3600..=7500).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            assert_eq!(
+                actor.current_redundancy_snapshot().unwrap().session.active,
+                Slot::A
+            );
+            assert_eq!(world.borrow().disk.as_ref().unwrap().active, Some(Slot::A));
+            assert_eq!(world.borrow().carrier, c);
+            confirm_role(&mut actor, Slot::A, 3);
+            world.borrow_mut().health_dead = [false; 2];
+            let before = actor.current_redundancy_snapshot().unwrap().session;
+            let retired = actor
+                .redundant(Command::RetireInactive {
+                    scope: scope(),
+                    slot: Slot::B,
+                    lease_id: member(Slot::B).lease_id,
+                    expected_revision: before.local_revision,
+                    expected_network_epoch: before.network_epoch,
+                    expected_membership_generation: before.membership_generation,
+                })
+                .unwrap();
+            assert!(world.borrow().members[1].is_none());
+            let mut replacement = member(Slot::B);
+            replacement.lease_id = "44444444-4444-4444-8444-444444444444".into();
+            replacement.configuration = TunnelConfiguration::new(
+                replacement
+                    .configuration
+                    .expose()
+                    .replace(":51820", ":51821"),
+            );
+            let new_lease = replacement.lease_id.clone();
+            let staged = actor
+                .redundant(Command::StageCandidate {
+                    scope: scope(),
+                    member: replacement,
+                    expected_revision: retired.session.local_revision,
+                    expected_network_epoch: retired.session.network_epoch,
+                    expected_membership_generation: 2,
+                })
+                .unwrap();
+            let effects = world.borrow().events.len();
+            assert!(actor
+                .redundant(Command::Attach {
+                    scope: scope(),
+                    member: member(Slot::B),
+                    expected_revision: first.session.local_revision,
+                    expected_network_epoch: first.session.network_epoch,
+                    expected_membership_generation: 1,
+                    membership_generation: 2,
+                })
+                .is_err());
+            assert_eq!(
+                world.borrow().events.len(),
+                effects,
+                "stale receipt cannot enter native"
+            );
+            let replaced = actor
+                .redundant(Command::CommitCandidate {
+                    scope: scope(),
+                    slot: Slot::B,
+                    expected_revision: staged.session.local_revision,
+                    expected_network_epoch: staged.session.network_epoch,
+                    session: view(Slot::A, 3, 3, &new_lease),
+                })
+                .unwrap();
+            assert_eq!(replaced.session.membership_generation, 3);
+            assert_eq!(world.borrow().carrier, c);
+            assert_eq!(world.borrow().counts.get("carrier-ready"), Some(&1));
+            assert_eq!(external.borrow().prepared[0].get(), 1);
+            assert_eq!(single.get(), 0);
+            actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            assert_eq!(external.borrow().finalized[0].get(), 1);
+            assert!(world.borrow().carrier.is_none());
+        }
+        #[test]
+        fn carrier_factory_switch_failure_never_publishes_target_or_falls_back() {
+            for boundary in [
+                "target-health",
+                "withdraw",
+                "network",
+                "endpoints",
+                "allows",
+                "data",
+            ] {
+                for lost_ack in [false, true] {
+                    let (mut actor, external, single) = setup();
+                    let first = actor.redundant(start(scope())).unwrap();
+                    actor
+                        .redundant(Command::Attach {
+                            scope: scope(),
+                            member: member(Slot::B),
+                            expected_revision: first.session.local_revision,
+                            expected_network_epoch: first.session.network_epoch,
+                            expected_membership_generation: 1,
+                            membership_generation: 2,
+                        })
+                        .unwrap();
+                    let world = external.borrow().worlds[0].clone();
+                    world.borrow_mut().probe_replies = true;
+                    actor.tick(0).unwrap();
+                    actor.tick(100).unwrap();
+                    world.borrow_mut().health_dead[0] = true;
+                    world.borrow_mut().fail = Some((boundary.into(), lost_ack));
+                    let mut failed_tick = false;
+                    for now in (200..=3500).step_by(100) {
+                        if actor.tick(now).is_err() {
+                            failed_tick = true;
+                            break;
+                        }
+                    }
+                    assert!(failed_tick, "{boundary} lost={lost_ack}");
+                    let stopped = actor.redundant(Command::Stop { scope: scope() }).unwrap();
+                    assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+                    assert!(!stopped.cleanup_pending);
+                    assert!(
+                        external
+                            .borrow()
+                            .sessions
+                            .iter()
+                            .all(|s| s.active == Slot::A),
+                        "no role publication after native failure"
+                    );
+                    let native = world.borrow();
+                    assert!(native.carrier.is_none());
+                    assert!(native.members.iter().all(Option::is_none));
+                    assert!(!native.guard.permits);
+                    assert!(native.network.routes.is_empty());
+                    assert_eq!(native.held, 0);
+                    assert_eq!(external.borrow().finalized[0].get(), 1);
+                    assert_eq!(single.get(), 0);
+                }
+            }
         }
     }
     #[test]
