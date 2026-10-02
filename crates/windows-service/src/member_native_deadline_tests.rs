@@ -441,9 +441,25 @@ fn missing_start_ack_and_worker_or_stop_ack_error_permanently_deny() {
         (false, true, false),
         (false, false, true),
     ] {
-        let (deadline, _) = fixture(ready, stop, wait);
-        let result = deadline.run(&7, || Ok::<_, ()>(42));
-        assert!(result.is_err());
+        let (deadline, external) = fixture(ready, stop, wait);
+        let result = deadline.run(&7, || {
+            if wait {
+                // A fast synchronous return may legitimately let the worker
+                // observe completion before it calls wait_stop. Injecting an
+                // error into an uncalled boundary is not evidence of failure.
+                // Keep this call in flight until the actual fake wait entered;
+                // its Err must then deny success, regardless of return order.
+                for _ in 0..1000 {
+                    if external.waiting.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(external.waiting.load(Ordering::SeqCst));
+            }
+            Ok::<_, ()>(42)
+        });
+        assert!(result.is_err(), "ready={ready}, stop={stop}, wait={wait}");
         assert_eq!(
             deadline.run::<(), ()>(&7, || panic!("retry must not enter")),
             Err(Failure::<()>::Supervisor(Error::Revoked))
