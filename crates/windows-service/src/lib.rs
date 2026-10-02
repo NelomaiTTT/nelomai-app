@@ -66,9 +66,6 @@ mod member_carrier_module;
 #[path = "windows/member_carrier_module_terminal_read.rs"]
 mod member_carrier_module_terminal_read;
 #[cfg(all(test, not(windows)))]
-#[path = "windows/member_carrier_registry_metadata.rs"]
-mod member_carrier_registry_metadata;
-#[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_network.rs"]
 mod member_carrier_network;
 #[cfg(all(test, not(windows)))]
@@ -89,6 +86,9 @@ mod member_carrier_ready;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_recovery.rs"]
 mod member_carrier_recovery;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_registry_metadata.rs"]
+mod member_carrier_registry_metadata;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_runtime.rs"]
 mod member_carrier_runtime;
