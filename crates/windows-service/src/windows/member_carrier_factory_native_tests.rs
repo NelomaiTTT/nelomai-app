@@ -36,6 +36,13 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         "fresh-ack",
         "starting-ack",
     ] {
+        // The case spans preparation, many independently supervised cleanup
+        // calls and a second session. This outer bound is not a native Calling
+        // budget: every actual call keeps its unchanged 30s watchdog. Owned
+        // files also prevent a full pipe from blocking the child before exit.
+        let output_dir = tempfile::tempdir().unwrap();
+        let stdout_path = output_dir.path().join("stdout");
+        let stderr_path = output_dir.path().join("stderr");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -45,35 +52,33 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 "--test-threads=1",
             ])
             .env("NELOMAI_FACTORY_OS_CASE", case)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            .stdout(std::fs::File::create(&stdout_path).unwrap())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
             .spawn()
             .unwrap();
         let started = std::time::Instant::now();
-        loop {
-            if child.try_wait().unwrap().is_some() {
-                break;
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break (status, false);
             }
-            if started.elapsed() > std::time::Duration::from_secs(30) {
+            if started.elapsed() > std::time::Duration::from_secs(240) {
                 child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
-                panic!(
-                    "actual native factory {case} exceeded 30s: {} {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                break (child.wait().unwrap(), true);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let output = child.wait_with_output().unwrap();
+        };
+        let stdout = std::fs::read_to_string(stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(stderr_path).unwrap();
         assert!(
-            output.status.success(),
-            "actual native factory {case}: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            !timed_out,
+            "actual native factory {case} exceeded outer 240s: {stdout} {stderr}"
         );
         assert!(
-            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            status.success(),
+            "actual native factory {case}: {stdout} {stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed"),
             "empty child selection at {case}"
         );
     }

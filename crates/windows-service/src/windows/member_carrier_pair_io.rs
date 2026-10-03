@@ -5582,6 +5582,13 @@ pub(crate) mod native {
             record: &pair::Record,
             effect: pair::Effect,
         ) -> io::Result<()> {
+            #[cfg(test)]
+            if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                eprintln!(
+                    "actual actor stage {:?}/{} effect={:?}",
+                    record.phase, record.stop_stage, effect
+                );
+            }
             if let Err(error) = require_attestation(record, effect) {
                 self.serial.fault();
                 return Err(error);
