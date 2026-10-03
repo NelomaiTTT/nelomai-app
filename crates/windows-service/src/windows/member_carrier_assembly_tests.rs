@@ -754,6 +754,7 @@ fn module_only_assembly_source_is_original_initial_and_revokes_before_key_access
             .unwrap();
         let actual = source.as_ref().unwrap();
         root.verify_module_only_source(actual).unwrap();
+        actual.verify_no_constructor_seal().unwrap();
         let (mut foreign, _, _, _) = setup(Fault::None);
         foreign.initialize().unwrap();
         assert!(foreign.verify_module_only_source(actual).is_err());
@@ -764,6 +765,7 @@ fn module_only_assembly_source_is_original_initial_and_revokes_before_key_access
             root.verify_module_only_source(actual).is_err(),
             "duplicate selection poisons the original"
         );
+        assert!(actual.verify_no_constructor_seal().is_err());
         // A separate real source for each entry: fail BEFORE missing assets/
         // owner checks, not after a hypothetical SDK operation.
         let (mut root, _, _, _) = setup(Fault::None);
@@ -784,6 +786,11 @@ fn module_only_assembly_source_is_original_initial_and_revokes_before_key_access
         }
         assert!(root
             .verify_module_only_source(source.as_ref().unwrap())
+            .is_err());
+        assert!(source
+            .as_ref()
+            .unwrap()
+            .verify_no_constructor_seal()
             .is_err());
         assert_eq!(state.borrow().creates, 0);
         assert_eq!(state.borrow().writes, 0);
@@ -808,6 +815,7 @@ fn module_only_assembly_source_retains_original_before_error_or_unwind() {
         let original = source.as_ref().expect("rooted original initial read");
         assert!(Rc::ptr_eq(&original.origin, &root.origin));
         assert!(root.verify_module_only_source(original).is_err());
+        assert!(original.verify_no_constructor_seal().is_err());
     }
 }
 

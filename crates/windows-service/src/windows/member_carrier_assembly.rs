@@ -21,6 +21,16 @@ struct ModuleOnlyAssemblyRead<J> {
     allowed: std::rc::Rc<std::cell::Cell<bool>>,
     selected: std::rc::Rc<TerminalCallState>,
 }
+impl<J> ModuleOnlyAssemblyRead<J> {
+    // SAME owner-created revocation cell and successful original selection.
+    // Readonly detached-origin fence; never SDK absence or release permission.
+    fn verify_no_constructor_seal(&self) -> Result<()> {
+        if !self.allowed.get() {
+            return Err(Error::Retired);
+        }
+        self.selected.verify().map_err(|_| Error::Retired)
+    }
+}
 
 /// SAME initial publication only, with explicit one-way original-J cleanup
 /// selection before its current bytes are checked. No native/disposal grant.
@@ -322,7 +332,7 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
     }
     fn verify_module_only_source(&self, source: &ModuleOnlyAssemblyRead<J>) -> Result<()> {
         self.verify_module_only_origin(source)?;
-        source.selected.verify().map_err(|_| Error::Retired)
+        source.verify_no_constructor_seal()
     }
     fn verify_module_only_origin(&self, source: &ModuleOnlyAssemblyRead<J>) -> Result<()> {
         if !source.allowed.get()
@@ -1137,6 +1147,11 @@ pub(crate) mod native {
         bootstrap: std::cell::RefCell<Option<Rc<NativeBootstrapModuleOnlyRead>>>,
     }
     impl NativeAssemblyModuleOnlyRead {
+        /// Original owner-created seal is revoked before every constructor/key
+        /// entry. No native facts or unload right are inferred from this check.
+        pub(crate) fn verify_no_constructor_seal(&self) -> Result<()> {
+            self.source.verify_no_constructor_seal()
+        }
         pub(crate) fn bootstrap(&self) -> Result<Rc<NativeBootstrapModuleOnlyRead>> {
             self.bootstrap
                 .try_borrow()

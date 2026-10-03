@@ -448,6 +448,31 @@ impl NativeDeadline {
             },
         )
     }
+    /// One independently authorized original own-reference release. Timing is
+    /// NOT native authority: supplier must perform fresh full no-constructor
+    /// SDK/private/BFE preflight, preserve native ACK and SDK-free postflight.
+    ///
+    /// # Safety
+    /// SAME retained issuer/original loader/current Stopped Pair bracket MUST
+    /// span this entire call. No constructor, other native effect or DATA write.
+    pub(crate) unsafe fn run_no_constructor_module_release<T>(
+        &self,
+        proof: &super::member_carrier_startup::native::NativeNoConstructorReleaseProof,
+        call: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let context = proof.context();
+        self.run_authenticated_cleanup(
+            context,
+            || proof.verify_entry(self),
+            || {
+                let pin = self.read_pin()?;
+                pin.verify_call(self, context)?;
+                let result = call();
+                pin.verify_call(self, context)?;
+                result
+            },
+        )
+    }
     /// Bounded readonly verification before any carrier/module/key attempt.
     /// A missing native receipt alone NEVER opens this channel: the SAME actual
     /// factory history and precise protected Closing ACK must authenticate it.

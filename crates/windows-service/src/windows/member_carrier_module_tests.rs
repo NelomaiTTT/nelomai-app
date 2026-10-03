@@ -1,6 +1,733 @@
 use super::*;
 use std::{cell::RefCell, rc::Rc};
 
+// Real LoadAttempt + ModuleRelease backend; only the OS/pre/post boundaries
+// below are doubles. None implements the unsafe native authorization supplier.
+fn no_constructor_loaded() -> (
+    LoadAttempt<Boundary>,
+    Rc<OriginalModuleLoadRead<Rc<Module>>>,
+) {
+    let state = Rc::new(RefCell::new(State::default()));
+    let mut loaded = LoadAttempt::empty();
+    loaded
+        .load(Boundary(state), &AtomicBool::new(false))
+        .unwrap();
+    let mut original = None;
+    loaded
+        .retain_original_load_read_into(&mut original, |_| Ok(()))
+        .unwrap();
+    (loaded, original.unwrap())
+}
+struct NoConstructorAck {
+    module: Rc<Module>,
+    original: Rc<OriginalModuleLoadRead<Rc<Module>>>,
+    proof: Rc<Cell<u8>>,
+}
+
+// Break: verifying the receipt after revoking its read gate rejects the genuine
+// owner; dropping it before ACK/post or bypassing module.1 permits repeated free.
+#[test]
+fn no_constructor_backend_releases_exact_original_once_after_revocation() {
+    let (mut loaded, original) = no_constructor_loaded();
+    let module = loaded.owner.as_ref().unwrap().module.clone();
+    let valid = loaded.owner.as_ref().unwrap().valid.clone();
+    let release = ModuleRelease::new();
+    let loans = LeasePins::new();
+    let mut terminal = None;
+    let mut retained = None;
+    let proof = Rc::new(Cell::new(7));
+    let free_calls = Cell::new(0);
+    loaded
+        .release_original_into(
+            OriginalLoadRelease {
+                original: &original,
+                same_module: Rc::ptr_eq,
+                terminal: &mut terminal,
+                release: &release,
+                loans: &loans,
+            },
+            (original.clone(), proof.clone()),
+            &mut retained,
+            |receipt, supplier| {
+                assert!(Rc::ptr_eq(receipt, &original));
+                assert!(Rc::ptr_eq(supplier, &proof));
+                assert!(release.was_attempted());
+                assert!(!original.available.get());
+                assert!(!valid.get());
+                original.inspect_release_pre_with(
+                    &release,
+                    &loans,
+                    &AtomicBool::new(false),
+                    |actual| {
+                        assert!(Rc::ptr_eq(actual, &module));
+                        let _query_loan = loans.retain_read()?;
+                        Ok(())
+                    },
+                )?;
+                Ok(())
+            },
+            |receipt, supplier| {
+                free_calls.set(free_calls.get() + 1);
+                assert!(release.effect_started.get());
+                Ok(NoConstructorAck {
+                    module: module.clone(),
+                    original: receipt.clone(),
+                    proof: supplier.clone(),
+                })
+            },
+            |ack| {
+                assert!(release.acknowledged());
+                assert!(Rc::ptr_eq(&ack.module, &module));
+                assert!(Rc::ptr_eq(&ack.original, &original));
+                assert!(Rc::ptr_eq(&ack.proof, &proof));
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(free_calls.get(), 1);
+    assert!(loaded.owner.is_none());
+    let ack = retained.as_ref().unwrap();
+    loaded
+        .verify_original_release(&ack.original, &terminal, &release, Rc::ptr_eq)
+        .unwrap();
+    loaded
+        .verify_original_disposition(&ack.original, &terminal, &release, &loans, Rc::ptr_eq)
+        .unwrap();
+    assert!(loaded
+        .verify_original_load_read(&original, Rc::ptr_eq)
+        .is_err());
+    assert!(original
+        .inspect_cleanup_with(
+            &AtomicBool::new(false),
+            || Ok(()),
+            |_| panic!("revoked ordinary query")
+        )
+        .is_err());
+    assert!(loaded
+        .release_original_into(
+            OriginalLoadRelease {
+                original: &original,
+                same_module: Rc::ptr_eq,
+                terminal: &mut terminal,
+                release: &release,
+                loans: &loans
+            },
+            (original.clone(), proof.clone()),
+            &mut retained,
+            |_, _| panic!("repeat pre"),
+            |_, _| panic!("repeat native"),
+            |_| panic!("repeat post"),
+        )
+        .is_err());
+    assert_eq!(free_calls.get(), 1);
+    assert!(Rc::ptr_eq(&retained.as_ref().unwrap().module, &module));
+}
+
+// Break: a pre/native/post error or unwind drops proof/owner, invents an ACK,
+// loses the actual returned ACK, or rearms an ambiguous reference release.
+#[test]
+fn no_constructor_backend_retains_originals_at_every_failed_boundary() {
+    // 0 pre error, 1 pre unwind, 2 free error, 3 free unwind, 4 lost ACK,
+    // 5 post error, 6 post unwind. A lost native return cannot create a receipt.
+    for fault in 0..7 {
+        let (mut loaded, original) = no_constructor_loaded();
+        let module = loaded.owner.as_ref().unwrap().module.clone();
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let mut terminal = None;
+        let mut retained = None;
+        let proof = Rc::new(Cell::new(7));
+        let proof_weak = Rc::downgrade(&proof);
+        let read_weak = Rc::downgrade(&original);
+        let free_calls = Cell::new(0);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loaded.release_original_into(
+                OriginalLoadRelease {
+                    original: &original,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut terminal,
+                    release: &release,
+                    loans: &loans,
+                },
+                (original.clone(), proof.clone()),
+                &mut retained,
+                |_, _| match fault {
+                    0 => Err(Error::Conflict),
+                    1 => panic!("pre unknown"),
+                    _ => Ok(()),
+                },
+                |receipt, supplier| {
+                    free_calls.set(free_calls.get() + 1);
+                    match fault {
+                        2 => Err(Error::Native),
+                        3 => panic!("FreeLibrary unknown"),
+                        4 => Err(Error::Native), // external effect with no usable return
+                        _ => Ok(NoConstructorAck {
+                            module: module.clone(),
+                            original: receipt.clone(),
+                            proof: supplier.clone(),
+                        }),
+                    }
+                },
+                |_| match fault {
+                    5 => Err(Error::Conflict),
+                    6 => panic!("post unknown"),
+                    _ => panic!("post without native ACK"),
+                },
+            )
+        }));
+        assert!(
+            outcome.is_err() || outcome.unwrap().is_err(),
+            "fault {fault}"
+        );
+        assert!(Rc::ptr_eq(&loaded.owner.as_ref().unwrap().module, &module));
+        assert!(!loaded.owner.as_ref().unwrap().valid.get());
+        assert!(terminal.is_some());
+        assert!(release.was_attempted());
+        assert_eq!(free_calls.get(), usize::from(fault >= 2));
+        assert_eq!(retained.is_some(), fault >= 5);
+        assert_eq!(release.acknowledged(), fault >= 5);
+        assert!(original
+            .inspect_release_pre_with(&release, &loans, &AtomicBool::new(false), |_| panic!(
+                "failed/returned frame image query"
+            ))
+            .is_err());
+        assert_eq!(
+            loaded
+                .verify_original_release(&original, &terminal, &release, Rc::ptr_eq)
+                .is_ok(),
+            fault >= 5
+        );
+        assert!(loaded
+            .verify_original_disposition(&original, &terminal, &release, &loans, Rc::ptr_eq)
+            .is_err());
+        if let Some(ack) = retained.as_ref() {
+            assert!(Rc::ptr_eq(&ack.module, &module));
+            assert!(Rc::ptr_eq(&ack.original, &original));
+            assert!(Rc::ptr_eq(&ack.proof, &proof));
+        }
+        // Even removing the caller's returned ACK never authorizes another free.
+        drop(retained.take());
+        assert!(loaded
+            .release_original_into(
+                OriginalLoadRelease {
+                    original: &original,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut terminal,
+                    release: &release,
+                    loans: &loans
+                },
+                (original.clone(), proof.clone()),
+                &mut retained,
+                |_, _| panic!("retry pre"),
+                |_, _| panic!("retry free"),
+                |_| panic!("retry post"),
+            )
+            .is_err());
+        drop(proof);
+        drop(original);
+        drop(loaded);
+        assert!(proof_weak.upgrade().is_some(), "failed proof root {fault}");
+        assert!(read_weak.upgrade().is_some(), "failed receipt root {fault}");
+    }
+}
+
+// Break: equal/foreign/missing receipts or origin drift release a different own
+// reference; a live actual module loan or poisoned count is ignored.
+#[test]
+fn no_constructor_backend_denies_foreign_missing_and_live_loan_origins() {
+    for defect in 0..8 {
+        let (mut loaded, original) = no_constructor_loaded();
+        let (_foreign, foreign_read) = no_constructor_loaded();
+        let forged = Rc::new(OriginalModuleLoadRead {
+            module: original.module.clone(),
+            valid: original.valid.clone(),
+            available: original.available.clone(),
+            inspecting: Cell::new(false),
+            tainted: Cell::new(false),
+        });
+        let candidate = match defect {
+            0 => &foreign_read,
+            1 => &forged,
+            _ => &original,
+        };
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let mut terminal = None;
+        let mut retained: Option<NoConstructorAck> = None;
+        let proof = Rc::new(Cell::new(7));
+        match defect {
+            2 => {
+                loaded.original_read.borrow_mut().take();
+            }
+            3 => {
+                loaded.owner.as_mut().unwrap().module = foreign_read.module.clone();
+            }
+            4 => {
+                loaded.owner.as_mut().unwrap().valid = Rc::new(Cell::new(true));
+            }
+            5 => {
+                loans.retain().unwrap();
+            }
+            6 => {
+                loans.release();
+            } // unknown zero count is not positive absence
+            7 => {
+                loaded.read_available = Rc::new(Cell::new(true));
+            }
+            _ => (),
+        }
+        assert!(
+            loaded
+                .release_original_into(
+                    OriginalLoadRelease {
+                        original: candidate,
+                        same_module: Rc::ptr_eq,
+                        terminal: &mut terminal,
+                        release: &release,
+                        loans: &loans
+                    },
+                    (candidate.clone(), proof),
+                    &mut retained,
+                    |_, _| panic!("invalid origin pre"),
+                    |_, _| panic!("invalid origin free"),
+                    |_| panic!("invalid origin post"),
+                )
+                .is_err(),
+            "defect {defect}"
+        );
+        assert!(loaded.owner.is_some());
+        assert!(retained.is_none());
+        assert!(!release.acknowledged());
+        assert!(release.was_attempted());
+        assert!(!loaded.read_available.get());
+        if defect == 5 {
+            loans.release();
+        }
+        assert!(loaded
+            .release_original_into(
+                OriginalLoadRelease {
+                    original: candidate,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut terminal,
+                    release: &release,
+                    loans: &loans
+                },
+                (candidate.clone(), Rc::new(Cell::new(7))),
+                &mut retained,
+                |_, _| panic!("invalid retry pre"),
+                |_, _| panic!("invalid retry free"),
+                |_| panic!("invalid retry post"),
+            )
+            .is_err());
+    }
+}
+
+// Break: occupied caller storage overwrites an original ACK; a nonexistent load
+// is treated as a successful owner or an earlier disposition is overwritten.
+#[test]
+fn no_constructor_backend_preserves_occupied_ack_and_missing_owner() {
+    for defect in 0..4 {
+        let (mut loaded, original) = no_constructor_loaded();
+        let (mut other, other_read) = no_constructor_loaded();
+        let proof = Rc::new(Cell::new(7));
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let mut terminal = None;
+        let mut retained = None;
+        match defect {
+            0 => {
+                retained = Some(NoConstructorAck {
+                    module: other.owner.as_ref().unwrap().module.clone(),
+                    original: other_read.clone(),
+                    proof: proof.clone(),
+                });
+            }
+            1 => {
+                std::mem::forget(loaded.owner.take());
+            }
+            2 => {
+                terminal = Some((
+                    other.owner.as_ref().unwrap().module.clone(),
+                    other.owner.as_ref().unwrap().valid.clone(),
+                ));
+            }
+            3 => {
+                loaded = LoadAttempt::empty();
+            } // no successful loader ACK at all
+            _ => unreachable!(),
+        }
+        assert!(loaded
+            .release_original_into(
+                OriginalLoadRelease {
+                    original: &original,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut terminal,
+                    release: &release,
+                    loans: &loans
+                },
+                (original.clone(), proof),
+                &mut retained,
+                |_, _| panic!("missing/occupied pre"),
+                |_, _| panic!("missing/occupied free"),
+                |_| panic!("missing/occupied post"),
+            )
+            .is_err());
+        assert!(!release.acknowledged());
+        assert!(!loaded.read_available.get());
+        if defect == 0 {
+            assert!(Rc::ptr_eq(
+                &retained.as_ref().unwrap().original,
+                &other_read
+            ));
+        }
+        if defect == 2 {
+            assert!(Rc::ptr_eq(
+                &terminal.as_ref().unwrap().0,
+                &other.owner.as_ref().unwrap().module
+            ));
+        }
+        assert!(loaded
+            .verify_original_release(&original, &terminal, &release, Rc::ptr_eq)
+            .is_err());
+        // This other load is unrelated and was not released by rejection.
+        assert!(other.owner.is_some());
+        drop(other.owner.take());
+    }
+}
+
+// Break: factual ACK/disposition accepts a foreign or equal reconstructed
+// receipt, substituted terminal identity or a gate with no actual native ACK.
+#[test]
+fn no_constructor_backend_factual_ack_denies_foreign_equal_and_missing_origins() {
+    let (mut loaded, original) = no_constructor_loaded();
+    let (_foreign, foreign) = no_constructor_loaded();
+    let module = original.module.clone();
+    let release = ModuleRelease::new();
+    let loans = LeasePins::new();
+    let mut terminal = None;
+    let mut retained = None;
+    loaded
+        .release_original_into(
+            OriginalLoadRelease {
+                original: &original,
+                same_module: Rc::ptr_eq,
+                terminal: &mut terminal,
+                release: &release,
+                loans: &loans,
+            },
+            (original.clone(), Rc::new(Cell::new(7))),
+            &mut retained,
+            |_, _| Ok(()),
+            |receipt, proof| {
+                Ok(NoConstructorAck {
+                    module: module.clone(),
+                    original: receipt.clone(),
+                    proof: proof.clone(),
+                })
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    let equal = Rc::new(OriginalModuleLoadRead {
+        module: original.module.clone(),
+        valid: original.valid.clone(),
+        available: original.available.clone(),
+        inspecting: Cell::new(false),
+        tainted: Cell::new(false),
+    });
+    for candidate in [&foreign, &equal] {
+        assert!(loaded
+            .verify_original_release(candidate, &terminal, &release, Rc::ptr_eq)
+            .is_err());
+        assert!(loaded
+            .verify_original_disposition(candidate, &terminal, &release, &loans, Rc::ptr_eq)
+            .is_err());
+    }
+    let missing_ack = ModuleRelease::new();
+    assert!(loaded
+        .verify_original_release(&original, &terminal, &missing_ack, Rc::ptr_eq)
+        .is_err());
+    assert!(loaded
+        .verify_original_release(&original, &None, &release, Rc::ptr_eq)
+        .is_err());
+    let wrong_terminal = Some((foreign.module.clone(), original.valid.clone()));
+    assert!(loaded
+        .verify_original_release(&original, &wrong_terminal, &release, Rc::ptr_eq)
+        .is_err());
+    loaded
+        .verify_original_disposition(
+            &retained.as_ref().unwrap().original,
+            &terminal,
+            &release,
+            &loans,
+            Rc::ptr_eq,
+        )
+        .unwrap();
+}
+
+#[cfg(windows)]
+fn actual_no_constructor_release_backend_compile_contract<
+    P: native::NativeNoConstructorModuleReleaseProof,
+>(
+    loaded: &mut native::LoadedWintun,
+    original: &Rc<native::NativeOriginalModuleLoadRead>,
+    proof: Rc<P>,
+    retained: &mut Option<native::NativeNoConstructorModuleReleased<P>>,
+) -> Result<()> {
+    // Actual fixed native API; no unsafe supplier implementation and no run.
+    loaded.release_no_constructor_into(original, proof, retained)?;
+    let ack = retained.as_ref().ok_or(Error::Conflict)?;
+    loaded.verify_original_no_constructor_native_release(ack)?;
+    loaded.verify_no_constructor_disposition(ack)
+}
+
+// Break: reopening ordinary image trust or admitting a factual image query
+// before selection, after effect/postflight, or after pre has returned.
+#[test]
+fn no_constructor_release_pre_reader_opens_only_inside_actual_pre_frame() {
+    let (loaded, original) = no_constructor_loaded();
+    let module = original.module.clone();
+    let release = ModuleRelease::new();
+    let loans = LeasePins::new();
+    let cancelled = AtomicBool::new(false);
+    let queries = Cell::new(0);
+    assert!(original
+        .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!("unselected image"))
+        .is_err());
+    loaded.deny_original_load_reads();
+    let mut retained = None;
+    release
+        .run_into(
+            &mut retained,
+            || {
+                original.inspect_release_pre_with(&release, &loans, &cancelled, |actual| {
+                    assert!(Rc::ptr_eq(actual, &module));
+                    assert!(!original.valid.get());
+                    assert!(!original.available.get());
+                    let _loan = loans.retain_read()?;
+                    queries.set(queries.get() + 1);
+                    Ok(())
+                })?;
+                assert!(loans.is_empty());
+                assert!(!original.valid.get());
+                assert!(!original.available.get());
+                Ok(())
+            },
+            || {
+                assert!(original
+                    .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!(
+                        "effect image"
+                    ))
+                    .is_err());
+                Ok(module.clone())
+            },
+            |_| {
+                assert!(original
+                    .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!(
+                        "post image"
+                    ))
+                    .is_err());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(queries.get(), 1);
+    assert!(original
+        .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!("completed image"))
+        .is_err());
+    assert!(original
+        .inspect_cleanup_with(&cancelled, || Ok(()), |_| panic!("ordinary read rearmed"))
+        .is_err());
+    assert!(release
+        .run_into(
+            &mut retained,
+            || panic!("repeat pre"),
+            || panic!("repeat free"),
+            |_| Ok(())
+        )
+        .is_err());
+    assert!(original
+        .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!("repeat image"))
+        .is_err());
+}
+
+// Break: failed/unwound/finished pre leaves a reusable pre aperture, or a caught
+// read failure is allowed to proceed to FreeLibrary on the same original.
+#[test]
+fn no_constructor_release_pre_reader_poison_and_rundown_deny_native_effect() {
+    for fault in 0..6 {
+        let (loaded, original) = no_constructor_loaded();
+        loaded.deny_original_load_reads();
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let cancelled = AtomicBool::new(false);
+        let mut retained: Option<()> = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            release.run_into(
+                &mut retained,
+                || {
+                    match fault {
+                        0 => {
+                            original.inspect_release_pre_with(
+                                &release,
+                                &loans,
+                                &cancelled,
+                                |_| Err(Error::Conflict),
+                            )?;
+                        }
+                        1 => {
+                            original.inspect_release_pre_with(
+                                &release,
+                                &loans,
+                                &cancelled,
+                                |_| panic!("pre factual read unwind"),
+                            )?;
+                        }
+                        2 => {
+                            assert!(original
+                                .inspect_release_pre_with(&release, &loans, &cancelled, |_| Err(
+                                    Error::Native
+                                ))
+                                .is_err());
+                            return Ok(()); // caught read error must still poison effect
+                        }
+                        3 => return Err(Error::Conflict), // error outside fact reader
+                        4 => panic!("pre supplier unwind"),
+                        5 => {
+                            assert!(release
+                                .run_into(
+                                    &mut None::<()>,
+                                    || panic!("reentered pre"),
+                                    || Ok(()),
+                                    |_| Ok(())
+                                )
+                                .is_err());
+                            assert!(original
+                                .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!(
+                                    "tainted image"
+                                ))
+                                .is_err());
+                            return Ok(());
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                },
+                || panic!("failed pre must never free"),
+                |_| panic!("no ACK post"),
+            )
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(retained.is_none());
+        assert!(!release.effect_started.get());
+        assert!(original
+            .inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!(
+                "abandoned pre image"
+            ))
+            .is_err());
+        assert!(!original.valid.get());
+        assert!(!original.available.get());
+    }
+}
+
+// Break: active loans/cancellation/live ordinary read gate are mistaken for
+// a valid pre-read origin, or their denial allows a native effect if caught.
+#[test]
+fn no_constructor_release_pre_reader_requires_revoked_zero_loan_original() {
+    for defect in 0..5 {
+        let (loaded, original) = no_constructor_loaded();
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let cancelled = AtomicBool::new(defect == 3);
+        if defect != 0 {
+            loaded.deny_original_load_reads();
+        }
+        match defect {
+            1 => {
+                loans.retain().unwrap();
+            }
+            2 => loans.release(),
+            4 => {
+                original.tainted.set(true);
+            }
+            _ => (),
+        }
+        assert!(release
+            .run_into(
+                &mut None::<()>,
+                || original.inspect_release_pre_with(&release, &loans, &cancelled, |_| panic!(
+                    "invalid pre query"
+                )),
+                || panic!("invalid pre free"),
+                |_| panic!("invalid pre post"),
+            )
+            .is_err());
+        assert!(!release.effect_started.get());
+    }
+}
+
+// Break: a new actual loan introduced by fallible pre/post escapes the backend
+// and permits native release or completed owning disposition.
+#[test]
+fn no_constructor_backend_rechecks_actual_loans_across_pre_and_post() {
+    for post_loan in [false, true] {
+        let (mut loaded, original) = no_constructor_loaded();
+        let module = original.module.clone();
+        let release = ModuleRelease::new();
+        let loans = LeasePins::new();
+        let mut terminal = None;
+        let mut retained = None;
+        assert!(loaded
+            .release_original_into(
+                OriginalLoadRelease {
+                    original: &original,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut terminal,
+                    release: &release,
+                    loans: &loans
+                },
+                (original.clone(), Rc::new(Cell::new(7))),
+                &mut retained,
+                |_, _| {
+                    if !post_loan {
+                        loans.retain()?;
+                    }
+                    Ok(())
+                },
+                |receipt, proof| {
+                    assert!(post_loan, "pre acquired loan must deny free");
+                    Ok(NoConstructorAck {
+                        module: module.clone(),
+                        original: receipt.clone(),
+                        proof: proof.clone(),
+                    })
+                },
+                |_| {
+                    loans.retain()?;
+                    Ok(())
+                },
+            )
+            .is_err());
+        assert!(loaded.owner.is_some());
+        assert_eq!(retained.is_some(), post_loan);
+        assert_eq!(release.acknowledged(), post_loan);
+        loans.release();
+        assert!(loaded
+            .verify_original_disposition(&original, &terminal, &release, &loans, Rc::ptr_eq)
+            .is_err());
+    }
+}
+
+#[cfg(windows)]
+fn actual_no_constructor_release_pre_read_compile_contract(
+    original: &native::NativeOriginalModuleLoadRead,
+    runtime: &crate::windows::member_carrier_key_authority::RuntimeRead,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    original.verify_release_pre_read(runtime, cancelled)
+}
+
 // Break: retaining the returned native original only AFTER fallible postflight.
 // This is the production release protocol, not an SDK success/permission mock.
 #[test]

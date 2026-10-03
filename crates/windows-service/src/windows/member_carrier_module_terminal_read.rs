@@ -198,12 +198,12 @@ pub(crate) mod native {
             member_carrier_assembly::native::NativeAssemblyModuleOnlyRead,
             member_carrier_bootstrap::native::NativeBootstrapModuleOnlyRead,
             member_carrier_guard::ScopedGuardAbsence,
-            member_carrier_key_authority::KeyLock,
+            member_carrier_key_authority::{KeyLock, KeyLockPin},
             member_carrier_keys::{win32::Kernel, RegistryKernel},
             member_carrier_module::native::NativeOriginalModuleLoadRead,
             member_carrier_pair_store::native_store::NativePairIntentRead,
             member_carrier_provider::native::inspect_mixed,
-            member_carrier_startup::native::{NativeStartupModuleOnlyCandidate, NativeStartupRoot},
+            member_carrier_startup::native::NativeStartupModuleOnlyCandidate,
             member_files::{pin_private_directory, PinnedDirectory},
             member_session::RecordKind,
         },
@@ -327,15 +327,36 @@ pub(crate) mod native {
         /// here before callback/postflight, even on Err or unwind.
         pub(crate) fn read_in_call(
             &self,
-            startup: &NativeStartupRoot,
             lock: &KeyLock,
+            inspect: impl FnOnce(&NativeModuleOnlyTerminalFacts<'_>) -> Result<()>,
+        ) -> Result<()> {
+            self.read_original_frame(&lock.pin(), false, inspect)
+        }
+
+        /// Fresh full factual universe ONLY during the original module's
+        /// actual one-shot pre-release aperture. Never a cached snapshot grant;
+        /// the caller owns the separate no-constructor release authorization.
+        pub(crate) fn read_in_release_pre_call(&self, lock: &KeyLockPin) -> Result<()> {
+            let record = &self.read.original.expected;
+            if record.phase != crate::member_carrier_pair::Phase::Stopped
+                || record.stop_stage != 12
+                || record.pending.is_some()
+            {
+                return Err(Error::Conflict);
+            }
+            self.read_original_frame(lock, true, |_| Ok(()))
+        }
+        fn read_original_frame(
+            &self,
+            lock: &KeyLockPin,
+            release_pre: bool,
             inspect: impl FnOnce(&NativeModuleOnlyTerminalFacts<'_>) -> Result<()>,
         ) -> Result<()> {
             let original = &self.read.original;
             let mut io = NativeIo {
                 original,
-                startup,
                 lock,
+                release_pre,
                 absence: None,
             };
             self.read
@@ -345,12 +366,53 @@ pub(crate) mod native {
                 })
                 .map_err(denied)
         }
+
+        /// After actual own-reference release: only SAME current protected
+        /// records/original journal/creator/source/Calling checks. No image,
+        /// SDK, BFE or native-resource queries; no retry/release authorization.
+        pub(crate) fn verify_release_post_in_call(&self, lock: &KeyLockPin) -> Result<()> {
+            let original = &self.read.original;
+            if self.read.failed.get()
+                || self.read.busy.get()
+                || original.expected.phase != crate::member_carrier_pair::Phase::Stopped
+                || original.expected.stop_stage != 12
+                || original.expected.pending.is_some()
+            {
+                return Err(Error::Retired);
+            }
+            original
+                .candidate
+                .verify_read_origin_in_call(&original.pair, &original.expected)?;
+            let facts = self.read.facts.try_borrow().map_err(|_| Error::Conflict)?;
+            let facts = facts.as_ref().ok_or(Error::Pending)?;
+            let mut io = NativeIo {
+                original,
+                lock,
+                release_pre: true,
+                absence: None,
+            };
+            let now = io.records().map_err(denied)?;
+            if now != facts.records {
+                return Err(Error::Conflict);
+            }
+            verify_records(&mut io, &now).map_err(denied)?;
+            let bootstrap = original.candidate.assembly()?.bootstrap()?;
+            let input = bootstrap.original_inputs();
+            if !input.runtime.matches_pin(lock) {
+                return Err(Error::Conflict);
+            }
+            lock.verify_source(input.source)
+                .map_err(|_| Error::Conflict)?;
+            original
+                .candidate
+                .verify_read_origin_in_call(&original.pair, &original.expected)
+        }
     }
 
     struct NativeIo<'a> {
         original: &'a Originals,
-        startup: &'a NativeStartupRoot,
-        lock: &'a KeyLock,
+        lock: &'a KeyLockPin,
+        release_pre: bool,
         absence: Option<ScopedGuardAbsence<crate::windows::member_carrier_guard::Wfp>>,
     }
     fn denied(error: ReadError) -> Error {
@@ -378,20 +440,15 @@ pub(crate) mod native {
         type Snapshot = Snapshot;
         fn fence(&mut self) -> ReadResult<()> {
             let root = self.original;
-            boundary(self.startup.verify_module_only_candidate(
-                &root.candidate,
-                &root.pair,
-                &root.expected,
-            ))?;
+            boundary(
+                root.candidate
+                    .verify_read_origin_in_call(&root.pair, &root.expected),
+            )?;
             // The actual owning loader comparison is mandatory. Source/runtime
             // equality or the candidate's successful boundary-return bit is NOT
             // an original LoadLibrary ACK comparison.
-            boundary(self.startup.verify_module_only_load_read(
-                &root.candidate,
-                &root.pair,
-                &root.expected,
-                &root.load,
-            ))?;
+            // The owning Startup compared this SAME private load capture on
+            // entry; the original native reader freshly reattests it below.
             if root
                 .assembly
                 .try_borrow()
@@ -434,7 +491,7 @@ pub(crate) mod native {
                     record,
                 ),
             )?;
-            if !input.runtime.matches_lock(self.lock)
+            if !input.runtime.matches_pin(self.lock)
                 || !root.pair.same_store_origin(input.original_intent)
                 || !root.load.matches_runtime(input.runtime)
                 || !root.load.matches_source(input.source)
@@ -461,9 +518,14 @@ pub(crate) mod native {
                     record,
                 )
                 .map_err(|_| ReadError::Boundary)?;
-            root.load
-                .verify_cleanup_read(input.runtime, input.cancelled)
-                .map_err(|_| ReadError::Boundary)?;
+            if self.release_pre {
+                root.load
+                    .verify_release_pre_read(input.runtime, input.cancelled)
+            } else {
+                root.load
+                    .verify_cleanup_read(input.runtime, input.cancelled)
+            }
+            .map_err(|_| ReadError::Boundary)?;
             boundary(input.runtime.verify_source(input.source))?;
             boundary(
                 input
@@ -524,8 +586,7 @@ pub(crate) mod native {
             // Decoding is comparison only. The original Startup must join its
             // SAME retained CapturedCreator and store publication/readback ACK;
             // missing/unknown publication cannot be adopted from these bytes.
-            boundary(self.startup.verify_module_only_creator_read(
-                &self.original.candidate,
+            boundary(self.original.candidate.verify_original_creator_in_call(
                 &self.original.pair,
                 &self.original.expected,
                 bytes,

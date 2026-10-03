@@ -224,6 +224,49 @@ impl<M> Drop for LoadReadInspection<'_, M> {
     }
 }
 impl<M> OriginalModuleLoadRead<M> {
+    fn inspect_release_pre_with(
+        &self,
+        release: &ModuleRelease,
+        loans: &LeasePins,
+        cancelled: &AtomicBool,
+        read: impl FnOnce(&M) -> Result<()>,
+    ) -> Result<()> {
+        // Deny before ANY source/image/SDK query. Merely having an attempted
+        // gate is insufficient: an error/unwind leaves that bit set forever.
+        if !release.pre_read_available() {
+            return Err(Error::Conflict);
+        }
+        if self.available.get()
+            || self.valid.get()
+            || self.tainted.get()
+            || !loans.is_empty()
+            || self.inspecting.replace(true)
+        {
+            release.tainted.set(true);
+            return Err(Error::Conflict);
+        }
+        let mut inspection = ReleaseReadInspection {
+            read: LoadReadInspection {
+                original: self,
+                completed: false,
+            },
+            release,
+        };
+        checkpoint(cancelled)?;
+        read(&self.module)?;
+        checkpoint(cancelled)?;
+        if !release.pre_read_available()
+            || !loans.is_empty()
+            || self.available.get()
+            || self.valid.get()
+            || self.tainted.get()
+        {
+            return Err(Error::Conflict);
+        }
+        inspection.read.completed = true;
+        // Query-only: never restore ordinary availability or forward validity.
+        Ok(())
+    }
     fn inspect_cleanup_with(
         &self,
         cancelled: &AtomicBool,
@@ -254,6 +297,18 @@ impl<M> OriginalModuleLoadRead<M> {
         })
     }
 }
+struct ReleaseReadInspection<'a, M> {
+    read: LoadReadInspection<'a, M>,
+    release: &'a ModuleRelease,
+}
+impl<M> Drop for ReleaseReadInspection<'_, M> {
+    fn drop(&mut self) {
+        if !self.read.completed {
+            // A supplier catching a read error cannot proceed to native free.
+            self.release.tainted.set(true);
+        }
+    }
+}
 
 /// Actor-retained ORIGINAL load outcome. Failure after the OS ACK keeps the
 /// exact owner accessible and denies another load; Drop is not unload authority.
@@ -264,7 +319,125 @@ struct LoadAttempt<K: Kernel> {
     read_capture: TerminalCallState,
     read_available: Rc<Cell<bool>>,
 }
+// Borrowed original-reference backend inputs, not authorization or a permit.
+struct OriginalLoadRelease<'a, M> {
+    original: &'a Rc<OriginalModuleLoadRead<M>>,
+    same_module: fn(&M, &M) -> bool,
+    terminal: &'a mut Option<(M, Rc<Cell<bool>>)>,
+    release: &'a ModuleRelease,
+    loans: &'a LeasePins,
+}
+/// Unknown disposition retains supplier and immutable receipt until process
+/// exit, even if the caller loses this stack frame. No native effect in Drop.
+struct UnknownReleaseRoots<T>(Option<T>);
+impl<T> Drop for UnknownReleaseRoots<T> {
+    fn drop(&mut self) {
+        if let Some(roots) = self.0.take() {
+            std::mem::forget(roots);
+        }
+    }
+}
 impl<K: Kernel> LoadAttempt<K> {
+    fn release_original_into<R, P, A>(
+        &mut self,
+        selected: OriginalLoadRelease<'_, K::Module>,
+        roots: (Rc<R>, Rc<P>),
+        retained: &mut Option<A>,
+        pre: impl FnOnce(&Rc<R>, &Rc<P>) -> Result<()>,
+        native_return: impl FnOnce(&Rc<R>, &Rc<P>) -> Result<A>,
+        post: impl FnOnce(&A) -> Result<()>,
+    ) -> Result<()> {
+        let mut roots = UnknownReleaseRoots(Some(roots));
+        // Pure receipt identity must be sampled BEFORE revocation. It is not
+        // authorization and its failure is consumed INSIDE the one-shot gate.
+        let initial = self.verify_original_load_read(selected.original, selected.same_module);
+        self.deny_original_load_reads();
+        let owner = self.owner.as_ref().ok_or(Error::Conflict)?;
+        let already_selected = selected.terminal.is_some();
+        if !already_selected {
+            *selected.terminal = Some((owner.module.clone(), owner.valid.clone()));
+        }
+        let (receipt, proof) = roots.0.as_ref().expect("retained release roots");
+        selected.release.run_into(
+            retained,
+            || {
+                initial?;
+                if already_selected
+                    || !selected.release.image_available()
+                    || !selected.loans.is_empty()
+                {
+                    return Err(Error::Conflict);
+                }
+                pre(receipt, proof)?;
+                if !selected.loans.is_empty() {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            },
+            || native_return(receipt, proof),
+            |ack| {
+                post(ack)?;
+                if !selected.loans.is_empty() {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            },
+        )?;
+        // ACK is in caller storage and postflight finished. Failure/unwind at
+        // any earlier boundary leaves this exact Loaded owner in its slot.
+        drop(self.owner.take().ok_or(Error::Conflict)?);
+        drop(roots.0.take());
+        Ok(())
+    }
+    fn verify_original_release(
+        &self,
+        read: &Rc<OriginalModuleLoadRead<K::Module>>,
+        terminal: &Option<(K::Module, Rc<Cell<bool>>)>,
+        release: &ModuleRelease,
+        same_module: impl Fn(&K::Module, &K::Module) -> bool,
+    ) -> Result<()> {
+        let (module, valid) = terminal.as_ref().ok_or(Error::Conflict)?;
+        if self
+            .original_read
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .as_ref()
+            .is_none_or(|original| !Rc::ptr_eq(original, read))
+            || !same_module(module, &read.module)
+            || !Rc::ptr_eq(valid, &read.valid)
+            || !Rc::ptr_eq(&self.read_available, &read.available)
+            || self.read_available.get()
+            || valid.get()
+            || !release.acknowledged()
+            || !release.effect_started.get()
+            || self.owner.as_ref().is_some_and(|owner| {
+                !same_module(module, &owner.module) || !Rc::ptr_eq(valid, &owner.valid)
+            })
+        {
+            return Err(Error::Conflict);
+        }
+        // Factual returned-original identity only. Never reads a released image
+        // and never uses the now-revoked cleanup reader for authorization.
+        Ok(())
+    }
+    fn verify_original_disposition(
+        &self,
+        read: &Rc<OriginalModuleLoadRead<K::Module>>,
+        terminal: &Option<(K::Module, Rc<Cell<bool>>)>,
+        release: &ModuleRelease,
+        loans: &LeasePins,
+        same_module: impl Fn(&K::Module, &K::Module) -> bool,
+    ) -> Result<()> {
+        self.verify_original_release(read, terminal, release, same_module)?;
+        if self.owner.is_some()
+            || !release.complete.get()
+            || release.tainted.get()
+            || !loans.is_empty()
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
     fn deny_original_load_reads(&self) {
         self.read_available.set(false);
         if let Some(owner) = &self.owner {
@@ -441,10 +614,24 @@ fn checkpoint(cancelled: &AtomicBool) -> Result<()> {
 pub(crate) struct ModuleRelease {
     attempted: Cell<bool>,
     busy: Cell<bool>,
+    checking: Cell<bool>,
     tainted: Cell<bool>,
     effect_started: Cell<bool>,
     unloaded: Cell<bool>,
     complete: Cell<bool>,
+}
+// Actual active native preflight frame, not a saved observation of attempted.
+struct ModulePreFrame<'a> {
+    release: &'a ModuleRelease,
+    completed: bool,
+}
+impl Drop for ModulePreFrame<'_> {
+    fn drop(&mut self) {
+        self.release.checking.set(false);
+        if !self.completed {
+            self.release.tainted.set(true);
+        }
+    }
 }
 // Counts actual OriginalModuleLease owners, not image Rc aliases or JSON.
 // Impossible duplicate/overflow bookkeeping poisons unload rather than guessing.
@@ -495,6 +682,7 @@ impl ModuleRelease {
         Self {
             attempted: Cell::new(false),
             busy: Cell::new(false),
+            checking: Cell::new(false),
             tainted: Cell::new(false),
             effect_started: Cell::new(false),
             unloaded: Cell::new(false),
@@ -528,7 +716,14 @@ impl ModuleRelease {
         }
         // Begin poisoned. A failed or unwound attempt can never be retried.
         // Reentry sets tainted even when its error is caught by a callback.
+        self.checking.set(true);
+        let mut pre_frame = ModulePreFrame {
+            release: self,
+            completed: false,
+        };
         check()?;
+        pre_frame.completed = true;
+        drop(pre_frame); // close query aperture BEFORE selecting native effect
         if self.tainted.get() {
             return Err(Error::Conflict);
         }
@@ -546,6 +741,15 @@ impl ModuleRelease {
     }
     fn image_available(&self) -> bool {
         !self.effect_started.get()
+    }
+    fn pre_read_available(&self) -> bool {
+        self.attempted.get()
+            && self.busy.get()
+            && self.checking.get()
+            && !self.effect_started.get()
+            && !self.unloaded.get()
+            && !self.complete.get()
+            && !self.tainted.get()
     }
     /// Actual returned native reference-release ACK only. A failed postflight
     /// does not erase this factual ACK or authorize whole-call/module release.
@@ -966,6 +1170,44 @@ pub(crate) mod native {
         source: Rc<WintunSource>,
         lock: KeyLockPin,
     }
+    /// Independently issued permission for ONLY the original own loader
+    /// reference. This module provides no implementation or authority issuer.
+    ///
+    /// # Safety
+    /// The actual issuer must authenticate the SAME original immutable
+    /// no-constructor Assembly and actual successful loader, precise CURRENT
+    /// protected Stopped12/None Pair ACK and whole positive bounded Calling,
+    /// original Runtime/KeyLock/source/initial journal/creator, full absence of
+    /// private/services/keys/mixed SDK/scoped BFE resources, zero own native
+    /// resources/loans and no attempts. JSON, equal observations, missing fields
+    /// or an earlier factual read alone can NEVER supply this permission.
+    /// The supplier must retain its actual authenticated originals, not just
+    /// copied identities or a snapshot. Pre must perform FRESH full SDK/private/
+    /// BFE absence reads immediately before the effect under that same Calling.
+    /// `pre_release` must run under the actual caller's Calling; that SAME
+    /// Calling must span the effect and complete postflight, not just this
+    /// callback. The receipt is revoked before this callback: independently
+    /// compare its original identity; do not reauthorize via its ordinary image
+    /// reader. `verify_release_pre_read` is a distinct query-only pre aperture,
+    /// not release permission; fresh full SDK/private/BFE checks remain yours.
+    /// `post_release` must authenticate ONLY the SAME runtime/source/CURRENT
+    /// Pair/Calling/origins. It must NEVER query image/exports/SDK after native
+    /// release, including on error. Neither callback may substitute another
+    /// loader/runtime/authority or turn factual ACK into retry/disposal rights.
+    pub(crate) unsafe trait NativeNoConstructorModuleReleaseProof {
+        fn pre_release(&self, original: &NativeOriginalModuleLoadRead) -> Result<()>;
+        fn post_release(&self, original: &NativeOriginalModuleLoadRead) -> Result<()>;
+    }
+    /// Sealed actual successful FreeLibrary return for the exact original own
+    /// LoadLibraryExW reference. No construction from status, handles or reads.
+    /// Retains original source/serialized-lock/proof roots; not Retired-C,
+    /// process code unload, session rundown or DATA retirement evidence.
+    #[must_use = "retain the actual original native release ACK through disposition"]
+    pub(crate) struct NativeNoConstructorModuleReleased<P: NativeNoConstructorModuleReleaseProof> {
+        original: Rc<NativeOriginalModuleLoadRead>,
+        proof: Rc<P>,
+        module: Rc<Module>,
+    }
     impl NativeOriginalModuleLoadRead {
         /// Actual registered process PIN/source origin only, including after
         /// release of this session reference. Not a worker/resource/session ACK
@@ -983,6 +1225,50 @@ pub(crate) mod native {
         }
         pub(crate) fn matches_runtime(&self, runtime: &RuntimeRead) -> bool {
             runtime.matches_pin(&self.lock)
+        }
+        /// Distinct query-only aperture for the independently authorized native
+        /// supplier's exact CURRENT Calling preflight. Ordinary cleanup reads
+        /// stay revoked. This does not issue release/constructor authority or
+        /// cache SDK/private/BFE absence; the supplier must freshly read those.
+        /// Actual cooperative lease acquisition is bounded to 5000ms; the
+        /// caller's positive bounded Calling must span these native reads.
+        pub(crate) fn verify_release_pre_read(
+            &self,
+            runtime: &RuntimeRead,
+            cancelled: &AtomicBool,
+        ) -> Result<()> {
+            let module = &self.original.module;
+            self.original
+                .inspect_release_pre_with(&module.1, &module.2, cancelled, |module| {
+                    if !self.matches_runtime(runtime) {
+                        return Err(Error::Conflict);
+                    }
+                    runtime
+                        .verify_source(&self.source)
+                        .map_err(|_| Error::Conflict)?;
+                    self.lock
+                        .verify_source(&self.source)
+                        .map_err(|_| Error::Conflict)?;
+                    let mut lease = Lease::take(cancelled, 5000).map_err(|_| Error::Conflict)?;
+                    let _read_lease = module.2.retain_read()?;
+                    runtime
+                        .verify_source(&self.source)
+                        .map_err(|_| Error::Conflict)?;
+                    lease.verify(cancelled).map_err(|_| Error::Conflict)?;
+                    require_process_anchor(&self.source, module)?;
+                    verify_image(&self.source, module)?;
+                    lease.verify(cancelled).map_err(|_| Error::Conflict)?;
+                    self.lock
+                        .verify_source(&self.source)
+                        .map_err(|_| Error::Conflict)?;
+                    runtime
+                        .verify_source(&self.source)
+                        .map_err(|_| Error::Conflict)?;
+                    if !self.matches_runtime(runtime) {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                })
         }
         /// Read-only image/source/actual Runtime facts under the actual bounded
         /// cooperative lease. Prior forward poison remains poisoned. No cold
@@ -1300,6 +1586,123 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             Ok(())
+        }
+        /// Independently authorized no-constructor original-reference backend.
+        /// The global process code PIN remains. No full-C terminal permit or
+        /// fabricated OriginalImage is involved, and no automatic unknown free.
+        pub(crate) fn release_no_constructor_into<P: NativeNoConstructorModuleReleaseProof>(
+            &mut self,
+            original: &Rc<NativeOriginalModuleLoadRead>,
+            proof: Rc<P>,
+            retained: &mut Option<NativeNoConstructorModuleReleased<P>>,
+        ) -> Result<()> {
+            let mut roots = UnknownReleaseRoots(Some((original.clone(), proof)));
+            // Comparison-only check while the original read gate is still
+            // available; the result is consumed under module.1 below, never
+            // re-read after revocation/effect as if it were permission.
+            let initial = self.verify_original_load_read(original);
+            let Some(owner) = self.loaded.owner.as_ref() else {
+                self.loaded.deny_original_load_reads();
+                return Err(Error::Conflict);
+            };
+            let module = owner.module.clone();
+            let source = &self.original_source;
+            let lock = &self.lock;
+            self.loaded.release_original_into(
+                OriginalLoadRelease {
+                    original: &original.original,
+                    same_module: Rc::ptr_eq,
+                    terminal: &mut self.terminal_original,
+                    release: &module.1,
+                    loans: &module.2,
+                },
+                roots.0.take().expect("retained original release inputs"),
+                retained,
+                |receipt, supplier| {
+                    initial?;
+                    lock.verify_source(source).map_err(|_| Error::Conflict)?;
+                    receipt
+                        .lock
+                        .verify_source(source)
+                        .map_err(|_| Error::Conflict)?;
+                    require_process_anchor(source, &module)?;
+                    supplier.pre_release(receipt)?;
+                    // Actual own source/serialized owner/PIN identity still
+                    // matches on the native side of the fallible caller check.
+                    require_process_anchor(source, &module)?;
+                    lock.verify_source(source).map_err(|_| Error::Conflict)
+                },
+                |receipt, supplier| {
+                    // SAFETY: exact own original loader receipt and current
+                    // serialized owner/process PIN were verified under the
+                    // irreversible module.1 gate; actual module loans are zero.
+                    // Unsafe supplier authenticates actual no-constructor,
+                    // Stopped/Calling/resources/origins before this sole effect.
+                    if unsafe { FreeLibrary(module.0.as_ptr()) } == 0 {
+                        return Err(Error::Native);
+                    }
+                    // No fallible work between native success and opaque ACK.
+                    Ok(NativeNoConstructorModuleReleased {
+                        original: receipt.clone(),
+                        proof: supplier.clone(),
+                        module: module.clone(),
+                    })
+                },
+                |ack| {
+                    // ACK already retained. NEVER SDK/image/PIN queries here.
+                    // Caller checks same runtime/source/current Pair/Calling.
+                    ack.proof.post_release(&ack.original)?;
+                    lock.verify_source(source).map_err(|_| Error::Conflict)
+                },
+            )
+        }
+        /// Pure factual native ACK identity, including failed postflight. No
+        /// loaded-image read, supplier call, disposal or reauthorization.
+        pub(crate) fn verify_original_no_constructor_native_release<
+            P: NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            ack: &NativeNoConstructorModuleReleased<P>,
+        ) -> Result<()> {
+            if self
+                .original_load_read
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .is_none_or(|read| !Rc::ptr_eq(read, &ack.original))
+                || !Rc::ptr_eq(&self.original_source, &ack.original.source)
+                || !Rc::ptr_eq(&ack.module, &ack.original.original.module)
+                || self
+                    .loaded
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !Rc::ptr_eq(&owner.kernel.source, &ack.original.source))
+            {
+                return Err(Error::Conflict);
+            }
+            self.loaded.verify_original_release(
+                &ack.original.original,
+                &self.terminal_original,
+                &ack.module.1,
+                Rc::ptr_eq,
+            )
+        }
+        /// Complete owning disposition, not merely a successful native return.
+        /// Original loaded owner was removed only after ACK + full postflight.
+        pub(crate) fn verify_no_constructor_disposition<
+            P: NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            ack: &NativeNoConstructorModuleReleased<P>,
+        ) -> Result<()> {
+            self.verify_original_no_constructor_native_release(ack)?;
+            self.loaded.verify_original_disposition(
+                &ack.original.original,
+                &self.terminal_original,
+                &ack.module.1,
+                &ack.module.2,
+                Rc::ptr_eq,
+            )
         }
         /// Explicit release of ONLY this original LoadLibraryExW reference.
         /// The caller's slot owns the opaque native return BEFORE both module

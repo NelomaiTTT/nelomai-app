@@ -747,7 +747,7 @@ pub(crate) mod native {
             member_carrier_guard_gate::native::{
                 NativeGuardResourceSelection, NativeResourceGuardGate,
             },
-            member_carrier_key_authority::{KeyLock, RuntimeRead},
+            member_carrier_key_authority::{KeyLock, KeyLockPin, RuntimeRead},
             member_carrier_lifecycle_gate::native::{
                 FullNativeLifecycleGate, NativeLifecycleSelection,
             },
@@ -852,11 +852,13 @@ pub(crate) mod native {
         module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
         module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
         module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 14]>,
+        module_only_release: Option<Rc<NativeNoConstructorReleaseRoot>>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
     /// permission. OtherAttempted remains denied by the existing finisher.
     pub(crate) struct NativeStartupModuleOnlyCandidate {
         invocation: Rc<StartupInvocationLedger>,
+        creator: Rc<CapturedCreator>,
         pair: Rc<NativePairIntentRead>,
         expected: pair::Record,
         runtime: Rc<RuntimeRead>,
@@ -890,6 +892,90 @@ pub(crate) mod native {
         }
     }
     impl NativeStartupModuleOnlyCandidate {
+        /// Detached SAME original roots: enables readonly pre-release checks
+        /// while the owning Assembly is mutably borrowed. The private actual
+        /// revocation seal, not copied flags/JSON, supplies constructor lineage.
+        pub(crate) fn verify_read_origin_in_call(
+            &self,
+            pair: &NativePairIntentRead,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            self.verify_read_origin(pair, expected)?;
+            let bootstrap = self.assembly()?.bootstrap()?;
+            let input = bootstrap.original_inputs();
+            input
+                .deadline
+                .verify_call(input.supervisor, input.context)?;
+            pair.verify_module_only_read_bracket(
+                input.runtime,
+                input.supervisor,
+                input.context,
+                expected,
+            )
+            .map_err(|_| Error::Conflict)
+        }
+        fn verify_read_origin(
+            &self,
+            pair: &NativePairIntentRead,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            self.selection.verify().map_err(|_| Error::Retired)?;
+            self.invocation.attempted(true, false)?;
+            self.graph
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .require_pristine()?;
+            let assembly = self.assembly()?;
+            assembly.verify_no_constructor_seal()?;
+            let bootstrap = assembly.bootstrap()?;
+            let input = bootstrap.original_inputs();
+            if !std::ptr::eq(input.runtime, self.runtime.as_ref())
+                || !Rc::ptr_eq(input.source, &self.source)
+                || !Rc::ptr_eq(input.supervisor, &self.supervisor)
+                || !pair.same_store_origin(&self.pair)
+            {
+                return Err(Error::Conflict);
+            }
+            compare_module_only_read_progress(input.context, &self.expected, expected)?;
+            input
+                .deadline
+                .verify_runtime(input.supervisor, input.runtime, input.context)?;
+            input
+                .runtime
+                .verify_same_session_files(input.context, input.files)?;
+            input.runtime.verify_source(input.source)
+        }
+        pub(crate) fn verify_original_creator_in_call(
+            &self,
+            pair: &NativePairIntentRead,
+            expected: &pair::Record,
+            observed: &[u8],
+        ) -> Result<()> {
+            self.verify_read_origin_in_call(pair, expected)?;
+            let bootstrap = self.assembly()?.bootstrap()?;
+            let input = bootstrap.original_inputs();
+            if input
+                .runtime
+                .record(input.context, RecordKind::NativeCreator)?
+                .as_slice()
+                != observed
+            {
+                return Err(Error::Conflict);
+            }
+            self.creator
+                .verify_published_read(input.runtime, input.context, observed)
+                .map_err(|_| Error::Conflict)?;
+            self.verify_read_origin_in_call(pair, expected)?;
+            if input
+                .runtime
+                .record(input.context, RecordKind::NativeCreator)?
+                .as_slice()
+                != observed
+            {
+                return Err(Error::Conflict);
+            }
+            Ok(())
+        }
         pub(crate) fn assembly(&self) -> Result<Rc<NativeAssemblyModuleOnlyRead>> {
             self.selection.verify().map_err(|_| Error::Retired)?;
             self.assembly
@@ -898,6 +984,110 @@ pub(crate) mod native {
                 .as_ref()
                 .cloned()
                 .ok_or(Error::Pending)
+        }
+    }
+
+    /// Caller-retained original release attempt. ACK is OUTSIDE the supplier
+    /// to avoid a proof->ACK->proof cycle. No DLL/DATA effect in Drop.
+    struct NativeNoConstructorReleaseRoot {
+        proof: Rc<NativeNoConstructorReleaseProof>,
+        ack: RefCell<
+            Option<
+                crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleased<
+                    NativeNoConstructorReleaseProof,
+                >,
+            >,
+        >,
+        whole: TerminalCallState,
+    }
+    pub(crate) struct NativeNoConstructorReleaseProof {
+        candidate: Rc<NativeStartupModuleOnlyCandidate>,
+        load: Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>,
+        pair: Rc<NativePairIntentRead>,
+        expected: pair::Record,
+        bootstrap: Rc<crate::windows::member_carrier_bootstrap::native::NativeBootstrapModuleOnlyRead>,
+        reader: Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>,
+        lock: KeyLockPin,
+    }
+    impl NativeNoConstructorReleaseProof {
+        pub(crate) fn context(&self) -> &Context {
+            self.bootstrap.original_inputs().context
+        }
+        /// Before/after outer Calling: SAME actual retained roots/current Pair,
+        /// but no image queries and no successful-native-return inference.
+        pub(crate) fn verify_entry(&self, supervisor: &NativeDeadline) -> Result<()> {
+            let input = self.bootstrap.original_inputs();
+            if !std::ptr::eq(input.supervisor.as_ref(), supervisor)
+                || module_only_read_stage(&self.expected)? != 13
+                || !input.runtime.matches_pin(&self.lock)
+                || !self.load.matches_runtime(input.runtime)
+                || !self.load.matches_source(input.source)
+                || !self.reader.matches_original(
+                    &self.candidate,
+                    &self.load,
+                    &self.pair,
+                    &self.expected,
+                )
+                || !Rc::ptr_eq(&self.candidate.assembly()?.bootstrap()?, &self.bootstrap)
+            {
+                return Err(Error::Conflict);
+            }
+            self.candidate
+                .verify_read_origin(&self.pair, &self.expected)?;
+            supervisor.verify_cleanup_runtime_entry(input.runtime, input.context)?;
+            self.pair
+                .verify_module_only_read_entry(input.runtime, input.context, &self.expected)
+                .map_err(|_| Error::Conflict)?;
+            self.lock
+                .verify_source(input.source)
+                .map_err(|_| Error::Conflict)
+        }
+        fn verify_call(&self) -> Result<()> {
+            self.verify_entry(self.bootstrap.original_inputs().supervisor)?;
+            self.candidate
+                .verify_read_origin_in_call(&self.pair, &self.expected)
+        }
+    }
+    // SAFETY: issued only by SAME actual Startup/Assembly successful loader
+    // owner below. Private no-constructor revocation seal/current original Pair
+    // are reauthenticated on both sides. Pre executes the FULL original native
+    // read (all SDK/private/services/keys + two scoped BFE snapshots) inside the
+    // actual loader's irreversible pre aperture and SAME bounded Calling.
+    // Post reads only protected/original journal/creator/source/Calling, never
+    // image/SDK after FreeLibrary. Whole watchdog completion is required by the
+    // owning release root; this supplier/ACK cannot itself retire DATA/session.
+    unsafe impl crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleaseProof
+        for NativeNoConstructorReleaseProof
+    {
+        fn pre_release(
+            &self,
+            original: &crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead,
+        ) -> crate::windows::member_carrier_module::Result<()> {
+            if !self.load.same_original(original) {
+                return Err(crate::windows::member_carrier_module::Error::Conflict);
+            }
+            self.verify_call()
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
+            self.reader
+                .read_in_release_pre_call(&self.lock)
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
+            self.verify_call()
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)
+        }
+        fn post_release(
+            &self,
+            original: &crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead,
+        ) -> crate::windows::member_carrier_module::Result<()> {
+            if !self.load.same_original(original) {
+                return Err(crate::windows::member_carrier_module::Error::Conflict);
+            }
+            self.verify_call()
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
+            self.reader
+                .verify_release_post_in_call(&self.lock)
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
+            self.verify_call()
+                .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)
         }
     }
 
@@ -2033,6 +2223,11 @@ pub(crate) mod native {
                     }
                     let original = Rc::new(NativeStartupModuleOnlyCandidate {
                         invocation: self.invocation.clone(),
+                        creator: self
+                            .creator
+                            .as_ref()
+                            .ok_or_else(|| std::io::Error::other("module_only_creator"))?
+                            .clone(),
                         pair: pair.clone(),
                         expected: expected.clone(),
                         runtime: self.runtime.clone(),
@@ -2103,6 +2298,11 @@ pub(crate) mod native {
         ) -> Result<()> {
             original.selection.verify().map_err(|_| Error::Retired)?;
             if self.terminal_attempted
+                || self.creator_store.is_none()
+                || self
+                    .creator
+                    .as_ref()
+                    .is_none_or(|creator| !Rc::ptr_eq(creator, &original.creator))
                 || self
                     .module_only_candidate
                     .as_ref()
@@ -2157,6 +2357,106 @@ pub(crate) mod native {
                 .with_original_module_only(original.assembly()?.as_ref(), pair, expected, call);
             self.verify_module_only_candidate(original, pair, expected)?;
             result
+        }
+        /// Separate original-reference operation, not yet actor/session DATA
+        /// completion. Every owning root/ACK is retained across Err/unwind.
+        fn release_original_no_constructor(
+            &mut self,
+            pair: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            if module_only_read_stage(expected)? != 13 {
+                return Err(Error::Conflict);
+            }
+            if self.module_only_release.is_none() {
+                let (candidate, load) = self.module_only_read_origins(pair, expected)?;
+                let mut reader = None;
+                crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead::retain_into(
+                    &candidate, &load, pair, expected, &mut reader,
+                )?;
+                let bootstrap = candidate.assembly()?.bootstrap()?;
+                let proof = Rc::new(NativeNoConstructorReleaseProof {
+                    candidate,
+                    load,
+                    pair: pair.clone(),
+                    expected: expected.clone(),
+                    bootstrap,
+                    reader: reader.ok_or(Error::Pending)?,
+                    lock: self.lock.as_ref().ok_or(Error::Retired)?.pin(),
+                });
+                self.module_only_release = Some(Rc::new(NativeNoConstructorReleaseRoot {
+                    proof,
+                    ack: RefCell::new(None),
+                    whole: TerminalCallState::new(),
+                })); // retain before whole-call authentication/native operation
+            }
+            let root = self
+                .module_only_release
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .clone();
+            let proof = root.proof.clone();
+            if !Rc::ptr_eq(&proof.pair, pair) || &proof.expected != expected {
+                return Err(Error::Conflict);
+            }
+            if root.whole.verify().is_ok() {
+                // SAME actual completed whole call + opaque returned native
+                // ACK only. Never reopen the loader borrow or query its image.
+                if root
+                    .ack
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .is_none()
+                {
+                    return Err(Error::Pending);
+                }
+                return proof.verify_entry(&self.supervisor);
+            }
+            root.whole
+                .run(|| {
+                    let supervisor = self.supervisor.clone();
+                    let runtime = self.runtime.clone();
+                    // SAFETY: actual issuer/loader/current Pair roots are retained
+                    // above; independent native supplier does full preflight within
+                    // module.1, records exact ACK before SDK-free postflight. SAME
+                    // positive bounded whole Calling spans native+all postflights.
+                    unsafe {
+                        supervisor.run_no_constructor_module_release(&proof, || {
+                            pair.inspect(&runtime, &supervisor, |actual| {
+                                if actual != expected {
+                                    return Err(std::io::Error::other("module_release_pair"));
+                                }
+                                self.with_original_module_only(
+                                    &proof.candidate,
+                                    pair,
+                                    expected,
+                                    |module| {
+                                        let mut ack = root
+                                            .ack
+                                            .try_borrow_mut()
+                                            .map_err(|_| Error::Conflict)?;
+                                        module
+                                            .release_no_constructor_into(
+                                                &proof.load,
+                                                proof.clone(),
+                                                &mut ack,
+                                            )
+                                            .map_err(|_| Error::Native)?;
+                                        module
+                                            .verify_no_constructor_disposition(
+                                                ack.as_ref().ok_or(Error::Pending)?,
+                                            )
+                                            .map_err(|_| Error::Retired)
+                                    },
+                                )
+                                .map_err(|_| std::io::Error::other("module_release_original"))
+                            })
+                            .map_err(|_| Error::Conflict)
+                        })
+                    }
+                    .map_err(|_| std::io::Error::other("module_release_whole"))
+                })
+                .map_err(|_| Error::Retired)
         }
         /// Actual loader ACK lineage, not a successful original boundary bit.
         /// Pure comparison leaves the once-only native disposition borrow unused.
@@ -2324,7 +2624,6 @@ pub(crate) mod native {
                             }
                             reader
                                 .read_in_call(
-                                    self,
                                     self.lock
                                         .as_ref()
                                         .ok_or_else(|| std::io::Error::other("module_read_lock"))?,
@@ -2617,6 +2916,7 @@ pub(crate) mod native {
                 module_only_load_read: RefCell::new(None),
                 module_only_native_read: RefCell::new(None),
                 module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| Vec::new())),
+                module_only_release: None,
             };
             retain_claim_startup(destination, startup, |startup| {
                 // SAME signed Runtime/current-process capture. The capsule and its
