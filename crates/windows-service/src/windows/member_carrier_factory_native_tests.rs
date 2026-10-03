@@ -152,6 +152,9 @@ fn carrier_factory_actual_cold_child() {
         },
         8,
     );
+    if stopped.is_err() {
+        fixture.trace_pair_stage();
+    }
     if matches!(case.as_str(), "cold" | "primary-data-denial") {
         let stopped = stopped.expect("actual prepared-before-DLL native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);

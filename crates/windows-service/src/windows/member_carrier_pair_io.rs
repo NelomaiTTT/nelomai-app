@@ -8635,6 +8635,15 @@ pub(crate) mod native {
         }
     }
     fn denied(_: impl std::fmt::Debug) -> io::Error {
+        #[cfg(test)]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            // Scoped fixture diagnostics only: call frames, never configurations,
+            // arbitrary native error text or a replacement cleanup decision.
+            eprintln!(
+                "actual actor boundary denied: {}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
         conflict()
     }
     fn carrier_denied(_: io::Error) -> CarrierError {

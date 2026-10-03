@@ -275,6 +275,29 @@ impl Fixture {
             "primary did not reach the actual carrier package source read"
         );
     }
+    pub(crate) fn trace_pair_stage(&self) {
+        use member_files::SessionFileIo;
+        let result = (|| -> io::Result<()> {
+            let mut files = member_files::MemberFiles::new().map_err(io::Error::other)?;
+            let raw = files
+                .transaction(|records| records.read(member_files::PrivateFile::Pair))?
+                .ok_or_else(|| io::Error::other("fixture Pair absent"))?;
+            let envelope: serde_json::Value = serde_json::from_slice(&raw)?;
+            let data = envelope
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io::Error::other("fixture Pair payload missing"))?;
+            let pair: serde_json::Value = serde_json::from_str(data)?;
+            eprintln!(
+                "actual Pair phase={} stop_stage={} pending={}",
+                pair["phase"], pair["stop_stage"], pair["pending"]
+            );
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("actual Pair diagnostic read: {error}");
+        }
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
