@@ -39,7 +39,10 @@ pub(crate) struct NativeCarrierPairFinalizer<'a> {
     branch: Option<NativeActorTerminalBranch<'a>>,
     locals: Option<Rc<NativeActorTerminalCut<'a>>>,
     canonical: Option<Rc<NativeActorCanonicalCut<'a>>>,
-    capture: Option<NativeCanonicalTerminalCapture<'a>>,
+    // Large retained raw aggregates live on the heap, not in every cold
+    // factory/SessionControl stack frame. Boxing changes no original identity
+    // or release order; each owning slot still exists before fallible capture.
+    capture: Option<Box<NativeCanonicalTerminalCapture<'a>>>,
     pins: Option<NativeCanonicalTerminalPins>,
     modules: Option<Rc<RefCell<TerminalResources<NativeTerminalModuleOriginals<'a>>>>>,
     resources: Option<TerminalResources<CanonicalActorT<'a>>>,
@@ -47,11 +50,11 @@ pub(crate) struct NativeCarrierPairFinalizer<'a> {
     release: Option<Rc<NativeCanonicalTerminalRelease<'a>>>,
     ack: Option<NativeCanonicalTerminalAck<'a>>,
     attempted_layout: Option<NativeAttemptedTerminalLayout>,
-    pregraph_capture: Option<NativePregraphTerminalCapture<'a>>,
+    pregraph_capture: Option<Box<NativePregraphTerminalCapture<'a>>>,
     pregraph_pins: Option<NativePregraphTerminalPins>,
-    pregraph_resources: Option<TerminalResources<NativePregraphTerminalResources<'a>>>,
+    pregraph_resources: Box<Option<TerminalResources<NativePregraphTerminalResources<'a>>>>,
     pregraph_gate: Option<NativePregraphTerminalGate<'a>>,
-    pregraph_slot: Option<NativePregraphReleaseSlot<'a>>,
+    pregraph_slot: Option<Box<NativePregraphReleaseSlot<'a>>>,
     pregraph_release: Option<Rc<NativePregraphTerminalRelease<'a>>>,
     pregraph_ack: Option<NativePregraphTerminalAck<'a>>,
     pregraph_captured: bool,
@@ -91,7 +94,7 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
             attempted_layout: None,
             pregraph_capture: None,
             pregraph_pins: None,
-            pregraph_resources: None,
+            pregraph_resources: Box::new(None),
             pregraph_gate: None,
             pregraph_slot: None,
             pregraph_release: None,
@@ -183,9 +186,9 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
         }
         if !self.actor_released {
             if self.pregraph_capture.is_none() {
-                self.pregraph_capture = Some(NativePregraphTerminalCapture::new(
+                self.pregraph_capture = Some(Box::new(NativePregraphTerminalCapture::new(
                     self.locals.as_ref().ok_or_else(conflict)?.clone(),
-                ));
+                )));
             }
             let capture = self.pregraph_capture.as_mut().ok_or_else(conflict)?;
             if !self.pregraph_captured {
@@ -220,11 +223,11 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
                 }
                 // Infallible owning registration BEFORE any fallible root
                 // construction. Slot retains all actual T/G/pins on failure.
-                self.pregraph_slot = Some(NativePregraphReleaseSlot::new(
+                self.pregraph_slot = Some(Box::new(NativePregraphReleaseSlot::new(
                     self.pregraph_resources.take().expect("retained pregraph T"),
                     self.pregraph_pins.take().expect("retained original pins"),
                     self.pregraph_gate.take().expect("retained pregraph G"),
-                ));
+                )));
             }
             if self.pregraph_release.is_none() {
                 self.pregraph_slot
@@ -287,6 +290,10 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
 #[cfg(test)]
 #[test]
 fn actual_initial_completion_selector_requires_unused_pair_finalizer() {
+    assert!(
+        std::mem::size_of::<NativeCarrierPairFinalizer<'_>>() <= 16 * 1024,
+        "cold factory control must not embed terminal raw aggregates on the stack"
+    );
     let mut original = NativeCarrierPairFinalizer::new();
     // This boolean is scheduling from the separate original native outcome,
     // not authority from Pair absence or a Stopped snapshot.
@@ -484,11 +491,11 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             let local = self.locals.as_ref().ok_or_else(conflict)?;
             if self.capture.is_none() {
                 let (rows, probes) = local.local_resources().terminal_capture_originals()?;
-                self.capture = Some(NativeCanonicalTerminalCapture::new(
+                self.capture = Some(Box::new(NativeCanonicalTerminalCapture::new(
                     local.local_resources(),
                     rows,
                     probes,
-                ));
+                )));
             }
             let capture = self.capture.as_mut().ok_or_else(conflict)?;
             if !self.capture_complete {
