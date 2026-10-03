@@ -27,6 +27,13 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         .expect("crate-qualified module")
         .1;
     let child_test = format!("{child_module}::carrier_factory_actual_cold_child");
+    // Two Stop lifecycles each persist twelve stages, with independent
+    // preflight/effect/postflight native reads plus final retirement. The
+    // whole-case aperture must span these calls, not truncate the fourth stage.
+    // Every individual call still has the production 30s watchdog; this bound
+    // only terminates this fixture's OWN child and never attests cleanup.
+    let case_budget =
+        std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     for case in [
         "cold",
         "primary-data-denial",
@@ -61,7 +68,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             if let Some(status) = child.try_wait().unwrap() {
                 break (status, false);
             }
-            if started.elapsed() > std::time::Duration::from_secs(240) {
+            if started.elapsed() > case_budget {
                 child.kill().unwrap();
                 break (child.wait().unwrap(), true);
             }
@@ -71,7 +78,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
         assert!(
             !timed_out,
-            "actual native factory {case} exceeded outer 240s: {stdout} {stderr}"
+            "actual native factory {case} exceeded whole-case {case_budget:?}: {stdout} {stderr}"
         );
         assert!(
             status.success(),
