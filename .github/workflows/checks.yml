@@ -204,6 +204,16 @@ jobs:
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
       - run: cargo test -p nelomai-windows-service
+      # Fresh ephemeral HKCU fixtures only. Explicit opt-in does NOT enable any
+      # product deletion path or reuse historical unsafe ignored measurements.
+      - name: Isolated original-handle TxR conflict gate
+        timeout-minutes: 2
+        run: |
+          $tests = & cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
+          if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
+          cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1
 
   macos:
     if: github.event_name != 'workflow_dispatch'

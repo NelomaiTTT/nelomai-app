@@ -3260,6 +3260,200 @@ mod txr_native_measurement {
             c.close(phase, |_| Ok(()), || Ok(())).unwrap();
         }
     }
+    // Critical-path measurement, not a carrier issuer: can a transaction on
+    // an already-empty original be write-enlisted WITHOUT a visible seed?
+    // The historical native seed-outside/delete-inside result does not prove
+    // this no-net-change variant. Run only on fresh ephemeral OWN-HKCU keys.
+    fn transient_enlist_measurement(race: RelativeRace, after_stage: bool) {
+        let mut s = RelativeSlots {
+            probe: Probe::uncreated(),
+            race,
+            race_status: None,
+            replacement: ptr::null_mut(),
+            replacement_created: false,
+            replacement_metadata: None,
+            extra_subkey: ptr::null_mut(),
+            extra_subkey_created: false,
+            extra_closed: false,
+            stage_status: None,
+        };
+        // Caller owns every output slot before any syscall. No implicit Drop,
+        // retry, recursive cleanup, foreign targets or product keys involved.
+        s.probe.create_native();
+        let original = metadata(s.probe.original);
+        s.probe.transaction = unsafe {
+            CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 5000, ptr::null())
+        };
+        assert!(!s.probe.transaction.is_null() && s.probe.transaction as isize != -1);
+        assert_eq!(
+            unsafe {
+                RegOpenKeyTransactedW(
+                    s.probe.original,
+                    ptr::null(),
+                    0,
+                    KEY_ALL_ACCESS,
+                    &mut s.probe.transactional,
+                    s.probe.transaction,
+                    ptr::null(),
+                )
+            },
+            NO_ERROR
+        );
+        assert!(!s.probe.transactional.is_null());
+        assert_ne!(s.probe.original, s.probe.transactional);
+        assert_eq!(name(s.probe.transactional), s.probe.expected);
+        assert_eq!(metadata(s.probe.transactional), original);
+        let value = wide(super::VALUE);
+        let seed_ack = unsafe {
+            RegSetValueExW(
+                s.probe.transactional,
+                value.as_ptr(),
+                0,
+                REG_DWORD,
+                0u32.to_le_bytes().as_ptr(),
+                4,
+            )
+        };
+        assert_eq!(seed_ack, NO_ERROR);
+        let remove_ack = unsafe { RegDeleteValueW(s.probe.transactional, value.as_ptr()) };
+        assert_eq!(remove_ack, NO_ERROR);
+        let enlisted = metadata(s.probe.transactional);
+        assert_eq!((enlisted.values, enlisted.subkeys), (0, 0));
+        // LastWrite may reflect OUR transacted mutation. Never substitute it
+        // for an original identity or pretend the historic empty baseline is
+        // unchanged. This measurement's security read is OWNER/GROUP/DACL,
+        // explicitly NOT full SACL/native product authorization.
+        assert_eq!(enlisted.security, original.security);
+        assert_eq!(enlisted.class, original.class);
+        assert_eq!(metadata(s.probe.transactional), enlisted);
+        if !after_stage {
+            s.race_after_last_empty_read();
+        }
+        s.probe.staged = true;
+        let stage = unsafe { NtDeleteKey(s.probe.transactional) };
+        s.stage_status = Some(stage);
+        s.probe.stage_ack = stage == 0;
+        if after_stage {
+            assert_eq!(stage, 0, "positive stage control must precede late writer");
+            s.race_after_last_empty_read();
+        }
+        let writer = s
+            .race_status
+            .expect("actual independent writer/control executed");
+        let commit = s.probe.stage_ack && s.probe.commit();
+        let commit_error = if s.probe.commit_attempted && !commit {
+            Some(unsafe { GetLastError() })
+        } else {
+            None
+        };
+        if !commit {
+            s.probe.rollback_ack = unsafe { RollbackTransaction(s.probe.transaction) } != 0;
+            assert!(
+                s.probe.rollback_ack,
+                "unknown rollback retains originals; no retry"
+            );
+        }
+        eprintln!(
+            "transient-enlist kind={} after_stage={after_stage} writer={writer} stage={stage:#x} commit={commit} commit_error={commit_error:?} rollback={}",
+            match race {
+                RelativeRace::None => "positive",
+                RelativeRace::Value => "value",
+                RelativeRace::Subkey => "subkey",
+                RelativeRace::Namespace => "namespace",
+            },
+            s.probe.rollback_ack,
+        );
+        // On unexpected success do NOT query a deleted original or synthesize
+        // preservation. Close each actual handle once first, then FAIL gate.
+        let accepted_change = !matches!(race, RelativeRace::None) && writer == NO_ERROR;
+        let safe = !accepted_change || !commit;
+        if !commit && writer == NO_ERROR {
+            match race {
+                RelativeRace::None => {}
+                RelativeRace::Value => {
+                    let (mut value, mut kind, mut len) = (0u32, 0, 4);
+                    assert_eq!(
+                        unsafe {
+                            RegQueryValueExW(
+                                s.probe.original,
+                                wide("OwnProbeExternalValue").as_ptr(),
+                                ptr::null(),
+                                &mut kind,
+                                (&mut value as *mut u32).cast(),
+                                &mut len,
+                            )
+                        },
+                        NO_ERROR
+                    );
+                    assert_eq!((kind, len, value), (REG_DWORD, 4, 17));
+                    assert_eq!(name(s.probe.original), s.probe.expected);
+                }
+                RelativeRace::Subkey => {
+                    assert!(s.extra_subkey_created);
+                    assert_eq!(metadata(s.probe.original).subkeys, 1);
+                    assert_eq!(
+                        name(s.extra_subkey),
+                        format!("{}\\OwnProbeExternalChild", s.probe.expected)
+                    );
+                }
+                RelativeRace::Namespace => {
+                    assert!(s.replacement_created);
+                    assert_eq!(
+                        name(s.probe.original),
+                        format!("{}-renamed", s.probe.expected)
+                    );
+                    assert_eq!(name(s.replacement), s.probe.expected);
+                    assert_eq!(Some(metadata(s.replacement)), s.replacement_metadata);
+                }
+            }
+            assert_eq!(metadata(s.probe.original).security, original.security);
+        }
+        let extra = if s.extra_subkey_created {
+            s.extra_subkey
+        } else if s.replacement_created {
+            s.replacement
+        } else {
+            ptr::null_mut()
+        };
+        if !extra.is_null() {
+            s.extra_closed = unsafe { RegCloseKey(extra) } == NO_ERROR;
+            assert!(
+                s.extra_closed,
+                "extra original close ACK missing; never retry"
+            );
+        }
+        s.probe.close();
+        assert!(
+            safe,
+            "UNSAFE: accepted outside write erased by transient-enlisted commit"
+        );
+        if matches!(race, RelativeRace::None) {
+            assert!(commit, "positive deletion control failed");
+            s.probe.require_absent_after_closed_commit();
+        } else {
+            assert!(
+                writer == NO_ERROR || writer == ERROR_TRANSACTIONAL_CONFLICT,
+                "unexpected writer error is not conflict disposition evidence"
+            );
+        }
+        // Negative fixtures remain on this ephemeral runner after exact
+        // rollback/close. Never remove them by name, reset journals or retry.
+    }
+    #[test]
+    #[ignore = "Isolated CI only: fresh OWN-HKCU no-net-change TxR conflict gate, NOT product/SACL proof"]
+    fn txr_transient_enlist_isolated_gate() {
+        transient_enlist_measurement(RelativeRace::None, false);
+        for race in [
+            RelativeRace::Value,
+            RelativeRace::Subkey,
+            RelativeRace::Namespace,
+        ] {
+            transient_enlist_measurement(race, false);
+        }
+        for race in [RelativeRace::Value, RelativeRace::Namespace] {
+            transient_enlist_measurement(race, true);
+        }
+    }
     #[test]
     #[ignore = "Main-only fresh own HKCU: original-relative TxR + handle-bound NtDeleteKey; not production proof"]
     fn relative_txr_native_handle_delete_commit_and_independent_close() {
