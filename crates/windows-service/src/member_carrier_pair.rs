@@ -1076,6 +1076,14 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
     /// captured from the acknowledged locked native transaction and CASed before
     /// any later allow. Error leaves the full original plan for cleanup only.
     fn transition_guard(&mut self, desired: guard::Model) -> io::Result<()> {
+        self.transition_guard_inflight(desired)?;
+        let mut next = self.record.clone();
+        next.pending = None;
+        self.save(next)
+    }
+    /// A Stop stage owns the final Guard ACK. Keep its pending effect until
+    /// that caller attests the actual native result and advances the stage.
+    fn transition_guard_inflight(&mut self, desired: guard::Model) -> io::Result<()> {
         let mut plan =
             guard::ExchangePlan::new(&self.record.guard, &desired).map_err(|_| failed())?;
         let mut next = self.record.clone();
@@ -1143,7 +1151,6 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         }
         let mut next = self.record.clone();
         next.pending_guard = None;
-        next.pending = None;
         self.save(next)
     }
     fn permit_authority(&mut self, slot: Slot) -> io::Result<()> {
@@ -1397,7 +1404,9 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         let mut next = self.record.clone();
         next.guard = model;
         next.pending_guard = None;
-        next.pending = None;
+        // This is still the Guard operation. Its actual native consumer must
+        // attest the withdrawal before finish(Guard) acknowledges that stage.
+        // Only finish clears the pending effect after that check succeeds.
         self.save(next)
     }
     fn release_all(&mut self) -> io::Result<()> {
@@ -1531,7 +1540,7 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
                         next.pending_guard = None;
                         self.save(next)?;
                     }
-                    self.transition_guard(
+                    self.transition_guard_inflight(
                         guard::Model::empty(self.record.scope.clone()).map_err(|_| failed())?,
                     )?;
                 }

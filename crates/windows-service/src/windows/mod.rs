@@ -30,6 +30,8 @@ mod member_carrier_network_gate;
 mod member_carrier_network_owner;
 mod member_carrier_original_read;
 mod member_carrier_pair_io;
+#[cfg(test)]
+pub(crate) use member_carrier_pair_io::require_attestation as require_carrier_effect_attestation;
 mod member_carrier_pair_store;
 mod member_carrier_payload;
 mod member_carrier_preload;

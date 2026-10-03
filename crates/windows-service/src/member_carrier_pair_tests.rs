@@ -291,7 +291,17 @@ impl CarrierPairIo for Io {
             Ok(())
         }
     }
-    fn attest_effect(&mut self, _: &Record, _: Effect) -> io::Result<()> {
+    fn attest_effect(&mut self, record: &Record, effect: Effect) -> io::Result<()> {
+        #[cfg(not(windows))]
+        use crate::member_carrier_pair_io::require_attestation;
+        #[cfg(windows)]
+        use crate::windows::require_carrier_effect_attestation as require_attestation;
+        require_attestation(record, effect).map_err(|_| {
+            io::Error::other(format!(
+                "native_attestation {:?}/stage{}/{:?}/effect{:?}",
+                record.phase, record.stop_stage, record.pending, effect
+            ))
+        })?;
         if self.0.borrow().foreign {
             Err(failed())
         } else {
@@ -705,6 +715,35 @@ fn pair() -> (CarrierNativePair<Io, Disk>, Shared) {
             .unwrap(),
         s,
     )
+}
+
+#[test]
+fn stop_guard_pending_survives_withdrawal_until_actual_native_finish_check() {
+    for started in [false, true] {
+        let (mut pair, state) = pair();
+        if started {
+            pair.start(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+        }
+        pair.stop(&scope()).unwrap();
+        assert_eq!(pair.snapshot().phase, Phase::Stopped);
+        assert_eq!(pair.snapshot().stop_stage, 12);
+        assert!(pair.snapshot().pending.is_none());
+        assert!(!pair.cleanup_pending());
+        let mut calls = state.borrow().counts.clone();
+        calls.remove("cleanup-storage");
+        let saves = state.borrow().saves;
+        pair.stop(&scope()).unwrap();
+        // Re-entering the journal cleanup scope is required; it is not an
+        // SDK mutation or a new protected write after the terminal ACK.
+        let mut repeated_calls = state.borrow().counts.clone();
+        repeated_calls.remove("cleanup-storage");
+        assert_eq!(
+            repeated_calls, calls,
+            "repeated Stop must not perform native mutations"
+        );
+        assert_eq!(state.borrow().saves, saves);
+    }
 }
 
 #[test]

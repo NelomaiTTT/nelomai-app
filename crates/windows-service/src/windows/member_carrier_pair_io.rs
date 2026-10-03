@@ -997,7 +997,7 @@ fn require_effect(
 /// Factual callback dispatch ONLY. Stopped/None can request the independent
 /// FullEmpty read; it cannot satisfy require_effect or any native mutation.
 /// The caller must separately enter the actual terminal ACK/Calling channel.
-fn require_attestation(
+pub(crate) fn require_attestation(
     record: &crate::member_carrier_pair::Record,
     effect: crate::member_carrier_pair::Effect,
 ) -> io::Result<()> {
