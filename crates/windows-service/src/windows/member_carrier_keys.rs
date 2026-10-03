@@ -626,6 +626,210 @@ pub(crate) trait RegistryKernel {
     ) -> Result<()> {
         Err(Error::Pending)
     }
+    /// Readonly capture of THIS CREATED_NEW original, before SDK/value effects.
+    /// Unsupported external boundaries may leave the capture incomplete; that
+    /// supplies no surviving-root disposition authority. Native has no fallback.
+    fn capture_created_metadata(
+        &mut self,
+        _handle: &Self::Handle,
+        _capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Exact original-relative disposition. Unsupported IO cannot grant it;
+    /// Ok alone is insufficient: caller requires retained native ACKs.
+    fn dispose_surviving_original(
+        &mut self,
+        _handle: &Self::Handle,
+        _birth: &registry_metadata::Metadata,
+        _current: &registry_metadata::Metadata,
+        _capture: &OriginalOwnedKeyDisposition,
+        _check: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::Pending)
+    }
+}
+/// SAME-created-original native outputs. No Drop IO, constructors/imports from
+/// saved metadata, SDK receipt or path. Native resources are retained on Err.
+pub(crate) struct OriginalOwnedKeyDisposition {
+    origin: Rc<()>,
+    commit_ack: std::cell::Cell<bool>,
+    derived_close_ack: std::cell::Cell<bool>,
+    transaction_close_ack: std::cell::Cell<bool>,
+    complete: std::cell::Cell<bool>,
+    outputs: OwnedDispositionOutputs,
+    flight: OriginalReadState,
+    attempted: std::cell::Cell<bool>,
+}
+impl OriginalOwnedKeyDisposition {
+    fn new(origin: Rc<()>) -> Self {
+        Self {
+            origin,
+            commit_ack: std::cell::Cell::new(false),
+            derived_close_ack: std::cell::Cell::new(false),
+            transaction_close_ack: std::cell::Cell::new(false),
+            complete: std::cell::Cell::new(false),
+            outputs: OwnedDispositionOutputs::new(),
+            flight: OriginalReadState::default(),
+            attempted: std::cell::Cell::new(false),
+        }
+    }
+    fn verify_complete(&self, origin: &Rc<()>) -> Result<()> {
+        self.flight.check()?;
+        if !Rc::ptr_eq(origin, &self.origin)
+            || !self.complete.get()
+            || !self.commit_ack.get()
+            || !self.derived_close_ack.get()
+            || !self.transaction_close_ack.get()
+        {
+            return Err(Error::Pending);
+        }
+        Ok(())
+    }
+    fn run(
+        &self,
+        io: &mut impl OwnedDispositionIo,
+        current: &registry_metadata::Metadata,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        let mut flight = self.flight.begin()?;
+        if self.attempted.replace(true) {
+            return Err(Error::Conflict);
+        }
+        let fresh = || {
+            check()?;
+            self.flight.check()
+        };
+        let result = (|| {
+            fresh()?;
+            io.begin(self)?;
+            fresh()?;
+            if self.outputs.transaction.get().is_null()
+                || self.outputs.transaction.get() as isize == -1
+            {
+                return Err(Error::Pending);
+            }
+            io.derive(self)?;
+            fresh()?;
+            if self.outputs.derived.get().is_null() || !self.outputs.derived_owned.get() {
+                return Err(Error::Pending);
+            }
+            let before = Rc::new(registry_metadata::RegistryMetadataCapture::new());
+            self.outputs
+                .metadata
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .push(before.clone());
+            io.metadata(&before)?;
+            fresh()?;
+            // Full last-write equality BEFORE enlist rejects even a net-empty
+            // concurrent change since the terminal original observation.
+            if before.present_data().map_err(|_| Error::Pending)? != *current {
+                return Err(Error::Conflict);
+            }
+            io.enlist(self)?;
+            fresh()?;
+            let after = Rc::new(registry_metadata::RegistryMetadataCapture::new());
+            self.outputs
+                .metadata
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .push(after.clone());
+            io.metadata(&after)?;
+            fresh()?;
+            same_empty_original_metadata(
+                current,
+                &after.present_data().map_err(|_| Error::Pending)?,
+            )?;
+            io.stage(self)?;
+            fresh()?;
+            io.commit(self)?;
+            fresh()?;
+            if !self.commit_ack.get() {
+                return Err(Error::Pending);
+            }
+            io.close_derived(self)?;
+            fresh()?;
+            if !self.derived_close_ack.get() {
+                return Err(Error::Pending);
+            }
+            io.close_transaction(self)?;
+            fresh()?;
+            if !self.transaction_close_ack.get() {
+                return Err(Error::Pending);
+            }
+            self.complete.set(true);
+            Ok(())
+        })();
+        if result.is_err() {
+            // Explicit rollback/rundown of ONLY the same acquired transaction,
+            // never deletion/retry/close of either original. Unknown rollback
+            // leaves all native output slots rooted, without Drop IO.
+            if !self.outputs.transaction.get().is_null()
+                && self.outputs.transaction.get() as isize != -1
+                && !self.commit_ack.get()
+                && io.rollback(self).is_ok()
+                && (!self.outputs.derived_owned.get()
+                    || self.derived_close_ack.get()
+                    || io.close_derived(self).is_ok())
+                && !self.transaction_close_ack.get()
+            {
+                let _ = io.close_transaction(self);
+            }
+            return result;
+        }
+        flight.complete = true;
+        Ok(())
+    }
+}
+struct OwnedDispositionOutputs {
+    transaction: std::cell::Cell<*mut std::ffi::c_void>,
+    derived: std::cell::Cell<*mut std::ffi::c_void>,
+    derived_owned: std::cell::Cell<bool>,
+    metadata: std::cell::RefCell<Vec<Rc<registry_metadata::RegistryMetadataCapture>>>,
+    statuses: [std::cell::Cell<Option<i64>>; 9],
+}
+impl OwnedDispositionOutputs {
+    fn new() -> Self {
+        Self {
+            transaction: std::cell::Cell::new(std::ptr::null_mut()),
+            derived: std::cell::Cell::new(std::ptr::null_mut()),
+            derived_owned: std::cell::Cell::new(false),
+            metadata: std::cell::RefCell::new(Vec::new()),
+            statuses: std::array::from_fn(|_| std::cell::Cell::new(None)),
+        }
+    }
+}
+// External syscalls only. Neither a detached IO nor matching metadata can
+// obtain the private root-owned disposition or authorize original close.
+trait OwnedDispositionIo {
+    fn begin(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn derive(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn metadata(&mut self, capture: &registry_metadata::RegistryMetadataCapture) -> Result<()>;
+    fn enlist(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn stage(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn commit(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn close_derived(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn close_transaction(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+    fn rollback(&mut self, capture: &OriginalOwnedKeyDisposition) -> Result<()>;
+}
+fn same_empty_original_metadata(
+    birth: &registry_metadata::Metadata,
+    current: &registry_metadata::Metadata,
+) -> Result<()> {
+    if birth.name != current.name
+        || birth.security != current.security
+        || !birth.info.class.is_empty()
+        || !current.info.class.is_empty()
+        || birth.info.values != 0
+        || current.info.values != 0
+        || birth.info.subkeys != 0
+        || current.info.subkeys != 0
+    {
+        return Err(Error::Conflict);
+    }
+    // LastWrite is NOT original identity: our own value/SDK mutations change it.
+    Ok(())
 }
 /// Sealed factual observation, never SDK absence/worker/effect permission.
 pub(crate) struct OriginalSdkDeletedKeyRead {
@@ -707,6 +911,9 @@ pub(crate) struct OriginalKeyRootObligation<H> {
     origin: Rc<()>,
     sdk_deleted: std::cell::RefCell<Option<Rc<OriginalSdkDeletedKeyRead>>>,
     present_metadata: std::cell::RefCell<Option<Rc<registry_metadata::RegistryMetadataCapture>>>,
+    birth_metadata: std::cell::RefCell<Option<Rc<registry_metadata::RegistryMetadataCapture>>>,
+    owned_disposition:
+        std::mem::ManuallyDrop<std::cell::RefCell<Option<Rc<OriginalOwnedKeyDisposition>>>>,
     observation: OriginalReadState,
     observed_deleted: std::cell::Cell<bool>,
     first_terminal_status: std::cell::Cell<Option<u32>>,
@@ -734,6 +941,8 @@ impl<H> OriginalKeyRootObligation<H> {
             origin: Rc::new(()),
             sdk_deleted: std::cell::RefCell::new(None),
             present_metadata: std::cell::RefCell::new(None),
+            birth_metadata: std::cell::RefCell::new(None),
+            owned_disposition: std::mem::ManuallyDrop::new(std::cell::RefCell::new(None)),
             observation: OriginalReadState::default(),
             observed_deleted: std::cell::Cell::new(false),
             first_terminal_status: std::cell::Cell::new(None),
@@ -767,15 +976,22 @@ impl<H> OriginalKeyRootObligation<H> {
             Err(Error::Conflict)
         }
     }
-    /// ONLY the sealed SDK-deleted-original lane plus both original native
-    /// close ACKs completes this obligation. A surviving empty root is Pending.
+    /// Separate sealed SDK-deleted or exact-owned disposition, BOTH actual
+    /// original close ACKs and parent-relative absence complete this obligation.
     pub(crate) fn require_root_absent(&self) -> Result<()> {
         self.check_health()?;
-        let read = self.sdk_deleted_read()?;
-        if !Rc::ptr_eq(&read.origin, &self.origin)
-            || read.statuses.each_ref().map(|s| s.get()) != [Some(1018), Some(1018)]
-            || !self.observed_deleted.get()
-            || !self.terminal_complete.get()
+        if let Some(owned) = self
+            .owned_disposition
+            .try_borrow()
+            .map_err(|_| Error::Conflict)?
+            .as_ref()
+        {
+            owned.verify_complete(&self.origin)?;
+        } else {
+            let read = self.sdk_deleted_read()?;
+            self.verify_sdk_deleted_read(&read)?;
+        }
+        if !self.terminal_complete.get()
             || self.closed_handle_ack().is_err()
             || self
                 .parent_closed
@@ -1018,10 +1234,6 @@ impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
             }
             self.kind
                 .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
-            // Closing the HKEY does not dispose the surviving registry root.
-            // It would destroy the SAME original needed by any subsequent
-            // exact-owned disposition, leaving permanent cleanup-pending.
-            // Keep both originals open; metadata is retained DATA only.
             let capture = Rc::new(registry_metadata::RegistryMetadataCapture::new());
             *self
                 .present_metadata
@@ -1032,7 +1244,39 @@ impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
             kernel.original_key_metadata(self.handle(), &capture)?;
             check()?;
             self.selection.check()?;
-            return Err(Error::Pending);
+            let current = capture.present_data().map_err(|_| Error::Pending)?;
+            let birth_capture = self
+                .birth_metadata
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)?;
+            let birth = birth_capture.present_data().map_err(|_| Error::Pending)?;
+            if !current
+                .name
+                .eq_ignore_ascii_case(&format!("{}\\{}", held.parent, held.child))
+            {
+                return Err(Error::Conflict);
+            }
+            same_empty_original_metadata(&birth, &current)?;
+            let mut call = self.terminal.begin()?;
+            let owned = Rc::new(OriginalOwnedKeyDisposition::new(self.origin.clone()));
+            *self
+                .owned_disposition
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)? = Some(owned.clone());
+            // SAME original owns all transacted outputs BEFORE native acquire,
+            // stage/commit or any fallible postflight. Ok alone is no ACK.
+            kernel.dispose_surviving_original(self.handle(), &birth, &current, &owned, || {
+                check()?;
+                self.check_health()
+            })?;
+            owned.verify_complete(&self.origin)?;
+            check()?;
+            self.check_health()?;
+            self.finish_original_handle_closes(held, kernel, &check, retain)?;
+            call.complete = true;
         }
         self.selection.check()?;
         selection.complete = true;
@@ -1052,6 +1296,17 @@ impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
         self.observe_sdk_deleted(original, kernel, &check)?;
         self.terminal.check()?;
         let held = original.retained_handle();
+        self.finish_original_handle_closes(held, kernel, &check, retain)?;
+        call.complete = true;
+        Ok(())
+    }
+    fn finish_original_handle_closes<K: RegistryKernel<Handle = H>>(
+        &self,
+        held: &Held<H>,
+        kernel: &mut K,
+        check: &impl Fn() -> Result<()>,
+        retain: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+    ) -> Result<()> {
         self.handle().close_original(
             || {
                 check()?;
@@ -1093,12 +1348,29 @@ impl<H: TerminalKeyHandle> OriginalKeyRootObligation<H> {
         self.observation.check()?;
         self.terminal.check()?;
         self.terminal_complete.set(true);
-        call.complete = true;
         Ok(())
     }
 }
 impl<H> Drop for OriginalKeyRootObligation<H> {
     fn drop(&mut self) {
+        let release_owned = self
+            .owned_disposition
+            .get_mut()
+            .as_ref()
+            .is_none_or(|owned| {
+                owned.verify_complete(&self.origin).is_ok()
+                    && self.terminal_complete.get()
+                    && self.closed.get_mut().is_some()
+                    && self.parent_closed.get_mut().is_some()
+            });
+        if release_owned {
+            // Native transaction/derived/original rundown ALL acknowledged.
+            // Inert captured DATA may now be released. Otherwise preserve the
+            // SAME allocated owner, raw outputs and ACK history without Drop IO.
+            unsafe {
+                std::mem::ManuallyDrop::drop(&mut self.owned_disposition);
+            }
+        }
         if self.closed.get_mut().is_some() {
             // Set ONLY after this SAME native Handle.close.verify_ack succeeds.
             // Native Handle Drop is now inert (its explicit close was attempted).
@@ -1569,6 +1841,18 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             .as_ref()
             .expect("retained NEW-key ACK")
             .clone();
+        let capture = Rc::new(registry_metadata::RegistryMetadataCapture::new());
+        *ack.retained_handle()
+            .handle
+            .birth_metadata
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)? = Some(capture.clone());
+        // SAME original and raw DATA owner are retained before the first
+        // fallible native query. Errors/unwind leave pending_key poisoned.
+        self.assert_serialized_lock(lock, &pending.context)?;
+        self.kernel
+            .capture_created_metadata(ack.retained_handle().handle.handle(), &capture)?;
+        self.assert_serialized_lock(lock, &pending.context)?;
         self.kernel
             .flush(ack.retained_handle().handle.parent_handle())
             .inspect_err(|_| self.poisoned = true)?;
@@ -1725,12 +2009,242 @@ pub(crate) mod win32 {
     use super::*;
     use std::ptr;
     use windows_sys::{
-        Wdk::System::Registry::{KeyNameInformation, NtQueryKey},
+        Wdk::System::Registry::{KeyNameInformation, NtDeleteKey, NtQueryKey},
         Win32::{
-            Foundation::{ERROR_FILE_NOT_FOUND, NO_ERROR},
+            Foundation::{CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, NO_ERROR},
+            Storage::FileSystem::{CommitTransaction, CreateTransaction, RollbackTransaction},
             System::Registry::*,
         },
     };
+    struct OwnedDispositionNativeIo<'a, F> {
+        original: &'a Handle,
+        capture: &'a OriginalOwnedKeyDisposition,
+        check: &'a F,
+    }
+    #[cfg(test)]
+    #[test]
+    fn actual_native_owned_disposition_rejects_imported_metadata_without_mutating_original() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let child = format!(
+            "Software\\NelomaiOwnedDispositionDenied-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut raw = ptr::null_mut();
+        let mut disposition = 0;
+        let rc = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide(&child).unwrap().as_ptr(),
+                0,
+                ptr::null_mut(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_QUERY_VALUE | KEY_SET_VALUE | 0x0002_0000,
+                ptr::null(),
+                &mut raw,
+                &mut disposition,
+            )
+        };
+        assert_eq!(rc, NO_ERROR);
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let original = Handle::new(raw);
+        let imported = registry_metadata::RegistryMetadataCapture::new();
+        registry_metadata::read_empty_metadata_for_key(
+            &imported,
+            "\\REGISTRY\\MACHINE\\FOREIGN",
+            false,
+        )
+        .unwrap();
+        let metadata = imported.present_data().unwrap();
+        let capture = OriginalOwnedKeyDisposition::new(Rc::new(()));
+        assert!(Kernel
+            .dispose_surviving_original(&original, &metadata, &metadata, &capture, || Ok(()))
+            .is_err());
+        assert!(!capture.complete.get() && !capture.commit_ack.get());
+        assert_eq!(capture.outputs.statuses[0].get(), Some(0));
+        assert_eq!(
+            capture.outputs.statuses[2].get(),
+            None,
+            "no enlist after full-security access denial or foreign current metadata"
+        );
+        assert_eq!(capture.outputs.statuses[4].get(), None, "no NtDeleteKey");
+        assert_eq!(capture.outputs.statuses[5].get(), None, "no commit");
+        assert_eq!(
+            capture.outputs.statuses[8].get(),
+            Some(0),
+            "actual rollback ACK"
+        );
+        assert!(capture.transaction_close_ack.get());
+        if capture.outputs.derived_owned.get() {
+            assert!(capture.derived_close_ack.get());
+        }
+        assert!(
+            !original.close.was_attempted(),
+            "producer must not close original"
+        );
+        let mut subkeys = 0;
+        let mut values = 0;
+        assert_eq!(
+            unsafe {
+                RegQueryInfoKeyW(
+                    original.raw().unwrap(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut subkeys,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut values,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            NO_ERROR
+        );
+        assert_eq!((subkeys, values), (0, 0));
+        original
+            .close_terminal(|| Ok(()), |_| Ok(()), || Ok(()))
+            .unwrap();
+        eprintln!("actual-owned-disposition-denial original-preserved=true rollback/transaction-close-ACK=true derive_status={:?} derived_owned={}", capture.outputs.statuses[1].get(), capture.outputs.derived_owned.get());
+        // Never delete a fixture by name/recursive retry. Ephemeral CI owns
+        // this retained empty leaf; no user-PC/system/parent/token changes.
+    }
+    impl<F: Fn() -> Result<()>> OwnedDispositionIo for OwnedDispositionNativeIo<'_, F> {
+        fn begin(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            let raw = unsafe {
+                CreateTransaction(ptr::null_mut(), ptr::null_mut(), 0, 0, 0, 5000, ptr::null())
+            };
+            c.outputs.transaction.set(raw); // retain BEFORE error/postflight
+            let error = if raw.is_null() || raw as isize == -1 {
+                unsafe { GetLastError() }
+            } else {
+                0
+            };
+            c.outputs.statuses[0].set(Some(i64::from(error)));
+            if error != 0 || raw.is_null() || raw as isize == -1 {
+                Err(Error::Pending)
+            } else {
+                Ok(())
+            }
+        }
+        fn derive(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            let raw = self.original.raw()?;
+            let rc = unsafe {
+                RegOpenKeyTransactedW(
+                    raw,
+                    ptr::null(),
+                    0,
+                    0x0001_0000 | KEY_QUERY_VALUE | KEY_SET_VALUE | original_key_security_access(),
+                    c.outputs.derived.as_ptr(),
+                    c.outputs.transaction.get(),
+                    ptr::null(),
+                )
+            };
+            c.outputs.statuses[1].set(Some(i64::from(rc)));
+            status(rc)?;
+            if c.outputs.derived.get().is_null() || c.outputs.derived.get() == raw {
+                return Err(Error::Conflict);
+            }
+            c.outputs.derived_owned.set(true);
+            Ok(())
+        }
+        fn metadata(&mut self, c: &registry_metadata::RegistryMetadataCapture) -> Result<()> {
+            // SAME derived-original HKEY held in the root-owned transaction.
+            // No nontransacted-original query in the active TxR window.
+            unsafe { c.read_original_native(self.capture.outputs.derived.get()) }
+                .map_err(|_| Error::Pending)
+        }
+        fn enlist(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            let name = wide(VALUE)?;
+            let rc = unsafe {
+                RegSetValueExW(
+                    c.outputs.derived.get(),
+                    name.as_ptr(),
+                    0,
+                    REG_DWORD,
+                    0u32.to_le_bytes().as_ptr(),
+                    4,
+                )
+            };
+            c.outputs.statuses[2].set(Some(i64::from(rc)));
+            status(rc)?;
+            (self.check)()?;
+            c.flight.check()?;
+            let rc = unsafe { RegDeleteValueW(c.outputs.derived.get(), name.as_ptr()) };
+            c.outputs.statuses[3].set(Some(i64::from(rc)));
+            status(rc)
+        }
+        fn stage(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            let rc = unsafe { NtDeleteKey(c.outputs.derived.get()) };
+            c.outputs.statuses[4].set(Some(i64::from(rc)));
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(Error::Pending)
+            }
+        }
+        fn commit(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            let ok = unsafe { CommitTransaction(c.outputs.transaction.get()) } != 0;
+            c.commit_ack.set(ok);
+            c.outputs.statuses[5].set(Some(if ok {
+                0
+            } else {
+                i64::from(unsafe { GetLastError() })
+            }));
+            if ok {
+                Ok(())
+            } else {
+                Err(Error::Pending)
+            }
+        }
+        fn close_derived(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            if c.outputs.statuses[6].get().is_some() {
+                return Err(Error::Conflict);
+            }
+            let rc = unsafe { RegCloseKey(c.outputs.derived.get()) };
+            c.outputs.statuses[6].set(Some(i64::from(rc)));
+            c.derived_close_ack.set(rc == NO_ERROR);
+            status(rc)
+        }
+        fn close_transaction(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            if c.outputs.statuses[7].get().is_some() {
+                return Err(Error::Conflict);
+            }
+            let ok = unsafe { CloseHandle(c.outputs.transaction.get()) } != 0;
+            c.transaction_close_ack.set(ok);
+            c.outputs.statuses[7].set(Some(if ok {
+                0
+            } else {
+                i64::from(unsafe { GetLastError() })
+            }));
+            if ok {
+                Ok(())
+            } else {
+                Err(Error::Pending)
+            }
+        }
+        fn rollback(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            if c.outputs.statuses[8].get().is_some() {
+                return Err(Error::Conflict);
+            }
+            let ok = unsafe { RollbackTransaction(c.outputs.transaction.get()) } != 0;
+            c.outputs.statuses[8].set(Some(if ok {
+                0
+            } else {
+                i64::from(unsafe { GetLastError() })
+            }));
+            if ok {
+                Ok(())
+            } else {
+                Err(Error::Pending)
+            }
+        }
+    }
     pub(crate) struct Handle {
         raw: HKEY,
         pub(super) close: KeyHandleClose,
@@ -1805,6 +2319,25 @@ pub(crate) mod win32 {
     }
     impl RegistryKernel for Kernel {
         type Handle = Handle;
+        fn dispose_surviving_original(
+            &mut self,
+            h: &Handle,
+            birth: &registry_metadata::Metadata,
+            current: &registry_metadata::Metadata,
+            capture: &OriginalOwnedKeyDisposition,
+            check: impl Fn() -> Result<()>,
+        ) -> Result<()> {
+            same_empty_original_metadata(birth, current)?;
+            capture.run(
+                &mut OwnedDispositionNativeIo {
+                    original: h,
+                    capture,
+                    check: &check,
+                },
+                current,
+                &check,
+            )
+        }
         fn pause_original_delete_read(&mut self) -> Result<bool> {
             std::thread::sleep(std::time::Duration::from_millis(25));
             Ok(true)
@@ -1817,6 +2350,18 @@ pub(crate) mod win32 {
             // SAFETY: SAME still-open owning original is borrowed for the whole
             // synchronous query. No raw handle escapes, open/reopen or close.
             unsafe { capture.read_original_native(h.raw()?) }.map_err(|_| Error::Pending)
+        }
+        fn capture_created_metadata(
+            &mut self,
+            h: &Handle,
+            capture: &registry_metadata::RegistryMetadataCapture,
+        ) -> Result<()> {
+            self.original_key_metadata(h, capture)?;
+            let data = capture.present_data().map_err(|_| Error::Pending)?;
+            if !data.info.class.is_empty() || data.info.values != 0 || data.info.subkeys != 0 {
+                return Err(Error::Conflict);
+            }
+            Ok(())
         }
         fn original_key_info_status(&mut self, h: &Handle) -> Result<u32> {
             // Status is factual even on failure; only exact KEY_DELETED from

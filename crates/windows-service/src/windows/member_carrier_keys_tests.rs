@@ -295,6 +295,12 @@ struct State {
     path: Option<u64>,
     birth_reads: usize,
     birth_access_denied: bool,
+    created_metadata_calls: usize,
+    created_metadata_fault: u8,
+    full_created_metadata: bool,
+    changed_terminal_security: bool,
+    own_disposition_calls: usize,
+    own_disposition_fault: u8,
     next: u64,
     writes: usize,
     fail_flush: bool,
@@ -352,6 +358,81 @@ impl NativeAuthority for Authority {
 }
 impl RegistryKernel for Kernel {
     type Handle = u64;
+    fn capture_created_metadata(
+        &mut self,
+        handle: &u64,
+        capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        let mut state = self.0.borrow_mut();
+        state.created_metadata_calls += 1;
+        assert_eq!(state.path, Some(*handle));
+        assert!(state.names.contains_key(handle));
+        assert_eq!(state.values.get(handle), Some(&NativeValue::Absent));
+        assert_eq!(state.writes, 0, "birth capture precedes value/SDK effects");
+        match state.created_metadata_fault {
+            1 => Err(Error::Pending),
+            2 => panic!("external birth metadata read unwound"),
+            _ => {
+                if state.full_created_metadata {
+                    registry_metadata::read_empty_metadata_for_key(
+                        capture,
+                        state.names.get(handle).unwrap(),
+                        false,
+                    )
+                    .map_err(|_| Error::Pending)?;
+                }
+                Ok(()) // Unsupported boundary: incomplete DATA is NOT authority.
+            }
+        }
+    }
+    fn original_key_metadata(
+        &mut self,
+        handle: &u64,
+        capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        let state = self.0.borrow();
+        if !state.full_created_metadata {
+            return Err(Error::Pending);
+        }
+        registry_metadata::read_empty_metadata_for_key(
+            capture,
+            state.names.get(handle).ok_or(Error::Conflict)?,
+            state.changed_terminal_security,
+        )
+        .map_err(|_| Error::Pending)
+    }
+    fn dispose_surviving_original(
+        &mut self,
+        handle: &u64,
+        _: &registry_metadata::Metadata,
+        _: &registry_metadata::Metadata,
+        capture: &OriginalOwnedKeyDisposition,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        // Native syscalls alone are doubled. Real selector, retained original,
+        // full captured metadata, close ACKs and parent checks remain product.
+        check()?;
+        let mut state = self.0.borrow_mut();
+        state.own_disposition_calls += 1;
+        assert_eq!(state.path, Some(*handle));
+        if state.own_disposition_fault == 1 {
+            return Err(Error::Pending);
+        }
+        if state.own_disposition_fault == 2 {
+            panic!("owned disposition native unwind");
+        }
+        capture.commit_ack.set(true);
+        if state.own_disposition_fault == 3 {
+            return Err(Error::Pending);
+        }
+        capture.derived_close_ack.set(true);
+        capture.transaction_close_ack.set(true);
+        state.path = None;
+        drop(state);
+        check()?;
+        capture.complete.set(true);
+        Ok(())
+    }
     fn birth_interfaces(&mut self) -> Result<u64> {
         let mut state = self.0.borrow_mut();
         state.birth_reads += 1;
@@ -1229,6 +1310,31 @@ impl DropTrackedKernel {
 }
 impl RegistryKernel for DropTrackedKernel {
     type Handle = DropTrackedHandle;
+    fn capture_created_metadata(
+        &mut self,
+        h: &Self::Handle,
+        capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        self.registry.capture_created_metadata(&h.id, capture)
+    }
+    fn original_key_metadata(
+        &mut self,
+        h: &Self::Handle,
+        capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        self.registry.original_key_metadata(&h.id, capture)
+    }
+    fn dispose_surviving_original(
+        &mut self,
+        h: &Self::Handle,
+        birth: &registry_metadata::Metadata,
+        current: &registry_metadata::Metadata,
+        capture: &OriginalOwnedKeyDisposition,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.registry
+            .dispose_surviving_original(&h.id, birth, current, capture, check)
+    }
     fn interfaces(&mut self) -> Result<Self::Handle> {
         let id = self.registry.interfaces()?;
         Ok(self.wrap(id, false))
@@ -1278,6 +1384,301 @@ impl RegistryKernel for DropTrackedKernel {
     }
     fn pause_original_delete_read(&mut self) -> Result<bool> {
         self.registry.pause_original_delete_read()
+    }
+}
+
+#[test]
+fn original_birth_capture_fault_retains_same_child_and_parent_before_publication() {
+    // Break: query before rooting its capture, skip the query, publish on Err,
+    // or let unwind close either actual original rather than retaining Pending.
+    for fault in [0, 1, 2] {
+        let (_, shared) = setup();
+        let closes = Rc::new(std::cell::Cell::new(0));
+        let mut keys = Keys::new(
+            DropTrackedKernel {
+                registry: Kernel(shared.clone()),
+                closes: closes.clone(),
+                track_created_parent: true,
+            },
+            Authority(shared.clone()),
+            context(),
+        );
+        let record = pending();
+        let binding = &record.context.bindings[0];
+        let facts = keys.inspect(&mut true, &record, binding, None, 1).unwrap();
+        shared.borrow_mut().created_metadata_fault = fault;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keys.create_new_key(&mut true, &record, binding, &facts)
+        }));
+        let pin = match (fault, result) {
+            (0, Ok(Ok(ack))) => terminal_original_key_obligation(&ack),
+            (1, Ok(Err(Error::Pending))) | (2, Err(_)) => {
+                keys.pending_original_key_obligation().unwrap()
+            }
+            _ => panic!("wrong publication after birth metadata fault={fault}"),
+        };
+        assert_eq!(shared.borrow().created_metadata_calls, 1);
+        assert_eq!(shared.borrow().path, Some(11));
+        assert!(pin.birth_metadata.borrow().is_some());
+        assert!(pin
+            .birth_metadata
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .present_data()
+            .is_err());
+        assert!(
+            pin.require_root_absent().is_err(),
+            "DATA is not disposition"
+        );
+        assert_eq!(closes.get(), 0);
+        assert!(keys
+            .create_new_key(&mut true, &record, binding, &facts)
+            .is_err());
+        assert_eq!(
+            shared.borrow().created_metadata_calls,
+            1,
+            "no query/effect replay"
+        );
+        drop(keys);
+        drop(pin);
+        assert_eq!(closes.get(), 0, "no implicit original close on Err/unwind");
+    }
+}
+
+#[test]
+fn surviving_original_terminal_disposition_finishes_only_exact_native_commit_and_close_acks() {
+    // Break: keep every surviving root Pending by construction; substitute an
+    // SDK-deleted receipt; dispose after changed security; or finish lost ACK.
+    for fault in 0..6 {
+        let (_, shared) = setup();
+        shared.borrow_mut().full_created_metadata = true;
+        let closes = Rc::new(std::cell::Cell::new(0));
+        let mut keys = Keys::new(
+            DropTrackedKernel {
+                registry: Kernel(shared.clone()),
+                closes: closes.clone(),
+                track_created_parent: true,
+            },
+            Authority(shared.clone()),
+            context(),
+        );
+        let record = pending();
+        let binding = &record.context.bindings[0];
+        let facts = keys.inspect(&mut true, &record, binding, None, 1).unwrap();
+        let ack = keys
+            .create_new_key(&mut true, &record, binding, &facts)
+            .unwrap();
+        let pin = terminal_original_key_obligation(&ack);
+        shared.borrow_mut().original_info_status = Some(0);
+        shared.borrow_mut().own_disposition_fault = if fault < 4 { fault } else { 0 };
+        shared.borrow_mut().changed_terminal_security = fault == 4;
+        if fault == 5 {
+            pin.birth_metadata.borrow_mut().take();
+        }
+        let retained = Rc::new(std::cell::Cell::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pin.close_terminal(
+                &ack,
+                &mut keys.kernel,
+                || Ok(()),
+                |_| {
+                    retained.set(retained.get() + 1);
+                    Ok(())
+                },
+            )
+        }));
+        if fault == 0 {
+            result.unwrap().unwrap();
+            pin.require_root_absent().unwrap();
+            assert_eq!(closes.get(), 2);
+            assert_eq!(retained.get(), 1);
+            assert_eq!(shared.borrow().path, None);
+        } else {
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(pin.require_root_absent().is_err());
+            assert_eq!(closes.get(), 0);
+            assert_eq!(retained.get(), 0);
+            assert!(pin
+                .close_terminal(&ack, &mut keys.kernel, || Ok(()), |_| Ok(()))
+                .is_err());
+        }
+        assert!(
+            pin.sdk_deleted_read().is_err(),
+            "own commit is not SDK authority"
+        );
+        assert_eq!(
+            shared.borrow().own_disposition_calls,
+            usize::from(fault < 4)
+        );
+        let native_owner = pin.owned_disposition.borrow().as_ref().map(Rc::downgrade);
+        drop(ack);
+        drop(keys);
+        drop(pin);
+        assert_eq!(closes.get(), if fault == 0 { 2 } else { 0 });
+        if let Some(owner) = native_owner {
+            assert_eq!(owner.upgrade().is_some(), fault != 0, "Unknown native transaction outputs remain owned after abandonment; complete rundown may release inert capture");
+        }
+    }
+}
+
+#[test]
+fn owned_disposition_native_protocol_brackets_enlist_commit_and_rundown_without_replay() {
+    // Break: commit without both full reads/enlist, close originals early,
+    // forget an actual ACK on failed postflight, or replay an uncertain call.
+    struct Io {
+        steps: Vec<&'static str>,
+        fail: Option<&'static str>,
+        name: String,
+    }
+    impl Io {
+        fn step(&mut self, step: &'static str) -> Result<()> {
+            self.steps.push(step);
+            if self.fail == Some(step) {
+                Err(Error::Pending)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    impl OwnedDispositionIo for Io {
+        fn begin(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("begin")?;
+            c.outputs
+                .transaction
+                .set(std::ptr::dangling_mut::<u8>().cast());
+            Ok(())
+        }
+        fn derive(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("derive")?;
+            c.outputs
+                .derived
+                .set(std::ptr::dangling_mut::<u32>().cast());
+            // An ambiguous alias/failed acquisition is NOT an owning ACK.
+            c.outputs
+                .derived_owned
+                .set(self.fail != Some("alias-derive"));
+            Ok(())
+        }
+        fn metadata(&mut self, c: &registry_metadata::RegistryMetadataCapture) -> Result<()> {
+            self.step("read")?;
+            registry_metadata::read_empty_metadata_for_key(c, &self.name, false)
+                .map_err(|_| Error::Pending)
+        }
+        fn enlist(&mut self, _: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("enlist")
+        }
+        fn stage(&mut self, _: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("stage")
+        }
+        fn commit(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("commit")?;
+            c.commit_ack.set(true);
+            Ok(())
+        }
+        fn close_derived(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("close-derived")?;
+            c.derived_close_ack.set(true);
+            Ok(())
+        }
+        fn close_transaction(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("close-transaction")?;
+            c.transaction_close_ack.set(true);
+            Ok(())
+        }
+        fn rollback(&mut self, _: &OriginalOwnedKeyDisposition) -> Result<()> {
+            self.step("rollback")
+        }
+    }
+    let baseline = registry_metadata::RegistryMetadataCapture::new();
+    registry_metadata::read_empty_metadata_for_key(&baseline, "\\REGISTRY\\MACHINE\\X", false)
+        .unwrap();
+    for fail in [
+        None,
+        Some("begin"),
+        Some("derive"),
+        Some("read"),
+        Some("enlist"),
+        Some("stage"),
+        Some("commit"),
+        Some("close-derived"),
+        Some("close-transaction"),
+        Some("alias-derive"),
+    ] {
+        let origin = Rc::new(());
+        let capture = OriginalOwnedKeyDisposition::new(origin.clone());
+        let mut io = Io {
+            steps: Vec::new(),
+            fail,
+            name: "\\REGISTRY\\MACHINE\\X".into(),
+        };
+        let result = capture.run(&mut io, &baseline.present_data().unwrap(), || Ok(()));
+        assert_eq!(result.is_ok(), fail.is_none());
+        if fail.is_none() {
+            capture.verify_complete(&origin).unwrap();
+            assert_eq!(
+                io.steps,
+                [
+                    "begin",
+                    "derive",
+                    "read",
+                    "enlist",
+                    "read",
+                    "stage",
+                    "commit",
+                    "close-derived",
+                    "close-transaction"
+                ]
+            );
+        } else {
+            assert!(capture.verify_complete(&origin).is_err());
+            assert!(!capture.complete.get());
+            if !capture.outputs.transaction.get().is_null() && !capture.commit_ack.get() {
+                assert!(io.steps.contains(&"rollback"));
+            }
+        }
+        let calls = io.steps.len();
+        assert!(capture
+            .run(&mut io, &baseline.present_data().unwrap(), || Ok(()))
+            .is_err());
+        assert_eq!(io.steps.len(), calls);
+    }
+    for unwind in [false, true] {
+        let origin = Rc::new(());
+        let capture = OriginalOwnedKeyDisposition::new(origin.clone());
+        let mut io = Io {
+            steps: Vec::new(),
+            fail: None,
+            name: "\\REGISTRY\\MACHINE\\X".into(),
+        };
+        let checks = std::cell::Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture.run(&mut io, &baseline.present_data().unwrap(), || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 8 {
+                    if unwind {
+                        panic!("fence unwound AFTER actual commit ACK");
+                    }
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            })
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(
+            capture.commit_ack.get(),
+            "actual fact retained before postflight"
+        );
+        assert!(capture.verify_complete(&origin).is_err());
+        assert_eq!(
+            io.steps,
+            ["begin", "derive", "read", "enlist", "read", "stage", "commit"]
+        );
+        let calls = io.steps.len();
+        assert!(capture
+            .run(&mut io, &baseline.present_data().unwrap(), || Ok(()))
+            .is_err());
+        assert_eq!(io.steps.len(), calls);
     }
 }
 

@@ -9,6 +9,64 @@ fn descriptor() -> Vec<u8> {
         0, 0, 0,
     ]
 }
+// External registry-query fixture only. Uses the real bounded capture/parser;
+// cannot create any product original/disposition/close permission.
+pub(crate) fn read_empty_metadata_for_key(
+    capture: &RegistryMetadataCapture,
+    name: &str,
+    changed_security: bool,
+) -> Result<()> {
+    struct Empty<'a> {
+        io: NativeIo,
+        name: &'a str,
+        changed_security: bool,
+    }
+    impl Queries for Empty<'_> {
+        fn info(&mut self, o: &mut RawInfo) {
+            self.io.info(o);
+            o.class_len = 0;
+            o.class[0] = 0;
+            o.subkeys = 0;
+            o.values = 0;
+            o.max_subkey_name = 0;
+            o.max_subkey_class = 0;
+            o.max_value_name = 0;
+            o.max_value_data = 0;
+        }
+        fn name(&mut self, o: &mut RawBuffer) {
+            let words: Vec<_> = self.name.encode_utf16().collect();
+            let mut bytes = ((words.len() * 2) as u32).to_le_bytes().to_vec();
+            for word in words {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            o.status = Some(0);
+            o.returned = bytes.len() as u32;
+            o.bytes_mut()[..bytes.len()].copy_from_slice(&bytes);
+        }
+        fn security(&mut self, information: u32, o: &mut RawBuffer) {
+            self.io.security(information, o);
+            if self.changed_security {
+                o.bytes_mut()[40] = 33; // Full, valid changed group SID.
+            }
+        }
+        fn descriptor(
+            &mut self,
+            raw: &RawBuffer,
+            layout: &SecurityLayout,
+            o: &mut DescriptorCheck,
+        ) {
+            self.io.descriptor(raw, layout, o);
+        }
+    }
+    capture.read(
+        &mut Empty {
+            io: NativeIo::good(),
+            name,
+            changed_security,
+        },
+        |_| Ok(()),
+    )
+}
 fn name_bytes() -> Vec<u8> {
     let mut b = vec![38, 0, 0, 0]; // 19 WCHARs, no terminating WCHAR in NtQueryKey.
     for w in "\\REGISTRY\\MACHINE\\X".encode_utf16() {
@@ -44,6 +102,27 @@ fn registry_metadata_decodes_full_self_relative_owner_group_sacl_dacl() {
             })
         }
     );
+}
+
+#[test]
+fn completed_present_metadata_is_readonly_data_and_denies_partial_or_failed_capture() {
+    let capture = RegistryMetadataCapture::new();
+    assert!(capture.present_data().is_err());
+    let mut io = NativeIo::good();
+    capture.read(&mut io, |_| Ok(())).unwrap();
+    let data = capture.present_data().unwrap();
+    assert_eq!(data.name, "\\REGISTRY\\MACHINE\\X");
+    assert_eq!(data.security.raw, descriptor());
+    assert_eq!(capture.present_data().unwrap(), data);
+    // A real post-read failure revokes successful DATA exposure; retained raw
+    // outputs are history, never a live original-disposition authorization.
+    let failed = RegistryMetadataCapture::new();
+    assert!(failed
+        .read(&mut NativeIo::good(), |_| Err(MetadataError::Changed))
+        .is_err());
+    assert!(failed.present_data().is_err());
+    assert!(capture.read(&mut NativeIo::good(), |_| Ok(())).is_err());
+    assert!(capture.present_data().is_err());
 }
 #[test]
 fn registry_metadata_native_name_is_exact_length_strict_utf16() {

@@ -332,6 +332,25 @@ pub(crate) struct RegistryMetadataCapture {
     local: PhantomData<Rc<()>>,
 }
 impl RegistryMetadataCapture {
+    /// Completed factual DATA only; not ownership or native-effect permission.
+    pub(crate) fn present_data(&self) -> Result<Metadata> {
+        self.check()?;
+        if !self.attempted.get() || self.busy.get() {
+            return Err(MetadataError::Busy);
+        }
+        let data = self
+            .observations
+            .try_borrow()
+            .map_err(|_| MetadataError::Busy)?;
+        match (&data[0], &data[1]) {
+            (Some(Observation::Present(first)), Some(Observation::Present(second)))
+                if first == second =>
+            {
+                Ok(first.as_ref().clone())
+            }
+            _ => Err(MetadataError::Invalid),
+        }
+    }
     pub(crate) fn new() -> Self {
         Self {
             acquired: RefCell::new(Acquired {
@@ -616,3 +635,5 @@ mod native {
 #[cfg(test)]
 #[path = "member_carrier_registry_metadata_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::read_empty_metadata_for_key;
