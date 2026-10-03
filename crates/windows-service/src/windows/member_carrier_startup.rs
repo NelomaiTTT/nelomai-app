@@ -214,6 +214,7 @@ pub(crate) fn compare_module_only_read_record(
     expected: &crate::member_carrier_pair::Record,
 ) -> Result<()> {
     use crate::member_carrier_pair::{Effect, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
     expected.validate().map_err(|_| Error::Conflict)?;
     crate::member_carrier_native_ownership::validate_context(context)?;
     if expected.scope != context.intent.scope
@@ -236,8 +237,18 @@ pub(crate) fn compare_module_only_read_record(
                 .map_err(|_| Error::Conflict)?
         || !matches!(
             (expected.phase, expected.stop_stage, expected.pending),
-            (Phase::Closing, 9, Some(Effect::NativeEmpty))
+            (Phase::Closing, 0, Some(Effect::Guard))
+                | (Phase::Closing, 1, Some(Effect::ReleaseProbes))
+                | (Phase::Closing, 2, Some(Effect::RestoreNetwork))
+                | (Phase::Closing, 3, Some(Effect::RestoreWeak))
+                | (Phase::Closing, 4, Some(Effect::MemberStop(Slot::A)))
+                | (Phase::Closing, 5, Some(Effect::MemberStop(Slot::B)))
+                | (Phase::Closing, 6, Some(Effect::CarrierAddressDelete))
+                | (Phase::Closing, 7, Some(Effect::CarrierSessionEnd))
+                | (Phase::Closing, 8, Some(Effect::CarrierClose))
+                | (Phase::Closing, 9, Some(Effect::NativeEmpty))
                 | (Phase::Closing, 10, Some(Effect::Guard))
+                | (Phase::Closing, 11, Some(Effect::RestoreKeys))
                 | (Phase::Closing, 12, Some(Effect::FullEmpty))
                 | (Phase::Stopped, 12, None)
         )
@@ -825,10 +836,10 @@ pub(crate) mod native {
         module_only_candidate: Option<Rc<NativeStartupModuleOnlyCandidate>>,
         module_only_selection: Rc<TerminalCallState>,
         module_only_read_call: Rc<TerminalCallState>,
-        module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 3],
+        module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 13],
         module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
         module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
-        module_only_cleanup_native_reads: RefCell<[Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>; 3]>,
+        module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 13]>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
     /// permission. OtherAttempted remains denied by the existing finisher.
@@ -1952,12 +1963,10 @@ pub(crate) mod native {
             expected: &pair::Record,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             compare_module_only_read_record(&self.context, expected)?;
-            let index = match (expected.phase, expected.stop_stage) {
-                (pair::Phase::Closing, 9) => 0,
-                (pair::Phase::Closing, 10) => 1,
-                (pair::Phase::Closing, 12) => 2,
-                _ => return Err(Error::Conflict),
-            };
+            if expected.phase != pair::Phase::Closing {
+                return Err(Error::Conflict);
+            }
+            let index = usize::from(expected.stop_stage);
             let (candidate, load) = self.module_only_read_origins(original, expected)?;
             let mut observed = None;
             let inspect = |facts: &crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalFacts<'_>| {
@@ -1969,7 +1978,20 @@ pub(crate) mod native {
                 .module_only_cleanup_native_reads
                 .try_borrow_mut()
                 .map_err(|_| Error::Conflict)?;
-            if let Some(reader) = readers[index].as_ref() {
+            let stage = readers.get_mut(index).ok_or(Error::Conflict)?;
+            // Each protected CAS produces a new actual Pair ACK. Keep every
+            // original read frame; equal stage numbers are not currentness.
+            let reuse = stage.last().and_then(Option::as_ref).is_some_and(|reader| {
+                reader.matches_original(&candidate, &load, original, expected)
+            });
+            if !reuse {
+                if stage.len() >= 32 {
+                    return Err(Error::Retired);
+                }
+                stage.push(None); // retain destination BEFORE authentication/native reads
+            }
+            let destination = stage.last_mut().ok_or(Error::Pending)?;
+            if let Some(reader) = destination.as_ref() {
                 self.read_module_only_terminal(
                     &candidate, &load, original, expected, reader, inspect,
                 )?;
@@ -1979,7 +2001,7 @@ pub(crate) mod native {
                     &load,
                     original,
                     expected,
-                    &mut readers[index],
+                    destination,
                     inspect,
                 )?;
             }
@@ -2308,14 +2330,11 @@ pub(crate) mod native {
             if expected.phase == pair::Phase::Stopped {
                 run_module_only_read_call(&self.module_only_read_call, authenticate, bounded_read)
             } else {
-                let index = match expected.stop_stage {
-                    9 => 0,
-                    10 => 1,
-                    12 => 2,
-                    _ => return Err(Error::Conflict),
-                };
+                let index = usize::from(expected.stop_stage);
                 run_repeated_module_only_read_call(
-                    &self.module_only_cleanup_read_calls[index],
+                    self.module_only_cleanup_read_calls
+                        .get(index)
+                        .ok_or(Error::Conflict)?,
                     authenticate,
                     bounded_read,
                 )
@@ -2593,7 +2612,7 @@ pub(crate) mod native {
                 module_only_cleanup_read_calls: std::array::from_fn(|_| RefCell::new(Vec::new())),
                 module_only_load_read: RefCell::new(None),
                 module_only_native_read: RefCell::new(None),
-                module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| None)),
+                module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| Vec::new())),
             };
             retain_claim_startup(destination, startup, |startup| {
                 // SAME signed Runtime/current-process capture. The capsule and its
@@ -3997,6 +4016,15 @@ pub(crate) mod native {
             expected: &pair::Record,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             self.read_bootstrap_full_empty_root(original, expected)
+        }
+        fn read_bootstrap_no_constructor_cleanup(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            // The original Assembly and actual successful loader authenticate
+            // no constructor. No Carrier=None, missing graph or JSON fallback.
+            self.read_module_only_cleanup_root(original, expected)
         }
         fn verify_bootstrap_native_empty(
             &mut self,

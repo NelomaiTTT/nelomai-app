@@ -1004,8 +1004,24 @@ fn module_only_cleanup_reads_are_possible_before_stopped_without_disposal_grant(
     use crate::member_carrier_pair::{Effect, Phase};
     let (context, mut record) = bootstrap_fixture();
     for (stage, effect) in [
+        (0, Effect::Guard),
+        (1, Effect::ReleaseProbes),
+        (2, Effect::RestoreNetwork),
+        (3, Effect::RestoreWeak),
+        (
+            4,
+            Effect::MemberStop(nelomai_client_tunnel::redundancy::Slot::A),
+        ),
+        (
+            5,
+            Effect::MemberStop(nelomai_client_tunnel::redundancy::Slot::B),
+        ),
+        (6, Effect::CarrierAddressDelete),
+        (7, Effect::CarrierSessionEnd),
+        (8, Effect::CarrierClose),
         (9, Effect::NativeEmpty),
         (10, Effect::Guard),
+        (11, Effect::RestoreKeys),
         (12, Effect::FullEmpty),
     ] {
         record.stop_stage = stage;
@@ -1016,7 +1032,7 @@ fn module_only_cleanup_reads_are_possible_before_stopped_without_disposal_grant(
             let mut bad = record.clone();
             match fault {
                 0 => bad.phase = Phase::Starting,
-                1 => bad.pending = Some(Effect::CarrierClose),
+                1 => bad.pending = None,
                 2 => {
                     bad.carrier = Some(crate::member_owner::InterfaceProof {
                         index: 1,

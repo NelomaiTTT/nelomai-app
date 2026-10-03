@@ -866,6 +866,52 @@ fn full_empty_requires_closed_guard_and_separate_exact_final_read_frame() {
 }
 
 #[test]
+fn no_constructor_cleanup_compares_actual_snapshot_before_full_empty_stage() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
+    let mut record = closing_record();
+    for (stage, effect) in [
+        (0, Effect::Guard),
+        (1, Effect::ReleaseProbes),
+        (2, Effect::RestoreNetwork),
+        (3, Effect::RestoreWeak),
+        (4, Effect::MemberStop(Slot::A)),
+        (5, Effect::MemberStop(Slot::B)),
+        (6, Effect::CarrierAddressDelete),
+        (7, Effect::CarrierSessionEnd),
+        (8, Effect::CarrierClose),
+        (9, Effect::NativeEmpty),
+        (10, Effect::Guard),
+        (11, Effect::RestoreKeys),
+        (12, Effect::FullEmpty),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        let actual = record.guard.expected.clone();
+        compare_no_constructor_cleanup_snapshot(&record, &actual).unwrap();
+        if stage < 12 {
+            assert!(compare_full_empty_snapshot(&record, &actual).is_err());
+        }
+        let mut foreign = actual.clone();
+        foreign.scope.connection_generation += 1;
+        assert!(compare_no_constructor_cleanup_snapshot(&record, &foreign).is_err());
+        let mut wrong = record.clone();
+        wrong.pending = None;
+        assert!(compare_no_constructor_cleanup_snapshot(&wrong, &actual).is_err());
+        wrong = record.clone();
+        wrong.carrier = Some(crate::member_owner::InterfaceProof {
+            guid: [1; 16],
+            index: 1,
+            luid: 1,
+        });
+        assert!(compare_no_constructor_cleanup_snapshot(&wrong, &actual).is_err());
+    }
+    record.phase = Phase::Stopped;
+    record.pending = None;
+    assert!(compare_no_constructor_cleanup_snapshot(&record, &record.guard.expected).is_err());
+}
+
+#[test]
 fn full_empty_snapshot_compares_every_observed_sdk_field_not_model_flags() {
     use crate::member_carrier_guard as guard;
     let mut record = closing_record();

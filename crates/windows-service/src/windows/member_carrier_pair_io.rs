@@ -234,6 +234,42 @@ fn compare_full_empty_snapshot(
     Ok(())
 }
 
+/// Readonly no-constructor comparison, not FullEmpty/Stopped disposition.
+#[cfg(any(windows, test))]
+fn compare_no_constructor_cleanup_snapshot(
+    record: &crate::member_carrier_pair::Record,
+    observed: &crate::member_carrier_guard::Snapshot,
+) -> io::Result<()> {
+    use crate::member_carrier_pair::{Effect, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
+    record.validate()?;
+    let empty =
+        crate::member_carrier_guard::Model::empty(record.scope.clone()).map_err(|_| conflict())?;
+    if record.carrier.is_some()
+        || record.guard != empty
+        || observed != &empty.expected
+        || !matches!(
+            (record.phase, record.stop_stage, record.pending),
+            (Phase::Closing, 0, Some(Effect::Guard))
+                | (Phase::Closing, 1, Some(Effect::ReleaseProbes))
+                | (Phase::Closing, 2, Some(Effect::RestoreNetwork))
+                | (Phase::Closing, 3, Some(Effect::RestoreWeak))
+                | (Phase::Closing, 4, Some(Effect::MemberStop(Slot::A)))
+                | (Phase::Closing, 5, Some(Effect::MemberStop(Slot::B)))
+                | (Phase::Closing, 6, Some(Effect::CarrierAddressDelete))
+                | (Phase::Closing, 7, Some(Effect::CarrierSessionEnd))
+                | (Phase::Closing, 8, Some(Effect::CarrierClose))
+                | (Phase::Closing, 9, Some(Effect::NativeEmpty))
+                | (Phase::Closing, 10, Some(Effect::Guard))
+                | (Phase::Closing, 11, Some(Effect::RestoreKeys))
+                | (Phase::Closing, 12, Some(Effect::FullEmpty))
+        )
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
 /// Factual reuse fence only. Actual capture calls additionally require the
 /// retained pin to be from THIS RowOwner and freshly verify full native G.
 fn require_reusable_member_rows(
@@ -2468,6 +2504,15 @@ pub(crate) mod native {
             expected: &pair::Record,
             effect: pair::Effect,
         ) -> crate::member_carrier::Result<()>;
+        /// Actual successful loader plus original no-constructor Assembly,
+        /// exact current Closing stage/Pair ACK and bounded full SDK/keys/
+        /// private paths/BFE read. This is readonly: it does not close absent
+        /// resources, restore keys, unload modules or retire initial DATA.
+        fn read_bootstrap_no_constructor_cleanup(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<policy::Snapshot>;
         fn create_ready(
             &mut self,
             original: &Rc<NativePairIntentRead>,
@@ -5124,6 +5169,48 @@ pub(crate) mod native {
             })
         }
 
+        /// No constructor: the SAME Startup/Assembly/loader performs a full
+        /// independently authenticated read. Missing actor slots alone never
+        /// authorize a successful no-op, SDK call or terminal disposition.
+        fn read_no_constructor_cleanup(
+            &mut self,
+            record: &pair::Record,
+        ) -> io::Result<policy::Snapshot> {
+            let serial = self.serial.clone();
+            serial.run(true, || {
+                if self.roots.is_some()
+                    || self.full_capture_attempted
+                    || !self.rejected_inputs.is_empty()
+                    || self.registered
+                    || record.phase != pair::Phase::Closing
+                    || record.carrier.is_some()
+                    || !self.network_intents.is_empty()
+                    || !self.guard_acks.is_empty()
+                    || self.held.iter().any(Option::is_some)
+                    || self.held_reads.iter().any(Option::is_some)
+                    || self.row_attempted.iter().any(|attempted| *attempted)
+                    || self.row_owners.iter().any(Option::is_some)
+                    || self.row_pins.iter().any(Option::is_some)
+                    || self.row_authorities.iter().any(Option::is_some)
+                    || !self.historical_member_rows.is_empty()
+                    || !self.member_generation_originals.is_empty()
+                {
+                    return Err(conflict());
+                }
+                let pin = self.current(record)?;
+                let actual = self
+                    .startup
+                    .as_ref()
+                    .ok_or_else(conflict)?
+                    .try_borrow_mut()
+                    .map_err(denied)?
+                    .read_bootstrap_no_constructor_cleanup(&pin, record)
+                    .map_err(denied)?;
+                compare_no_constructor_cleanup_snapshot(record, &actual)?;
+                Ok(actual)
+            })
+        }
+
         pub(crate) fn attest_effect(
             &mut self,
             record: &pair::Record,
@@ -5137,6 +5224,9 @@ pub(crate) mod native {
                 return self.verify_full_empty(record);
             }
             if self.roots.is_none() {
+                if record.phase == pair::Phase::Closing && record.carrier.is_none() {
+                    return self.read_no_constructor_cleanup(record).map(|_| ());
+                }
                 if matches!(record.stop_stage, 9 | 10) {
                     return self.verify_native_empty(record);
                 }
@@ -5901,6 +5991,9 @@ pub(crate) mod native {
                 .load(scope)?
                 .ok_or_else(conflict)?;
             if self.roots.is_none() {
+                if record.phase == pair::Phase::Closing && record.carrier.is_none() {
+                    return self.read_no_constructor_cleanup(&record);
+                }
                 let serial = self.serial.clone();
                 return serial.run(true, || {
                     require_full_empty_frame(&record)?;
@@ -6045,6 +6138,10 @@ pub(crate) mod native {
         }
 
         pub(crate) fn close_dynamic_permits(&mut self, record: &pair::Record) -> io::Result<()> {
+            if self.roots.is_none() && record.carrier.is_none() {
+                require_effect(record, pair::Effect::Guard)?;
+                return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;
                 let r = this.roots()?;
@@ -6083,6 +6180,9 @@ pub(crate) mod native {
             {
                 self.serial.fault();
                 return Err(conflict());
+            }
+            if self.roots.is_none() && record.carrier.is_none() {
+                return self.read_no_constructor_cleanup(record).map(|_| ());
             }
             self.in_call(record, |this, pin| {
                 // Advance actual selections BEFORE Close/its first AfterClose
@@ -6284,6 +6384,10 @@ pub(crate) mod native {
             record: &pair::Record,
             slot: Slot,
         ) -> io::Result<()> {
+            if record.carrier.is_none() {
+                require_unstarted_cleanup(record, slot)?;
+                return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
             let serial = self.serial.clone();
             serial.run(true, || {
                 require_unstarted_cleanup(record, slot)?;
@@ -6758,6 +6862,10 @@ pub(crate) mod native {
             &mut self,
             record: &pair::Record,
         ) -> io::Result<()> {
+            if self.roots.is_none() && record.carrier.is_none() {
+                require_effect(record, pair::Effect::ReleaseProbes)?;
+                return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;
                 let closing = this.closing.clone();
@@ -6908,6 +7016,10 @@ pub(crate) mod native {
         }
 
         pub(crate) fn restore_owned_keys(&mut self, record: &pair::Record) -> io::Result<()> {
+            if self.roots.is_none() && record.carrier.is_none() {
+                require_effect(record, pair::Effect::RestoreKeys)?;
+                return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
             self.in_call(record, |this, _| {
                 if record.phase != pair::Phase::Closing
                     || record.stop_stage != 11
@@ -7445,6 +7557,10 @@ pub(crate) mod native {
         }
 
         pub(crate) fn restore_weak_rows(&mut self, record: &pair::Record) -> io::Result<()> {
+            if self.roots.is_none() && record.carrier.is_none() {
+                require_effect(record, pair::Effect::RestoreWeak)?;
+                return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;
                 // Preserve and hand off EVERY actual A/B owner, including a
