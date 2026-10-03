@@ -20,7 +20,13 @@ use nelomai_contracts::{HealthProbeKind, RedundantHealthProbe, RuntimeSlot};
 fn carrier_factory_selects_new_path_for_supported_pair() {
     // Each unknown publication retains the original process KeyLock. Run each
     // case in its OWN child; process exit is not a synthesized cleanup receipt.
-    let child_test = format!("{}::carrier_factory_actual_cold_child", module_path!());
+    // libtest names start at the crate's modules; module_path! includes the
+    // crate name. Retain the exact single-child count check below.
+    let child_module = module_path!()
+        .split_once("::")
+        .expect("crate-qualified module")
+        .1;
+    let child_test = format!("{child_module}::carrier_factory_actual_cold_child");
     for case in [
         "cold",
         "creator-ack",
@@ -132,6 +138,9 @@ fn carrier_factory_actual_cold_child() {
         let stopped = stopped.expect("actual prepared-before-DLL native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        // CompositeBackend drops its terminal previous control before calling
+        // this factory for the next session. Exercise that production order.
+        drop(original);
         // SAME factory, real new Startup and KeyLock after exact old completion.
         // There is no process module anchor yet: full primary/pin acceptance is
         // a later scenario, never inferred from this before-DLL repeat.

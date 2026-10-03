@@ -230,6 +230,11 @@ impl Fixture {
         });
     }
     pub(crate) fn verify_files(&self) -> io::Result<()> {
+        if INPUTS.with(|inputs| inputs.borrow().as_ref().is_none_or(|v| v.fault.is_some())) {
+            return Err(io::Error::other(
+                "requested filesystem ACK fault was not reached",
+            ));
+        }
         self.installation.load_engine(&self.executable)?;
         if !self.state.is_dir() {
             return Err(io::Error::other("original fixture state lost"));
