@@ -538,9 +538,9 @@ impl NativeDeadline {
             let _ = error;
         })?;
         #[cfg(test)]
-        if super::member_carrier_factory_test_os::state().is_some() {
-            eprintln!("actual cleanup pre-entry authentication completed");
-        }
+        super::member_carrier_factory_test_os::trace_step(
+            "cleanup pre-entry authentication completed",
+        );
         let authenticated_return = std::cell::Cell::new(false);
         let outcome = match self.deadline.run_cleanup(context, || {
             authenticate().inspect_err(|error| {
@@ -553,9 +553,9 @@ impl NativeDeadline {
                 let _ = error;
             })?;
             #[cfg(test)]
-            if super::member_carrier_factory_test_os::state().is_some() {
-                eprintln!("actual cleanup Calling authentication completed");
-            }
+            super::member_carrier_factory_test_os::trace_step(
+                "cleanup Calling authentication completed",
+            );
             let result = call().inspect_err(|error| {
                 #[cfg(test)]
                 super::member_carrier_factory_test_os::trace_native("cleanup callback", error);

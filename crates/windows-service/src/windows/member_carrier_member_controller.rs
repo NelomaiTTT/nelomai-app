@@ -2934,6 +2934,8 @@ pub(crate) mod native {
             expected: &PairRecord,
             lock: &KeyLock,
         ) -> Result<()> {
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step("full absence entry");
             self.history.cold()?;
             self.pair(pair, expected, lock).inspect_err(|error| {
                 #[cfg(test)]
@@ -2944,7 +2946,13 @@ pub(crate) mod native {
                 #[cfg(not(test))]
                 let _ = error;
             })?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step("full absence Pair completed");
             let before = self.no_effect_records()?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "full absence ledger completed",
+            );
             for _ in 0..2 {
                 for slot in [TunnelSlot::A, TunnelSlot::B] {
                     self.file_absence(slot).inspect_err(|error| {
@@ -2956,6 +2964,10 @@ pub(crate) mod native {
                         #[cfg(not(test))]
                         let _ = error;
                     })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "private file absence completed",
+                    );
                     self.services_absent(slot).inspect_err(|error| {
                         #[cfg(test)]
                         super::super::member_carrier_factory_test_os::trace_native(
@@ -2966,6 +2978,8 @@ pub(crate) mod native {
                         let _ = error;
                     })?;
                 }
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step("SCM absence completed");
                 for index in 0..3 {
                     self.key_fact(index, false).inspect_err(|error| {
                         #[cfg(test)]
@@ -2977,6 +2991,10 @@ pub(crate) mod native {
                         let _ = error;
                     })?;
                 }
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "key absence completed; entering SDK",
+                );
                 provider::native::inspect_mixed(&complete_provider_inputs(
                     &self.input.context,
                     &[],
@@ -2992,6 +3010,8 @@ pub(crate) mod native {
                     #[cfg(not(test))]
                     let _ = error;
                 })?;
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step("SDK absence completed");
                 self.pair(pair, expected, lock).inspect_err(|error| {
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::trace_native(
@@ -3031,14 +3051,14 @@ pub(crate) mod native {
                     let _ = error;
                 })?;
                 #[cfg(test)]
-                if super::super::member_carrier_factory_test_os::state().is_some() {
-                    eprintln!("actual no-C Pair read completed");
-                }
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "no-C Pair read completed",
+                );
                 let before = self.no_effect_records()?;
                 #[cfg(test)]
-                if super::super::member_carrier_factory_test_os::state().is_some() {
-                    eprintln!("actual no-C ledger read completed; opening BFE");
-                }
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "no-C ledger read completed; opening BFE",
+                );
                 let mut guard = super::super::member_carrier_guard::ScopedGuardAbsence::open(
                     expected.scope.clone(),
                 )
@@ -3053,9 +3073,9 @@ pub(crate) mod native {
                     let _ = error;
                 })?;
                 #[cfg(test)]
-                if super::super::member_carrier_factory_test_os::state().is_some() {
-                    eprintln!("actual no-C BFE opened; reading snapshot");
-                }
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "no-C BFE opened; reading snapshot",
+                );
                 let actual = guard
                     .read_snapshot(&expected.scope)
                     .map_err(|_| Error::Pending)
@@ -3069,9 +3089,9 @@ pub(crate) mod native {
                         let _ = error;
                     })?;
                 #[cfg(test)]
-                if super::super::member_carrier_factory_test_os::state().is_some() {
-                    eprintln!("actual no-C BFE snapshot completed");
-                }
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "no-C BFE snapshot completed",
+                );
                 for _ in 0..2 {
                     pair.verify_cleanup_entry_for(
                         &self.input.runtime,
@@ -3079,6 +3099,10 @@ pub(crate) mod native {
                         expected,
                     )
                     .map_err(|_| Error::Conflict)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "no-C cleanup entry reverified",
+                    );
                     self.cold_full_absence(pair, expected, lock)
                         .inspect_err(|error| {
                             #[cfg(test)]

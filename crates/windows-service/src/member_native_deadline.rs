@@ -767,6 +767,14 @@ fn terminate_once<K: Kernel>(state: &Mutex<State>, kernel: &K) -> Result<()> {
         return Ok(());
     }
     s.termination = Termination::Attempted;
+    #[cfg(test)]
+    eprintln!(
+        "native watchdog unknown outcome: reason={:?} phase={:?} tick={} deadline={}",
+        s.blocked,
+        s.phase,
+        kernel.now_ms(),
+        s.deadline
+    );
     // Serialize the FINAL boundary with returned() publication, not merely an
     // earlier decision. If completion wins this lock, it suppresses termination;
     // if the watchdog wins, the still-inflight call remains UNKNOWN. The actual

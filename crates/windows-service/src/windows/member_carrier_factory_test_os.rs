@@ -75,7 +75,16 @@ pub(crate) fn package_source_read() {
 
 pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::CarrierError) {
     if state().is_some() {
-        eprintln!("actual native step {step}: {error:?}");
+        eprintln!("actual native step {step}: {error:?} tick={}", unsafe {
+            windows_sys::Win32::System::SystemInformation::GetTickCount64()
+        });
+    }
+}
+pub(crate) fn trace_step(step: &'static str) {
+    if state().is_some() {
+        eprintln!("actual native step {step} tick={}", unsafe {
+            windows_sys::Win32::System::SystemInformation::GetTickCount64()
+        });
     }
 }
 
