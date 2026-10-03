@@ -13,6 +13,8 @@ mod member_carrier_coordinator_rows;
 mod member_carrier_creator;
 mod member_carrier_creators;
 mod member_carrier_factory;
+#[cfg(test)]
+mod member_carrier_factory_test_os;
 mod member_carrier_guard;
 mod member_carrier_guard_attestor;
 mod member_carrier_guard_gate;

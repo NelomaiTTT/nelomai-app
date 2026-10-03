@@ -26,6 +26,10 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+#[path = "member_carrier_factory_native_tests.rs"]
+mod actual_execution;
+
 type InitialRetirement = Rc<RefCell<Option<Rc<NativeNoCInitialDataRetirement>>>>;
 type Finalizer = Rc<RefCell<NativeCarrierPairFinalizer<'static>>>;
 pub(crate) type NativeFactoryControl =

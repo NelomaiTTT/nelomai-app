@@ -98,6 +98,12 @@ pub(crate) mod native {
                 .verify_at(&root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
             let root_pin = pin_private_directory(root).map_err(|_| Error::Conflict)?;
+            #[cfg(test)]
+            let installation = super::super::member_carrier_factory_test_os::installation(root)
+                .map(Ok)
+                .unwrap_or_else(|| Installation::production(root))
+                .map_err(|_| Error::Conflict)?;
+            #[cfg(not(test))]
             let installation = Installation::production(root).map_err(|_| Error::Conflict)?;
             let executable = actual_executable()?;
             let layout = installation
@@ -316,6 +322,10 @@ pub(crate) mod native {
         }
     }
     fn actual_executable() -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(path) = crate::windows::member_carrier_factory_test_os::executable() {
+            return std::fs::canonicalize(path).map_err(|_| Error::Native);
+        }
         std::fs::canonicalize(std::env::current_exe().map_err(|_| Error::Native)?)
             .map_err(|_| Error::Native)
     }
@@ -328,6 +338,12 @@ pub(crate) mod native {
             .map_err(|_| Error::Conflict)?;
         let signature =
             d::read_bounded(&directory.join(d::SIGNATURE_NAME), 64).map_err(|_| Error::Conflict)?;
+        #[cfg(test)]
+        let key = crate::windows::member_carrier_factory_test_os::key(directory)
+            .map(Ok)
+            .unwrap_or_else(d::pinned_key)
+            .map_err(|_| Error::Conflict)?;
+        #[cfg(not(test))]
         let key = d::pinned_key().map_err(|_| Error::Conflict)?;
         let manifest = nelomai_contracts::verify_container_manifest(
             &bytes, &signature, &key, "windows", "x86_64",

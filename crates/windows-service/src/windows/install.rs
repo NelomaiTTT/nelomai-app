@@ -1070,6 +1070,10 @@ fn service_manager(access: ServiceManagerAccess) -> Result<ServiceManager, Servi
 }
 
 pub(crate) fn state_directory() -> Result<PathBuf, ServiceError> {
+    #[cfg(test)]
+    if let Some(path) = super::member_carrier_factory_test_os::state() {
+        return Ok(path);
+    }
     let program_data = env::var_os("ProgramData")
         .ok_or_else(|| ServiceError::Backend("ProgramData is unavailable".to_string()))?;
     Ok(PathBuf::from(program_data).join("Nelomai").join("Tunnel"))

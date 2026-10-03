@@ -1,0 +1,167 @@
+//! Native entry execution, with external source/file ACK fixtures only.
+use super::*;
+use crate::{
+    member_actor::PairFactory,
+    windows::{
+        member_carrier_factory_test_os::Fixture, member_files::PrivateFile,
+        member_pair::NativePairFactory,
+    },
+};
+use nelomai_client_tunnel::{
+    redundancy::{
+        protocol::{Command, Member},
+        Slot,
+    },
+    DesktopTunnelOptions, TunnelConfiguration,
+};
+use nelomai_contracts::{HealthProbeKind, RedundantHealthProbe, RuntimeSlot};
+
+#[test]
+fn carrier_factory_selects_new_path_for_supported_pair() {
+    // Each unknown publication retains the original process KeyLock. Run each
+    // case in its OWN child; process exit is not a synthesized cleanup receipt.
+    let child_test = format!("{}::carrier_factory_actual_cold_child", module_path!());
+    for case in [
+        "cold",
+        "creator-ack",
+        "initial-native-ack",
+        "initial-native-unwind",
+        "fresh-ack",
+        "starting-ack",
+    ] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &child_test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NELOMAI_FACTORY_OS_CASE", case)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "actual native factory {case} exceeded 30s: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "actual native factory {case}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "empty child selection at {case}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "executed exactly by the bounded native factory parent, one OS case per process"]
+fn carrier_factory_actual_cold_child() {
+    let case = std::env::var("NELOMAI_FACTORY_OS_CASE").expect("bounded factory parent required");
+    let fixture = Fixture::new().expect("external signed/private fixture");
+    let mut factory: NativePairFactory<NativeSessionFiles> = fixture.factory().unwrap();
+    let scope = SessionScope {
+        runtime: RuntimeSlot::Latest,
+        runtime_generation: 2,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        connection_generation: 3,
+    };
+    let primary = Member { slot: Slot::A, lease_id: "22222222-2222-4222-8222-222222222222".into(),
+        configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.11:51820\nPersistentKeepalive = 25\n".into()),
+        probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "1.1.1.1".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
+    let mut command = Command::Start {
+        scope: scope.clone(),
+        primary,
+        role_generation: 1,
+        membership_generation: 1,
+        warm_stop_v1: true,
+        options: DesktopTunnelOptions::default(),
+    };
+    match case.as_str() {
+        "cold" => (),
+        "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
+        "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
+        "initial-native-unwind" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, true),
+        "fresh-ack" => fixture.lose_ack(PrivateFile::Pair, false),
+        "starting-ack" => fixture.lose_ack(PrivateFile::Session, false),
+        _ => panic!("unknown bounded case"),
+    }
+    let mut retained = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
+    }));
+    if case == "cold" {
+        result
+            .expect("actual cold prepare unwound")
+            .expect("actual cold factory preparation");
+    } else {
+        assert!(
+            result.is_err() || result.unwrap().is_err(),
+            "external ACK did not fault at {case}"
+        );
+    }
+    let mut original = retained.expect("factory lost its actual SessionControl before DLL");
+    assert_eq!(original.snapshot().session.scope, scope);
+    assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
+    fixture.verify_files().unwrap();
+    let stopped = original.execute(
+        Command::Stop {
+            scope: scope.clone(),
+        },
+        8,
+    );
+    if case == "cold" {
+        let stopped = stopped.expect("actual prepared-before-DLL native Stop");
+        assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+        assert!(!stopped.cleanup_pending);
+        // SAME factory, real new Startup and KeyLock after exact old completion.
+        // There is no process module anchor yet: full primary/pin acceptance is
+        // a later scenario, never inferred from this before-DLL repeat.
+        let Command::Start { scope: next, .. } = &mut command else {
+            unreachable!()
+        };
+        next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+        next.connection_generation += 1;
+        let next = next.clone();
+        let mut second = factory
+            .prepare(RuntimeSlot::Latest, &command, 9)
+            .expect("actual before-DLL repeat factory preparation");
+        let stopped = second
+            .execute(Command::Stop { scope: next }, 10)
+            .expect("actual before-DLL repeat native Stop");
+        assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+        assert!(!stopped.cleanup_pending);
+    } else {
+        match stopped {
+            Ok(snapshot) => {
+                assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
+                assert!(!snapshot.cleanup_pending);
+            }
+            Err(_) => {
+                assert!(original.snapshot().cleanup_pending);
+                // Unknown native/record ACK remains with the original owner.
+                // Process exit is not an invented successful disposition.
+                std::mem::forget(original);
+                std::mem::forget(factory);
+            }
+        }
+    }
+}

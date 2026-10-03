@@ -941,6 +941,13 @@ pub(crate) mod native {
             self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
             proof.directory.verify().map_err(|_| conflict())?;
             proof.executable_pin.verify().map_err(|_| conflict())?;
+            #[cfg(test)]
+            let executable = std::fs::canonicalize(
+                super::super::member_carrier_factory_test_os::executable()
+                    .map(Ok)
+                    .unwrap_or_else(std::env::current_exe)?,
+            )?;
+            #[cfg(not(test))]
             let executable = std::fs::canonicalize(std::env::current_exe()?)?;
             if executable != proof.executable || super::super::member_boot::boot_id()? != proof.boot
             {
@@ -977,7 +984,20 @@ pub(crate) mod native {
                 self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
                 let directory = super::super::member_files::pin_private_directory(&self.root)
                     .map_err(|_| conflict())?;
+                #[cfg(test)]
+                let installation =
+                    super::super::member_carrier_factory_test_os::installation(&self.root)
+                        .map(Ok)
+                        .unwrap_or_else(|| Installation::production(&self.root))?;
+                #[cfg(not(test))]
                 let installation = Installation::production(&self.root)?;
+                #[cfg(test)]
+                let executable = std::fs::canonicalize(
+                    super::super::member_carrier_factory_test_os::executable()
+                        .map(Ok)
+                        .unwrap_or_else(std::env::current_exe)?,
+                )?;
+                #[cfg(not(test))]
                 let executable = std::fs::canonicalize(std::env::current_exe()?)?;
                 let layout = self.execution.load(&installation, &executable, self.slot)?;
                 if layout.identity.slot != self.slot {

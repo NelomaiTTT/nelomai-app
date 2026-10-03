@@ -1313,7 +1313,11 @@ mod native {
                 // Slot only selects an opaque CREATE_NEW temporary prefix; the
                 // publication destination is always the closed file allowlist.
                 self.0
-                    .publish(TunnelSlot::A, &path, current, desired, file.limit())
+                    .publish(TunnelSlot::A, &path, current, desired, file.limit())?;
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::publication_ack(file)
+                    .map_err(|_| OwnerError::Native)?;
+                Ok(())
             })()
             .map_err(|_| std::io::Error::other("protected_session_file_failed"))
         }
