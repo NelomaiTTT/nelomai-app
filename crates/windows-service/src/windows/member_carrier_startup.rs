@@ -3082,6 +3082,11 @@ pub(crate) mod native {
             }
             if !self.initial_cleanup_attempted {
                 self.initial_cleanup_attempted = true;
+                // Pair Stop must select this SAME supervisor's storage-only
+                // cleanup lease before Never registers the original journal.
+                // Calling/Pair/native absence gates remain in the later read.
+                self.supervisor
+                    .begin_original_cleanup_storage(&self.runtime, &self.context)?;
                 let original = self.initial_noc.as_ref().ok_or(Error::Pending)?.clone();
                 // Resolve the actual parent cleanup view OUTSIDE original J's
                 // RefCell/private backend bracket. No lock or writer replaced.
