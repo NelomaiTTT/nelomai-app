@@ -1000,6 +1000,36 @@ fn bootstrap_fixture() -> (Context, crate::member_carrier_pair::Record) {
 }
 
 #[test]
+fn module_only_factual_read_selects_distinct_stopped_frame_without_rewinding_cleanup() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    let (context, mut record) = bootstrap_fixture();
+    for (stage, effect) in [
+        (0, Effect::Guard),
+        (9, Effect::NativeEmpty),
+        (12, Effect::FullEmpty),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        compare_module_only_read_record(&context, &record).unwrap();
+        assert_eq!(module_only_read_stage(&record).unwrap(), usize::from(stage));
+    }
+    record.phase = Phase::Stopped;
+    record.pending = None;
+    compare_module_only_read_record(&context, &record).unwrap();
+    assert_eq!(module_only_read_stage(&record).unwrap(), 13);
+    for fault in 0..4 {
+        let mut wrong = record.clone();
+        match fault {
+            0 => wrong.stop_stage = 11,
+            1 => wrong.pending = Some(Effect::FullEmpty),
+            2 => wrong.phase = Phase::Fresh,
+            _ => wrong.phase = Phase::Running,
+        }
+        assert!(module_only_read_stage(&wrong).is_err());
+    }
+}
+
+#[test]
 fn module_only_cleanup_reads_are_possible_before_stopped_without_disposal_grant() {
     use crate::member_carrier_pair::{Effect, Phase};
     let (context, mut record) = bootstrap_fixture();

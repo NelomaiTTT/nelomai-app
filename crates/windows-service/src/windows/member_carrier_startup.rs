@@ -277,6 +277,19 @@ pub(crate) fn compare_module_only_read_progress(
     }
     Ok(())
 }
+
+/// Read-frame slot selection only; no native resource or release permission.
+fn module_only_read_stage(expected: &crate::member_carrier_pair::Record) -> Result<usize> {
+    use crate::member_carrier_pair::Phase;
+    expected.validate().map_err(|_| Error::Conflict)?;
+    if expected.phase == Phase::Stopped && expected.stop_stage == 12 && expected.pending.is_none() {
+        return Ok(13);
+    }
+    if expected.phase != Phase::Closing || expected.stop_stage > 12 {
+        return Err(Error::Conflict);
+    }
+    Ok(usize::from(expected.stop_stage))
+}
 impl StartupInvocationLedger {
     fn new() -> Self {
         Self {
@@ -835,11 +848,10 @@ pub(crate) mod native {
         terminal_key_closes: [Option<Rc<crate::windows::member_carrier_keys::KeyHandleClosed>>; 3],
         module_only_candidate: Option<Rc<NativeStartupModuleOnlyCandidate>>,
         module_only_selection: Rc<TerminalCallState>,
-        module_only_read_call: Rc<TerminalCallState>,
-        module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 13],
+        module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 14],
         module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
         module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
-        module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 13]>,
+        module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 14]>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
     /// permission. OtherAttempted remains denied by the existing finisher.
@@ -1963,10 +1975,7 @@ pub(crate) mod native {
             expected: &pair::Record,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             compare_module_only_read_record(&self.context, expected)?;
-            if expected.phase != pair::Phase::Closing {
-                return Err(Error::Conflict);
-            }
-            let index = usize::from(expected.stop_stage);
+            let index = module_only_read_stage(expected)?;
             let (candidate, load) = self.module_only_read_origins(original, expected)?;
             let mut observed = None;
             let inspect = |facts: &crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalFacts<'_>| {
@@ -2327,18 +2336,14 @@ pub(crate) mod native {
                     })
                 }
             };
-            if expected.phase == pair::Phase::Stopped {
-                run_module_only_read_call(&self.module_only_read_call, authenticate, bounded_read)
-            } else {
-                let index = usize::from(expected.stop_stage);
-                run_repeated_module_only_read_call(
-                    self.module_only_cleanup_read_calls
-                        .get(index)
-                        .ok_or(Error::Conflict)?,
-                    authenticate,
-                    bounded_read,
-                )
-            }
+            let index = module_only_read_stage(expected)?;
+            run_repeated_module_only_read_call(
+                self.module_only_cleanup_read_calls
+                    .get(index)
+                    .ok_or(Error::Conflict)?,
+                authenticate,
+                bounded_read,
+            )
         }
         /// Retain the actual query-only reader in the caller's owning slot
         /// BEFORE authentication/Calling/any observation. Never replace an
@@ -2608,7 +2613,6 @@ pub(crate) mod native {
                 terminal_key_closes: [None, None, None],
                 module_only_candidate: None,
                 module_only_selection: Rc::new(TerminalCallState::new()),
-                module_only_read_call: Rc::new(TerminalCallState::new()),
                 module_only_cleanup_read_calls: std::array::from_fn(|_| RefCell::new(Vec::new())),
                 module_only_load_read: RefCell::new(None),
                 module_only_native_read: RefCell::new(None),
@@ -4045,6 +4049,25 @@ pub(crate) mod native {
                     self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
                     Ok(actual)
                 })
+            }
+        }
+        fn read_bootstrap_no_constructor_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            // Terminal facts ONLY. Select by the original actual invocation,
+            // never by absent receipts and never by catching an attempted read.
+            if expected.phase != pair::Phase::Stopped
+                || expected.stop_stage != 12
+                || expected.pending.is_some()
+            {
+                return Err(Error::Conflict);
+            }
+            if self.create_attempted {
+                self.read_module_only_cleanup_root(original, expected)
+            } else {
+                self.verify_uncaptured_terminal_root(original, expected)
             }
         }
         fn verify_bootstrap_native_empty(

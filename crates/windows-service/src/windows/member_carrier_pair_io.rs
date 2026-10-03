@@ -2525,6 +2525,14 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<policy::Snapshot>;
+        /// Separate current Stopped12/None factual read, using original Never
+        /// or successful loader/no-constructor lineage. No unload/disposition
+        /// or ordinary fallback; each successful call rereads the full universe.
+        fn read_bootstrap_no_constructor_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<policy::Snapshot>;
         fn create_ready(
             &mut self,
             original: &Rc<NativePairIntentRead>,
@@ -5466,7 +5474,7 @@ pub(crate) mod native {
                         .try_borrow_mut()
                         .map_err(denied)?;
                     let actual = if record.phase == pair::Phase::Stopped {
-                        startup.read_uncaptured_terminal(&pin, record)
+                        startup.read_bootstrap_no_constructor_terminal(&pin, record)
                     } else {
                         startup.read_bootstrap_full_empty(&pin, record)
                     }
@@ -6017,7 +6025,7 @@ pub(crate) mod native {
                         .try_borrow_mut()
                         .map_err(denied)?;
                     let actual = if record.phase == pair::Phase::Stopped {
-                        startup.read_uncaptured_terminal(&pin, &record)
+                        startup.read_bootstrap_no_constructor_terminal(&pin, &record)
                     } else {
                         startup.read_bootstrap_full_empty(&pin, &record)
                     }
