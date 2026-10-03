@@ -1049,6 +1049,32 @@ enum CarrierCleanupRoute {
     RetainedStartup,
     FullGraph,
 }
+
+/// Factual reader dispatch only; the selected original Startup authenticates
+/// the precise private origin, complete SDK/rows and independent WFP samples.
+fn require_pregraph_closing_read(record: &crate::member_carrier_pair::Record) -> io::Result<()> {
+    use crate::member_carrier_pair::{Effect, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
+    record.validate()?;
+    if record.phase != Phase::Closing
+        || record.carrier.is_none()
+        || !matches!(
+            (record.stop_stage, record.pending),
+            (0, Some(Effect::Guard))
+                | (1, Some(Effect::ReleaseProbes))
+                | (2, Some(Effect::RestoreNetwork))
+                | (3, Some(Effect::RestoreWeak))
+                | (4, Some(Effect::MemberStop(Slot::A)))
+                | (5, Some(Effect::MemberStop(Slot::B)))
+                | (6, Some(Effect::CarrierAddressDelete))
+                | (7, Some(Effect::CarrierSessionEnd))
+                | (8, Some(Effect::CarrierClose))
+        )
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
 fn carrier_cleanup_route(
     record: &crate::member_carrier_pair::Record,
     effect: crate::member_carrier_pair::Effect,
@@ -2592,6 +2618,14 @@ pub(crate) mod native {
             expected: &pair::Record,
             effect: pair::Effect,
         ) -> crate::member_carrier::Result<()>;
+        /// Precise Closing0..8 factual read of SAME original cold C/rows and
+        /// never-started prepared members under full SDK + two BFE reads. No
+        /// graph/constructor absence inference or native/disposition grant.
+        fn read_pregraph_closing_cleanup(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<policy::Snapshot>;
         /// Actual successful loader plus original no-constructor Assembly,
         /// exact current Closing stage/Pair ACK and bounded full SDK/keys/
         /// private paths/BFE read. This is readonly: it does not close absent
@@ -5455,6 +5489,47 @@ pub(crate) mod native {
             })
         }
 
+        fn read_pregraph_closing_cleanup(
+            &mut self,
+            record: &pair::Record,
+        ) -> io::Result<policy::Snapshot> {
+            let serial = self.serial.clone();
+            serial.run(true, || {
+                require_pregraph_closing_read(record)?;
+                if self.roots.is_some()
+                    || self.full_capture_attempted
+                    || !self.rejected_inputs.is_empty()
+                    || self.registered
+                    || record.carrier.is_none()
+                    || !self.network_intents.is_empty()
+                    || !self.guard_acks.is_empty()
+                    || self.held.iter().any(Option::is_some)
+                    || self.held_reads.iter().any(Option::is_some)
+                    || self.row_attempted.iter().any(|attempted| *attempted)
+                    || self.row_owners.iter().any(Option::is_some)
+                    || self.row_pins.iter().any(Option::is_some)
+                    || self.row_authorities.iter().any(Option::is_some)
+                    || !self.historical_member_rows.is_empty()
+                    || !self.member_generation_originals.is_empty()
+                {
+                    return Err(conflict());
+                }
+                let pin = self.current(record)?;
+                let actual = self
+                    .startup
+                    .as_ref()
+                    .ok_or_else(conflict)?
+                    .try_borrow_mut()
+                    .map_err(denied)?
+                    .read_pregraph_closing_cleanup(&pin, record)
+                    .map_err(denied)?;
+                if actual != record.guard.expected {
+                    return Err(conflict());
+                }
+                Ok(actual)
+            })
+        }
+
         pub(crate) fn attest_effect(
             &mut self,
             record: &pair::Record,
@@ -5470,6 +5545,9 @@ pub(crate) mod native {
             if self.roots.is_none() {
                 if record.phase == pair::Phase::Closing && record.carrier.is_none() {
                     return self.read_no_constructor_cleanup(record).map(|_| ());
+                }
+                if record.phase == pair::Phase::Closing && record.stop_stage <= 8 {
+                    return self.read_pregraph_closing_cleanup(record).map(|_| ());
                 }
                 if matches!(record.stop_stage, 9 | 10) {
                     return self.verify_native_empty(record);
@@ -6238,6 +6316,9 @@ pub(crate) mod native {
                 if record.phase == pair::Phase::Closing && record.carrier.is_none() {
                     return self.read_no_constructor_cleanup(&record);
                 }
+                if record.phase == pair::Phase::Closing && record.stop_stage <= 8 {
+                    return self.read_pregraph_closing_cleanup(&record);
+                }
                 let serial = self.serial.clone();
                 return serial.run(true, || {
                     require_full_empty_frame(&record)?;
@@ -6382,9 +6463,13 @@ pub(crate) mod native {
         }
 
         pub(crate) fn close_dynamic_permits(&mut self, record: &pair::Record) -> io::Result<()> {
-            if self.roots.is_none() && record.carrier.is_none() {
+            if self.roots.is_none() {
                 require_effect(record, pair::Effect::Guard)?;
-                return self.read_no_constructor_cleanup(record).map(|_| ());
+                return if record.carrier.is_none() {
+                    self.read_no_constructor_cleanup(record).map(|_| ())
+                } else {
+                    self.read_pregraph_closing_cleanup(record).map(|_| ())
+                };
             }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;
@@ -6674,18 +6759,11 @@ pub(crate) mod native {
                 require_unstarted_cleanup(record, slot)?;
                 return self.read_no_constructor_cleanup(record).map(|_| ());
             }
-            let serial = self.serial.clone();
-            serial.run(true, || {
-                require_unstarted_cleanup(record, slot)?;
-                let pin = self.current(record)?;
-                self.startup
-                    .as_ref()
-                    .ok_or_else(conflict)?
-                    .try_borrow_mut()
-                    .map_err(denied)?
-                    .verify_unstarted_member(&pin, record, slot, None, None)
-                    .map_err(denied)
-            })
+            require_unstarted_cleanup(record, slot)?;
+            // The SAME original preparation ledger/owners plus full Closing C
+            // SDK sample prove absence. Cold member keys are Unstarted, not
+            // full-graph precreated Disabled keys; do not manufacture that ACK.
+            self.read_pregraph_closing_cleanup(record).map(|_| ())
         }
 
         fn verify_unstarted_member_in_call(
@@ -7148,9 +7226,13 @@ pub(crate) mod native {
             &mut self,
             record: &pair::Record,
         ) -> io::Result<()> {
-            if self.roots.is_none() && record.carrier.is_none() {
+            if self.roots.is_none() {
                 require_effect(record, pair::Effect::ReleaseProbes)?;
-                return self.read_no_constructor_cleanup(record).map(|_| ());
+                return if record.carrier.is_none() {
+                    self.read_no_constructor_cleanup(record).map(|_| ())
+                } else {
+                    self.read_pregraph_closing_cleanup(record).map(|_| ())
+                };
             }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;

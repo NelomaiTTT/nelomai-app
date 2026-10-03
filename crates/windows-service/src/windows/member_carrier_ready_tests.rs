@@ -976,6 +976,61 @@ fn pregraph_native_empty_is_disjoint_from_terminal_key_restoration() {
     compare_prepublication_terminal_frame(&context, &record, proof).unwrap();
 }
 
+// Break: early original C cleanup is routed through a later NativeEmpty or
+// terminal-key channel. The actual native caller must STILL supply the SAME
+// original C/rows/Calling/full SDK bracket; these are comparison facts only.
+#[test]
+fn pregraph_closing_facts_have_exact_early_frames_not_terminal_permissions() {
+    use crate::{member_carrier_guard as g, member_carrier_pair as p};
+    use nelomai_client_tunnel::redundancy::Slot;
+    let (context, mut record, proof) = full_cleanup_fixture();
+    record.members = [None, None];
+    record.network = None;
+    record.guard = g::Model::empty(record.scope.clone()).unwrap();
+    for (stage, effect) in [
+        (0, p::Effect::Guard),
+        (1, p::Effect::ReleaseProbes),
+        (2, p::Effect::RestoreNetwork),
+        (3, p::Effect::RestoreWeak),
+        (4, p::Effect::MemberStop(Slot::A)),
+        (5, p::Effect::MemberStop(Slot::B)),
+        (6, p::Effect::CarrierAddressDelete),
+        (7, p::Effect::CarrierSessionEnd),
+        (8, p::Effect::CarrierClose),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        compare_pregraph_closing_frame(&context, &record, proof).unwrap();
+        assert!(compare_pregraph_native_empty_frame(&context, &record, proof).is_err());
+        for fault in 0..9 {
+            let mut wrong = record.clone();
+            let mut original = proof;
+            match fault {
+                0 => wrong.pending = None,
+                1 => wrong.pending = Some(p::Effect::FullEmpty),
+                2 => wrong.carrier = None,
+                3 => original.luid += 1,
+                4 => wrong.provenance.network_epoch += 1,
+                5 => wrong.phase = p::Phase::Stopped,
+                6 => wrong.addresses.clear(),
+                7 => wrong.options = None,
+                _ => wrong.active = Some(Slot::A),
+            }
+            assert!(compare_pregraph_closing_frame(&context, &wrong, original).is_err());
+        }
+    }
+    for (stage, effect) in [
+        (9, p::Effect::NativeEmpty),
+        (10, p::Effect::Guard),
+        (11, p::Effect::RestoreKeys),
+        (12, p::Effect::FullEmpty),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        assert!(compare_pregraph_closing_frame(&context, &record, proof).is_err());
+    }
+}
+
 // Break: genuine Stopped is routed as Closing12, or a stopped row/frame grants
 // permission without its original SDK reader. This is a strict comparison only.
 #[test]

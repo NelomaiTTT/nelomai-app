@@ -400,6 +400,31 @@ fn compare_pregraph_native_empty_frame(
     }
     compare_prepublication_closed_origin(context, record, Some(original))
 }
+pub(crate) fn compare_pregraph_closing_frame(
+    context: &crate::member_carrier_native_ownership::Context,
+    record: &crate::member_carrier_pair::Record,
+    original: crate::member_owner::InterfaceProof,
+) -> Result<()> {
+    use crate::member_carrier_pair as p;
+    use nelomai_client_tunnel::redundancy::Slot;
+    if record.carrier != Some(original)
+        || !matches!(
+            (record.stop_stage, record.pending),
+            (0, Some(p::Effect::Guard))
+                | (1, Some(p::Effect::ReleaseProbes))
+                | (2, Some(p::Effect::RestoreNetwork))
+                | (3, Some(p::Effect::RestoreWeak))
+                | (4, Some(p::Effect::MemberStop(Slot::A)))
+                | (5, Some(p::Effect::MemberStop(Slot::B)))
+                | (6, Some(p::Effect::CarrierAddressDelete))
+                | (7, Some(p::Effect::CarrierSessionEnd))
+                | (8, Some(p::Effect::CarrierClose))
+        )
+    {
+        return Err(CarrierError::Conflict);
+    }
+    compare_prepublication_closed_origin(context, record, Some(original))
+}
 fn compare_prepublication_terminal_origin(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
@@ -451,6 +476,7 @@ fn compare_prepublication_closed_origin(
 }
 #[derive(Clone, Copy)]
 enum PregraphRead {
+    CarrierClosed,
     NativeEmpty,
     FullEmpty,
     Stopped,
@@ -1211,8 +1237,9 @@ pub(crate) mod native {
         }
         /// Acquire ONE original Closing Rc after the actual journal Closing
         /// transition, inside the caller's actual supervised cleanup Calling.
-        /// `register` MUST weak-register THIS Rc in the actor's actual gates;
-        /// it must not inspect/borrow the native Authority from this callback.
+        /// A full graph's `register` MUST weak-register THIS Rc in its actual
+        /// gates; pregraph reads have only this Ready retention root and grant
+        /// no delegate effect. The callback must never reenter the Authority.
         pub(crate) fn capture_closing_in_call(
             &mut self,
             current: Rc<NativePairIntentRead>,
@@ -2029,6 +2056,162 @@ pub(crate) mod native {
                 inspect,
             )
         }
+        /// Exact Closing0..8 before full-G attachment. This is a FACTUAL read:
+        /// SAME actual source-origin Closing reader, original RowOwner/ACK,
+        /// precise Pair/Calling and full SDK are mandatory before/after. It
+        /// grants no row/member/Guard/native mutation or owner disposition.
+        pub(crate) fn inspect_pregraph_closing_in_call<T>(
+            &mut self,
+            pair: &Rc<NativePairIntentRead>,
+            expected: &PairRecord,
+            inspect: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
+        ) -> Result<T> {
+            if self.terminal_attempted || self.lifecycle.attempted() {
+                return Err(CarrierError::Retired);
+            }
+            let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
+            let context = meta.scope.context.clone();
+            let runtime = meta.runtime.read_pin()?;
+            let supervisor = meta.supervisor.clone();
+            let proof = self.proof.ok_or(CarrierError::Pending)?;
+            compare_pregraph_closing_frame(&context, expected, proof)?;
+            // Select a genuine close-origin ONLY if its actual first AfterClose
+            // callback retained it. A failed native read never falls back to a
+            // live C or an unpublished/NoC sampler.
+            match self.lifecycle.retired_pin() {
+                Ok(_) if expected.stop_stage == 8 => {
+                    return self.inspect_pregraph_originals_in_call(
+                        pair,
+                        expected,
+                        PregraphRead::CarrierClosed,
+                        inspect,
+                    );
+                }
+                Ok(_) => return Err(CarrierError::Conflict),
+                Err(CarrierError::Pending) => {}
+                Err(error) => return Err(error),
+            }
+            pair.inspect_cleanup_effect(
+                &runtime,
+                &supervisor,
+                expected,
+                expected.stop_stage,
+                |_| Ok(()),
+            )
+            .map_err(denied)?;
+            let source = self.source.as_ref().ok_or(CarrierError::Pending)?.clone();
+            let closing = if self.closing_attempted {
+                self.closing.require_registered()?;
+                self.closing.pin()?
+            } else {
+                // There is no full delegate to weak-register yet. The SAME
+                // Ready root retains this original BEFORE origin/SDK checks;
+                // no callback supplies a native permission or an absence ACK.
+                self.capture_closing_in_call(pair.clone(), expected, |_| Ok(()))?
+            };
+            if !closing.matches_source_origin(&source) {
+                return Err(CarrierError::Conflict);
+            }
+            {
+                let (_, authority) = self
+                    .construction
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?
+                    .retained_parts()
+                    .components
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?;
+                authority
+                    .select_pair_intent(pair.clone(), expected)
+                    .map_err(denied)?;
+            }
+            let row = self.original_rows.as_ref().ok_or(CarrierError::Pending)?;
+            // Published C requires the actual completed original row handoff,
+            // not a failed capture inferred from an address/index in JSON.
+            verify_row_owner_original(self.rows.as_ref().ok_or(CarrierError::Pending)?, row)?;
+            let pair_before = runtime.record(&context, RecordKind::Pair)?;
+            let value = closing
+                .inspect_bindings(|bindings| {
+                    if bindings.scope != expected.scope
+                        || bindings.carrier.as_ref().map(|c| c.identity.proof) != Some(proof)
+                        || bindings.egress.iter().any(Option::is_some)
+                        || bindings.carrier.as_ref().is_none_or(|c| {
+                            c.identity.scope != expected.scope
+                                || c.sources
+                                    != context
+                                        .intent
+                                        .addresses
+                                        .iter()
+                                        .map(|address| address.addr())
+                                        .collect::<Vec<_>>()
+                        })
+                    {
+                        return Err(wintun::Error::Conflict);
+                    }
+                    let read_rows = || -> Result<(Vec<u8>, rows::Snapshot)> {
+                        for kind in [
+                            RecordKind::Network,
+                            RecordKind::CarrierGuard,
+                            RecordKind::MemberARows,
+                            RecordKind::MemberBRows,
+                        ] {
+                            if runtime.optional_record(&context, kind)?.is_some() {
+                                return Err(CarrierError::Conflict);
+                            }
+                        }
+                        row.with_cleanup_record(
+                            &expected.scope,
+                            expected.provenance.network_epoch,
+                            |facts| {
+                                let b = facts.binding;
+                                if b.guid != proof.guid
+                                    || b.key.index != proof.index
+                                    || b.key.luid != proof.luid
+                                {
+                                    return Err(rows::Error::Conflict);
+                                }
+                                let bytes = runtime
+                                    .record(&context, RecordKind::CarrierRows)
+                                    .map_err(|_| rows::Error::Journal)?;
+                                let saved = rows::Record::decode(&bytes)?;
+                                if saved != *facts.acknowledged || saved.binding != *b {
+                                    return Err(rows::Error::Conflict);
+                                }
+                                let observed = rows::native::read_original_snapshot(b)?;
+                                let stage =
+                                    crate::windows::member_carrier_coordinator_rows::Stage::Observe;
+                                crate::windows::member_carrier_coordinator_rows::compare(
+                                    b, &saved, &observed, stage,
+                                )?;
+                                Ok((bytes, observed))
+                            },
+                        )
+                        .map_err(denied)
+                    };
+                    let before = read_rows().map_err(native_denied)?;
+                    let value = inspect(bindings).map_err(native_denied)?;
+                    if read_rows().map_err(native_denied)? != before {
+                        return Err(wintun::Error::Conflict);
+                    }
+                    Ok(value)
+                })
+                .map_err(denied)?;
+            self.closing.require_registered()?;
+            if !Rc::ptr_eq(&closing, &self.closing.pin()?)
+                || runtime.record(&context, RecordKind::Pair)? != pair_before
+            {
+                return Err(CarrierError::Conflict);
+            }
+            pair.inspect_cleanup_effect(
+                &runtime,
+                &supervisor,
+                expected,
+                expected.stop_stage,
+                |_| Ok(()),
+            )
+            .map_err(denied)?;
+            Ok(value)
+        }
         /// Genuine Stopped caller, never a projected Closing12 record. Caller
         /// MUST already hold this exact Pair.inspect frame and terminal Calling.
         /// The original Retired SDK and private row ACK are checked before/after
@@ -2073,7 +2256,7 @@ pub(crate) mod native {
                     .as_ref()
                     .ok_or(CarrierError::Pending)?;
                 match channel {
-                    PregraphRead::NativeEmpty => {
+                    PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
                         authority.verify_retired_cleanup_original_in_call(&retired)
                     }
                     PregraphRead::FullEmpty | PregraphRead::Stopped => {
@@ -2094,7 +2277,9 @@ pub(crate) mod native {
             )?;
             let verify_pair = || -> Result<()> {
                 match channel {
-                    PregraphRead::NativeEmpty | PregraphRead::FullEmpty => pair
+                    PregraphRead::CarrierClosed
+                    | PregraphRead::NativeEmpty
+                    | PregraphRead::FullEmpty => pair
                         .verify_cleanup_entry_for(&runtime, &context, expected)
                         .map_err(denied),
                     PregraphRead::Stopped => pair
@@ -2107,6 +2292,12 @@ pub(crate) mod native {
             let read_rows = |bindings: &crate::windows::member_carrier_guard::Bindings| {
                 let c = bindings.carrier.as_ref().ok_or(CarrierError::Conflict)?;
                 match channel {
+                    PregraphRead::CarrierClosed => {
+                        if expected.stop_stage != 8 {
+                            return Err(CarrierError::Conflict);
+                        }
+                        compare_pregraph_closing_frame(&context, expected, c.identity.proof)?
+                    }
                     PregraphRead::NativeEmpty => {
                         compare_pregraph_native_empty_frame(&context, expected, c.identity.proof)?
                     }
@@ -2176,7 +2367,7 @@ pub(crate) mod native {
                         return Err(wintun::Error::Conflict);
                     }
                     let before = read_rows(bindings).map_err(native_denied)?;
-                    if !matches!(channel, PregraphRead::NativeEmpty) && self.rows.is_none() {
+                    if matches!(channel, PregraphRead::FullEmpty | PregraphRead::Stopped) && self.rows.is_none() {
                         // This exact private row ACK/protected payload and the
                         // independent full SDK absence have been authenticated
                         // ABOVE, inside the actual Retired terminal bracket.
@@ -2220,7 +2411,7 @@ pub(crate) mod native {
                     Ok(value)
                 };
             let value = match channel {
-                PregraphRead::NativeEmpty => {
+                PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
                     retired.inspect_bindings_and_history(inspect_originals)
                 }
                 PregraphRead::FullEmpty | PregraphRead::Stopped => {
@@ -2239,7 +2430,7 @@ pub(crate) mod native {
                 .as_ref()
                 .ok_or(CarrierError::Pending)?;
             match channel {
-                PregraphRead::NativeEmpty => {
+                PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
                     authority.verify_retired_cleanup_original_in_call(&retired)
                 }
                 PregraphRead::FullEmpty | PregraphRead::Stopped => {

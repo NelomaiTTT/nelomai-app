@@ -2265,6 +2265,61 @@ fn published_pregraph_carrier_cleanup_selects_retained_startup_for_each_effect()
 }
 
 #[test]
+fn published_pregraph_guard_reads_use_exact_early_closing_frames() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    let mut record = closing_record();
+    record.addresses = vec!["10.7.0.2/32".parse().unwrap()];
+    record.options = Some(nelomai_client_tunnel::DesktopTunnelOptions::default());
+    record.carrier = Some(crate::member_owner::InterfaceProof {
+        guid: [3; 16],
+        index: 73,
+        luid: 117,
+    });
+    for (stage, effect) in [
+        (0, Effect::Guard),
+        (1, Effect::ReleaseProbes),
+        (2, Effect::RestoreNetwork),
+        (3, Effect::RestoreWeak),
+        (
+            4,
+            Effect::MemberStop(nelomai_client_tunnel::redundancy::Slot::A),
+        ),
+        (
+            5,
+            Effect::MemberStop(nelomai_client_tunnel::redundancy::Slot::B),
+        ),
+        (6, Effect::CarrierAddressDelete),
+        (7, Effect::CarrierSessionEnd),
+        (8, Effect::CarrierClose),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        require_pregraph_closing_read(&record).unwrap();
+        for fault in 0..5 {
+            let mut wrong = record.clone();
+            match fault {
+                0 => wrong.pending = None,
+                1 => wrong.pending = Some(Effect::FullEmpty),
+                2 => wrong.stop_stage = 10,
+                3 => wrong.phase = Phase::Stopped,
+                _ => wrong.carrier = None,
+            }
+            assert!(require_pregraph_closing_read(&wrong).is_err());
+        }
+    }
+    for (stage, effect) in [
+        (9, Effect::NativeEmpty),
+        (10, Effect::Guard),
+        (11, Effect::RestoreKeys),
+        (12, Effect::FullEmpty),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        assert!(require_pregraph_closing_read(&record).is_err());
+    }
+}
+
+#[test]
 fn terminal_factual_cache_advances_to_actual_stopped_and_never_back_to_forward() {
     use crate::member_carrier_pair::Phase;
     let mut closing = closing_record();

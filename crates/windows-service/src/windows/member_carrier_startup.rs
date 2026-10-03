@@ -4923,25 +4923,44 @@ pub(crate) mod native {
             expected: &pair::Record,
             effect: pair::Effect,
         ) -> Result<()> {
-            // Route facts are not native permission. Require the SAME private
-            // invocation and retained original C; Ready independently gates
-            // each actual row/session/handle effect against SDK/Calling/Pair.
+            // Join the already-existing original-owner method, not a parallel
+            // cleanup implementation. It owns the whole Calling and checks
+            // private invocation/graph/Runtime/KeyLock before/after effects.
+            if expected.pending != Some(effect)
+                || expected.carrier.is_none()
+                || expected.carrier != self.proof
+                || self.pins.is_none()
+            {
+                return Err(Error::Conflict);
+            }
+            NativeStartupRoot::cleanup_pregraph_carrier(self, original, expected)
+        }
+        fn create_ready(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_owner::InterfaceProof> {
+            NativeStartupRoot::create_ready(self, original, expected)
+        }
+        fn read_pregraph_closing_cleanup(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            crate::windows::member_carrier_ready::compare_pregraph_closing_frame(
+                &self.context,
+                expected,
+                self.proof.ok_or(Error::Pending)?,
+            )?;
             if !self.create_attempted
                 || self.attach_attempted
                 || self.terminal_attempted
                 || !self.invocation.attempted(true, false)?
-                || expected.carrier.is_none()
-                || expected.carrier != self.proof
                 || self.pins.is_none()
-                || expected.phase != pair::Phase::Closing
-                || expected.pending != Some(effect)
-                || !matches!(
-                    (expected.stop_stage, effect),
-                    (3, pair::Effect::RestoreWeak)
-                        | (6, pair::Effect::CarrierAddressDelete)
-                        | (7, pair::Effect::CarrierSessionEnd)
-                        | (8, pair::Effect::CarrierClose)
-                )
+                || self
+                    .retired_members
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
             {
                 return Err(Error::Conflict);
             }
@@ -4951,43 +4970,58 @@ pub(crate) mod native {
                 .require_pristine()?;
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
+            let runtime = self.runtime.clone();
+            let never = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
             supervisor.run_cleanup(&context, original, || {
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
-                if !self
-                    .runtime
-                    .matches_lock(self.lock.as_ref().ok_or(Error::Retired)?)
-                {
+                if !runtime.matches_lock(self.lock.as_ref().ok_or(Error::Retired)?) {
                     return Err(Error::Conflict);
                 }
                 self.graph
                     .try_borrow()
                     .map_err(|_| Error::Conflict)?
                     .require_pristine()?;
-                let carrier = self.carrier.as_mut().ok_or(Error::Pending)?;
-                if effect == pair::Effect::RestoreWeak {
-                    carrier.restore_interface_in_call(original.clone(), expected)?;
-                } else {
-                    carrier.cleanup_carrier_in_call(original.clone(), expected)?;
-                }
+                let prepared = &self.prepared;
+                let mut guard = crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
+                    expected.scope.clone(),
+                )
+                .map_err(|_| Error::Conflict)?;
+                let actual = self
+                    .carrier
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .inspect_pregraph_closing_in_call(original, expected, |_| {
+                        let verify = || {
+                            never.verify_pregraph_closing_originals(
+                                prepared, &runtime, &context, expected,
+                            )
+                        };
+                        verify()?;
+                        let before = guard
+                            .read_snapshot(&expected.scope)
+                            .map_err(|_| Error::Conflict)?;
+                        verify()?;
+                        if before != expected.guard.expected
+                            || guard
+                                .read_snapshot(&expected.scope)
+                                .map_err(|_| Error::Conflict)?
+                                != before
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        verify()?;
+                        Ok(before)
+                    })?;
                 self.graph
                     .try_borrow()
                     .map_err(|_| Error::Conflict)?
                     .require_pristine()?;
-                if !self
-                    .runtime
-                    .matches_lock(self.lock.as_ref().ok_or(Error::Retired)?)
-                {
+                if !runtime.matches_lock(self.lock.as_ref().ok_or(Error::Retired)?) {
                     return Err(Error::Conflict);
                 }
-                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                Ok(actual)
             })
-        }
-        fn create_ready(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> Result<crate::member_owner::InterfaceProof> {
-            NativeStartupRoot::create_ready(self, original, expected)
         }
         fn attach_full(
             &mut self,

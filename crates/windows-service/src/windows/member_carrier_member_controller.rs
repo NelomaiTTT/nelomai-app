@@ -506,6 +506,13 @@ fn validate_pregraph_native_empty_unstarted(
     validate_prepublication_unstarted_origin(context, current, slot, original)
 }
 
+#[derive(Clone, Copy)]
+enum PrepublicationOriginalRead {
+    EarlyClosing,
+    NativeEmpty,
+    FullEmpty,
+}
+
 fn validate_never_bootstrap_native_frame(
     context: &crate::member_carrier_native_ownership::Context,
     current: &crate::member_carrier_pair::Record,
@@ -1970,7 +1977,13 @@ pub(crate) mod native {
             context: &Context,
             expected: &PairRecord,
         ) -> Result<()> {
-            self.verify_prepublication_originals(prepared, runtime, context, expected, false)
+            self.verify_prepublication_originals(
+                prepared,
+                runtime,
+                context,
+                expected,
+                PrepublicationOriginalRead::FullEmpty,
+            )
         }
         /// SAME private prepared origins for readonly Closing9/10. Never a
         /// substitute Never ledger after attempted C creation or a key ACK.
@@ -1981,7 +1994,30 @@ pub(crate) mod native {
             context: &Context,
             expected: &PairRecord,
         ) -> Result<()> {
-            self.verify_prepublication_originals(prepared, runtime, context, expected, true)
+            self.verify_prepublication_originals(
+                prepared,
+                runtime,
+                context,
+                expected,
+                PrepublicationOriginalRead::NativeEmpty,
+            )
+        }
+        /// SAME private prepared origins inside the actual C-only Closing SDK
+        /// bracket. No started member/key ACK or terminal disposition is made.
+        pub(crate) fn verify_pregraph_closing_originals(
+            self: &Rc<Self>,
+            prepared: &[Option<NativePreparedMember>; 2],
+            runtime: &RuntimeRead,
+            context: &Context,
+            expected: &PairRecord,
+        ) -> Result<()> {
+            self.verify_prepublication_originals(
+                prepared,
+                runtime,
+                context,
+                expected,
+                PrepublicationOriginalRead::EarlyClosing,
+            )
         }
         fn verify_prepublication_originals(
             self: &Rc<Self>,
@@ -1989,7 +2025,7 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             context: &Context,
             expected: &PairRecord,
-            native_empty: bool,
+            channel: PrepublicationOriginalRead,
         ) -> Result<()> {
             if context != &self.input.context
                 || !self.input.runtime.same_original_runtime(runtime)
@@ -2009,10 +2045,25 @@ pub(crate) mod native {
                     TunnelSlot::B
                 };
                 let original = prepared.as_ref().map(|p| &p.origin.intent);
-                if native_empty {
-                    validate_pregraph_native_empty_unstarted(context, expected, slot, original)?;
-                } else {
-                    validate_closing12_unstarted(context, expected, slot, original)?;
+                match channel {
+                    PrepublicationOriginalRead::EarlyClosing => {
+                        crate::windows::member_carrier_ready::compare_pregraph_closing_frame(
+                            context,
+                            expected,
+                            expected.carrier.ok_or(Error::Conflict)?,
+                        )?;
+                        validate_prepublication_unstarted_origin(
+                            context, expected, slot, original,
+                        )?;
+                    }
+                    PrepublicationOriginalRead::NativeEmpty => {
+                        validate_pregraph_native_empty_unstarted(
+                            context, expected, slot, original,
+                        )?;
+                    }
+                    PrepublicationOriginalRead::FullEmpty => {
+                        validate_closing12_unstarted(context, expected, slot, original)?;
+                    }
                 }
                 if let Some(prepared) = prepared {
                     self.terminal_prepared_origin(&prepared.origin, index, runtime, context)?;
