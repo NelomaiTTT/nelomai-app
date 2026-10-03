@@ -510,6 +510,7 @@ fn validate_pregraph_native_empty_unstarted(
 enum PrepublicationOriginalRead {
     EarlyClosing,
     NativeEmpty,
+    RestoringKeys,
     FullEmpty,
 }
 
@@ -2019,6 +2020,21 @@ pub(crate) mod native {
                 PrepublicationOriginalRead::EarlyClosing,
             )
         }
+        pub(crate) fn verify_pregraph_key_restore_originals(
+            self: &Rc<Self>,
+            prepared: &[Option<NativePreparedMember>; 2],
+            runtime: &RuntimeRead,
+            context: &Context,
+            expected: &PairRecord,
+        ) -> Result<()> {
+            self.verify_prepublication_originals(
+                prepared,
+                runtime,
+                context,
+                expected,
+                PrepublicationOriginalRead::RestoringKeys,
+            )
+        }
         fn verify_prepublication_originals(
             self: &Rc<Self>,
             prepared: &[Option<NativePreparedMember>; 2],
@@ -2058,6 +2074,16 @@ pub(crate) mod native {
                     }
                     PrepublicationOriginalRead::NativeEmpty => {
                         validate_pregraph_native_empty_unstarted(
+                            context, expected, slot, original,
+                        )?;
+                    }
+                    PrepublicationOriginalRead::RestoringKeys => {
+                        crate::windows::member_carrier_ready::compare_pregraph_key_restore_frame(
+                            context,
+                            expected,
+                            expected.carrier.ok_or(Error::Conflict)?,
+                        )?;
+                        validate_prepublication_unstarted_origin(
                             context, expected, slot, original,
                         )?;
                     }

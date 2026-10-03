@@ -3593,6 +3593,87 @@ pub(crate) mod native {
                 Ok(actual)
             })
         }
+        /// READONLY exact Closing11 before/after actual key restoration.
+        /// SAME published C and original cold prepared/row owners, never an
+        /// imported Empty frame, full-graph substitute or key effect grant.
+        fn read_pregraph_key_restore_root(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            restored: bool,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            crate::windows::member_carrier_ready::compare_pregraph_key_restore_frame(
+                &self.context,
+                expected,
+                self.proof.ok_or(Error::Pending)?,
+            )?;
+            if !self.create_attempted
+                || self.attach_attempted
+                || self.terminal_attempted
+                || !self.invocation.attempted(true, false)?
+                || self.pins.is_none()
+                || self
+                    .retired_members
+                    .as_ref()
+                    .is_none_or(|members| !members.is_empty())
+            {
+                return Err(Error::Conflict);
+            }
+            self.graph
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .require_pristine()?;
+            let supervisor = self.supervisor.clone();
+            let context = self.context.clone();
+            let runtime = self.runtime.clone();
+            let never = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
+            supervisor.run_cleanup(&context, original, || {
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                if !runtime.matches_lock(self.lock.as_ref().ok_or(Error::Retired)?) {
+                    return Err(Error::Conflict);
+                }
+                let prepared = &self.prepared;
+                let mut guard = crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
+                    expected.scope.clone(),
+                )
+                .map_err(|_| Error::Conflict)?;
+                let actual = self
+                    .carrier
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .inspect_pregraph_key_restore_in_call(original, expected, restored, |_| {
+                        let verify = || {
+                            never.verify_pregraph_key_restore_originals(
+                                prepared, &runtime, &context, expected,
+                            )
+                        };
+                        verify()?;
+                        let before = guard
+                            .read_snapshot(&expected.scope)
+                            .map_err(|_| Error::Conflict)?;
+                        verify()?;
+                        if before != expected.guard.expected
+                            || guard
+                                .read_snapshot(&expected.scope)
+                                .map_err(|_| Error::Conflict)?
+                                != before
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        verify()?;
+                        Ok(before)
+                    })?;
+                self.graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .require_pristine()?;
+                if !runtime.matches_lock(self.lock.as_ref().ok_or(Error::Retired)?) {
+                    return Err(Error::Conflict);
+                }
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                Ok(actual)
+            })
+        }
         /// READONLY exact Closing9/10. The original cold ledger or actual
         /// retained Retired C/full-resource graph is mandatory, never None or
         /// a historical SDK index. All owners stay in this startup root.
@@ -5020,6 +5101,51 @@ pub(crate) mod native {
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
                 Ok(actual)
             })
+        }
+        fn restore_pregraph_keys(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            // Before and after reads are independent whole Calling intervals.
+            // The original key owner performs real restoration OUTSIDE the
+            // immutable SDK read bracket, authenticating each effect itself.
+            self.read_pregraph_key_restore_root(original, expected, false)?;
+            let supervisor = self.supervisor.clone();
+            let context = self.context.clone();
+            supervisor.run_cleanup(&context, original, || {
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                self.graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .require_pristine()?;
+                let lock = self.lock.as_mut().ok_or(Error::Retired)?;
+                if !self.runtime.matches_lock(lock) {
+                    return Err(Error::Conflict);
+                }
+                let assembly = self.assembly.as_mut().ok_or(Error::Pending)?;
+                let (owner, _) = assembly.retained_parts();
+                let owner = owner.as_mut().ok_or(Error::Pending)?;
+                let current = owner.snapshot()?.ok_or(Error::Pending)?;
+                if current.context != context {
+                    return Err(Error::Conflict);
+                }
+                owner.cleanup(&current, lock)?;
+                self.graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .require_pristine()?;
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+            })?;
+            self.read_pregraph_key_restore_root(original, expected, true)
+                .map(|_| ())
+        }
+        fn read_pregraph_restored_keys(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            self.read_pregraph_key_restore_root(original, expected, true)
         }
         fn attach_full(
             &mut self,

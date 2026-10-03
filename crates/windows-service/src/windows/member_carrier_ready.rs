@@ -425,6 +425,22 @@ pub(crate) fn compare_pregraph_closing_frame(
     }
     compare_prepublication_closed_origin(context, record, Some(original))
 }
+
+/// Exact factual key-restoration window, not value/delete/handle permission.
+pub(crate) fn compare_pregraph_key_restore_frame(
+    context: &crate::member_carrier_native_ownership::Context,
+    record: &crate::member_carrier_pair::Record,
+    original: crate::member_owner::InterfaceProof,
+) -> Result<()> {
+    use crate::member_carrier_pair as p;
+    if record.stop_stage != 11
+        || record.pending != Some(p::Effect::RestoreKeys)
+        || record.carrier != Some(original)
+    {
+        return Err(CarrierError::Conflict);
+    }
+    compare_prepublication_closed_origin(context, record, Some(original))
+}
 fn compare_prepublication_terminal_origin(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
@@ -478,6 +494,8 @@ fn compare_prepublication_closed_origin(
 enum PregraphRead {
     CarrierClosed,
     NativeEmpty,
+    KeyRestoreBefore,
+    KeyRestoreAfter,
     FullEmpty,
     Stopped,
 }
@@ -2056,6 +2074,27 @@ pub(crate) mod native {
                 inspect,
             )
         }
+        /// Two DISJOINT factual SDK channels at actual Closing11. The caller's
+        /// original key owner alone authenticates restoration effects between
+        /// these reads; no key effect occurs inside either SDK bracket.
+        pub(crate) fn inspect_pregraph_key_restore_in_call<T>(
+            &mut self,
+            pair: &Rc<NativePairIntentRead>,
+            expected: &PairRecord,
+            restored: bool,
+            inspect: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
+        ) -> Result<T> {
+            self.inspect_pregraph_originals_in_call(
+                pair,
+                expected,
+                if restored {
+                    PregraphRead::KeyRestoreAfter
+                } else {
+                    PregraphRead::KeyRestoreBefore
+                },
+                inspect,
+            )
+        }
         /// Exact Closing0..8 before full-G attachment. This is a FACTUAL read:
         /// SAME actual source-origin Closing reader, original RowOwner/ACK,
         /// precise Pair/Calling and full SDK are mandatory before/after. It
@@ -2256,12 +2295,14 @@ pub(crate) mod native {
                     .as_ref()
                     .ok_or(CarrierError::Pending)?;
                 match channel {
-                    PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
+                    PregraphRead::CarrierClosed
+                    | PregraphRead::NativeEmpty
+                    | PregraphRead::KeyRestoreBefore => {
                         authority.verify_retired_cleanup_original_in_call(&retired)
                     }
-                    PregraphRead::FullEmpty | PregraphRead::Stopped => {
-                        authority.verify_retired_original_in_call(&retired)
-                    }
+                    PregraphRead::KeyRestoreAfter
+                    | PregraphRead::FullEmpty
+                    | PregraphRead::Stopped => authority.verify_retired_original_in_call(&retired),
                 }
                 .map_err(denied)?;
             } // release authority borrow BEFORE Retired SDK callback
@@ -2279,6 +2320,8 @@ pub(crate) mod native {
                 match channel {
                     PregraphRead::CarrierClosed
                     | PregraphRead::NativeEmpty
+                    | PregraphRead::KeyRestoreBefore
+                    | PregraphRead::KeyRestoreAfter
                     | PregraphRead::FullEmpty => pair
                         .verify_cleanup_entry_for(&runtime, &context, expected)
                         .map_err(denied),
@@ -2300,6 +2343,9 @@ pub(crate) mod native {
                     }
                     PregraphRead::NativeEmpty => {
                         compare_pregraph_native_empty_frame(&context, expected, c.identity.proof)?
+                    }
+                    PregraphRead::KeyRestoreBefore | PregraphRead::KeyRestoreAfter => {
+                        compare_pregraph_key_restore_frame(&context, expected, c.identity.proof)?
                     }
                     PregraphRead::FullEmpty => {
                         compare_prepublication_terminal_frame(&context, expected, c.identity.proof)?
@@ -2411,10 +2457,12 @@ pub(crate) mod native {
                     Ok(value)
                 };
             let value = match channel {
-                PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
+                PregraphRead::CarrierClosed
+                | PregraphRead::NativeEmpty
+                | PregraphRead::KeyRestoreBefore => {
                     retired.inspect_bindings_and_history(inspect_originals)
                 }
-                PregraphRead::FullEmpty | PregraphRead::Stopped => {
+                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty | PregraphRead::Stopped => {
                     retired.inspect_terminal_bindings_and_history(inspect_originals)
                 }
             }
@@ -2430,10 +2478,12 @@ pub(crate) mod native {
                 .as_ref()
                 .ok_or(CarrierError::Pending)?;
             match channel {
-                PregraphRead::CarrierClosed | PregraphRead::NativeEmpty => {
+                PregraphRead::CarrierClosed
+                | PregraphRead::NativeEmpty
+                | PregraphRead::KeyRestoreBefore => {
                     authority.verify_retired_cleanup_original_in_call(&retired)
                 }
-                PregraphRead::FullEmpty | PregraphRead::Stopped => {
+                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty | PregraphRead::Stopped => {
                     authority.verify_retired_original_in_call(&retired)
                 }
             }

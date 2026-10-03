@@ -1031,6 +1031,34 @@ fn pregraph_closing_facts_have_exact_early_frames_not_terminal_permissions() {
     }
 }
 
+#[test]
+fn pregraph_key_restore_read_uses_actual_stage11_not_projected_full_empty() {
+    use crate::{member_carrier_guard as g, member_carrier_pair as p};
+    let (context, mut record, proof) = full_cleanup_fixture();
+    record.members = [None, None];
+    record.network = None;
+    record.guard = g::Model::empty(record.scope.clone()).unwrap();
+    record.stop_stage = 11;
+    record.pending = Some(p::Effect::RestoreKeys);
+    compare_pregraph_key_restore_frame(&context, &record, proof).unwrap();
+    for fault in 0..9 {
+        let mut wrong = record.clone();
+        let mut origin = proof;
+        match fault {
+            0 => wrong.pending = None,
+            1 => wrong.pending = Some(p::Effect::FullEmpty),
+            2 => wrong.stop_stage = 12,
+            3 => wrong.stop_stage = 10,
+            4 => wrong.carrier = None,
+            5 => wrong.phase = p::Phase::Stopped,
+            6 => origin.luid += 1,
+            7 => wrong.options = None,
+            _ => wrong.provenance.network_epoch += 1,
+        }
+        assert!(compare_pregraph_key_restore_frame(&context, &wrong, origin).is_err());
+    }
+}
+
 // Break: genuine Stopped is routed as Closing12, or a stopped row/frame grants
 // permission without its original SDK reader. This is a strict comparison only.
 #[test]

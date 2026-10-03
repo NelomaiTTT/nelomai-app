@@ -2655,6 +2655,21 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<policy::Snapshot>;
+        /// SAME actual retained key owner at Closing11; native key IO reattests
+        /// every restore effect. Before/after full SDK + WFP facts are separate
+        /// whole calls, not mutation inside an immutable SDK read callback.
+        fn restore_pregraph_keys(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<()>;
+        /// Exact Closing11 after actual keys-Clean receipt, not FullEmpty12,
+        /// final Stopped or a constructor/terminal disposition permission.
+        fn read_pregraph_restored_keys(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<policy::Snapshot>;
         /// Actual successful loader plus original no-constructor Assembly,
         /// exact current Closing stage/Pair ACK and bounded full SDK/keys/
         /// private paths/BFE read. This is readonly: it does not close absent
@@ -5581,6 +5596,25 @@ pub(crate) mod native {
                 if matches!(record.stop_stage, 9 | 10) {
                     return self.verify_native_empty(record);
                 }
+                if record.phase == pair::Phase::Closing && record.stop_stage == 11 {
+                    let serial = self.serial.clone();
+                    return serial.run(true, || {
+                        require_effect(record, pair::Effect::RestoreKeys)?;
+                        let pin = self.current(record)?;
+                        let actual = self
+                            .startup
+                            .as_ref()
+                            .ok_or_else(conflict)?
+                            .try_borrow_mut()
+                            .map_err(denied)?
+                            .read_pregraph_restored_keys(&pin, record)
+                            .map_err(denied)?;
+                        if actual != record.guard.expected {
+                            return Err(conflict());
+                        }
+                        Ok(())
+                    });
+                }
                 if record.phase == pair::Phase::Stopped {
                     return self.verify_full_empty(record);
                 }
@@ -7437,6 +7471,26 @@ pub(crate) mod native {
             if self.roots.is_none() && record.carrier.is_none() {
                 require_effect(record, pair::Effect::RestoreKeys)?;
                 return self.read_no_constructor_cleanup(record).map(|_| ());
+            }
+            if self.roots.is_none() {
+                let serial = self.serial.clone();
+                return serial.run(true, || {
+                    require_effect(record, pair::Effect::RestoreKeys)?;
+                    if record.phase != pair::Phase::Closing
+                        || record.stop_stage != 11
+                        || record.carrier.is_none()
+                    {
+                        return Err(conflict());
+                    }
+                    let pin = self.current(record)?;
+                    self.startup
+                        .as_ref()
+                        .ok_or_else(conflict)?
+                        .try_borrow_mut()
+                        .map_err(denied)?
+                        .restore_pregraph_keys(&pin, record)
+                        .map_err(denied)
+                });
             }
             self.in_call(record, |this, _| {
                 if record.phase != pair::Phase::Closing
