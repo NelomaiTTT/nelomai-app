@@ -73,6 +73,12 @@ pub(crate) fn package_source_read() {
     });
 }
 
+pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::CarrierError) {
+    if state().is_some() {
+        eprintln!("actual native step {step}: {error:?}");
+    }
+}
+
 pub(crate) struct Fixture {
     root: PathBuf,
     state: PathBuf,
@@ -287,7 +293,10 @@ impl Fixture {
                 .get("data")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| io::Error::other("fixture Pair payload missing"))?;
-            let pair: serde_json::Value = serde_json::from_str(data)?;
+            let wrapped: serde_json::Value = serde_json::from_str(data)?;
+            let pair = wrapped
+                .get("payload")
+                .ok_or_else(|| io::Error::other("fixture Pair envelope payload missing"))?;
             eprintln!(
                 "actual Pair phase={} stop_stage={} pending={}",
                 pair["phase"], pair["stop_stage"], pair["pending"]

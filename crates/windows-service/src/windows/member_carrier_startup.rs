@@ -5213,7 +5213,12 @@ pub(crate) mod native {
             if self.attach_attempted || self.terminal_attempted {
                 return Err(Error::Retired);
             }
-            self.bind_initial_noc_cleanup()?;
+            self.bind_initial_noc_cleanup().inspect_err(|error| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_native("no-C bind", error);
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             let never = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
@@ -5221,13 +5226,51 @@ pub(crate) mod native {
             // original Never ledger can enter the full readonly universe.
             // No attempt flag is reset and no attempted-lane error falls back.
             unsafe {
-                supervisor.run_uncaptured_read(&context, original, expected, &never, || {
-                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
-                    let lock = self.lock.as_ref().ok_or(Error::Retired)?;
-                    let actual = never.read_no_constructor_cleanup(original, expected, lock)?;
-                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
-                    Ok(actual)
-                })
+                supervisor
+                    .run_uncaptured_read(&context, original, expected, &never, || {
+                        self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+                            .inspect_err(|error| {
+                                #[cfg(test)]
+                                crate::windows::member_carrier_factory_test_os::trace_native(
+                                    "no-C Calling continuity",
+                                    error,
+                                );
+                                #[cfg(not(test))]
+                                let _ = error;
+                            })?;
+                        let lock = self.lock.as_ref().ok_or(Error::Retired)?;
+                        let actual = never
+                            .read_no_constructor_cleanup(original, expected, lock)
+                            .inspect_err(|error| {
+                                #[cfg(test)]
+                                crate::windows::member_carrier_factory_test_os::trace_native(
+                                    "no-C full native read",
+                                    error,
+                                );
+                                #[cfg(not(test))]
+                                let _ = error;
+                            })?;
+                        self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+                            .inspect_err(|error| {
+                                #[cfg(test)]
+                                crate::windows::member_carrier_factory_test_os::trace_native(
+                                    "no-C Calling continuity",
+                                    error,
+                                );
+                                #[cfg(not(test))]
+                                let _ = error;
+                            })?;
+                        Ok(actual)
+                    })
+                    .inspect_err(|error| {
+                        #[cfg(test)]
+                        crate::windows::member_carrier_factory_test_os::trace_native(
+                            "no-C supervised read",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })
             }
         }
         fn read_bootstrap_no_constructor_terminal(

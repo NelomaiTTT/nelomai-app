@@ -531,12 +531,38 @@ impl NativeDeadline {
             return Err(CarrierError::Retired);
         }
         self.owner.retain_cleanup_only().map_err(denied)?;
-        authenticate()?;
+        authenticate().inspect_err(|error| {
+            #[cfg(test)]
+            super::member_carrier_factory_test_os::trace_native("cleanup authentication", error);
+            #[cfg(not(test))]
+            let _ = error;
+        })?;
         let authenticated_return = std::cell::Cell::new(false);
         let outcome = match self.deadline.run_cleanup(context, || {
-            authenticate()?;
-            let result = call();
-            authenticate()?;
+            authenticate().inspect_err(|error| {
+                #[cfg(test)]
+                super::member_carrier_factory_test_os::trace_native(
+                    "cleanup authentication",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
+            let result = call().inspect_err(|error| {
+                #[cfg(test)]
+                super::member_carrier_factory_test_os::trace_native("cleanup callback", error);
+                #[cfg(not(test))]
+                let _ = error;
+            });
+            authenticate().inspect_err(|error| {
+                #[cfg(test)]
+                super::member_carrier_factory_test_os::trace_native(
+                    "cleanup authentication",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             authenticated_return.set(true);
             result
         }) {

@@ -2521,17 +2521,54 @@ pub(crate) mod native {
             {
                 return Err(Error::Pending);
             }
-            owner.verify_cleanup_runtime_entry(&self.input.runtime, context)?;
+            owner
+                .verify_cleanup_runtime_entry(&self.input.runtime, context)
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "no-C entry Runtime",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
             pair.verify_cleanup_entry_for(&self.input.runtime, context, expected)
                 .map_err(|_| Error::Conflict)?;
-            let before = self.no_effect_records()?;
+            let before = self.no_effect_records().inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "no-C entry ledger",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             self.history.cold()?;
             pair.verify_cleanup_entry_for(&self.input.runtime, context, expected)
                 .map_err(|_| Error::Conflict)?;
-            if self.no_effect_records()? != before {
+            if self.no_effect_records().inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "no-C entry ledger postflight",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })? != before
+            {
                 return Err(Error::Conflict);
             }
-            owner.verify_cleanup_runtime_entry(&self.input.runtime, context)?;
+            owner
+                .verify_cleanup_runtime_entry(&self.input.runtime, context)
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "no-C entry Runtime",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
             self.history.cold()
         }
         /// Separate no-C terminal pre-entry. SAME original ledger/deadline and
@@ -2898,23 +2935,72 @@ pub(crate) mod native {
             lock: &KeyLock,
         ) -> Result<()> {
             self.history.cold()?;
-            self.pair(pair, expected, lock)?;
+            self.pair(pair, expected, lock).inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "same Pair and native roots",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             let before = self.no_effect_records()?;
             for _ in 0..2 {
                 for slot in [TunnelSlot::A, TunnelSlot::B] {
-                    self.file_absence(slot)?;
-                    self.services_absent(slot)?;
+                    self.file_absence(slot).inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "private member file absence",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
+                    self.services_absent(slot).inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "SCM member absence",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
                 }
                 for index in 0..3 {
-                    self.key_fact(index, false)?;
+                    self.key_fact(index, false).inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "native key absence",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
                 }
                 provider::native::inspect_mixed(&complete_provider_inputs(
                     &self.input.context,
                     &[],
                     &[],
                 )?)
-                .map_err(|_| Error::Pending)?;
-                self.pair(pair, expected, lock)?;
+                .map_err(|_| Error::Pending)
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "native SDK or WFP absence",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
+                self.pair(pair, expected, lock).inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "same Pair and native roots",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
                 self.history.cold()?;
                 if self.no_effect_records()? != before {
                     return Err(Error::Conflict);
@@ -2935,15 +3021,41 @@ pub(crate) mod native {
             (|| {
                 self.history.cold()?;
                 validate_never_cleanup_stage_frame(&self.input.context, expected)?;
-                self.pair(pair, expected, lock)?;
+                self.pair(pair, expected, lock).inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "same Pair and native roots",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
                 let before = self.no_effect_records()?;
                 let mut guard = super::super::member_carrier_guard::ScopedGuardAbsence::open(
                     expected.scope.clone(),
                 )
-                .map_err(|_| Error::Pending)?;
+                .map_err(|_| Error::Pending)
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "native SDK or WFP absence",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
                 let actual = guard
                     .read_snapshot(&expected.scope)
-                    .map_err(|_| Error::Pending)?;
+                    .map_err(|_| Error::Pending)
+                    .inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "native SDK or WFP absence",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
                 for _ in 0..2 {
                     pair.verify_cleanup_entry_for(
                         &self.input.runtime,
@@ -2951,7 +3063,16 @@ pub(crate) mod native {
                         expected,
                     )
                     .map_err(|_| Error::Conflict)?;
-                    self.cold_full_absence(pair, expected, lock)?;
+                    self.cold_full_absence(pair, expected, lock)
+                        .inspect_err(|error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "full absence",
+                                error,
+                            );
+                            #[cfg(not(test))]
+                            let _ = error;
+                        })?;
                     if guard
                         .read_snapshot(&expected.scope)
                         .map_err(|_| Error::Pending)?
@@ -2961,7 +3082,15 @@ pub(crate) mod native {
                         return Err(Error::Conflict);
                     }
                     validate_never_cleanup_stage_frame(&self.input.context, expected)?;
-                    self.pair(pair, expected, lock)?;
+                    self.pair(pair, expected, lock).inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "same Pair and native roots",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
                     self.history.cold()?;
                 }
                 Ok(actual)
