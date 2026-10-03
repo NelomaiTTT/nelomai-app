@@ -1728,7 +1728,7 @@ pub(crate) mod native {
     /// They are deliberately not hidden in the local resource T.
     pub(crate) struct NativeActorTerminalCut<'a> {
         locals: Rc<NativeActorLocalResources>,
-        rejected_inputs: RefCell<Vec<NativeActorInputs<'a>>>,
+        rejected_inputs: RefCell<Vec<Box<NativeActorInputs<'a>>>>,
         // Original execution/Session ACK lineage stays outside local T. It is
         // not terminal/module release authority and must never be reconstructed.
         execution: Option<NativeActorExecution>,
@@ -1826,7 +1826,7 @@ pub(crate) mod native {
         }
         pub(crate) fn with_rejected_inputs<T>(
             &self,
-            read: impl FnOnce(&[NativeActorInputs<'_>]) -> io::Result<T>,
+            read: impl FnOnce(&[Box<NativeActorInputs<'_>>]) -> io::Result<T>,
         ) -> io::Result<T> {
             read(&self.rejected_inputs.try_borrow().map_err(denied)?)
         }
@@ -1852,7 +1852,7 @@ pub(crate) mod native {
         /// No input may be dropped/replaced/adopted while that proof is unknown.
         pub(crate) unsafe fn retain_rejected_inputs_into(
             &self,
-            destination: &mut Vec<NativeActorInputs<'a>>,
+            destination: &mut Vec<Box<NativeActorInputs<'a>>>,
         ) -> io::Result<()> {
             let mut originals = self.rejected_inputs.try_borrow_mut().map_err(denied)?;
             destination.append(&mut originals);
@@ -3219,12 +3219,14 @@ pub(crate) mod native {
     /// proven, abandonment retains ALL original owners (including partial ACKs).
     pub(crate) struct NativeCarrierPairIo<'a> {
         serial: Rc<ActorSerial>,
-        roots: Option<NativeActorInputs<'a>>,
+        // The native graph is retained as one owner; moving actor/control slots
+        // must not copy its 78KiB aggregate through every factory frame.
+        roots: Option<Box<NativeActorInputs<'a>>>,
         pair: Rc<OriginalPairCache>,
         socket_context: Option<Rc<SocketContext>>,
         startup: Option<Rc<RefCell<Box<dyn NativeStartup<'a> + 'a>>>>,
         full_capture_attempted: bool,
-        rejected_inputs: Vec<NativeActorInputs<'a>>,
+        rejected_inputs: Vec<Box<NativeActorInputs<'a>>>,
         network_intents: Vec<Rc<NativeNetworkIntentRead>>,
         guard_acks: Vec<policy::Model>,
         held: [Option<Rc<RefCell<Held>>>; 2],
@@ -3361,7 +3363,7 @@ pub(crate) mod native {
     pub(crate) struct NativeActorCanonicalInputs<'a> {
         pub terminal_pair: Rc<NativePairIntentRead>,
         pub terminal_record: pair::Record,
-        pub roots: Option<NativeActorInputs<'a>>,
+        pub roots: Option<Box<NativeActorInputs<'a>>>,
         pub startup: Option<Rc<RefCell<Box<dyn NativeStartup<'a> + 'a>>>>,
     }
     pub(crate) struct NativeActorCanonicalCut<'a> {
@@ -4955,7 +4957,7 @@ pub(crate) mod native {
             });
             Self {
                 serial,
-                roots: Some(input),
+                roots: Some(Box::new(input)),
                 pair,
                 socket_context: Some(socket_context),
                 startup: None,
@@ -5042,7 +5044,7 @@ pub(crate) mod native {
                 &mut self.roots,
                 &mut self.rejected_inputs,
                 &mut self.full_capture_attempted,
-                input,
+                Box::new(input),
             )
             .is_err()
             {
@@ -5196,10 +5198,10 @@ pub(crate) mod native {
             })
         }
         fn roots(&self) -> io::Result<&NativeActorInputs<'a>> {
-            self.roots.as_ref().ok_or_else(conflict)
+            self.roots.as_deref().ok_or_else(conflict)
         }
         fn roots_mut(&mut self) -> io::Result<&mut NativeActorInputs<'a>> {
-            self.roots.as_mut().ok_or_else(conflict)
+            self.roots.as_deref_mut().ok_or_else(conflict)
         }
         /// Mint a current original only from the SAME coordinator store's exact
         /// durable ACK. At equal revision reuse THAT opaque Rc, never equal-clone.

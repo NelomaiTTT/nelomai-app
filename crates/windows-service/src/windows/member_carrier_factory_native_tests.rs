@@ -112,6 +112,7 @@ fn carrier_factory_actual_cold_child() {
         _ => panic!("unknown bounded case"),
     }
     let mut retained = None;
+    eprintln!("actual factory {case}: prepare_retained_into");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
@@ -128,6 +129,7 @@ fn carrier_factory_actual_cold_child() {
     let mut original = retained.expect("factory lost its actual SessionControl before DLL");
     assert_eq!(original.snapshot().session.scope, scope);
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
+    eprintln!("actual factory {case}: retained Starting");
     fixture.verify_files().unwrap();
     if case == "primary-data-denial" {
         let Command::Start {
@@ -143,6 +145,7 @@ fn carrier_factory_actual_cold_child() {
         fixture.require_package_source_read();
         assert!(original.snapshot().cleanup_pending);
     }
+    eprintln!("actual factory {case}: original Stop");
     let stopped = original.execute(
         Command::Stop {
             scope: scope.clone(),
@@ -165,9 +168,11 @@ fn carrier_factory_actual_cold_child() {
         next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
         next.connection_generation += 1;
         let next = next.clone();
+        eprintln!("actual factory {case}: repeat prepare");
         let mut second = factory
             .prepare(RuntimeSlot::Latest, &command, 9)
             .expect("actual before-DLL repeat factory preparation");
+        eprintln!("actual factory {case}: repeat Stop");
         let stopped = second
             .execute(Command::Stop { scope: next }, 10)
             .expect("actual before-DLL repeat native Stop");

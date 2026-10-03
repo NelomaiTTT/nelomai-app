@@ -324,7 +324,7 @@ pub(crate) mod native {
     /// cuts. No owning input is reconstructed from metadata on an error.
     struct NativeInputTerminalRaw<'a> {
         // Present ONLY during the actual partial cut; G forbids this field.
-        original: Option<NativeActorInputs<'a>>,
+        original: Option<Box<NativeActorInputs<'a>>>,
         metadata: Option<NativeInputTerminalPins>,
         graph: Option<NativeGraphTerminalResources>,
         controllers: [Option<actor::Controller>; 2],
@@ -390,7 +390,7 @@ pub(crate) mod native {
     pub(crate) struct NativeCanonicalTerminalCapture<'a> {
         canonical: TerminalResources<NativeCanonicalTerminalResources<'a>>,
         modules: Rc<RefCell<TerminalResources<NativeTerminalModuleOriginals<'a>>>>,
-        incoming: TerminalResources<Vec<NativeActorInputs<'a>>>,
+        incoming: TerminalResources<Vec<Box<NativeActorInputs<'a>>>>,
         startup_output: TerminalStartupResources<'a>,
         complete: Rc<TerminalCallState>,
         published: Rc<TerminalCallState>,
@@ -1820,7 +1820,7 @@ pub(crate) mod native {
             network_ack,
             controllers,
             member_gates,
-        } = raw
+        } = *raw
             .original
             .take()
             .expect("rooted input drained before split");
