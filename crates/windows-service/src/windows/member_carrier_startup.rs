@@ -3600,7 +3600,7 @@ pub(crate) mod native {
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
-            restored: bool,
+            restored: Option<bool>,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             crate::windows::member_carrier_ready::compare_pregraph_key_restore_frame(
                 &self.context,
@@ -3632,6 +3632,18 @@ pub(crate) mod native {
                 if !runtime.matches_lock(self.lock.as_ref().ok_or(Error::Retired)?) {
                     return Err(Error::Conflict);
                 }
+                // Pair.begin/finish use the SAME attestation entry. Select
+                // actual native key phase INSIDE Calling, never by read failure.
+                let restored = match restored {
+                    Some(restored) => restored,
+                    None => {
+                        let raw = runtime.record(&context, RecordKind::NativeCarrierReceipts)?;
+                        let native = crate::member_carrier_native_ownership::Record::decode(&raw)?;
+                        crate::windows::member_carrier_ready::key_restore_read_is_terminal(
+                            &context, expected, &native,
+                        )?
+                    }
+                };
                 let prepared = &self.prepared;
                 let mut guard = crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
                     expected.scope.clone(),
@@ -5110,7 +5122,7 @@ pub(crate) mod native {
             // Before and after reads are independent whole Calling intervals.
             // The original key owner performs real restoration OUTSIDE the
             // immutable SDK read bracket, authenticating each effect itself.
-            self.read_pregraph_key_restore_root(original, expected, false)?;
+            self.read_pregraph_key_restore_root(original, expected, Some(false))?;
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
             supervisor.run_cleanup(&context, original, || {
@@ -5137,15 +5149,15 @@ pub(crate) mod native {
                     .require_pristine()?;
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
             })?;
-            self.read_pregraph_key_restore_root(original, expected, true)
+            self.read_pregraph_key_restore_root(original, expected, Some(true))
                 .map(|_| ())
         }
-        fn read_pregraph_restored_keys(
+        fn read_pregraph_key_restore(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<crate::member_carrier_guard::Snapshot> {
-            self.read_pregraph_key_restore_root(original, expected, true)
+            self.read_pregraph_key_restore_root(original, expected, None)
         }
         fn attach_full(
             &mut self,

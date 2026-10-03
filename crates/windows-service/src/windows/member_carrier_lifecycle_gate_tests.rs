@@ -321,6 +321,30 @@ fn full_empty_guard_has_disjoint_closing_and_stopped_frames() {
         );
     }
 }
+
+#[test]
+fn restored_keys_resources_read_actual_closing11_not_future_full_empty() {
+    let (context, record) = fixture();
+    let mut record = closing(record, 11, pair::Effect::RestoreKeys);
+    record.guard = policy::Model::empty(record.scope.clone()).unwrap();
+    let observed = record.guard.expected.clone();
+    compare_restored_keys_guard(&context, &record, &observed).unwrap();
+    assert!(compare_full_empty_guard(&context, &record, &observed).is_err());
+    for fault in 0..7 {
+        let mut wrong = record.clone();
+        let mut actual = observed.clone();
+        match fault {
+            0 => wrong.stop_stage = 12,
+            1 => wrong.pending = Some(pair::Effect::FullEmpty),
+            2 => wrong.pending = None,
+            3 => wrong.phase = pair::Phase::Stopped,
+            4 => wrong.carrier = None,
+            5 => wrong.provenance.network_epoch += 1,
+            _ => actual.scope.runtime_generation += 1,
+        }
+        assert!(compare_restored_keys_guard(&context, &wrong, &actual).is_err());
+    }
+}
 // Break: final empty history requires C.creation=None (losing genuine original
 // provenance), or permits live native observations/restoration/binding drift.
 #[test]

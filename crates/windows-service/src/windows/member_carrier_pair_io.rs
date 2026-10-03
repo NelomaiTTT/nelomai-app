@@ -2663,9 +2663,10 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<()>;
-        /// Exact Closing11 after actual keys-Clean receipt, not FullEmpty12,
-        /// final Stopped or a constructor/terminal disposition permission.
-        fn read_pregraph_restored_keys(
+        /// Exact Closing11 before OR after effect, selected from actual native
+        /// receipt under SAME original SDK/Calling. Not FullEmpty12, final
+        /// Stopped or a constructor/terminal disposition permission.
+        fn read_pregraph_key_restore(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
@@ -5607,7 +5608,7 @@ pub(crate) mod native {
                             .ok_or_else(conflict)?
                             .try_borrow_mut()
                             .map_err(denied)?
-                            .read_pregraph_restored_keys(&pin, record)
+                            .read_pregraph_key_restore(&pin, record)
                             .map_err(denied)?;
                         if actual != record.guard.expected {
                             return Err(conflict());
@@ -5676,6 +5677,33 @@ pub(crate) mod native {
                 if let Some(retired) = retired {
                     if matches!(record.stop_stage, 9 | 10) {
                         return Self::native_empty_graph_in_call(r, record);
+                    }
+                    if record.stop_stage == 11 {
+                        require_effect(record, pair::Effect::RestoreKeys)?;
+                        let raw = r
+                            .runtime
+                            .record(
+                                &r.context,
+                                crate::windows::member_session::RecordKind::NativeCarrierReceipts,
+                            )
+                            .map_err(denied)?;
+                        let native = crate::member_carrier_native_ownership::Record::decode(&raw)
+                            .map_err(denied)?;
+                        if crate::windows::member_carrier_ready::key_restore_read_is_terminal(
+                            &r.context, record, &native,
+                        )
+                        .map_err(denied)?
+                        {
+                            return retired
+                                .inspect_terminal_bindings_and_history(|bindings, history| {
+                                    r.lifecycle.verify_restored_keys_in_retired_bracket(
+                                        pin, record, &retired, bindings, history,
+                                    )
+                                })
+                                .map_err(denied);
+                        }
+                        // Before effect: original Cleanup SDK requires Disabled.
+                        // No caught denial/fallback to terminal or old Pair frame.
                     }
                     retired
                         .inspect_bindings(|bindings| {

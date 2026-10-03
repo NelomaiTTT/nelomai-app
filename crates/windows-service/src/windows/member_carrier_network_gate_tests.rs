@@ -293,6 +293,34 @@ fn full_empty_network_comparison_requires_exact_closing_or_terminal_channel() {
 }
 
 #[test]
+fn restored_keys_network_facts_do_not_require_future_full_empty_or_skip_baseline() {
+    let (context, mut record, baseline) = native_empty_fixture(10);
+    record.stop_stage = 11;
+    record.pending = Some(pair::Effect::RestoreKeys);
+    record.guard = policy::Model::empty(record.scope.clone()).unwrap();
+    compare_restored_keys_resource_stage(&context, &record, &baseline).unwrap();
+    assert!(compare_full_empty_resource_stage(&context, &record, &baseline).is_err());
+    for fault in 0..8 {
+        let mut wrong = record.clone();
+        let mut original = baseline.clone();
+        match fault {
+            0 => wrong.stop_stage = 12,
+            1 => wrong.pending = Some(pair::Effect::FullEmpty),
+            2 => wrong.pending = None,
+            3 => wrong.phase = pair::Phase::Stopped,
+            4 => wrong.carrier = None,
+            5 => original.interface.luid += 1,
+            6 => {
+                wrong.network.as_mut().unwrap().pending =
+                    Some(wrong.network.as_ref().unwrap().baseline.clone())
+            }
+            _ => wrong.provenance.network_epoch += 1,
+        }
+        assert!(compare_restored_keys_resource_stage(&context, &wrong, &original).is_err());
+    }
+}
+
+#[test]
 fn full_empty_network_journal_still_requires_every_original_restore_ack() {
     let (context, mut record, baseline) = native_empty_fixture(10);
     record.stop_stage = 12;
@@ -352,6 +380,57 @@ fn full_empty_network_journal_still_requires_every_original_restore_ack() {
             &[foreign]
         )
         .is_err());
+    }
+}
+
+#[test]
+fn restored_keys_network_journal_requires_every_original_restore_ack() {
+    let (context, mut record, baseline) = native_empty_fixture(10);
+    record.stop_stage = 11;
+    record.pending = Some(pair::Effect::RestoreKeys);
+    record.guard = policy::Model::empty(record.scope.clone()).unwrap();
+    let route = RouteAttempt {
+        row: Row::static_route(
+            route("192.0.2.11/32", 20, 10, Some("192.0.2.1")),
+            NativeProof {
+                index: 20,
+                luid: 200,
+            },
+        ),
+        deleting: true,
+        acknowledged: true,
+    };
+    for fault in 0..8 {
+        let mut restored = NetworkJournal::default();
+        let mut original_dns = baseline.clone();
+        let mut ack = route.clone();
+        let mut journal_present = true;
+        let mut dns_attempts = 1;
+        match fault {
+            0 => (),
+            1 => journal_present = false,
+            2 => dns_attempts = 2,
+            3 => original_dns.settings.domain = Some("foreign".into()),
+            4 => ack.acknowledged = false,
+            5 => ack.deleting = false,
+            6 => restored = journal(&[], Some(&[route.row.route.clone()]), false),
+            _ => restored = journal(&[route.row.route.clone()], None, false),
+        }
+        assert_eq!(
+            compare_restored_keys_resource_journals(
+                &context,
+                &record,
+                &baseline,
+                journal_present.then_some(&restored),
+                None,
+                &[ack],
+                dns_attempts,
+                &[original_dns],
+            )
+            .is_ok(),
+            fault == 0,
+            "fault {fault}"
+        );
     }
 }
 

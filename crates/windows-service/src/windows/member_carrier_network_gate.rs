@@ -542,6 +542,14 @@ fn compare_full_empty_resource_stage(
     record: &pair::Record,
     baseline: &dns::Snapshot,
 ) -> io::Result<()> {
+    compare_terminal_resource_stage(context, record, baseline, false)
+}
+fn compare_terminal_resource_stage(
+    context: &Context,
+    record: &pair::Record,
+    baseline: &dns::Snapshot,
+    keys_restored: bool,
+) -> io::Result<()> {
     record.validate()?;
     baseline.with_servers(&record.dns).map_err(denied)?;
     let c = &baseline.interface;
@@ -549,7 +557,6 @@ fn compare_full_empty_resource_stage(
         || record.provenance != context.provenance
         || record.addresses != context.intent.addresses
         || record.options.is_none()
-        || record.stop_stage != 12
         || record.pending_guard.is_some()
         || record.active.is_some()
         || record.operation.is_some()
@@ -562,7 +569,14 @@ fn compare_full_empty_resource_stage(
         return Err(conflict());
     }
     match (record.phase, record.pending) {
-        (pair::Phase::Closing, Some(pair::Effect::FullEmpty)) => {
+        (pair::Phase::Closing, Some(effect))
+            if (keys_restored
+                && record.stop_stage == 11
+                && effect == pair::Effect::RestoreKeys)
+                || (!keys_restored
+                    && record.stop_stage == 12
+                    && effect == pair::Effect::FullEmpty) =>
+        {
             if record.carrier
                 != Some(crate::member_owner::InterfaceProof {
                     guid: c.guid,
@@ -574,7 +588,10 @@ fn compare_full_empty_resource_stage(
             }
         }
         (pair::Phase::Stopped, None)
-            if record.carrier.is_none() && record.members.iter().all(Option::is_none) => {}
+            if !keys_restored
+                && record.stop_stage == 12
+                && record.carrier.is_none()
+                && record.members.iter().all(Option::is_none) => {}
         _ => return Err(conflict()),
     }
     if record.network.as_ref().is_some_and(|network| {
@@ -586,6 +603,13 @@ fn compare_full_empty_resource_stage(
         return Err(conflict());
     }
     Ok(())
+}
+fn compare_restored_keys_resource_stage(
+    context: &Context,
+    record: &pair::Record,
+    baseline: &dns::Snapshot,
+) -> io::Result<()> {
+    compare_terminal_resource_stage(context, record, baseline, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -614,7 +638,44 @@ fn compare_full_empty_resource_journals(
 #[derive(Clone, Copy)]
 enum EmptyReadChannel {
     Native,
+    KeysRestored,
     Full,
+}
+fn compare_terminal_empty_stage(
+    channel: EmptyReadChannel,
+    context: &Context,
+    record: &pair::Record,
+    baseline: &dns::Snapshot,
+) -> io::Result<()> {
+    match channel {
+        EmptyReadChannel::KeysRestored => {
+            compare_restored_keys_resource_stage(context, record, baseline)
+        }
+        EmptyReadChannel::Full => compare_full_empty_resource_stage(context, record, baseline),
+        EmptyReadChannel::Native => Err(conflict()),
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn compare_restored_keys_resource_journals(
+    context: &Context,
+    record: &pair::Record,
+    baseline: &dns::Snapshot,
+    journal: Option<&NetworkJournal>,
+    dns_child: Option<&crate::member_pair::DnsRecord>,
+    routes: &[RouteAttempt],
+    dns_attempts: usize,
+    dns_acks: &[dns::Snapshot],
+) -> io::Result<()> {
+    compare_restored_keys_resource_stage(context, record, baseline)?;
+    compare_restored_resource_journals(
+        record,
+        baseline,
+        journal,
+        dns_child,
+        routes,
+        dns_attempts,
+        dns_acks,
+    )
 }
 #[allow(clippy::too_many_arguments)]
 fn compare_native_empty_resource_journals(
@@ -2210,10 +2271,11 @@ pub(crate) mod native {
         }
         fn full_empty_continuity(
             &self,
+            channel: EmptyReadChannel,
             record: &pair::Record,
             baseline: &NativeNetworkBaselineRead<A>,
         ) -> io::Result<()> {
-            compare_full_empty_resource_stage(&self.context, record, baseline.snapshot())?;
+            compare_terminal_empty_stage(channel, &self.context, record, baseline.snapshot())?;
             if record.phase != pair::Phase::Stopped {
                 return self.lifecycle_origin_continuity(record, baseline);
             }
@@ -2268,7 +2330,9 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             match channel {
                 EmptyReadChannel::Native => self.native_empty_continuity(record, baseline),
-                EmptyReadChannel::Full => self.full_empty_continuity(record, baseline),
+                EmptyReadChannel::Full | EmptyReadChannel::KeysRestored => {
+                    self.full_empty_continuity(channel, record, baseline)
+                }
             }
         }
         fn lifecycle_journal(
@@ -2471,6 +2535,23 @@ pub(crate) mod native {
                 reader,
             )
         }
+        pub(crate) fn verify_restored_keys_in_retired_bracket(
+            &self,
+            record: &pair::Record,
+            retired: &RetiredCarrierRead,
+            bindings: &crate::windows::member_carrier_guard::Bindings,
+            baseline: &NativeNetworkBaselineRead<A>,
+            reader: &NativeNetworkRead,
+        ) -> io::Result<()> {
+            self.verify_empty_in_retired_bracket(
+                EmptyReadChannel::KeysRestored,
+                record,
+                retired,
+                bindings,
+                baseline,
+                reader,
+            )
+        }
         fn verify_empty_in_retired_bracket(
             &self,
             channel: EmptyReadChannel,
@@ -2518,6 +2599,7 @@ pub(crate) mod native {
                     )?;
                     let compare_journals = match channel {
                         EmptyReadChannel::Native => compare_native_empty_resource_journals,
+                        EmptyReadChannel::KeysRestored => compare_restored_keys_resource_journals,
                         EmptyReadChannel::Full => compare_full_empty_resource_journals,
                     };
                     compare_journals(
@@ -2553,14 +2635,16 @@ pub(crate) mod native {
                             &table,
                             false,
                         )?,
-                        EmptyReadChannel::Full => compare_original_route_absence(
-                            record,
-                            proofs,
-                            &before_acks.0,
-                            &table,
-                            false,
-                            proofs[0].ok_or_else(conflict)?,
-                        )?,
+                        EmptyReadChannel::Full | EmptyReadChannel::KeysRestored => {
+                            compare_original_route_absence(
+                                record,
+                                proofs,
+                                &before_acks.0,
+                                &table,
+                                false,
+                                proofs[0].ok_or_else(conflict)?,
+                            )?
+                        }
                     }
                     // Full route table capture resolves ONLY interfaces of
                     // actual remaining rows. Historical identities stay
@@ -2608,12 +2692,13 @@ pub(crate) mod native {
                         &mut original_files,
                         inspect,
                     )?,
-                    EmptyReadChannel::Full => reader.inspect_original_full_empty_record(
-                        &self.source,
-                        retired,
-                        &mut original_files,
-                        inspect,
-                    )?,
+                    EmptyReadChannel::Full | EmptyReadChannel::KeysRestored => reader
+                        .inspect_original_full_empty_record(
+                            &self.source,
+                            retired,
+                            &mut original_files,
+                            inspect,
+                        )?,
                 }
                 // Reader finishes its shared protected Network postread before
                 // the final Runtime/Calling/whole-Pair checks return any facts.
@@ -3055,7 +3140,7 @@ pub(crate) mod native {
             if matches!(channel, EmptyReadChannel::Native) {
                 return self.compare_retired_bindings(record, retired, bindings);
             }
-            compare_full_empty_resource_stage(&self.context, record, baseline.snapshot())?;
+            compare_terminal_empty_stage(channel, &self.context, record, baseline.snapshot())?;
             let c = bindings.carrier.as_ref().ok_or_else(conflict)?;
             let original = &baseline.snapshot().interface;
             if bindings.scope != record.scope
@@ -3072,8 +3157,8 @@ pub(crate) mod native {
             {
                 return Err(conflict());
             }
-            // FullEmpty uses the terminal registry channel, not a fabricated
-            // Closing9/10 record. The carrier proof comes from the SAME retained
+            // Post-RestoreKeys11 and FullEmpty use the terminal registry channel,
+            // not a fabricated Closing9/10 or future Pair record. C comes from SAME retained
             // baseline and full-SDK bracket even when Stopped removes Pair.C.
             retired
                 .inspect_terminal_history_in_bracket(|history| {

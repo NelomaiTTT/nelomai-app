@@ -1059,6 +1059,62 @@ fn pregraph_key_restore_read_uses_actual_stage11_not_projected_full_empty() {
     }
 }
 
+// Actual Pair.begin and Pair.finish BOTH call attest_effect at Closing11.
+// Terminal-only selection rejects the pre-effect Disabled original keys.
+#[test]
+fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
+    use crate::{member_carrier_native_ownership as n, member_carrier_pair as p};
+    let (context, mut record, _) = full_cleanup_fixture();
+    record.stop_stage = 11;
+    record.pending = Some(p::Effect::RestoreKeys);
+    record.guard = crate::member_carrier_guard::Model::empty(record.scope.clone()).unwrap();
+    let mut native = n::Record {
+        version: 2,
+        context: context.clone(),
+        generation: 7,
+        phase: n::Phase::Closing,
+        native_rows: n::FullNativeRows::Unbound,
+        keys: std::array::from_fn(|i| n::KeyReceipt {
+            role: context.bindings[i].role,
+            phase: n::KeyPhase::Disabled,
+            new_key_ack: true,
+            baseline: n::Value::Absent,
+            current: n::Value::DwordZero,
+            pending: None,
+        }),
+    };
+    assert!(!key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    native.phase = n::Phase::Stopped;
+    for key in &mut native.keys {
+        key.phase = n::KeyPhase::Clean;
+        key.current = n::Value::Absent;
+    }
+    assert!(key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    for fault in 0..10 {
+        let mut wrong = record.clone();
+        let mut observed = native.clone();
+        match fault {
+            0 => wrong.stop_stage = 12,
+            1 => wrong.pending = None,
+            2 => wrong.pending = Some(p::Effect::FullEmpty),
+            3 => wrong.phase = p::Phase::Stopped,
+            4 => wrong.carrier = None,
+            5 => observed.context.provenance.network_epoch += 1,
+            6 => observed.phase = n::Phase::Preparing,
+            7 => observed.keys[1].phase = n::KeyPhase::Captured,
+            8 => observed.generation = 0,
+            _ => {
+                observed.phase = n::Phase::Closing;
+                observed.keys[0].phase = n::KeyPhase::Clean;
+            }
+        }
+        assert!(
+            key_restore_read_is_terminal(&context, &wrong, &observed).is_err(),
+            "fault {fault}"
+        );
+    }
+}
+
 // Break: genuine Stopped is routed as Closing12, or a stopped row/frame grants
 // permission without its original SDK reader. This is a strict comparison only.
 #[test]

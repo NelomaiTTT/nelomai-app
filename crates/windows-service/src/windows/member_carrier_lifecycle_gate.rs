@@ -138,20 +138,35 @@ fn compare_full_empty_guard(
     record: &pair::Record,
     actual: &policy::Snapshot,
 ) -> io::Result<()> {
+    compare_restored_resource_guard(context, record, actual, false)
+}
+fn compare_restored_resource_guard(
+    context: &Context,
+    record: &pair::Record,
+    actual: &policy::Snapshot,
+    keys_restored: bool,
+) -> io::Result<()> {
     crate::member_carrier_native_ownership::validate_context(context).map_err(denied)?;
     record.validate()?;
     if record.scope != context.intent.scope
         || record.provenance != context.provenance
         || record.addresses != context.intent.addresses
         || record.options.is_none()
-        || record.stop_stage != 12
         || record.pending_guard.is_some()
         || record.active.is_some()
         || record.operation.is_some()
-        || !matches!(
-            (record.phase, record.pending),
-            (pair::Phase::Closing, Some(pair::Effect::FullEmpty)) | (pair::Phase::Stopped, None)
-        )
+        || !(if keys_restored {
+            matches!(
+                (record.phase, record.stop_stage, record.pending),
+                (pair::Phase::Closing, 11, Some(pair::Effect::RestoreKeys))
+            )
+        } else {
+            matches!(
+                (record.phase, record.stop_stage, record.pending),
+                (pair::Phase::Closing, 12, Some(pair::Effect::FullEmpty))
+                    | (pair::Phase::Stopped, 12, None)
+            )
+        })
         || (record.phase == pair::Phase::Closing
             && record
                 .carrier
@@ -169,6 +184,14 @@ fn compare_full_empty_guard(
         return Err(conflict());
     }
     Ok(())
+}
+
+fn compare_restored_keys_guard(
+    context: &Context,
+    record: &pair::Record,
+    actual: &policy::Snapshot,
+) -> io::Result<()> {
+    compare_restored_resource_guard(context, record, actual, true)
 }
 
 fn compare_full_empty_row(
@@ -1015,13 +1038,43 @@ pub(crate) mod native {
             bindings: &Bindings,
             history: &[crate::windows::member_carrier_members::ClosedMemberBinding],
         ) -> wintun::Result<()> {
+            self.verify_restored_resources_in_retired_bracket(
+                original, record, retired, bindings, history, false,
+            )
+        }
+        pub(crate) fn verify_restored_keys_in_retired_bracket(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            record: &pair::Record,
+            retired: &RetiredCarrierRead,
+            bindings: &Bindings,
+            history: &[crate::windows::member_carrier_members::ClosedMemberBinding],
+        ) -> wintun::Result<()> {
+            self.verify_restored_resources_in_retired_bracket(
+                original, record, retired, bindings, history, true,
+            )
+        }
+        fn verify_restored_resources_in_retired_bracket(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            record: &pair::Record,
+            retired: &RetiredCarrierRead,
+            bindings: &Bindings,
+            history: &[crate::windows::member_carrier_members::ClosedMemberBinding],
+            keys_restored: bool,
+        ) -> wintun::Result<()> {
             let shared = &self.shared;
+            let compare = if keys_restored {
+                compare_restored_keys_guard
+            } else {
+                compare_full_empty_guard
+            };
             shared
                 .fence
                 .run(true, || {
                     // Reject wrong stages BEFORE SDK reads. Empty JSON is only a
                     // shape comparison; the actual Guard snapshot is checked below.
-                    compare_full_empty_guard(&shared.context, record, &record.guard.expected)?;
+                    compare(&shared.context, record, &record.guard.expected)?;
                     let source = shared.source.read()?;
                     if !std::ptr::eq(shared.retired.read()?.as_ref(), retired)
                         || !retired.matches_source_origin(&source)
@@ -1086,7 +1139,7 @@ pub(crate) mod native {
                         .map_err(denied)?
                         .snapshot_in_retired_bracket(retired, bindings)
                         .map_err(denied)?;
-                    compare_full_empty_guard(&shared.context, record, &before)?;
+                    compare(&shared.context, record, &before)?;
                     let rows_root = shared.rows.read()?;
                     rows_root
                         .inspect_retired_in_bracket(retired, bindings, |facts| {
@@ -1135,18 +1188,22 @@ pub(crate) mod native {
                     {
                         return Err(conflict());
                     }
-                    shared
-                        .network
-                        .read()?
-                        .verify_full_empty_in_retired_bracket(
+                    let network = shared.network.read()?;
+                    if keys_restored {
+                        network.verify_restored_keys_in_retired_bracket(
                             record, retired, bindings, &baseline, &reader,
                         )?;
+                    } else {
+                        network.verify_full_empty_in_retired_bracket(
+                            record, retired, bindings, &baseline, &reader,
+                        )?;
+                    }
                     let after = guard
                         .try_borrow_mut()
                         .map_err(denied)?
                         .snapshot_in_retired_bracket(retired, bindings)
                         .map_err(denied)?;
-                    compare_full_empty_guard(&shared.context, record, &after)?;
+                    compare(&shared.context, record, &after)?;
                     if before != after
                         || shared
                             .runtime

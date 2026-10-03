@@ -427,6 +427,40 @@ pub(crate) fn compare_pregraph_closing_frame(
 }
 
 /// Exact factual key-restoration window, not value/delete/handle permission.
+// Factual selector only. Each selected native reader must independently
+// authenticate SAME original SDK/journal/Calling; no failed-read fallback.
+pub(crate) fn key_restore_read_is_terminal(
+    context: &crate::member_carrier_native_ownership::Context,
+    record: &crate::member_carrier_pair::Record,
+    native: &crate::member_carrier_native_ownership::Record,
+) -> Result<bool> {
+    use crate::{member_carrier_native_ownership as n, member_carrier_pair as p};
+    record.validate().map_err(denied_comparison)?;
+    n::validate_record(native)?;
+    if native.context != *context
+        || record.scope != context.intent.scope
+        || record.provenance != context.provenance
+        || record.addresses != context.intent.addresses
+        || record.options.is_none()
+        || record.phase != p::Phase::Closing
+        || record.stop_stage != 11
+        || record.pending != Some(p::Effect::RestoreKeys)
+        || record.pending_guard.is_some()
+        || record.active.is_some()
+        || record.operation.is_some()
+        || record
+            .carrier
+            .is_none_or(|c| c.guid != context.bindings[0].guid)
+    {
+        return Err(CarrierError::Conflict);
+    }
+    match native.phase {
+        n::Phase::Closing if native.keys[0].phase == n::KeyPhase::Disabled => Ok(false),
+        n::Phase::Stopped => Ok(true), // validate_record requires ALL keys Clean
+        _ => Err(CarrierError::Conflict),
+    }
+}
+
 pub(crate) fn compare_pregraph_key_restore_frame(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
