@@ -214,7 +214,7 @@ impl Fixture {
             self.identity.clone(),
             super::member_boot::boot_id()?,
         )?;
-        let owner = Arc::new(MutationGuard::acquire(&self.root)?);
+        let owner = Arc::new(MutationGuard::at(&self.root.join("engine-owner.lock"))?);
         NativePairFactory::new(
             files,
             self.identity.slot,
