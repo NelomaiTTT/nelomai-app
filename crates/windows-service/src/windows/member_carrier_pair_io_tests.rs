@@ -2320,6 +2320,56 @@ fn published_pregraph_guard_reads_use_exact_early_closing_frames() {
 }
 
 #[test]
+fn pregraph_guard_route_keeps_native_empty_read_separate_from_restored_keys() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    let mut record = closing_record();
+    record.addresses = vec!["10.7.0.2/32".parse().unwrap()];
+    record.options = Some(nelomai_client_tunnel::DesktopTunnelOptions::default());
+    record.carrier = Some(crate::member_owner::InterfaceProof {
+        guid: [3; 16],
+        index: 73,
+        luid: 117,
+    });
+    for (stage, effect) in [(9, Effect::NativeEmpty), (10, Effect::Guard)] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        assert_eq!(
+            pregraph_guard_read_route(&record).unwrap(),
+            PregraphGuardRead::NativeEmpty
+        );
+        let mut wrong = record.clone();
+        wrong.pending = Some(Effect::RestoreKeys);
+        assert!(pregraph_guard_read_route(&wrong).is_err());
+        wrong = record.clone();
+        wrong.pending = None;
+        assert!(pregraph_guard_read_route(&wrong).is_err());
+    }
+    record.stop_stage = 3;
+    record.pending = Some(Effect::RestoreWeak);
+    assert_eq!(
+        pregraph_guard_read_route(&record).unwrap(),
+        PregraphGuardRead::EarlyClosing
+    );
+    record.stop_stage = 11;
+    record.pending = Some(Effect::RestoreKeys);
+    assert!(pregraph_guard_read_route(&record).is_err());
+    record.stop_stage = 12;
+    record.pending = Some(Effect::FullEmpty);
+    assert_eq!(
+        pregraph_guard_read_route(&record).unwrap(),
+        PregraphGuardRead::FullEmpty
+    );
+    record.phase = Phase::Stopped;
+    record.pending = None;
+    record.carrier = None;
+    record.members = [None, None];
+    assert_eq!(
+        pregraph_guard_read_route(&record).unwrap(),
+        PregraphGuardRead::Stopped
+    );
+}
+
+#[test]
 fn terminal_factual_cache_advances_to_actual_stopped_and_never_back_to_forward() {
     use crate::member_carrier_pair::Phase;
     let mut closing = closing_record();

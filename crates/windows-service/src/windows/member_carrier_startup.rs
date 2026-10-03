@@ -3596,11 +3596,11 @@ pub(crate) mod native {
         /// READONLY exact Closing9/10. The original cold ledger or actual
         /// retained Retired C/full-resource graph is mandatory, never None or
         /// a historical SDK index. All owners stay in this startup root.
-        fn verify_bootstrap_native_empty_root(
+        fn read_bootstrap_native_empty_root(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
-        ) -> Result<()> {
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
             if self.terminal_attempted || self.lock.is_none() {
@@ -3615,13 +3615,9 @@ pub(crate) mod native {
                     .get()
             {
                 if expected.carrier.is_none() {
-                    return self
-                        .read_module_only_cleanup_root(original, expected)
-                        .map(|_| ());
+                    return self.read_module_only_cleanup_root(original, expected);
                 }
-                return self
-                    .read_prepublication_empty_root(original, expected, true)
-                    .map(|_| ());
+                return self.read_prepublication_empty_root(original, expected, true);
             }
             if !self.create_attempted {
                 self.bind_initial_noc_cleanup()?;
@@ -3640,7 +3636,7 @@ pub(crate) mod native {
                 unsafe {
                     supervisor.run_uncaptured_read(&context, original, expected, &never, || {
                         self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
-                        inspect_bootstrap_empty(
+                        let actual = read_bootstrap_empty(
                             &context,
                             expected,
                             BootstrapOrigin::OriginalNever,
@@ -3674,7 +3670,8 @@ pub(crate) mod native {
                                 Ok(before)
                             },
                         )?;
-                        self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+                        self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                        Ok(actual)
                     })
                 }
             } else {
@@ -3721,9 +3718,9 @@ pub(crate) mod native {
                             retired.clone(),
                         )
                         .map_err(|_| Error::Conflict)?;
-                    retired
+                    let actual = retired
                         .inspect_bindings(|bindings| {
-                            inspect_bootstrap_empty(
+                            read_bootstrap_empty(
                                 &context,
                                 expected,
                                 BootstrapOrigin::CreatedRetired,
@@ -3737,7 +3734,8 @@ pub(crate) mod native {
                         })
                         .map_err(|_| Error::Conflict)?;
                     drop(graph_read);
-                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                    Ok(actual)
                 })
             }
         }
@@ -4705,12 +4703,12 @@ pub(crate) mod native {
                 self.verify_uncaptured_terminal_root(original, expected)
             }
         }
-        fn verify_bootstrap_native_empty(
+        fn read_bootstrap_native_empty(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
-        ) -> Result<()> {
-            self.verify_bootstrap_native_empty_root(original, expected)
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            self.read_bootstrap_native_empty_root(original, expected)
         }
         fn verify_uncaptured_terminal(
             &mut self,

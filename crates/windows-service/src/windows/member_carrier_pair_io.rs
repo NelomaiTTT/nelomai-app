@@ -1075,6 +1075,35 @@ fn require_pregraph_closing_read(record: &crate::member_carrier_pair::Record) ->
     }
     Ok(())
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PregraphGuardRead {
+    EarlyClosing,
+    NativeEmpty,
+    FullEmpty,
+    Stopped,
+}
+fn pregraph_guard_read_route(
+    record: &crate::member_carrier_pair::Record,
+) -> io::Result<PregraphGuardRead> {
+    use crate::member_carrier_pair::Phase;
+    if record.phase == Phase::Closing && record.stop_stage <= 8 {
+        require_pregraph_closing_read(record)?;
+        return Ok(PregraphGuardRead::EarlyClosing);
+    }
+    if record.phase == Phase::Closing && matches!(record.stop_stage, 9 | 10) {
+        require_native_empty_frame(record)?;
+        return Ok(PregraphGuardRead::NativeEmpty);
+    }
+    require_full_empty_frame(record)?;
+    Ok(
+        if record.phase == crate::member_carrier_pair::Phase::Stopped {
+            PregraphGuardRead::Stopped
+        } else {
+            PregraphGuardRead::FullEmpty
+        },
+    )
+}
 fn carrier_cleanup_route(
     record: &crate::member_carrier_pair::Record,
     effect: crate::member_carrier_pair::Effect,
@@ -2721,11 +2750,11 @@ pub(crate) mod native {
         /// Missing inputs/unknown attempts deny; no synthesized receipts, new
         /// Source, terminal-Stopped fallback or native effects. Registration,
         /// phase, JSON, and Option absence never supply cleanup success.
-        fn verify_bootstrap_native_empty(
+        fn read_bootstrap_native_empty(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
-        ) -> crate::member_carrier::Result<()>;
+        ) -> crate::member_carrier::Result<policy::Snapshot>;
     }
 
     pub(crate) struct NativeColdActorInputs<'a> {
@@ -5671,7 +5700,8 @@ pub(crate) mod native {
                         .ok_or_else(conflict)?
                         .try_borrow_mut()
                         .map_err(denied)?
-                        .verify_bootstrap_native_empty(&pin, record)
+                        .read_bootstrap_native_empty(&pin, record)
+                        .map(|_| ())
                         .map_err(denied)
                 });
             }
@@ -6316,12 +6346,18 @@ pub(crate) mod native {
                 if record.phase == pair::Phase::Closing && record.carrier.is_none() {
                     return self.read_no_constructor_cleanup(&record);
                 }
-                if record.phase == pair::Phase::Closing && record.stop_stage <= 8 {
+                let route = match pregraph_guard_read_route(&record) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        self.serial.fault();
+                        return Err(error);
+                    }
+                };
+                if route == PregraphGuardRead::EarlyClosing {
                     return self.read_pregraph_closing_cleanup(&record);
                 }
                 let serial = self.serial.clone();
                 return serial.run(true, || {
-                    require_full_empty_frame(&record)?;
                     let pin = self.current(&record)?;
                     let mut startup = self
                         .startup
@@ -6329,13 +6365,27 @@ pub(crate) mod native {
                         .ok_or_else(conflict)?
                         .try_borrow_mut()
                         .map_err(denied)?;
-                    let actual = if record.phase == pair::Phase::Stopped {
-                        startup.read_bootstrap_no_constructor_terminal(&pin, &record)
-                    } else {
-                        startup.read_bootstrap_full_empty(&pin, &record)
+                    let actual = match route {
+                        PregraphGuardRead::NativeEmpty => {
+                            startup.read_bootstrap_native_empty(&pin, &record)
+                        }
+                        PregraphGuardRead::Stopped => {
+                            startup.read_bootstrap_no_constructor_terminal(&pin, &record)
+                        }
+                        PregraphGuardRead::FullEmpty => {
+                            startup.read_bootstrap_full_empty(&pin, &record)
+                        }
+                        PregraphGuardRead::EarlyClosing => return Err(conflict()),
                     }
                     .map_err(denied)?;
-                    compare_full_empty_snapshot(&record, &actual)?;
+                    if route == PregraphGuardRead::NativeEmpty {
+                        require_native_empty_frame(&record)?;
+                        if actual != record.guard.expected {
+                            return Err(conflict());
+                        }
+                    } else {
+                        compare_full_empty_snapshot(&record, &actual)?;
+                    }
                     Ok(actual)
                 });
             }
