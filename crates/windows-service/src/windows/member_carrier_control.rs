@@ -113,11 +113,63 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
     }
     /// Scheduling distinction only, after this SAME finalizer acknowledged
     /// native retirement. Initial DATA retirement still needs its opaque root.
-    pub(crate) fn completed_initial_noc(&self) -> io::Result<bool> {
+    pub(crate) fn completed_initial_noc(&self, pre_pair_initial: bool) -> io::Result<bool> {
+        if pre_pair_initial {
+            self.verify_unused_before_pair()?;
+            return Ok(true);
+        }
         if !self.completed {
             return Err(conflict());
         }
         Ok(self.completed_initial_noc)
+    }
+    /// Pure branch check only. A before-Pair disposition has its OWN original
+    /// authority and must not consume or downgrade a used Pair finalizer.
+    fn verify_unused_before_pair(&self) -> io::Result<()> {
+        macro_rules! absent { ($($field:ident),*) => { $(
+            if self.$field.is_some() { return Err(conflict()); }
+        )* }; }
+        absent!(
+            scope,
+            coordinator,
+            actor,
+            selection,
+            branch,
+            locals,
+            canonical,
+            capture,
+            pins,
+            modules,
+            resources,
+            gate,
+            release,
+            ack,
+            attempted_layout,
+            pregraph_capture,
+            pregraph_pins,
+            pregraph_resources,
+            pregraph_gate,
+            pregraph_slot,
+            pregraph_release,
+            pregraph_ack
+        );
+        if self.pregraph_captured
+            || self.pregraph_closed
+            || self.pregraph_published
+            || self.locals_captured
+            || self.canonical_captured
+            || self.capture_complete
+            || self.guards_closed
+            || self.keys_closed
+            || self.adapter_released
+            || self.published
+            || self.actor_released
+            || self.completed
+            || self.completed_initial_noc
+        {
+            return Err(conflict());
+        }
+        Ok(())
     }
     /// Original private layout must be selected BEFORE any full capture. This
     /// lane never consumes full-capture errors as a no-C/pregraph fallback.
@@ -230,6 +282,49 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
         self.completed = true;
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn actual_initial_completion_selector_requires_unused_pair_finalizer() {
+    let mut original = NativeCarrierPairFinalizer::new();
+    // This boolean is scheduling from the separate original native outcome,
+    // not authority from Pair absence or a Stopped snapshot.
+    assert!(original.completed_initial_noc(true).unwrap());
+    assert!(original.completed_initial_noc(false).is_err());
+    let flags: [fn(&mut NativeCarrierPairFinalizer<'_>); 13] = [
+        |f| f.pregraph_captured = true,
+        |f| f.pregraph_closed = true,
+        |f| f.pregraph_published = true,
+        |f| f.locals_captured = true,
+        |f| f.canonical_captured = true,
+        |f| f.capture_complete = true,
+        |f| f.guards_closed = true,
+        |f| f.keys_closed = true,
+        |f| f.adapter_released = true,
+        |f| f.published = true,
+        |f| f.actor_released = true,
+        |f| f.completed = true,
+        |f| f.completed_initial_noc = true,
+    ];
+    for mark_used in flags {
+        let mut used = NativeCarrierPairFinalizer::new();
+        mark_used(&mut used);
+        assert!(used.completed_initial_noc(true).is_err());
+    }
+    original.scope = Some(SessionScope {
+        runtime: nelomai_contracts::RuntimeSlot::Stable,
+        runtime_generation: 2,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        connection_generation: 3,
+    });
+    assert!(original.completed_initial_noc(true).is_err());
+    let mut pair = NativeCarrierPairFinalizer::new();
+    pair.completed = true;
+    assert!(!pair.completed_initial_noc(false).unwrap());
+    pair.completed_initial_noc = true;
+    assert!(pair.completed_initial_noc(false).unwrap());
+    assert!(pair.completed_initial_noc(true).is_err());
 }
 impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
     for NativeCarrierPairFinalizer<'a>

@@ -133,6 +133,34 @@ fn require_never_inventory(
     Ok(())
 }
 
+/// Protected DATA frame only. The actual original Never/initial journal,
+/// Calling, lock, full SDK/private/services/keys and BFE checks remain required.
+fn require_pre_pair_session(
+    context: &crate::member_carrier_native_ownership::Context,
+    session: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+    pair_present: bool,
+) -> crate::member_carrier::Result<()> {
+    use crate::member_carrier::CarrierError as Error;
+    use nelomai_client_tunnel::redundancy::session::SessionPhase;
+    crate::member_carrier_native_ownership::validate_context(context)?;
+    if pair_present
+        || session.scope != context.intent.scope
+        || session.phase != SessionPhase::Stopping
+        || session.network_epoch != context.provenance.network_epoch
+        || session.installed != [false; 2]
+        || session.committed != [false; 2]
+        || session.role_confirmed
+        || session.local_revision == 0
+        || session.role_generation == 0
+        || session.membership_generation == 0
+        || session.role_generation > i64::MAX as u64
+        || session.membership_generation > i64::MAX as u64
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+
 /// Does not own the Assembly (which may retain the Never ledger). An attempted
 /// registration cannot be replaced after error, unwind, reentry or weak expiry.
 struct InitialNoCRegistration<T> {
@@ -2546,6 +2574,80 @@ pub(crate) mod native {
             }
             owner.verify_cleanup_runtime_entry(&self.input.runtime, context)?;
             self.history.cold()
+        }
+        fn pre_pair_inventory(
+            &self,
+            initial: &Rc<NativeInitialAssemblyNoCRead>,
+        ) -> Result<Vec<Option<Vec<u8>>>> {
+            self.history.cold()?;
+            if !Rc::ptr_eq(&self.initial_noc.read()?, initial) {
+                return Err(Error::Conflict);
+            }
+            initial.verify_ready(&self.input.runtime, &self.input.context)?;
+            let records = self.no_effect_records()?;
+            let session = super::super::member_session::decode_session_payload(
+                &self.input.context.intent.scope,
+                records[0].as_deref().ok_or(Error::Pending)?,
+            )
+            .map_err(|_| Error::Conflict)?;
+            require_pre_pair_session(&self.input.context, &session, records[1].is_some())?;
+            if records[4].is_none() || records[9].is_none() {
+                return Err(Error::Pending);
+            }
+            self.history.cold()?;
+            Ok(records)
+        }
+        /// SAME no-effect ledger and acknowledged original initial journal.
+        /// Real absent Pair is independently read, never a synthetic Stopped
+        /// Pair or a replacement pin. Entry grants no Calling or SDK effect.
+        pub(crate) fn verify_pre_pair_entry(
+            &self,
+            owner: &NativeDeadline,
+            initial: &Rc<NativeInitialAssemblyNoCRead>,
+            context: &Context,
+        ) -> Result<()> {
+            if !std::ptr::eq(owner, Rc::as_ptr(&self.input.supervisor))
+                || context != &self.input.context
+            {
+                return Err(Error::Conflict);
+            }
+            owner.verify_cleanup_runtime_entry(&self.input.runtime, context)?;
+            let before = self.pre_pair_inventory(initial)?;
+            if self.pre_pair_inventory(initial)? != before {
+                return Err(Error::Conflict);
+            }
+            owner.verify_cleanup_runtime_entry(&self.input.runtime, context)
+        }
+        /// Full native absence inside the original pre-Pair Calling. Sources,
+        /// held KeyLock and the initial journal are actual retained originals.
+        /// Independent scoped BFE reads are performed by the Startup caller.
+        pub(crate) fn verify_pre_pair_absent(
+            &self,
+            initial: &Rc<NativeInitialAssemblyNoCRead>,
+            lock: &KeyLock,
+        ) -> Result<()> {
+            self.verify_roots(lock)?;
+            let before = self.pre_pair_inventory(initial)?;
+            for _ in 0..2 {
+                for slot in [TunnelSlot::A, TunnelSlot::B] {
+                    self.file_absence(slot)?;
+                    self.services_absent(slot)?;
+                }
+                for index in 0..3 {
+                    self.key_fact(index, false)?;
+                }
+                provider::native::inspect_mixed(&complete_provider_inputs(
+                    &self.input.context,
+                    &[],
+                    &[],
+                )?)
+                .map_err(|_| Error::Pending)?;
+                self.verify_roots(lock)?;
+                if self.pre_pair_inventory(initial)? != before {
+                    return Err(Error::Conflict);
+                }
+            }
+            self.verify_roots(lock)
         }
         fn matches(
             &self,

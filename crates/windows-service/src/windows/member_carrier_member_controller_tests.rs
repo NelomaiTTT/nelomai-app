@@ -4,6 +4,68 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
 };
 
+#[test]
+fn pre_pair_absence_frame_requires_actual_stopping_session_without_native_members() {
+    use nelomai_client_tunnel::redundancy::{
+        session::{SessionPhase, SessionSnapshot},
+        Slot,
+    };
+    let (context, _) = never_bootstrap_full_frame();
+    let session = SessionSnapshot {
+        scope: context.intent.scope.clone(),
+        phase: SessionPhase::Stopping,
+        active: Slot::A,
+        installed: [false; 2],
+        committed: [false; 2],
+        network_epoch: context.provenance.network_epoch,
+        local_revision: 2,
+        role_generation: 1,
+        membership_generation: 1,
+        role_confirmed: false,
+    };
+    require_pre_pair_session(&context, &session, false).unwrap();
+    assert!(require_pre_pair_session(&context, &session, true).is_err());
+    let mut invalid = Vec::new();
+    for phase in [
+        SessionPhase::Starting,
+        SessionPhase::Running,
+        SessionPhase::Stopped,
+    ] {
+        let mut s = session.clone();
+        s.phase = phase;
+        invalid.push(s);
+    }
+    for slot in 0..2 {
+        let mut s = session.clone();
+        s.installed[slot] = true;
+        invalid.push(s);
+        let mut s = session.clone();
+        s.committed[slot] = true;
+        invalid.push(s);
+    }
+    let mut s = session.clone();
+    s.scope.connection_generation += 1;
+    invalid.push(s);
+    let mut s = session.clone();
+    s.network_epoch += 1;
+    invalid.push(s);
+    let mut s = session.clone();
+    s.local_revision = 0;
+    invalid.push(s);
+    let mut s = session.clone();
+    s.role_generation = 0;
+    invalid.push(s);
+    let mut s = session.clone();
+    s.membership_generation = 0;
+    invalid.push(s);
+    let mut s = session.clone();
+    s.role_confirmed = true;
+    invalid.push(s);
+    for s in invalid {
+        assert!(require_pre_pair_session(&context, &s, false).is_err());
+    }
+}
+
 fn initial_noc_receipt_data(context: &crate::member_carrier_native_ownership::Context) -> Vec<u8> {
     use crate::member_carrier_native_ownership::{
         FullNativeRows, KeyPhase, KeyReceipt, Phase, Record, Role, Value,

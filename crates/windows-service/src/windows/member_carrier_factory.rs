@@ -115,6 +115,26 @@ impl CarrierPairPreparation<NativeCarrierPairIo<'static>, NativePairJournal>
             }
         }
     }
+    fn finish_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if *scope != self.scope || self.io.is_some() || self.journal.is_some() {
+            return Err(pending());
+        }
+        self.startup
+            .as_mut()
+            .ok_or_else(pending)?
+            .finish_cleanup_before_pair(scope)
+            .map_err(|_| pending())?;
+        let root = self.retirement.try_borrow().map_err(|_| pending())?;
+        if !root
+            .as_ref()
+            .ok_or_else(pending)?
+            .completed_pre_pair()
+            .map_err(|_| pending())?
+        {
+            return Err(pending());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct NativeCarrierSessionStore {
@@ -144,13 +164,20 @@ impl SessionStore for NativeCarrierSessionStore {
                 |_| Err(pending()),
             );
         }
-        // A session phase does not select terminal authority. Read only the
-        // actual finalizer's completed branch; every callback keeps its guards.
-        let initial = self
-            .finalizer
+        // A session phase does not select terminal authority. The actual
+        // original pre-Pair outcome selects its separate branch BEFORE any
+        // Pair finalizer read; a missing/erroring outcome is never fallback.
+        let pre_pair_initial = self
+            .retirement
             .try_borrow()
             .map_err(|_| pending())?
-            .completed_initial_noc()?;
+            .as_ref()
+            .map(|root| root.completed_pre_pair().map_err(|_| pending()))
+            .transpose()?
+            .unwrap_or(false);
+        let finalizer = self.finalizer.try_borrow().map_err(|_| pending())?;
+        let initial = finalizer.completed_initial_noc(pre_pair_initial)?;
+        drop(finalizer);
         if initial {
             let root = self
                 .retirement

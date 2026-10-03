@@ -548,6 +548,24 @@ impl NativeDeadline {
             outcome.is_ok() || (authenticated_return.get() && self.deadline.cleanup_eligible());
         outcome
     }
+    /// Before-Pair read-only lane, authenticated by SAME original Never ledger
+    /// and acknowledged initial journal plus actual protected Pair absence.
+    /// # Safety
+    /// Only full native/private/key/service/BFE absence observations may run.
+    /// No create, write, close, module effect or manufactured Pair is allowed.
+    pub(crate) unsafe fn run_pre_pair_terminal_read<T>(
+        &self,
+        context: &Context,
+        initial: &Rc<super::member_carrier_assembly::native::NativeInitialAssemblyNoCRead>,
+        never: &super::member_carrier_member_controller::native::NativeNeverMemberEffects,
+        call: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.run_authenticated_cleanup(
+            context,
+            || never.verify_pre_pair_entry(self, initial, context),
+            call,
+        )
+    }
     fn verify_cleanup_entry(
         &self,
         context: &Context,
@@ -609,6 +627,24 @@ impl NativeDeadline {
             return Err(CarrierError::Retired);
         }
         Ok(())
+    }
+    /// Irreversible storage-only cleanup selection of this SAME quiescent
+    /// supervisor/runtime. Does not mint Calling, SDK or disposal authority.
+    /// Original pre-Pair inventory is authenticated separately by the caller.
+    pub(crate) fn begin_original_cleanup_storage(
+        &self,
+        runtime: &RuntimeRead,
+        context: &Context,
+    ) -> Result<()> {
+        self.forward_closed.set(true);
+        if context != &self.context
+            || !self.runtime.same_original_runtime(runtime)
+            || !self.deadline.cleanup_eligible()
+        {
+            return Err(CarrierError::Conflict);
+        }
+        self.owner.retain_cleanup_only().map_err(denied)?;
+        self.verify_cleanup_runtime_entry(runtime, context)
     }
     fn verify_lease(&self) -> Result<()> {
         if self.forward_closed.get() {
@@ -681,6 +717,25 @@ impl NativeDeadline {
     pub(crate) fn allow_zero_effect_terminal_drop(
         &self,
         outcome: &super::member_carrier_startup::native::NativeZeroEffectOutcome,
+    ) -> Result<()> {
+        self.owner
+            .verified_terminal_drop(|| {
+                if !self.deadline.cleanup_eligible() || !self.forward_closed.get() {
+                    return Err(policy::Error::Revoked);
+                }
+                outcome
+                    .verify_supervisor_terminal_drop(self)
+                    .map_err(|_| policy::Error::Native)?;
+                if !self.deadline.cleanup_eligible() {
+                    return Err(policy::Error::Revoked);
+                }
+                Ok(())
+            })
+            .map_err(denied)
+    }
+    pub(crate) fn allow_pre_pair_terminal_drop(
+        &self,
+        outcome: &super::member_carrier_startup::native::NativePrePairOutcome,
     ) -> Result<()> {
         self.owner
             .verified_terminal_drop(|| {

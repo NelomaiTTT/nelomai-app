@@ -451,6 +451,118 @@ unsafe impl OriginalInitialNativeDataRetirement for CompletedNoC {
     }
 }
 
+struct CompletedBeforePair(CompletedNoC);
+// SAFETY: external completed-native boundary double only. The real original
+// private journal, transaction, ACKs and storage completion are not replaced.
+unsafe impl OriginalInitialNativeDataRetirement for CompletedBeforePair {
+    fn begin_retirement(&self, original: &InitialNativeDataRead) -> io::Result<()> {
+        self.0.begin_retirement(original)
+    }
+    fn verify_retirement(
+        &self,
+        original: &InitialNativeDataRead,
+        current: &ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        self.0.verify_retirement(original, current)?;
+        self.verify_absent_pair(original, current)
+    }
+    fn verify_absent_pair(
+        &self,
+        original: &InitialNativeDataRead,
+        current: &ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        if !self.0.completed
+            || self.0.failed.get()
+            || !self.0.original.same_original(original)
+            || current.scope != original.acknowledged().context.intent.scope
+            || current
+                .records
+                .iter()
+                .find(|(k, _)| *k == RecordKind::Pair)
+                .is_none_or(|(_, raw)| raw.is_some())
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn fail_retirement(&self) {
+        self.0.fail_retirement();
+    }
+}
+
+#[test]
+fn before_pair_initial_retirement_requires_separate_original_outcome_and_releases_real_store() {
+    for bound in [false, true] {
+        let (disk, mut files, mut journal, held_execution) = noc_terminal_fixture_bound(bound);
+        // External private-file fixture: this original never published Pair.
+        disk.0.borrow_mut().bytes.remove(&PrivateFile::Pair);
+        let pin = journal.original_initial_data_read().unwrap();
+        let proof = CompletedBeforePair(CompletedNoC::new(pin.clone()));
+        let before = disk.0.borrow().bytes.clone();
+        let retained = RefCell::new(None);
+        let ack = journal
+            .retire_original_initial_data(&proof, |ack| {
+                *retained.borrow_mut() = Some(ack);
+                Ok(())
+            })
+            .unwrap();
+        assert!(ack.matches_original(&pin));
+        assert!(Rc::ptr_eq(&ack, retained.borrow().as_ref().unwrap()));
+        for kind in RecordKind::OWNED {
+            assert_eq!(
+                disk.0.borrow().bytes.get(&kind.file()),
+                before.get(&kind.file())
+            );
+        }
+        assert!(!disk.0.borrow().bytes.contains_key(&PrivateFile::Pair));
+        files.complete(&scope()).unwrap();
+        let mut next_scope = scope();
+        next_scope.connection_generation += 1;
+        files.claim(&next_scope).unwrap();
+        assert!(files.read(&next_scope, KIND).unwrap().is_none());
+        assert!(journal
+            .retire_original_initial_data(&proof, |_| Ok(()))
+            .is_err());
+        drop(held_execution);
+    }
+}
+
+#[test]
+fn before_pair_retirement_rejects_default_pair_issuer_and_preserves_lost_storage_ack() {
+    let (disk, _, mut journal) = noc_terminal_fixture();
+    disk.0.borrow_mut().bytes.remove(&PrivateFile::Pair);
+    let proof = CompletedNoC::new(journal.original_initial_data_read().unwrap());
+    let before = disk.0.borrow().bytes.clone();
+    assert!(journal
+        .retire_original_initial_data(&proof, |_| Ok(()))
+        .is_err());
+    assert_eq!(disk.0.borrow().bytes, before);
+    for target in [completed_file(&scope()).unwrap(), PrivateFile::Index] {
+        for fault in [
+            Fault::Fail,
+            Fault::Lost,
+            Fault::FalseSuccess,
+            Fault::Unreadable,
+        ] {
+            let (disk, _, mut journal) = noc_terminal_fixture();
+            disk.0.borrow_mut().bytes.remove(&PrivateFile::Pair);
+            let pin = journal.original_initial_data_read().unwrap();
+            let proof = CompletedBeforePair(CompletedNoC::new(pin));
+            let native = disk.0.borrow().bytes[&FILE].clone();
+            disk.0.borrow_mut().meta_fault = Some((target, fault));
+            assert!(journal
+                .retire_original_initial_data(&proof, |_| Ok(()))
+                .is_err());
+            assert!(journal.initial_retirement_ack.is_none());
+            assert_eq!(disk.0.borrow().bytes[&FILE], native);
+            assert!(proof.0.failed.get());
+            assert!(journal
+                .retire_original_initial_data(&proof, |_| Ok(()))
+                .is_err());
+        }
+    }
+}
+
 #[test]
 fn original_initial_data_retirement_preserves_preparing_and_permanent_replay_history() {
     let (disk, mut files, mut journal) = noc_terminal_fixture();

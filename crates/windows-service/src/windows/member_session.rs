@@ -2960,6 +2960,12 @@ fn decode<T: DeserializeOwned>(scope: &SessionScope, bytes: &[u8]) -> io::Result
     }
     Ok(saved.payload)
 }
+pub(crate) fn decode_session_payload(
+    scope: &SessionScope,
+    bytes: &[u8],
+) -> io::Result<SessionSnapshot> {
+    decode(scope, bytes)
+}
 pub(crate) type WindowsSessionStore<F> = ProtectedStore<F, SessionSnapshot>;
 pub(crate) type WindowsPairStore<F> = ProtectedStore<F, PairRecord>;
 pub(crate) type WindowsNetworkStore<F> = ProtectedStore<F, NetworkJournal>;
@@ -3374,6 +3380,15 @@ pub(crate) unsafe trait OriginalInitialNativeDataRetirement {
         current: &ProtectedRecoveryRecords,
     ) -> io::Result<()>;
     fn fail_retirement(&self);
+    /// Separate sealed original pre-Pair outcome. Default denial preserves the
+    /// existing Pair-backed issuers; absent bytes never select this authority.
+    fn verify_absent_pair(
+        &self,
+        _original: &InitialNativeDataRead,
+        _current: &ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        Err(failed())
+    }
 }
 pub(crate) struct InitialDataRetirementAck {
     original: InitialNativeDataRead,
@@ -3448,6 +3463,15 @@ impl<I: SessionFileIo> WindowsNativeCarrierReceiptStore<ProtectedSessionFiles<I>
                     native.verify(files)?;
                 }
                 let (raw, mut index, identity) = match_cold_snapshot(files, &expected)?;
+                if expected
+                    .records
+                    .iter()
+                    .find(|(kind, _)| *kind == RecordKind::Pair)
+                    .and_then(|(_, bytes)| bytes.as_deref())
+                    .is_none()
+                {
+                    proof.verify_absent_pair(&original, &expected)?;
+                }
                 require_initial_noc_records(&expected, original.acknowledged())?;
                 proof.verify_retirement(&original, &expected)?;
                 let mut stamp = ColdRetirementStamp {
@@ -4032,11 +4056,16 @@ fn require_initial_noc_records(
     {
         return Err(failed());
     }
+    if let Some(creator) = facts.creator_obligation()? {
+        creator.require_context(&acknowledged.context)?;
+    }
+    // Missing Pair is admitted ONLY by the separate original outcome check in
+    // the same retirement transaction. This predicate supplies no authority.
+    let Some(raw_pair) = payload(RecordKind::Pair) else {
+        return Ok(());
+    };
     let crate::member_carrier_pair::CleanupRecord::Carrier(pair) =
-        carrier_pair_store::decode_pair_payload(
-            &facts.scope,
-            payload(RecordKind::Pair).ok_or_else(failed)?,
-        )?
+        carrier_pair_store::decode_pair_payload(&facts.scope, raw_pair)?
     else {
         return Err(failed());
     };
@@ -4046,13 +4075,7 @@ fn require_initial_noc_records(
     {
         return Err(failed());
     }
-    if let Some(creator) = facts.creator_obligation()? {
-        creator.require_context(&acknowledged.context)?;
-    }
-    carrier_pair_store::require_terminal_pair(
-        &facts.scope,
-        payload(RecordKind::Pair).ok_or_else(failed)?,
-    )?;
+    carrier_pair_store::require_terminal_pair(&facts.scope, raw_pair)?;
     Ok(())
 }
 fn require_native_obligation(

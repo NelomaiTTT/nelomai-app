@@ -846,6 +846,8 @@ pub(crate) mod native {
         initial_cleanup_attempted: bool,
         pre_pair_cleanup_attempted: bool,
         pre_pair_cleanup: Rc<TerminalCallState>,
+        pre_pair_terminal: Option<Rc<NativeStartupPrePairTerminal>>,
+        pre_pair_outcome: Option<Rc<NativePrePairOutcome>>,
         carrier: Option<NativeCarrierRoot<'static>>,
         pins: Option<NativeCarrierPins>,
         proof: Option<crate::member_owner::InterfaceProof>,
@@ -1261,6 +1263,88 @@ pub(crate) mod native {
     pub(crate) struct NativeZeroEffectOutcome {
         original: Rc<NativeStartupZeroEffectTerminal>,
     }
+    /// Actual original pre-Pair lane. No Pair or future record is constructed.
+    /// All originals/output slots are retained BEFORE read/drain/disposal.
+    struct NativeStartupPrePairTerminal {
+        context: Context,
+        runtime: Rc<RuntimeRead>,
+        source: Rc<WintunSource>,
+        member_source: Rc<MemberSource>,
+        supervisor: Rc<NativeDeadline>,
+        creator: Rc<CapturedCreator>,
+        never: Rc<NativeNeverMemberEffects>,
+        initial: Rc<NativeInitialAssemblyNoCRead>,
+        graph: Rc<RefCell<GraphSlot>>,
+        store: Rc<RefCell<NativeCarrierPairStore>>,
+        raw: Rc<RefCell<TerminalStartupResources<'static>>>,
+        whole: TerminalCallState,
+        disposal: TerminalCallState,
+    }
+    pub(crate) struct NativePrePairOutcome {
+        original: Rc<NativeStartupPrePairTerminal>,
+    }
+    impl NativeStartupPrePairTerminal {
+        fn read(&self, lock: &KeyLock) -> Result<()> {
+            // SAFETY: actual original Never/initial journal, held lock and
+            // bounded Calling bracket surround full read-only native checks.
+            unsafe {
+                self.supervisor.run_pre_pair_terminal_read(
+                    &self.context,
+                    &self.initial,
+                    &self.never,
+                    || {
+                        self.never.verify_pre_pair_absent(&self.initial, lock)?;
+                        let bytes = self
+                            .runtime
+                            .record(&self.context, RecordKind::NativeCreator)?;
+                        self.creator
+                            .verify_published_read(&self.runtime, &self.context, &bytes)
+                            .map_err(|_| Error::Conflict)?;
+                        let mut guard =
+                            crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
+                                self.context.intent.scope.clone(),
+                            )
+                            .map_err(|_| Error::Conflict)?;
+                        let before = guard
+                            .read_snapshot(&self.context.intent.scope)
+                            .map_err(|_| Error::Conflict)?;
+                        compare_uncaptured_terminal_snapshot(&self.context.intent.scope, &before)?;
+                        self.never.verify_pre_pair_absent(&self.initial, lock)?;
+                        if guard
+                            .read_snapshot(&self.context.intent.scope)
+                            .map_err(|_| Error::Conflict)?
+                            != before
+                            || self
+                                .runtime
+                                .record(&self.context, RecordKind::NativeCreator)?
+                                != bytes
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        self.creator
+                            .verify_published_read(&self.runtime, &self.context, &bytes)
+                            .map_err(|_| Error::Conflict)
+                    },
+                )
+            }
+        }
+    }
+    impl NativePrePairOutcome {
+        pub(crate) fn verify_supervisor_terminal_drop(
+            &self,
+            supplied: &NativeDeadline,
+        ) -> Result<()> {
+            verify_zero_effect_rundown(
+                &self.original.supervisor,
+                supplied,
+                &self.original.whole,
+                &self.original.disposal,
+            )?;
+            self.original
+                .initial
+                .verify_ready(&self.original.runtime, &self.original.context)
+        }
+    }
     /// Deferred SDK-free DATA retirement. Before NoC selection it owns only
     /// a weak source only, so normal-C cannot retain its
     /// Runtime through this handle. A completed NoC outcome is rooted before
@@ -1270,6 +1354,7 @@ pub(crate) mod native {
         data: RefCell<Option<InitialNativeDataRead>>,
         outcome: RefCell<Option<Rc<NativeZeroEffectOutcome>>>,
         module_outcome: RefCell<Option<Rc<NativeModuleOnlyOutcome>>>,
+        pre_pair_outcome: RefCell<Option<Rc<NativePrePairOutcome>>>,
         binding: TerminalCallState,
         retirement: TerminalCallState,
         begun: std::cell::Cell<bool>,
@@ -1283,6 +1368,7 @@ pub(crate) mod native {
                 data: RefCell::new(None),
                 outcome: RefCell::new(None),
                 module_outcome: RefCell::new(None),
+                pre_pair_outcome: RefCell::new(None),
                 binding: TerminalCallState::new(),
                 retirement: TerminalCallState::new(),
                 begun: std::cell::Cell::new(false),
@@ -1297,6 +1383,48 @@ pub(crate) mod native {
                 .as_ref()
                 .cloned()
                 .ok_or(Error::Pending)
+        }
+        fn bind_pre_pair_completed(&self, outcome: Rc<NativePrePairOutcome>) -> Result<()> {
+            bind_initial_data_outcome(&self.pre_pair_outcome, &self.binding, outcome, |actual| {
+                if self
+                    .outcome
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .is_some()
+                    || self
+                        .module_outcome
+                        .try_borrow()
+                        .map_err(|_| Error::Conflict)?
+                        .is_some()
+                {
+                    return Err(Error::Conflict);
+                }
+                let source = self.source.upgrade().ok_or(Error::Retired)?;
+                if !Rc::ptr_eq(&source, &actual.original.initial) {
+                    return Err(Error::Conflict);
+                }
+                let original = source.original_initial_data_read()?;
+                let mut data = self.data.try_borrow_mut().map_err(|_| Error::Conflict)?;
+                if data.is_some() {
+                    return Err(Error::Conflict);
+                }
+                *data = Some(original); // actual original DATA retained before postflight
+                drop(data);
+                actual.verify_supervisor_terminal_drop(&actual.original.supervisor)
+            })
+        }
+        pub(crate) fn completed_pre_pair(&self) -> Result<bool> {
+            let slot = self
+                .pre_pair_outcome
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?;
+            let Some(outcome) = slot.as_ref() else {
+                return Ok(false);
+            };
+            self.verify_completed(&self.original_data()?)
+                .map_err(|_| Error::Retired)?;
+            outcome.verify_supervisor_terminal_drop(&outcome.original.supervisor)?;
+            Ok(true)
         }
         fn bind_completed(&self, outcome: Rc<NativeZeroEffectOutcome>) -> Result<()> {
             bind_initial_data_outcome(&self.outcome, &self.binding, outcome, |actual| {
@@ -1355,6 +1483,28 @@ pub(crate) mod native {
                 return Err(denied());
             }
             self.binding.verify()?;
+            let pre = self.pre_pair_outcome.try_borrow().map_err(|_| denied())?;
+            if let Some(outcome) = pre.as_ref() {
+                if self.outcome.try_borrow().map_err(|_| denied())?.is_some()
+                    || self
+                        .module_outcome
+                        .try_borrow()
+                        .map_err(|_| denied())?
+                        .is_some()
+                {
+                    return Err(denied());
+                }
+                let source = self.source.upgrade().ok_or_else(denied)?;
+                if !Rc::ptr_eq(&source, &outcome.original.initial)
+                    || !data
+                        .same_original(&source.original_initial_data_read().map_err(|_| denied())?)
+                {
+                    return Err(denied());
+                }
+                return outcome
+                    .verify_supervisor_terminal_drop(&outcome.original.supervisor)
+                    .map_err(|_| denied());
+            }
             let module = self.module_outcome.try_borrow().map_err(|_| denied())?;
             if let Some(outcome) = module.as_ref() {
                 if self.outcome.try_borrow().map_err(|_| denied())?.is_some()
@@ -1457,16 +1607,25 @@ pub(crate) mod native {
                 .module_outcome
                 .try_borrow_mut()
                 .map_err(|_| Error::Conflict)?;
+            let mut pre = self
+                .pre_pair_outcome
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
             if ack.as_ref().is_none_or(|ack| !ack.matches_original(&data))
                 || held_data
                     .as_ref()
                     .is_none_or(|held| !held.same_original(&data))
-                || (outcome.is_some() == module.is_some())
+                || [outcome.is_some(), module.is_some(), pre.is_some()]
+                    .into_iter()
+                    .filter(|v| *v)
+                    .count()
+                    != 1
             {
                 return Err(Error::Conflict);
             }
             outcome.take();
             module.take();
+            pre.take();
             ack.take();
             held_data.take();
             Ok(())
@@ -1489,6 +1648,13 @@ pub(crate) mod native {
             current: &ProtectedRecoveryRecords,
         ) -> std::io::Result<()> {
             self.verify_completed(original)?;
+            let pre = self
+                .pre_pair_outcome
+                .try_borrow()
+                .map_err(|_| std::io::Error::other("initial_pre_pair_busy"))?;
+            if pre.is_some() {
+                return self.verify_absent_pair(original, current);
+            }
             let slot = self
                 .outcome
                 .try_borrow()
@@ -1557,9 +1723,66 @@ pub(crate) mod native {
         fn fail_retirement(&self) {
             self.failed.set(true);
         }
+        fn verify_absent_pair(
+            &self,
+            original: &InitialNativeDataRead,
+            current: &ProtectedRecoveryRecords,
+        ) -> std::io::Result<()> {
+            self.verify_completed(original)?;
+            let slot = self
+                .pre_pair_outcome
+                .try_borrow()
+                .map_err(|_| std::io::Error::other("initial_pre_pair_busy"))?;
+            let outcome = slot
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("initial_pre_pair_outcome"))?;
+            let context = &outcome.original.context;
+            if current.changed_boot
+                || current.scope != context.intent.scope
+                || current.provenance != context.provenance
+                || current.records.iter().map(|(kind, _)| *kind).ne([
+                    RecordKind::Session,
+                    RecordKind::Pair,
+                    RecordKind::Network,
+                    RecordKind::Carrier,
+                    RecordKind::NativeCarrierReceipts,
+                    RecordKind::CarrierRows,
+                    RecordKind::MemberARows,
+                    RecordKind::MemberBRows,
+                    RecordKind::CarrierGuard,
+                    RecordKind::NativeCreator,
+                ])
+            {
+                return Err(std::io::Error::other("initial_pre_pair_context"));
+            }
+            let payload = |kind| {
+                current
+                    .records
+                    .iter()
+                    .find(|(k, _)| *k == kind)
+                    .and_then(|(_, bytes)| bytes.as_deref())
+            };
+            if payload(RecordKind::Pair).is_some()
+                || payload(RecordKind::NativeCreator).is_none()
+                || crate::member_carrier_native_ownership::Record::decode(
+                    payload(RecordKind::NativeCarrierReceipts)
+                        .ok_or_else(|| std::io::Error::other("initial_pre_pair_ack"))?,
+                )
+                .map_err(|_| std::io::Error::other("initial_pre_pair_ack"))?
+                    != *original.acknowledged()
+            {
+                return Err(std::io::Error::other("initial_pre_pair_current"));
+            }
+            // PURE inside the backend transaction; the original store also
+            // requires SessionStopped and absence of every other native record.
+            self.verify_completed(original)
+        }
     }
     impl Drop for NativeNoCInitialDataRetirement {
         fn drop(&mut self) {
+            if let Some(original) = self.pre_pair_outcome.get_mut().take() {
+                std::mem::forget(original);
+            }
             if let Some(original) = self.module_outcome.get_mut().take() {
                 std::mem::forget(original);
             }
@@ -3038,6 +3261,8 @@ pub(crate) mod native {
                 initial_cleanup_attempted: false,
                 pre_pair_cleanup_attempted: false,
                 pre_pair_cleanup: Rc::new(TerminalCallState::new()),
+                pre_pair_terminal: None,
+                pre_pair_outcome: None,
                 carrier: Some(NativeCarrierRoot::empty()),
                 pins: None,
                 proof: None,
@@ -3174,6 +3399,11 @@ pub(crate) mod native {
                 std::mem::replace(&mut self.pre_pair_cleanup_attempted, true),
                 &state,
                 || {
+                    // Storage selection precedes the initial journal handoff.
+                    // Never's registration checks this exact supervisor's
+                    // cleanup-only lease; no Calling/native grant is issued.
+                    self.supervisor
+                        .begin_original_cleanup_storage(&self.runtime, &self.context)?;
                     use crate::member_carrier_pair::PairJournal;
                     self.store
                         .try_borrow_mut()
@@ -3183,6 +3413,176 @@ pub(crate) mod native {
                     self.bind_initial_noc_cleanup()
                 },
             )
+        }
+        /// Complete ONLY this original acknowledged initialization before
+        /// Pair publication. Unknown initialization/read/disposal remains
+        /// retained Pending. No Pair, module ACK or future native state exists.
+        pub(crate) fn finish_cleanup_before_pair(&mut self, scope: &SessionScope) -> Result<()> {
+            if *scope != self.context.intent.scope {
+                return Err(Error::Conflict);
+            }
+            self.pre_pair_cleanup.verify().map_err(|_| Error::Retired)?;
+            if let Some(outcome) = &self.pre_pair_outcome {
+                return outcome.verify_supervisor_terminal_drop(&self.supervisor);
+            }
+            if self.pre_pair_terminal.is_some()
+                || self.create_attempted
+                || self.attach_attempted
+                || self.birth_attempted
+                || self.terminal_attempted
+                || self.prepared.iter().any(Option::is_some)
+                || self.pins.is_some()
+                || self.proof.is_some()
+                || self
+                    .retired_members
+                    .as_ref()
+                    .is_none_or(|roots| !roots.is_empty())
+            {
+                return Err(Error::Retired);
+            }
+            self.graph
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .require_pristine()?;
+            let original = Rc::new(NativeStartupPrePairTerminal {
+                context: self.context.clone(),
+                runtime: self.runtime.clone(),
+                source: self.source.clone(),
+                member_source: self.member_source.clone(),
+                supervisor: self.supervisor.clone(),
+                creator: self.creator.as_ref().ok_or(Error::Pending)?.clone(),
+                never: self.never_effects.as_ref().ok_or(Error::Pending)?.clone(),
+                initial: self.initial_noc.as_ref().ok_or(Error::Pending)?.clone(),
+                graph: self.graph.clone(),
+                store: self.store.clone(),
+                raw: Rc::new(RefCell::new(TerminalStartupResources::empty())),
+                whole: TerminalCallState::new(),
+                disposal: TerminalCallState::new(),
+            });
+            self.pre_pair_terminal = Some(original.clone()); // before any SDK/cut/unwind
+            original
+                .whole
+                .run(|| {
+                    original
+                        .read(
+                            self.lock
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_lock"))?,
+                        )
+                        .map_err(|_| std::io::Error::other("pre_pair_whole"))?;
+                    self.graph
+                        .try_borrow()
+                        .map_err(|_| std::io::Error::other("pre_pair_graph"))?
+                        .require_pristine()
+                        .map_err(|_| std::io::Error::other("pre_pair_graph"))
+                })
+                .map_err(|_| Error::Retired)?;
+            let raw = original.raw.clone();
+            self.drain_terminal_into(&mut *raw.try_borrow_mut().map_err(|_| Error::Conflict)?)?;
+            original
+                .disposal
+                .run(|| {
+                    raw.try_borrow_mut()
+                        .map_err(|_| std::io::Error::other("pre_pair_raw_busy"))?
+                        .release_original_with(|raw| {
+                            let pins = raw
+                                .startup
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_pins"))?;
+                            if pins.context != original.context
+                                || !Rc::ptr_eq(&pins.runtime, &original.runtime)
+                                || !Rc::ptr_eq(&pins.source, &original.source)
+                                || !Rc::ptr_eq(&pins.member_source, &original.member_source)
+                                || !Rc::ptr_eq(&pins.supervisor, &original.supervisor)
+                                || !Rc::ptr_eq(&pins.store, &original.store)
+                                || pins
+                                    .creator
+                                    .as_ref()
+                                    .is_none_or(|c| !Rc::ptr_eq(c, &original.creator))
+                                || pins
+                                    .initial_noc
+                                    .as_ref()
+                                    .is_none_or(|c| !Rc::ptr_eq(c, &original.initial))
+                                || raw
+                                    .never_effects
+                                    .as_ref()
+                                    .is_none_or(|c| !Rc::ptr_eq(c, &original.never))
+                                || raw.prepared.iter().any(Option::is_some)
+                                || raw.pins.is_some()
+                                || raw.proof.is_some()
+                                || raw
+                                    .retired_members
+                                    .as_ref()
+                                    .is_none_or(|roots| !roots.is_empty())
+                            {
+                                return Err(std::io::Error::other("pre_pair_original"));
+                            }
+                            let graph = raw
+                                .graph
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_graph"))?;
+                            graph
+                                .require_zero_effect_shape()
+                                .map_err(|_| std::io::Error::other("pre_pair_graph"))?;
+                            let source_graph = original
+                                .graph
+                                .try_borrow()
+                                .map_err(|_| std::io::Error::other("pre_pair_graph"))?;
+                            if !source_graph.terminal_attempted
+                                || graph
+                                    .terminal_origin
+                                    .as_ref()
+                                    .is_none_or(|o| !Rc::ptr_eq(o, &source_graph.terminal_origin))
+                            {
+                                return Err(std::io::Error::other("pre_pair_graph_origin"));
+                            }
+                            drop(source_graph);
+                            self.assembly
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_assembly"))?
+                                .verify_initial_noc_terminal_cut(
+                                    raw.assembly.as_ref().ok_or_else(|| {
+                                        std::io::Error::other("pre_pair_assembly")
+                                    })?,
+                                    &original.initial,
+                                )
+                                .map_err(|_| std::io::Error::other("pre_pair_assembly_origin"))?;
+                            let ready = raw
+                                .carrier
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_ready"))?;
+                            self.carrier
+                                .as_ref()
+                                .ok_or_else(|| std::io::Error::other("pre_pair_ready"))?
+                                .verify_terminal_drained_into(ready)
+                                .map_err(|_| std::io::Error::other("pre_pair_ready_origin"))?;
+                            ready
+                                .verify_unconstructed_shape()
+                                .map_err(|_| std::io::Error::other("pre_pair_ready"))?;
+                            original.whole.verify()?;
+                            // Fresh full original absence before the held KeyLock
+                            // is disposed, followed by positive watchdog rundown.
+                            let lock = raw
+                                .lock
+                                .try_borrow()
+                                .map_err(|_| std::io::Error::other("pre_pair_lock"))?;
+                            original
+                                .read(
+                                    lock.as_ref()
+                                        .ok_or_else(|| std::io::Error::other("pre_pair_lock"))?,
+                                )
+                                .map_err(|_| std::io::Error::other("pre_pair_disposal_read"))?;
+                            original.whole.verify()
+                        })
+                })
+                .map_err(|_| Error::Retired)?;
+            let outcome = Rc::new(NativePrePairOutcome { original });
+            self.pre_pair_outcome = Some(outcome.clone()); // actual disposal ACK before binding
+            self.initial_data_retirement
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .bind_pre_pair_completed(outcome.clone())?;
+            self.supervisor.allow_pre_pair_terminal_drop(&outcome)
         }
         pub(crate) fn context(&self) -> &Context {
             &self.context
@@ -4311,6 +4711,11 @@ pub(crate) mod native {
 
     impl Drop for NativeStartupRoot {
         fn drop(&mut self) {
+            if self.pre_pair_outcome.is_none() {
+                if let Some(original) = self.pre_pair_terminal.take() {
+                    std::mem::forget(original); // unknown actual raw/read history
+                }
+            }
             // No terminal ACK => retain attempted publication originals. The
             // actual terminal drain moves them into retained raw T; only its
             // mandatory successful disposal drops these SAME originals.

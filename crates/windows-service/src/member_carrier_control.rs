@@ -36,6 +36,12 @@ pub(crate) trait CarrierPairPreparation<I: CarrierPairIo, J: PairJournal> {
     fn begin_cleanup_before_pair(&mut self, _scope: &SessionScope) -> io::Result<()> {
         Err(conflict())
     }
+    /// Separate whole native/owning completion, never storage handoff alone.
+    /// The provider must retain its SAME typed disposition outcome for the
+    /// session store's subsequent initial-DATA retirement.
+    fn finish_cleanup_before_pair(&mut self, _scope: &SessionScope) -> io::Result<()> {
+        Err(conflict())
+    }
 }
 pub(crate) struct CarrierPairControl<I: CarrierPairIo, J: PairJournal, F> {
     pair: Option<CarrierNativePair<I, J>>,
@@ -294,10 +300,15 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> NativePair
                 .as_mut()
                 .ok_or_else(conflict)?
                 .begin_cleanup_before_pair(scope)?;
-            // This is only the cold owner's authenticated storage handoff.
-            // Existing native disposal requires original Pair/Calling receipts;
-            // neither an absent Pair nor a successful handoff supplies them.
-            return Err(conflict());
+            // Storage selection is not disposition. Only the SAME provider's
+            // separately authenticated pre-Pair whole disposal may complete;
+            // the session store still requires its original DATA retirement.
+            self.preparation
+                .as_mut()
+                .ok_or_else(conflict)?
+                .finish_cleanup_before_pair(scope)?;
+            self.completed = true;
+            return Ok(());
         }
         if let Some(original) = self.pair.as_mut() {
             original.close(scope)?;
@@ -427,6 +438,82 @@ mod pre_pair_tests {
         }
     }
 
+    struct TerminalPreparation {
+        cold: Preparation,
+        dispositions: Rc<Cell<usize>>,
+        acknowledged: bool,
+    }
+    impl CarrierPairPreparation<Io, ConstructionDisk> for TerminalPreparation {
+        fn prepare_retained_into(
+            &mut self,
+            destination: &mut Option<CarrierNativePair<Io, ConstructionDisk>>,
+        ) -> io::Result<()> {
+            self.cold.prepare_retained_into(destination)
+        }
+        fn begin_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
+            self.cold.begin_cleanup_before_pair(scope)
+        }
+        fn finish_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
+            self.cold.original.borrow().assert_untouched();
+            assert_eq!(
+                &self.cold.original.borrow().startup.as_ref().unwrap().scope,
+                scope
+            );
+            self.dispositions.set(self.dispositions.get() + 1);
+            if self.acknowledged {
+                Ok(())
+            } else {
+                Err(conflict())
+            }
+        }
+    }
+    #[test]
+    fn pre_pair_stop_requires_separate_actual_disposition_then_is_idempotent() {
+        for acknowledged in [false, true] {
+            let original = Rc::new(RefCell::new(StartupTransferFixture::new(
+                ConstructionFault::None,
+            )));
+            let scope = original.borrow().startup.as_ref().unwrap().scope.clone();
+            let preparations = Rc::new(Cell::new(0));
+            let cleanups = Rc::new(Cell::new(0));
+            let dispositions = Rc::new(Cell::new(0));
+            let mut control = CarrierPairControl::from_preparation(
+                scope.clone(),
+                Box::new(TerminalPreparation {
+                    cold: Preparation {
+                        original,
+                        prepare_failure: Failure::Error,
+                        cleanup_failure: None,
+                        preparations: preparations.clone(),
+                        cleanups: cleanups.clone(),
+                    },
+                    dispositions: dispositions.clone(),
+                    acknowledged,
+                }),
+                NoPairFinalizer,
+            );
+            assert!(control.prepare_session(&scope).is_err());
+            assert_eq!(control.close(&scope).is_ok(), acknowledged);
+            assert_eq!(
+                dispositions.get(),
+                1,
+                "original disposition consumer skipped"
+            );
+            assert_eq!(control.cleanup_pending(), !acknowledged);
+            assert!(control.prepare_session(&scope).is_err());
+            if acknowledged {
+                control.close(&scope).unwrap();
+                assert_eq!(
+                    dispositions.get(),
+                    1,
+                    "acknowledged native disposal must not repeat"
+                );
+                assert_eq!(cleanups.get(), 1);
+            }
+            assert_eq!(preparations.get(), 1);
+        }
+    }
+
     // Break: skip the retained provider after Err/unwind, replay preparation,
     // use a foreign scope, or turn cleanup selection into terminal success.
     #[test]
@@ -479,21 +566,56 @@ mod pre_pair_tests {
             },
             TunnelConfiguration,
         };
-        struct Store(Rc<RefCell<Vec<SessionSnapshot>>>);
+        struct Store {
+            scope: SessionScope,
+            records: Rc<RefCell<Vec<SessionSnapshot>>>,
+            completion: crate::member_pair::InitialDataCompletionState,
+            dispositions: Rc<Cell<usize>>,
+            acknowledged: bool,
+            terminal_events: Rc<RefCell<Vec<&'static str>>>,
+        }
         impl SessionStore for Store {
             fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
-                self.0.borrow_mut().push(snapshot.clone());
-                Ok(())
+                // Actual product completion scheduler. Only the OS/native
+                // outcome and private-file effects are external doubles here.
+                self.completion.save(
+                    &self.scope,
+                    snapshot,
+                    |s| {
+                        self.records.borrow_mut().push(s.clone());
+                        Ok(())
+                    },
+                    || {
+                        assert!(self.acknowledged && self.dispositions.get() == 1);
+                        self.terminal_events.borrow_mut().push("retire-original");
+                        Ok(())
+                    },
+                    |_| {
+                        self.terminal_events.borrow_mut().push("complete-files");
+                        Ok(())
+                    },
+                    || {
+                        self.terminal_events.borrow_mut().push("release-original");
+                        Ok(())
+                    },
+                )
             }
         }
-        for failure in [Failure::Error, Failure::Unwind] {
+        for (failure, acknowledged) in [
+            (Failure::Error, false),
+            (Failure::Unwind, false),
+            (Failure::Error, true),
+            (Failure::Unwind, true),
+        ] {
             let original = Rc::new(RefCell::new(StartupTransferFixture::new(
                 ConstructionFault::None,
             )));
             let scope = original.borrow().startup.as_ref().unwrap().scope.clone();
             let preparations = Rc::new(Cell::new(0));
             let cleanups = Rc::new(Cell::new(0));
+            let dispositions = Rc::new(Cell::new(0));
             let records = Rc::new(RefCell::new(Vec::new()));
+            let terminal_events = Rc::new(RefCell::new(Vec::new()));
             let command = Command::Start {
                 scope: scope.clone(),
                 primary: Member {
@@ -514,16 +636,27 @@ mod pre_pair_tests {
             };
             let mut native = Some(CarrierPairControl::from_preparation(
                 scope.clone(),
-                Box::new(Preparation {
-                    original: original.clone(),
-                    prepare_failure: failure,
-                    cleanup_failure: None,
-                    preparations: preparations.clone(),
-                    cleanups: cleanups.clone(),
+                Box::new(TerminalPreparation {
+                    cold: Preparation {
+                        original: original.clone(),
+                        prepare_failure: failure,
+                        cleanup_failure: None,
+                        preparations: preparations.clone(),
+                        cleanups: cleanups.clone(),
+                    },
+                    dispositions: dispositions.clone(),
+                    acknowledged,
                 }),
                 NoPairFinalizer,
             ));
-            let mut store = Some(Store(records.clone()));
+            let mut store = Some(Store {
+                scope: scope.clone(),
+                records: records.clone(),
+                completion: Default::default(),
+                dispositions: dispositions.clone(),
+                acknowledged,
+                terminal_events: terminal_events.clone(),
+            });
             let mut retained = None;
             let prepared = catch_unwind(AssertUnwindSafe(|| {
                 SessionControl::prepare_retained_into(
@@ -548,29 +681,64 @@ mod pre_pair_tests {
                 .execute(Command::Stop { scope: foreign }, 1)
                 .is_err());
             assert_eq!(cleanups.get(), 0);
-            assert!(session
-                .execute(
-                    Command::Stop {
-                        scope: scope.clone()
-                    },
-                    2
-                )
-                .is_err());
+            assert_eq!(
+                session
+                    .execute(
+                        Command::Stop {
+                            scope: scope.clone()
+                        },
+                        2
+                    )
+                    .is_ok(),
+                acknowledged
+            );
             assert_eq!(cleanups.get(), 1);
-            assert_eq!(session.snapshot().session.phase, SessionPhase::Stopping);
-            assert!(session.snapshot().cleanup_pending);
+            assert_eq!(dispositions.get(), 1);
+            assert_eq!(
+                session.snapshot().session.phase,
+                if acknowledged {
+                    SessionPhase::Stopped
+                } else {
+                    SessionPhase::Stopping
+                }
+            );
+            assert_eq!(session.snapshot().cleanup_pending, !acknowledged);
             assert!(
                 !records.borrow().is_empty(),
                 "actual Stopping save precedes cleanup"
             );
-            assert!(records
-                .borrow()
-                .iter()
-                .all(|record| record.phase == SessionPhase::Stopping));
+            let phases: Vec<_> = records.borrow().iter().map(|s| s.phase).collect();
+            assert_eq!(
+                phases,
+                if acknowledged {
+                    vec![SessionPhase::Stopping, SessionPhase::Stopped]
+                } else {
+                    vec![SessionPhase::Stopping, SessionPhase::Stopping]
+                }
+            );
             assert!(session.execute(command, 3).is_err());
-            assert!(session.execute(Command::Stop { scope }, 4).is_err());
+            assert_eq!(
+                session.execute(Command::Stop { scope }, 4).is_ok(),
+                acknowledged
+            );
             assert_eq!(preparations.get(), 1);
-            assert_eq!(cleanups.get(), 2);
+            assert_eq!(cleanups.get(), if acknowledged { 1 } else { 2 });
+            assert_eq!(dispositions.get(), if acknowledged { 1 } else { 2 });
+            if acknowledged {
+                assert_eq!(
+                    records.borrow().len(),
+                    2,
+                    "repeat Stop must not replay retirement"
+                );
+            }
+            assert_eq!(
+                *terminal_events.borrow(),
+                if acknowledged {
+                    vec!["retire-original", "complete-files", "release-original"]
+                } else {
+                    vec![]
+                }
+            );
             original.borrow().assert_untouched();
         }
     }
