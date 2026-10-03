@@ -1524,6 +1524,9 @@ mod terminal_control {
     }
     mod factory_entry {
         use super::*;
+        mod result_entry {
+            include!("windows/member_carrier_factory_tests.rs");
+        }
         use crate::{
             member_actor::{CompositeBackend, PairFactory},
             ServiceError, ServiceTunnelBackend, ServiceTunnelState,

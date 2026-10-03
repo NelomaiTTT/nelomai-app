@@ -20,6 +20,45 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
+/// Owning-result compatibility entry. This slot belongs to the factory, so an
+/// original SessionControl stays reachable after a failed publication/unwind.
+/// It supplies no cleanup permission; the concrete caller must finish the SAME
+/// control's native and protected completion before retiring it.
+#[cfg(any(windows, test))]
+pub(crate) struct FactoryPreparationSlot<C> {
+    original: Option<C>,
+}
+#[cfg(any(windows, test))]
+impl<C> Default for FactoryPreparationSlot<C> {
+    fn default() -> Self {
+        Self { original: None }
+    }
+}
+#[cfg(any(windows, test))]
+impl<C> FactoryPreparationSlot<C> {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.original.is_some()
+    }
+    pub(crate) fn prepare(
+        &mut self,
+        construct: impl FnOnce(&mut Option<C>) -> io::Result<()>,
+    ) -> io::Result<C> {
+        if self.original.is_some() {
+            return Err(failed());
+        }
+        construct(&mut self.original)?;
+        self.original.take().ok_or_else(failed)
+    }
+    pub(crate) fn cleanup(
+        &mut self,
+        finish_original: impl FnOnce(&mut C) -> io::Result<()>,
+    ) -> io::Result<()> {
+        finish_original(self.original.as_mut().ok_or_else(failed)?)?;
+        self.original.take();
+        Ok(())
+    }
+}
+
 // Both paths must come from the verified installation, never from IPC. Permit
 // only canonicalize's local DOS extended-length prefix; do not resolve aliases,
 // fold case, or accept a different target after following a reparse point.

@@ -907,6 +907,12 @@ pub(crate) struct NativePairFactory<F: SessionFiles> {
     // Retain actual cleanup composition BEFORE its first static BFE effect.
     // Full native emptiness/claim retirement remain independent requirements.
     recovery_guard: Option<Rc<super::member_carrier_recovery_guard::NativeColdGuardCleanup>>,
+    result_preparation: FactoryPreparationSlot<
+        SessionControl<
+            super::member_carrier_factory::NativeFactoryControl,
+            super::member_carrier_factory::NativeCarrierSessionStore,
+        >,
+    >,
     execution: crate::install_recovery::RecoveryExecutable,
 }
 impl<F: SessionFiles> NativePairFactory<F> {
@@ -942,6 +948,7 @@ impl<F: SessionFiles> NativePairFactory<F> {
             cancelled,
             recovery_entry: None,
             recovery_guard: None,
+            result_preparation: FactoryPreparationSlot::default(),
             execution: crate::install_recovery::RecoveryExecutable::Engine,
         };
         factory.verify_service_owner()?;
@@ -1224,6 +1231,27 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
             {
                 return Err(failed());
             }
+            // An owning-result preparation may have returned Err/unwound after
+            // original publication. Clean that SAME live owner before any
+            // cold journal discovery; bytes cannot replace its native roots.
+            if self.result_preparation.is_pending() {
+                let owner = self.owner.clone();
+                let root = self.root.clone();
+                self.result_preparation.cleanup(|original| {
+                    let scope = original.snapshot().session.scope;
+                    if scope.runtime != runtime {
+                        return Err(failed());
+                    }
+                    let stopped = original.execute(Command::Stop { scope }, 0)?;
+                    if stopped.session.phase
+                        != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+                        || stopped.cleanup_pending
+                    {
+                        return Err(failed());
+                    }
+                    owner.verify_at(&root.join("engine-owner.lock"))
+                })?;
+            }
             let entry = Rc::new(
                 super::member_carrier_recovery::native::NativeFactoryRecoveryEntry::new(
                     &self.root,
@@ -1275,9 +1303,17 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         command: &Command,
         now: u64,
     ) -> io::Result<SessionControl<Self::Native, Self::Store>> {
-        let mut destination = None;
-        self.prepare_retained_into(&mut destination, runtime, command, now)?;
-        destination.ok_or_else(failed)
+        let (pair, store) = self.prepare_carrier_parts(runtime, command)?;
+        self.result_preparation.prepare(|destination| {
+            SessionControl::prepare_retained_into(
+                destination,
+                runtime,
+                command,
+                &mut Some(pair),
+                &mut Some(store),
+                now,
+            )
+        })
     }
     fn prepare_retained_into(
         &mut self,
@@ -1289,6 +1325,26 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         if destination.is_some() {
             return Err(failed());
         }
+        let (pair, store) = self.prepare_carrier_parts(runtime, command)?;
+        SessionControl::prepare_retained_into(
+            destination,
+            runtime,
+            command,
+            &mut Some(pair),
+            &mut Some(store),
+            now,
+        )
+    }
+}
+impl NativePairFactory<NativeSessionFiles> {
+    fn prepare_carrier_parts(
+        &mut self,
+        runtime: RuntimeSlot,
+        command: &Command,
+    ) -> io::Result<(
+        super::member_carrier_factory::NativeFactoryControl,
+        super::member_carrier_factory::NativeCarrierSessionStore,
+    )> {
         self.execution.require_engine()?;
         require_factory_start_context(
             runtime,
@@ -1319,7 +1375,7 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
         if self.files.read(scope, RecordKind::Pair)?.is_some() {
             return Err(failed());
         }
-        let (pair, store) = super::member_carrier_factory::select_carrier(
+        super::member_carrier_factory::select_carrier(
             self.root.clone(),
             self.engine.clone(),
             self.owner.clone(),
@@ -1327,18 +1383,8 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
             scope.clone(),
             primary.configuration.expose(),
             self.cancelled.clone(),
-        )?;
-        SessionControl::prepare_retained_into(
-            destination,
-            runtime,
-            command,
-            &mut Some(pair),
-            &mut Some(store),
-            now,
         )
     }
-}
-impl NativePairFactory<NativeSessionFiles> {
     /// Cleanup-only installer: source is derived from the validated installed
     /// client location, never IPC. Actual classification rechecks its signed
     /// package/current executable and the OLD full installed layout each edge.
