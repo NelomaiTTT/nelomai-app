@@ -29,6 +29,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let child_test = format!("{child_module}::carrier_factory_actual_cold_child");
     for case in [
         "cold",
+        "primary-data-denial",
         "creator-ack",
         "initial-native-ack",
         "initial-native-unwind",
@@ -102,7 +103,7 @@ fn carrier_factory_actual_cold_child() {
         options: DesktopTunnelOptions::default(),
     };
     match case.as_str() {
-        "cold" => (),
+        "cold" | "primary-data-denial" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
         "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
         "initial-native-unwind" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, true),
@@ -114,7 +115,7 @@ fn carrier_factory_actual_cold_child() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
-    if case == "cold" {
+    if matches!(case.as_str(), "cold" | "primary-data-denial") {
         result
             .expect("actual cold prepare unwound")
             .expect("actual cold factory preparation");
@@ -128,13 +129,27 @@ fn carrier_factory_actual_cold_child() {
     assert_eq!(original.snapshot().session.scope, scope);
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
     fixture.verify_files().unwrap();
+    if case == "primary-data-denial" {
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        assert!(
+            original.start_primary(primary, options).is_err(),
+            "signed DATA must not become an executable carrier package"
+        );
+        fixture.require_package_source_read();
+        assert!(original.snapshot().cleanup_pending);
+    }
     let stopped = original.execute(
         Command::Stop {
             scope: scope.clone(),
         },
         8,
     );
-    if case == "cold" {
+    if matches!(case.as_str(), "cold" | "primary-data-denial") {
         let stopped = stopped.expect("actual prepared-before-DLL native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);

@@ -1262,7 +1262,10 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
                 ),
             );
             self.recovery_entry = Some(entry.clone());
-            match entry.classify()? {
+            match entry
+                .classify()
+                .map_err(|e| context("recovery_classify", e))?
+            {
                 Some(super::member_carrier_recovery::RecoveryLayout::NativeCarrier) => {
                     if entry.retained_facts()?.guard.is_some() {
                         let cleanup = Rc::new(
@@ -1289,8 +1292,11 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
                 | Some(super::member_carrier_recovery::RecoveryLayout::LegacyOnly)
                 | Some(super::member_carrier_recovery::RecoveryLayout::UnpublishedClaim) => {}
             }
-            self.recover_legacy(runtime)?;
-            entry.verify()?;
+            self.recover_legacy(runtime)
+                .map_err(|e| context("recovery_legacy", e))?;
+            entry
+                .verify()
+                .map_err(|e| context("recovery_postflight", e))?;
             self.verify_service_owner()?;
             self.recovery_entry.take();
             Ok(())

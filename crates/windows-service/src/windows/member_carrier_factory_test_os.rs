@@ -16,6 +16,7 @@ struct Inputs {
     executable: Option<PathBuf>,
     key: [u8; 32],
     fault: Option<(member_files::PrivateFile, bool)>,
+    package_source_reads: usize,
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
@@ -64,6 +65,13 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile) -> io::Result<()>
         Ok(())
     })
 }
+pub(crate) fn package_source_read() {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            inputs.package_source_reads += 1;
+        }
+    });
+}
 
 pub(crate) struct Fixture {
     root: PathBuf,
@@ -105,6 +113,7 @@ impl Fixture {
                 .ok_or_else(|| io::Error::other("ProgramData absent"))?,
         )
         .join(nonce);
+        let root = parent.join("installation");
         let sddl = super::wide("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         let mut descriptor = std::ptr::null_mut();
         if unsafe {
@@ -125,13 +134,24 @@ impl Fixture {
         };
         let created = unsafe { CreateDirectoryW(super::wide(&parent).as_ptr(), &attributes) };
         let error = io::Error::last_os_error();
+        // Installation::install preserves Windows ACLs; its portable filesystem
+        // writer does not create a protected native root. Exclusively create our
+        // new root with the exact private DACL before installing signed bytes.
+        let root_created = if created != 0 {
+            unsafe { CreateDirectoryW(super::wide(&root).as_ptr(), &attributes) }
+        } else {
+            0
+        };
+        let root_error = io::Error::last_os_error();
         unsafe {
             LocalFree(descriptor);
         }
         if created == 0 {
             return Err(error);
         }
-        let root = parent.join("installation");
+        if root_created == 0 {
+            return Err(root_error);
+        }
         let state = parent.join("state");
         let key = SigningKey::from_bytes(&[83; 32]); // existing test trust boundary only
         INPUTS.with(|inputs| {
@@ -141,6 +161,7 @@ impl Fixture {
                 executable: None,
                 key: key.verifying_key().to_bytes(),
                 fault: None,
+                package_source_reads: 0,
             })
         });
         // Real private-directory/ancestor/lock/CAS implementation creates state.
@@ -209,6 +230,10 @@ impl Fixture {
         })
     }
     pub(crate) fn factory(&self) -> io::Result<NativePairFactory<NativeSessionFiles>> {
+        member_files::pin_private_directory(&self.root)
+            .map_err(|e| io::Error::other(format!("fixture native root pin: {e:?}")))?
+            .verify()
+            .map_err(|e| io::Error::other(format!("fixture native root continuity: {e:?}")))?;
         let files = ProtectedSessionFiles::new(
             member_files::MemberFiles::new().map_err(io::Error::other)?,
             self.identity.clone(),
@@ -240,6 +265,15 @@ impl Fixture {
             return Err(io::Error::other("original fixture state lost"));
         }
         Ok(())
+    }
+    pub(crate) fn require_package_source_read(&self) {
+        assert!(
+            INPUTS.with(|inputs| inputs
+                .borrow()
+                .as_ref()
+                .is_some_and(|v| v.package_source_reads > 0)),
+            "primary did not reach the actual carrier package source read"
+        );
     }
 }
 impl Drop for Fixture {

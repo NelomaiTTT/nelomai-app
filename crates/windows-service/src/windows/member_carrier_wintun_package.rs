@@ -2032,6 +2032,8 @@ pub(crate) mod native {
         type Pin = Pin;
         fn source(&mut self) -> Result<Observed> {
             let source = observe(self.source.file()?)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::package_source_read();
             if hash(&source.bytes) != AUDITED_DLL_SHA256 {
                 return Err(Error::Changed);
             }
