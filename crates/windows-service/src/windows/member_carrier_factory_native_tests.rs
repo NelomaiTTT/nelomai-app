@@ -75,7 +75,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         );
         assert!(
             status.success(),
-            "actual native factory {case}: {stdout} {stderr}"
+            "actual native factory {case} status={status}: {stdout} {stderr}"
         );
         assert!(
             stdout.contains("1 passed; 0 failed"),

@@ -3030,7 +3030,15 @@ pub(crate) mod native {
                     #[cfg(not(test))]
                     let _ = error;
                 })?;
+                #[cfg(test)]
+                if super::super::member_carrier_factory_test_os::state().is_some() {
+                    eprintln!("actual no-C Pair read completed");
+                }
                 let before = self.no_effect_records()?;
+                #[cfg(test)]
+                if super::super::member_carrier_factory_test_os::state().is_some() {
+                    eprintln!("actual no-C ledger read completed; opening BFE");
+                }
                 let mut guard = super::super::member_carrier_guard::ScopedGuardAbsence::open(
                     expected.scope.clone(),
                 )
@@ -3044,6 +3052,10 @@ pub(crate) mod native {
                     #[cfg(not(test))]
                     let _ = error;
                 })?;
+                #[cfg(test)]
+                if super::super::member_carrier_factory_test_os::state().is_some() {
+                    eprintln!("actual no-C BFE opened; reading snapshot");
+                }
                 let actual = guard
                     .read_snapshot(&expected.scope)
                     .map_err(|_| Error::Pending)
@@ -3056,6 +3068,10 @@ pub(crate) mod native {
                         #[cfg(not(test))]
                         let _ = error;
                     })?;
+                #[cfg(test)]
+                if super::super::member_carrier_factory_test_os::state().is_some() {
+                    eprintln!("actual no-C BFE snapshot completed");
+                }
                 for _ in 0..2 {
                     pair.verify_cleanup_entry_for(
                         &self.input.runtime,

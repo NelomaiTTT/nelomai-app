@@ -5224,6 +5224,10 @@ pub(crate) mod native {
                 #[cfg(not(test))]
                 let _ = error;
             })?;
+            #[cfg(test)]
+            if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                eprintln!("actual no-C bind completed");
+            }
             let never = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
@@ -5243,6 +5247,10 @@ pub(crate) mod native {
                                 #[cfg(not(test))]
                                 let _ = error;
                             })?;
+                        #[cfg(test)]
+                        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                            eprintln!("actual no-C Calling continuity completed");
+                        }
                         let lock = self.lock.as_ref().ok_or(Error::Retired)?;
                         let actual = never
                             .read_no_constructor_cleanup(original, expected, lock)
