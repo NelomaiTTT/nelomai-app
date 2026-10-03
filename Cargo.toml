@@ -28,3 +28,9 @@ rust-version = "1.88"
 # Keep checks/assertions enabled; do not alter shipping release profiles.
 [profile.test]
 debug = 0
+
+# The real Windows factory reauthenticates signed installed bytes inside its
+# unchanged 30s native call budget. Use the shipping arithmetic optimization
+# for signature verification; test assertions and every reread stay enabled.
+[profile.test.package.curve25519-dalek]
+opt-level = 3
