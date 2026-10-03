@@ -2212,6 +2212,58 @@ fn closing_record() -> crate::member_carrier_pair::Record {
     record
 }
 
+// Break: Stop of the actual published C before attach selects missing full G,
+// or turns that C into the disjoint no-constructor branch. This exercises the
+// SAME selector used by the native actor, not a substitute coordinator.
+#[test]
+fn published_pregraph_carrier_cleanup_selects_retained_startup_for_each_effect() {
+    use crate::member_carrier_pair::Effect;
+    let mut record = closing_record();
+    record.addresses = vec!["10.7.0.2/32".parse().unwrap()];
+    record.options = Some(nelomai_client_tunnel::DesktopTunnelOptions::default());
+    record.carrier = Some(crate::member_owner::InterfaceProof {
+        guid: [3; 16],
+        index: 73,
+        luid: 117,
+    });
+    for (stage, effect) in [
+        (3, Effect::RestoreWeak),
+        (6, Effect::CarrierAddressDelete),
+        (7, Effect::CarrierSessionEnd),
+        (8, Effect::CarrierClose),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        assert_eq!(
+            carrier_cleanup_route(&record, effect, false).unwrap(),
+            CarrierCleanupRoute::RetainedStartup
+        );
+        assert_eq!(
+            carrier_cleanup_route(&record, effect, true).unwrap(),
+            CarrierCleanupRoute::FullGraph
+        );
+        let mut no_c = record.clone();
+        no_c.carrier = None;
+        assert_eq!(
+            carrier_cleanup_route(&no_c, effect, false).unwrap(),
+            CarrierCleanupRoute::NoConstructorRead
+        );
+        for fault in 0..4 {
+            let mut wrong = record.clone();
+            match fault {
+                0 => wrong.pending = None,
+                1 => wrong.stop_stage = 12,
+                2 => wrong.pending = Some(Effect::FullEmpty),
+                _ => wrong.phase = crate::member_carrier_pair::Phase::Stopped,
+            }
+            assert!(carrier_cleanup_route(&wrong, effect, false).is_err());
+        }
+    }
+    record.stop_stage = 11;
+    record.pending = Some(Effect::RestoreKeys);
+    assert!(carrier_cleanup_route(&record, Effect::RestoreKeys, false).is_err());
+}
+
 #[test]
 fn terminal_factual_cache_advances_to_actual_stopped_and_never_back_to_forward() {
     use crate::member_carrier_pair::Phase;

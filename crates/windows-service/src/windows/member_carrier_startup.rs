@@ -4917,6 +4917,71 @@ pub(crate) mod native {
                 self.continuity(original, expected)
             })
         }
+        fn cleanup_pregraph_carrier(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            effect: pair::Effect,
+        ) -> Result<()> {
+            // Route facts are not native permission. Require the SAME private
+            // invocation and retained original C; Ready independently gates
+            // each actual row/session/handle effect against SDK/Calling/Pair.
+            if !self.create_attempted
+                || self.attach_attempted
+                || self.terminal_attempted
+                || !self.invocation.attempted(true, false)?
+                || expected.carrier.is_none()
+                || expected.carrier != self.proof
+                || self.pins.is_none()
+                || expected.phase != pair::Phase::Closing
+                || expected.pending != Some(effect)
+                || !matches!(
+                    (expected.stop_stage, effect),
+                    (3, pair::Effect::RestoreWeak)
+                        | (6, pair::Effect::CarrierAddressDelete)
+                        | (7, pair::Effect::CarrierSessionEnd)
+                        | (8, pair::Effect::CarrierClose)
+                )
+            {
+                return Err(Error::Conflict);
+            }
+            self.graph
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .require_pristine()?;
+            let supervisor = self.supervisor.clone();
+            let context = self.context.clone();
+            supervisor.run_cleanup(&context, original, || {
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                if !self
+                    .runtime
+                    .matches_lock(self.lock.as_ref().ok_or(Error::Retired)?)
+                {
+                    return Err(Error::Conflict);
+                }
+                self.graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .require_pristine()?;
+                let carrier = self.carrier.as_mut().ok_or(Error::Pending)?;
+                if effect == pair::Effect::RestoreWeak {
+                    carrier.restore_interface_in_call(original.clone(), expected)?;
+                } else {
+                    carrier.cleanup_carrier_in_call(original.clone(), expected)?;
+                }
+                self.graph
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .require_pristine()?;
+                if !self
+                    .runtime
+                    .matches_lock(self.lock.as_ref().ok_or(Error::Retired)?)
+                {
+                    return Err(Error::Conflict);
+                }
+                self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
+            })
+        }
         fn create_ready(
             &mut self,
             original: &Rc<NativePairIntentRead>,

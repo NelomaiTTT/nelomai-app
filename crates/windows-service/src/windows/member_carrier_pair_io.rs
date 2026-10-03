@@ -1041,6 +1041,41 @@ fn require_effect(
     Ok(())
 }
 
+/// Route only, not native permission or a no-constructor proof. Each selected
+/// consumer must independently authenticate its SAME original owner/Calling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CarrierCleanupRoute {
+    NoConstructorRead,
+    RetainedStartup,
+    FullGraph,
+}
+fn carrier_cleanup_route(
+    record: &crate::member_carrier_pair::Record,
+    effect: crate::member_carrier_pair::Effect,
+    graph: bool,
+) -> io::Result<CarrierCleanupRoute> {
+    use crate::member_carrier_pair::{Effect, Phase};
+    require_effect(record, effect)?;
+    if record.phase != Phase::Closing
+        || !matches!(
+            (record.stop_stage, effect),
+            (3, Effect::RestoreWeak)
+                | (6, Effect::CarrierAddressDelete)
+                | (7, Effect::CarrierSessionEnd)
+                | (8, Effect::CarrierClose)
+        )
+    {
+        return Err(conflict());
+    }
+    if graph {
+        Ok(CarrierCleanupRoute::FullGraph)
+    } else if record.carrier.is_none() {
+        Ok(CarrierCleanupRoute::NoConstructorRead)
+    } else {
+        Ok(CarrierCleanupRoute::RetainedStartup)
+    }
+}
+
 #[cfg(any(windows, test))]
 /// Factual callback dispatch ONLY. Stopped/None can request the independent
 /// FullEmpty read; it cannot satisfy require_effect or any native mutation.
@@ -2542,6 +2577,16 @@ pub(crate) mod native {
             preparation: NativeLiveMemberPreparation<'_>,
         ) -> crate::member_carrier::Result<crate::member_owner::Record>;
         fn attest_bootstrap(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            effect: pair::Effect,
+        ) -> crate::member_carrier::Result<()>;
+        /// Actual C owner BEFORE graph attachment. Run the SAME precise
+        /// Closing3/6/7/8 Calling with original Runtime/KeyLock/Pair/private
+        /// invocation, pristine graph and native carrier/row/session gates.
+        /// No absent-graph proof, substitute Never or full-G fabrication.
+        fn cleanup_pregraph_carrier(
             &mut self,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
@@ -6367,6 +6412,42 @@ pub(crate) mod native {
             })
         }
 
+        fn cleanup_pregraph_carrier(
+            &mut self,
+            record: &pair::Record,
+            effect: pair::Effect,
+        ) -> io::Result<()> {
+            let serial = self.serial.clone();
+            serial.run(true, || {
+                if carrier_cleanup_route(record, effect, self.roots.is_some())?
+                    != CarrierCleanupRoute::RetainedStartup
+                    || self.full_capture_attempted
+                    || !self.rejected_inputs.is_empty()
+                    || self.registered
+                    || !self.network_intents.is_empty()
+                    || !self.guard_acks.is_empty()
+                    || self.held.iter().any(Option::is_some)
+                    || self.held_reads.iter().any(Option::is_some)
+                    || self.row_attempted.iter().any(|attempted| *attempted)
+                    || self.row_owners.iter().any(Option::is_some)
+                    || self.row_pins.iter().any(Option::is_some)
+                    || self.row_authorities.iter().any(Option::is_some)
+                    || !self.historical_member_rows.is_empty()
+                    || !self.member_generation_originals.is_empty()
+                {
+                    return Err(conflict());
+                }
+                let pin = self.current(record)?;
+                self.startup
+                    .as_ref()
+                    .ok_or_else(conflict)?
+                    .try_borrow_mut()
+                    .map_err(denied)?
+                    .cleanup_pregraph_carrier(&pin, record, effect)
+                    .map_err(denied)
+            })
+        }
+
         fn stop_c(
             &mut self,
             record: &pair::Record,
@@ -6380,8 +6461,14 @@ pub(crate) mod native {
                 self.serial.fault();
                 return Err(conflict());
             }
-            if self.roots.is_none() && record.carrier.is_none() {
-                return self.read_no_constructor_cleanup(record).map(|_| ());
+            match carrier_cleanup_route(record, effect, self.roots.is_some())? {
+                CarrierCleanupRoute::NoConstructorRead => {
+                    return self.read_no_constructor_cleanup(record).map(|_| ());
+                }
+                CarrierCleanupRoute::RetainedStartup => {
+                    return self.cleanup_pregraph_carrier(record, effect);
+                }
+                CarrierCleanupRoute::FullGraph => {}
             }
             self.in_call(record, |this, pin| {
                 // Advance actual selections BEFORE Close/its first AfterClose
@@ -7756,9 +7843,14 @@ pub(crate) mod native {
         }
 
         pub(crate) fn restore_weak_rows(&mut self, record: &pair::Record) -> io::Result<()> {
-            if self.roots.is_none() && record.carrier.is_none() {
-                require_effect(record, pair::Effect::RestoreWeak)?;
-                return self.read_no_constructor_cleanup(record).map(|_| ());
+            match carrier_cleanup_route(record, pair::Effect::RestoreWeak, self.roots.is_some())? {
+                CarrierCleanupRoute::NoConstructorRead => {
+                    return self.read_no_constructor_cleanup(record).map(|_| ());
+                }
+                CarrierCleanupRoute::RetainedStartup => {
+                    return self.cleanup_pregraph_carrier(record, pair::Effect::RestoreWeak);
+                }
+                CarrierCleanupRoute::FullGraph => {}
             }
             self.in_call(record, |this, pin| {
                 this.select_guard(pin, record)?;
