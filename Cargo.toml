@@ -34,3 +34,11 @@ debug = 0
 # for signature verification; test assertions and every reread stay enabled.
 [profile.test.package.curve25519-dalek]
 opt-level = 3
+
+# Execute the full native lifecycle with optimized runtime/record checks while
+# retaining the test profile's assertions and both unchanged watchdog bounds.
+[profile.test.package.nelomai-contracts]
+opt-level = 1
+
+[profile.test.package.nelomai-windows-service]
+opt-level = 1
