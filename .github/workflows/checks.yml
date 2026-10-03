@@ -204,6 +204,16 @@ jobs:
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
       - run: cargo test -p nelomai-windows-service
+      # Read-only existing HKCU key. Log the actual native in/out-size contract;
+      # this cannot grant SACL access, product key ownership or disposition.
+      - name: Readonly original-key security buffer gate
+        timeout-minutes: 2
+        run: |
+          $tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $selected = @($tests | Where-Object { $_ -match 'native_security_buffer_sizes_readonly_descriptor_without_capacity_padding: test$' })
+          if ($selected.Count -ne 1) { throw 'Expected exactly one readonly security-size gate; no empty-filter PASS' }
+          cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --nocapture --test-threads=1
       # Fresh ephemeral HKCU fixtures only. Explicit opt-in does NOT enable any
       # product deletion path or reuse historical unsafe ignored measurements.
       - name: Isolated original-handle TxR conflict gate

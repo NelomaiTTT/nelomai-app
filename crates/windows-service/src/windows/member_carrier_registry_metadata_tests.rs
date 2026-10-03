@@ -288,6 +288,167 @@ fn registry_metadata_full_native_observation_has_all_fields_before_callback() {
         ]
     );
 }
+
+// Break: use buffer capacity as descriptor length when the successful native
+// fill leaves its in/out length unchanged. Exercise the SAME production OS
+// buffer adapter and complete capture/parser; only native calls are doubled.
+#[test]
+fn registry_metadata_sizes_full_security_before_an_unchanged_length_fill() {
+    struct SizedIo(NativeIo, Vec<&'static str>);
+    impl Queries for SizedIo {
+        fn info(&mut self, out: &mut RawInfo) {
+            self.0.info(out);
+        }
+        fn name(&mut self, out: &mut RawBuffer) {
+            self.0.name(out);
+        }
+        fn security(&mut self, information: u32, out: &mut RawBuffer) {
+            assert_eq!(information, FULL_SECURITY, "never reduce SACL request");
+            out.registry_security_with(|buffer, length| {
+                if let Some(words) = buffer {
+                    self.1.push("fill");
+                    // Native success writes the descriptor, not a padded SD.
+                    let bytes = descriptor();
+                    for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *word = u32::from_le_bytes(bytes.try_into().unwrap());
+                    }
+                    0 // Deliberately leave the input length unchanged.
+                } else {
+                    self.1.push("size");
+                    assert_eq!(*length, 0);
+                    *length = descriptor().len() as u32;
+                    122
+                }
+            });
+        }
+        fn descriptor(
+            &mut self,
+            raw: &RawBuffer,
+            layout: &SecurityLayout,
+            out: &mut DescriptorCheck,
+        ) {
+            self.0.descriptor(raw, layout, out);
+        }
+    }
+    let capture = RegistryMetadataCapture::new();
+    let mut io = SizedIo(NativeIo::good(), Vec::new());
+    capture.read(&mut io, |_| Ok(())).unwrap();
+    assert_eq!(capture.present_data().unwrap().security.raw, descriptor());
+    assert_eq!(io.1, ["size", "fill", "size", "fill"]);
+}
+
+// Break: retry a denied/oversized size query, allocate a requested large
+// buffer, or turn a changed/failed fill into complete security DATA.
+#[test]
+fn registry_security_sizing_denies_unknown_and_changed_native_outputs_without_retry() {
+    for (size_status, required, fill_status, filled, expected_calls) in [
+        (5, 0, 0, 60, 1),
+        (122, 0, 0, 60, 1),
+        (122, 19, 0, 60, 1),
+        (122, 65_537, 0, 60, 1),
+        (0, 60, 0, 60, 1),
+        (122, 60, 122, 80, 2),
+        (122, 60, 5, 60, 2),
+    ] {
+        let mut raw = RawBuffer::new(SECURITY_BYTES);
+        let pointer = raw.words.as_ptr();
+        let mut calls = 0;
+        raw.registry_security_with(|buffer, size| {
+            calls += 1;
+            if buffer.is_none() {
+                assert_eq!(*size, 0);
+                *size = required;
+                size_status
+            } else {
+                assert_eq!(*size, 60);
+                *size = filled;
+                fill_status
+            }
+        });
+        assert_eq!(calls, expected_calls);
+        assert_eq!(raw.words.as_ptr(), pointer, "must keep same bounded buffer");
+        assert_eq!(raw.words.len(), 16_384);
+        assert_eq!(raw.security_size_status, Some(size_status));
+        assert_eq!(raw.security_size_returned, required);
+        assert_eq!(raw.returned, if calls == 1 { required } else { filled });
+        assert_ne!(
+            raw.status,
+            Some(0),
+            "unknown query must not become fill ACK"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_security_buffer_sizes_readonly_descriptor_without_capacity_padding() {
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        Security::{GetSecurityDescriptorLength, IsValidSecurityDescriptor},
+        Storage::FileSystem::READ_CONTROL,
+        System::Registry::{
+            RegCloseKey, RegGetKeySecurity, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+        },
+    };
+    // Read-only characterization of the actual buffer adapter. Mask7 is ONLY
+    // for this query-only HKCU fixture: production still requests full mask15,
+    // and the separate native denial test checks missing SACL access. No
+    // privilege, key/ACL creation or product ownership/effect permission.
+    let path: Vec<u16> = "Software\0".encode_utf16().collect();
+    let mut handle = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | READ_CONTROL,
+                &mut handle,
+            )
+        },
+        ERROR_SUCCESS
+    );
+    struct Held(windows_sys::Win32::System::Registry::HKEY);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { RegCloseKey(self.0) }, ERROR_SUCCESS);
+        }
+    }
+    let original = Held(handle);
+    let mut oversized = RawBuffer::new(SECURITY_BYTES);
+    oversized.status = Some(unsafe {
+        RegGetKeySecurity(
+            original.0,
+            7,
+            oversized.words.as_mut_ptr().cast(),
+            &mut oversized.returned,
+        )
+    } as i32);
+    assert_eq!(oversized.status, Some(0));
+    let descriptor = oversized.words.as_ptr().cast_mut().cast();
+    assert_ne!(unsafe { IsValidSecurityDescriptor(descriptor) }, 0);
+    let oversized_native_length = unsafe { GetSecurityDescriptorLength(descriptor) };
+    assert!((20..=65_536).contains(&oversized_native_length));
+    let mut exact = RawBuffer::new(SECURITY_BYTES);
+    exact.registry_security_with(|buffer, size| unsafe {
+        RegGetKeySecurity(
+            original.0,
+            7,
+            buffer.map_or(std::ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+            size,
+        )
+    } as i32);
+    assert_eq!(exact.security_size_status, Some(122));
+    assert_eq!(exact.status, Some(0));
+    let descriptor = exact.words.as_ptr().cast_mut().cast();
+    assert_ne!(unsafe { IsValidSecurityDescriptor(descriptor) }, 0);
+    let actual = unsafe { GetSecurityDescriptorLength(descriptor) };
+    assert_eq!(exact.returned, actual);
+    assert_eq!(exact.security_size_returned, actual);
+    parse_security(&exact.bytes()[..actual as usize]).unwrap();
+    eprintln!("native-readonly-security-sizing oversized_returned={} oversized_native={} exact_required={} exact_native={actual}; mask7 DATA only, no SACL/product authority",
+        oversized.returned, oversized_native_length, exact.security_size_returned);
+}
 #[test]
 fn registry_metadata_no_sacl_rights_is_pending_with_actual_outputs_retained() {
     let capture = RegistryMetadataCapture::new();

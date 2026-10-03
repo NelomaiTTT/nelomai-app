@@ -241,6 +241,8 @@ struct RawBuffer {
     status: Option<i32>,
     words: Vec<u32>,
     returned: u32,
+    security_size_status: Option<i32>,
+    security_size_returned: u32,
 }
 impl RawBuffer {
     fn new(bytes: usize) -> Self {
@@ -248,12 +250,36 @@ impl RawBuffer {
             status: None,
             words: vec![0; bytes / 4],
             returned: bytes as u32,
+            security_size_status: None,
+            security_size_returned: 0,
         }
     }
     fn bytes(&self) -> &[u8] {
         // Initialized u32 storage is aligned for native structures and all bit
         // patterns are valid bytes. This does not dereference a native pointer.
         unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.words.len() * 4) }
+    }
+    // Both OS calls write directly into retained outputs. A bounded size query
+    // primes the native fill with the descriptor's actual required length,
+    // never the 64KiB allocation capacity. No size-driven allocation/retry or
+    // reduction of the requested security information is performed.
+    #[cfg(any(windows, test))]
+    fn registry_security_with(
+        &mut self,
+        mut query: impl FnMut(Option<&mut [u32]>, &mut u32) -> i32,
+    ) {
+        self.security_size_status = Some(query(None, &mut self.security_size_returned));
+        // Unexpected NULL-buffer success is not the fill's successful ACK.
+        // Preserve that actual return separately; never expose stale/empty
+        // buffer contents as an acquired successful descriptor.
+        self.status = self.security_size_status.filter(|status| *status != 0);
+        self.returned = self.security_size_returned;
+        if self.security_size_status != Some(122)
+            || !(20..=self.words.len() * 4).contains(&(self.security_size_returned as usize))
+        {
+            return;
+        }
+        self.status = Some(query(Some(&mut self.words), &mut self.returned));
     }
     #[cfg(test)]
     fn bytes_mut(&mut self) -> &mut [u8] {
@@ -567,12 +593,12 @@ mod native {
             });
         }
         fn security(&mut self, information: u32, output: &mut RawBuffer) {
-            output.status = Some(unsafe {
+            output.registry_security_with(|buffer, length| unsafe {
                 RegGetKeySecurity(
                     self.handle,
                     information,
-                    output.words.as_mut_ptr().cast(),
-                    &mut output.returned,
+                    buffer.map_or(std::ptr::null_mut(), |b| b.as_mut_ptr().cast()),
+                    length,
                 )
             } as i32);
         }
