@@ -2,6 +2,87 @@
 // Only registry effects and the independent native-authority boundary are fake.
 use super::*;
 
+// Test stimulus only, never a carrier effect capability. Reduce one existing
+// ALLOW mask; never add rights, reduce a DENY, change ACE/SID/order/control, or
+// mutate caller bytes. Native callers retain this aligned copy before the IO.
+fn restricted_probe_descriptor(original: &[u8]) -> Result<Vec<u32>> {
+    if !(28..=4096).contains(&original.len()) || original[0] != 1 {
+        return Err(Error::Invalid);
+    }
+    let word = |at: usize| -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            original
+                .get(at..at + 4)
+                .ok_or(Error::Invalid)?
+                .try_into()
+                .map_err(|_| Error::Invalid)?,
+        ))
+    };
+    let control = u16::from_le_bytes(original[2..4].try_into().map_err(|_| Error::Invalid)?);
+    let dacl = word(16)? as usize;
+    if control & 0x8004 != 0x8004 || dacl < 20 || dacl % 4 != 0 {
+        return Err(Error::Invalid);
+    }
+    let header = original.get(dacl..dacl + 8).ok_or(Error::Invalid)?;
+    if ![2, 4].contains(&header[0]) {
+        return Err(Error::Invalid);
+    }
+    let end = dacl
+        .checked_add(u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize)
+        .filter(|end| *end <= original.len())
+        .ok_or(Error::Invalid)?;
+    let count = u16::from_le_bytes(header[4..6].try_into().unwrap());
+    let mut cursor = dacl + 8;
+    let mut selected = None;
+    for _ in 0..count {
+        let ace = original.get(cursor..cursor + 8).ok_or(Error::Invalid)?;
+        let size = u16::from_le_bytes(ace[2..4].try_into().unwrap()) as usize;
+        if size < 8 || size % 4 != 0 || cursor.checked_add(size).is_none_or(|next| next > end) {
+            return Err(Error::Invalid);
+        }
+        let mask = word(cursor + 4)?;
+        if selected.is_none() && ace[0] == 0 && mask & 1 != 0 {
+            selected = Some((cursor + 4, mask & !1));
+        }
+        cursor += size;
+    }
+    if cursor > end {
+        return Err(Error::Invalid);
+    }
+    let (offset, mask) = selected.ok_or(Error::Invalid)?;
+    let mut words = vec![0u32; 1024];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 4) };
+    bytes[..original.len()].copy_from_slice(original);
+    bytes[offset..offset + 4].copy_from_slice(&mask.to_le_bytes());
+    Ok(words)
+}
+
+#[test]
+fn security_probe_stimulus_restricts_allow_only_and_preserves_all_other_bytes() {
+    // Two literal ACEs: DENY query and ALLOW query/set. Only reducing an ALLOW
+    // mask is acceptable; reducing DENY would broaden access to the fixture.
+    let descriptor = vec![
+        1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 2, 0, 48, 0, 2, 0, 0, 0, 1,
+        0, 20, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0, 0, 0, 20, 0, 3, 0, 0, 0, 1, 1,
+        0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+    ];
+    let mut expected = descriptor.clone();
+    expected[52] = 2; // Remove KEY_QUERY_VALUE, retain KEY_SET_VALUE.
+    let words = restricted_probe_descriptor(&descriptor).unwrap();
+    let actual =
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), descriptor.len()) };
+    assert_eq!(actual, expected);
+    assert_ne!(actual, descriptor);
+    for invalid in [Vec::new(), descriptor[..40].to_vec(), {
+        let mut no_allow = descriptor.clone();
+        no_allow[48] = 1; // Both DENY; cannot manufacture a grant or drop ACE.
+        no_allow
+    }] {
+        assert!(restricted_probe_descriptor(&invalid).is_err());
+    }
+}
+
 #[test]
 fn terminal_hkey_native_ack_is_retained_before_postflight_and_never_repeated() {
     // Break: storing close success only after postflight loses a real native
@@ -2705,7 +2786,6 @@ mod txr_native_measurement {
             },
             Security::{
                 DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-                PROTECTED_DACL_SECURITY_INFORMATION,
             },
             Storage::FileSystem::{CommitTransaction, CreateTransaction, RollbackTransaction},
             System::Registry::*,
@@ -3318,6 +3398,49 @@ mod txr_native_measurement {
             c.close(phase, |_| Ok(()), || Ok(())).unwrap();
         }
     }
+    fn dacl_bytes(bytes: &[u8]) -> Vec<u8> {
+        let start = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        assert!(start >= 20);
+        let len = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap()) as usize;
+        bytes[start..start + len].to_vec()
+    }
+    fn descriptor_bytes(words: &[u32]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 4) }
+    }
+    fn real_security_mutation_control() {
+        let mut p = Probe::uncreated();
+        p.create_native();
+        let original = metadata(p.original);
+        let mut changed = super::restricted_probe_descriptor(&original.security).unwrap();
+        let expected_dacl = dacl_bytes(descriptor_bytes(&changed));
+        let write = unsafe {
+            RegSetKeySecurity(
+                p.original,
+                DACL_SECURITY_INFORMATION,
+                changed.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(write, NO_ERROR);
+        let actual = metadata(p.original);
+        let actual_name = name(p.original);
+        // No transaction exists in this independent positive stimulus control.
+        // Close ONLY its two real original handles, once, with actual ACKs.
+        for (index, handle) in [(1, p.original), (3, p.parent)] {
+            assert!(!p.close_attempted[index]);
+            p.close_attempted[index] = true;
+            p.close_ack[index] = unsafe { RegCloseKey(handle) } == NO_ERROR;
+            assert!(
+                p.close_ack[index],
+                "unknown positive-control close; no retry"
+            );
+        }
+        assert_ne!(dacl_bytes(&original.security), expected_dacl);
+        assert_eq!(dacl_bytes(&actual.security), expected_dacl);
+        assert_eq!(actual_name, p.expected);
+        assert_eq!(actual.class, original.class);
+        assert_eq!((actual.values, actual.subkeys), (0, 0));
+        eprintln!("security-only-DACL restrictive stimulus control: real-change=true original/parent-close-ACK=true; no transaction or product authority");
+    }
     // Critical-path measurement, not a carrier issuer: can a transaction on
     // an already-empty original be write-enlisted WITHOUT a visible seed?
     // The historical native seed-outside/delete-inside result does not prove
@@ -3391,35 +3514,31 @@ mod txr_native_measurement {
         assert_eq!(enlisted.security, original.security);
         assert_eq!(enlisted.class, original.class);
         assert_eq!(metadata(s.probe.transactional), enlisted);
-        // The DACL mutation uses only THIS fresh own original's captured
-        // descriptor. No new ACE/access grant, inheritance propagation,
+        // The DACL mutation REDUCES one existing ALLOW mask in THIS fresh own
+        // original's captured descriptor. No new ACE/access grant/deny reduction,
+        // inheritance-control mutation/propagation,
         // parent/system/token change or named security API. Keep the copied
         // descriptor aligned and alive across the syscall. Never read the
         // nontransacted original inside the active TxR window merely to prove
         // the writer: that read could abort the transaction and mask the race.
-        let mut security_descriptor = [0u32; 1024];
-        let security_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                security_descriptor.as_mut_ptr().cast::<u8>(),
-                std::mem::size_of_val(&security_descriptor),
-            )
-        };
-        security_bytes[..original.security.len()].copy_from_slice(&original.security);
-        if security_only {
+        let mut security_descriptor = if security_only {
             assert!(matches!(race, RelativeRace::None));
-            assert_eq!(
-                u16::from_le_bytes(original.security[2..4].try_into().unwrap()) & 0x1000,
-                0,
-                "fresh inherited-DACL control required; no smaller mutation fallback"
-            );
-        }
+            super::restricted_probe_descriptor(&original.security).unwrap()
+        } else {
+            vec![0u32; 1024]
+        };
+        let expected_dacl = if security_only {
+            Some(dacl_bytes(descriptor_bytes(&security_descriptor)))
+        } else {
+            None
+        };
         let mut interleave = |s: &mut RelativeSlots| {
             if security_only {
                 assert!(s.race_status.is_none());
                 s.race_status = Some(unsafe {
                     RegSetKeySecurity(
                         s.probe.original,
-                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        DACL_SECURITY_INFORMATION,
                         security_descriptor.as_mut_ptr().cast(),
                     )
                 });
@@ -3511,24 +3630,14 @@ mod txr_native_measurement {
             let preserved = metadata(s.probe.original);
             if security_only {
                 assert_ne!(
-                    preserved.security, original.security,
+                    dacl_bytes(&preserved.security),
+                    dacl_bytes(&original.security),
                     "accepted security writer must have made a REAL retained change"
                 );
                 assert_eq!(
-                    u16::from_le_bytes(preserved.security[2..4].try_into().unwrap()) & 0x1000,
-                    0x1000
-                );
-                let dacl = |bytes: &[u8]| {
-                    let start = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-                    assert!(start >= 20);
-                    let len = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap())
-                        as usize;
-                    bytes[start..start + len].to_vec()
-                };
-                assert_eq!(
-                    dacl(&preserved.security),
-                    dacl(&original.security),
-                    "no broadened or lost ACE is allowed in this own fixture"
+                    dacl_bytes(&preserved.security),
+                    expected_dacl.unwrap(),
+                    "the exact restrictive DACL must survive real rollback"
                 );
                 assert_eq!((preserved.values, preserved.subkeys), (0, 0));
                 assert_eq!(preserved.class, original.class);
@@ -3572,6 +3681,7 @@ mod txr_native_measurement {
     #[test]
     #[ignore = "Isolated CI only: fresh OWN-HKCU no-net-change TxR conflict gate, NOT product/SACL proof"]
     fn txr_transient_enlist_isolated_gate() {
+        real_security_mutation_control();
         transient_enlist_measurement(RelativeRace::None, false);
         for race in [
             RelativeRace::Value,
