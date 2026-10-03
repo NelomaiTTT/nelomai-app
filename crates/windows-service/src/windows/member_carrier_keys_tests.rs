@@ -212,6 +212,8 @@ struct State {
     subkeys: BTreeMap<(u64, String), ()>,
     names: BTreeMap<u64, String>,
     path: Option<u64>,
+    birth_reads: usize,
+    birth_access_denied: bool,
     next: u64,
     writes: usize,
     fail_flush: bool,
@@ -269,6 +271,15 @@ impl NativeAuthority for Authority {
 }
 impl RegistryKernel for Kernel {
     type Handle = u64;
+    fn birth_interfaces(&mut self) -> Result<u64> {
+        let mut state = self.0.borrow_mut();
+        state.birth_reads += 1;
+        if state.birth_access_denied {
+            return Err(Error::Pending);
+        }
+        drop(state);
+        self.interfaces()
+    }
     fn interfaces(&mut self) -> Result<u64> {
         Ok(1)
     }
@@ -396,6 +407,52 @@ fn setup() -> (Keys<Kernel, Authority>, Shared) {
         Keys::new(Kernel(shared.clone()), Authority(shared.clone()), context()),
         shared,
     )
+}
+
+#[test]
+fn original_birth_requires_full_read_security_without_mutation_or_query_fallback() {
+    // Actual native producer uses this mask. No DELETE/WRITE_DAC/WRITE_OWNER
+    // permission follows from metadata; a later root issuer stays separate.
+    assert_eq!(original_key_security_access(), 0x0102_0000);
+    for denied in [false, true] {
+        let (mut io, state) = setup();
+        let record = pending();
+        let binding = &record.context.bindings[0];
+        state.borrow_mut().birth_access_denied = denied;
+        // Existing read-only/no-C cleanup must NOT acquire SACL privilege.
+        let facts = io.inspect(&mut true, &record, binding, None, 1).unwrap();
+        assert_eq!(state.borrow().birth_reads, 0);
+        let created = io.create_new_key(&mut true, &record, binding, &facts);
+        assert_eq!(created.is_ok(), !denied);
+        assert_eq!(state.borrow().birth_reads, 1);
+        if denied {
+            assert!(state.borrow().path.is_none());
+            assert_eq!(
+                state.borrow().next,
+                10,
+                "no native child creation before prerequisite"
+            );
+            assert_eq!(state.borrow().writes, 0);
+            assert!(io.pending_original_key_obligation().is_err());
+            io.inspect(&mut true, &record, binding, None, 2).unwrap();
+            assert_eq!(
+                state.borrow().birth_reads,
+                1,
+                "no lesser birth access retry"
+            );
+        }
+    }
+}
+
+#[test]
+fn original_birth_uses_distinct_complete_metadata_prerequisite_before_create() {
+    let (mut io, state) = setup();
+    let record = pending();
+    let binding = &record.context.bindings[0];
+    let facts = io.inspect(&mut true, &record, binding, None, 1).unwrap();
+    io.create_new_key(&mut true, &record, binding, &facts)
+        .unwrap();
+    assert_eq!(state.borrow().birth_reads, 1);
 }
 
 #[test]

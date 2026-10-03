@@ -470,6 +470,11 @@ const MAX_NAME: usize = 2048;
 // Native pacing is 25ms, at most forty waits (1s). The caller's independent
 // hard deadline and original terminal fence remain mandatory around each read.
 const MAX_TERMINAL_KEY_READS: usize = 41;
+// Rights needed by the SAME original's complete security observation. The
+// native birth supplier consumes this policy; ordinary absence reads do not.
+fn original_key_security_access() -> u32 {
+    0x0002_0000 | 0x0100_0000 // READ_CONTROL | ACCESS_SYSTEM_SECURITY
+}
 pub(crate) fn decode_value(kind: u32, bytes: &[u8]) -> Result<NativeValue> {
     if bytes.len() > 256 {
         return Err(Error::Invalid);
@@ -588,6 +593,12 @@ pub(crate) fn effect_matches_storage(
 pub(crate) trait RegistryKernel {
     type Handle;
     fn interfaces(&mut self) -> Result<Self::Handle>;
+    /// Read-only birth prerequisite, distinct from ordinary key absence.
+    /// Native implementations must obtain complete original metadata rights
+    /// BEFORE creating any child. Denial must not fall back to a lesser mask.
+    fn birth_interfaces(&mut self) -> Result<Self::Handle> {
+        self.interfaces()
+    }
     fn name(&mut self, handle: &Self::Handle) -> Result<String>;
     fn open(&mut self, parent: &Self::Handle, child: &str) -> Result<Option<Self::Handle>>;
     fn create(&mut self, parent: &Self::Handle, child: &str) -> Result<(Self::Handle, u32)>;
@@ -1323,6 +1334,13 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
     }
     fn parent(&mut self) -> Result<(K::Handle, String)> {
         let handle = self.kernel.interfaces()?;
+        self.checked_parent(handle)
+    }
+    fn birth_parent(&mut self) -> Result<(K::Handle, String)> {
+        let handle = self.kernel.birth_interfaces()?;
+        self.checked_parent(handle)
+    }
+    fn checked_parent(&mut self, handle: K::Handle) -> Result<(K::Handle, String)> {
         let name = self.kernel.name(&handle)?;
         if !parent_valid(&name) {
             return Err(Error::Conflict);
@@ -1521,7 +1539,7 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         if fresh.key != KeyPresence::Absent || fresh.value != NativeValue::Absent {
             return Err(Error::Conflict);
         }
-        let (parent, parent_name) = self.parent()?;
+        let (parent, parent_name) = self.birth_parent()?;
         let child = Self::child(binding)?.to_owned();
         // Complete allocating metadata BEFORE a native owning handle exists.
         let key_context = self.context.clone();
@@ -1836,6 +1854,26 @@ pub(crate) mod win32 {
                 h,
             )
         }
+        fn birth_interfaces(&mut self) -> Result<Handle> {
+            let p = wide(PARENT)?;
+            let mut h = ptr::null_mut();
+            // This non-mutating open is BEFORE RegCreateKeyEx. Require the
+            // current token's complete metadata access now, never create an
+            // original whose rights guarantee a later SACL denial. No token
+            // privilege/ACL change or retry with fewer rights is performed.
+            owned(
+                unsafe {
+                    RegOpenKeyExW(
+                        HKEY_LOCAL_MACHINE,
+                        p.as_ptr(),
+                        0,
+                        KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | original_key_security_access(),
+                        &mut h,
+                    )
+                },
+                h,
+            )
+        }
         fn name(&mut self, h: &Handle) -> Result<String> {
             // Fixed aligned buffer, never use attacker-controlled required size
             // to allocate. Native result excludes a terminating WCHAR.
@@ -1886,7 +1924,7 @@ pub(crate) mod win32 {
                     0,
                     ptr::null(),
                     REG_OPTION_NON_VOLATILE,
-                    KEY_QUERY_VALUE | KEY_SET_VALUE,
+                    KEY_QUERY_VALUE | KEY_SET_VALUE | original_key_security_access(),
                     ptr::null(),
                     &mut h,
                     &mut disposition,
