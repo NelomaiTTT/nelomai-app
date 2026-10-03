@@ -618,9 +618,12 @@ mod tests {
 
         thread::sleep(Duration::from_millis(100));
         let first = thread::spawn(|| exchange_blocking(Request::version()));
+        // accept includes the real cold executable digest before signaling.
+        // Use the existing exchange budget, not a shorter fixture-only bound.
+        // The client's pipe-connect deadline and all auth guards are unchanged.
         accepted_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("first request accepted");
+            .recv_timeout(super::PIPE_EXCHANGE_TIMEOUT)
+            .expect("first request accepted within exchange budget");
         let second = exchange_blocking(Request::version()).expect("wait for the pipe instance");
 
         assert_eq!(second.service_version.as_deref(), Some("test-1"));
