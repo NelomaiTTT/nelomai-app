@@ -5,6 +5,145 @@ use crate::member_carrier_pair::tests::{
     ConstructionFault, StartupTransferFixture, StartupTransferOwner,
 };
 
+// Break: replay a failed cleanup handoff, discard an original initialization
+// ACK, or synthesize Pair/Stopped/native permissions from cleanup selection.
+#[test]
+fn pre_pair_cleanup_selects_original_initialized_journal_once_and_preserves_unknown_ack() {
+    use crate::member_carrier_native_ownership::PendingNativeOwnership;
+    #[cfg(not(windows))]
+    use crate::member_files::{PrivateFile, PrivateRecords, SessionFileIo};
+    #[cfg(not(windows))]
+    use crate::member_session as files_api;
+    #[cfg(windows)]
+    use crate::windows::member_files::{PrivateFile, PrivateRecords, SessionFileIo};
+    #[cfg(windows)]
+    use crate::windows::member_session as files_api;
+    use files_api::{
+        ProtectedSessionFiles, RecordKind, SessionFiles, WindowsNativeCarrierReceiptStore,
+    };
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        panic::{catch_unwind, AssertUnwindSafe},
+        rc::Rc,
+    };
+
+    #[derive(Clone, Default)]
+    struct Disk {
+        records: Rc<RefCell<BTreeMap<PrivateFile, Vec<u8>>>>,
+        failure: Rc<RefCell<Option<u8>>>,
+    }
+    impl PrivateRecords for Disk {
+        fn read(&mut self, file: PrivateFile) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.records.borrow().get(&file).cloned())
+        }
+        fn compare_exchange(
+            &mut self,
+            file: PrivateFile,
+            expected: Option<&[u8]>,
+            desired: &[u8],
+        ) -> std::io::Result<()> {
+            if self.records.borrow().get(&file).map(Vec::as_slice) != expected {
+                return Err(std::io::Error::other("foreign original"));
+            }
+            let failure = self.failure.borrow_mut().take();
+            if failure != Some(1) {
+                self.records.borrow_mut().insert(file, desired.to_vec());
+            }
+            match failure {
+                Some(1 | 2) => Err(std::io::Error::other("publication ACK missing")),
+                Some(3) => panic!("publication return lost"),
+                _ => Ok(()),
+            }
+        }
+    }
+    impl SessionFileIo for Disk {
+        fn transaction<T>(
+            &mut self,
+            action: impl FnOnce(&mut dyn PrivateRecords) -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            action(self)
+        }
+    }
+
+    for failure in 0..4 {
+        let logical = "[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.11:51820\n";
+        let paths = paths();
+        let mut provenance = provenance();
+        provenance.network_epoch = 1;
+        let context =
+            requested_context(&scope(), &provenance, logical, [&paths[0], &paths[1]]).unwrap();
+        let disk = Disk::default();
+        let mut files = ProtectedSessionFiles::new(
+            disk.clone(),
+            context.provenance.runtime.clone(),
+            context.provenance.boot_id,
+        )
+        .unwrap();
+        files.claim(&context.intent.scope).unwrap();
+        let (journal, saved) =
+            WindowsNativeCarrierReceiptStore::open(files.clone(), context.clone()).unwrap();
+        assert!(saved.is_none());
+        let mut original = PendingNativeOwnership::new(context.clone(), journal);
+        *disk.failure.borrow_mut() = (failure != 0).then_some(failure);
+        let initialized = catch_unwind(AssertUnwindSafe(|| original.initialize()));
+        assert_eq!(matches!(initialized, Ok(Ok(_))), failure == 0);
+        let before = disk.records.borrow().clone();
+        let state = TerminalCallState::new();
+        let mut attempted = false;
+        let mut data = None;
+        let result =
+            run_pre_pair_cleanup_selection(std::mem::replace(&mut attempted, true), &state, || {
+                let pin = original.read_pin()?; // actual original ACK, never a bool
+                pin.inspect_original_initial_cleanup(&context, |journal, acknowledged| {
+                    let canonical = files
+                        .recovery_view(context.intent.scope.runtime)
+                        .map_err(|_| Error::Journal)?
+                        .ok_or(Error::Pending)?
+                        .0;
+                    journal
+                        .enter_original_initial_cleanup(canonical)
+                        .map_err(|_| Error::Journal)?;
+                    let held = journal
+                        .original_initial_data_read()
+                        .map_err(|_| Error::Journal)?;
+                    assert_eq!(held.acknowledged(), acknowledged);
+                    data = Some(held);
+                    Ok(())
+                })
+            });
+        assert_eq!(result.is_ok(), failure == 0);
+        assert_eq!(data.is_some(), failure == 0);
+        assert_eq!(
+            disk.records.borrow().clone(),
+            before,
+            "cleanup cannot invent any publication"
+        );
+        let pair = files.read(&context.intent.scope, RecordKind::Pair);
+        if failure == 3 {
+            assert!(
+                pair.is_err(),
+                "an interrupted private transaction stays unknown"
+            );
+        } else {
+            assert!(pair.unwrap().is_none());
+        }
+        let repeated =
+            run_pre_pair_cleanup_selection(std::mem::replace(&mut attempted, true), &state, || {
+                panic!("do not replay original-J handoff")
+            });
+        assert_eq!(repeated.is_ok(), failure == 0);
+        if let Some(data) = data {
+            let (reopened, _) = WindowsNativeCarrierReceiptStore::open(files, context).unwrap();
+            assert!(
+                reopened.original_initial_data_read().is_err(),
+                "equal data cannot adopt the original initialization ACK"
+            );
+            assert_eq!(data.acknowledged().generation, 1);
+        }
+    }
+}
+
 #[test]
 fn module_only_cleanup_repeats_fresh_reads_but_never_retries_failed_calls() {
     use std::{

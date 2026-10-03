@@ -91,6 +91,30 @@ impl CarrierPairPreparation<NativeCarrierPairIo<'static>, NativePairJournal>
             destination,
         )
     }
+    fn begin_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if *scope != self.scope || self.io.is_some() || self.journal.is_some() {
+            return Err(pending());
+        }
+        let startup = self.startup.as_mut().ok_or_else(pending)?;
+        startup
+            .begin_cleanup_before_pair(scope)
+            .map_err(|_| pending())?;
+        // Select only this Startup's actual initialized NoC root. It still
+        // cannot retire DATA until the original whole native disposition binds
+        // an outcome. Unknown initialization never produces this handle.
+        let original = startup
+            .initial_data_retirement_root()
+            .map_err(|_| pending())?;
+        let mut retained = self.retirement.try_borrow_mut().map_err(|_| pending())?;
+        match retained.as_ref() {
+            Some(existing) if !Rc::ptr_eq(existing, &original) => Err(pending()),
+            Some(_) => Ok(()),
+            None => {
+                *retained = Some(original);
+                Ok(())
+            }
+        }
+    }
 }
 
 pub(crate) struct NativeCarrierSessionStore {

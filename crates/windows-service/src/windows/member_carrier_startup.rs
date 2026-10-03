@@ -14,6 +14,22 @@ use nelomai_client_tunnel::{redundancy::SessionScope, TunnelTransport};
 use nelomai_contracts::dispatcher::TunnelSlot;
 use std::path::Path;
 
+/// Cleanup selection only. The original initialized journal and its ACK remain
+/// mandatory inside `select`; completion of this call grants no native absence,
+/// owner disposal, Pair phase or initial-DATA retirement permission.
+fn run_pre_pair_cleanup_selection(
+    already_attempted: bool,
+    state: &TerminalCallState,
+    select: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if already_attempted {
+        return state.verify().map_err(|_| Error::Retired);
+    }
+    state
+        .run(|| select().map_err(|_| std::io::Error::other("pre_pair_cleanup_selection")))
+        .map_err(|_| Error::Retired)
+}
+
 /// Ownership transfer ONLY. The cold callback is the existing infallible native
 /// cold actor composition: no journal/native IO, fallible output or postflight.
 /// Every converted owner is in a caller slot before Pair publication; Err or
@@ -828,6 +844,8 @@ pub(crate) mod native {
         initial_noc: Option<Rc<NativeInitialAssemblyNoCRead>>,
         initial_data_retirement: Option<Rc<NativeNoCInitialDataRetirement>>,
         initial_cleanup_attempted: bool,
+        pre_pair_cleanup_attempted: bool,
+        pre_pair_cleanup: Rc<TerminalCallState>,
         carrier: Option<NativeCarrierRoot<'static>>,
         pins: Option<NativeCarrierPins>,
         proof: Option<crate::member_owner::InterfaceProof>,
@@ -3018,6 +3036,8 @@ pub(crate) mod native {
                 initial_noc: None,
                 initial_data_retirement: None,
                 initial_cleanup_attempted: false,
+                pre_pair_cleanup_attempted: false,
+                pre_pair_cleanup: Rc::new(TerminalCallState::new()),
                 carrier: Some(NativeCarrierRoot::empty()),
                 pins: None,
                 proof: None,
@@ -3135,6 +3155,34 @@ pub(crate) mod native {
                 .as_ref()
                 .cloned()
                 .ok_or(Error::Pending)
+        }
+        /// Explicit cleanup selection of this retained, pre-Pair owner. The
+        /// SAME runtime revokes forward storage before fallible private reads;
+        /// an initialized journal hands off through its original NoC supplier.
+        /// No Pair record, native absence or terminal disposal ACK is created.
+        pub(crate) fn begin_cleanup_before_pair(&mut self, scope: &SessionScope) -> Result<()> {
+            if *scope != self.context.intent.scope
+                || self.create_attempted
+                || self.attach_attempted
+                || self.birth_attempted
+                || self.terminal_attempted
+            {
+                return Err(Error::Conflict);
+            }
+            let state = self.pre_pair_cleanup.clone();
+            run_pre_pair_cleanup_selection(
+                std::mem::replace(&mut self.pre_pair_cleanup_attempted, true),
+                &state,
+                || {
+                    use crate::member_carrier_pair::PairJournal;
+                    self.store
+                        .try_borrow_mut()
+                        .map_err(|_| Error::Conflict)?
+                        .begin_cleanup(scope)
+                        .map_err(|_| Error::Journal)?;
+                    self.bind_initial_noc_cleanup()
+                },
+            )
         }
         pub(crate) fn context(&self) -> &Context {
             &self.context

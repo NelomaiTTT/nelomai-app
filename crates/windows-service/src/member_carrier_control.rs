@@ -30,6 +30,12 @@ pub(crate) trait CarrierPairPreparation<I: CarrierPairIo, J: PairJournal> {
         &mut self,
         destination: &mut Option<CarrierNativePair<I, J>>,
     ) -> io::Result<()>;
+    /// Select cleanup through the SAME retained cold owner when no Pair was
+    /// constructed. Success acknowledges storage selection only; it cannot
+    /// replace the native finalizer's whole disposition or DATA retirement.
+    fn begin_cleanup_before_pair(&mut self, _scope: &SessionScope) -> io::Result<()> {
+        Err(conflict())
+    }
 }
 pub(crate) struct CarrierPairControl<I: CarrierPairIo, J: PairJournal, F> {
     pair: Option<CarrierNativePair<I, J>>,
@@ -189,6 +195,7 @@ fn pregraph_continuation_survives_actor_release_without_selecting_other_lanes() 
     assert!(!continue_pregraph_terminal(false, false));
     assert!(!continue_pregraph_terminal(false, true));
 }
+
 impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> CarrierPairControl<I, J, F> {
     pub(crate) fn new(pair: CarrierNativePair<I, J>, finalizer: F) -> Self {
         let scope = pair.snapshot().scope.clone();
@@ -280,12 +287,16 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> NativePair
         if !self.preparation_attempted {
             // Direct native users without SessionControl still need their
             // cold owner. Product prepares it before Starting publication.
-            let preparation = self.initialize();
-            if self.pair.is_none() {
-                return preparation.and(Err(conflict()));
-            }
+            let _ = self.initialize();
         }
         if self.pair.is_none() && !self.preparation_completed {
+            self.preparation
+                .as_mut()
+                .ok_or_else(conflict)?
+                .begin_cleanup_before_pair(scope)?;
+            // This is only the cold owner's authenticated storage handoff.
+            // Existing native disposal requires original Pair/Calling receipts;
+            // neither an absent Pair nor a successful handoff supplies them.
             return Err(conflict());
         }
         if let Some(original) = self.pair.as_mut() {
@@ -350,6 +361,217 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> PairContro
             true
         } else {
             self.pair.as_ref().is_none_or(PairControl::cleanup_pending)
+        }
+    }
+}
+
+#[cfg(test)]
+mod pre_pair_tests {
+    use super::*;
+    use crate::member_carrier_pair::tests::{
+        ConstructionDisk, ConstructionFault, Io, StartupTransferFixture,
+    };
+    use std::{
+        cell::{Cell, RefCell},
+        panic::{catch_unwind, AssertUnwindSafe},
+        rc::Rc,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        Error,
+        Unwind,
+    }
+    struct Preparation {
+        original: Rc<RefCell<StartupTransferFixture>>,
+        prepare_failure: Failure,
+        cleanup_failure: Option<Failure>,
+        preparations: Rc<Cell<usize>>,
+        cleanups: Rc<Cell<usize>>,
+    }
+    impl CarrierPairPreparation<Io, ConstructionDisk> for Preparation {
+        fn prepare_retained_into(
+            &mut self,
+            destination: &mut Option<CarrierNativePair<Io, ConstructionDisk>>,
+        ) -> io::Result<()> {
+            assert!(destination.is_none());
+            // The existing fixture retains the actual cold original; none of
+            // these OS-boundary failures may publish a replacement Pair.
+            self.original.borrow().assert_untouched();
+            self.preparations.set(self.preparations.get() + 1);
+            match self.prepare_failure {
+                Failure::Error => Err(conflict()),
+                Failure::Unwind => panic!("cold publication interrupted"),
+            }
+        }
+        fn begin_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
+            let original = self.original.borrow();
+            original.assert_untouched();
+            assert_eq!(&original.startup.as_ref().unwrap().scope, scope);
+            self.cleanups.set(self.cleanups.get() + 1);
+            match self.cleanup_failure {
+                Some(Failure::Error) => Err(conflict()),
+                Some(Failure::Unwind) => panic!("cleanup selection interrupted"),
+                None => Ok(()), // storage selection alone is not native disposal
+            }
+        }
+    }
+    struct NoPairFinalizer;
+    impl CarrierPairFinalizer<Io, ConstructionDisk> for NoPairFinalizer {
+        fn finish(
+            &mut self,
+            _: &mut Option<CarrierNativePair<Io, ConstructionDisk>>,
+            _: &SessionScope,
+        ) -> io::Result<()> {
+            panic!("Pair finalization cannot adopt a before-Pair owner")
+        }
+    }
+
+    // Break: skip the retained provider after Err/unwind, replay preparation,
+    // use a foreign scope, or turn cleanup selection into terminal success.
+    #[test]
+    fn failed_pre_pair_preparation_reaches_same_cleanup_owner_without_terminal_permission() {
+        for preparation_failure in [Failure::Error, Failure::Unwind] {
+            for cleanup_failure in [None, Some(Failure::Error), Some(Failure::Unwind)] {
+                let original = Rc::new(RefCell::new(StartupTransferFixture::new(
+                    ConstructionFault::None,
+                )));
+                let scope = original.borrow().startup.as_ref().unwrap().scope.clone();
+                let preparations = Rc::new(Cell::new(0));
+                let cleanups = Rc::new(Cell::new(0));
+                let mut control = CarrierPairControl::from_preparation(
+                    scope.clone(),
+                    Box::new(Preparation {
+                        original: original.clone(),
+                        prepare_failure: preparation_failure,
+                        cleanup_failure,
+                        preparations: preparations.clone(),
+                        cleanups: cleanups.clone(),
+                    }),
+                    NoPairFinalizer,
+                );
+                let result = catch_unwind(AssertUnwindSafe(|| control.prepare_session(&scope)));
+                assert!(!matches!(result, Ok(Ok(()))));
+                let mut foreign = scope.clone();
+                foreign.connection_generation += 1;
+                assert!(control.close(&foreign).is_err());
+                assert_eq!(cleanups.get(), 0);
+                let result = catch_unwind(AssertUnwindSafe(|| control.close(&scope)));
+                assert!(!matches!(result, Ok(Ok(()))));
+                assert_eq!(cleanups.get(), 1, "retained cleanup provider was skipped");
+                assert!(control.cleanup_pending());
+                assert!(control.prepare_session(&scope).is_err());
+                assert!(control.check_integrity().is_err());
+                assert_eq!(preparations.get(), 1);
+                original.borrow().assert_untouched();
+            }
+        }
+    }
+
+    #[test]
+    fn session_control_keeps_pre_pair_original_on_failed_prepare_and_scoped_stop() {
+        use nelomai_client_tunnel::{
+            redundancy::{
+                control::SessionControl,
+                driver::SessionStore,
+                protocol::Command,
+                session::{SessionPhase, SessionSnapshot},
+            },
+            TunnelConfiguration,
+        };
+        struct Store(Rc<RefCell<Vec<SessionSnapshot>>>);
+        impl SessionStore for Store {
+            fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
+                self.0.borrow_mut().push(snapshot.clone());
+                Ok(())
+            }
+        }
+        for failure in [Failure::Error, Failure::Unwind] {
+            let original = Rc::new(RefCell::new(StartupTransferFixture::new(
+                ConstructionFault::None,
+            )));
+            let scope = original.borrow().startup.as_ref().unwrap().scope.clone();
+            let preparations = Rc::new(Cell::new(0));
+            let cleanups = Rc::new(Cell::new(0));
+            let records = Rc::new(RefCell::new(Vec::new()));
+            let command = Command::Start {
+                scope: scope.clone(),
+                primary: Member {
+                    slot: Slot::A,
+                    lease_id: "22222222-2222-4222-8222-222222222222".into(),
+                    configuration: TunnelConfiguration::new("software fixture".into()),
+                    probe: nelomai_contracts::RedundantHealthProbe {
+                        kind: nelomai_contracts::HealthProbeKind::DnsA,
+                        target_ipv4: "192.0.2.11".parse().unwrap(),
+                        query_name: "example.com".into(),
+                        timeout_ms: 2000,
+                    },
+                },
+                role_generation: 1,
+                membership_generation: 1,
+                warm_stop_v1: true,
+                options: DesktopTunnelOptions::default(),
+            };
+            let mut native = Some(CarrierPairControl::from_preparation(
+                scope.clone(),
+                Box::new(Preparation {
+                    original: original.clone(),
+                    prepare_failure: failure,
+                    cleanup_failure: None,
+                    preparations: preparations.clone(),
+                    cleanups: cleanups.clone(),
+                }),
+                NoPairFinalizer,
+            ));
+            let mut store = Some(Store(records.clone()));
+            let mut retained = None;
+            let prepared = catch_unwind(AssertUnwindSafe(|| {
+                SessionControl::prepare_retained_into(
+                    &mut retained,
+                    scope.runtime,
+                    &command,
+                    &mut native,
+                    &mut store,
+                    0,
+                )
+            }));
+            assert!(!matches!(prepared, Ok(Ok(()))));
+            assert!(native.is_none() && store.is_none());
+            assert!(
+                records.borrow().is_empty(),
+                "preparation precedes Session publication"
+            );
+            let session = retained.as_mut().expect("same SessionControl owns cleanup");
+            let mut foreign = scope.clone();
+            foreign.connection_generation += 1;
+            assert!(session
+                .execute(Command::Stop { scope: foreign }, 1)
+                .is_err());
+            assert_eq!(cleanups.get(), 0);
+            assert!(session
+                .execute(
+                    Command::Stop {
+                        scope: scope.clone()
+                    },
+                    2
+                )
+                .is_err());
+            assert_eq!(cleanups.get(), 1);
+            assert_eq!(session.snapshot().session.phase, SessionPhase::Stopping);
+            assert!(session.snapshot().cleanup_pending);
+            assert!(
+                !records.borrow().is_empty(),
+                "actual Stopping save precedes cleanup"
+            );
+            assert!(records
+                .borrow()
+                .iter()
+                .all(|record| record.phase == SessionPhase::Stopping));
+            assert!(session.execute(command, 3).is_err());
+            assert!(session.execute(Command::Stop { scope }, 4).is_err());
+            assert_eq!(preparations.get(), 1);
+            assert_eq!(cleanups.get(), 2);
+            original.borrow().assert_untouched();
         }
     }
 }
