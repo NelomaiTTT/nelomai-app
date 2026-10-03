@@ -4024,7 +4024,28 @@ pub(crate) mod native {
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             // The original Assembly and actual successful loader authenticate
             // no constructor. No Carrier=None, missing graph or JSON fallback.
-            self.read_module_only_cleanup_root(original, expected)
+            if self.create_attempted {
+                return self.read_module_only_cleanup_root(original, expected);
+            }
+            if self.attach_attempted || self.terminal_attempted {
+                return Err(Error::Retired);
+            }
+            self.bind_initial_noc_cleanup()?;
+            let never = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
+            let supervisor = self.supervisor.clone();
+            let context = self.context.clone();
+            // SAFETY: before actual loader/constructor attempts only this
+            // original Never ledger can enter the full readonly universe.
+            // No attempt flag is reset and no attempted-lane error falls back.
+            unsafe {
+                supervisor.run_uncaptured_read(&context, original, expected, &never, || {
+                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                    let lock = self.lock.as_ref().ok_or(Error::Retired)?;
+                    let actual = never.read_no_constructor_cleanup(original, expected, lock)?;
+                    self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
+                    Ok(actual)
+                })
+            }
         }
         fn verify_bootstrap_native_empty(
             &mut self,

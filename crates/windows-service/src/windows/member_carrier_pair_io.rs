@@ -240,6 +240,19 @@ fn compare_no_constructor_cleanup_snapshot(
     record: &crate::member_carrier_pair::Record,
     observed: &crate::member_carrier_guard::Snapshot,
 ) -> io::Result<()> {
+    require_no_constructor_cleanup_frame(record)?;
+    if observed != &record.guard.expected {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+/// Metadata dispatch only. The native caller must separately authenticate its
+/// actual no-constructor history and read SDK/paths/keys/BFE inside Calling.
+#[cfg(any(windows, test))]
+pub(crate) fn require_no_constructor_cleanup_frame(
+    record: &crate::member_carrier_pair::Record,
+) -> io::Result<()> {
     use crate::member_carrier_pair::{Effect, Phase};
     use nelomai_client_tunnel::redundancy::Slot;
     record.validate()?;
@@ -247,7 +260,6 @@ fn compare_no_constructor_cleanup_snapshot(
         crate::member_carrier_guard::Model::empty(record.scope.clone()).map_err(|_| conflict())?;
     if record.carrier.is_some()
         || record.guard != empty
-        || observed != &empty.expected
         || !matches!(
             (record.phase, record.stop_stage, record.pending),
             (Phase::Closing, 0, Some(Effect::Guard))

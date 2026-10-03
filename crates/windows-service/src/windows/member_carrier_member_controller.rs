@@ -521,6 +521,19 @@ fn validate_never_bootstrap_native_frame(
     Ok(())
 }
 
+fn validate_never_cleanup_stage_frame(
+    context: &crate::member_carrier_native_ownership::Context,
+    current: &crate::member_carrier_pair::Record,
+) -> crate::member_carrier::Result<()> {
+    validate_never_bootstrap_origin(context, current)?;
+    #[cfg(not(windows))]
+    use crate::member_carrier_pair_io::require_no_constructor_cleanup_frame;
+    #[cfg(windows)]
+    use crate::windows::member_carrier_pair_io::require_no_constructor_cleanup_frame;
+    require_no_constructor_cleanup_frame(current)
+        .map_err(|_| crate::member_carrier::CarrierError::Conflict)
+}
+
 // Shared comparison facts ONLY, not a receipt/Calling/effect capability.
 // The disjoint callers must additionally require their own exact stage/effect.
 fn validate_never_bootstrap_origin(
@@ -2730,6 +2743,53 @@ pub(crate) mod native {
             }
             Ok(())
         }
+        /// Before any loader/constructor attempt, under the SAME original
+        /// cleanup Calling. Exact stage/Pair ACK and full SDK, all native keys,
+        /// private paths/services/initial-J/creator and BFE are independently
+        /// reread. This is not a no-op permission from missing actor fields.
+        pub(crate) fn read_no_constructor_cleanup(
+            &self,
+            pair: &NativePairIntentRead,
+            expected: &PairRecord,
+            lock: &KeyLock,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            (|| {
+                self.history.cold()?;
+                validate_never_cleanup_stage_frame(&self.input.context, expected)?;
+                self.pair(pair, expected, lock)?;
+                let before = self.no_effect_records()?;
+                let mut guard = super::super::member_carrier_guard::ScopedGuardAbsence::open(
+                    expected.scope.clone(),
+                )
+                .map_err(|_| Error::Pending)?;
+                let actual = guard
+                    .read_snapshot(&expected.scope)
+                    .map_err(|_| Error::Pending)?;
+                for _ in 0..2 {
+                    pair.verify_cleanup_entry_for(
+                        &self.input.runtime,
+                        &self.input.context,
+                        expected,
+                    )
+                    .map_err(|_| Error::Conflict)?;
+                    self.cold_full_absence(pair, expected, lock)?;
+                    if guard
+                        .read_snapshot(&expected.scope)
+                        .map_err(|_| Error::Pending)?
+                        != actual
+                        || self.no_effect_records()? != before
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    validate_never_cleanup_stage_frame(&self.input.context, expected)?;
+                    self.pair(pair, expected, lock)?;
+                    self.history.cold()?;
+                }
+                Ok(actual)
+            })()
+            .map_err(pending_unknown)
+        }
+
         /// Exact no-C Closing9/10, inside SAME run_uncaptured_read Calling.
         /// Actual original Closing ACK, runtime/source/held lock, private
         /// no-effect ledger and full native absence are mandatory on both

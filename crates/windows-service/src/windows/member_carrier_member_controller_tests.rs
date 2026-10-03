@@ -705,6 +705,59 @@ fn never_bootstrap_frame(
 }
 
 #[test]
+fn never_cleanup_stage_frame_accepts_exact_cold_stage_without_terminal_projection() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
+    for before_start in [false, true] {
+        let (context, mut record) = never_bootstrap_frame(9);
+        if before_start {
+            record.addresses.clear();
+            record.dns.clear();
+            record.options = None;
+            record.members = [None, None];
+        }
+        for (stage, effect) in [
+            (0, Effect::Guard),
+            (1, Effect::ReleaseProbes),
+            (2, Effect::RestoreNetwork),
+            (3, Effect::RestoreWeak),
+            (4, Effect::MemberStop(Slot::A)),
+            (5, Effect::MemberStop(Slot::B)),
+            (6, Effect::CarrierAddressDelete),
+            (7, Effect::CarrierSessionEnd),
+            (8, Effect::CarrierClose),
+            (9, Effect::NativeEmpty),
+            (10, Effect::Guard),
+            (11, Effect::RestoreKeys),
+            (12, Effect::FullEmpty),
+        ] {
+            record.stop_stage = stage;
+            record.pending = Some(effect);
+            validate_never_cleanup_stage_frame(&context, &record).unwrap();
+            for fault in 0..4 {
+                let mut wrong = record.clone();
+                match fault {
+                    0 => wrong.scope.connection_generation += 1,
+                    1 => wrong.provenance.network_epoch += 1,
+                    2 => wrong.pending = None,
+                    _ => {
+                        wrong.carrier = Some(crate::member_owner::InterfaceProof {
+                            guid: [1; 16],
+                            index: 1,
+                            luid: 1,
+                        })
+                    }
+                }
+                assert!(validate_never_cleanup_stage_frame(&context, &wrong).is_err());
+            }
+        }
+        record.phase = Phase::Stopped;
+        record.pending = None;
+        assert!(validate_never_cleanup_stage_frame(&context, &record).is_err());
+    }
+}
+
+#[test]
 fn never_bootstrap_native_frame_accepts_only_exact_no_c_closing9_and10() {
     for stage in [9, 10] {
         let (context, mut record) = never_bootstrap_frame(stage);
