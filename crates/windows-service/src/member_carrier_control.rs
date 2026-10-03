@@ -44,6 +44,43 @@ pub(crate) struct CarrierPairControl<I: CarrierPairIo, J: PairJournal, F> {
 fn conflict() -> io::Error {
     io::Error::other("carrier_terminal_completion_pending")
 }
+
+#[cfg(test)]
+#[test]
+fn completed_original_module_release_precedes_canonical_cut() {
+    use std::cell::Cell;
+    for lost_ack in [false, true] {
+        let events = std::cell::RefCell::new(Vec::new());
+        let retained = Cell::new(true);
+        let result = capture_terminal_originals_for_layout(
+            true,
+            || {
+                assert!(retained.get());
+                events.borrow_mut().push("original-release-whole");
+                if lost_ack {
+                    Err(conflict())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                events.borrow_mut().push("canonical-cut");
+                retained.set(false);
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), !lost_ack);
+        assert_eq!(retained.get(), lost_ack);
+        assert_eq!(
+            *events.borrow(),
+            if lost_ack {
+                vec!["original-release-whole"]
+            } else {
+                vec!["original-release-whole", "canonical-cut"]
+            }
+        );
+    }
+}
 /// Dispatch only: this conveys no native release or absence authority.
 /// A selected pregraph lane stays selected after the actor's release; its
 /// retained module container and release slot still require their own checks.
@@ -51,23 +88,24 @@ pub(crate) fn continue_pregraph_terminal(selected_pregraph: bool, _actor_release
     selected_pregraph
 }
 
-/// Terminal scheduling only, not resource/disposal authority. Pending layouts
-/// need their SAME intact Startup for a concrete bounded read, not a raw cut.
+/// Terminal scheduling only, not resource/disposal authority. An unconstructed
+/// attempted layout needs the actual original release AND whole postflight
+/// BEFORE any cut. The concrete native callback verifies its typed ACK; a
+/// successful factual read cannot satisfy that callback's contract.
 pub(crate) fn capture_terminal_originals_for_layout(
     pending_layout: bool,
-    observe_pending: impl FnOnce() -> io::Result<()>,
+    release_original_and_verify_whole: impl FnOnce() -> io::Result<()>,
     capture: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     if pending_layout {
-        observe_pending()?;
-        return Err(conflict());
+        release_original_and_verify_whole()?;
     }
     capture()
 }
 
 #[cfg(test)]
 #[test]
-fn pending_terminal_read_keeps_startup_intact_and_never_promotes_observation() {
+fn unacknowledged_terminal_release_keeps_startup_intact() {
     use std::cell::Cell;
     let drained = Cell::new(false);
     let observed = Cell::new(false);
@@ -79,7 +117,7 @@ fn pending_terminal_read_keeps_startup_intact_and_never_promotes_observation() {
                 "original Startup must precede any raw handoff"
             );
             observed.set(true);
-            Ok(())
+            Err(conflict()) // factual observation is not the actual release ACK
         },
         || {
             drained.set(true);

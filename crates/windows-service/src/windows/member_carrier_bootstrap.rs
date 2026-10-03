@@ -213,6 +213,36 @@ impl<T> LoadSlot<T> {
         Ok(())
     }
     /// Comparison-only original owner aperture, not the once-only effect borrow.
+    fn verify_module_only_terminal_cut<E>(
+        &self,
+        raw: &TerminalLoad<T>,
+        read: &ModuleOnlyLoadRead,
+        verify_native_ack: impl FnOnce(&T) -> Result<(), E>,
+    ) -> Result<(), LoadError<E>> {
+        self.verify_terminal_transfer(raw)
+            .map_err(|_| LoadError::AlreadyAttempted)?;
+        if !read.same_loader(self)
+            || !self.load_returned.get()
+            || !raw.attempted
+            || raw.module_transfer.is_some()
+        {
+            return Err(LoadError::MissingAcknowledgement);
+        }
+        read.capture
+            .verify()
+            .map_err(|_| LoadError::AlreadyAttempted)?;
+        read.call
+            .verify()
+            .map_err(|_| LoadError::AlreadyAttempted)?;
+        verify_native_ack(
+            raw.acknowledged
+                .as_ref()
+                .ok_or(LoadError::MissingAcknowledgement)?,
+        )
+        .map_err(LoadError::Boundary)
+    }
+
+    /// Comparison-only original owner aperture, not the once-only effect borrow.
     /// The concrete loader must separately compare its actual native ACK pin.
     fn verify_original_loaded_read<E>(
         &self,
@@ -310,7 +340,10 @@ pub(crate) mod native {
         member_carrier_preload::native::WintunPreload,
         member_carrier_wintun::native::{OriginalKeyInventory, OriginalUniverse, OriginalWintun},
         member_native_deadline::{NativeDeadline, NativeDeadlineReadPin},
-        member_session::{NativeSessionFiles, RecordKind, WindowsNativeCarrierReceiptStore},
+        member_session::{
+            InitialDataRetirementAck, InitialNativeDataRead, NativeSessionFiles,
+            OriginalInitialNativeDataRetirement, RecordKind, WindowsNativeCarrierReceiptStore,
+        },
     };
     use sha2::{Digest, Sha256};
     use std::{
@@ -766,6 +799,8 @@ pub(crate) mod native {
         load: std::cell::RefCell<Option<Rc<ModuleOnlyLoadRead>>>,
         canonical: std::cell::RefCell<Option<NativeSessionFiles>>,
         initial_cleanup: crate::windows::member_carrier_terminal_release::TerminalCallState,
+        initial_data: std::cell::RefCell<Option<InitialNativeDataRead>>,
+        data_capture: crate::windows::member_carrier_terminal_release::TerminalCallState,
     }
     impl NativeBootstrapModuleOnlyRead {
         /// Actual SAME initial-J ACK under its explicit original cleanup view.
@@ -834,10 +869,22 @@ pub(crate) mod native {
                             &input.initial,
                             &input.context,
                             observed,
-                            |journal| {
-                                journal
-                                    .enter_original_initial_cleanup(canonical)
-                                    .map_err(|_| Error::Journal)
+                            |journal, acknowledged| {
+                                let journal = std::cell::RefCell::new(journal);
+                                crate::windows::member_carrier_assembly::retain_initial_cleanup_data(
+                                    &self.initial_data, &self.data_capture,
+                                    || journal.borrow_mut()
+                                        .enter_original_initial_cleanup(canonical)
+                                        .map_err(|_| Error::Journal),
+                                    || journal.borrow().original_initial_data_read()
+                                        .map_err(|_| Error::Journal),
+                                    |original| {
+                                        if original.acknowledged() != acknowledged {
+                                            return Err(Error::Conflict);
+                                        }
+                                        check()
+                                    },
+                                )
                             },
                         )
                         .map_err(|_| std::io::Error::other("module_initial_handoff"))?;
@@ -858,13 +905,47 @@ pub(crate) mod native {
                 &input.initial,
                 &input.context,
                 observed,
-                |journal| {
+                |journal, _| {
                     journal
                         .enter_original_initial_cleanup(canonical)
                         .map_err(|_| Error::Journal)
                 },
             )?;
             check()
+        }
+        /// SDK-free SAME initialized-journal pin captured during canonical
+        /// cleanup. Not a native-effect, absence or retirement authorization.
+        pub(crate) fn original_initial_data_read(&self) -> Result<InitialNativeDataRead> {
+            self.initial_cleanup.verify().map_err(|_| Error::Retired)?;
+            self.data_capture.verify().map_err(|_| Error::Retired)?;
+            self.initial_data
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)
+        }
+        pub(crate) fn retire_original_initial_data(
+            &self,
+            proof: &dyn OriginalInitialNativeDataRetirement,
+            retain: impl FnOnce(Rc<InitialDataRetirementAck>) -> std::io::Result<()>,
+        ) -> Result<()> {
+            let original = self.original_initial_data_read()?;
+            self.inputs.initial.retire_original_initial_data(
+                &self.inputs.context,
+                |journal, acknowledged| {
+                    if original.acknowledged() != acknowledged {
+                        return Err(Error::Conflict);
+                    }
+                    let ack = journal
+                        .retire_original_initial_data(proof, retain)
+                        .map_err(|_| Error::Journal)?;
+                    if !ack.matches_original(&original) {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                },
+            )
         }
         pub(crate) fn original_inputs(&self) -> NativeBootstrapTerminalInputs<'_> {
             let input = &self.inputs;
@@ -905,6 +986,9 @@ pub(crate) mod native {
                 load: std::cell::RefCell::new(None),
                 canonical: std::cell::RefCell::new(None),
                 initial_cleanup:
+                    crate::windows::member_carrier_terminal_release::TerminalCallState::new(),
+                initial_data: std::cell::RefCell::new(None),
+                data_capture:
                     crate::windows::member_carrier_terminal_release::TerminalCallState::new(),
             }));
             let original = destination
@@ -1153,6 +1237,87 @@ pub(crate) mod native {
         pub(crate) capture_native_bytes: &'a [u8],
     }
     impl NativeBootstrapSlot {
+        /// SAME original loader wrapper only, after its actual typed native
+        /// disposition. The caller retains this raw before any transfer/check.
+        /// No SDK/image query, release retry or constructor absence inference.
+        pub(crate) fn verify_completed_no_constructor_release<
+            P: module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            original: &NativeBootstrapModuleOnlyRead,
+            expected: &PairRecord,
+            ack: &module::native::NativeNoConstructorModuleReleased<P>,
+        ) -> Result<()> {
+            self.verify_module_only_read(original, &original.pair, expected)?;
+            let load = original.load.try_borrow().map_err(|_| Error::Conflict)?;
+            let load = load.as_ref().ok_or(Error::Pending)?;
+            load.call.verify().map_err(|_| Error::Retired)?;
+            self.module
+                .verify_original_loaded_read(load, |module| {
+                    module
+                        .verify_no_constructor_disposition(ack)
+                        .map_err(|_| Error::Retired)
+                })
+                .map_err(terminal_error)
+        }
+        pub(crate) fn drain_no_constructor_after_release<
+            P: module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &mut self,
+            original: &NativeBootstrapModuleOnlyRead,
+            expected: &PairRecord,
+            ack: &module::native::NativeNoConstructorModuleReleased<P>,
+            destination: &mut NativeBootstrapTerminalResources,
+        ) -> Result<()> {
+            self.verify_completed_no_constructor_release(original, expected, ack)?;
+            original.original_initial_data_read()?;
+            self.drain_terminal_into(destination)?;
+            self.verify_no_constructor_terminal_cut(destination.retained(), original, ack)
+        }
+        pub(crate) fn verify_no_constructor_terminal_cut<
+            P: module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            raw: &NativeBootstrapTerminalParts,
+            original: &NativeBootstrapModuleOnlyRead,
+            ack: &module::native::NativeNoConstructorModuleReleased<P>,
+        ) -> Result<()> {
+            self.verify_original_terminal_transfer(raw)?;
+            if raw
+                .inputs
+                .as_ref()
+                .is_none_or(|input| !Rc::ptr_eq(input, &original.inputs))
+                || raw
+                    .origin
+                    .as_ref()
+                    .is_none_or(|origin| !Rc::ptr_eq(origin, &original.origin))
+                || raw.compose_attempted
+                || raw.transferred_to_assembly
+                || raw.image.is_some()
+                || raw.members.is_some()
+                || raw.registry.is_some()
+                || raw.keys.is_some()
+            {
+                return Err(Error::Conflict);
+            }
+            self.module
+                .verify_module_only_terminal_cut(
+                    raw.module.as_ref().ok_or(Error::Pending)?,
+                    original
+                        .load
+                        .try_borrow()
+                        .map_err(|_| Error::Conflict)?
+                        .as_ref()
+                        .ok_or(Error::Pending)?,
+                    |module| {
+                        module
+                            .verify_no_constructor_disposition(ack)
+                            .map_err(|_| Error::Retired)
+                    },
+                )
+                .map_err(terminal_error)
+        }
+
         pub(crate) fn drain_terminal_into(
             &mut self,
             destination: &mut NativeBootstrapTerminalResources,

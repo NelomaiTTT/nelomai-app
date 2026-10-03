@@ -296,7 +296,7 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             crate::member_carrier_control::capture_terminal_originals_for_layout(
                 self.attempted_layout == Some(NativeAttemptedTerminalLayout::OtherAttempted),
                 || {
-                    actor.observe_pending_module_only_terminal(
+                    actor.release_module_only_terminal(
                         &stopped,
                         &record,
                         attempted.as_ref().ok_or_else(conflict)?,
@@ -304,7 +304,22 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                 },
                 || {
                     if !self.locals_captured {
-                        actor.capture_locals(&stopped, &record, &mut self.locals, |_| Ok(()))?;
+                        if self.attempted_layout
+                            == Some(NativeAttemptedTerminalLayout::OtherAttempted)
+                        {
+                            actor.capture_module_only_locals(
+                                &stopped,
+                                &record,
+                                &mut self.locals,
+                            )?;
+                        } else {
+                            actor.capture_locals(
+                                &stopped,
+                                &record,
+                                &mut self.locals,
+                                |_| Ok(()),
+                            )?;
+                        }
                         self.locals_captured = true;
                     }
                     if !self.canonical_captured {
@@ -348,9 +363,28 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                     return self.finish_pregraph(&actor, scope);
                 }
                 NativeAttemptedTerminalLayout::GraphAttempted => {}
-                // Before-C/unknown creation and partial other shapes remain
-                // cleanup-pending; no boolean/None/ACK substitution or fallback.
-                NativeAttemptedTerminalLayout::OtherAttempted => return Err(conflict()),
+                NativeAttemptedTerminalLayout::OtherAttempted => {
+                    // The scheduling discriminator grants nothing. Actual
+                    // Startup already verified the SAME completed own-loader
+                    // release; this disposer joins canonical ownership + DATA.
+                    // Constructor/failed/unknown loads never reach success here.
+                    actor.dispose_module_only_terminal(
+                        &stopped,
+                        &record,
+                        attempted.as_ref().ok_or_else(conflict)?,
+                        &mut self.locals,
+                        &mut self.canonical,
+                    )?;
+                    self.actor_released = true;
+                    self.branch.take();
+                    self.selection.take();
+                    self.coordinator.take();
+                    self.actor.take();
+                    // Select original initialized-J DATA retirement, not Never.
+                    self.completed_initial_noc = true;
+                    self.completed = true;
+                    return Ok(());
+                }
             }
             let local = self.locals.as_ref().ok_or_else(conflict)?;
             if self.capture.is_none() {

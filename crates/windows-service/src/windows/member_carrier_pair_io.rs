@@ -1646,7 +1646,7 @@ pub(crate) mod native {
     impl NativeActorTerminalCut<'_> {
         /// Defensive actor half only. None/empty here never grants Never or
         /// SDK absence; the independent private Startup proof is mandatory.
-        fn require_zero_effect_originals(&self) -> io::Result<()> {
+        fn require_unconstructed_originals(&self) -> io::Result<()> {
             if self.execution.is_some()
                 || !self
                     .rejected_inputs
@@ -1732,7 +1732,7 @@ pub(crate) mod native {
                 .map_err(denied)?;
             // This is deliberately the stringent original actor-no-graph
             // fence. It says nothing about C/key/module absence or release.
-            self.require_zero_effect_originals()
+            self.require_unconstructed_originals()
         }
         pub(crate) fn with_rejected_inputs<T>(
             &self,
@@ -2419,6 +2419,37 @@ pub(crate) mod native {
     /// before baseline capture, then full inputs before registration/postflight.
     /// Errors/unwinds retain originals; registration NEVER grants an effect.
     pub(crate) unsafe trait NativeStartup<'a> {
+        /// Exact original no-constructor module lane only. Must complete the
+        /// actual typed own-DLL ACK under full original bounded native bracket
+        /// BEFORE canonical capture. Failed/unknown constructor/load denies.
+        fn release_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<()>;
+        /// Pure SAME completed whole native release, while its original owner
+        /// remains in Startup. No SDK access or raw/destructor permission.
+        fn verify_module_only_release(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<()>;
+        /// SAME original raw/canonical owners and acknowledged module release;
+        /// no image/SDK reentry after release. Retain all partial roots on Err.
+        /// Bind original initial-DATA issuer only after whole owning disposition.
+        fn dispose_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            destination: &mut crate::windows::member_carrier_startup::native::TerminalStartupResources<'a>,
+        ) -> crate::member_carrier::Result<()>;
+        /// PURE completed SAME Startup/Pair owning-disposal comparison only.
+        /// No import, SDK/Runtime/backend reentry or success based on phase.
+        fn verify_module_only_disposition(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<()>;
         /// Retain/read SAME loader-only originals under the concrete bounded
         /// Calling/Pair reader. Observations are DATA: no release or completion
         /// permission. Unknown layouts deny while keeping Startup intact.
@@ -3107,6 +3138,8 @@ pub(crate) mod native {
         canonical: RefCell<ActorResourceTransfer<NativeActorCanonicalCut<'a>>>,
         zero_effect: RefCell<ActorResourceTransfer<NativeActorZeroEffectTerminalCut<'a>>>,
         zero_effect_capture: Cell<u8>,
+        module_only: ActorTerminalParts<Option<NativeActorModuleOnlyOriginals<'a>>>,
+        module_only_disposal: crate::windows::member_carrier_terminal_release::TerminalCallState,
         terminal_selection: RefCell<ActorResourceTransfer<NativeActorTerminalSelection<'a>>>,
         terminal_selection_state: Cell<u8>,
         release_attempted: Cell<bool>,
@@ -3170,6 +3203,13 @@ pub(crate) mod native {
         raw: crate::windows::member_carrier_startup::native::TerminalStartupResources<'a>,
         locals: Option<Rc<NativeActorTerminalCut<'a>>>,
         canonical: Option<Rc<NativeActorCanonicalCut<'a>>>,
+    }
+    struct NativeActorModuleOnlyOriginals<'a> {
+        startup: Rc<RefCell<Box<dyn NativeStartup<'a> + 'a>>>,
+        raw: crate::windows::member_carrier_startup::native::TerminalStartupResources<'a>,
+        // Keep the actual captures rooted even if provider disposition fails.
+        _locals: Rc<NativeActorTerminalCut<'a>>,
+        _canonical: Rc<NativeActorCanonicalCut<'a>>,
     }
     impl NativeActorZeroEffectTerminalCut<'_> {
         /// PURE selection of an actual acknowledged outcome, not inferred from
@@ -3484,6 +3524,132 @@ pub(crate) mod native {
                 witness.verify_original(self, original, expected)
             })
         }
+        /// Before any owning cut, consume ONLY the genuine original loader's
+        /// once-only native release and mandatory whole postflight. A factual
+        /// observation, OtherAttempted discriminator or Stopped is insufficient.
+        pub(crate) fn release_module_only_terminal(
+            self: &Rc<Self>,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            witness: &Rc<NativeActorAttemptedTerminalWitness<'a>>,
+        ) -> io::Result<()> {
+            if self.attempted_terminal_layout(original, expected, witness)?
+                != crate::windows::member_carrier_startup::NativeAttemptedTerminalLayout::OtherAttempted
+            { return Err(conflict()); }
+            let (startup, serial) = {
+                let actor = self.originals.actor.try_borrow().map_err(denied)?;
+                (
+                    actor.startup.as_ref().ok_or_else(conflict)?.clone(),
+                    actor.serial.clone(),
+                )
+            };
+            serial.run(true, || {
+                witness.verify_original(self, original, expected)?;
+                let mut source = startup.try_borrow_mut().map_err(denied)?;
+                source
+                    .release_module_only_terminal(original, expected)
+                    .map_err(denied)?;
+                source
+                    .verify_module_only_release(original, expected)
+                    .map_err(denied)?;
+                witness.verify_original(self, original, expected)
+            })
+        }
+        pub(crate) fn capture_module_only_locals(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            stopped: &pair::Record,
+            destination: &mut Option<Rc<NativeActorTerminalCut<'a>>>,
+        ) -> io::Result<()> {
+            self.originals
+                .actor
+                .try_borrow_mut()?
+                .capture_terminal_locals_with(original, stopped, destination, true, |_| Ok(()))
+        }
+        /// Original completed loader + canonical owning Startup disposition,
+        /// then pure actor-shell disposal. Neither Never nor full native-C G is
+        /// substituted. Every unknown destination remains rooted on Err/unwind.
+        pub(crate) fn dispose_module_only_terminal(
+            self: &Rc<Self>,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            witness: &Rc<NativeActorAttemptedTerminalWitness<'a>>,
+            local_destination: &mut Option<Rc<NativeActorTerminalCut<'a>>>,
+            canonical_destination: &mut Option<Rc<NativeActorCanonicalCut<'a>>>,
+        ) -> io::Result<()> {
+            if self.attempted_terminal_layout(original, expected, witness)?
+                != crate::windows::member_carrier_startup::NativeAttemptedTerminalLayout::OtherAttempted
+                || self.release_attempted.replace(true)
+            { return Err(conflict()); }
+            self.module_only_disposal.run(|| {
+                let local = local_destination.as_ref().ok_or_else(conflict)?.clone();
+                let canonical = canonical_destination.as_ref().ok_or_else(conflict)?.clone();
+                let startup = {
+                    let raw = canonical.originals.try_borrow()?;
+                    if raw.roots.is_some() || raw.terminal_record != *expected
+                        || !Rc::ptr_eq(&raw.terminal_pair, original)
+                    { return Err(conflict()); }
+                    raw.startup.as_ref().ok_or_else(conflict)?.clone()
+                };
+                {
+                    let mut retained = self.module_only.try_borrow_mut()?;
+                    if retained.is_some() { return Err(conflict()); }
+                    *retained = Some(NativeActorModuleOnlyOriginals {
+                        startup: startup.clone(),
+                        raw: crate::windows::member_carrier_startup::native::TerminalStartupResources::empty(),
+                        _locals: local.clone(), _canonical: canonical.clone(),
+                    }); // BEFORE drain/provider checks
+                }
+                {
+                    let actor = self.originals.actor.try_borrow()?;
+                    let captured = self.canonical.try_borrow().map_err(denied)?;
+                    if !actor.terminal_cut.complete || !captured.complete
+                        || !Rc::ptr_eq(actor.terminal_cut.retained()?, &local)
+                        || !Rc::ptr_eq(captured.retained()?, &canonical)
+                        || actor.roots.is_some() || actor.startup.is_some()
+                        || actor.full_capture_attempted || actor.registered
+                        || actor.closing_attempted || actor.execution.is_some()
+                    { return Err(conflict()); }
+                    local.require_unconstructed_originals()?; // shape only, NOT Never authority
+                }
+                startup.try_borrow().map_err(denied)?.verify_module_only_release(original, expected).map_err(denied)?;
+                {
+                    let mut retained = self.module_only.try_borrow_mut()?;
+                    startup.try_borrow_mut().map_err(denied)?.drain_terminal_into(
+                        &mut retained.as_mut().ok_or_else(conflict)?.raw,
+                    ).map_err(denied)?;
+                }
+                // Last actual journal read while the original held KeyLock is
+                // still alive. No native/storage query after owning disposal.
+                let (pin, record) = self.readback_terminal(&expected.scope)?;
+                witness.verify_original(self, &pin, &record)?;
+                {
+                    let mut retained = self.module_only.try_borrow_mut()?;
+                    let retained = retained.as_mut().ok_or_else(conflict)?;
+                    if !Rc::ptr_eq(&retained.startup, &startup) { return Err(conflict()); }
+                    startup.try_borrow_mut().map_err(denied)?.dispose_module_only_terminal(
+                        original, expected, &mut retained.raw,
+                    ).map_err(denied)?;
+                }
+                startup.try_borrow().map_err(denied)?.verify_module_only_disposition(original, expected).map_err(denied)?;
+                local.locals.parts.release_with(|| {
+                    local.require_unconstructed_originals()?;
+                    startup.try_borrow().map_err(denied)?.verify_module_only_disposition(original, expected).map_err(denied)
+                })?;
+                canonical.originals.try_borrow_mut()?.startup.take();
+                canonical.originals.release_with(|| Ok(()))?;
+                self.originals.actor.try_borrow_mut()?.terminal_cut.finish_release(&local)?;
+                self.canonical.try_borrow_mut().map_err(denied)?.finish_release(&canonical)?;
+                local_destination.take();
+                canonical_destination.take();
+                self.module_only.release_with(|| {
+                    startup.try_borrow().map_err(denied)?.verify_module_only_disposition(original, expected).map_err(denied)
+                })?;
+                self.originals.journal.release_with(|| Ok(()))?;
+                self.originals.actor.release_with(|| Ok(()))?;
+                self.finish_terminal_selection()
+            })
+        }
         /// Call while SAME Startup is still in the original actor, before
         /// canonical capture. Caller and actor root retain the outcome FIRST.
         /// Provider decides eligibility from its private OriginalNever ledger;
@@ -3658,7 +3824,7 @@ pub(crate) mod native {
                     {
                         return Err(conflict());
                     }
-                    local.require_zero_effect_originals()?;
+                    local.require_unconstructed_originals()?;
                 }
                 let startup = outcome.originals.try_borrow()?.startup.clone();
                 {
@@ -3695,7 +3861,7 @@ pub(crate) mod native {
                 // whole postflight. Remaining actor cuts contain NO SDK owner;
                 // checks here are PURE and cannot revive forward use.
                 local.locals.parts.release_with(|| {
-                    local.require_zero_effect_originals()?;
+                    local.require_unconstructed_originals()?;
                     proof.verify_original(&pin, &actual).map_err(denied)
                 })?;
                 canonical.originals.try_borrow_mut()?.startup.take();
@@ -3889,7 +4055,7 @@ pub(crate) mod native {
                     {
                         return Err(conflict());
                     }
-                    local.require_zero_effect_originals()
+                    local.require_unconstructed_originals()
                 },
                 |retained_ack| root.unload_in_terminal_call(module, retained_ack),
                 |(destination, canonical_destination), ack| {
@@ -4080,6 +4246,9 @@ pub(crate) mod native {
                 canonical: RefCell::new(ActorResourceTransfer::default()),
                 zero_effect: RefCell::new(ActorResourceTransfer::default()),
                 zero_effect_capture: Cell::new(0),
+                module_only: ActorTerminalParts::new(None),
+                module_only_disposal:
+                    crate::windows::member_carrier_terminal_release::TerminalCallState::new(),
                 terminal_selection: RefCell::new(ActorResourceTransfer::default()),
                 terminal_selection_state: Cell::new(0),
                 release_attempted: Cell::new(false),
@@ -4477,6 +4646,16 @@ pub(crate) mod native {
             destination: &mut Option<Rc<NativeActorTerminalCut<'a>>>,
             handoff: impl FnOnce(&Rc<NativeActorTerminalCut<'a>>) -> io::Result<()>,
         ) -> io::Result<()> {
+            self.capture_terminal_locals_with(original, expected, destination, false, handoff)
+        }
+        fn capture_terminal_locals_with(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            destination: &mut Option<Rc<NativeActorTerminalCut<'a>>>,
+            completed_original_module: bool, // dispatch only: concrete provider ACK below
+            handoff: impl FnOnce(&Rc<NativeActorTerminalCut<'a>>) -> io::Result<()>,
+        ) -> io::Result<()> {
             let serial = self.serial.clone();
             let pair = self.pair.clone();
             let startup = self.startup.clone();
@@ -4558,19 +4737,19 @@ pub(crate) mod native {
                             return Err(conflict());
                         }
                         if let Some(roots) = roots.as_ref() {
+                            if completed_original_module { return Err(conflict()); }
                             original.verify_terminal_entry(
                                 &roots.runtime,
                                 &roots.context,
                                 expected,
                             )?;
                         } else {
-                            startup
-                                .as_ref()
-                                .ok_or_else(conflict)?
-                                .try_borrow_mut()
-                                .map_err(denied)?
-                                .verify_uncaptured_terminal(original, expected)
-                                .map_err(denied)?;
+                            let mut actual = startup.as_ref().ok_or_else(conflict)?.try_borrow_mut().map_err(denied)?;
+                            if completed_original_module {
+                                actual.verify_module_only_release(original, expected).map_err(denied)?;
+                            } else {
+                                actual.verify_uncaptured_terminal(original, expected).map_err(denied)?;
+                            }
                         }
                         handoff(cut)
                     },

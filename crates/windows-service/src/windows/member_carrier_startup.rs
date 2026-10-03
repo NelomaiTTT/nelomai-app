@@ -853,9 +853,10 @@ pub(crate) mod native {
         module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
         module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 14]>,
         module_only_release: Option<Rc<NativeNoConstructorReleaseRoot>>,
+        module_only_outcome: Option<Rc<NativeModuleOnlyOutcome>>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
-    /// permission. OtherAttempted remains denied by the existing finisher.
+    /// permission. The finisher additionally requires actual loader disposition.
     pub(crate) struct NativeStartupModuleOnlyCandidate {
         invocation: Rc<StartupInvocationLedger>,
         creator: Rc<CapturedCreator>,
@@ -999,6 +1000,49 @@ pub(crate) mod native {
             >,
         >,
         whole: TerminalCallState,
+        disposal: TerminalCallState,
+        bootstrap_raw: RefCell<
+            crate::windows::member_carrier_bootstrap::native::NativeBootstrapTerminalResources,
+        >,
+    }
+    /// Issued ONLY after the SAME original loader's whole ACK AND canonical
+    /// Startup owning disposition. No constructor/NativeC/Never substitution.
+    pub(crate) struct NativeModuleOnlyOutcome {
+        original: Rc<NativeNoConstructorReleaseRoot>,
+    }
+    impl NativeModuleOnlyOutcome {
+        pub(crate) fn verify_supervisor_terminal_drop(
+            &self,
+            supervisor: &NativeDeadline,
+        ) -> Result<()> {
+            let root = &self.original;
+            root.whole.verify().map_err(|_| Error::Retired)?;
+            root.disposal.verify().map_err(|_| Error::Retired)?;
+            let input = root.proof.bootstrap.original_inputs();
+            if !std::ptr::eq(input.supervisor.as_ref(), supervisor)
+                || root
+                    .ack
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .is_none()
+                || module_only_read_stage(&root.proof.expected)? != 13
+            {
+                return Err(Error::Conflict);
+            }
+            root.proof
+                .candidate
+                .selection
+                .verify()
+                .map_err(|_| Error::Retired)?;
+            root.proof
+                .candidate
+                .assembly()?
+                .verify_no_constructor_seal()?;
+            root.proof
+                .bootstrap
+                .original_initial_data_read()
+                .map(|_| ())
+        }
     }
     pub(crate) struct NativeNoConstructorReleaseProof {
         candidate: Rc<NativeStartupModuleOnlyCandidate>,
@@ -1207,6 +1251,7 @@ pub(crate) mod native {
         source: std::rc::Weak<NativeInitialAssemblyNoCRead>,
         data: RefCell<Option<InitialNativeDataRead>>,
         outcome: RefCell<Option<Rc<NativeZeroEffectOutcome>>>,
+        module_outcome: RefCell<Option<Rc<NativeModuleOnlyOutcome>>>,
         binding: TerminalCallState,
         retirement: TerminalCallState,
         begun: std::cell::Cell<bool>,
@@ -1219,6 +1264,7 @@ pub(crate) mod native {
                 source: Rc::downgrade(source),
                 data: RefCell::new(None),
                 outcome: RefCell::new(None),
+                module_outcome: RefCell::new(None),
                 binding: TerminalCallState::new(),
                 retirement: TerminalCallState::new(),
                 begun: std::cell::Cell::new(false),
@@ -1255,6 +1301,32 @@ pub(crate) mod native {
                 actual.verify_supervisor_terminal_drop(&actual.original.supervisor)
             })
         }
+        fn bind_module_completed(&self, outcome: Rc<NativeModuleOnlyOutcome>) -> Result<()> {
+            bind_initial_data_outcome(&self.module_outcome, &self.binding, outcome, |actual| {
+                if self
+                    .outcome
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?
+                    .is_some()
+                {
+                    return Err(Error::Conflict);
+                }
+                let original = actual
+                    .original
+                    .proof
+                    .bootstrap
+                    .original_initial_data_read()?;
+                let mut data = self.data.try_borrow_mut().map_err(|_| Error::Conflict)?;
+                if data.is_some() {
+                    return Err(Error::Conflict);
+                }
+                *data = Some(original);
+                drop(data);
+                actual.verify_supervisor_terminal_drop(
+                    actual.original.proof.bootstrap.original_inputs().supervisor,
+                )
+            })
+        }
         fn verify_completed(&self, original: &InitialNativeDataRead) -> std::io::Result<()> {
             let denied = || std::io::Error::other("initial_data_original_noc_outcome");
             let data = self.original_data().map_err(|_| denied())?;
@@ -1265,6 +1337,31 @@ pub(crate) mod native {
                 return Err(denied());
             }
             self.binding.verify()?;
+            let module = self.module_outcome.try_borrow().map_err(|_| denied())?;
+            if let Some(outcome) = module.as_ref() {
+                if self.outcome.try_borrow().map_err(|_| denied())?.is_some()
+                    || !data.same_original(
+                        &outcome
+                            .original
+                            .proof
+                            .bootstrap
+                            .original_initial_data_read()
+                            .map_err(|_| denied())?,
+                    )
+                {
+                    return Err(denied());
+                }
+                return outcome
+                    .verify_supervisor_terminal_drop(
+                        outcome
+                            .original
+                            .proof
+                            .bootstrap
+                            .original_inputs()
+                            .supervisor,
+                    )
+                    .map_err(|_| denied());
+            }
             let slot = self.outcome.try_borrow().map_err(|_| denied())?;
             let outcome = slot.as_ref().ok_or_else(denied)?;
             let source = self.source.upgrade().ok_or_else(denied)?;
@@ -1287,23 +1384,35 @@ pub(crate) mod native {
                         .original_data()
                         .map_err(|_| std::io::Error::other("initial_data_missing"))?;
                     self.verify_completed(&data)?;
-                    let source = self
-                        .source
-                        .upgrade()
-                        .ok_or_else(|| std::io::Error::other("initial_data_source"))?;
-                    source
-                        .retire_original_initial_data(self, |ack| {
-                            let mut slot = self
-                                .ack
-                                .try_borrow_mut()
-                                .map_err(|_| std::io::Error::other("initial_data_ack_busy"))?;
-                            if slot.is_some() {
-                                return Err(std::io::Error::other("initial_data_duplicate_ack"));
-                            }
-                            *slot = Some(ack); // root actual ACK BEFORE store postflight
-                            Ok(())
-                        })
-                        .map_err(|_| std::io::Error::other("initial_data_store_retirement"))?;
+                    let retain = |ack| {
+                        let mut slot = self
+                            .ack
+                            .try_borrow_mut()
+                            .map_err(|_| std::io::Error::other("initial_data_ack_busy"))?;
+                        if slot.is_some() {
+                            return Err(std::io::Error::other("initial_data_duplicate_ack"));
+                        }
+                        *slot = Some(ack); // root actual ACK BEFORE store postflight
+                        Ok(())
+                    };
+                    let module = self
+                        .module_outcome
+                        .try_borrow()
+                        .map_err(|_| std::io::Error::other("initial_data_module_busy"))?;
+                    match module.as_ref() {
+                        Some(outcome) => outcome
+                            .original
+                            .proof
+                            .bootstrap
+                            .retire_original_initial_data(self, retain),
+                        None => self
+                            .source
+                            .upgrade()
+                            .ok_or_else(|| std::io::Error::other("initial_data_source"))?
+                            .retire_original_initial_data(self, retain),
+                    }
+                    .map_err(|_| std::io::Error::other("initial_data_store_retirement"))?;
+                    drop(module);
                     let ack = self
                         .ack
                         .try_borrow()
@@ -1326,15 +1435,20 @@ pub(crate) mod native {
             let mut ack = self.ack.try_borrow_mut().map_err(|_| Error::Conflict)?;
             let mut held_data = self.data.try_borrow_mut().map_err(|_| Error::Conflict)?;
             let mut outcome = self.outcome.try_borrow_mut().map_err(|_| Error::Conflict)?;
+            let mut module = self
+                .module_outcome
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
             if ack.as_ref().is_none_or(|ack| !ack.matches_original(&data))
                 || held_data
                     .as_ref()
                     .is_none_or(|held| !held.same_original(&data))
-                || outcome.is_none()
+                || (outcome.is_some() == module.is_some())
             {
                 return Err(Error::Conflict);
             }
             outcome.take();
+            module.take();
             ack.take();
             held_data.take();
             Ok(())
@@ -1361,12 +1475,21 @@ pub(crate) mod native {
                 .outcome
                 .try_borrow()
                 .map_err(|_| std::io::Error::other("initial_data_busy"))?;
-            let outcome = slot
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("initial_data_outcome"))?;
+            let module = self
+                .module_outcome
+                .try_borrow()
+                .map_err(|_| std::io::Error::other("initial_data_module_busy"))?;
+            let (context, expected) = match (slot.as_ref(), module.as_ref()) {
+                (Some(outcome), None) => (&outcome.original.context, &outcome.original.expected),
+                (None, Some(outcome)) => (
+                    outcome.original.proof.bootstrap.original_inputs().context,
+                    &outcome.original.proof.expected,
+                ),
+                _ => return Err(std::io::Error::other("initial_data_outcome")),
+            };
             if current.changed_boot
-                || current.scope != outcome.original.context.intent.scope
-                || current.provenance != outcome.original.context.provenance
+                || current.scope != context.intent.scope
+                || current.provenance != context.provenance
                 || current.records.iter().map(|(kind, _)| *kind).ne([
                     RecordKind::Session,
                     RecordKind::Pair,
@@ -1399,7 +1522,7 @@ pub(crate) mod native {
             else {
                 return Err(std::io::Error::other("initial_data_pair"));
             };
-            if *actual != outcome.original.expected
+            if actual.as_ref() != expected
                 || crate::member_carrier_native_ownership::Record::decode(
                     payload(RecordKind::NativeCarrierReceipts)
                         .ok_or_else(|| std::io::Error::other("initial_data_ack"))?,
@@ -1419,6 +1542,9 @@ pub(crate) mod native {
     }
     impl Drop for NativeNoCInitialDataRetirement {
         fn drop(&mut self) {
+            if let Some(original) = self.module_outcome.get_mut().take() {
+                std::mem::forget(original);
+            }
             if let Some(original) = self.outcome.get_mut().take() {
                 // Explicit release_retired_originals empties this only after
                 // actual completed retirement. Unknown Drop is not success.
@@ -2388,6 +2514,10 @@ pub(crate) mod native {
                     proof,
                     ack: RefCell::new(None),
                     whole: TerminalCallState::new(),
+                    disposal: TerminalCallState::new(),
+                    bootstrap_raw: RefCell::new(crate::windows::member_carrier_assembly::TerminalResources::new(
+                        crate::windows::member_carrier_bootstrap::native::NativeBootstrapTerminalParts::empty(),
+                    )),
                 })); // retain before whole-call authentication/native operation
             }
             let root = self
@@ -2917,6 +3047,7 @@ pub(crate) mod native {
                 module_only_native_read: RefCell::new(None),
                 module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| Vec::new())),
                 module_only_release: None,
+                module_only_outcome: None,
             };
             retain_claim_startup(destination, startup, |startup| {
                 // SAME signed Runtime/current-process capture. The capsule and its
@@ -4075,6 +4206,210 @@ pub(crate) mod native {
     // Every method enters the actual supervisor or inherits Assembly's whole
     // Calling; registration is never used as native effect authorization.
     unsafe impl NativeStartup<'static> for NativeStartupRoot {
+        fn release_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            self.release_original_no_constructor(original, expected)
+        }
+        fn verify_module_only_release(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            let root = self.module_only_release.as_ref().ok_or(Error::Pending)?;
+            root.whole.verify().map_err(|_| Error::Retired)?;
+            if !Rc::ptr_eq(&root.proof.pair, original) || &root.proof.expected != expected {
+                return Err(Error::Conflict);
+            }
+            let source = root.proof.candidate.assembly()?;
+            source.verify_no_constructor_seal()?;
+            self.assembly
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .verify_completed_no_constructor_release(
+                    &source,
+                    original,
+                    expected,
+                    root.ack
+                        .try_borrow()
+                        .map_err(|_| Error::Conflict)?
+                        .as_ref()
+                        .ok_or(Error::Pending)?,
+                )
+        }
+        fn dispose_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            destination: &mut TerminalStartupResources<'static>,
+        ) -> Result<()> {
+            let root = self
+                .module_only_release
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .clone();
+            let proof = &root.proof;
+            root.whole.verify().map_err(|_| Error::Retired)?;
+            if !Rc::ptr_eq(&proof.pair, original)
+                || &proof.expected != expected
+                || !self.create_attempted
+                || self.attach_attempted
+                || !self.terminal_attempted
+                || !Rc::ptr_eq(&self.graph, &proof.candidate.graph)
+                || self.module_only_outcome.is_some()
+            {
+                return Err(Error::Conflict);
+            }
+            proof.candidate.assembly()?.verify_no_constructor_seal()?;
+            let ack_guard = root.ack.try_borrow().map_err(|_| Error::Conflict)?;
+            let ack = ack_guard.as_ref().ok_or(Error::Pending)?;
+            root.disposal
+                .run(|| {
+                    // The actual raw destination was rooted before transfer. Do
+                    // every origin check BEFORE either owning container is dropped.
+                    // FreeLibrary and its whole supervisor postflight already ACKed;
+                    // all checks here are PURE: never query SDK/image/closed handles.
+                    let raw = destination.retained_mut();
+                    let pins = raw
+                        .startup
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("module_disposal_pins"))?;
+                    let input = proof.bootstrap.original_inputs();
+                    if pins.context != *input.context
+                        || !Rc::ptr_eq(&pins.runtime, &self.runtime)
+                        || !Rc::ptr_eq(&pins.source, &self.source)
+                        || !Rc::ptr_eq(&pins.member_source, &self.member_source)
+                        || !Rc::ptr_eq(&pins.supervisor, &self.supervisor)
+                        || !Rc::ptr_eq(&pins.store, &self.store)
+                        || raw
+                            .pregraph_invocation
+                            .as_ref()
+                            .is_none_or(|invocation| !Rc::ptr_eq(invocation, &self.invocation))
+                        || raw
+                            .pregraph_graph
+                            .as_ref()
+                            .is_none_or(|graph| !Rc::ptr_eq(graph, &self.graph))
+                        || pins
+                            .creator
+                            .as_ref()
+                            .is_none_or(|creator| !Rc::ptr_eq(creator, &proof.candidate.creator))
+                        || pins.initial_data_retirement.as_ref().is_none_or(|data| {
+                            self.initial_data_retirement
+                                .as_ref()
+                                .is_none_or(|original| !Rc::ptr_eq(data, original))
+                        })
+                        || raw.prepared.iter().any(Option::is_some)
+                        || raw
+                            .retired_members
+                            .as_ref()
+                            .is_none_or(|members| !members.is_empty())
+                        || raw.pins.is_some()
+                        || raw.proof.is_some()
+                        || raw.terminal_key_closes.iter().any(Option::is_some)
+                    {
+                        return Err(std::io::Error::other("module_disposal_original"));
+                    }
+                    let lock = raw
+                        .lock
+                        .try_borrow()
+                        .map_err(|_| std::io::Error::other("module_disposal_lock"))?;
+                    if !self.runtime.matches_lock(
+                        lock.as_ref()
+                            .ok_or_else(|| std::io::Error::other("module_disposal_lock"))?,
+                    ) {
+                        return Err(std::io::Error::other("module_disposal_lock"));
+                    }
+                    drop(lock);
+                    raw.verify_pregraph_original_cut()
+                        .map_err(|_| std::io::Error::other("module_disposal_graph"))?;
+                    let ready = raw
+                        .carrier
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("module_disposal_ready"))?;
+                    self.carrier
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("module_disposal_ready"))?
+                        .verify_terminal_drained_into(ready)
+                        .map_err(|_| std::io::Error::other("module_disposal_ready"))?;
+                    ready
+                        .verify_unconstructed_shape()
+                        .map_err(|_| std::io::Error::other("module_disposal_ready"))?;
+                    let assembly = self
+                        .assembly
+                        .as_ref()
+                        .ok_or_else(|| std::io::Error::other("module_disposal_assembly"))?;
+                    let assembly_raw = raw
+                        .assembly
+                        .as_mut()
+                        .ok_or_else(|| std::io::Error::other("module_disposal_assembly"))?;
+                    let source = proof
+                        .candidate
+                        .assembly()
+                        .map_err(|_| std::io::Error::other("module_disposal_source"))?;
+                    let mut bootstrap_raw = root
+                        .bootstrap_raw
+                        .try_borrow_mut()
+                        .map_err(|_| std::io::Error::other("module_disposal_bootstrap"))?;
+                    assembly
+                        .drain_module_only_bootstrap(
+                            assembly_raw,
+                            &source,
+                            expected,
+                            ack,
+                            &mut bootstrap_raw,
+                        )
+                        .map_err(|_| std::io::Error::other("module_disposal_bootstrap"))?;
+                    // The nested Bootstrap contains the actual loader owner. Its
+                    // empty source wrapper alone is not disposal permission: rejoin
+                    // the SAME typed complete native ACK before its inert Drop.
+                    destination.release_original_with(|raw| {
+                        bootstrap_raw.release_original_with(|bootstrap| {
+                            root.whole.verify()?;
+                            proof
+                                .candidate
+                                .assembly()
+                                .map_err(|_| std::io::Error::other("module_disposal_source"))?
+                                .verify_no_constructor_seal()
+                                .map_err(|_| std::io::Error::other("module_disposal_source"))?;
+                            assembly
+                                .verify_released_module_only_cut(
+                                    raw.assembly.as_ref().ok_or_else(|| {
+                                        std::io::Error::other("module_disposal_assembly")
+                                    })?,
+                                    &source,
+                                    ack,
+                                    bootstrap,
+                                )
+                                .map_err(|_| std::io::Error::other("module_disposal_ack"))
+                        })
+                        // No fallible/native work after inner original disposal.
+                    })
+                })
+                .map_err(|_| Error::Retired)?;
+            drop(ack_guard);
+            let outcome = Rc::new(NativeModuleOnlyOutcome { original: root });
+            self.module_only_outcome = Some(outcome.clone()); // before binding/postflight
+            self.initial_data_retirement
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .bind_module_completed(outcome.clone())?;
+            self.supervisor.allow_module_only_terminal_drop(&outcome)
+        }
+        fn verify_module_only_disposition(
+            &self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            let outcome = self.module_only_outcome.as_ref().ok_or(Error::Pending)?;
+            if !Rc::ptr_eq(&outcome.original.proof.pair, original)
+                || &outcome.original.proof.expected != expected
+            {
+                return Err(Error::Conflict);
+            }
+            outcome.verify_supervisor_terminal_drop(&self.supervisor)
+        }
         fn observe_attempted_module_only_terminal(
             &mut self,
             original: &Rc<NativePairIntentRead>,

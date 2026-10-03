@@ -708,6 +708,13 @@ pub(crate) mod native {
             expected: &crate::member_carrier_pair::Record,
         ) -> Result<()> {
             proof.verify_original(original, expected)?;
+            self.verify_unconstructed_shape()?;
+            proof.verify_original(original, expected)
+        }
+        /// Shape/provenance component only. An actual original terminal issuer
+        /// must independently authenticate Never or completed no-constructor
+        /// module disposition; this method grants no native or Drop authority.
+        pub(crate) fn verify_unconstructed_shape(&self) -> Result<()> {
             let run = self.run.as_ref().ok_or(CarrierError::Pending)?;
             let lifecycle = self.lifecycle.as_ref().ok_or(CarrierError::Pending)?;
             if run.attempted.get()
@@ -726,7 +733,7 @@ pub(crate) mod native {
             {
                 return Err(CarrierError::Conflict);
             }
-            proof.verify_original(original, expected)
+            Ok(())
         }
         fn empty() -> Self {
             Self {

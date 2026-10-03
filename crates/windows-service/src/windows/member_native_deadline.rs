@@ -652,6 +652,28 @@ impl NativeDeadline {
             .map_err(denied)
     }
 
+    /// Bookkeeping for a DIFFERENT actual completed no-constructor loader +
+    /// canonical owning disposition. Never a ZeroEffect or native permission.
+    pub(crate) fn allow_module_only_terminal_drop(
+        &self,
+        outcome: &super::member_carrier_startup::native::NativeModuleOnlyOutcome,
+    ) -> Result<()> {
+        self.owner
+            .verified_terminal_drop(|| {
+                if !self.deadline.cleanup_eligible() || !self.forward_closed.get() {
+                    return Err(policy::Error::Revoked);
+                }
+                outcome
+                    .verify_supervisor_terminal_drop(self)
+                    .map_err(|_| policy::Error::Native)?;
+                if !self.deadline.cleanup_eligible() {
+                    return Err(policy::Error::Revoked);
+                }
+                Ok(())
+            })
+            .map_err(denied)
+    }
+
     /// The original no-effect Startup has no DLL/module ACK to supply. Its
     /// private typed outcome instead binds the SAME Never ledger, full native
     /// terminal read, watchdog rundown and actual owning-raw disposal. This

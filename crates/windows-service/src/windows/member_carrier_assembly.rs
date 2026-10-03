@@ -38,10 +38,10 @@ pub(crate) fn inspect_module_only_initial<J: NativeJournal>(
     initial: &InitialRead<J>,
     context: &Context,
     observed: &[u8],
-    select: impl FnOnce(&mut J) -> Result<()>,
+    select: impl FnOnce(&mut J, &Record) -> Result<()>,
 ) -> Result<()> {
     initial.inspect_original_initial_cleanup(context, |journal, acknowledged| {
-        select(journal)?;
+        select(journal, acknowledged)?;
         if acknowledged.encode()?.as_slice() != observed {
             return Err(Error::Conflict);
         }
@@ -56,7 +56,7 @@ use crate::member_carrier_terminal_release::TerminalCallState;
 
 /// Registration only. The caller selects the SAME journal's canonical cleanup
 /// view; no DATA identity or callback result supplies SDK/disposal permission.
-fn retain_initial_cleanup_data<D>(
+pub(crate) fn retain_initial_cleanup_data<D>(
     destination: &std::cell::RefCell<Option<D>>,
     capture_state: &TerminalCallState,
     select_cleanup: impl FnOnce() -> Result<()>,
@@ -464,6 +464,55 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         }
         Ok(())
     }
+    /// Factual original no-constructor cut. Loader entry stays recorded; this
+    /// does not certify the owning DLL's release or authorize raw disposal.
+    fn verify_module_only_terminal_cut(
+        &self,
+        raw: &AssemblyTerminalParts<J, I, A, B>,
+        source: &ModuleOnlyAssemblyRead<J>,
+    ) -> Result<()> {
+        self.verify_drained_original(raw)?;
+        source.verify_no_constructor_seal()?;
+        if !self.initialize_attempted
+            || self.attach_attempted
+            || self.prepare_attempted
+            || self.precreation_attempted
+            || self.member_attempted.iter().any(|attempt| *attempt)
+            || !std::rc::Rc::ptr_eq(&source.origin, &self.origin)
+            || !std::rc::Rc::ptr_eq(&source.allowed, &self.module_only_allowed)
+            || !std::rc::Rc::ptr_eq(&source.selected, &self.module_only_selection)
+            || self
+                .initial_original
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+                .is_none_or(|initial| !std::rc::Rc::ptr_eq(&initial, &source.initial))
+            || raw
+                .initial
+                .as_ref()
+                .is_none_or(|initial| !std::rc::Rc::ptr_eq(initial, &source.initial))
+            || raw.pending.is_none()
+            || raw.bootstrap.is_none()
+            || raw.io.try_borrow().map_err(|_| Error::Conflict)?.is_some()
+            || raw
+                .owner
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_some()
+            || raw
+                .assets
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_some()
+            || raw.disabled.is_some()
+            || raw.closing.is_some()
+            || raw.member_disabled.iter().any(Option::is_some)
+            || raw.member_key_retired.iter().any(Option::is_some)
+        {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
+
     /// Factual no-SDK initial-journal cut, not native absence or disposal.
     /// Requires the exact opaque initial ACK minted by this original Assembly.
     fn verify_initial_terminal_cut(
@@ -1325,6 +1374,105 @@ pub(crate) mod native {
             // execution identity must be captured AFTER canonical cleanup.
             Ok(())
         }
+        /// Exact owning cut after separately completed native own-DLL release.
+        /// Native constructors/keys remain disjoint from this original source.
+        pub(crate) fn drain_module_only_bootstrap<
+            P: crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            raw: &mut NativeAssemblyTerminalResources,
+            original: &NativeAssemblyModuleOnlyRead,
+            expected: &PairRecord,
+            ack: &crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleased<
+                P,
+            >,
+            bootstrap: &mut crate::windows::member_carrier_bootstrap::native::NativeBootstrapTerminalResources,
+        ) -> Result<()> {
+            self.verify_terminal_drained_into(raw)?;
+            if self.assembly_attempted
+                || self.prepare_call_attempted
+                || self.precreation_call_attempted
+                || self.member_call_attempted.iter().any(|a| *a)
+                || raw.incoming.is_some()
+                || raw
+                    .module_only_source
+                    .as_ref()
+                    .is_none_or(|source| !Rc::ptr_eq(source, &original.source))
+            {
+                return Err(Error::Conflict);
+            }
+            let parts = raw.parts.as_mut().ok_or(Error::Pending)?;
+            self.root
+                .verify_module_only_terminal_cut(parts, &original.source)?;
+            parts
+                .bootstrap
+                .as_mut()
+                .ok_or(Error::Pending)?
+                .drain_no_constructor_after_release(
+                    original.bootstrap()?.as_ref(),
+                    expected,
+                    ack,
+                    bootstrap,
+                )?;
+            self.root
+                .verify_module_only_terminal_cut(parts, &original.source)
+        }
+        pub(crate) fn verify_completed_no_constructor_release<
+            P: crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            original: &NativeAssemblyModuleOnlyRead,
+            pair: &Rc<NativePairIntentRead>,
+            expected: &PairRecord,
+            ack: &crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleased<
+                P,
+            >,
+        ) -> Result<()> {
+            self.verify_module_only_candidate(original, pair, expected)?;
+            self.root
+                .bootstrap
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .verify_completed_no_constructor_release(
+                    original.bootstrap()?.as_ref(),
+                    expected,
+                    ack,
+                )
+        }
+        pub(crate) fn verify_released_module_only_cut<
+            P: crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleaseProof,
+        >(
+            &self,
+            raw: &NativeAssemblyTerminalResources,
+            original: &NativeAssemblyModuleOnlyRead,
+            ack: &crate::windows::member_carrier_module::native::NativeNoConstructorModuleReleased<
+                P,
+            >,
+            bootstrap: &crate::windows::member_carrier_bootstrap::native::NativeBootstrapTerminalParts,
+        ) -> Result<()> {
+            self.verify_terminal_drained_into(raw)?;
+            if self.assembly_attempted
+                || self.prepare_call_attempted
+                || self.precreation_call_attempted
+                || self.member_call_attempted.iter().any(|a| *a)
+                || raw.incoming.is_some()
+                || raw
+                    .module_only_source
+                    .as_ref()
+                    .is_none_or(|source| !Rc::ptr_eq(source, &original.source))
+            {
+                return Err(Error::Conflict);
+            }
+            let parts = raw.parts.as_ref().ok_or(Error::Pending)?;
+            self.root
+                .verify_module_only_terminal_cut(parts, &original.source)?;
+            parts
+                .bootstrap
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .verify_no_constructor_terminal_cut(bootstrap, original.bootstrap()?.as_ref(), ack)
+        }
+
         /// Only actual initialized/no-SDK originals can have inert raw Drop.
         /// Native whole-Never terminal checks remain a separate prerequisite.
         pub(crate) fn verify_initial_noc_terminal_cut(

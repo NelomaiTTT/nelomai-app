@@ -234,6 +234,65 @@ fn module_only_original_borrow_keeps_owner_rooted_and_never_repeats_callback() {
 
 use std::{cell::Cell, rc::Rc};
 
+// Break: an attempted/failed release or an equal foreign raw loader can
+// authorize disposition, or the external native-ACK comparison is skipped.
+#[test]
+fn module_only_terminal_transfer_requires_completed_original_release() {
+    for fault in 0..3 {
+        let mut original = LoadSlot::empty();
+        original
+            .load_into(
+                &mut (),
+                |_| Ok::<_, &str>(()),
+                |_, slot| {
+                    *slot = Some(31u32);
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        let mut read = None;
+        original
+            .retain_module_only_read_into(&mut read, |_| Ok::<_, &str>(()))
+            .unwrap();
+        let read = read.unwrap();
+        let release = original.with_original_module_only(&read, |value| {
+            *value = 47;
+            if fault == 1 {
+                return Err("native ACK lost");
+            }
+            Ok(())
+        });
+        assert_eq!(release.is_ok(), fault != 1);
+        let mut raw = None;
+        original
+            .drain_terminal_into(&mut raw, |_| Ok::<_, &str>(()))
+            .unwrap();
+        let checks = Cell::new(0);
+        let result =
+            original.verify_module_only_terminal_cut(raw.as_ref().unwrap(), &read, |value| {
+                checks.set(checks.get() + 1);
+                assert_eq!(*value, 47);
+                if fault == 2 {
+                    return Err("native disposition unknown");
+                }
+                Ok(())
+            });
+        assert_eq!(result.is_ok(), fault == 0);
+        assert_eq!(checks.get(), usize::from(fault != 1));
+        let foreign = LoadSlot::<u32>::empty();
+        assert!(foreign
+            .verify_module_only_terminal_cut(
+                raw.as_ref().unwrap(),
+                &read,
+                |_| -> Result<(), &str> { panic!("foreign cannot query native") }
+            )
+            .is_err());
+        assert!(original.acknowledged.is_none());
+        assert_eq!(raw.as_ref().unwrap().acknowledged, Some(47));
+    }
+}
+
 #[cfg(not(windows))]
 use crate::member_carrier_assembly::TerminalResources;
 #[cfg(windows)]

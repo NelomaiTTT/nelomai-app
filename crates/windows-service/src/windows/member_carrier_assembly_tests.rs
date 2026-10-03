@@ -867,7 +867,7 @@ fn module_only_initial_read_selects_original_cleanup_and_never_rearms_forward() 
     let bytes = record.encode().unwrap();
     let selected = std::cell::Cell::new(0);
     for _ in 0..2 {
-        inspect_module_only_initial(&source.initial, &record.context, &bytes, |_| {
+        inspect_module_only_initial(&source.initial, &record.context, &bytes, |_, _| {
             selected.set(selected.get() + 1);
             Ok(())
         })
@@ -899,7 +899,7 @@ fn module_only_initial_foreign_data_or_handoff_failure_irreversibly_denies_read(
                 &source.initial,
                 &record.context,
                 &observed.encode().unwrap(),
-                |_| {
+                |_, _| {
                     if fault == 1 {
                         return Err(Error::Journal);
                     };
@@ -915,7 +915,7 @@ fn module_only_initial_foreign_data_or_handoff_failure_irreversibly_denies_read(
             &source.initial,
             &record.context,
             &record.encode().unwrap(),
-            |_| panic!("unknown original must not retry handoff")
+            |_, _| panic!("unknown original must not retry handoff")
         )
         .is_err());
         assert_eq!(state.borrow().creates, 0);
@@ -1097,6 +1097,84 @@ fn initialized_assembly_terminal_cut_requires_same_initial_ack_and_no_sdk_entry(
 }
 // Break: considering an empty shell drained into an equal foreign raw, or
 // ignoring an original field that a future drain forgot to transfer.
+// Break: a genuine loaded-but-unconstructed Assembly is mistaken for Never,
+// or a foreign/constructor-touched raw owner is accepted as the original cut.
+#[test]
+fn module_only_terminal_cut_preserves_loader_history_and_same_initial_owner() {
+    let (mut root, state, _, _) = setup(Fault::None);
+    root.initialize().unwrap();
+    let mut selected = None;
+    root.retain_module_only_source_into(&mut selected, |_| Ok(()))
+        .unwrap();
+    let selected = selected.unwrap();
+    root.no_sdk.set(false); // actual loader entry is not a constructor.
+    let mut destination = None;
+    root.drain_terminal_into(&mut destination, |_| Ok(()))
+        .unwrap();
+    let raw = destination.as_mut().unwrap();
+    root.verify_module_only_terminal_cut(raw, &selected)
+        .unwrap();
+    assert!(!root.no_sdk.get(), "never reset actual loader history");
+    assert!(root.verify_initial_terminal_cut(raw, &context()).is_err());
+
+    let (mut foreign, _, _, _) = setup(Fault::None);
+    foreign.initialize().unwrap();
+    let mut foreign_selected = None;
+    foreign
+        .retain_module_only_source_into(&mut foreign_selected, |_| Ok(()))
+        .unwrap();
+    assert!(root
+        .verify_module_only_terminal_cut(raw, &foreign_selected.unwrap())
+        .is_err());
+    let initial = raw.initial.take();
+    raw.initial = foreign.initial.take();
+    assert!(root
+        .verify_module_only_terminal_cut(raw, &selected)
+        .is_err());
+    raw.initial = initial;
+    root.verify_module_only_terminal_cut(raw, &selected)
+        .unwrap();
+    root.module_only_allowed.set(false);
+    assert!(root
+        .verify_module_only_terminal_cut(raw, &selected)
+        .is_err());
+    assert_eq!(state.borrow().creates, 0);
+    assert_eq!(state.borrow().writes, 0);
+}
+
+#[test]
+fn module_only_terminal_cut_rejects_remaining_or_constructor_owned_slots() {
+    for fault in 0..8 {
+        let (mut root, _, _, drops) = setup(Fault::None);
+        root.initialize().unwrap();
+        let mut selected = None;
+        root.retain_module_only_source_into(&mut selected, |_| Ok(()))
+            .unwrap();
+        let selected = selected.unwrap();
+        root.no_sdk.set(false);
+        let mut destination = None;
+        root.drain_terminal_into(&mut destination, |_| Ok(()))
+            .unwrap();
+        let raw = destination.as_mut().unwrap();
+        match fault {
+            0 => root.attach_attempted = true,
+            1 => root.prepare_attempted = true,
+            2 => root.precreation_attempted = true,
+            3 => root.member_attempted[1] = true,
+            4 => raw.bootstrap = None,
+            5 => raw.pending = None,
+            6 => *raw.assets.get_mut() = Some(Resource(drops.clone())),
+            7 => root.bootstrap = Some(Resource(drops.clone())),
+            _ => unreachable!(),
+        }
+        assert!(
+            root.verify_module_only_terminal_cut(raw, &selected)
+                .is_err(),
+            "fault {fault}"
+        );
+    }
+}
+
 #[test]
 fn assembly_empty_shell_requires_same_raw_origin_and_every_owner_moved() {
     let (mut first, state, _, drops) = setup(Fault::None);
