@@ -2705,6 +2705,7 @@ mod txr_native_measurement {
             },
             Security::{
                 DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+                PROTECTED_DACL_SECURITY_INFORMATION,
             },
             Storage::FileSystem::{CommitTransaction, CreateTransaction, RollbackTransaction},
             System::Registry::*,
@@ -3322,6 +3323,13 @@ mod txr_native_measurement {
     // The historical native seed-outside/delete-inside result does not prove
     // this no-net-change variant. Run only on fresh ephemeral OWN-HKCU keys.
     fn transient_enlist_measurement(race: RelativeRace, after_stage: bool) {
+        transient_enlist_measurement_with_security(race, after_stage, false);
+    }
+    fn transient_enlist_measurement_with_security(
+        race: RelativeRace,
+        after_stage: bool,
+        security_only: bool,
+    ) {
         let mut s = RelativeSlots {
             probe: Probe::uncreated(),
             race,
@@ -3383,8 +3391,44 @@ mod txr_native_measurement {
         assert_eq!(enlisted.security, original.security);
         assert_eq!(enlisted.class, original.class);
         assert_eq!(metadata(s.probe.transactional), enlisted);
+        // The DACL mutation uses only THIS fresh own original's captured
+        // descriptor. No new ACE/access grant, inheritance propagation,
+        // parent/system/token change or named security API. Keep the copied
+        // descriptor aligned and alive across the syscall. Never read the
+        // nontransacted original inside the active TxR window merely to prove
+        // the writer: that read could abort the transaction and mask the race.
+        let mut security_descriptor = [0u32; 1024];
+        let security_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                security_descriptor.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(&security_descriptor),
+            )
+        };
+        security_bytes[..original.security.len()].copy_from_slice(&original.security);
+        if security_only {
+            assert!(matches!(race, RelativeRace::None));
+            assert_eq!(
+                u16::from_le_bytes(original.security[2..4].try_into().unwrap()) & 0x1000,
+                0,
+                "fresh inherited-DACL control required; no smaller mutation fallback"
+            );
+        }
+        let mut interleave = |s: &mut RelativeSlots| {
+            if security_only {
+                assert!(s.race_status.is_none());
+                s.race_status = Some(unsafe {
+                    RegSetKeySecurity(
+                        s.probe.original,
+                        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                        security_descriptor.as_mut_ptr().cast(),
+                    )
+                });
+            } else {
+                s.race_after_last_empty_read();
+            }
+        };
         if !after_stage {
-            s.race_after_last_empty_read();
+            interleave(&mut s);
         }
         s.probe.staged = true;
         let stage = unsafe { NtDeleteKey(s.probe.transactional) };
@@ -3392,7 +3436,7 @@ mod txr_native_measurement {
         s.probe.stage_ack = stage == 0;
         if after_stage {
             assert_eq!(stage, 0, "positive stage control must precede late writer");
-            s.race_after_last_empty_read();
+            interleave(&mut s);
         }
         let writer = s
             .race_status
@@ -3412,17 +3456,18 @@ mod txr_native_measurement {
         }
         eprintln!(
             "transient-enlist kind={} after_stage={after_stage} writer={writer} stage={stage:#x} commit={commit} commit_error={commit_error:?} rollback={}",
-            match race {
+            if security_only { "security-only-DACL" } else { match race {
                 RelativeRace::None => "positive",
                 RelativeRace::Value => "value",
                 RelativeRace::Subkey => "subkey",
                 RelativeRace::Namespace => "namespace",
-            },
+            } },
             s.probe.rollback_ack,
         );
         // On unexpected success do NOT query a deleted original or synthesize
         // preservation. Close each actual handle once first, then FAIL gate.
-        let accepted_change = !matches!(race, RelativeRace::None) && writer == NO_ERROR;
+        let accepted_change =
+            (security_only || !matches!(race, RelativeRace::None)) && writer == NO_ERROR;
         let safe = !accepted_change || !commit;
         if !commit && writer == NO_ERROR {
             match race {
@@ -3463,7 +3508,35 @@ mod txr_native_measurement {
                     assert_eq!(Some(metadata(s.replacement)), s.replacement_metadata);
                 }
             }
-            assert_eq!(metadata(s.probe.original).security, original.security);
+            let preserved = metadata(s.probe.original);
+            if security_only {
+                assert_ne!(
+                    preserved.security, original.security,
+                    "accepted security writer must have made a REAL retained change"
+                );
+                assert_eq!(
+                    u16::from_le_bytes(preserved.security[2..4].try_into().unwrap()) & 0x1000,
+                    0x1000
+                );
+                let dacl = |bytes: &[u8]| {
+                    let start = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+                    assert!(start >= 20);
+                    let len = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().unwrap())
+                        as usize;
+                    bytes[start..start + len].to_vec()
+                };
+                assert_eq!(
+                    dacl(&preserved.security),
+                    dacl(&original.security),
+                    "no broadened or lost ACE is allowed in this own fixture"
+                );
+                assert_eq!((preserved.values, preserved.subkeys), (0, 0));
+                assert_eq!(preserved.class, original.class);
+                assert_eq!(name(s.probe.original), s.probe.expected);
+                assert_eq!(metadata(s.probe.original), preserved);
+            } else {
+                assert_eq!(preserved.security, original.security);
+            }
         }
         let extra = if s.extra_subkey_created {
             s.extra_subkey
@@ -3484,7 +3557,7 @@ mod txr_native_measurement {
             safe,
             "UNSAFE: accepted outside write erased by transient-enlisted commit"
         );
-        if matches!(race, RelativeRace::None) {
+        if !security_only && matches!(race, RelativeRace::None) {
             assert!(commit, "positive deletion control failed");
             s.probe.require_absent_after_closed_commit();
         } else {
@@ -3509,6 +3582,9 @@ mod txr_native_measurement {
         }
         for race in [RelativeRace::Value, RelativeRace::Namespace] {
             transient_enlist_measurement(race, true);
+        }
+        for after_stage in [false, true] {
+            transient_enlist_measurement_with_security(RelativeRace::None, after_stage, true);
         }
     }
     #[test]
