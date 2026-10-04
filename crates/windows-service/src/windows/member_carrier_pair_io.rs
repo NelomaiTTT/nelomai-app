@@ -5191,8 +5191,21 @@ pub(crate) mod native {
                     }
                     Ok(prepared)
                 } else {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "bootstrap member current original selected",
+                    );
                     startup
                         .prepare_member(&pin, record, member, native)
+                        .inspect_err(|error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "bootstrap member preparation delegate",
+                                error,
+                            );
+                            #[cfg(not(test))]
+                            let _ = error;
+                        })
                         .map_err(denied)
                 }
             })

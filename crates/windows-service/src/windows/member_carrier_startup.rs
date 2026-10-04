@@ -4330,7 +4330,15 @@ pub(crate) mod native {
             member: &nelomai_client_tunnel::redundancy::protocol::Member,
             native: &str,
         ) -> Result<crate::member_owner::Record> {
-            self.continuity(original, current)?;
+            self.continuity(original, current).inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "member preparation current original",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             member.validate().map_err(|_| Error::Invalid)?;
             compare_member_text(
                 &self.context,
@@ -4357,9 +4365,28 @@ pub(crate) mod native {
                 input,
                 member.configuration.expose(),
                 lock,
-            )?;
+            )
+            .inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "readonly native member preparation",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             let prepared = self.prepared[i].as_mut().ok_or(Error::Pending)?;
-            prepared.verify_proposal(original, proposal, lock)?;
+            prepared
+                .verify_proposal(original, proposal, lock)
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "prepared member proposal",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
             let record = prepared.prepared_record(lock)?;
             self.continuity(original, current)?;
             Ok(record)
@@ -5350,7 +5377,16 @@ pub(crate) mod native {
             supervisor.run(&context, || {
                 let current = original
                     .inspect(&self.runtime, &supervisor, |actual| Ok(actual.clone()))
-                    .map_err(|_| Error::Conflict)?;
+                    .map_err(|_| Error::Conflict)
+                    .inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "bootstrap member current Pair ACK",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })?;
                 self.prepare_in_call(original, &current, proposal, member, native)
             })
         }

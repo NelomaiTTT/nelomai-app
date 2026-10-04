@@ -3762,7 +3762,16 @@ pub(crate) mod native {
                 transport,
                 MemberFiles::new().map_err(owner_error)?,
             )
-            .map_err(owner_error)?;
+            .map_err(owner_error)
+            .inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "prepared native member adapter",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             let owner = MemberOwner::from_trusted_carrier_engine(
                 &input.context.intent,
                 input.slot,
@@ -3772,7 +3781,16 @@ pub(crate) mod native {
                 MemberFiles::new().map_err(owner_error)?,
                 io,
             )
-            .map_err(owner_error)?;
+            .map_err(owner_error)
+            .inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "prepared addressless member owner",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
+            })?;
             let origin = Rc::new(PreparedMemberOrigin {
                 context: input.context,
                 intent: owner.intent().clone(),
@@ -3801,6 +3819,15 @@ pub(crate) mod native {
                 .expect("rooted readonly preparation")
                 .prepared_record(lock)
                 .map(|_| ())
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "prepared readonly member profile",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })
         }
         pub(crate) fn origin(&self) -> &PreparedMemberOrigin {
             &self.origin
