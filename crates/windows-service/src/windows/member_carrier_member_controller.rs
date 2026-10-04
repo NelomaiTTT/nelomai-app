@@ -3142,12 +3142,12 @@ pub(crate) mod native {
         /// Actual original Closing ACK, runtime/source/held lock, private
         /// no-effect ledger and full native absence are mandatory on both
         /// sides. No receipt/owner is manufactured and no object is mutated.
-        pub(crate) fn verify_bootstrap_native_empty(
+        pub(crate) fn read_bootstrap_native_empty(
             &self,
             pair: &NativePairIntentRead,
             expected: &PairRecord,
             lock: &mut KeyLock,
-        ) -> Result<()> {
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
             (|| {
                 self.history.cold()?;
                 validate_never_bootstrap_native_frame(&self.input.context, expected)?;
@@ -3159,6 +3159,7 @@ pub(crate) mod native {
                     expected.scope.clone(),
                 )
                 .map_err(|_| Error::Pending)?;
+                let mut snapshot = None;
                 verify_never_bootstrap_reads(&self.history, &self.input.context, expected, || {
                     self.pair(pair, expected, lock)?;
                     pair.verify_cleanup_entry_for(
@@ -3170,6 +3171,13 @@ pub(crate) mod native {
                     let empty = guard
                         .read_snapshot(&expected.scope)
                         .map_err(|_| Error::Pending)?;
+                    if snapshot.as_ref().is_some_and(|before| before != &empty) {
+                        return Err(Error::Conflict);
+                    }
+                    // Return THIS reader's actual sample only after both full
+                    // SDK/private/runtime brackets. Never synthesize an empty
+                    // snapshot or make Startup reopen a second WFP reader.
+                    snapshot = Some(empty.clone());
                     self.cold_full_absence(pair, expected, lock)?;
                     if guard
                         .read_snapshot(&expected.scope)
@@ -3186,7 +3194,8 @@ pub(crate) mod native {
                     )
                     .map_err(|_| Error::Conflict)?;
                     self.pair(pair, expected, lock)
-                })
+                })?;
+                snapshot.ok_or(Error::Pending)
             })()
             .map_err(pending_unknown)
         }

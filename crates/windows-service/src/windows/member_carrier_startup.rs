@@ -4191,29 +4191,14 @@ pub(crate) mod native {
                                 if !self.runtime.matches_lock(lock) {
                                     return Err(Error::Conflict);
                                 }
-                                never.verify_bootstrap_native_empty(original, expected, lock)?;
-                                let mut reader =
-                                    crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
-                                        expected.scope.clone(),
-                                    )
-                                    .map_err(|_| Error::Conflict)?;
-                                let before = reader
-                                    .read_snapshot(&expected.scope)
-                                    .map_err(|_| Error::Conflict)?;
-                                never.verify_bootstrap_native_empty(original, expected, lock)?;
-                                if reader
-                                    .read_snapshot(&expected.scope)
-                                    .map_err(|_| Error::Conflict)?
-                                    != before
-                                {
-                                    return Err(Error::Conflict);
-                                }
+                                let actual =
+                                    never.read_bootstrap_native_empty(original, expected, lock)?;
                                 self.continuity_runtime_for(
                                     original,
                                     expected,
                                     StartupRead::Cleanup,
                                 )?;
-                                Ok(before)
+                                Ok(actual)
                             },
                         )?;
                         self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
