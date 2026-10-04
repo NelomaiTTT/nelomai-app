@@ -635,9 +635,16 @@ pub(crate) mod native {
                         );
                     })?;
             }
-            if Record::decode(observed[1].as_deref().ok_or(ReadError::Changed)?)
-                .map_err(|_| ReadError::Changed)?
-                != self.original.expected
+            // SAME protected Pair store publishes an envelope, not a bare
+            // Record. Decode its strict scope-bound carrier payload; a legacy
+            // or foreign envelope must still deny, never supply native rights.
+            if crate::windows::member_carrier_pair_store::carrier_payload(
+                &self.original.expected.scope,
+                observed[1].as_deref().ok_or(ReadError::Changed)?,
+            )
+            .map_err(|_| ReadError::Changed)?
+            .as_ref()
+                != Some(&self.original.expected)
             {
                 return Err(ReadError::Changed);
             }
