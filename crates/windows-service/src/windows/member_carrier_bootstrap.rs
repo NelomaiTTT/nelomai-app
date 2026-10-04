@@ -709,7 +709,7 @@ pub(crate) mod native {
                     Ok(())
                 },
             )?;
-            // Image, full passive registry composition and key authority are
+            // Image, universe, full registry read and key authority are
             // separate readonly operations. Keep every original in THIS slot
             // across their SAME-supervisor fences; no stage grants C effects.
             supervisor.run_intent(
@@ -739,7 +739,18 @@ pub(crate) mod native {
                         Producer::<OriginalWintun>::intent(input.context.clone(), universe)
                             .map_err(|_| Error::Conflict)
                     ));
-                    let (producer, observer) = self.registry.as_ref().expect("retained registry");
+                    step!("current Calling", input.calling());
+                    Ok(())
+                },
+            )?;
+            supervisor.run_intent(
+                &input.context,
+                &input.intent,
+                &input.expected,
+                pair::Effect::CarrierReady,
+                || {
+                    step!("current Calling", input.calling());
+                    let (producer, observer) = self.registry.as_ref().ok_or(Error::Pending)?;
                     if !observer.same_original_registry(&producer.observer())
                         || observer.context() != &input.context
                         || !step!(
