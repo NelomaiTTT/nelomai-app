@@ -35,8 +35,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let case_budget =
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     for case in [
-        "module-load-read-error",
         "primary",
+        "module-load-read-error",
         "module-load-read-unwind",
         "cold",
         "primary-data-denial",
