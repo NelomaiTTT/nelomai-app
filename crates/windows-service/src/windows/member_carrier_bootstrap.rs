@@ -668,13 +668,21 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             let supervisor = input.supervisor.clone();
+            // run_intent already authenticates this SAME original Pair and
+            // Calling before/after each readonly stage. Keep source, storage,
+            // initial-native/freshness and original deadline checks here once;
+            // Inputs::calling would repeat that Pair window and current read.
             supervisor.run_intent(
                 &input.context,
                 &input.intent,
                 &input.expected,
                 pair::Effect::CarrierReady,
                 || {
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     let module = self.module.acknowledged.as_mut().ok_or(Error::Pending)?;
                     // Retain the actual image return BEFORE any subsequent check.
                     // The loaded module has been in the slot throughout the mint.
@@ -705,7 +713,11 @@ pub(crate) mod native {
                     {
                         return Err(Error::Conflict);
                     }
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     Ok(())
                 },
             )?;
@@ -718,7 +730,11 @@ pub(crate) mod native {
                 &input.expected,
                 pair::Effect::CarrierReady,
                 || {
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     let image = self.image.as_ref().ok_or(Error::Pending)?;
                     let members = self.members.as_ref().ok_or(Error::Pending)?;
                     // read_all checks its original inventory; with_members
@@ -737,7 +753,11 @@ pub(crate) mod native {
                         Producer::<OriginalWintun>::intent(input.context.clone(), universe)
                             .map_err(|_| Error::Conflict)
                     ));
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     Ok(())
                 },
             )?;
@@ -747,7 +767,11 @@ pub(crate) mod native {
                 &input.expected,
                 pair::Effect::CarrierReady,
                 || {
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     let (producer, observer) = self.registry.as_ref().ok_or(Error::Pending)?;
                     if !observer.same_original_registry(&producer.observer())
                         || observer.context() != &input.context
@@ -762,7 +786,11 @@ pub(crate) mod native {
                     {
                         return Err(Error::Conflict);
                     }
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     Ok(())
                 },
             )?;
@@ -772,7 +800,11 @@ pub(crate) mod native {
                 &input.expected,
                 pair::Effect::CarrierReady,
                 || {
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     let image = self.image.as_ref().ok_or(Error::Pending)?;
                     let (producer, _) = self.registry.as_ref().ok_or(Error::Pending)?;
                     let originals = step!(
@@ -790,7 +822,11 @@ pub(crate) mod native {
                             .verify_live_runtime(&input.runtime)
                             .map_err(module_error)
                     );
-                    step!("current Calling", input.calling());
+                    step!("current originals", input.current());
+                    step!(
+                        "current Calling",
+                        input.deadline.verify_call(&supervisor, &input.context)
+                    );
                     Ok(())
                 },
             )?;
