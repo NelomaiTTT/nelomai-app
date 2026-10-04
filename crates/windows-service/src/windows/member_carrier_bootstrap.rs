@@ -706,6 +706,20 @@ pub(crate) mod native {
                         return Err(Error::Conflict);
                     }
                     step!("current Calling", input.calling());
+                    Ok(())
+                },
+            )?;
+            // Image, full passive registry composition and key authority are
+            // separate readonly operations. Keep every original in THIS slot
+            // across their SAME-supervisor fences; no stage grants C effects.
+            supervisor.run_intent(
+                &input.context,
+                &input.intent,
+                &input.expected,
+                pair::Effect::CarrierReady,
+                || {
+                    step!("current Calling", input.calling());
+                    let image = self.image.as_ref().ok_or(Error::Pending)?;
                     let members = self.members.as_ref().ok_or(Error::Pending)?;
                     step!(
                         "original members",
@@ -739,6 +753,19 @@ pub(crate) mod native {
                     {
                         return Err(Error::Conflict);
                     }
+                    step!("current Calling", input.calling());
+                    Ok(())
+                },
+            )?;
+            supervisor.run_intent(
+                &input.context,
+                &input.intent,
+                &input.expected,
+                pair::Effect::CarrierReady,
+                || {
+                    step!("current Calling", input.calling());
+                    let image = self.image.as_ref().ok_or(Error::Pending)?;
+                    let (producer, _) = self.registry.as_ref().ok_or(Error::Pending)?;
                     let originals = step!(
                         "original key inventory",
                         OriginalKeyInventory::from_producer(producer, &input.runtime, image)
