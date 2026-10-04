@@ -107,7 +107,15 @@ pub(crate) mod native {
     impl WintunPreload {
         pub(crate) fn new(source: &Rc<WintunSource>) -> Result<Self> {
             source.verify()?;
-            let package = package::from_original_source(source).map_err(|_| Error::Conflict)?;
+            let package = package::from_original_source(source).map_err(|error| {
+                #[cfg(test)]
+                if super::super::member_carrier_factory_test_os::state().is_some() {
+                    eprintln!("actual original Wintun package: {error:?}");
+                }
+                #[cfg(not(test))]
+                let _ = error;
+                Error::Conflict
+            })?;
             source.verify()?;
             Ok(Self {
                 source: Rc::clone(source),

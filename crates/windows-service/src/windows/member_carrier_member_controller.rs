@@ -2881,13 +2881,45 @@ pub(crate) mod native {
             )
         }
         fn forward_no_effect_records(&self) -> Result<Vec<Option<Vec<u8>>>> {
-            let original = self.initial_forward.read()?;
-            let records = self.inspect_no_effect_records(|bytes| {
-                original.verify_forward_current(&self.input.runtime, &self.input.context, bytes)
+            let original = self.initial_forward.read().inspect_err(|error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_native(
+                    "cold forward initial registration",
+                    error,
+                );
+                #[cfg(not(test))]
+                let _ = error;
             })?;
+            let records = self
+                .inspect_no_effect_records(|bytes| {
+                    original
+                        .verify_forward_current(&self.input.runtime, &self.input.context, bytes)
+                        .inspect_err(|error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "cold forward original initial ACK",
+                                error,
+                            );
+                            #[cfg(not(test))]
+                            let _ = error;
+                        })
+                })
+                .inspect_err(|error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_native(
+                        "cold forward initial inventory",
+                        error,
+                    );
+                    #[cfg(not(test))]
+                    let _ = error;
+                })?;
             if records[4].is_none() {
                 return Err(Error::Pending);
             }
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "cold forward original initial inventory accepted",
+            );
             Ok(records)
         }
         fn no_effect_records(&self) -> Result<Vec<Option<Vec<u8>>>> {
@@ -4494,9 +4526,32 @@ pub(crate) mod native {
                         }
                         original_records = Some(records);
                         for index in 0..3 {
-                            origin.never_effects.key_fact(index, false)?;
+                            origin
+                                .never_effects
+                                .key_fact(index, false)
+                                .inspect_err(|error| {
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_native(
+                                        [
+                                            "cold prerequisite C key",
+                                            "cold prerequisite A key",
+                                            "cold prerequisite B key",
+                                        ][index],
+                                        error,
+                                    );
+                                    #[cfg(not(test))]
+                                    let _ = error;
+                                })?;
                         }
-                        origin.verify(lock)
+                        origin.verify(lock).inspect_err(|error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "cold prerequisite original postflight",
+                                error,
+                            );
+                            #[cfg(not(test))]
+                            let _ = error;
+                        })
                     },
                     || WintunPreload::new(&origin.carrier),
                     WintunPreload::reattest,
@@ -4546,9 +4601,32 @@ pub(crate) mod native {
                         }
                         original_records = Some(records);
                         for index in 0..3 {
-                            origin.never_effects.key_fact(index, false)?;
+                            origin
+                                .never_effects
+                                .key_fact(index, false)
+                                .inspect_err(|error| {
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_native(
+                                        [
+                                            "cold prerequisite C key",
+                                            "cold prerequisite A key",
+                                            "cold prerequisite B key",
+                                        ][index],
+                                        error,
+                                    );
+                                    #[cfg(not(test))]
+                                    let _ = error;
+                                })?;
                         }
-                        origin.verify(lock)
+                        origin.verify(lock).inspect_err(|error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "cold prerequisite original postflight",
+                                error,
+                            );
+                            #[cfg(not(test))]
+                            let _ = error;
+                        })
                     },
                     || {
                         let source = Rc::new(
