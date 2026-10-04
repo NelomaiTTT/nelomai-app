@@ -1096,9 +1096,13 @@ pub(crate) mod native {
             return Err(Error::Native);
         }
         let actual = std::path::PathBuf::from(std::ffi::OsString::from_wide(&path[..count]));
-        if std::fs::canonicalize(actual).map_err(|_| Error::Native)?
-            != source.path().map_err(|_| Error::Conflict)?
-        {
+        // Windows canonicalize returns an extended DOS path. Compare both
+        // sides in that same representation; the original source's payload
+        // and ancestors remain pinned and authenticated before and after this
+        // mapping read. Canonical equality supplies no SDK/resource authority.
+        let expected = std::fs::canonicalize(source.path().map_err(|_| Error::Conflict)?)
+            .map_err(|_| Error::Native)?;
+        if std::fs::canonicalize(actual).map_err(|_| Error::Native)? != expected {
             return Err(Error::Conflict);
         }
         let mut info: MODULEINFO = unsafe { std::mem::zeroed() };
