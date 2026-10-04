@@ -950,7 +950,10 @@ pub(crate) mod native {
             assembly.verify_no_constructor_seal()?;
             let bootstrap = assembly.bootstrap()?;
             let input = bootstrap.original_inputs();
-            if !std::ptr::eq(input.runtime, self.runtime.as_ref())
+            // Bootstrap retains read_pin(), whose wrapper has a new address.
+            // Authenticate its SAME original runtime Rc and serialized lease,
+            // not equality of context metadata or wrapper storage addresses.
+            if !input.runtime.same_original_runtime(self.runtime.as_ref())
                 || !Rc::ptr_eq(input.source, &self.source)
                 || !Rc::ptr_eq(input.supervisor, &self.supervisor)
                 || !pair.same_store_origin(&self.pair)
