@@ -359,8 +359,12 @@ fn never_attempted_key_preparation_requires_full_native_universe_and_cannot_begi
     let (mut producer, observer) = registry();
     assert_eq!(
         observer.assert_never_attempted(&context(), &scope(0).binding),
-        Ok(())
+        Ok(UniverseObservation {
+            context: context(),
+            originals: vec![],
+        })
     );
+    assert_eq!(&*observer.shared.universe.calls.borrow(), &[0]);
     assert_eq!(
         observer.assert_absent(&context(), &scope(0).binding),
         Err(Error::Pending)
@@ -378,6 +382,22 @@ fn never_attempted_key_preparation_requires_full_native_universe_and_cannot_begi
     assert!(observer
         .assert_never_attempted(&context(), &scope(0).binding)
         .is_err());
+
+    // The full census is DATA, including actual originals of OTHER roles.
+    // Returning it must neither manufacture target absence nor rearm Intent.
+    let (mut producer, observer, log) = live(0);
+    let expected = observer.observe_all(&context()).unwrap();
+    assert_eq!(expected.originals.len(), 1);
+    let reads = log.reads.get();
+    assert_eq!(
+        observer.assert_never_attempted(&context(), &scope(1).binding),
+        Ok(expected)
+    );
+    assert!(log.reads.get() > reads);
+    assert_eq!(observer.snapshot(&context()).unwrap()[1], State::Intent);
+    assert!(producer.begin(scope(1)).is_err());
+    assert_eq!(log.closes.get(), 0);
+    assert_eq!(log.drops.get(), 0);
 }
 
 #[test]

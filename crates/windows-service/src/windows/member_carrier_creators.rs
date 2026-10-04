@@ -1011,11 +1011,13 @@ impl<N: OriginalNative> Observer<N> {
     /// Unlike bare context metadata, a complete independent native universe is
     /// queried even for zero originals. Any lost ACK/attempt/poison denies this
     /// path forever; callers still independently check exact target absence.
+    /// Return that complete factual census for a caller's before/after SDK
+    /// comparison. It contains no owning capability or permission to begin.
     pub(crate) fn assert_never_attempted(
         &self,
         context: &Context,
         binding: &Binding,
-    ) -> Result<()> {
+    ) -> Result<UniverseObservation<N::Provider>> {
         self.shared.idle(false)?;
         let i = self.shared.binding(context, binding)?;
         let check = || -> Result<()> {
@@ -1042,9 +1044,10 @@ impl<N: OriginalNative> Observer<N> {
             Ok(())
         };
         check()?;
-        self.shared.read_universe()?;
+        let observed = self.shared.read_universe()?;
         self.shared.idle(false)?;
-        check()
+        check()?;
+        Ok(observed)
     }
     pub(crate) fn observe(&self, scope: &Scope) -> Result<Observation<N::Provider>> {
         self.shared.idle(false)?;

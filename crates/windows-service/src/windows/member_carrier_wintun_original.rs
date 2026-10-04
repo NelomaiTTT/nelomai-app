@@ -312,6 +312,7 @@ impl OriginalKeyInventory {
         context: &receipt::Context,
         binding: &receipt::Binding,
         cleanup: bool,
+        before: Option<creators::UniverseObservation<member_carrier_provider::Observation>>,
     ) -> creators::Result<()> {
         let Some(members) = &self.members else {
             if cleanup
@@ -335,16 +336,21 @@ impl OriginalKeyInventory {
         crate::windows::member_carrier_factory_test_os::trace_step(
             "key target full before census begin",
         );
-        let before = observe()?;
+        let before = match before {
+            Some(before) => before,
+            None => observe()?,
+        };
         #[cfg(test)]
         crate::windows::member_carrier_factory_test_os::trace_step(
             "key target full before census end",
         );
-        if before.originals.iter().any(|o| {
-            o.scope.binding != context.bindings[0]
-                || o.identity.guid == binding.guid
-                || o.identity.name.eq_ignore_ascii_case(&binding.name)
-        }) {
+        if before.context != *context
+            || before.originals.iter().any(|o| {
+                o.scope.binding != context.bindings[0]
+                    || o.identity.guid == binding.guid
+                    || o.identity.name.eq_ignore_ascii_case(&binding.name)
+            })
+        {
             return Err(creators::Error::Conflict);
         }
         let carrier = before
@@ -427,7 +433,7 @@ impl OriginalKeyInventory {
                 // to proceed to its separate current HKEY/storage CAS gate.
                 self.observer
                     .assert_no_creator_for_key_cleanup(context, binding)?;
-                self.inspect_target(context, binding, true)?;
+                self.inspect_target(context, binding, true, None)?;
                 self.observer
                     .assert_no_creator_for_key_cleanup(context, binding)?;
             }
@@ -441,19 +447,25 @@ impl OriginalKeyInventory {
                     .iter()
                     .position(|b| b == binding)
                     .ok_or(creators::Error::Conflict)?;
-                if state[index] == creators::State::Intent {
+                let before = if state[index] == creators::State::Intent {
                     #[cfg(test)]
                     crate::windows::member_carrier_factory_test_os::trace_step(
                         "key inventory private Never begin",
                     );
-                    self.observer.assert_never_attempted(context, binding)?;
+                    let observed = self.observer.assert_never_attempted(context, binding)?;
                     #[cfg(test)]
                     crate::windows::member_carrier_factory_test_os::trace_step(
                         "key inventory private Never end",
                     );
+                    // The SAME private Never read already performed the full
+                    // original/member SDK census and rechecked its private
+                    // state/attempt/held. Reuse only its DATA on the integrated
+                    // path; the independent target and full after read remain.
+                    self.members.as_ref().map(|_| observed)
                 } else {
                     self.observer.assert_absent(context, binding)?;
-                }
+                    None
+                };
                 if self.members.is_none() {
                     // The legacy target reader has no before/after census;
                     // keep its existing independent full-universe query.
@@ -468,7 +480,7 @@ impl OriginalKeyInventory {
                 // The integrated target reader already checks its full before
                 // census and compares the after census around its independent
                 // SDK query. Keep that query and the private Never check once.
-                self.inspect_target(context, binding, false)?;
+                self.inspect_target(context, binding, false, before)?;
                 self.image
                     .verify_live_runtime(&self.runtime)
                     .map_err(original_error)?;
