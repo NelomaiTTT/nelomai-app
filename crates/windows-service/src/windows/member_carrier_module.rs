@@ -193,9 +193,15 @@ trait Kernel {
     fn verify_lease(&mut self, lease: &mut Self::Lease, cancelled: &AtomicBool) -> Result<()>;
     fn package(&mut self) -> Result<()>;
     fn load(&mut self) -> Result<Self::Module>;
-    /// Factual OS-return publication only, after the owning slot is populated.
-    /// Never image trust, rundown, resource permission or a successful load.
-    fn original_load_retained(&mut self, module: &Self::Module);
+    /// Publish the actual OS return after its owning slot is populated, then
+    /// establish the code lifetime floor through that SAME retained module.
+    /// Failure retains the original ACK and never publishes successful load.
+    fn original_load_retained(
+        &mut self,
+        module: &Self::Module,
+        lease: &mut Self::Lease,
+        cancelled: &AtomicBool,
+    ) -> Result<()>;
     fn module(&mut self, module: &Self::Module) -> Result<()>;
 }
 
@@ -540,7 +546,9 @@ impl<K: Kernel> LoadAttempt<K> {
             valid: Rc::new(Cell::new(false)),
         });
         let loaded = self.owner.as_mut().expect("retained OS load ACK");
-        loaded.kernel.original_load_retained(&loaded.module);
+        loaded
+            .kernel
+            .original_load_retained(&loaded.module, &mut lease, cancelled)?;
         loaded.kernel.module(&loaded.module)?;
         loaded.kernel.package()?;
         loaded.kernel.source()?;
@@ -1076,10 +1084,26 @@ pub(crate) mod native {
         fn module(&mut self, module: &Rc<Module>) -> Result<()> {
             verify_image(&self.source, module)
         }
-        fn original_load_retained(&mut self, _module: &Rc<Module>) {
+        fn original_load_retained(
+            &mut self,
+            module: &Rc<Module>,
+            lease: &mut Lease,
+            cancelled: &AtomicBool,
+        ) -> Result<()> {
             self.actual_load_returned.set(true);
             #[cfg(test)]
-            super::super::member_carrier_factory_test_os::native_module_loaded(_module);
+            super::super::member_carrier_factory_test_os::native_module_loaded(module);
+            // The original loader ACK is already rooted, but package/image
+            // postflight has not run. Retain the actual immutable-source code
+            // PIN before a later normal Err can enter no-constructor cleanup.
+            // Unknown PIN outcomes remain owned and deny SDK/release entry.
+            self.verify_lease(lease, cancelled)?;
+            let source = self.source.clone();
+            establish_process_anchor(&source, module, cancelled, || {
+                self.verify_lease(lease, cancelled)?;
+                self.source()?;
+                checkpoint(cancelled)
+            })
         }
     }
     fn verify_image(source: &WintunSource, module: &Module) -> Result<()> {

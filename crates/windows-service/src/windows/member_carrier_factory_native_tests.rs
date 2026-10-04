@@ -36,6 +36,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     for case in [
         "module-load-read-error",
+        "primary",
         "module-load-read-unwind",
         "cold",
         "primary-data-denial",
@@ -101,8 +102,9 @@ fn carrier_factory_actual_cold_child() {
         case.as_str(),
         "module-load-read-error" | "module-load-read-unwind"
     );
-    let fixture = if module_partial {
-        Fixture::new_module_only()
+    let full_primary = case == "primary";
+    let fixture = if module_partial || full_primary {
+        Fixture::new_native_modules()
     } else {
         Fixture::new()
     }
@@ -126,7 +128,7 @@ fn carrier_factory_actual_cold_child() {
         options: DesktopTunnelOptions::default(),
     };
     match case.as_str() {
-        "cold" | "primary-data-denial" => (),
+        "cold" | "primary-data-denial" | "primary" => (),
         "module-load-read-error" | "module-load-read-unwind" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
         "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
@@ -140,7 +142,7 @@ fn carrier_factory_actual_cold_child() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
-    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial {
+    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial || full_primary {
         result
             .expect("actual cold prepare unwound")
             .expect("actual cold factory preparation");
@@ -155,6 +157,24 @@ fn carrier_factory_actual_cold_child() {
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
     eprintln!("actual factory {case}: retained Starting");
     fixture.verify_files().unwrap();
+    if full_primary {
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        eprintln!("actual factory {case}: primary Start");
+        let started = original.start_primary(primary, options);
+        if started.is_err() {
+            fixture.trace_pair_stage();
+        }
+        let running = started.expect("actual native primary Start");
+        assert_eq!(running.session.scope, scope);
+        assert_eq!(running.session.phase, SessionPhase::Running);
+        assert!(!running.cleanup_pending);
+        fixture.require_package_source_read();
+    }
     if module_partial {
         eprintln!("actual factory {case}: primary through audited module load");
         fixture.lose_inventory_after_load(case == "module-load-read-unwind");
@@ -206,10 +226,21 @@ fn carrier_factory_actual_cold_child() {
         std::mem::forget(factory);
         return;
     }
-    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial {
-        let stopped = stopped.expect("actual retained native Stop before C");
+    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial || full_primary {
+        let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        if full_primary {
+            let repeated = original
+                .execute(
+                    Command::Stop {
+                        scope: scope.clone(),
+                    },
+                    8,
+                )
+                .expect("actual native primary repeated Stop");
+            assert_eq!(repeated, stopped);
+        }
         if module_partial {
             // A post-LoadLibrary error/unwind must clean the SAME native
             // returned module. Do not call process exit a release ACK.
@@ -219,8 +250,8 @@ fn carrier_factory_actual_cold_child() {
         // this factory for the next session. Exercise that production order.
         drop(original);
         // SAME factory, real new Startup and KeyLock after exact old completion.
-        // There is no process module anchor yet: full primary/pin acceptance is
-        // a later scenario, never inferred from this before-DLL repeat.
+        // Only the full primary case establishes the actual process code PIN.
+        // Its repeat must still create a NEW session through the SAME factory.
         let Command::Start { scope: next, .. } = &mut command else {
             unreachable!()
         };
@@ -230,13 +261,41 @@ fn carrier_factory_actual_cold_child() {
         eprintln!("actual factory {case}: repeat prepare");
         let mut second = factory
             .prepare(RuntimeSlot::Latest, &command, 9)
-            .expect("actual before-DLL repeat factory preparation");
+            .expect("actual repeat factory preparation");
+        assert_eq!(second.snapshot().session.scope, next);
+        assert_eq!(second.snapshot().session.phase, SessionPhase::Starting);
+        if full_primary {
+            let Command::Start {
+                primary, options, ..
+            } = &command
+            else {
+                unreachable!()
+            };
+            eprintln!("actual factory {case}: repeat primary Start");
+            let running = second
+                .start_primary(primary, options)
+                .expect("actual native repeat primary Start");
+            assert_eq!(running.session.scope, next);
+            assert_eq!(running.session.phase, SessionPhase::Running);
+            assert!(!running.cleanup_pending);
+        }
         eprintln!("actual factory {case}: repeat Stop");
         let stopped = second
-            .execute(Command::Stop { scope: next }, 10)
-            .expect("actual before-DLL repeat native Stop");
+            .execute(
+                Command::Stop {
+                    scope: next.clone(),
+                },
+                10,
+            )
+            .expect("actual repeat native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        if full_primary {
+            let repeated = second
+                .execute(Command::Stop { scope: next }, 10)
+                .expect("actual second native primary repeated Stop");
+            assert_eq!(repeated, stopped);
+        }
     } else {
         match stopped {
             Ok(snapshot) => {

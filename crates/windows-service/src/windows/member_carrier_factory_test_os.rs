@@ -1,7 +1,7 @@
 //! Test-only external source/filesystem inputs. No selector, Startup, journal,
 //! coordinator, ownership, native-effect or completion implementation is fake.
-//! Cold fixtures use signed DATA. Module-only fixtures use the audited genuine
-//! Wintun DLL and external package inventory; no constructor is invoked.
+//! Cold fixtures use signed DATA. Native fixtures use the audited genuine DLLs
+//! and external package inventory; SDK effects remain in the production path.
 use super::{member_files, member_pair::NativePairFactory, member_session::*};
 use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard};
 use std::{
@@ -144,7 +144,7 @@ impl Fixture {
     pub(crate) fn new() -> io::Result<Self> {
         Self::with_wintun(None)
     }
-    pub(crate) fn new_module_only() -> io::Result<Self> {
+    pub(crate) fn new_native_modules() -> io::Result<Self> {
         let path = std::env::var_os("NELOMAI_FACTORY_WINTUN_DLL")
             .ok_or_else(|| io::Error::other("audited Wintun DLL fixture input absent"))?;
         Self::with_wintun(Some(std::fs::read(path)?))

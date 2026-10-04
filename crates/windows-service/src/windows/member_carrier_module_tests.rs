@@ -1089,9 +1089,17 @@ impl Kernel for Boundary {
     fn module(&mut self, _: &Rc<Module>) -> Result<()> {
         self.call("module")
     }
-    fn original_load_retained(&mut self, module: &Rc<Module>) {
+    fn original_load_retained(
+        &mut self,
+        module: &Rc<Module>,
+        lease: &mut Lease,
+        _: &AtomicBool,
+    ) -> Result<()> {
         assert!(Rc::ptr_eq(&module.0, &self.0));
+        assert!(Rc::ptr_eq(&lease.0, &self.0));
+        assert!(self.0.borrow().lease_held);
         self.0.borrow_mut().original_load_retained = true;
+        Ok(())
     }
 }
 
