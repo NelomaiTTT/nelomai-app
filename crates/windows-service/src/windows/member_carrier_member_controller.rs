@@ -4564,7 +4564,21 @@ pub(crate) mod native {
                 .map_err(|error| match error {
                     ColdPackageError::Retired => Error::Retired,
                     ColdPackageError::Boundary(error) => pending_unknown(error),
-                })
+                })?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "member preflight actual cold carrier package accepted",
+            );
+            super::super::member_owner::verify_readonly_cold_backend_modules(
+                &origin.source,
+                &origin.carrier,
+            )
+            .map_err(|_| Error::Pending)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "member preflight cold backend module absence accepted",
+            );
+            Ok(())
         }
         /// Original signed WireGuardNT DATA package, exact installed bytes and
         /// FULL legacy/problem universe under the original cold Calling fence.
@@ -4722,17 +4736,43 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             verify_pair()?;
-            self.verify_cold_carrier_package_before_carrier(pair, expected, lock)?;
-            reached!("member preflight actual cold carrier package accepted");
-            super::super::member_owner::verify_readonly_cold_backend_modules(
-                &self.origin.source,
-                &self.origin.carrier,
-            )
-            .map_err(|_| Error::Pending)?;
-            reached!("member preflight cold backend module absence accepted");
+            Ok(())
+        }
+        /// Final independent native reread AFTER both passive packages. The
+        /// caller owns a separate actual Calling; package DATA grants no SDK
+        /// permission and an incomplete/denied package cannot finish preflight.
+        pub(crate) fn finish_preflight_before_carrier(
+            &mut self,
+            pair: &NativePairIntentRead,
+            expected: &PairRecord,
+            lock: &mut KeyLock,
+        ) -> Result<()> {
+            validate_before_carrier(&self.origin.context, expected, &self.origin.intent)?;
+            self.origin.never_effects.history.cold()?;
+            let carrier = self
+                .origin
+                .cold_carrier_package
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?;
+            if carrier.denied || carrier.original.is_none() {
+                return Err(Error::Pending);
+            }
+            drop(carrier);
             if self.origin.intent.transport == nelomai_client_tunnel::TunnelTransport::WireGuard {
-                self.verify_cold_wireguard_package_before_carrier(pair, expected, lock)?;
-                reached!("member preflight actual cold WireGuard package accepted");
+                let backend = self
+                    .origin
+                    .cold_wireguard_package
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?;
+                if backend.denied || backend.original.is_none() {
+                    return Err(Error::Pending);
+                }
+            }
+            let owner = self.root.owner.as_mut().ok_or(Error::Retired)?;
+            let raw = owner.raw.as_mut().ok_or(Error::Retired)?;
+            let before = owner.prior.as_ref().ok_or(Error::Pending)?;
+            if &raw.prior_stopped().map_err(owner_error)? != before {
+                return Err(Error::Conflict);
             }
             // No partial package observation replaces the original full native
             // absence preflight. Requery the entire C+member universe afterward.
@@ -4742,7 +4782,17 @@ pub(crate) mod native {
                 &[],
             )?)
             .map_err(|_| Error::Conflict)?;
-            verify_pair()?;
+            if &raw.prior_stopped().map_err(owner_error)? != before {
+                return Err(Error::Conflict);
+            }
+            pair.inspect(&self.origin.runtime, &self.origin.supervisor, |actual| {
+                if actual == expected {
+                    Ok(())
+                } else {
+                    Err(io_error(Error::Conflict))
+                }
+            })
+            .map_err(|_| Error::Conflict)?;
             self.origin.verify(lock)
         }
         /// Publish SAME owner in the persistent controller slot BEFORE any

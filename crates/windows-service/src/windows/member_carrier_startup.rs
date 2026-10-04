@@ -5461,6 +5461,55 @@ pub(crate) mod native {
                 // Store resolves this canonical backend itself, preserving its
                 // original writer/receipt and sticky cleanup selection.
                 self.preflight_in_call(original, expected)
+            })?;
+            let slot = match expected.operation {
+                Some(pair::Operation::Start(slot)) => {
+                    usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)
+                }
+                _ => return Err(Error::Conflict),
+            };
+            // Passive package reads have their own complete Calling fences.
+            // Keep the SAME retained owner/Pair/lock, every before/after check,
+            // and the final full native requery before returning to C creation.
+            supervisor.run(&context, || {
+                self.continuity(original, expected)?;
+                self.prepared[slot]
+                    .as_ref()
+                    .ok_or(Error::Pending)?
+                    .verify_cold_carrier_package_before_carrier(
+                        original,
+                        expected,
+                        self.lock.as_mut().ok_or(Error::Retired)?,
+                    )?;
+                self.continuity(original, expected)
+            })?;
+            if self.member_source.transport() == nelomai_client_tunnel::TunnelTransport::WireGuard {
+                supervisor.run(&context, || {
+                    self.continuity(original, expected)?;
+                    self.prepared[slot]
+                        .as_ref()
+                        .ok_or(Error::Pending)?
+                        .verify_cold_wireguard_package_before_carrier(
+                            original,
+                            expected,
+                            self.lock.as_mut().ok_or(Error::Retired)?,
+                        )?;
+                    reached!("member preflight actual cold WireGuard package accepted");
+                    self.continuity(original, expected)
+                })?;
+            }
+            supervisor.run(&context, || {
+                self.continuity(original, expected)?;
+                self.prepared[slot]
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .finish_preflight_before_carrier(
+                        original,
+                        expected,
+                        self.lock.as_mut().ok_or(Error::Retired)?,
+                    )?;
+                reached!("preflight final full native recheck accepted");
+                self.continuity(original, expected)
             })
         }
         fn prepare_member(
