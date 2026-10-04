@@ -35,10 +35,18 @@ debug = 0
 [profile.test.package.curve25519-dalek]
 opt-level = 3
 
-# Execute the full native lifecycle with optimized runtime/record checks while
-# retaining the test profile's assertions and both unchanged watchdog bounds.
+# Match shipping optimization for the complete signature/hash path and native
+# runtime/record checks. Nested full-absence reads still execute every sample,
+# original-owner check and reauthentication within the same 30s Calling budget.
+# Test assertions/debug assertions and the release profiles stay unchanged.
+[profile.test.package.ed25519-dalek]
+opt-level = 3
+
+[profile.test.package.sha2]
+opt-level = 3
+
 [profile.test.package.nelomai-contracts]
-opt-level = 1
+opt-level = 3
 
 [profile.test.package.nelomai-windows-service]
-opt-level = 1
+opt-level = 3
