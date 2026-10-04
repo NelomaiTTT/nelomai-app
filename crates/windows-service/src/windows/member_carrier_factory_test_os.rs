@@ -142,21 +142,14 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> io::Result<Self> {
-        Self::with_wintun(None)
+        Self::with_runtime(None)
     }
     pub(crate) fn new_native_modules() -> io::Result<Self> {
-        let path = std::env::var_os("NELOMAI_FACTORY_WINTUN_DLL")
-            .ok_or_else(|| io::Error::other("audited Wintun DLL fixture input absent"))?;
-        Self::with_wintun(Some(std::fs::read(path)?))
+        let directory = std::env::var_os("NELOMAI_FACTORY_RUNTIME_DIRECTORY")
+            .ok_or_else(|| io::Error::other("actual factory runtime fixture input absent"))?;
+        Self::with_runtime(Some(PathBuf::from(directory)))
     }
-    fn with_wintun(wintun: Option<Vec<u8>>) -> io::Result<Self> {
-        let wireguard = if wintun.is_some() {
-            let path = std::env::var_os("NELOMAI_FACTORY_WIREGUARD_DLL")
-                .ok_or_else(|| io::Error::other("audited WireGuard DLL fixture input absent"))?;
-            Some(std::fs::read(path)?)
-        } else {
-            None
-        };
+    fn with_runtime(native_runtime: Option<PathBuf>) -> io::Result<Self> {
         use ed25519_dalek::{Signer, SigningKey};
         use member_files::SessionFileIo;
         use nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN;
@@ -251,31 +244,30 @@ impl Fixture {
         let source = parent.join("source");
         let bin = source.join("engines/latest/0.3.3");
         std::fs::create_dir_all(&bin)?;
-        let payloads: [(&str, &[u8], &str); 5] = [
-            (
-                "nelomai-windows-service.exe",
-                b"fixture engine DATA",
-                "executable",
-            ),
-            (
-                "wintun.dll",
-                wintun.as_deref().unwrap_or(b"fixture Wintun DATA"),
-                "shared_library",
-            ),
-            (
-                "wireguard.dll",
-                wireguard.as_deref().unwrap_or(b"fixture WG DATA"),
-                "shared_library",
-            ),
-            ("tunnel.dll", b"fixture tunnel DATA", "shared_library"),
-            (
-                "amneziawg-tunnel.dll",
-                b"fixture AWG DATA",
-                "shared_library",
-            ),
+        let names = [
+            "nelomai-windows-service.exe",
+            "wintun.dll",
+            "wireguard.dll",
+            "tunnel.dll",
+            "amneziawg-tunnel.dll",
         ];
+        let payloads = match &native_runtime {
+            Some(directory) => names
+                .iter()
+                .map(|name| std::fs::read(directory.join(name)))
+                .collect::<io::Result<Vec<_>>>()?,
+            None => names
+                .iter()
+                .map(|name| format!("fixture {name} DATA").into_bytes())
+                .collect(),
+        };
         let mut files = Vec::new();
-        for (name, bytes, role) in payloads {
+        for (index, (name, bytes)) in names.iter().zip(&payloads).enumerate() {
+            let role = if index == 0 {
+                "executable"
+            } else {
+                "shared_library"
+            };
             std::fs::write(bin.join(name), bytes)?;
             files.push(serde_json::json!({"path": name, "size_bytes": bytes.len(), "sha256": d::digest(bytes), "role": role}));
         }
@@ -303,7 +295,7 @@ impl Fixture {
         );
         let layout = installation.install(&source, &client, "S-1-5-21-1000", &d::RealInstallIo)?;
         let executable = std::fs::canonicalize(layout.engine_path())?;
-        if wintun.is_some() {
+        if native_runtime.is_some() {
             let wireguard_package =
                 crate::member_owner::cold_wireguard_data::native::prepare_fixture_package(
                     &executable.with_file_name("wireguard.dll"),

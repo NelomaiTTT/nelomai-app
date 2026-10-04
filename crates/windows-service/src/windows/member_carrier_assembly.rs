@@ -1691,6 +1691,10 @@ pub(crate) mod native {
                 pair::Effect::CarrierReady,
                 || {
                     check_cancelled(&cancelled)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly begin original transfer",
+                    );
                     self.incoming = Some(
                         self.root
                             .bootstrap
@@ -1698,14 +1702,34 @@ pub(crate) mod native {
                             .ok_or(Error::Pending)?
                             .take_for_assembly(lock)?,
                     );
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly end original transfer",
+                    );
                     if !Rc::ptr_eq(
                         &self.incoming.as_ref().ok_or(Error::Pending)?.pair_intent,
                         &intent,
                     ) {
                         return Err(Error::Conflict);
                     }
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly begin split keys",
+                    );
                     self.split_keys()?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly end split keys",
+                    );
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly begin original attach",
+                    );
                     self.root.attach_keys(lock)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "assembly end original attach",
+                    );
                     check_cancelled(&cancelled)
                 },
             )?;

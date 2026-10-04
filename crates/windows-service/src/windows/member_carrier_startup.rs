@@ -4452,6 +4452,10 @@ pub(crate) mod native {
         ) -> Result<crate::member_owner::InterfaceProof> {
             macro_rules! step {
                 ($label:literal, $result:expr) => {{
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(concat!(
+                        "begin ", $label
+                    ));
                     let value = $result.inspect_err(|_error| {
                         #[cfg(test)]
                         super::super::member_carrier_factory_test_os::trace_native($label, _error);
@@ -4516,14 +4520,23 @@ pub(crate) mod native {
                         initial,
                     )
                 );
-                assembly
-                    .bootstrap_mut()?
-                    .compose_originals(lock, &mut store)?;
+                step!(
+                    "CarrierReady original composition",
+                    assembly
+                        .bootstrap_mut()?
+                        .compose_originals(lock, &mut store)
+                );
             }
-            assembly.assemble(lock, original)?;
-            assembly.prepare_carrier(lock)?;
+            step!(
+                "CarrierReady original assembly",
+                assembly.assemble(lock, original)
+            );
+            step!("CarrierReady original keys", assembly.prepare_carrier(lock));
             let carrier = self.carrier.as_mut().ok_or(Error::Retired)?;
-            self.proof = Some(carrier.create_ready(assembly, lock, &self.files)?);
+            self.proof = Some(step!(
+                "CarrierReady original C creation",
+                carrier.create_ready(assembly, lock, &self.files)
+            ));
             self.pins = Some(carrier.member_pins()?);
             self.continuity(original, expected)?;
             self.proof.ok_or(Error::Pending)

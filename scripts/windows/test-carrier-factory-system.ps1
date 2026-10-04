@@ -1,7 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$TestExecutable,
-    [Parameter(Mandatory = $true)][string]$WintunDll,
-    [Parameter(Mandatory = $true)][string]$WireGuardDll,
+    [Parameter(Mandatory = $true)][string]$RuntimeDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory
 )
 $ErrorActionPreference = 'Stop'
@@ -27,8 +26,7 @@ $payload = @{
     executable = $exe
     test = $selectedTest
     directory = (Get-Location).Path
-    wintun = (Resolve-Path -LiteralPath $WintunDll).Path
-    wireguard = (Resolve-Path -LiteralPath $WireGuardDll).Path
+    runtime = (Resolve-Path -LiteralPath $RuntimeDirectory).Path
     log = $log
     result = $resultPath
 } | ConvertTo-Json -Compress
@@ -44,8 +42,7 @@ try {
     $system = $identity.User.Value -eq 'S-1-5-18'
     if (-not $system) { throw 'Actual factory process is not SYSTEM' }
     Set-Location -LiteralPath $data.directory
-    $env:NELOMAI_FACTORY_WINTUN_DLL = $data.wintun
-    $env:NELOMAI_FACTORY_WIREGUARD_DLL = $data.wireguard
+    $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY = $data.runtime
     # PowerShell 5 treats native stderr as ErrorRecords. Capture both streams
     # directly so a normal Rust diagnostic cannot interrupt the actual test.
     $process = Start-Process -FilePath $data.executable -ArgumentList @(
