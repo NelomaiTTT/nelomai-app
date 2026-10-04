@@ -926,6 +926,9 @@ pub(crate) mod native {
             let input = bootstrap.original_inputs();
             input
                 .deadline
+                .verify_runtime(input.supervisor, input.runtime, input.context)?;
+            input
+                .deadline
                 .verify_call(input.supervisor, input.context)?;
             pair.verify_module_only_read_bracket(
                 input.runtime,
@@ -961,9 +964,13 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             compare_module_only_read_progress(input.context, &self.expected, expected)?;
+            // Entry can be idle after a normally returned forward Err. The
+            // original revoked pin is valid only INSIDE cleanup Calling; keep
+            // that pin check in verify_read_origin_in_call. Entry authenticates
+            // the SAME supervisor/runtime/lease through its cleanup-only gate.
             input
-                .deadline
-                .verify_runtime(input.supervisor, input.runtime, input.context)?;
+                .supervisor
+                .verify_cleanup_runtime_entry(input.runtime, input.context)?;
             input
                 .runtime
                 .verify_same_session_files(input.context, input.files)?;
