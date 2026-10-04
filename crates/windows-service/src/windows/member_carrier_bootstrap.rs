@@ -550,9 +550,11 @@ pub(crate) mod native {
                 expected,
                 pair::Effect::CarrierReady,
                 || {
-                    step!("cold load original Calling input", input.calling());
                     // Data-only preflight is retained independently as well as the
                     // audited loader's internal cold package. It grants no effects.
+                    // Each passive reader checks its own original source/runtime.
+                    // The whole original Calling input is checked immediately
+                    // before LoadLibrary below and again after its retained ACK.
                     self.preload = Some(step!(
                         "cold load original Wintun preflight",
                         WintunPreload::new(&input.source)
@@ -580,7 +582,7 @@ pub(crate) mod native {
                         .load_into(
                             lock,
                             |lock| {
-                                input.calling()?;
+                                step!("cold load original Calling input", input.calling());
                                 if !input.runtime.matches_lock(lock) {
                                     return Err(Error::Conflict);
                                 }

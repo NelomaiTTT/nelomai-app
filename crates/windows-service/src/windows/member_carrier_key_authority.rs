@@ -466,16 +466,9 @@ impl RuntimeRead {
         context: &Context,
         files: &NativeSessionFiles,
     ) -> Result<()> {
-        self.verify(context)?;
-        if !self
-            .runtime
-            .files
-            .try_borrow()
-            .map_err(|_| Error::Conflict)?
-            .same_original_backend(files)
-        {
-            return Err(Error::Conflict);
-        }
+        // native_files_for_original already brackets this SAME backend
+        // comparison with full runtime authentication and also checks the
+        // original execution birth/view. Keep its original owner checks once.
         self.native_files_for_original(context, files)?
             .native_carrier_access(&context.intent.scope)
             .map_err(|_| Error::Journal)?
