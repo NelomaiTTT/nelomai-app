@@ -572,6 +572,10 @@ pub(crate) mod native {
                     if !members.is_empty() {
                         return Err(Error::Conflict);
                     }
+                    // SAME slot's factual marker is set only after the real OS
+                    // return is rooted in LoadedWintun, before fallible image/
+                    // package postflight. Wrapper presence alone is not an ACK.
+                    let actual_load_returned = self.module.load_returned.clone();
                     self.module
                         .load_into(
                             lock,
@@ -588,6 +592,7 @@ pub(crate) mod native {
                                     &input.source,
                                     lock,
                                     &input.cancelled,
+                                    &actual_load_returned,
                                 )
                                 .map_err(module_error)
                             },

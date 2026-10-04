@@ -1010,6 +1010,7 @@ struct State {
     panic: Option<usize>,
     lease_held: bool,
     loaded: usize,
+    original_load_retained: bool,
     unloads: usize,
     cancel_at: Option<(usize, Rc<AtomicBool>)>,
     deny_lease_verification: bool,
@@ -1087,6 +1088,10 @@ impl Kernel for Boundary {
     }
     fn module(&mut self, _: &Rc<Module>) -> Result<()> {
         self.call("module")
+    }
+    fn original_load_retained(&mut self, module: &Rc<Module>) {
+        assert!(Rc::ptr_eq(&module.0, &self.0));
+        self.0.borrow_mut().original_load_retained = true;
     }
 }
 
@@ -1434,6 +1439,10 @@ fn load_attempt_retains_internal_os_ack_before_failed_postload_queries() {
             assert!(result.is_err() || result.unwrap().is_err());
             assert_eq!(s.borrow().loaded, 1);
             assert_eq!(s.borrow().unloads, 0);
+            assert!(
+                s.borrow().original_load_retained,
+                "actual retained load ACK must precede every post-load Err/unwind"
+            );
             assert!(
                 !s.borrow().lease_held,
                 "rundown releases timing lease, not module ACK"

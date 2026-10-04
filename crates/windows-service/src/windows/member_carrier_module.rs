@@ -193,6 +193,9 @@ trait Kernel {
     fn verify_lease(&mut self, lease: &mut Self::Lease, cancelled: &AtomicBool) -> Result<()>;
     fn package(&mut self) -> Result<()>;
     fn load(&mut self) -> Result<Self::Module>;
+    /// Factual OS-return publication only, after the owning slot is populated.
+    /// Never image trust, rundown, resource permission or a successful load.
+    fn original_load_retained(&mut self, module: &Self::Module);
     fn module(&mut self, module: &Self::Module) -> Result<()>;
 }
 
@@ -537,6 +540,7 @@ impl<K: Kernel> LoadAttempt<K> {
             valid: Rc::new(Cell::new(false)),
         });
         let loaded = self.owner.as_mut().expect("retained OS load ACK");
+        loaded.kernel.original_load_retained(&loaded.module);
         loaded.kernel.module(&loaded.module)?;
         loaded.kernel.package()?;
         loaded.kernel.source()?;
@@ -994,6 +998,7 @@ pub(crate) mod native {
     struct Boundary {
         source: Rc<WintunSource>,
         package: Option<WintunPreload>,
+        actual_load_returned: Rc<Cell<bool>>,
     }
     impl Kernel for Boundary {
         type Lease = Lease;
@@ -1059,20 +1064,22 @@ pub(crate) mod native {
             };
             NonNull::new(raw)
                 .map(|raw| {
-                    let module = Rc::new(Module(
+                    Rc::new(Module(
                         raw,
                         ModuleRelease::new(),
                         LeasePins::new(),
                         RefCell::new(None),
-                    ));
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::native_module_loaded(&module);
-                    module
+                    ))
                 })
                 .ok_or(Error::Native)
         }
         fn module(&mut self, module: &Rc<Module>) -> Result<()> {
             verify_image(&self.source, module)
+        }
+        fn original_load_retained(&mut self, _module: &Rc<Module>) {
+            self.actual_load_returned.set(true);
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::native_module_loaded(_module);
         }
     }
     fn verify_image(source: &WintunSource, module: &Module) -> Result<()> {
@@ -1941,6 +1948,7 @@ pub(crate) mod native {
             source: &Rc<WintunSource>,
             lock: &mut KeyLock,
             cancelled: &AtomicBool,
+            actual_load_returned: &Rc<Cell<bool>>,
         ) -> Result<()> {
             if slot.is_some() {
                 return Err(Error::Conflict);
@@ -1962,6 +1970,7 @@ pub(crate) mod native {
                 Boundary {
                     source: source.clone(),
                     package: None,
+                    actual_load_returned: actual_load_returned.clone(),
                 },
                 cancelled,
             )?;
@@ -1999,7 +2008,13 @@ pub(crate) mod native {
             cancelled: &AtomicBool,
         ) -> Result<Self> {
             let mut slot = None;
-            Self::load_cold_into(&mut slot, source, lock, cancelled)?;
+            Self::load_cold_into(
+                &mut slot,
+                source,
+                lock,
+                cancelled,
+                &Rc::new(Cell::new(false)),
+            )?;
             slot.take().ok_or(Error::Conflict)
         }
         /// Returning a number grants no effect authority. The unsafe native
