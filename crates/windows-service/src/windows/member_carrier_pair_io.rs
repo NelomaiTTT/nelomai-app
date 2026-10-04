@@ -4861,10 +4861,28 @@ pub(crate) mod native {
                         execution: execution.take(),
                     },
                     |cut| {
+                        #[cfg(test)]
+                        if completed_original_module {
+                            crate::windows::member_carrier_factory_test_os::trace_step(
+                                "module-only locals terminal record begin",
+                            );
+                        }
                         require_terminal_record(expected)?;
+                        #[cfg(test)]
+                        if completed_original_module {
+                            crate::windows::member_carrier_factory_test_os::trace_step(
+                                "module-only locals original Pair begin",
+                            );
+                        }
                         let current = pair.current(expected)?;
                         if !Rc::ptr_eq(&current, original) {
                             return Err(conflict());
+                        }
+                        #[cfg(test)]
+                        if completed_original_module {
+                            crate::windows::member_carrier_factory_test_os::trace_step(
+                                "module-only locals release provider begin",
+                            );
                         }
                         if let Some(roots) = roots.as_ref() {
                             if completed_original_module { return Err(conflict()); }
@@ -4880,6 +4898,12 @@ pub(crate) mod native {
                             } else {
                                 actual.verify_uncaptured_terminal(original, expected).map_err(denied)?;
                             }
+                        }
+                        #[cfg(test)]
+                        if completed_original_module {
+                            crate::windows::member_carrier_factory_test_os::trace_step(
+                                "module-only locals release provider end",
+                            );
                         }
                         handoff(cut)
                     },
