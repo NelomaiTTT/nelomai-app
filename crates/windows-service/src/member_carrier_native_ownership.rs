@@ -1223,6 +1223,8 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         result
     }
     fn prepare_inner(&mut self, role: Role, lock: &mut I::MutationLock) -> Result<Record> {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key prepare original current");
         let i = role.index();
         let mut record = match &self.current {
             Some(record) => record.clone(),
@@ -1239,7 +1241,15 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         if record.phase != Phase::Preparing || record.keys[i].phase != KeyPhase::Unstarted {
             return Err(Error::Retired);
         }
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare initial absence begin",
+        );
         let absent = self.observe(&record, role, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare initial absence end",
+        );
         require_nic_absent(&absent)?;
         require_value(&absent, Value::Absent)?;
         if absent.key != KeyPresence::Absent {
@@ -1247,9 +1257,23 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         }
         let mut pending = next(&record)?;
         pending.keys[i].phase = KeyPhase::CreatePending;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare CreatePending begin",
+        );
         self.persist(Some(&record), &pending, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key prepare CreatePending end");
         record = pending;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare pending absence begin",
+        );
         let absent = self.observe(&record, role, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare pending absence end",
+        );
         require_nic_absent(&absent)?;
         require_value(&absent, Value::Absent)?;
         if absent.key != KeyPresence::Absent {
@@ -1258,6 +1282,8 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         next(&record)?; // Captured ACK must have a representable revision.
         self.io.assert_serialized_lock(lock, &self.context)?;
         let binding = self.context.bindings[i].clone();
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key prepare native NEW begin");
         let ack = self
             .io
             .create_new_key(lock, &record, &binding, &absent)
@@ -1267,12 +1293,22 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             binding,
             ack,
         });
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare native NEW retained",
+        );
         let mut captured = next(&record)?;
         captured.keys[i].phase = KeyPhase::Captured;
         captured.keys[i].new_key_ack = true;
         self.persist(Some(&record), &captured, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare Captured acknowledged",
+        );
         record = captured;
         let facts = self.observe(&record, role, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key prepare Captured readback");
         require_owned(&facts)?;
         require_nic_absent(&facts)?;
         require_value(&facts, Value::Absent)?;
@@ -1280,12 +1316,24 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         pending.keys[i].phase = KeyPhase::DisablePending;
         pending.keys[i].pending = Some(Value::DwordZero);
         self.persist(Some(&record), &pending, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare DisablePending acknowledged",
+        );
         self.write_value(&pending, role, Value::Absent, Value::DwordZero, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare disabled value readback",
+        );
         let mut disabled = next(&pending)?;
         disabled.keys[i].phase = KeyPhase::Disabled;
         disabled.keys[i].current = Value::DwordZero;
         disabled.keys[i].pending = None;
         self.persist(Some(&pending), &disabled, lock)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key prepare Disabled acknowledged",
+        );
         Ok(disabled)
     }
     /// A single-use registry prerequisite, tied to a borrowed captured token.

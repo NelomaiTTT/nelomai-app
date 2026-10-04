@@ -14,7 +14,7 @@ mod member_carrier_creator;
 mod member_carrier_creators;
 mod member_carrier_factory;
 #[cfg(test)]
-mod member_carrier_factory_test_os;
+pub(crate) mod member_carrier_factory_test_os;
 #[cfg(test)]
 pub(crate) use member_carrier_factory_test_os::wireguard_package_paths;
 mod member_carrier_guard;
