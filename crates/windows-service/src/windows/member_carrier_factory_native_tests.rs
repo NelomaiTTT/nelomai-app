@@ -36,6 +36,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     for case in [
         "cold",
+        "module-load-read-error",
+        "module-load-read-unwind",
         "primary-data-denial",
         "creator-ack",
         "initial-native-ack",
@@ -95,7 +97,16 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
 #[ignore = "executed exactly by the bounded native factory parent, one OS case per process"]
 fn carrier_factory_actual_cold_child() {
     let case = std::env::var("NELOMAI_FACTORY_OS_CASE").expect("bounded factory parent required");
-    let fixture = Fixture::new().expect("external signed/private fixture");
+    let module_partial = matches!(
+        case.as_str(),
+        "module-load-read-error" | "module-load-read-unwind"
+    );
+    let fixture = if module_partial {
+        Fixture::new_module_only()
+    } else {
+        Fixture::new()
+    }
+    .expect("external signed/private fixture");
     let mut factory: NativePairFactory<NativeSessionFiles> = fixture.factory().unwrap();
     let scope = SessionScope {
         runtime: RuntimeSlot::Latest,
@@ -116,6 +127,7 @@ fn carrier_factory_actual_cold_child() {
     };
     match case.as_str() {
         "cold" | "primary-data-denial" => (),
+        "module-load-read-error" | "module-load-read-unwind" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
         "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
         "initial-native-unwind" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, true),
@@ -128,7 +140,7 @@ fn carrier_factory_actual_cold_child() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
-    if matches!(case.as_str(), "cold" | "primary-data-denial") {
+    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial {
         result
             .expect("actual cold prepare unwound")
             .expect("actual cold factory preparation");
@@ -143,6 +155,22 @@ fn carrier_factory_actual_cold_child() {
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
     eprintln!("actual factory {case}: retained Starting");
     fixture.verify_files().unwrap();
+    if module_partial {
+        eprintln!("actual factory {case}: primary through audited module load");
+        fixture.lose_inventory_after_load(case == "module-load-read-unwind");
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            original.start_primary(primary, options)
+        }));
+        assert!(started.is_err() || started.unwrap().is_err());
+        fixture.require_original_load_and_fault();
+        assert!(original.snapshot().cleanup_pending);
+    }
     if case == "primary-data-denial" {
         let Command::Start {
             primary, options, ..
@@ -167,10 +195,26 @@ fn carrier_factory_actual_cold_child() {
     if stopped.is_err() {
         fixture.trace_pair_stage();
     }
-    if matches!(case.as_str(), "cold" | "primary-data-denial") {
-        let stopped = stopped.expect("actual prepared-before-DLL native Stop");
+    if case == "module-load-read-unwind" {
+        // Native supervisor permanently revokes uncertain unwind timing.
+        // Preserve the actual returned owner; never turn revocation/exit into
+        // permission to unload or into successful protected completion.
+        assert!(stopped.is_err());
+        assert!(original.snapshot().cleanup_pending);
+        fixture.require_original_load_and_fault();
+        std::mem::forget(original);
+        std::mem::forget(factory);
+        return;
+    }
+    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial {
+        let stopped = stopped.expect("actual retained native Stop before C");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        if module_partial {
+            // A post-LoadLibrary error/unwind must clean the SAME native
+            // returned module. Do not call process exit a release ACK.
+            return;
+        }
         // CompositeBackend drops its terminal previous control before calling
         // this factory for the next session. Exercise that production order.
         drop(original);

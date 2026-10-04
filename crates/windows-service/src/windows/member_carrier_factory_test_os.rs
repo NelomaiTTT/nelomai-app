@@ -1,12 +1,15 @@
 //! Test-only external source/filesystem inputs. No selector, Startup, journal,
 //! coordinator, ownership, native-effect or completion implementation is fake.
-//! Fixture binaries are signed DATA and are never executed or loaded as DLLs.
+//! Cold fixtures use signed DATA. Module-only fixtures use the audited genuine
+//! Wintun DLL and external package inventory; no constructor is invoked.
 use super::{member_files, member_pair::NativePairFactory, member_session::*};
 use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard};
 use std::{
+    any::Any,
     cell::RefCell,
     io,
     path::{Path, PathBuf},
+    rc::{Rc, Weak},
     sync::{atomic::AtomicBool, Arc},
 };
 
@@ -17,6 +20,11 @@ struct Inputs {
     key: [u8; 32],
     fault: Option<(member_files::PrivateFile, bool)>,
     package_source_reads: usize,
+    package_paths: Option<[PathBuf; 5]>,
+    native_loads: usize,
+    module_originals: Vec<Weak<dyn Any>>,
+    inventory_fault: Option<bool>,
+    inventory_fault_reached: bool,
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
@@ -72,6 +80,33 @@ pub(crate) fn package_source_read() {
         }
     });
 }
+pub(crate) fn native_module_loaded<T: Any>(module: &Rc<T>) {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            inputs.native_loads += 1;
+            let original: Rc<dyn Any> = module.clone();
+            inputs.module_originals.push(Rc::downgrade(&original));
+        }
+    });
+}
+pub(crate) fn package_paths(source: &Path) -> io::Result<Option<[PathBuf; 5]>> {
+    INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        let Some(inputs) = inputs.as_mut().filter(|v| source.starts_with(&v.root)) else {
+            return Ok(None);
+        };
+        if inputs.native_loads > 0 {
+            if let Some(unwind) = inputs.inventory_fault.take() {
+                inputs.inventory_fault_reached = true;
+                if unwind {
+                    panic!("fixture package inventory read after native LoadLibrary");
+                }
+                return Err(io::Error::other("fixture package inventory read lost"));
+            }
+        }
+        Ok(inputs.package_paths.clone())
+    })
+}
 
 pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::CarrierError) {
     if state().is_some() {
@@ -97,6 +132,14 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> io::Result<Self> {
+        Self::with_wintun(None)
+    }
+    pub(crate) fn new_module_only() -> io::Result<Self> {
+        let path = std::env::var_os("NELOMAI_FACTORY_WINTUN_DLL")
+            .ok_or_else(|| io::Error::other("audited Wintun DLL fixture input absent"))?;
+        Self::with_wintun(Some(std::fs::read(path)?))
+    }
+    fn with_wintun(wintun: Option<Vec<u8>>) -> io::Result<Self> {
         use ed25519_dalek::{Signer, SigningKey};
         use member_files::SessionFileIo;
         use nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN;
@@ -177,6 +220,11 @@ impl Fixture {
                 key: key.verifying_key().to_bytes(),
                 fault: None,
                 package_source_reads: 0,
+                package_paths: None,
+                native_loads: 0,
+                module_originals: vec![],
+                inventory_fault: None,
+                inventory_fault_reached: false,
             })
         });
         // Real private-directory/ancestor/lock/CAS implementation creates state.
@@ -191,7 +239,11 @@ impl Fixture {
                 b"fixture engine DATA",
                 "executable",
             ),
-            ("wintun.dll", b"fixture Wintun DATA", "shared_library"),
+            (
+                "wintun.dll",
+                wintun.as_deref().unwrap_or(b"fixture Wintun DATA"),
+                "shared_library",
+            ),
             ("wireguard.dll", b"fixture WG DATA", "shared_library"),
             ("tunnel.dll", b"fixture tunnel DATA", "shared_library"),
             (
@@ -229,6 +281,20 @@ impl Fixture {
         );
         let layout = installation.install(&source, &client, "S-1-5-21-1000", &d::RealInstallIo)?;
         let executable = std::fs::canonicalize(layout.engine_path())?;
+        if wintun.is_some() {
+            let paths = super::member_carrier_wintun_package::native::prepare_fixture_package(
+                &executable.with_file_name("wintun.dll"),
+                &parent.join("package-input"),
+            )
+            .map_err(|e| io::Error::other(format!("audited package fixture: {e:?}")))?;
+            INPUTS.with(|inputs| {
+                inputs
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("fixture inputs")
+                    .package_paths = Some(paths)
+            });
+        }
         INPUTS.with(|inputs| {
             inputs
                 .borrow_mut()
@@ -267,6 +333,35 @@ impl Fixture {
     pub(crate) fn lose_ack(&self, target: member_files::PrivateFile, unwind: bool) {
         INPUTS.with(|inputs| {
             inputs.borrow_mut().as_mut().expect("fixture inputs").fault = Some((target, unwind))
+        });
+    }
+    pub(crate) fn lose_inventory_after_load(&self, unwind: bool) {
+        INPUTS.with(|inputs| {
+            inputs
+                .borrow_mut()
+                .as_mut()
+                .expect("fixture inputs")
+                .inventory_fault = Some(unwind)
+        });
+    }
+    pub(crate) fn require_original_load_and_fault(&self) {
+        INPUTS.with(|inputs| {
+            let inputs = inputs.borrow();
+            let inputs = inputs.as_ref().expect("fixture inputs");
+            assert_eq!(
+                inputs.native_loads, 1,
+                "missing/repeated actual LoadLibrary ACK"
+            );
+            assert_eq!(inputs.module_originals.len(), 1);
+            assert!(
+                inputs.module_originals[0].upgrade().is_some(),
+                "actual returned module owner was discarded after Err/unwind"
+            );
+            assert!(
+                inputs.inventory_fault_reached,
+                "post-load external read fault not reached"
+            );
+            assert!(inputs.inventory_fault.is_none());
         });
     }
     pub(crate) fn verify_files(&self) -> io::Result<()> {

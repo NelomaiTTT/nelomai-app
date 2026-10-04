@@ -1059,12 +1059,15 @@ pub(crate) mod native {
             };
             NonNull::new(raw)
                 .map(|raw| {
-                    Rc::new(Module(
+                    let module = Rc::new(Module(
                         raw,
                         ModuleRelease::new(),
                         LeasePins::new(),
                         RefCell::new(None),
-                    ))
+                    ));
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::native_module_loaded(&module);
+                    module
                 })
                 .ok_or(Error::Native)
         }

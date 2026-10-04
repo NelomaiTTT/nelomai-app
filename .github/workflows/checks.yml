@@ -203,6 +203,17 @@ jobs:
       - run: cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
+      - name: Audited module-only factory input
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'factory-wintun-0.14.1.zip'
+          $expanded = Join-Path $env:RUNNER_TEMP 'factory-wintun-0.14.1'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $dll = Join-Path $expanded 'wintun/bin/amd64/wintun.dll'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $dll).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
+            throw 'Audited factory Wintun input hash mismatch'
+          }
+          "NELOMAI_FACTORY_WINTUN_DLL=$dll" | Out-File -FilePath $env:GITHUB_ENV -Append
       - run: cargo test -p nelomai-windows-service
       # Read-only existing HKCU key. Log the actual native in/out-size contract;
       # this cannot grant SACL access, product key ownership or disposition.

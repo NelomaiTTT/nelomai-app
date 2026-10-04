@@ -1066,6 +1066,36 @@ pub(crate) mod native {
     ];
     const BUFFER: usize = 64 * 1024;
     const MAX_NODES: u32 = 16_384;
+    /// Test OS input only: exact audited resources in a fresh owned tree.
+    /// Production parsing, actual file/link pins, Authenticode/catalog and all
+    /// byte/readback checks still execute. Nothing is installed in the OS.
+    #[cfg(test)]
+    pub(crate) fn prepare_fixture_package(source: &Path, directory: &Path) -> Result<[PathBuf; 5]> {
+        let bytes = std::fs::read(source).map_err(|e| io("fixture source read", e))?;
+        if hash(&bytes) != AUDITED_DLL_SHA256 {
+            return Err(Error::Changed);
+        }
+        let package = extract_package(&bytes)?;
+        std::fs::create_dir(directory).map_err(|e| io("fixture package directory", e))?;
+        let paths = [
+            "published.inf",
+            "store.inf",
+            "wintun.cat",
+            "store.sys",
+            "system.sys",
+        ]
+        .map(|name| directory.join(name));
+        for (path, bytes) in paths.iter().zip([
+            &package.inf,
+            &package.inf,
+            &package.cat,
+            &package.sys,
+            &package.sys,
+        ]) {
+            std::fs::write(path, bytes).map_err(|e| io("fixture package input", e))?;
+        }
+        Ok(paths)
+    }
     fn last(op: &'static str) -> Error {
         Error::Native(op, unsafe { GetLastError() })
     }
@@ -2043,6 +2073,34 @@ pub(crate) mod native {
             let native_amd64_win10_plus = native_platform()?;
             if !native_amd64_win10_plus {
                 return Err(Error::Unsupported("native platform"));
+            }
+            #[cfg(test)]
+            if let Some(paths) = super::super::member_carrier_factory_test_os::package_paths(
+                &final_path(self.source.file()?)?,
+            )
+            .map_err(|e| io("fixture package inventory", e))?
+            {
+                let [published_inf, store_inf, store_cat, store_sys, system_sys] =
+                    paths.map(|path| path.to_string_lossy().into_owned());
+                return Ok(Inventory {
+                    native_amd64_win10_plus,
+                    candidates: vec![Candidate {
+                        date: DRIVER_DATE,
+                        version: DRIVER_VERSION,
+                        provider: "WireGuard LLC".into(),
+                        published_inf,
+                        store_inf,
+                        store_cat,
+                        store_sys,
+                    }],
+                    devices: vec![],
+                    service_type: 1,
+                    service_start: 3,
+                    service_state: 1,
+                    pending_maintenance: false,
+                    pending: PendingSnapshot::default(),
+                    system_sys,
+                });
             }
             let root = os_directory(false)?;
             let system_root = os_directory(true)?;
