@@ -1051,7 +1051,6 @@ pub(crate) mod native {
                     let pins = inputs.pins.as_ref().ok_or_else(conflict)?;
                     verify_pregraph_pins(inputs.resources.retained(), pins)?;
                     let runtime = pins.runtime.read_pin().map_err(|_| conflict())?;
-                    let deadline = pins.supervisor.read_pin().map_err(|_| conflict())?;
                     inputs
                         .resources
                         .transfer_original_into(&mut inputs.extracted)
@@ -1075,7 +1074,6 @@ pub(crate) mod native {
                             pins.expected,
                             pins.image,
                             pins.supervisor,
-                            deadline,
                             original,
                             gate,
                         ),
@@ -1087,7 +1085,6 @@ pub(crate) mod native {
                             pins.expected,
                             pins.image,
                             pins.supervisor,
-                            deadline,
                             original,
                             gate,
                         ),

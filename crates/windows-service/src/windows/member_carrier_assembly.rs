@@ -143,7 +143,6 @@ impl<T> TerminalResources<T> {
         expected: crate::member_carrier_pair::Record,
         image: std::rc::Rc<crate::windows::member_carrier_module::native::OriginalImage>,
         supervisor: std::rc::Rc<crate::windows::member_native_deadline::NativeDeadline>,
-        deadline: crate::windows::member_native_deadline::NativeDeadlineReadPin,
         gate: G,
     ) -> std::rc::Rc<
         crate::windows::member_carrier_terminal_release::native::NativeTerminalReleaseRoot<T, G>,
@@ -162,7 +161,6 @@ impl<T> TerminalResources<T> {
             expected,
             image,
             supervisor,
-            deadline,
             self.original.take().expect("retained terminal handoff"),
             gate,
         )

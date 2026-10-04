@@ -2134,7 +2134,14 @@ pub(crate) mod native {
                 .runtime
                 .record(&self.context, RecordKind::Pair)
                 .map_err(denied)?;
-            if pair::Record::decode(&payload).map_err(denied)? != *input.record {
+            if crate::windows::member_carrier_pair_store::carrier_payload(
+                &self.context.intent.scope,
+                &payload,
+            )
+            .map_err(denied)?
+            .as_ref()
+                != Some(input.record)
+            {
                 return Err(Error::Conflict);
             }
             Ok(payload)

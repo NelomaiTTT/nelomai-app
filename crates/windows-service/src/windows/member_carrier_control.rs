@@ -534,7 +534,6 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             if self.release.is_none() {
                 // All fallible reads precede extraction of the actual T/G.
                 let runtime = pins.runtime.read_pin().map_err(|_| conflict())?;
-                let deadline = pins.supervisor.read_pin().map_err(|_| conflict())?;
                 if self.resources.is_none() || self.gate.is_none() {
                     return Err(conflict());
                 }
@@ -549,7 +548,6 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                     pins.expected.clone(),
                     pins.image.clone(),
                     pins.supervisor.clone(),
-                    deadline,
                     gate,
                 ));
             }

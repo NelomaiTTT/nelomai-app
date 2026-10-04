@@ -630,6 +630,28 @@ pub(crate) mod native {
             lock: &mut KeyLock,
             store: &mut NativeCarrierPairStore,
         ) -> Result<()> {
+            macro_rules! step {
+                ($label:literal, $result:expr) => {{
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(concat!(
+                        "compose begin ",
+                        $label
+                    ));
+                    let value = $result.inspect_err(|_error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            concat!("compose ", $label),
+                            _error,
+                        );
+                    })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(concat!(
+                        "compose end ",
+                        $label
+                    ));
+                    value
+                }};
+            }
             if self.terminal_attempted
                 || !self.cold_verified
                 || self.compose_attempted
@@ -650,63 +672,88 @@ pub(crate) mod native {
                 &input.expected,
                 pair::Effect::CarrierReady,
                 || {
-                    input.calling()?;
+                    step!("current Calling", input.calling());
                     let module = self.module.acknowledged.as_mut().ok_or(Error::Pending)?;
                     // Retain the actual image return BEFORE any subsequent check.
                     // The loaded module has been in the slot throughout the mint.
-                    self.image = Some(
+                    self.image = Some(step!(
+                        "original image",
                         module
                             .original_image(lock, &input.cancelled)
-                            .map_err(module_error)?,
-                    );
+                            .map_err(module_error)
+                    ));
                     let image = self.image.as_ref().expect("retained image");
                     if !image.matches_source(&input.source)
                         || !image.matches_runtime(&input.runtime)
                     {
                         return Err(Error::Conflict);
                     }
-                    image
-                        .verify_live_runtime(&input.runtime)
-                        .map_err(module_error)?;
-                    if module
-                        .original_cold_module(lock, &input.cancelled)
-                        .map_err(module_error)?
-                        != image.module().map_err(module_error)?
+                    step!(
+                        "live image",
+                        image
+                            .verify_live_runtime(&input.runtime)
+                            .map_err(module_error)
+                    );
+                    if step!(
+                        "cold module",
+                        module
+                            .original_cold_module(lock, &input.cancelled)
+                            .map_err(module_error)
+                    ) != step!("image module", image.module().map_err(module_error))
                     {
                         return Err(Error::Conflict);
                     }
-                    input.calling()?;
+                    step!("current Calling", input.calling());
                     let members = self.members.as_ref().ok_or(Error::Pending)?;
-                    members.matches_original_runtime_image(&input.runtime, image)?;
-                    if !members.read_all()?.is_empty() {
+                    step!(
+                        "original members",
+                        members.matches_original_runtime_image(&input.runtime, image)
+                    );
+                    if !step!("member inventory", members.read_all()).is_empty() {
                         return Err(Error::Conflict);
                     }
-                    let universe = OriginalUniverse::new(&input.runtime, image)
-                        .and_then(|universe| universe.with_members(members.read_pin()))
-                        .map_err(|_| Error::Conflict)?;
-                    self.registry = Some(
-                        Producer::<OriginalWintun>::intent(input.context.clone(), universe)
-                            .map_err(|_| Error::Conflict)?,
+                    let universe = step!(
+                        "original universe",
+                        OriginalUniverse::new(&input.runtime, image)
+                            .and_then(|universe| universe.with_members(members.read_pin()))
+                            .map_err(|_| Error::Conflict)
                     );
+                    self.registry = Some(step!(
+                        "registry intent",
+                        Producer::<OriginalWintun>::intent(input.context.clone(), universe)
+                            .map_err(|_| Error::Conflict)
+                    ));
                     let (producer, observer) = self.registry.as_ref().expect("retained registry");
                     if !observer.same_original_registry(&producer.observer())
                         || observer.context() != &input.context
-                        || !observer
-                            .observe_all(&input.context)
-                            .map_err(|_| Error::Conflict)?
-                            .originals
-                            .is_empty()
+                        || !step!(
+                            "whole registry",
+                            observer
+                                .observe_all(&input.context)
+                                .map_err(|_| Error::Conflict)
+                        )
+                        .originals
+                        .is_empty()
                     {
                         return Err(Error::Conflict);
                     }
-                    let originals =
+                    let originals = step!(
+                        "original key inventory",
                         OriginalKeyInventory::from_producer(producer, &input.runtime, image)
-                            .map_err(|_| Error::Conflict)?;
-                    self.keys = Some(KeyAuthority::from_read(&input.runtime, originals, lock)?);
-                    image
-                        .verify_live_runtime(&input.runtime)
-                        .map_err(module_error)?;
-                    input.calling()
+                            .map_err(|_| Error::Conflict)
+                    );
+                    self.keys = Some(step!(
+                        "key authority",
+                        KeyAuthority::from_read(&input.runtime, originals, lock)
+                    ));
+                    step!(
+                        "live image",
+                        image
+                            .verify_live_runtime(&input.runtime)
+                            .map_err(module_error)
+                    );
+                    step!("current Calling", input.calling());
+                    Ok(())
                 },
             )?;
             input.current()?;

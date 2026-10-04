@@ -173,7 +173,7 @@ pub(crate) mod native {
         member_carrier_module::native::{NativeModuleReleased, OriginalImage},
         member_carrier_pair_store::native_store::NativePairIntentRead,
         member_carrier_runtime::native::{NativeSourceRead, RetiredCarrierRead},
-        member_native_deadline::{NativeDeadline, NativeDeadlineReadPin},
+        member_native_deadline::NativeDeadline,
     };
     use std::{cell::Ref, mem::ManuallyDrop, rc::Rc};
 
@@ -215,7 +215,6 @@ pub(crate) mod native {
         expected: pair::Record,
         image: Rc<OriginalImage>,
         supervisor: Rc<NativeDeadline>,
-        deadline: NativeDeadlineReadPin,
     }
     /// Caller retains this root BEFORE any fallible terminal authentication.
     /// Never returns unique originals solely through Result. No automatic release
@@ -248,7 +247,6 @@ pub(crate) mod native {
             expected: pair::Record,
             image: Rc<OriginalImage>,
             supervisor: Rc<NativeDeadline>,
-            deadline: NativeDeadlineReadPin,
             resources: T,
             gate: G,
         ) -> Rc<Self> {
@@ -262,7 +260,6 @@ pub(crate) mod native {
                     expected,
                     image,
                     supervisor,
-                    deadline,
                 }),
                 gate: ManuallyDrop::new(gate),
                 resources: ResourceSlot::new(resources),
@@ -285,7 +282,6 @@ pub(crate) mod native {
             expected: pair::Record,
             image: Rc<OriginalImage>,
             supervisor: Rc<NativeDeadline>,
-            deadline: NativeDeadlineReadPin,
             resources: T,
             gate: G,
         ) -> Rc<Self> {
@@ -299,7 +295,6 @@ pub(crate) mod native {
                     expected,
                     image,
                     supervisor,
-                    deadline,
                 }),
                 gate: ManuallyDrop::new(gate),
                 resources: ResourceSlot::new(resources),
@@ -325,8 +320,12 @@ pub(crate) mod native {
             {
                 return Err(conflict());
             }
-            p.deadline
-                .verify_runtime(&p.supervisor, &p.runtime, &p.context)
+            // The original supervisor outlives Calling. A revoked forward pin
+            // cannot authenticate idle disposition after successful cleanup.
+            // This factual gate authenticates the SAME runtime/lease without
+            // minting a pin or granting an effect outside cleanup Calling.
+            p.supervisor
+                .verify_cleanup_runtime_entry(&p.runtime, &p.context)
                 .map_err(io::Error::other)?;
             // Does not query the image or resolve an export. Safe also AFTER
             // unloading; same real source/runtime/serialized lock still held.
@@ -337,7 +336,13 @@ pub(crate) mod native {
         fn continuity(&self) -> io::Result<()> {
             self.original_continuity()?;
             let p = &self.pins;
-            p.deadline
+            // Mint only inside this original supervisor's actual Calling.
+            // Construction and final ownership disposal require no read pin.
+            let deadline = p.supervisor.read_pin().map_err(io::Error::other)?;
+            deadline
+                .verify_runtime(&p.supervisor, &p.runtime, &p.context)
+                .map_err(io::Error::other)?;
+            deadline
                 .verify_call(&p.supervisor, &p.context)
                 .map_err(io::Error::other)
         }
@@ -447,16 +452,10 @@ pub(crate) mod native {
             self.terminal_call.verify()?;
             self.original_continuity()?;
             let p = &self.pins;
-            p.supervisor
-                .verify_cleanup_runtime_entry(&p.runtime, &p.context)
-                .map_err(|_| conflict())?;
             compare_terminal(&p.context, &p.expected)?;
             p.stopped
                 .verify_terminal_entry(&p.runtime, &p.context, &p.expected)?;
-            self.original_continuity()?;
-            p.supervisor
-                .verify_cleanup_runtime_entry(&p.runtime, &p.context)
-                .map_err(|_| conflict())
+            self.original_continuity()
         }
         /// Requires SAME module ACK AND this root's whole terminal Calling has
         /// returned successfully. Final idle checks are protected record/runtime/
