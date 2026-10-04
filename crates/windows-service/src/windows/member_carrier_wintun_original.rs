@@ -332,11 +332,11 @@ impl OriginalKeyInventory {
             }
         };
         let before = observe()?;
-        if before
-            .originals
-            .iter()
-            .any(|o| o.scope.binding != context.bindings[0])
-        {
+        if before.originals.iter().any(|o| {
+            o.scope.binding != context.bindings[0]
+                || o.identity.guid == binding.guid
+                || o.identity.name.eq_ignore_ascii_case(&binding.name)
+        }) {
             return Err(creators::Error::Conflict);
         }
         let carrier = before
@@ -424,13 +424,20 @@ impl OriginalKeyInventory {
                 } else {
                     self.observer.assert_absent(context, binding)?;
                 }
-                let universe = self.observer.observe_all(context)?;
-                if universe.originals.iter().any(|o| {
-                    o.identity.guid == binding.guid
-                        || o.identity.name.eq_ignore_ascii_case(&binding.name)
-                }) {
-                    return Err(creators::Error::Conflict);
+                if self.members.is_none() {
+                    // The legacy target reader has no before/after census;
+                    // keep its existing independent full-universe query.
+                    let universe = self.observer.observe_all(context)?;
+                    if universe.originals.iter().any(|o| {
+                        o.identity.guid == binding.guid
+                            || o.identity.name.eq_ignore_ascii_case(&binding.name)
+                    }) {
+                        return Err(creators::Error::Conflict);
+                    }
                 }
+                // The integrated target reader already checks its full before
+                // census and compares the after census around its independent
+                // SDK query. Keep that query and the private Never check once.
                 self.inspect_target(context, binding, false)?;
                 self.image
                     .verify_live_runtime(&self.runtime)
@@ -455,8 +462,14 @@ impl crate::windows::member_carrier_key_authority::OriginalCreatorInventory
         context: &receipt::Context,
         binding: &receipt::Binding,
     ) -> crate::member_carrier::Result<()> {
-        self.recheck(context, binding)
-            .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+        if self.members.is_none() {
+            // Preserve the legacy reader's original two complete rounds.
+            self.recheck(context, binding)
+                .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+        }
+        // Integrated recheck fences current source/record and the whole native
+        // universe on both sides of its independent target observation.
+        // KeyAuthority also brackets its actual OS reads with this recheck.
         self.recheck(context, binding)
             .map_err(|_| crate::member_carrier::CarrierError::Conflict)
     }
