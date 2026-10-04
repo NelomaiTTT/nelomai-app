@@ -572,6 +572,27 @@ impl RuntimeRead {
                     .map_err(|_| Error::Journal)?
                     .require_native_context(context)
                     .map_err(|_| Error::Conflict)?;
+                if kind == RecordKind::Network {
+                    // Legacy absence is a common-storage fact, never a native
+                    // birth receipt. Keep the native facet's explicit denial;
+                    // bracket the SAME original backend read with the selected
+                    // native context. Consumers still reject any present record.
+                    if !files.same_original_backend(&self.runtime.original_files) {
+                        return Err(Error::Conflict);
+                    }
+                    let record = self
+                        .runtime
+                        .original_files
+                        .clone()
+                        .read(&context.intent.scope, kind)
+                        .map_err(|_| Error::Journal)?;
+                    files
+                        .native_carrier_access(&context.intent.scope)
+                        .map_err(|_| Error::Journal)?
+                        .require_native_context(context)
+                        .map_err(|_| Error::Conflict)?;
+                    return Ok(record);
+                }
                 files
                     .read(&context.intent.scope, kind)
                     .map_err(|_| Error::Journal)
