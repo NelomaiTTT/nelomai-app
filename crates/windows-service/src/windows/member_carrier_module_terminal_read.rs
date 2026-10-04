@@ -71,6 +71,14 @@ impl<O, S: Clone + Eq> RetainedRead<O, S> {
         io: &mut I,
         inspect: impl FnOnce(&ReadFacts<S>) -> ReadResult<()>,
     ) -> ReadResult<()> {
+        macro_rules! step {
+            ($label:literal, $read:expr) => {
+                $read.inspect_err(|_error| {
+                    #[cfg(all(test, target_os = "windows"))]
+                    crate::windows::member_carrier_factory_test_os::trace_step($label);
+                })?
+            };
+        }
         if self.busy.replace(true) {
             self.failed.set(true);
             return Err(ReadError::Busy);
@@ -82,32 +90,69 @@ impl<O, S: Clone + Eq> RetainedRead<O, S> {
         if self.failed.get() || !Rc::ptr_eq(original, &self.original) {
             return Err(ReadError::Denied);
         }
-        io.fence()?;
-        let records = io.records()?;
+        step!("module-only full read first fence denied", io.fence());
+        let records = step!("module-only full read first inventory denied", io.records());
         *self.records.try_borrow_mut().map_err(|_| ReadError::Busy)? = Some(records.clone());
-        verify_records(io, &records)?;
-        io.paths_absent()?;
-        io.native_empty()?;
-        let snapshot = io.snapshot()?;
+        step!(
+            "module-only full read first record shape denied",
+            verify_records(io, &records)
+        );
+        step!(
+            "module-only full read first paths denied",
+            io.paths_absent()
+        );
+        step!(
+            "module-only full read first native absence denied",
+            io.native_empty()
+        );
+        let snapshot = step!("module-only full read first snapshot denied", io.snapshot());
         // Retain the actual returned observations BEFORE their fallible
         // comparison, callback or postflight. Failure never promotes them.
         *self.facts.try_borrow_mut().map_err(|_| ReadError::Busy)? =
             Some(ReadFacts { records, snapshot });
         let facts = self.facts.try_borrow().map_err(|_| ReadError::Busy)?;
         let facts = facts.as_ref().ok_or(ReadError::Denied)?;
-        io.verify_empty_snapshot(&facts.snapshot)?;
-        io.fence()?;
-        inspect(facts)?;
-        io.paths_absent()?;
-        io.native_empty()?;
-        let after = io.records()?;
-        verify_records(io, &after)?;
-        let snapshot = io.snapshot()?;
-        io.verify_empty_snapshot(&snapshot)?;
+        step!(
+            "module-only full read first empty snapshot denied",
+            io.verify_empty_snapshot(&facts.snapshot)
+        );
+        step!("module-only full read callback fence denied", io.fence());
+        step!(
+            "module-only full read original callback denied",
+            inspect(facts)
+        );
+        step!(
+            "module-only full read second paths denied",
+            io.paths_absent()
+        );
+        step!(
+            "module-only full read second native absence denied",
+            io.native_empty()
+        );
+        let after = step!(
+            "module-only full read second inventory denied",
+            io.records()
+        );
+        step!(
+            "module-only full read second record shape denied",
+            verify_records(io, &after)
+        );
+        let snapshot = step!(
+            "module-only full read second snapshot denied",
+            io.snapshot()
+        );
+        step!(
+            "module-only full read second empty snapshot denied",
+            io.verify_empty_snapshot(&snapshot)
+        );
         if after != facts.records || snapshot != facts.snapshot {
+            #[cfg(all(test, target_os = "windows"))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "module-only full read observations changed",
+            );
             return Err(ReadError::Changed);
         }
-        io.fence()?;
+        step!("module-only full read final fence denied", io.fence());
         if self.failed.get() {
             return Err(ReadError::Denied);
         }
