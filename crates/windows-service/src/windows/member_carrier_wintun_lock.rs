@@ -599,6 +599,10 @@ pub(crate) mod native {
                 )
             }? != Principal::System
             {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "Wintun cooperative lease denied non-SYSTEM process",
+                );
                 return Err(Error::Conflict);
             }
             self.check(cancelled)

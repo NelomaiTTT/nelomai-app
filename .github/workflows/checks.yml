@@ -226,7 +226,22 @@ jobs:
             throw 'Audited factory WireGuard DLL hash mismatch'
           }
           "NELOMAI_FACTORY_WIREGUARD_DLL=$wgDll" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - run: cargo test -p nelomai-windows-service
+      # The actual factory invokes the audited unimpersonated SYSTEM cooperative
+      # lease. Run this one test separately under its real production principal;
+      # its selector/coordinator/ownership/native gates are not replaced.
+      - run: cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair
+      - name: Actual factory lifecycle under SYSTEM
+        timeout-minutes: 55
+        run: |
+          $build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_service' -and $_.profile.test -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
+          ./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable $tests[0].executable `
+            -WintunDll $env:NELOMAI_FACTORY_WINTUN_DLL -WireGuardDll $env:NELOMAI_FACTORY_WIREGUARD_DLL `
+            -OutputDirectory $env:RUNNER_TEMP
       # Read-only existing HKCU key. Log the actual native in/out-size contract;
       # this cannot grant SACL access, product key ownership or disposition.
       - name: Readonly original-key security buffer gate
