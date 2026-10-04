@@ -4547,8 +4547,16 @@ pub(crate) mod native {
             expected: &PairRecord,
             lock: &mut KeyLock,
         ) -> Result<()> {
+            macro_rules! reached {
+                ($step:literal) => {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step($step);
+                };
+            }
             let prepared = self.prepared_record(lock)?;
+            reached!("member preflight original prepared record accepted");
             validate_before_carrier(&self.origin.context, expected, &prepared.intent)?;
+            reached!("member preflight Starting shape accepted");
             let verify_pair = || {
                 pair.inspect(&self.origin.runtime, &self.origin.supervisor, |actual| {
                     if actual == expected {
@@ -4560,9 +4568,11 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)
             };
             verify_pair()?;
+            reached!("member preflight current Starting ACK accepted");
             let owner = self.root.owner.as_mut().ok_or(Error::Retired)?;
             let raw = owner.raw.as_mut().ok_or(Error::Retired)?;
             let before = raw.prior_stopped().map_err(owner_error)?;
+            reached!("member preflight original prior-stopped read returned");
             if owner.prior.as_ref().is_some_and(|p| p != &before) {
                 return Err(Error::Conflict);
             }
@@ -4573,18 +4583,22 @@ pub(crate) mod native {
                 &[],
             )?)
             .map_err(|_| Error::Conflict)?;
+            reached!("member preflight first full native absence returned");
             if raw.prior_stopped().map_err(owner_error)? != before {
                 return Err(Error::Conflict);
             }
             verify_pair()?;
             self.verify_cold_carrier_package_before_carrier(pair, expected, lock)?;
+            reached!("member preflight actual cold carrier package accepted");
             super::super::member_owner::verify_readonly_cold_backend_modules(
                 &self.origin.source,
                 &self.origin.carrier,
             )
             .map_err(|_| Error::Pending)?;
+            reached!("member preflight cold backend module absence accepted");
             if self.origin.intent.transport == nelomai_client_tunnel::TunnelTransport::WireGuard {
                 self.verify_cold_wireguard_package_before_carrier(pair, expected, lock)?;
+                reached!("member preflight actual cold WireGuard package accepted");
             }
             // No partial package observation replaces the original full native
             // absence preflight. Requery the entire C+member universe afterward.

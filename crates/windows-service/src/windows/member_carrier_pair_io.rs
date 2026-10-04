@@ -5091,12 +5091,25 @@ pub(crate) mod native {
             let serial = self.serial.clone();
             serial.run(false, || {
                 let pin = self.current(record)?;
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "bootstrap preflight current Starting selected",
+                );
                 self.startup
                     .as_ref()
                     .ok_or_else(conflict)?
                     .try_borrow_mut()
                     .map_err(denied)?
                     .preflight_fresh(&pin, record)
+                    .inspect_err(|error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native(
+                            "bootstrap preflight delegate",
+                            error,
+                        );
+                        #[cfg(not(test))]
+                        let _ = error;
+                    })
                     .map_err(denied)
             })
         }

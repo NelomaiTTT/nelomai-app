@@ -5329,36 +5329,49 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<()> {
+            macro_rules! reached {
+                ($step:literal) => {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step($step);
+                };
+            }
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
             supervisor.run(&context, || {
+                reached!("preflight Calling entered");
                 begin_native_birth(
                     &mut self.birth_attempted,
                     expected.phase,
                     expected.carrier.is_some(),
                     self.create_attempted,
                 )?;
+                reached!("preflight birth ordering accepted");
                 // Common Starting CAS has already ACKed. Authenticate that
                 // SAME actual Pair/Calling before binding; Runtime retains the
                 // actual execution root before its fallible view/postflight.
                 self.continuity(original, expected)?;
+                reached!("preflight current Pair continuity accepted");
                 self.runtime
                     .bind_native_execution_birth(&context)
                     .map_err(|_| Error::Conflict)?;
+                reached!("preflight original native execution birth retained");
                 let canonical = self
                     .runtime
                     .native_birth_files(&context)
                     .map_err(|_| Error::Conflict)?;
+                reached!("preflight canonical native birth files returned");
                 let initial = self
                     .assembly
                     .as_ref()
                     .ok_or(Error::Pending)?
                     .initial_read_pin()?;
+                reached!("preflight initial assembly read retained");
                 initial.inspect_initial(&context, |journal, _| {
                     journal
                         .bind_original_native_view(canonical.clone())
                         .map_err(|_| Error::Journal)
                 })?;
+                reached!("preflight initial assembly canonical view bound");
                 self.files = canonical;
                 // Store resolves this canonical backend itself, preserving its
                 // original writer/receipt and sticky cleanup selection.
