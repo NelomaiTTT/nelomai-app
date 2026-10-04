@@ -972,23 +972,46 @@ pub(crate) mod native_store {
             supervisor: &crate::windows::member_native_deadline::NativeDeadline,
             inspect: impl FnOnce(&Record) -> io::Result<T>,
         ) -> io::Result<T> {
-            let mut call = PairIntentCall::begin(&self.busy, &self.revoked)?;
+            macro_rules! entry {
+                ($label:literal, $result:expr) => {
+                    $result.inspect_err(|_error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_step($label);
+                    })?
+                };
+            }
+            let mut call = entry!(
+                "module release Pair begin denied",
+                PairIntentCall::begin(&self.busy, &self.revoked)
+            );
             if !self.matches_runtime(runtime) {
                 return Err(conflict());
             }
-            let deadline = std::rc::Rc::new(supervisor.read_pin().map_err(|_| conflict())?);
-            deadline
-                .verify_runtime(supervisor, runtime, &self.context)
-                .map_err(|_| conflict())?;
-            deadline
-                .verify_call(supervisor, &self.context)
-                .map_err(|_| conflict())?;
-            self.verify()?;
+            let deadline = std::rc::Rc::new(entry!(
+                "module release Pair supervisor pin denied",
+                supervisor.read_pin().map_err(|_| conflict())
+            ));
+            entry!(
+                "module release Pair runtime denied",
+                deadline
+                    .verify_runtime(supervisor, runtime, &self.context)
+                    .map_err(|_| conflict())
+            );
+            entry!(
+                "module release Pair Calling denied",
+                deadline
+                    .verify_call(supervisor, &self.context)
+                    .map_err(|_| conflict())
+            );
+            entry!("module release Pair protected bytes denied", self.verify());
             // The protected reread itself can exhaust the original budget.
             deadline
                 .verify_call(supervisor, &self.context)
                 .map_err(|_| conflict())?;
-            let _frame = PairReadFrame::enter(&self.read_frame, deadline.clone())?;
+            let _frame = entry!(
+                "module release Pair frame denied",
+                PairReadFrame::enter(&self.read_frame, deadline.clone())
+            );
             let result = inspect(&self.intent.record);
             // A normal callback Err is still a returned read: reauthenticate
             // its postflight before propagating it. Unwind revokes via Drop.

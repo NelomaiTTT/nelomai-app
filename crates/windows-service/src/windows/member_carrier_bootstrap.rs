@@ -1141,7 +1141,13 @@ pub(crate) mod native {
             expected: &PairRecord,
             call: impl FnOnce(&mut LoadedWintun) -> Result<()>,
         ) -> Result<()> {
-            self.verify_module_only_read(original, pair, expected)?;
+            self.verify_module_only_read(original, pair, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "module release Bootstrap origin denied",
+                    );
+                })?;
             let input = &original.inputs;
             pair.verify_terminal_bracket(
                 &input.runtime,
@@ -1149,6 +1155,12 @@ pub(crate) mod native {
                 &input.context,
                 expected,
             )
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "module release Bootstrap Pair bracket denied",
+                );
+            })
             .map_err(|_| Error::Conflict)?;
             let load = original.load.try_borrow().map_err(|_| Error::Conflict)?;
             self.module

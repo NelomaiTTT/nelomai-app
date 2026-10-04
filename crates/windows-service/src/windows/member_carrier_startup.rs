@@ -1144,9 +1144,21 @@ pub(crate) mod native {
                 return Err(crate::windows::member_carrier_module::Error::Conflict);
             }
             self.verify_call()
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "module release proof Calling denied",
+                    );
+                })
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
             self.reader
                 .read_in_release_pre_call(&self.lock)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "module release full pre-read denied",
+                    );
+                })
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
             self.verify_call()
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)
@@ -2727,8 +2739,20 @@ pub(crate) mod native {
                 &mut crate::windows::member_carrier_module::native::LoadedWintun,
             ) -> Result<()>,
         ) -> Result<()> {
-            self.verify_module_only_candidate(original, pair, expected)?;
+            self.verify_module_only_candidate(original, pair, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "module release Startup candidate denied",
+                    );
+                })?;
             pair.verify_terminal_bracket(&self.runtime, &self.supervisor, &self.context, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "module release Startup Pair bracket denied",
+                    );
+                })
                 .map_err(|_| Error::Conflict)?;
             let result = self
                 .assembly
@@ -2807,6 +2831,8 @@ pub(crate) mod native {
                     unsafe {
                         supervisor.run_no_constructor_module_release(&proof, || {
                             pair.inspect(&runtime, &supervisor, |actual| {
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_step("module release Pair callback entered");
                                 if actual != expected {
                                     return Err(std::io::Error::other("module_release_pair"));
                                 }
@@ -2825,6 +2851,10 @@ pub(crate) mod native {
                                                 proof.clone(),
                                                 &mut ack,
                                             )
+                                            .inspect_err(|_error| {
+                                                #[cfg(test)]
+                                                super::super::member_carrier_factory_test_os::trace_step("module release native backend denied");
+                                            })
                                             .map_err(|_| Error::Native)?;
                                         module
                                             .verify_no_constructor_disposition(
