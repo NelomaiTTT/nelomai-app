@@ -986,8 +986,11 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
+            // Creator captured THIS original RuntimeRead allocation. The
+            // bootstrap's read_pin() shares its authenticated backing/lease
+            // (verified above), but cannot replace the publisher's original Rc.
             self.creator
-                .verify_published_read(input.runtime, input.context, observed)
+                .verify_published_read(self.runtime.as_ref(), input.context, observed)
                 .map_err(|_| Error::Conflict)?;
             self.verify_read_origin_in_call(pair, expected)?;
             if input
