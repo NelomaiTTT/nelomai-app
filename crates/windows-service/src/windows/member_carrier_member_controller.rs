@@ -3206,12 +3206,12 @@ pub(crate) mod native {
         /// private member/service namespaces, all three keys, full mixed SDK
         /// and the scoped WFP universe are reattested around both reads.
         /// Partial C attempts cannot use this channel even if SDK looks empty.
-        pub(crate) fn verify_bootstrap_full_empty(
+        pub(crate) fn read_bootstrap_full_empty(
             &self,
             pair: &NativePairIntentRead,
             expected: &PairRecord,
             lock: &mut KeyLock,
-        ) -> Result<()> {
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
             (|| {
                 self.history.cold()?;
                 validate_never_bootstrap_full_frame(&self.input.context, expected)?;
@@ -3223,6 +3223,7 @@ pub(crate) mod native {
                     expected.scope.clone(),
                 )
                 .map_err(|_| Error::Pending)?;
+                let mut snapshot = None;
                 verify_never_bootstrap_full_reads(
                     &self.history,
                     &self.input.context,
@@ -3238,6 +3239,10 @@ pub(crate) mod native {
                         let empty = guard
                             .read_snapshot(&expected.scope)
                             .map_err(|_| Error::Pending)?;
+                        if snapshot.as_ref().is_some_and(|before| before != &empty) {
+                            return Err(Error::Conflict);
+                        }
+                        snapshot = Some(empty.clone());
                         self.cold_full_absence(pair, expected, lock)?;
                         if guard
                             .read_snapshot(&expected.scope)
@@ -3255,7 +3260,8 @@ pub(crate) mod native {
                         .map_err(|_| Error::Conflict)?;
                         self.pair(pair, expected, lock)
                     },
-                )
+                )?;
+                snapshot.ok_or(Error::Pending)
             })()
             .map_err(pending_unknown)
         }

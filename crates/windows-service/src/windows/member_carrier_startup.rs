@@ -3848,23 +3848,8 @@ pub(crate) mod native {
                                 if !self.runtime.matches_lock(lock) {
                                     return Err(Error::Conflict);
                                 }
-                                never.verify_bootstrap_full_empty(original, expected, lock)?;
-                                let mut guard =
-                                    crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
-                                        expected.scope.clone(),
-                                    )
-                                    .map_err(|_| Error::Conflict)?;
-                                let actual = guard
-                                    .read_snapshot(&expected.scope)
-                                    .map_err(|_| Error::Conflict)?;
-                                never.verify_bootstrap_full_empty(original, expected, lock)?;
-                                if guard
-                                    .read_snapshot(&expected.scope)
-                                    .map_err(|_| Error::Conflict)?
-                                    != actual
-                                {
-                                    return Err(Error::Conflict);
-                                }
+                                let actual =
+                                    never.read_bootstrap_full_empty(original, expected, lock)?;
                                 self.continuity_runtime_for(
                                     original,
                                     expected,
