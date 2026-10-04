@@ -470,7 +470,7 @@ fn inspect_mixed_absent_queries(
     wants: &[ExpectedProvider],
     target: &AbsenceTarget,
     query: &mut impl Queries,
-) -> Result<()> {
+) -> Result<Vec<Observation>> {
     validate_target(target)?;
     if wants.len() > 3 {
         return Err(Error::Invalid("device universe bound"));
@@ -483,7 +483,7 @@ fn inspect_mixed_absent_queries(
     // Keep the actual mixed validator's exact universe, independent per-key
     // lookups, complete tables, stack and double reads. Target absence is an
     // additional factual predicate on those SAME reads, never a filtered set.
-    inspect_mixed_queries(wants, &mut MixedAbsenceQueries { target, query }).map(|_| ())
+    inspect_mixed_queries(wants, &mut MixedAbsenceQueries { target, query })
 }
 struct MixedAbsenceQueries<'a, Q> {
     target: &'a AbsenceTarget,
@@ -1285,7 +1285,7 @@ pub(crate) mod native {
         wants: &[ExpectedProvider],
         guid: [u8; 16],
         name: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<Observation>> {
         validate_target_parts(guid, name)?;
         inspect_mixed_absent_queries(
             wants,

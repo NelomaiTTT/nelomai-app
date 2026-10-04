@@ -312,7 +312,6 @@ impl OriginalKeyInventory {
         context: &receipt::Context,
         binding: &receipt::Binding,
         cleanup: bool,
-        before: Option<creators::UniverseObservation<member_carrier_provider::Observation>>,
     ) -> creators::Result<()> {
         let Some(members) = &self.members else {
             if cleanup
@@ -336,10 +335,7 @@ impl OriginalKeyInventory {
         crate::windows::member_carrier_factory_test_os::trace_step(
             "key target full before census begin",
         );
-        let before = match before {
-            Some(before) => before,
-            None => observe()?,
-        };
+        let before = observe()?;
         #[cfg(test)]
         crate::windows::member_carrier_factory_test_os::trace_step(
             "key target full before census end",
@@ -433,7 +429,7 @@ impl OriginalKeyInventory {
                 // to proceed to its separate current HKEY/storage CAS gate.
                 self.observer
                     .assert_no_creator_for_key_cleanup(context, binding)?;
-                self.inspect_target(context, binding, true, None)?;
+                self.inspect_target(context, binding, true)?;
                 self.observer
                     .assert_no_creator_for_key_cleanup(context, binding)?;
             }
@@ -447,24 +443,24 @@ impl OriginalKeyInventory {
                     .iter()
                     .position(|b| b == binding)
                     .ok_or(creators::Error::Conflict)?;
-                let before = if state[index] == creators::State::Intent {
+                let target_checked = if state[index] == creators::State::Intent {
                     #[cfg(test)]
                     crate::windows::member_carrier_factory_test_os::trace_step(
                         "key inventory private Never begin",
                     );
-                    let observed = self.observer.assert_never_attempted(context, binding)?;
+                    self.observer.assert_never_attempted(context, binding)?;
                     #[cfg(test)]
                     crate::windows::member_carrier_factory_test_os::trace_step(
                         "key inventory private Never end",
                     );
-                    // The SAME private Never read already performed the full
-                    // original/member SDK census and rechecked its private
-                    // state/attempt/held. Reuse only its DATA on the integrated
-                    // path; the independent target and full after read remain.
-                    self.members.as_ref().map(|_| observed)
+                    // The same full original SDK query now checks the target
+                    // on EVERY MIB/PnP read. Raw C, member originals, runtime/
+                    // image and protected revision already fence that whole
+                    // query. No second complete census is needed here.
+                    self.members.is_some()
                 } else {
                     self.observer.assert_absent(context, binding)?;
-                    None
+                    false
                 };
                 if self.members.is_none() {
                     // The legacy target reader has no before/after census;
@@ -477,10 +473,9 @@ impl OriginalKeyInventory {
                         return Err(creators::Error::Conflict);
                     }
                 }
-                // The integrated target reader already checks its full before
-                // census and compares the after census around its independent
-                // SDK query. Keep that query and the private Never check once.
-                self.inspect_target(context, binding, false, before)?;
+                if !target_checked {
+                    self.inspect_target(context, binding, false)?;
+                }
                 self.image
                     .verify_live_runtime(&self.runtime)
                     .map_err(original_error)?;
@@ -809,9 +804,13 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
         &self,
         context: &receipt::Context,
         originals: &[creators::OriginalIdentity],
+        absent: Option<&receipt::Binding>,
     ) -> creators::Result<creators::UniverseObservation<member_carrier_provider::Observation>> {
         self.verify(context)?;
-        if originals.len() > 3 || originals.iter().any(|o| o.scope.context != *context) {
+        if originals.len() > 3
+            || originals.iter().any(|o| o.scope.context != *context)
+            || absent.is_some_and(|binding| !context.bindings.contains(binding))
+        {
             return Err(creators::Error::Conflict);
         }
         let targets = originals
@@ -862,14 +861,25 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
             if record.context != *context {
                 return Err(creators::Error::Conflict);
             }
+            if absent.is_some() && record.phase != receipt::Phase::Preparing {
+                return Err(creators::Error::Conflict);
+            }
             let inspect = |member_facts: &[member_carrier_provider::ExpectedProvider]| {
                 let complete = crate::windows::member_carrier_members::complete_provider_inputs(
                     context,
                     &carrier,
                     member_facts,
                 )?;
-                let facts = member_carrier_provider::native::inspect_mixed(&complete)
-                    .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+                let facts = if let Some(binding) = absent {
+                    member_carrier_provider::native::inspect_mixed_absent(
+                        &complete,
+                        binding.guid,
+                        &binding.name,
+                    )
+                } else {
+                    member_carrier_provider::native::inspect_mixed(&complete)
+                }
+                .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
                 if facts.len() != complete.len() {
                     return Err(crate::member_carrier::CarrierError::Conflict);
                 }
@@ -921,7 +931,31 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
                 .collect::<Vec<_>>()
         } else {
             // Legacy strict path does not learn to accept an unowned WG device.
-            member_carrier_provider::native::inspect_all(&targets).map_err(original_error)?
+            if let Some(binding) = absent {
+                let complete = targets
+                    .iter()
+                    .map(|identity| member_carrier_provider::ExpectedProvider {
+                        identity: member_carrier_provider::Expected {
+                            guid: identity.guid,
+                            luid: identity.luid,
+                            index: identity.index,
+                            name: identity.name.clone(),
+                            description: identity.description.clone(),
+                            if_type: identity.if_type,
+                            tunnel_type: identity.tunnel_type,
+                        },
+                        kind: member_carrier_provider::ProviderKind::Wintun,
+                    })
+                    .collect::<Vec<_>>();
+                member_carrier_provider::native::inspect_mixed_absent(
+                    &complete,
+                    binding.guid,
+                    &binding.name,
+                )
+                .map_err(original_error)?
+            } else {
+                member_carrier_provider::native::inspect_all(&targets).map_err(original_error)?
+            }
         };
         self.verify(context)?;
         if facts.len() != originals.len() {

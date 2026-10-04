@@ -81,6 +81,7 @@ unsafe impl OriginalNative for Native {
 }
 struct Universe {
     calls: RefCell<Vec<usize>>,
+    absent: RefCell<Vec<Option<Binding>>>,
     provider: RefCell<String>,
     extra: Cell<bool>,
     missing: Cell<bool>,
@@ -92,6 +93,7 @@ impl Universe {
     fn new() -> Self {
         Self {
             calls: RefCell::new(vec![]),
+            absent: RefCell::new(vec![]),
             provider: RefCell::new("actual-original-provider".into()),
             extra: Cell::new(false),
             missing: Cell::new(false),
@@ -106,8 +108,19 @@ unsafe impl NativeUniverse<Native> for Universe {
         &self,
         c: &Context,
         ids: &[OriginalIdentity],
+        absent: Option<&Binding>,
     ) -> Result<UniverseObservation<String>> {
         self.calls.borrow_mut().push(ids.len());
+        self.absent.borrow_mut().push(absent.cloned());
+        if absent.is_some_and(|binding| {
+            !c.bindings.contains(binding)
+                || ids.iter().any(|id| {
+                    id.identity.guid == binding.guid
+                        || id.identity.name.eq_ignore_ascii_case(&binding.name)
+                })
+        }) {
+            return Err(Error::Conflict);
+        }
         if let Some(f) = self.on_inspect.borrow().as_ref() {
             f();
         }
@@ -365,6 +378,10 @@ fn never_attempted_key_preparation_requires_full_native_universe_and_cannot_begi
         })
     );
     assert_eq!(&*observer.shared.universe.calls.borrow(), &[0]);
+    assert_eq!(
+        &*observer.shared.universe.absent.borrow(),
+        &[Some(scope(0).binding)]
+    );
     assert_eq!(
         observer.assert_absent(&context(), &scope(0).binding),
         Err(Error::Pending)

@@ -124,7 +124,7 @@ fn mixed_live_c_and_wireguard_allow_a_fresh_unique_absence_target() {
     // WG original. Actual production validation; only OS reads are replaced.
     let (wants, mut q) = mixed_absence_fixture();
     assert_eq!(
-        inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q),
+        inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q).map(|_| ()),
         Ok(())
     );
 }
@@ -203,7 +203,7 @@ fn mixed_absence_supplies_the_absent_target_to_both_actual_full_pnp_scans() {
     let (wants, mut q) = mixed_absence_fixture();
     let target = mixed_absence_target();
     assert_eq!(
-        inspect_mixed_absent_queries(&wants, &target, &mut q),
+        inspect_mixed_absent_queries(&wants, &target, &mut q).map(|_| ()),
         Ok(())
     );
     assert_eq!(
@@ -257,9 +257,10 @@ fn mixed_absence_zero_wants_checks_the_target_against_full_foreign_facts() {
 fn mixed_absence_accepts_exact_c_wg_awg_and_preserves_read_order() {
     // Break: projecting a complete C/A/B universe down to only its WG member.
     let (wants, mut q) = mixed_fixture();
+    let observed = inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q).unwrap();
     assert_eq!(
-        inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q),
-        Ok(())
+        observed.iter().map(|o| &o.interface).collect::<Vec<_>>(),
+        wants.iter().map(|w| &w.identity).collect::<Vec<_>>()
     );
     assert_eq!(
         q.source.events,
@@ -278,7 +279,7 @@ fn mixed_absence_accepts_exact_c_wg_awg_and_preserves_read_order() {
     );
     let (wants, mut q) = mixed_absence_fixture();
     assert_eq!(
-        inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q),
+        inspect_mixed_absent_queries(&wants, &mixed_absence_target(), &mut q).map(|_| ()),
         Ok(())
     );
     assert_eq!(
@@ -544,7 +545,7 @@ fn mixed_absence_zero_wants_is_full_empty_related_universe_without_adopting_wint
     // Break: use old target-only absence's inferred Wintun universe for zero.
     let mut q = AbsenceScript::empty();
     assert_eq!(
-        inspect_mixed_absent_queries(&[], &mixed_absence_target(), &mut q),
+        inspect_mixed_absent_queries(&[], &mixed_absence_target(), &mut q).map(|_| ()),
         Ok(())
     );
     assert_eq!(
@@ -557,7 +558,7 @@ fn mixed_absence_zero_wants_is_full_empty_related_universe_without_adopting_wint
     );
     let mut q = foreign_query(true);
     assert_eq!(
-        inspect_mixed_absent_queries(&[], &mixed_absence_target(), &mut q),
+        inspect_mixed_absent_queries(&[], &mixed_absence_target(), &mut q).map(|_| ()),
         Ok(())
     );
     for member in 0..3 {

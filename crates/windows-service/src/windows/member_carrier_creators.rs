@@ -101,6 +101,8 @@ pub(crate) unsafe trait OriginalNative: Sized {
 /// not native ownership: only OriginalNative's retained ACK supplies ownership.
 /// Independently verify current scope/runtime/source/pins/SAME serialized lock.
 /// Returned per-original provider metadata must be concrete stable native facts.
+/// If absent is supplied, check its name/GUID on every complete MIB/PnP read
+/// of that SAME universe; it is an additional predicate, never a filtered set.
 /// Do not call Carrier.capture, this observer, or an authority which recursively
 /// collects this inventory. No mutation, adoption, or successful query defaults.
 pub(crate) unsafe trait NativeUniverse<N: OriginalNative> {
@@ -108,6 +110,7 @@ pub(crate) unsafe trait NativeUniverse<N: OriginalNative> {
         &self,
         context: &Context,
         originals: &[OriginalIdentity],
+        absent: Option<&Binding>,
     ) -> Result<UniverseObservation<N::Provider>>;
 }
 /// Independent bounded native absence inventory, not a lookup-adoption seam.
@@ -294,14 +297,15 @@ fn validate_observation<P>(scope: &Scope, observed: &Observation<P>) -> Result<(
 }
 impl<N: OriginalNative> Shared<N> {
     fn read_universe(self: &Rc<Self>) -> Result<UniverseObservation<N::Provider>> {
-        self.read_universe_for(false)
+        self.read_universe_for(false, None)
     }
     fn read_universe_for(
         self: &Rc<Self>,
         cleanup: bool,
+        absent: Option<&Binding>,
     ) -> Result<UniverseObservation<N::Provider>> {
         let operation = Operation::enter(self, cleanup)?;
-        let observed = self.read_universe_locked(cleanup, &operation)?;
+        let observed = self.read_universe_locked(cleanup, &operation, absent)?;
         operation.finish()?;
         Ok(observed)
     }
@@ -309,6 +313,7 @@ impl<N: OriginalNative> Shared<N> {
         self: &Rc<Self>,
         cleanup: bool,
         operation: &Operation<N>,
+        absent: Option<&Binding>,
     ) -> Result<UniverseObservation<N::Provider>> {
         // Snapshot private strong retention only. No RefCell borrow crosses a
         // native callback, and no numeric identity is used to obtain ownership.
@@ -394,7 +399,9 @@ impl<N: OriginalNative> Shared<N> {
         }
         // Full actual PnP universe, exactly ONCE after ALL raw-original reads.
         // Even the empty input must enumerate and reject unexpected devices.
-        let universe = self.universe.inspect_universe(&self.context, &identities)?;
+        let universe = self
+            .universe
+            .inspect_universe(&self.context, &identities, absent)?;
         operation.check()?;
         if universe.context != self.context || universe.originals.len() != identities.len() {
             return Err(Error::Conflict);
@@ -1044,7 +1051,7 @@ impl<N: OriginalNative> Observer<N> {
             Ok(())
         };
         check()?;
-        let observed = self.shared.read_universe()?;
+        let observed = self.shared.read_universe_for(false, Some(binding))?;
         self.shared.idle(false)?;
         check()?;
         Ok(observed)
@@ -1104,7 +1111,7 @@ impl<N: OriginalNative> Observer<N> {
             self.shared.fail();
             return Err(Error::Conflict);
         }
-        self.shared.read_universe_for(true)
+        self.shared.read_universe_for(true, None)
     }
 }
 impl<N: OriginalNative> Begin<N> {
@@ -1331,7 +1338,7 @@ impl<N: OriginalNative> UnpublishedClosedRead<N> {
         operation.check()?;
         if !self
             .shared
-            .read_universe_locked(true, operation)?
+            .read_universe_locked(true, operation, None)?
             .originals
             .is_empty()
         {
@@ -1482,7 +1489,7 @@ impl<N: OriginalNative> RetiredRead<N> {
         }
         self.native.verify_close_receipt(scope, &self.receipt)?;
         operation.check()?;
-        let universe = self.shared.read_universe_locked(true, operation)?;
+        let universe = self.shared.read_universe_locked(true, operation, None)?;
         if !universe.originals.is_empty() {
             return Err(Error::Pending);
         }
