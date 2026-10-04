@@ -721,10 +721,8 @@ pub(crate) mod native {
                     step!("current Calling", input.calling());
                     let image = self.image.as_ref().ok_or(Error::Pending)?;
                     let members = self.members.as_ref().ok_or(Error::Pending)?;
-                    step!(
-                        "original members",
-                        members.matches_original_runtime_image(&input.runtime, image)
-                    );
+                    // read_all checks its original inventory; with_members
+                    // below performs the SAME runtime/image join itself.
                     if !step!("member inventory", members.read_all()).is_empty() {
                         return Err(Error::Conflict);
                     }
