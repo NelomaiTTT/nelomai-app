@@ -1096,6 +1096,30 @@ pub(crate) mod native {
             self.verify_origin(runtime, context)?;
             self.cleanup.verify().map_err(|_| Error::Retired)
         }
+        /// Factual initial DATA during cold preparation, before cleanup and SDK
+        /// entry. Inspect the SAME initialized journal/ACK in its forward view;
+        /// an equal record cannot substitute for this original reader.
+        pub(crate) fn verify_forward_current(
+            &self,
+            runtime: &RuntimeRead,
+            context: &Context,
+            observed_native_receipt_bytes: &[u8],
+        ) -> Result<()> {
+            self.verify_origin(runtime, context)?;
+            if !runtime.fresh(context)? {
+                return Err(Error::Retired);
+            }
+            self.initial.inspect_initial(context, |_, acknowledged| {
+                if Record::decode(observed_native_receipt_bytes)? != *acknowledged {
+                    return Err(Error::Conflict);
+                }
+                self.verify_origin(runtime, context)
+            })?;
+            if !runtime.fresh(context)? {
+                return Err(Error::Retired);
+            }
+            self.verify_origin(runtime, context)
+        }
         /// SDK-free handoff only. Retains the actual canonical cleanup view
         /// BEFORE original journal handoff/postflight. No record rewrite and
         /// no Stopped/native/module ACK is minted here.

@@ -3369,6 +3369,13 @@ pub(crate) mod native {
                     Some(Rc::new(NativeNoCInitialDataRetirement::new(
                         startup.initial_noc.as_ref().ok_or(Error::Pending)?,
                     )));
+                startup
+                    .never_effects
+                    .as_ref()
+                    .ok_or(Error::Pending)?
+                    .retain_forward_initial_read(
+                        startup.initial_noc.as_ref().ok_or(Error::Pending)?,
+                    )?;
                 Ok(())
             })
         }

@@ -1617,6 +1617,7 @@ pub(crate) mod native {
         history: NeverMemberHistory,
         directory: RefCell<Option<super::super::member_files::PinnedDirectory>>,
         retired: RefCell<Vec<Rc<NativeMemberPreparationGeneration>>>,
+        initial_forward: InitialNoCRegistration<NativeInitialAssemblyNoCRead>,
         initial_noc: InitialNoCRegistration<NativeInitialAssemblyNoCRead>,
     }
     /// Original Stop-bound READONLY preparation transition. No SDK admission,
@@ -1963,6 +1964,33 @@ pub(crate) mod native {
         }
     }
     impl NativeNeverMemberEffects {
+        /// Register the actual initial DATA reader before Pair/DLL publication.
+        /// This weak factual channel cannot select cleanup or grant SDK effects.
+        pub(crate) fn retain_forward_initial_read(
+            &self,
+            original: &Rc<NativeInitialAssemblyNoCRead>,
+        ) -> Result<()> {
+            self.initial_forward.retain(original, |reader| {
+                self.history.cold()?;
+                let inspect = || {
+                    self.inspect_no_effect_records(|bytes| {
+                        reader.verify_forward_current(
+                            &self.input.runtime,
+                            &self.input.context,
+                            bytes,
+                        )
+                    })
+                };
+                let records = inspect()?;
+                if records[4].is_none() {
+                    return Err(Error::Pending);
+                }
+                if inspect()? != records {
+                    return Err(Error::Conflict);
+                }
+                self.history.cold()
+            })
+        }
         /// SAME original initialized Assembly only; weak to avoid a ledger /
         /// Startup / Assembly retention cycle. Failed or duplicate registration
         /// is never replaceable. This is SDK-free and grants no native effects.
@@ -2450,6 +2478,7 @@ pub(crate) mod native {
                 history: NeverMemberHistory::default(),
                 directory: RefCell::new(None),
                 retired: RefCell::new(Vec::new()),
+                initial_forward: InitialNoCRegistration::new(),
                 initial_noc: InitialNoCRegistration::new(),
             }));
             let original = slot.as_ref().expect("retained never-effect root");
@@ -2850,6 +2879,16 @@ pub(crate) mod native {
                     NeverKeyFact::Absent
                 },
             )
+        }
+        fn forward_no_effect_records(&self) -> Result<Vec<Option<Vec<u8>>>> {
+            let original = self.initial_forward.read()?;
+            let records = self.inspect_no_effect_records(|bytes| {
+                original.verify_forward_current(&self.input.runtime, &self.input.context, bytes)
+            })?;
+            if records[4].is_none() {
+                return Err(Error::Pending);
+            }
+            Ok(records)
         }
         fn no_effect_records(&self) -> Result<Vec<Option<Vec<u8>>>> {
             // Once registered, loss of the original reader or its acknowledged
@@ -4446,7 +4485,7 @@ pub(crate) mod native {
                             }
                         })
                         .map_err(|_| Error::Conflict)?; // Release Pair before native reads.
-                        let records = origin.never_effects.no_effect_records()?;
+                        let records = origin.never_effects.forward_no_effect_records()?;
                         if original_records
                             .as_ref()
                             .is_some_and(|before| before != &records)
@@ -4498,7 +4537,7 @@ pub(crate) mod native {
                             }
                         })
                         .map_err(|_| Error::Conflict)?; // Release Pair before native reads.
-                        let records = origin.never_effects.no_effect_records()?;
+                        let records = origin.never_effects.forward_no_effect_records()?;
                         if original_records
                             .as_ref()
                             .is_some_and(|before| before != &records)
