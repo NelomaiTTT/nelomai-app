@@ -4428,46 +4428,72 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<crate::member_owner::InterfaceProof> {
+            macro_rules! step {
+                ($label:literal, $result:expr) => {{
+                    let value = $result.inspect_err(|_error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native($label, _error);
+                    })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step($label);
+                    value
+                }};
+            }
             // Retain the actual invocation identity before any fallible access,
             // even if the Never ledger or Assembly has not produced an owner.
-            self.invocation.begin(false)?;
+            step!(
+                "CarrierReady original invocation",
+                self.invocation.begin(false)
+            );
             self.create_attempted = true;
             self.never_effects
                 .as_ref()
                 .ok_or(Error::Pending)?
                 .begin_carrier_construction();
-            self.continuity(original, expected)?;
+            step!(
+                "CarrierReady entry continuity",
+                self.continuity(original, expected)
+            );
             // Re-resolve the SAME retained Runtime birth/backend before any
             // receipt store, DLL assembly or graph is constructed. An ordering
             // latch or Starting JSON cannot substitute for this actual root.
-            self.files = self
-                .runtime
-                .native_birth_files(&self.context)
-                .map_err(|_| Error::Conflict)?;
+            self.files = step!(
+                "CarrierReady canonical birth view",
+                self.runtime
+                    .native_birth_files(&self.context)
+                    .map_err(|_| Error::Conflict)
+            );
             if expected.pending != Some(pair::Effect::CarrierReady) || expected.carrier.is_some() {
                 return Err(Error::Conflict);
             }
             // The original early Assembly/initial journal is never reopened or
             // reinitialized after PairFresh or after Runtime birth binding.
             let assembly = self.assembly.as_mut().ok_or(Error::Pending)?;
-            let initial = assembly.initial_read_pin()?;
+            let initial = step!(
+                "CarrierReady original initial reader",
+                assembly.initial_read_pin()
+            );
             let lock = self.lock.as_mut().ok_or(Error::Retired)?;
             {
                 let mut store = self.store.try_borrow_mut().map_err(|_| Error::Conflict)?;
-                assembly.bootstrap_mut()?.load_cold(
-                    &self.runtime,
-                    lock,
-                    &mut store,
-                    &self.files,
-                    &self.source,
-                    &self.context,
-                    expected,
-                    original.clone(),
-                    &self.logical,
-                    &self.supervisor,
-                    &self.cancelled,
-                    initial,
-                )?;
+                let bootstrap = step!("CarrierReady original bootstrap", assembly.bootstrap_mut());
+                step!(
+                    "CarrierReady original cold load",
+                    bootstrap.load_cold(
+                        &self.runtime,
+                        lock,
+                        &mut store,
+                        &self.files,
+                        &self.source,
+                        &self.context,
+                        expected,
+                        original.clone(),
+                        &self.logical,
+                        &self.supervisor,
+                        &self.cancelled,
+                        initial,
+                    )
+                );
                 assembly
                     .bootstrap_mut()?
                     .compose_originals(lock, &mut store)?;

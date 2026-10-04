@@ -475,6 +475,17 @@ pub(crate) mod native {
             actor_cancelled: &Arc<AtomicBool>,
             initial: InitialRead<WindowsNativeCarrierReceiptStore<NativeSessionFiles>>,
         ) -> Result<()> {
+            macro_rules! step {
+                ($label:literal, $result:expr) => {{
+                    let value = $result.inspect_err(|_error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_native($label, _error);
+                    })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step($label);
+                    value
+                }};
+            }
             if self.terminal_attempted
                 || self.inputs.is_some()
                 || self.module.attempted
@@ -483,13 +494,19 @@ pub(crate) mod native {
                 return Err(Error::Pending);
             }
             cancelled(actor_cancelled)?;
-            validate_requested(context, expected, logical_configuration)?;
+            step!(
+                "cold load requested CarrierReady frame",
+                validate_requested(context, expected, logical_configuration)
+            );
             if !runtime.matches_lock(lock) {
                 return Err(Error::Conflict);
             }
-            runtime.verify_same_session_files(context, files)?;
-            runtime.verify_source(source)?;
-            lock.verify_source(source)?;
+            step!(
+                "cold load same storage",
+                runtime.verify_same_session_files(context, files)
+            );
+            step!("cold load original source", runtime.verify_source(source));
+            step!("cold load original lock", lock.verify_source(source));
             if !runtime.fresh(context)? {
                 return Err(Error::Retired);
             }
@@ -502,9 +519,15 @@ pub(crate) mod native {
             if !original_intent.matches_runtime(runtime) {
                 return Err(Error::Conflict);
             }
-            let native_bytes = read_original_initial(runtime, context, &initial)?;
-            let deadline = supervisor.read_pin()?;
-            deadline.verify_runtime(supervisor, runtime, context)?;
+            let native_bytes = step!(
+                "cold load original initial ACK",
+                read_original_initial(runtime, context, &initial)
+            );
+            let deadline = step!("cold load original deadline pin", supervisor.read_pin());
+            step!(
+                "cold load deadline/runtime",
+                deadline.verify_runtime(supervisor, runtime, context)
+            );
             self.inputs = Some(Rc::new(Inputs {
                 runtime: runtime.read_pin()?,
                 files: files.clone(),
