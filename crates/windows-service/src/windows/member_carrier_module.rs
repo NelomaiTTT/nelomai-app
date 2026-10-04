@@ -1657,23 +1657,13 @@ pub(crate) mod native {
                 roots.0.take().expect("retained original release inputs"),
                 retained,
                 |receipt, supplier| {
-                    initial.inspect_err(|_error| {
-                        #[cfg(test)]
-                        super::super::member_carrier_factory_test_os::trace_step(
-                            "module release original load denied",
-                        );
-                    })?;
+                    initial?;
                     lock.verify_source(source).map_err(|_| Error::Conflict)?;
                     receipt
                         .lock
                         .verify_source(source)
                         .map_err(|_| Error::Conflict)?;
-                    require_process_anchor(source, &module).inspect_err(|_error| {
-                        #[cfg(test)]
-                        super::super::member_carrier_factory_test_os::trace_step(
-                            "module release process PIN denied",
-                        );
-                    })?;
+                    require_process_anchor(source, &module)?;
                     supplier.pre_release(receipt)?;
                     // Actual own source/serialized owner/PIN identity still
                     // matches on the native side of the fallible caller check.

@@ -1093,6 +1093,13 @@ pub(crate) mod native {
         /// Before/after outer Calling: SAME actual retained roots/current Pair,
         /// but no image queries and no successful-native-return inference.
         pub(crate) fn verify_entry(&self, supervisor: &NativeDeadline) -> Result<()> {
+            self.verify_origins(supervisor)?;
+            let input = self.bootstrap.original_inputs();
+            self.pair
+                .verify_module_only_read_entry(input.runtime, input.context, &self.expected)
+                .map_err(|_| Error::Conflict)
+        }
+        fn verify_origins(&self, supervisor: &NativeDeadline) -> Result<()> {
             let input = self.bootstrap.original_inputs();
             if !std::ptr::eq(input.supervisor.as_ref(), supervisor)
                 || module_only_read_stage(&self.expected)? != 13
@@ -1112,15 +1119,15 @@ pub(crate) mod native {
             self.candidate
                 .verify_read_origin(&self.pair, &self.expected)?;
             supervisor.verify_cleanup_runtime_entry(input.runtime, input.context)?;
-            self.pair
-                .verify_module_only_read_entry(input.runtime, input.context, &self.expected)
-                .map_err(|_| Error::Conflict)?;
             self.lock
                 .verify_source(input.source)
                 .map_err(|_| Error::Conflict)
         }
         fn verify_call(&self) -> Result<()> {
-            self.verify_entry(self.bootstrap.original_inputs().supervisor)?;
+            // The SAME Pair inspect frame is already active. Entry would begin
+            // another PairIntentCall and revoke that original on reentry. Keep
+            // every origin check, then validate the actual in-call bracket.
+            self.verify_origins(self.bootstrap.original_inputs().supervisor)?;
             self.candidate
                 .verify_read_origin_in_call(&self.pair, &self.expected)
         }
@@ -1144,21 +1151,9 @@ pub(crate) mod native {
                 return Err(crate::windows::member_carrier_module::Error::Conflict);
             }
             self.verify_call()
-                .inspect_err(|_error| {
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::trace_step(
-                        "module release proof Calling denied",
-                    );
-                })
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
             self.reader
                 .read_in_release_pre_call(&self.lock)
-                .inspect_err(|_error| {
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::trace_step(
-                        "module release full pre-read denied",
-                    );
-                })
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)?;
             self.verify_call()
                 .map_err(|_| crate::windows::member_carrier_module::Error::Conflict)
@@ -2739,20 +2734,8 @@ pub(crate) mod native {
                 &mut crate::windows::member_carrier_module::native::LoadedWintun,
             ) -> Result<()>,
         ) -> Result<()> {
-            self.verify_module_only_candidate(original, pair, expected)
-                .inspect_err(|_error| {
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::trace_step(
-                        "module release Startup candidate denied",
-                    );
-                })?;
+            self.verify_module_only_candidate(original, pair, expected)?;
             pair.verify_terminal_bracket(&self.runtime, &self.supervisor, &self.context, expected)
-                .inspect_err(|_error| {
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::trace_step(
-                        "module release Startup Pair bracket denied",
-                    );
-                })
                 .map_err(|_| Error::Conflict)?;
             let result = self
                 .assembly
@@ -2831,8 +2814,6 @@ pub(crate) mod native {
                     unsafe {
                         supervisor.run_no_constructor_module_release(&proof, || {
                             pair.inspect(&runtime, &supervisor, |actual| {
-                                #[cfg(test)]
-                                super::super::member_carrier_factory_test_os::trace_step("module release Pair callback entered");
                                 if actual != expected {
                                     return Err(std::io::Error::other("module_release_pair"));
                                 }
@@ -2851,10 +2832,6 @@ pub(crate) mod native {
                                                 proof.clone(),
                                                 &mut ack,
                                             )
-                                            .inspect_err(|_error| {
-                                                #[cfg(test)]
-                                                super::super::member_carrier_factory_test_os::trace_step("module release native backend denied");
-                                            })
                                             .map_err(|_| Error::Native)?;
                                         module
                                             .verify_no_constructor_disposition(
