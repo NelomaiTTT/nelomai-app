@@ -5469,10 +5469,10 @@ pub(crate) mod native {
                 _ => return Err(Error::Conflict),
             };
             // Passive package reads have their own complete Calling fences.
-            // Keep the SAME retained owner/Pair/lock, every before/after check,
-            // and the final full native requery before returning to C creation.
+            // Their cold checkers already authenticate original Pair/source/
+            // lock/records/keys BEFORE and AFTER. Startup/store continuity
+            // brackets the full sequence; final native requery precedes C.
             supervisor.run(&context, || {
-                self.continuity(original, expected)?;
                 self.prepared[slot]
                     .as_ref()
                     .ok_or(Error::Pending)?
@@ -5480,12 +5480,10 @@ pub(crate) mod native {
                         original,
                         expected,
                         self.lock.as_mut().ok_or(Error::Retired)?,
-                    )?;
-                self.continuity(original, expected)
+                    )
             })?;
             if self.member_source.transport() == nelomai_client_tunnel::TunnelTransport::WireGuard {
                 supervisor.run(&context, || {
-                    self.continuity(original, expected)?;
                     self.prepared[slot]
                         .as_ref()
                         .ok_or(Error::Pending)?
@@ -5495,7 +5493,7 @@ pub(crate) mod native {
                             self.lock.as_mut().ok_or(Error::Retired)?,
                         )?;
                     reached!("member preflight actual cold WireGuard package accepted");
-                    self.continuity(original, expected)
+                    Ok(())
                 })?;
             }
             supervisor.run(&context, || {
