@@ -98,6 +98,14 @@ pub(crate) fn package_paths(source: &Path) -> io::Result<Option<[PathBuf; 5]>> {
         };
         if inputs.native_loads > 0 {
             if let Some(unwind) = inputs.inventory_fault.take() {
+                // Observe retention AT the external failure boundary, before
+                // SessionDriver may perform its actual original Stop on Err.
+                assert_eq!(inputs.native_loads, 1);
+                assert_eq!(inputs.module_originals.len(), 1);
+                assert!(
+                    inputs.module_originals[0].upgrade().is_some(),
+                    "actual returned module missing at post-load fault"
+                );
                 inputs.inventory_fault_reached = true;
                 if unwind {
                     panic!("fixture package inventory read after native LoadLibrary");
@@ -365,7 +373,7 @@ impl Fixture {
                 .inventory_fault = Some(unwind)
         });
     }
-    pub(crate) fn require_original_load_and_fault(&self) {
+    pub(crate) fn require_original_load_and_fault(&self, cleanup_pending: bool) {
         INPUTS.with(|inputs| {
             let inputs = inputs.borrow();
             let inputs = inputs.as_ref().expect("fixture inputs");
@@ -374,10 +382,12 @@ impl Fixture {
                 "missing/repeated actual LoadLibrary ACK"
             );
             assert_eq!(inputs.module_originals.len(), 1);
-            assert!(
-                inputs.module_originals[0].upgrade().is_some(),
-                "actual returned module owner was discarded after Err/unwind"
-            );
+            if cleanup_pending {
+                assert!(
+                    inputs.module_originals[0].upgrade().is_some(),
+                    "actual returned module owner discarded before protected completion"
+                );
+            }
             assert!(
                 inputs.inventory_fault_reached,
                 "post-load external read fault not reached"

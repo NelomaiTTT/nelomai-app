@@ -188,8 +188,15 @@ fn carrier_factory_actual_cold_child() {
             original.start_primary(primary, options)
         }));
         assert!(started.is_err() || started.unwrap().is_err());
-        fixture.require_original_load_and_fault();
-        assert!(original.snapshot().cleanup_pending);
+        let snapshot = original.snapshot();
+        fixture.require_original_load_and_fault(snapshot.cleanup_pending);
+        if case == "module-load-read-unwind" {
+            assert!(snapshot.cleanup_pending);
+        } else if !snapshot.cleanup_pending {
+            // start_primary already called the actual original Stop on Err.
+            // Only its real native/protected completion may discard the owner.
+            assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
+        }
     }
     if case == "primary-data-denial" {
         let Command::Start {
@@ -221,7 +228,7 @@ fn carrier_factory_actual_cold_child() {
         // permission to unload or into successful protected completion.
         assert!(stopped.is_err());
         assert!(original.snapshot().cleanup_pending);
-        fixture.require_original_load_and_fault();
+        fixture.require_original_load_and_fault(true);
         std::mem::forget(original);
         std::mem::forget(factory);
         return;
