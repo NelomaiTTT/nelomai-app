@@ -746,6 +746,8 @@ fn compare_member_text(
 
 #[cfg(windows)]
 pub(crate) mod native {
+    #[cfg(test)]
+    use super::super::member_carrier_factory_test_os::trace_step;
     use super::*;
     use crate::{
         member_carrier_pair as pair,
@@ -4359,6 +4361,8 @@ pub(crate) mod native {
             member: &nelomai_client_tunnel::redundancy::protocol::Member,
             native: &str,
         ) -> Result<crate::member_owner::Record> {
+            #[cfg(test)]
+            trace_step("member preparation begin original continuity");
             self.continuity(original, current).inspect_err(|error| {
                 #[cfg(test)]
                 super::super::member_carrier_factory_test_os::trace_native(
@@ -4368,6 +4372,8 @@ pub(crate) mod native {
                 #[cfg(not(test))]
                 let _ = error;
             })?;
+            #[cfg(test)]
+            trace_step("member preparation end original continuity");
             member.validate().map_err(|_| Error::Invalid)?;
             compare_member_text(
                 &self.context,
@@ -4388,7 +4394,11 @@ pub(crate) mod native {
                 supervisor: self.supervisor.clone(),
                 never_effects: self.never_effects.as_ref().ok_or(Error::Pending)?.clone(),
             };
+            #[cfg(test)]
+            trace_step("member preparation original runtime pin retained");
             let lock = self.lock.as_mut().ok_or(Error::Retired)?;
+            #[cfg(test)]
+            trace_step("member preparation begin readonly owner");
             NativePreparedMember::prepare(
                 &mut self.prepared[i],
                 input,
@@ -4404,7 +4414,11 @@ pub(crate) mod native {
                 #[cfg(not(test))]
                 let _ = error;
             })?;
+            #[cfg(test)]
+            trace_step("member preparation end readonly owner");
             let prepared = self.prepared[i].as_mut().ok_or(Error::Pending)?;
+            #[cfg(test)]
+            trace_step("member preparation begin original proposal");
             prepared
                 .verify_proposal(original, proposal, lock)
                 .inspect_err(|error| {
@@ -4416,8 +4430,14 @@ pub(crate) mod native {
                     #[cfg(not(test))]
                     let _ = error;
                 })?;
+            #[cfg(test)]
+            trace_step("member preparation end original proposal");
             let record = prepared.prepared_record(lock)?;
+            #[cfg(test)]
+            trace_step("member preparation record returned");
             self.continuity(original, current)?;
+            #[cfg(test)]
+            trace_step("member preparation final original continuity");
             Ok(record)
         }
         pub(crate) fn preflight_in_call(
@@ -5456,6 +5476,8 @@ pub(crate) mod native {
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
             supervisor.run(&context, || {
+                #[cfg(test)]
+                trace_step("bootstrap member Calling entered");
                 let current = original
                     .inspect(&self.runtime, &supervisor, |actual| Ok(actual.clone()))
                     .map_err(|_| Error::Conflict)
@@ -5468,6 +5490,8 @@ pub(crate) mod native {
                         #[cfg(not(test))]
                         let _ = error;
                     })?;
+                #[cfg(test)]
+                trace_step("bootstrap member current Pair ACK returned");
                 self.prepare_in_call(original, &current, proposal, member, native)
             })
         }

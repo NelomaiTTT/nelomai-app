@@ -236,10 +236,18 @@ impl Runtime {
         // Reauthenticate actual installed signatures and every runtime payload
         // hash; this is deliberately not dispatcher::trusted() on a path.
         // It does not pin/load a DLL and grants no module/driver authority.
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step(
+            "runtime begin installed payload authentication",
+        );
         let live = self
             .installation
             .load_engine(&self.executable)
             .map_err(|_| Error::Conflict)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step(
+            "runtime end installed payload authentication",
+        );
         if live.identity != self.identity
             || live.directory != self.directory
             || std::fs::canonicalize(live.engine_path()).map_err(|_| Error::Native)?
