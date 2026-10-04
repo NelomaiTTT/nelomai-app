@@ -439,11 +439,22 @@ pub(crate) mod native {
     impl ReadIo for NativeIo<'_> {
         type Snapshot = Snapshot;
         fn fence(&mut self) -> ReadResult<()> {
+            macro_rules! step {
+                ($label:literal, $read:expr) => {
+                    $read.inspect_err(|_error| {
+                        #[cfg(test)]
+                        crate::windows::member_carrier_factory_test_os::trace_step($label);
+                    })?
+                };
+            }
             let root = self.original;
-            boundary(
-                root.candidate
-                    .verify_read_origin_in_call(&root.pair, &root.expected),
-            )?;
+            step!(
+                "module-only candidate fence denied",
+                boundary(
+                    root.candidate
+                        .verify_read_origin_in_call(&root.pair, &root.expected),
+                )
+            );
             // The actual owning loader comparison is mandatory. Source/runtime
             // equality or the candidate's successful boundary-return bit is NOT
             // an original LoadLibrary ACK comparison.
@@ -498,34 +509,52 @@ pub(crate) mod native {
             {
                 return Err(ReadError::Changed);
             }
-            boundary(
-                input
-                    .runtime
-                    .verify_same_session_files(input.context, input.files),
-            )?;
-            boundary(input.runtime.verify_source(input.source))?;
-            boundary(input.deadline.verify_runtime(
-                input.supervisor,
-                input.runtime,
-                input.context,
-            ))?;
-            boundary(input.deadline.verify_call(input.supervisor, input.context))?;
-            root.pair
-                .verify_module_only_read_bracket(
-                    input.runtime,
-                    input.supervisor,
-                    input.context,
-                    record,
+            step!(
+                "module-only original storage fence denied",
+                boundary(
+                    input
+                        .runtime
+                        .verify_same_session_files(input.context, input.files),
                 )
-                .map_err(|_| ReadError::Boundary)?;
-            if self.release_pre {
-                root.load
-                    .verify_release_pre_read(input.runtime, input.cancelled)
-            } else {
-                root.load
-                    .verify_cleanup_read(input.runtime, input.cancelled)
-            }
-            .map_err(|_| ReadError::Boundary)?;
+            );
+            step!(
+                "module-only original source fence denied",
+                boundary(input.runtime.verify_source(input.source))
+            );
+            step!(
+                "module-only original deadline runtime fence denied",
+                boundary(input.deadline.verify_runtime(
+                    input.supervisor,
+                    input.runtime,
+                    input.context,
+                ))
+            );
+            step!(
+                "module-only original Calling fence denied",
+                boundary(input.deadline.verify_call(input.supervisor, input.context))
+            );
+            step!(
+                "module-only original Pair fence denied",
+                root.pair
+                    .verify_module_only_read_bracket(
+                        input.runtime,
+                        input.supervisor,
+                        input.context,
+                        record,
+                    )
+                    .map_err(|_| ReadError::Boundary)
+            );
+            step!(
+                "module-only original native image read denied",
+                if self.release_pre {
+                    root.load
+                        .verify_release_pre_read(input.runtime, input.cancelled)
+                } else {
+                    root.load
+                        .verify_cleanup_read(input.runtime, input.cancelled)
+                }
+                .map_err(|_| ReadError::Boundary)
+            );
             boundary(input.runtime.verify_source(input.source))?;
             boundary(
                 input
@@ -553,7 +582,13 @@ pub(crate) mod native {
             .into_iter()
             .enumerate()
             {
-                observed[i] = boundary(input.runtime.optional_record(input.context, kind))?;
+                observed[i] = boundary(input.runtime.optional_record(input.context, kind))
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        crate::windows::member_carrier_factory_test_os::trace_step(
+                            "module-only original inventory read denied",
+                        );
+                    })?;
             }
             if Record::decode(observed[1].as_deref().ok_or(ReadError::Changed)?)
                 .map_err(|_| ReadError::Changed)?
@@ -576,6 +611,12 @@ pub(crate) mod native {
                 &self.original.expected,
                 bytes,
             ))
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "module-only original initial journal read denied",
+                );
+            })
         }
         fn verify_creator(&mut self, bytes: &[u8]) -> ReadResult<()> {
             let bootstrap = self.bootstrap()?;
@@ -591,6 +632,12 @@ pub(crate) mod native {
                 &self.original.expected,
                 bytes,
             ))
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "module-only original creator read denied",
+                );
+            })
         }
         fn native_empty(&mut self) -> ReadResult<()> {
             if inspect_mixed(&[])
