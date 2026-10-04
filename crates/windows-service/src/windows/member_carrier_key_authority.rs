@@ -567,6 +567,18 @@ impl RuntimeRead {
         context: &Context,
         kind: RecordKind,
     ) -> Result<Option<Vec<u8>>> {
+        self.optional_records(context, &[kind])?
+            .pop()
+            .ok_or(Error::Journal)
+    }
+    /// One factual inventory, reread in full AFTER actual runtime authentication.
+    /// Every record still uses the original private backend's own claim/birth/
+    /// payload checks. No cache, publication ACK or effect permission is returned.
+    pub(super) fn optional_records(
+        &self,
+        context: &Context,
+        kinds: &[RecordKind],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
         crate::member_fresh_read::read(
             || self.verify(context),
             || {
@@ -575,35 +587,41 @@ impl RuntimeRead {
                     .files
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                files
-                    .native_carrier_access(&context.intent.scope)
-                    .map_err(|_| Error::Journal)?
-                    .require_native_context(context)
-                    .map_err(|_| Error::Conflict)?;
-                if kind == RecordKind::Network {
-                    // Legacy absence is a common-storage fact, never a native
-                    // birth receipt. Keep the native facet's explicit denial;
-                    // bracket the SAME original backend read with the selected
-                    // native context. Consumers still reject any present record.
-                    if !files.same_original_backend(&self.runtime.original_files) {
-                        return Err(Error::Conflict);
-                    }
-                    let record = self
-                        .runtime
-                        .original_files
-                        .clone()
-                        .read(&context.intent.scope, kind)
-                        .map_err(|_| Error::Journal)?;
+                let mut records = Vec::with_capacity(kinds.len());
+                for &kind in kinds {
                     files
                         .native_carrier_access(&context.intent.scope)
                         .map_err(|_| Error::Journal)?
                         .require_native_context(context)
                         .map_err(|_| Error::Conflict)?;
-                    return Ok(record);
+                    let record = if kind == RecordKind::Network {
+                        // Legacy absence is a common-storage fact, never a native
+                        // birth receipt. Keep the native facet's explicit denial;
+                        // bracket the SAME original backend read with the selected
+                        // native context. Consumers still reject any present record.
+                        if !files.same_original_backend(&self.runtime.original_files) {
+                            return Err(Error::Conflict);
+                        }
+                        let record = self
+                            .runtime
+                            .original_files
+                            .clone()
+                            .read(&context.intent.scope, kind)
+                            .map_err(|_| Error::Journal)?;
+                        files
+                            .native_carrier_access(&context.intent.scope)
+                            .map_err(|_| Error::Journal)?
+                            .require_native_context(context)
+                            .map_err(|_| Error::Conflict)?;
+                        record
+                    } else {
+                        files
+                            .read(&context.intent.scope, kind)
+                            .map_err(|_| Error::Journal)?
+                    };
+                    records.push(record);
                 }
-                files
-                    .read(&context.intent.scope, kind)
-                    .map_err(|_| Error::Journal)
+                Ok(records)
             },
         )
     }

@@ -2946,27 +2946,23 @@ pub(crate) mod native {
             &self,
             verify_initial: impl FnOnce(&[u8]) -> Result<()>,
         ) -> Result<Vec<Option<Vec<u8>>>> {
-            let mut records = Vec::new();
             // EVERY protected kind is read, including Session/Pair. Their
             // existing original publication is not a native effect receipt.
-            for kind in [
-                RecordKind::Session,
-                RecordKind::Pair,
-                RecordKind::Network,
-                RecordKind::Carrier,
-                RecordKind::NativeCarrierReceipts,
-                RecordKind::CarrierGuard,
-                RecordKind::CarrierRows,
-                RecordKind::MemberARows,
-                RecordKind::MemberBRows,
-                RecordKind::NativeCreator,
-            ] {
-                let record = self
-                    .input
-                    .runtime
-                    .optional_record(&self.input.context, kind)?;
-                records.push(record);
-            }
+            let records = self.input.runtime.optional_records(
+                &self.input.context,
+                &[
+                    RecordKind::Session,
+                    RecordKind::Pair,
+                    RecordKind::Network,
+                    RecordKind::Carrier,
+                    RecordKind::NativeCarrierReceipts,
+                    RecordKind::CarrierGuard,
+                    RecordKind::CarrierRows,
+                    RecordKind::MemberARows,
+                    RecordKind::MemberBRows,
+                    RecordKind::NativeCreator,
+                ],
+            )?;
             require_never_inventory(
                 &self.input.context,
                 &std::array::from_fn(|i| records[i + 2].clone()),

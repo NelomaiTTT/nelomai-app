@@ -55,6 +55,24 @@ mod tests {
             || Ok(bytes.borrow().clone()),
         );
         assert_eq!(result, Err(CarrierError::Conflict));
+
+        // A whole inventory is one factual value. A late change in ANY kind,
+        // including absent -> present, must reject the complete observation.
+        for index in 0..10 {
+            let records = RefCell::new(vec![None; 10]);
+            let calls = Cell::new(0);
+            let result = super::read(
+                || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 2 {
+                        records.borrow_mut()[index] = Some(vec![9]);
+                    }
+                    Ok(())
+                },
+                || Ok(records.borrow().clone()),
+            );
+            assert_eq!(result, Err(CarrierError::Conflict));
+        }
     }
 
     #[test]
