@@ -4006,7 +4006,7 @@ pub(crate) mod native {
             current_fresh: &NativePairIntentRead,
             proposal: &PairRecord,
             lock: &mut KeyLock,
-        ) -> Result<()> {
+        ) -> Result<MemberRecord> {
             if self.live_source.is_some() {
                 return Err(Error::Conflict);
             }
@@ -4022,7 +4022,12 @@ pub(crate) mod native {
                     .map_err(io_error)
                 })
                 .map_err(|_| Error::Conflict)?;
-            self.origin.verify(lock)
+            self.origin.verify(lock)?;
+            // Only immutable intent/Prepared DATA crosses this return. The
+            // original owner and readonly profile stay in this retained root;
+            // the callback above only validates the protected proposal. Do not
+            // repeat the complete readonly preparation to reconstruct this DATA.
+            Ok(prepared)
         }
         /// Attach prepare_state receives an unchanged, UNSAVED Running clone;
         /// it adds Prepared/Attach only AFTER this returns. Actor supplies its

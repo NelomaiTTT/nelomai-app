@@ -2605,9 +2605,13 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<()>;
+        /// current is the protected record loaded by the SAME actor/store;
+        /// proposal is UNSAVED. Reauthenticate current/original inside Calling
+        /// before preparation and before returning the readonly Prepared DATA.
         fn prepare_member(
             &mut self,
             original: &Rc<NativePairIntentRead>,
+            current: &pair::Record,
             proposal: &pair::Record,
             member: &nelomai_client_tunnel::redundancy::protocol::Member,
             native: &str,
@@ -5209,7 +5213,7 @@ pub(crate) mod native {
                         "bootstrap member current original selected",
                     );
                     startup
-                        .prepare_member(&pin, record, member, native)
+                        .prepare_member(&pin, &actual, record, member, native)
                         .inspect_err(|error| {
                             #[cfg(test)]
                             super::super::member_carrier_factory_test_os::trace_native(

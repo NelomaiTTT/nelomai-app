@@ -4419,7 +4419,7 @@ pub(crate) mod native {
             let prepared = self.prepared[i].as_mut().ok_or(Error::Pending)?;
             #[cfg(test)]
             trace_step("member preparation begin original proposal");
-            prepared
+            let record = prepared
                 .verify_proposal(original, proposal, lock)
                 .inspect_err(|error| {
                     #[cfg(test)]
@@ -4432,9 +4432,6 @@ pub(crate) mod native {
                 })?;
             #[cfg(test)]
             trace_step("member preparation end original proposal");
-            let record = prepared.prepared_record(lock)?;
-            #[cfg(test)]
-            trace_step("member preparation record returned");
             self.continuity(original, current)?;
             #[cfg(test)]
             trace_step("member preparation final original continuity");
@@ -5469,6 +5466,7 @@ pub(crate) mod native {
         fn prepare_member(
             &mut self,
             original: &Rc<NativePairIntentRead>,
+            current: &pair::Record,
             proposal: &pair::Record,
             member: &nelomai_client_tunnel::redundancy::protocol::Member,
             native: &str,
@@ -5478,21 +5476,10 @@ pub(crate) mod native {
             supervisor.run(&context, || {
                 #[cfg(test)]
                 trace_step("bootstrap member Calling entered");
-                let current = original
-                    .inspect(&self.runtime, &supervisor, |actual| Ok(actual.clone()))
-                    .map_err(|_| Error::Conflict)
-                    .inspect_err(|error| {
-                        #[cfg(test)]
-                        super::super::member_carrier_factory_test_os::trace_native(
-                            "bootstrap member current Pair ACK",
-                            error,
-                        );
-                        #[cfg(not(test))]
-                        let _ = error;
-                    })?;
-                #[cfg(test)]
-                trace_step("bootstrap member current Pair ACK returned");
-                self.prepare_in_call(original, &current, proposal, member, native)
+                // Actor already loaded current and minted THIS original Rc.
+                // prepare_in_call reauthenticates the exact store/record under
+                // Calling before preparation and again before returning.
+                self.prepare_in_call(original, current, proposal, member, native)
             })
         }
         fn prepare_live_member(
