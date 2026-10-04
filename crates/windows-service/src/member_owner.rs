@@ -3333,6 +3333,37 @@ pub(super) mod cold_wireguard_data {
         struct Native {
             source: std::rc::Rc<NativeWireGuardSource>,
         }
+        /// External inventory input for the actual native factory fixture.
+        /// The audited parser, original source/pins, bytes, catalog membership
+        /// and Windows signatures still execute. No driver is installed.
+        #[cfg(test)]
+        pub(crate) fn prepare_fixture_package(
+            source: &Path,
+            directory: &Path,
+        ) -> Result<([PathBuf; 5], u64)> {
+            let bytes = std::fs::read(source).map_err(|e| io("fixture WG source", e))?;
+            require_audited_source_digest(&sha2::Sha256::digest(&bytes).into())?;
+            let package = extract_package(&bytes)?;
+            std::fs::create_dir(directory).map_err(|e| io("fixture WG package directory", e))?;
+            let paths = [
+                "published.inf",
+                "store.inf",
+                "wireguard.cat",
+                "store.sys",
+                "system.sys",
+            ]
+            .map(|name| directory.join(name));
+            for (path, bytes) in paths.iter().zip([
+                &package.inf,
+                &package.inf,
+                &package.cat,
+                &package.sys,
+                &package.sys,
+            ]) {
+                std::fs::write(path, bytes).map_err(|e| io("fixture WG package input", e))?;
+            }
+            Ok((paths, package.date))
+        }
         fn pending_maintenance() -> Result<(bool, PendingSnapshot)> {
             let mut handle = ptr::null_mut();
             let status = unsafe {
@@ -3404,6 +3435,32 @@ pub(super) mod cold_wireguard_data {
                 let native_amd64_win10_plus = native_platform()?;
                 if !native_amd64_win10_plus {
                     return Err(Error::Unsupported("native platform"));
+                }
+                #[cfg(test)]
+                if let Some((paths, date)) =
+                    crate::windows::wireguard_package_paths(&final_path(self.source.file()?)?)
+                {
+                    let [published_inf, store_inf, store_cat, store_sys, system_sys] =
+                        paths.map(|path| path.to_string_lossy().into_owned());
+                    return Ok(Inventory {
+                        native_amd64_win10_plus,
+                        candidates: vec![Candidate {
+                            date,
+                            version: 0x0001_0001_0000_0000,
+                            provider: "WireGuard LLC".into(),
+                            published_inf,
+                            store_inf,
+                            store_cat,
+                            store_sys,
+                        }],
+                        devices: vec![],
+                        service_type: 1,
+                        service_start: 3,
+                        service_state: 1,
+                        pending_maintenance: false,
+                        pending: PendingSnapshot::default(),
+                        system_sys,
+                    });
                 }
                 let root = os_directory(false)?;
                 let system_root = os_directory(true)?;

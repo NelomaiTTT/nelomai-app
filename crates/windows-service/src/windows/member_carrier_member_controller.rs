@@ -4634,11 +4634,23 @@ pub(crate) mod native {
                                 &origin.source,
                                 &origin.carrier,
                             )
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                if super::super::member_carrier_factory_test_os::state().is_some() {
+                                    eprintln!("actual cold WireGuard original source: {_error:?}");
+                                }
+                            })
                             .map_err(|_| Error::Pending)?,
                         );
                         crate::member_owner::cold_wireguard_data::native::from_original_source(
                             &source,
                         )
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            if super::super::member_carrier_factory_test_os::state().is_some() {
+                                eprintln!("actual cold WireGuard DATA package: {_error:?}");
+                            }
+                        })
                         .map_err(|_| Error::Pending)
                     },
                     |checked| {

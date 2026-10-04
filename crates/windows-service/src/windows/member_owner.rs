@@ -111,7 +111,7 @@ impl NativeWireGuardSource {
             .parent()
             .ok_or(PackageError::Changed)?
             .to_owned();
-        let manifest = Self::manifest(source, &directory)?;
+        let manifest = Self::manifest(source, carrier)?;
         let pin = |name: &str| {
             let selected = manifest
                 .selected(source.identity().slot)
@@ -140,13 +140,22 @@ impl NativeWireGuardSource {
     }
     fn manifest(
         source: &MemberSource,
-        directory: &Path,
+        carrier: &WintunSource,
     ) -> PackageResult<nelomai_contracts::VerifiedContainerManifest> {
         use nelomai_contracts::dispatcher as d;
+        let directory = carrier
+            .manifest_directory()
+            .map_err(|_| PackageError::Changed)?;
         let bytes = d::read_bounded(&directory.join(d::MANIFEST_NAME), 1024 * 1024)
             .map_err(|_| PackageError::Changed)?;
         let signature = d::read_bounded(&directory.join(d::SIGNATURE_NAME), 64)
             .map_err(|_| PackageError::Changed)?;
+        #[cfg(test)]
+        let key = super::member_carrier_factory_test_os::key(directory)
+            .map(Ok)
+            .unwrap_or_else(d::pinned_key)
+            .map_err(|_| PackageError::Changed)?;
+        #[cfg(not(test))]
         let key = d::pinned_key().map_err(|_| PackageError::Changed)?;
         let manifest = nelomai_contracts::verify_container_manifest(
             &bytes, &signature, &key, "windows", "x86_64",
@@ -178,7 +187,7 @@ impl NativeWireGuardSource {
             .map_err(|_| PackageError::Changed)?
             .parent()
             .ok_or(PackageError::Changed)?;
-        Self::manifest(&self.source, directory)?;
+        Self::manifest(&self.source, &self.carrier)?;
         for (file, name) in self.files.iter().zip(["wireguard.dll", "tunnel.dll"]) {
             if file.path() != directory.join(name) {
                 return Err(PackageError::Changed);

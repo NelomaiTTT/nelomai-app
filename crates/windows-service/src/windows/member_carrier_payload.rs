@@ -185,6 +185,12 @@ pub(crate) mod native {
         pub(crate) fn verify(&self) -> Result<()> {
             self.0.verify()
         }
+        /// SAME authenticated installed container, distinct from its engine
+        /// payload directory. This returns no module or effect authority.
+        pub(in crate::windows) fn manifest_directory(&self) -> Result<&Path> {
+            self.0.verify()?;
+            Ok(&self.0.directory)
+        }
         pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
             self.0.verify_owner(owner)
         }

@@ -214,6 +214,18 @@ jobs:
             throw 'Audited factory Wintun input hash mismatch'
           }
           "NELOMAI_FACTORY_WINTUN_DLL=$dll" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $wgArchive = Join-Path $env:RUNNER_TEMP 'factory-wireguard-nt-1.1.zip'
+          $wgExpanded = Join-Path $env:RUNNER_TEMP 'factory-wireguard-nt-1.1'
+          Invoke-WebRequest -Uri 'https://download.wireguard.com/wireguard-nt/wireguard-nt-1.1.zip' -OutFile $wgArchive
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $wgArchive).Hash.ToLowerInvariant() -ne 'dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace') {
+            throw 'Audited factory WireGuard archive hash mismatch'
+          }
+          Expand-Archive -LiteralPath $wgArchive -DestinationPath $wgExpanded
+          $wgDll = Join-Path $wgExpanded 'wireguard-nt/bin/amd64/wireguard.dll'
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $wgDll).Hash.ToLowerInvariant() -ne 'b1b85e072c45d81358be29d94c599dc76652f912be8c0f0a41e2d5d89a6461d3') {
+            throw 'Audited factory WireGuard DLL hash mismatch'
+          }
+          "NELOMAI_FACTORY_WIREGUARD_DLL=$wgDll" | Out-File -FilePath $env:GITHUB_ENV -Append
       - run: cargo test -p nelomai-windows-service
       # Read-only existing HKCU key. Log the actual native in/out-size contract;
       # this cannot grant SACL access, product key ownership or disposition.

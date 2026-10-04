@@ -21,6 +21,7 @@ struct Inputs {
     fault: Option<(member_files::PrivateFile, bool)>,
     package_source_reads: usize,
     package_paths: Option<[PathBuf; 5]>,
+    wireguard_package: Option<([PathBuf; 5], u64)>,
     native_loads: usize,
     module_originals: Vec<Weak<dyn Any>>,
     inventory_fault: Option<bool>,
@@ -107,6 +108,15 @@ pub(crate) fn package_paths(source: &Path) -> io::Result<Option<[PathBuf; 5]>> {
         Ok(inputs.package_paths.clone())
     })
 }
+pub(crate) fn wireguard_package_paths(source: &Path) -> Option<([PathBuf; 5], u64)> {
+    INPUTS.with(|inputs| {
+        inputs
+            .borrow()
+            .as_ref()
+            .filter(|v| source.starts_with(&v.root))
+            .and_then(|v| v.wireguard_package.clone())
+    })
+}
 
 pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::CarrierError) {
     if state().is_some() {
@@ -140,6 +150,13 @@ impl Fixture {
         Self::with_wintun(Some(std::fs::read(path)?))
     }
     fn with_wintun(wintun: Option<Vec<u8>>) -> io::Result<Self> {
+        let wireguard = if wintun.is_some() {
+            let path = std::env::var_os("NELOMAI_FACTORY_WIREGUARD_DLL")
+                .ok_or_else(|| io::Error::other("audited WireGuard DLL fixture input absent"))?;
+            Some(std::fs::read(path)?)
+        } else {
+            None
+        };
         use ed25519_dalek::{Signer, SigningKey};
         use member_files::SessionFileIo;
         use nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN;
@@ -221,6 +238,7 @@ impl Fixture {
                 fault: None,
                 package_source_reads: 0,
                 package_paths: None,
+                wireguard_package: None,
                 native_loads: 0,
                 module_originals: vec![],
                 inventory_fault: None,
@@ -244,7 +262,11 @@ impl Fixture {
                 wintun.as_deref().unwrap_or(b"fixture Wintun DATA"),
                 "shared_library",
             ),
-            ("wireguard.dll", b"fixture WG DATA", "shared_library"),
+            (
+                "wireguard.dll",
+                wireguard.as_deref().unwrap_or(b"fixture WG DATA"),
+                "shared_library",
+            ),
             ("tunnel.dll", b"fixture tunnel DATA", "shared_library"),
             (
                 "amneziawg-tunnel.dll",
@@ -282,17 +304,24 @@ impl Fixture {
         let layout = installation.install(&source, &client, "S-1-5-21-1000", &d::RealInstallIo)?;
         let executable = std::fs::canonicalize(layout.engine_path())?;
         if wintun.is_some() {
+            let wireguard_package =
+                crate::member_owner::cold_wireguard_data::native::prepare_fixture_package(
+                    &executable.with_file_name("wireguard.dll"),
+                    &parent.join("wireguard-package-input"),
+                )
+                .map_err(|e| {
+                    io::Error::other(format!("audited WireGuard package fixture: {e:?}"))
+                })?;
             let paths = super::member_carrier_wintun_package::native::prepare_fixture_package(
                 &executable.with_file_name("wintun.dll"),
                 &parent.join("package-input"),
             )
             .map_err(|e| io::Error::other(format!("audited package fixture: {e:?}")))?;
             INPUTS.with(|inputs| {
-                inputs
-                    .borrow_mut()
-                    .as_mut()
-                    .expect("fixture inputs")
-                    .package_paths = Some(paths)
+                let mut inputs = inputs.borrow_mut();
+                let inputs = inputs.as_mut().expect("fixture inputs");
+                inputs.package_paths = Some(paths);
+                inputs.wireguard_package = Some(wireguard_package);
             });
         }
         INPUTS.with(|inputs| {
