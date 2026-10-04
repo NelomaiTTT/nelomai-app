@@ -83,7 +83,8 @@ try {
         if ([DateTime]::UtcNow -ge $deadline) { throw 'Factory SYSTEM process exceeded CI aperture; no cleanup ACK' }
         $task = Get-ScheduledTask -TaskName $taskName
         $info = Get-ScheduledTaskInfo -TaskName $taskName
-        if ($task.State -eq 'Ready' -and $info.LastRunTime.ToUniversalTime() -ge $started.AddSeconds(-2)) {
+        if ($task.State -eq 'Ready' -and $info.LastRunTime.ToUniversalTime() -ge $started.AddSeconds(-2) -and
+            -not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
             throw "Factory SYSTEM process ended without its result, task exit $($info.LastTaskResult); no PASS"
         }
         Start-Sleep -Seconds 2
