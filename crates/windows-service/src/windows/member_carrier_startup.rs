@@ -3067,7 +3067,9 @@ pub(crate) mod native {
                                     .expected
                                 || facts.protected_records()[1].as_deref()
                                     != Some(
-                                        expected.encode().map_err(|_| Error::Conflict)?.as_slice(),
+                                        crate::windows::member_carrier_pair_store::encode_carrier_payload(expected)
+                                            .map_err(|_| Error::Conflict)?
+                                            .as_slice(),
                                     )
                                 || facts.protected_records()[9].is_none()
                             {
