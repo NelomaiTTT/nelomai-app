@@ -276,11 +276,23 @@ impl NativeDeadline {
         };
         intent
             .verify_forward_entry(&self.runtime, context, expected, effect)
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                super::member_carrier_factory_test_os::trace_step(
+                    "intent pre-Calling entry denied",
+                );
+            })
             .map_err(|_| CarrierError::Conflict)?;
         let authenticated_return = std::cell::Cell::new(false);
         let outcome = self.run(context, || {
             intent
                 .inspect_effect(&self.runtime, self, expected, effect, |_| Ok(()))
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    super::member_carrier_factory_test_os::trace_step(
+                        "intent current Calling effect read denied",
+                    );
+                })
                 .map_err(|_| CarrierError::Conflict)?;
             let value = call();
             // Err is not an absence ACK. Reauthenticate after normal return

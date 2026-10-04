@@ -550,22 +550,26 @@ pub(crate) mod native {
                 expected,
                 pair::Effect::CarrierReady,
                 || {
-                    input.calling()?;
+                    step!("cold load original Calling input", input.calling());
                     // Data-only preflight is retained independently as well as the
                     // audited loader's internal cold package. It grants no effects.
-                    self.preload = Some(WintunPreload::new(&input.source)?);
-                    self.members = Some(MemberInventory::retain(
-                        &input.runtime,
-                        input.context.clone(),
-                        input.source.clone(),
-                    )?);
-                    if !self
-                        .members
-                        .as_ref()
-                        .expect("retained members")
-                        .read_all()?
-                        .is_empty()
-                    {
+                    self.preload = Some(step!(
+                        "cold load original Wintun preflight",
+                        WintunPreload::new(&input.source)
+                    ));
+                    self.members = Some(step!(
+                        "cold load original member inventory",
+                        MemberInventory::retain(
+                            &input.runtime,
+                            input.context.clone(),
+                            input.source.clone(),
+                        )
+                    ));
+                    let members = step!(
+                        "cold load original member inventory read",
+                        self.members.as_ref().expect("retained members").read_all()
+                    );
+                    if !members.is_empty() {
                         return Err(Error::Conflict);
                     }
                     self.module
