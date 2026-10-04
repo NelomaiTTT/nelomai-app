@@ -709,16 +709,30 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
         context: &Context,
         binding: &Binding,
     ) -> Result<(bool, bool, bool)> {
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence runtime preflight begin");
         self.verify(lock, context)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence runtime preflight end");
         if !context.bindings.contains(binding) {
             return Err(Error::Conflict);
         }
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence originals before begin");
         self.originals.assert_absent(context, binding)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence originals before end");
         let (name_absent, guid_absent) = native_absence(binding)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence native inventory end");
         // Check retained creators again after the bounded native inventory.
         // There is no reconstruction from a numeric index or saved JSON.
         self.originals.assert_absent(context, binding)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence originals after end");
         self.verify(lock, context)?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step("key absence runtime postflight end");
         Ok((name_absent, guid_absent, true))
     }
 }

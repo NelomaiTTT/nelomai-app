@@ -331,7 +331,15 @@ impl OriginalKeyInventory {
                 self.observer.observe_all(context)
             }
         };
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key target full before census begin",
+        );
         let before = observe()?;
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key target full before census end",
+        );
         if before.originals.iter().any(|o| {
             o.scope.binding != context.bindings[0]
                 || o.identity.guid == binding.guid
@@ -347,6 +355,10 @@ impl OriginalKeyInventory {
                 identity: o.provider.interface.clone(),
             })
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key target independent mixed read begin",
+        );
         members
             .inspect_full(context, &self.runtime, &self.image, |member_facts| {
                 let inputs = crate::windows::member_carrier_members::key_provider_inputs(
@@ -365,9 +377,17 @@ impl OriginalKeyInventory {
                 Ok(())
             })
             .map_err(original_error)?;
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key target independent mixed read end",
+        );
         if before != observe()? {
             return Err(creators::Error::Conflict);
         }
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key target full after census end",
+        );
         Ok(())
     }
     fn recheck(
@@ -375,6 +395,8 @@ impl OriginalKeyInventory {
         context: &receipt::Context,
         binding: &receipt::Binding,
     ) -> creators::Result<()> {
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step("key inventory recheck begin");
         self.runtime.verify(context).map_err(original_error)?;
         self.image
             .verify_runtime(&self.runtime)
@@ -420,7 +442,15 @@ impl OriginalKeyInventory {
                     .position(|b| b == binding)
                     .ok_or(creators::Error::Conflict)?;
                 if state[index] == creators::State::Intent {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "key inventory private Never begin",
+                    );
                     self.observer.assert_never_attempted(context, binding)?;
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "key inventory private Never end",
+                    );
                 } else {
                     self.observer.assert_absent(context, binding)?;
                 }
@@ -451,7 +481,10 @@ impl OriginalKeyInventory {
         if before != read()? {
             return Err(creators::Error::Conflict);
         }
-        self.runtime.verify(context).map_err(original_error)
+        self.runtime.verify(context).map_err(original_error)?;
+        #[cfg(test)]
+        crate::windows::member_carrier_factory_test_os::trace_step("key inventory recheck end");
+        Ok(())
     }
 }
 impl crate::windows::member_carrier_key_authority::OriginalCreatorInventory
