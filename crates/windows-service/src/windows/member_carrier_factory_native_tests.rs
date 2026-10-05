@@ -16,6 +16,7 @@ use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelConfiguration,
 };
 use nelomai_contracts::{HealthProbeKind, RedundantHealthProbe, RuntimeSlot};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn carrier_factory_selects_new_path_for_supported_pair() {
@@ -188,10 +189,30 @@ fn carrier_factory_actual_cold_child() {
     }
     .expect("external signed/private fixture");
     let mut factory: NativePairFactory<NativeSessionFiles> = fixture.factory().unwrap();
+    // A prior partial child deliberately leaves its original registry keys.
+    // Distinct cases and repeat sessions must never reuse those carrier GUIDs.
+    let session_ids = [0u8, 1].map(|round| {
+        let mut hash = Sha256::new();
+        hash.update(b"nelomai-native-factory-test-session/v1\0");
+        hash.update(case.as_bytes());
+        hash.update([round]);
+        let mut bytes: [u8; 16] = hash.finalize()[..16].try_into().unwrap();
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..]
+        )
+    });
     let scope = SessionScope {
         runtime: RuntimeSlot::Latest,
         runtime_generation: 2,
-        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        session_id: session_ids[0].clone(),
         connection_generation: 3,
     };
     let primary = Member { slot: Slot::A, lease_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -460,7 +481,7 @@ fn carrier_factory_actual_cold_child() {
         let Command::Start { scope: next, .. } = &mut command else {
             unreachable!()
         };
-        next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+        next.session_id = session_ids[1].clone();
         next.connection_generation += 1;
         let next = next.clone();
         eprintln!("actual factory {case}: repeat prepare");
