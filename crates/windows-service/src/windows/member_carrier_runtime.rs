@@ -6059,11 +6059,13 @@ pub(crate) mod native {
                 Use::Live
             };
             let before = self.current(use_)?;
-            if stage == Stage::BeforeCreate {
-                // Carrier and native kernel perform factual driver/absence
-                // queries before the final SDK effect seam. They cannot create
-                // a pending token or grant SDK creation. Authenticate the SAME
-                // live original image/runtime and exact Preparing receipt here.
+            if matches!(stage, Stage::Resolve | Stage::BeforeCreate) {
+                // Resolve adds a reference to the already loaded original DLL
+                // and reads exports; it does not initialize the DLL or touch
+                // drivers/NICs. Carrier/kernel likewise perform only factual
+                // driver/absence queries before the final SDK effect seam.
+                // Neither seam can issue a pending token or grant creation.
+                // Authenticate the SAME live image/runtime and exact receipt.
                 // authorize_create independently runs the complete package/G,
                 // actual NEW-HKEY/DWORD0 and lock gate LAST before CreateAdapter.
                 self.image
@@ -6072,13 +6074,13 @@ pub(crate) mod native {
                 same_record(&before, self.current(Use::Create)?).map_err(denied)?;
                 self.verify_supervised()?;
                 self.failed = false;
+                #[cfg(test)]
+                if stage == Stage::Resolve {
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "C Resolve original image and Preparing receipt accepted",
+                    );
+                }
                 return Ok(());
-            }
-            #[cfg(test)]
-            if stage == Stage::Resolve {
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "C Resolve current native receipt accepted",
-                );
             }
             if stage == Stage::AfterClose {
                 self.complete_original_close()?;
@@ -6102,19 +6104,7 @@ pub(crate) mod native {
             // Acquire new recursive lease BEFORE replacing/releasing the old
             // one; no unlocked gap before a later EndSession/CloseAdapter.
             let held = self.refresh(use_)?;
-            #[cfg(test)]
-            if stage == Stage::Resolve {
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "C Resolve original module lease accepted",
-                );
-            }
             self.gate.authorize(&self.scope, stage, &self.observer)?;
-            #[cfg(test)]
-            if stage == Stage::Resolve {
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "C Resolve full lifecycle gate accepted",
-                );
-            }
             same_record(&before, self.current(use_)?).map_err(denied)?;
             self.effect = Some(held);
             if stage == Stage::BeforeClose && self.retirement.is_none() {
