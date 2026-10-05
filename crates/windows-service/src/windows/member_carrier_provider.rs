@@ -1254,7 +1254,14 @@ pub(crate) mod native {
     /// Returns all concrete observations in caller order, with the same full
     /// PnP/MIB/stack reads as the strict Wintun entry point. No factory selection.
     pub(crate) fn inspect_mixed(wants: &[ExpectedProvider]) -> Result<Vec<Observation>> {
-        inspect_mixed_queries(wants, &mut NativeQueries)
+        let result = inspect_mixed_queries(wants, &mut NativeQueries);
+        #[cfg(test)]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            if let Err(error) = &result {
+                eprintln!("actual native complete provider census: {error:?}");
+            }
+        }
+        result
     }
 
     /// Service-only cleanup comparison, never a provider/Running proof. Caller
@@ -1316,7 +1323,14 @@ pub(crate) mod native {
 
     /// Enumerate an actually empty universe; zero input is not zero OS queries.
     pub(crate) fn inspect_empty() -> Result<()> {
-        inspect_all(&[]).map(|_| ())
+        let result = inspect_all(&[]).map(|_| ());
+        #[cfg(test)]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            if let Err(error) = &result {
+                eprintln!("actual native empty provider census: {error:?}");
+            }
+        }
+        result
     }
 
     // Native test harness only: actual unvalidated observations are diagnostic

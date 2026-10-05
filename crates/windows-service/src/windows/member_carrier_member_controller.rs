@@ -4718,6 +4718,10 @@ pub(crate) mod native {
             let before = raw.prior_stopped().map_err(owner_error)?;
             reached!("member preflight original prior-stopped read returned");
             if owner.prior.as_ref().is_some_and(|p| p != &before) {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "member preflight original prior-stopped changed",
+                );
                 return Err(Error::Conflict);
             }
             owner.prior = Some(before.clone());
