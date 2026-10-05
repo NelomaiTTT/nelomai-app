@@ -289,7 +289,13 @@ fn carrier_factory_actual_cold_child() {
             "signed DATA must not become an executable carrier package"
         );
         fixture.require_package_source_read();
-        assert!(original.snapshot().cleanup_pending);
+        let snapshot = original.snapshot();
+        if !snapshot.cleanup_pending {
+            // A rejected package can finish its actual original Stop before
+            // Start returns Err. The retained control must then be terminal;
+            // the explicit Stop/repeat preparation below still checks completion.
+            assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
+        }
     }
     eprintln!("actual factory {case}: original Stop");
     let stopped = original.execute(
