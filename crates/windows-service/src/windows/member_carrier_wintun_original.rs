@@ -47,7 +47,6 @@ pub(crate) struct OriginalPackageInventory {
     runtime: RuntimeRead,
     image: OriginalImage,
     context: receipt::Context,
-    members: Option<crate::windows::member_carrier_members::native::MemberInventoryRead>,
 }
 /// Only factual reads under an actual current protected Closing record. Cannot
 /// convert back into forward permission or issue original end/close effects.
@@ -66,7 +65,6 @@ impl OriginalPackageInventory {
             runtime: runtime.read_pin().map_err(original_error)?,
             image: image.read_pin().map_err(original_error)?,
             context,
-            members: None,
         })
     }
     pub(crate) fn from_producer(
@@ -77,13 +75,7 @@ impl OriginalPackageInventory {
         producer
             .original_universe()
             .matches_original_runtime_image(runtime, image)?;
-        let mut package = Self::new(producer.observer(), runtime, image)?;
-        package.members = producer
-            .original_universe()
-            .members
-            .as_ref()
-            .map(|m| m.read_pin());
-        Ok(package)
+        Self::new(producer.observer(), runtime, image)
     }
     pub(crate) fn matches_source(
         &self,
@@ -146,63 +138,26 @@ impl OriginalPackageInventory {
             self.observer.observe_all(&self.context)
         }
         .map_err(|_| PackageError::Changed)?;
-        let devices = if let Some(members) = &self.members {
-            if observations
-                .originals
-                .iter()
-                .any(|o| o.scope.binding != self.context.bindings[0])
-            {
-                return Err(PackageError::Changed);
-            }
-            let carrier = observations
-                .originals
-                .iter()
-                .map(|o| member_carrier_provider::ExpectedProvider {
-                    kind: member_carrier_provider::ProviderKind::Wintun,
-                    identity: o.provider.interface.clone(),
-                })
-                .collect::<Vec<_>>();
-            members
-                .inspect_full(&self.context, &self.runtime, &self.image, |member_facts| {
-                    let inputs = crate::windows::member_carrier_members::complete_provider_inputs(
-                        &self.context,
-                        &carrier,
-                        member_facts,
-                    )?;
-                    let facts = member_carrier_provider::native::inspect_mixed(&inputs)
-                        .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
-                    if facts.len() != inputs.len()
-                        || !observations
-                            .originals
-                            .iter()
-                            .zip(&facts)
-                            .all(|(old, fresh)| old.provider == *fresh)
-                    {
-                        return Err(crate::member_carrier::CarrierError::Conflict);
-                    }
-                    let kinds = inputs.iter().map(|i| i.kind).collect::<Vec<_>>();
-                    let devices = facts
-                        .iter()
-                        .map(|o| Device {
-                            instance: o.instance.instance.clone(),
-                            status: o.instance.status,
-                            problem: o.instance.problem,
-                        })
-                        .collect::<Vec<_>>();
-                    crate::windows::member_carrier_members::package_devices(&kinds, &devices)
-                })
-                .map_err(|_| PackageError::Changed)?
-        } else {
-            observations
-                .originals
-                .iter()
-                .map(|o| Device {
-                    instance: o.provider.instance.instance.clone(),
-                    status: o.provider.instance.status,
-                    problem: o.provider.instance.problem,
-                })
-                .collect()
-        };
+        // The SAME registry read already brackets the complete native
+        // C+member census with actual original C identities and member owners.
+        // Preserve that full result instead of querying the member census again
+        // merely because the raw-C projection used to discard it.
+        let kinds = observations
+            .complete
+            .iter()
+            .map(|(kind, _)| *kind)
+            .collect::<Vec<_>>();
+        let devices = observations
+            .complete
+            .iter()
+            .map(|(_, o)| Device {
+                instance: o.instance.instance.clone(),
+                status: o.instance.status,
+                problem: o.instance.problem,
+            })
+            .collect::<Vec<_>>();
+        let devices = crate::windows::member_carrier_members::package_devices(&kinds, &devices)
+            .map_err(|_| PackageError::Changed)?;
         // Actual raw C is checked AGAIN after all independent SCM/provider
         // member reads; stale C facts cannot seed an owned package projection.
         let after = if cleanup {
@@ -818,7 +773,7 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
                 tunnel_type: o.identity.tunnel_type,
             })
             .collect::<Vec<_>>();
-        let facts = if let Some(members) = &self.members {
+        let complete = if let Some(members) = &self.members {
             // C is the sole raw Wintun creator in the integrated topology;
             // A/B must originate in their actual SCM/process owners instead.
             if originals
@@ -876,7 +831,11 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
                 if facts.len() != complete.len() {
                     return Err(crate::member_carrier::CarrierError::Conflict);
                 }
-                Ok(facts)
+                Ok(complete
+                    .iter()
+                    .map(|input| input.kind)
+                    .zip(facts)
+                    .collect::<Vec<_>>())
             };
             let facts = match record.phase {
                 receipt::Phase::Closing => {
@@ -917,14 +876,9 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
                 return Err(creators::Error::Conflict);
             }
             facts
-                // The WHOLE query above verified all C+A+B, including extra/foreign
-                // nodes. Only C results are exposed to the raw-C creator registry.
-                .into_iter()
-                .take(originals.len())
-                .collect::<Vec<_>>()
         } else {
             // Legacy strict path does not learn to accept an unowned WG device.
-            if let Some(binding) = absent {
+            let facts = if let Some(binding) = absent {
                 let complete = targets
                     .iter()
                     .map(|identity| member_carrier_provider::ExpectedProvider {
@@ -948,15 +902,24 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
                 .map_err(original_error)?
             } else {
                 member_carrier_provider::native::inspect_all(&targets).map_err(original_error)?
-            }
+            };
+            facts
+                .into_iter()
+                .map(|fact| (member_carrier_provider::ProviderKind::Wintun, fact))
+                .collect::<Vec<_>>()
         };
         self.verify(context)?;
-        if facts.len() != originals.len() {
+        if complete.len() < originals.len() || complete.len() > 3 {
             return Err(creators::Error::Conflict);
         }
         let observations = originals
             .iter()
-            .zip(facts)
+            .zip(
+                complete
+                    .iter()
+                    .take(originals.len())
+                    .map(|(_, fact)| fact.clone()),
+            )
             .map(|(o, provider)| creators::Observation {
                 scope: o.scope.clone(),
                 identity: creators::Identity {
@@ -974,6 +937,7 @@ unsafe impl creators::NativeUniverse<OriginalWintun> for OriginalUniverse {
         Ok(creators::UniverseObservation {
             context: context.clone(),
             originals: observations,
+            complete,
         })
     }
 }

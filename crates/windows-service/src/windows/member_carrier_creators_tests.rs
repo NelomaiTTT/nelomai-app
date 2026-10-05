@@ -156,7 +156,29 @@ unsafe impl NativeUniverse<Native> for Universe {
             5 => originals.reverse(),
             _ => (),
         }
-        Ok(UniverseObservation { context, originals })
+        let mut complete = originals
+            .iter()
+            .map(|o| (ProviderKind::Wintun, o.provider.clone()))
+            .collect::<Vec<_>>();
+        match self.fault.get() {
+            6 => complete[0].1 = "different-provider".into(),
+            7 => {
+                complete.pop();
+            }
+            8 => {
+                complete.extend([
+                    (ProviderKind::Wintun, "extra".into()),
+                    (ProviderKind::Wintun, "extra".into()),
+                ]);
+            }
+            9 => complete.push((ProviderKind::WireGuardNt, "actual-member-provider".into())),
+            _ => (),
+        }
+        Ok(UniverseObservation {
+            context,
+            originals,
+            complete,
+        })
     }
 }
 impl Native {
@@ -375,6 +397,7 @@ fn never_attempted_key_preparation_requires_full_native_universe_and_cannot_begi
         Ok(UniverseObservation {
             context: context(),
             originals: vec![],
+            complete: vec![],
         })
     );
     assert_eq!(&*observer.shared.universe.calls.borrow(), &[0]);
@@ -403,8 +426,14 @@ fn never_attempted_key_preparation_requires_full_native_universe_and_cannot_begi
     // The full census is DATA, including actual originals of OTHER roles.
     // Returning it must neither manufacture target absence nor rearm Intent.
     let (mut producer, observer, log) = live(0);
+    producer.shared.universe.fault.set(9);
     let expected = observer.observe_all(&context()).unwrap();
     assert_eq!(expected.originals.len(), 1);
+    assert_eq!(expected.complete.len(), 2);
+    assert_eq!(
+        expected.complete[1],
+        (ProviderKind::WireGuardNt, "actual-member-provider".into())
+    );
     let reads = log.reads.get();
     assert_eq!(
         observer.assert_never_attempted(&context(), &scope(1).binding),
@@ -1490,7 +1519,16 @@ fn whole_provider_waits_for_every_original_and_fences_every_full_identity_afterw
             );
         }
     }));
-    o.observe_all(&context()).unwrap();
+    let observed = o.observe_all(&context()).unwrap();
+    assert_eq!(
+        observed.complete,
+        observed
+            .originals
+            .iter()
+            .map(|o| (ProviderKind::Wintun, o.provider.clone()))
+            .collect::<Vec<_>>(),
+        "the actual complete provider census must survive the original registry read"
+    );
     for (l, count) in logs.iter().zip(&before) {
         assert_eq!(l.reads.get(), count + 2);
     }
@@ -1541,7 +1579,7 @@ fn complete_actual_mib_description_including_windows_numeric_suffix_is_preserved
 }
 #[test]
 fn whole_provider_error_duplicate_scope_or_fabricated_identity_denies_and_retains_actuals() {
-    for fault in 1..5 {
+    for fault in [1, 2, 3, 4, 6, 7, 8] {
         let (mut p, o, _) = live(0);
         let s = scope(1);
         p.confirm_empty(s.clone(), &mut absent()).unwrap();

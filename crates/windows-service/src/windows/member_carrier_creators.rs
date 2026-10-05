@@ -3,6 +3,7 @@
 #![cfg(any(windows, test))]
 #![allow(dead_code)] // Main owns NativeKernel/factory and module integration.
 
+use super::member_carrier_provider::ProviderKind;
 use crate::member_carrier_native_ownership::{self as receipt, Binding, Context, Role};
 use std::{
     cell::{Cell, RefCell},
@@ -60,6 +61,9 @@ pub(crate) struct OriginalIdentity {
 pub(crate) struct UniverseObservation<P> {
     pub context: Context,
     pub originals: Vec<Observation<P>>,
+    /// Full readonly C/member census from the SAME native provider query.
+    /// Metadata only: retained original ACKs alone supply resource ownership.
+    pub complete: Vec<(ProviderKind, P)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AbsenceFacts {
@@ -101,6 +105,9 @@ pub(crate) unsafe trait OriginalNative: Sized {
 /// not native ownership: only OriginalNative's retained ACK supplies ownership.
 /// Independently verify current scope/runtime/source/pins/SAME serialized lock.
 /// Returned per-original provider metadata must be concrete stable native facts.
+/// `complete` preserves that SAME full query's C/member rows with provider kinds;
+/// its raw-original prefix is in input order and equals `originals`' provider
+/// facts. This readonly census cannot issue or replace original owning ACKs.
 /// If absent is supplied, check its name/GUID on every complete MIB/PnP read
 /// of that SAME universe; it is an additional predicate, never a filtered set.
 /// Do not call Carrier.capture, this observer, or an authority which recursively
@@ -403,14 +410,21 @@ impl<N: OriginalNative> Shared<N> {
             .universe
             .inspect_universe(&self.context, &identities, absent)?;
         operation.check()?;
-        if universe.context != self.context || universe.originals.len() != identities.len() {
+        if universe.context != self.context
+            || universe.originals.len() != identities.len()
+            || universe.complete.len() < identities.len()
+            || universe.complete.len() > 3
+        {
             return Err(Error::Conflict);
         }
         let mut originals = Vec::with_capacity(3);
-        for id in &identities {
+        for (index, id) in identities.iter().enumerate() {
             let mut matches = universe.originals.iter().filter(|o| o.scope == id.scope);
             let facts = matches.next().ok_or(Error::Conflict)?;
-            if matches.next().is_some() || facts.identity != id.identity {
+            if matches.next().is_some()
+                || facts.identity != id.identity
+                || universe.complete[index].1 != facts.provider
+            {
                 return Err(Error::Conflict);
             }
             validate_observation(&id.scope, facts)?;
@@ -441,6 +455,7 @@ impl<N: OriginalNative> Shared<N> {
         Ok(UniverseObservation {
             context: self.context.clone(),
             originals,
+            complete: universe.complete,
         })
     }
     fn fail(&self) {
