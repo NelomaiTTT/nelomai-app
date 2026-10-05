@@ -5413,11 +5413,9 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            inputs
-                .producer
-                .original_universe()
-                .matches_original_runtime_image(&inputs.runtime, &inputs.image)
-                .map_err(denied)?;
+            // from_producer performs the SAME original runtime/image match
+            // before constructing the passive package reader. No effect or
+            // authority publication occurs between these inputs and that check.
             let package = OriginalPackageInventory::from_producer(
                 &inputs.producer,
                 &inputs.runtime,

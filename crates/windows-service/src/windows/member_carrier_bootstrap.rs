@@ -544,36 +544,36 @@ pub(crate) mod native {
             // Marked retained before any fallible supervised operation. Failed
             // postflight/rundown cannot discard the caller's owning slot.
             let input = self.inputs.as_ref().expect("retained original inputs");
+            // Passive package/inventory preparation grants no loader authority.
+            // Keep these SAME originals before Calling; input.calling and the
+            // audited loader still reauthenticate immediately before the effect.
+            self.preload = Some(step!(
+                "cold load original Wintun preflight",
+                WintunPreload::new(&input.source)
+            ));
+            self.members = Some(step!(
+                "cold load original member inventory",
+                MemberInventory::retain(
+                    &input.runtime,
+                    input.context.clone(),
+                    input.source.clone(),
+                )
+            ));
+            let members = step!(
+                "cold load original member inventory read",
+                self.members.as_ref().expect("retained members").read_all()
+            );
+            if !members.is_empty() {
+                return Err(Error::Conflict);
+            }
             let result = supervisor.run_intent(
                 context,
                 &input.intent,
                 expected,
                 pair::Effect::CarrierReady,
                 || {
-                    // Data-only preflight is retained independently as well as the
-                    // audited loader's internal cold package. It grants no effects.
-                    // Each passive reader checks its own original source/runtime.
                     // The whole original Calling input is checked immediately
                     // before LoadLibrary below and again after its retained ACK.
-                    self.preload = Some(step!(
-                        "cold load original Wintun preflight",
-                        WintunPreload::new(&input.source)
-                    ));
-                    self.members = Some(step!(
-                        "cold load original member inventory",
-                        MemberInventory::retain(
-                            &input.runtime,
-                            input.context.clone(),
-                            input.source.clone(),
-                        )
-                    ));
-                    let members = step!(
-                        "cold load original member inventory read",
-                        self.members.as_ref().expect("retained members").read_all()
-                    );
-                    if !members.is_empty() {
-                        return Err(Error::Conflict);
-                    }
                     // SAME slot's factual marker is set only after the real OS
                     // return is rooted in LoadedWintun, before fallible image/
                     // package postflight. Wrapper presence alone is not an ACK.
