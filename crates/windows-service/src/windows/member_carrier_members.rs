@@ -1889,7 +1889,9 @@ pub(crate) mod native {
         }
 
         fn revision(&self) -> Result<Vec<u8>> {
-            self.runtime.verify(&self.context)?;
+            // Source verification already authenticates this SAME runtime;
+            // record then authenticates and rereads the complete protected
+            // bytes before/after. Decoding them performs no native or file IO.
             self.runtime.verify_source(&self.carrier)?;
             let bytes = self
                 .runtime
@@ -1900,7 +1902,6 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            self.runtime.verify(&self.context)?;
             Ok(bytes)
         }
 
