@@ -1535,10 +1535,23 @@ pub(crate) mod native {
         fn sample(&self, stage: StartupStage) -> wintun::Result<Sample> {
             self.continuity()?;
             let context = &self.scope.context;
-            let native = self
+            let [native, network, member_a, member_b, guard, rows]: [Option<Vec<u8>>; 6] = self
                 .runtime
-                .record(context, RecordKind::NativeCarrierReceipts)
+                .optional_records(
+                    context,
+                    &[
+                        RecordKind::NativeCarrierReceipts,
+                        RecordKind::Network,
+                        RecordKind::MemberARows,
+                        RecordKind::MemberBRows,
+                        RecordKind::CarrierGuard,
+                        RecordKind::CarrierRows,
+                    ],
+                )
+                .map_err(denied)?
+                .try_into()
                 .map_err(denied)?;
+            let native = native.ok_or(wintun::Error::Conflict)?;
             let record = receipts::Record::decode(&native).map_err(denied)?;
             // All original members, not a model projection or names-only query.
             if !self.members.read_all().map_err(denied)?.is_empty() {
@@ -1554,25 +1567,12 @@ pub(crate) mod native {
                 })
                 .collect::<Vec<_>>();
             validate_startup(&record, &self.scope, stage, &identities).map_err(denied)?;
-            for kind in [
-                RecordKind::Network,
-                RecordKind::MemberARows,
-                RecordKind::MemberBRows,
-                RecordKind::CarrierGuard,
-            ] {
-                if self
-                    .runtime
-                    .optional_record(context, kind)
-                    .map_err(denied)?
-                    .is_some()
-                {
-                    return Err(wintun::Error::Conflict);
-                }
+            if [network, member_a, member_b, guard]
+                .iter()
+                .any(Option::is_some)
+            {
+                return Err(wintun::Error::Conflict);
             }
-            let rows = self
-                .runtime
-                .optional_record(context, RecordKind::CarrierRows)
-                .map_err(denied)?;
             let snapshot = if let Some(original) = identities.first() {
                 let binding = crate::windows::member_carrier_runtime::rows_binding(
                     context,
@@ -1698,10 +1698,23 @@ pub(crate) mod native {
         fn sample_closing(&self, stage: ClosingStage) -> wintun::Result<Sample> {
             self.continuity_cleanup()?;
             let context = &self.scope.context;
-            let native = self
+            let [native, network, member_a, member_b, guard, rows]: [Option<Vec<u8>>; 6] = self
                 .runtime
-                .record(context, RecordKind::NativeCarrierReceipts)
+                .optional_records(
+                    context,
+                    &[
+                        RecordKind::NativeCarrierReceipts,
+                        RecordKind::Network,
+                        RecordKind::MemberARows,
+                        RecordKind::MemberBRows,
+                        RecordKind::CarrierGuard,
+                        RecordKind::CarrierRows,
+                    ],
+                )
+                .map_err(denied)?
+                .try_into()
                 .map_err(denied)?;
+            let native = native.ok_or(wintun::Error::Conflict)?;
             let record = receipts::Record::decode(&native).map_err(denied)?;
             let originals = self
                 .members
@@ -1724,25 +1737,12 @@ pub(crate) mod native {
                 .collect::<Vec<_>>();
             validate_c_only_closing(&record, &self.scope, &self.expected, stage, &identities)
                 .map_err(denied)?;
-            for kind in [
-                RecordKind::Network,
-                RecordKind::MemberARows,
-                RecordKind::MemberBRows,
-                RecordKind::CarrierGuard,
-            ] {
-                if self
-                    .runtime
-                    .optional_record(context, kind)
-                    .map_err(denied)?
-                    .is_some()
-                {
-                    return Err(wintun::Error::Conflict);
-                }
+            if [network, member_a, member_b, guard]
+                .iter()
+                .any(Option::is_some)
+            {
+                return Err(wintun::Error::Conflict);
             }
-            let rows = self
-                .runtime
-                .optional_record(context, RecordKind::CarrierRows)
-                .map_err(denied)?;
             let snapshot = if let Some(original) = identities.first() {
                 let binding = crate::windows::member_carrier_runtime::rows_binding(
                     context,
