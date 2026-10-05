@@ -168,8 +168,9 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
 };
 
-const STEPS: [ReadyStep; 8] = [
+const STEPS: [ReadyStep; 9] = [
     ReadyStep::Construct,
+    ReadyStep::Resolve,
     ReadyStep::Create,
     ReadyStep::Session,
     ReadyStep::CaptureRows,
@@ -1314,11 +1315,22 @@ fn creation_policy_uses_only_the_validated_single_ipv4_host_address() {
 fn source_publication_is_last_after_all_native_creation_and_ready_boundaries() {
     let run = ReadyRun::new();
     let mut seen = vec![];
-    run.execute(|step| {
-        seen.push(step);
-        Ok(())
-    })
+    let mut calls = 0;
+    run.execute_in(
+        &mut |call| {
+            calls += 1;
+            call()
+        },
+        |step| {
+            seen.push(step);
+            Ok(())
+        },
+    )
     .unwrap();
+    assert_eq!(
+        calls, 9,
+        "authority and native resolution have independent Calling fences"
+    );
     assert_eq!(seen, STEPS);
     assert!(!run.revoked.get());
     let mut repeated = false;
@@ -1493,7 +1505,7 @@ fn caught_reentry_cannot_publish_a_source_from_the_outer_attempt() {
             Ok(())
         })
         .is_err());
-    assert_eq!(*seen.borrow(), [ReadyStep::Construct, ReadyStep::Create]);
+    assert_eq!(*seen.borrow(), STEPS[..=2]);
     assert!(run.revoked.get());
 }
 
@@ -1509,7 +1521,7 @@ fn unwind_retains_the_callers_partial_objects_and_irreversibly_retires_run() {
         Ok(())
     })))
     .is_err());
-    assert_eq!(*retained.borrow(), STEPS[..=4]);
+    assert_eq!(*retained.borrow(), STEPS[..=5]);
     assert!(run.revoked.get());
     assert!(run.execute(|_| Ok(())).is_err());
 }

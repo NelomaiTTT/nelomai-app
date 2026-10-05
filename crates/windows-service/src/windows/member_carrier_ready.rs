@@ -169,6 +169,7 @@ fn needs_created_cleanup(acknowledged: &crate::member_carrier_rows::Record) -> R
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadyStep {
     Construct,
+    Resolve,
     Create,
     Session,
     CaptureRows,
@@ -227,6 +228,7 @@ impl ReadyRun {
         };
         for step in [
             ReadyStep::Construct,
+            ReadyStep::Resolve,
             ReadyStep::Create,
             ReadyStep::Session,
             ReadyStep::CaptureRows,
@@ -1735,6 +1737,7 @@ pub(crate) mod native {
                         #[cfg(test)]
                         let label = match step {
                             ReadyStep::Construct => "C ready Construct",
+                            ReadyStep::Resolve => "C ready Resolve",
                             ReadyStep::Create => "C ready Create",
                             ReadyStep::Session => "C ready Session",
                             ReadyStep::CaptureRows => "C ready CaptureRows",
@@ -2740,7 +2743,10 @@ pub(crate) mod native {
                     super::super::member_carrier_factory_test_os::trace_step(
                         "C construct authority",
                     );
-                    root.construct().map_err(denied)?;
+                    root.construct().map_err(denied)
+                }
+                ReadyStep::Resolve => {
+                    let root = self.construction.as_ref().ok_or(CarrierError::Pending)?;
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::trace_step("C construct resolve");
                     root.resolve_components().map_err(denied)
