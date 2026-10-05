@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$TestExecutable,
     [Parameter(Mandatory = $true)][string]$RuntimeDirectory,
-    [Parameter(Mandatory = $true)][string]$OutputDirectory
+    [Parameter(Mandatory = $true)][string]$OutputDirectory,
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Case
 )
 $ErrorActionPreference = 'Stop'
 # This harness belongs only to the disposable native CI runner, never line H.
@@ -29,6 +30,7 @@ $payload = @{
     runtime = (Resolve-Path -LiteralPath $RuntimeDirectory).Path
     log = $log
     result = $resultPath
+    case = $Case
 } | ConvertTo-Json -Compress
 $payload64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
 # Encode data separately; no path/config interpolation into executable code.
@@ -43,6 +45,7 @@ try {
     if (-not $system) { throw 'Actual factory process is not SYSTEM' }
     Set-Location -LiteralPath $data.directory
     $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY = $data.runtime
+    $env:NELOMAI_FACTORY_SYSTEM_CASE = $data.case
     # PowerShell 5 treats native stderr as ErrorRecords. Capture both streams
     # directly so a normal Rust diagnostic cannot interrupt the actual test.
     $process = Start-Process -FilePath $data.executable -ArgumentList @(
@@ -92,6 +95,9 @@ try {
     if ($result.system -ne $true -or $result.exit_code -ne 0) { throw 'Actual SYSTEM factory scenario failed' }
     if ($output -notmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
         throw 'Missing exact factory execution count; no empty-filter PASS'
+    }
+    if ($output -notmatch ('(?m)^actual native factory coverage case=' + [regex]::Escape($Case) + ' completed=1\r?$')) {
+        throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     }
 } finally {
     if ($registered) {

@@ -190,9 +190,30 @@ jobs:
             -p plugins/push-android/android \
             testDebugUnitTest
 
-  windows:
+  windows-native:
     if: github.event_name != 'workflow_dispatch'
+    name: windows-native (${{ matrix.case }})
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - primary
+          - module-load-read-error
+          - module-load-read-unwind
+          - carrier-ack
+          - carrier-unwind
+          - member-ack
+          - member-unwind
+          - running-ack
+          - running-unwind
+          - cold
+          - primary-data-denial
+          - creator-ack
+          - initial-native-ack
+          - initial-native-unwind
+          - fresh-ack
+          - starting-ack
     steps:
       - uses: actions/checkout@v4
         with:
@@ -236,7 +257,7 @@ jobs:
           if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
           ./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable $tests[0].executable `
             -RuntimeDirectory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
-            -OutputDirectory $env:RUNNER_TEMP
+            -OutputDirectory $env:RUNNER_TEMP -Case ${{ matrix.case }}
       # Read-only existing HKCU key. Log the actual native in/out-size contract;
       # this cannot grant SACL access, product key ownership or disposition.
       - name: Readonly original-key security buffer gate
@@ -257,6 +278,16 @@ jobs:
           $selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
           if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
           cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1
+
+  windows:
+    if: ${{ always() && github.event_name != 'workflow_dispatch' }}
+    needs: [windows-native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every isolated native factory case
+        env:
+          NATIVE_RESULT: ${{ needs.windows-native.result }}
+        run: test "$NATIVE_RESULT" = success
 
   macos:
     if: github.event_name != 'workflow_dispatch'

@@ -35,7 +35,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     // only terminates this fixture's OWN child and never attests cleanup.
     let case_budget =
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
-    for case in [
+    let cases = [
         "primary",
         "module-load-read-error",
         "module-load-read-unwind",
@@ -52,7 +52,23 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         "initial-native-unwind",
         "fresh-ack",
         "starting-ack",
-    ] {
+    ];
+    let selected = match std::env::var("NELOMAI_FACTORY_SYSTEM_CASE") {
+        Ok(case) => {
+            assert!(
+                cases.contains(&case.as_str()),
+                "unknown native factory case"
+            );
+            Some(case)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => panic!("invalid native factory case"),
+    };
+    let mut completed = 0;
+    for case in cases
+        .into_iter()
+        .filter(|case| selected.as_deref().is_none_or(|selected| *case == selected))
+    {
         // The case spans preparation, many independently supervised cleanup
         // calls and a second session. This outer bound is not a native Calling
         // budget: every actual call keeps its unchanged 30s watchdog. Owned
@@ -98,7 +114,22 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             stdout.contains("1 passed; 0 failed"),
             "empty child selection at {case}"
         );
+        // Keep meaningful native step/ACK evidence on successful runs as well.
+        // Authentication remains real; its repeated timing labels need not
+        // obscure the actual lifecycle in the parent output.
+        for line in stderr.lines().filter(|line| {
+            !line.contains("runtime begin installed payload authentication")
+                && !line.contains("runtime end installed payload authentication")
+        }) {
+            println!("{line}");
+        }
+        completed += 1;
     }
+    assert_eq!(completed, if selected.is_some() { 1 } else { cases.len() });
+    println!(
+        "actual native factory coverage case={} completed={completed}",
+        selected.as_deref().unwrap_or("all")
+    );
 }
 
 #[test]

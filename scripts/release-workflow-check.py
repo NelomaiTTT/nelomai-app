@@ -57,6 +57,26 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     assert_amneziawg_go_workflow_revision(workflow, "release workflow")
     assert_amneziawg_go_workflow_revision(checks_workflow, "checks workflow")
+    # Unknown partial cleanup cannot establish a clean starting VM for the next
+    # case. Keep every existing case mandatory, on its own disposable runner.
+    factory_test = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+    factory_cases = re.search(r"(?:for case in|let cases =)\s*\[([^]]+)\]", factory_test)
+    if factory_cases is None:
+        raise RuntimeError("Missing actual factory case inventory")
+    cases = re.findall(r'"([a-z-]+)"', factory_cases.group(1))
+    native_job = checks_workflow.split("  windows-native:", 1)
+    if len(native_job) != 2:
+        raise RuntimeError("Native factory cases require isolated Windows runners")
+    matrix = native_job[1].split("    steps:", 1)[0]
+    selected = re.findall(r"^          - ([a-z-]+)$", matrix, re.MULTILINE)
+    if len(cases) != 16 or len(set(cases)) != 16 or len(selected) != len(cases) or set(selected) != set(cases):
+        raise RuntimeError("Native matrix must cover every actual factory case exactly once")
+    if "-Case ${{ matrix.case }}" not in native_job[1]:
+        raise RuntimeError("Native runner must select its explicit factory case")
+    aggregate = checks_workflow.split("  windows:", 1)[1].split("  macos:", 1)[0]
+    for token in ("needs: [windows-native]", "always()", "needs.windows-native.result", 'test "$NATIVE_RESULT" = success'):
+        if token not in aggregate:
+            raise RuntimeError(f"Windows required check misses matrix completion guard: {token}")
     submodule_entry = subprocess.run(
         ["git", "-C", str(ROOT), "ls-files", "--stage", "vendor/amneziawg-go"],
         check=True,

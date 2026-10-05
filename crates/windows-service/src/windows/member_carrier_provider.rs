@@ -780,7 +780,21 @@ fn validate_snapshot(
             }
             continue;
         }
-        let row = matching_row.ok_or(Error::Conflict("PnP without exact MIB row"))?;
+        let Some(row) = matching_row else {
+            #[cfg(all(windows, test))]
+            eprintln!(
+                "actual native PnP without exact MIB row: device={d:?}; rows={:?}",
+                rows.iter()
+                    .map(|r| (
+                        r.identity.guid,
+                        r.identity.index,
+                        r.identity.luid,
+                        r.identity.if_type
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            return Err(Error::Conflict("PnP without exact MIB row"));
+        };
         if device_related(targets, d)? {
             related.push(d.clone());
         } else {
