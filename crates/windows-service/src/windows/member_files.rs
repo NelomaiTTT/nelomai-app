@@ -416,8 +416,9 @@ fn exact_config_slot(
 
 #[cfg(windows)]
 pub(crate) use native::{
-    create_private_child, pin_private_directory, pin_recovery_marker, pin_runtime_payload,
-    ColdMemberStorageAck, MemberFiles, PinnedDirectory, PinnedPayload,
+    create_private_child, pin_installed_files, pin_private_directory, pin_recovery_marker,
+    pin_runtime_payload, ColdMemberStorageAck, MemberFiles, PinnedDirectory, PinnedInstalledFiles,
+    PinnedPayload,
 };
 
 #[cfg(windows)]
@@ -770,15 +771,32 @@ mod native {
         sha256: String,
     }
     impl PinnedPayload {
+        fn verify_file_original(&self, file: &File) -> Result<()> {
+            if stamp(file, false, 16 * 1024 * 1024)? != self.stamp
+                || acl(file, Protection::Payload)? != self.acl
+            {
+                return Err(OwnerError::Conflict);
+            }
+            Ok(())
+        }
+        /// Current SAME strict original file/security facts. Construction has
+        /// authenticated its bytes and its held read-only handle denies writes
+        /// and writable mappings. Installed Source additionally retains the
+        /// complete pinned signature/hash proof; no caller can skip verification
+        /// by passing a trusted flag or authenticated digest here.
+        pub(crate) fn verify_original(&self) -> Result<()> {
+            self.parents.verify()?;
+            let by_path = open_payload(&self.path)?;
+            for file in [&self.file, &by_path] {
+                self.verify_file_original(file)?;
+            }
+            self.parents.verify()
+        }
         pub(crate) fn verify(&self) -> Result<()> {
             self.parents.verify()?;
             let by_path = open_payload(&self.path)?;
             for file in [&self.file, &by_path] {
-                if stamp(file, false, 16 * 1024 * 1024)? != self.stamp
-                    || acl(file, Protection::Payload)? != self.acl
-                {
-                    return Err(OwnerError::Conflict);
-                }
+                self.verify_file_original(file)?;
                 let mut read = file.try_clone().map_err(|_| OwnerError::Native)?;
                 read.seek(SeekFrom::Start(0))
                     .map_err(|_| OwnerError::Native)?;
@@ -803,6 +821,172 @@ mod native {
             None,
         )
         .map_err(|_| OwnerError::Native)
+    }
+
+    // Installed manifests/broker files historically had no ACL acceptance
+    // policy in contracts::trusted on Windows. Capture their current security
+    // without applying the stricter DLL/private-file policy. All valid ACE
+    // kinds are retained; NULL DACL and empty DACL remain distinct.
+    #[derive(PartialEq, Eq)]
+    struct InstalledSecurity {
+        owner: String,
+        control: u16,
+        aces: Option<Vec<Vec<u8>>>,
+    }
+    fn installed_security(file: &File) -> Result<InstalledSecurity> {
+        let mut owner = ptr::null_mut();
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut descriptor,
+            )
+        } != 0
+        {
+            return Err(OwnerError::Native);
+        }
+        let _descriptor = Allocation(descriptor);
+        let mut control = 0;
+        let mut revision = 0;
+        if descriptor.is_null()
+            || unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0
+        {
+            return Err(OwnerError::Native);
+        }
+        let aces = if dacl.is_null() {
+            None
+        } else {
+            if unsafe { IsValidAcl(dacl) } == 0 {
+                return Err(OwnerError::Conflict);
+            }
+            let start = dacl as usize;
+            let end = start
+                .checked_add(unsafe { (*dacl).AclSize } as usize)
+                .ok_or(OwnerError::Conflict)?;
+            let mut aces = Vec::new();
+            for index in 0..unsafe { (*dacl).AceCount } as u32 {
+                let mut raw = ptr::null_mut();
+                if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+                    return Err(OwnerError::Conflict);
+                }
+                let address = raw as usize;
+                if address < start + size_of::<ACL>()
+                    || address.checked_add(4).is_none_or(|header| header > end)
+                {
+                    return Err(OwnerError::Conflict);
+                }
+                let raw = raw.cast::<u8>();
+                let size = unsafe { ptr::read_unaligned(raw.add(2).cast::<u16>()) } as usize;
+                if size < 4 || address.checked_add(size).is_none_or(|extent| extent > end) {
+                    return Err(OwnerError::Conflict);
+                }
+                aces.push(unsafe { std::slice::from_raw_parts(raw, size) }.to_vec());
+            }
+            Some(aces)
+        };
+        Ok(InstalledSecurity {
+            owner: sid_text(owner)?,
+            control,
+            aces,
+        })
+    }
+    struct InstalledFile {
+        path: PathBuf,
+        file: File,
+        stamp: Stamp,
+        security: InstalledSecurity,
+    }
+    impl InstalledFile {
+        fn verify(&self) -> Result<()> {
+            let current = open_payload(&self.path)?;
+            for file in [&self.file, &current] {
+                if stamp(file, false, usize::MAX)? != self.stamp
+                    || installed_security(file)? != self.security
+                {
+                    return Err(OwnerError::Conflict);
+                }
+            }
+            Ok(())
+        }
+    }
+    /// Original read-only OS handles, not authenticated metadata or authority.
+    /// Caller MUST fully authenticate the whole inventory after acquisition
+    /// while retaining this object. Each use checks actual original/path IDs,
+    /// length, links, reparse facts and security inside one ancestor bracket.
+    pub(crate) struct PinnedInstalledFiles {
+        directories: PinnedDirectory,
+        files: Vec<InstalledFile>,
+    }
+    impl PinnedInstalledFiles {
+        pub(crate) fn verify(&self) -> Result<()> {
+            self.directories.verify()?;
+            for file in &self.files {
+                file.verify()?;
+            }
+            self.directories.verify()
+        }
+        #[cfg(test)]
+        pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+            self.files.iter().map(|file| file.path.as_path())
+        }
+    }
+    pub(crate) fn pin_installed_files(
+        inventory: &[(PathBuf, Option<u64>)],
+    ) -> Result<PinnedInstalledFiles> {
+        let mut paths = std::collections::BTreeSet::new();
+        for (path, _) in inventory {
+            if !path.is_absolute() {
+                return Err(OwnerError::Invalid);
+            }
+            let parent = path.parent().ok_or(OwnerError::Invalid)?;
+            let drive = parent.ancestors().last().ok_or(OwnerError::Invalid)?;
+            if unsafe { GetDriveTypeW(wide(drive)?.as_ptr()) } != 3 {
+                return Err(OwnerError::Invalid);
+            }
+            paths.extend(parent.ancestors().map(Path::to_path_buf));
+        }
+        let mut paths: Vec<_> = paths.into_iter().collect();
+        paths.sort_by_key(|path| path.components().count());
+        let mut directories = PinnedDirectory(Vec::new());
+        for path in paths {
+            directories.verify()?;
+            let file = open_directory(&path).map_err(|_| OwnerError::Native)?;
+            let directory = Directory {
+                id: stamp(&file, true, 0)?.id,
+                acl: acl(&file, Protection::Ancestor)?,
+                path,
+                file,
+                protection: Protection::Ancestor,
+            };
+            directory.verify()?;
+            directories.0.push(directory);
+        }
+        let mut files = Vec::new();
+        for (path, expected_size) in inventory {
+            let file = open_payload(path)?;
+            let stamp = stamp(&file, false, usize::MAX)?;
+            if expected_size.is_some_and(|size| size != stamp.facts.size) {
+                return Err(OwnerError::Conflict);
+            }
+            let pin = InstalledFile {
+                path: path.clone(),
+                security: installed_security(&file)?,
+                file,
+                stamp,
+            };
+            pin.verify()?;
+            files.push(pin);
+        }
+        let pinned = PinnedInstalledFiles { directories, files };
+        pinned.verify()?;
+        Ok(pinned)
     }
     pub(crate) fn pin_runtime_payload(
         path: &Path,
@@ -1443,6 +1627,58 @@ mod native {
             assert_eq!(std::fs::read(&path).unwrap(), b"abc");
             drop(retained);
             std::fs::write(&path, b"new").unwrap();
+        }
+        #[test]
+        fn retained_payload_handle_excludes_preexisting_writable_file_mapping() {
+            use windows_sys::Win32::{
+                Foundation::CloseHandle,
+                System::Memory::{
+                    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+                    PAGE_READWRITE,
+                },
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mapped.dll");
+            std::fs::write(&path, b"abc").unwrap();
+            let writable = open(
+                &path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                OPEN_EXISTING,
+                false,
+                None,
+            )
+            .unwrap();
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    writable.as_raw_handle(),
+                    ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    0,
+                    ptr::null(),
+                )
+            };
+            assert!(!mapping.is_null());
+            let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 3) };
+            assert!(!view.Value.is_null());
+            unsafe { view.Value.cast::<u8>().write(b'x') };
+            drop(writable); // The actual writable view must prevent acquisition.
+            assert!(open_payload(&path).is_err());
+            assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+            assert_ne!(unsafe { CloseHandle(mapping) }, 0);
+            let retained = open_payload(&path).unwrap();
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    retained.as_raw_handle(),
+                    ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    0,
+                    ptr::null(),
+                )
+            };
+            assert!(mapping.is_null());
         }
         #[test]
         fn native_payload_stamp_rejects_actual_hardlink_alias() {

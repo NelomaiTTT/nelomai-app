@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 use super::member_carrier_keys::{effect_matches_storage, Effect, NativeAuthority};
+use super::member_carrier_payload::native::{InstalledRuntimeOrigin, PinnedInstalledRuntime};
 use super::member_session::{
     epoch::NativeExecutionRoot, NativeSessionFiles, RecordKind, SessionFiles,
 };
@@ -74,6 +75,7 @@ struct Runtime {
     directory: PathBuf,
     executable: PathBuf,
     installation: Installation,
+    installed: PinnedInstalledRuntime,
     owner: Arc<MutationGuard>,
     lease: KeyLockPin,
     pin: Box<dyn Fn() -> Result<()>>,
@@ -203,16 +205,21 @@ impl RuntimeRead {
         #[cfg(not(test))]
         let installation = Installation::production(root).map_err(|_| Error::Conflict)?;
         let executable = actual_executable()?;
-        let layout = installation
-            .load_engine(&executable)
-            .map_err(|_| Error::Conflict)?;
+        let installed = PinnedInstalledRuntime::new(
+            &installation,
+            &executable,
+            owner.clone(),
+            InstalledRuntimeOrigin::Runtime,
+        )?;
+        let layout = installed.layout();
         let lock = KeyLock {
             lease: SerializedLease::new(owner.clone(), serialized),
         };
         let runtime = Rc::new(Runtime {
             context,
-            identity: layout.identity,
-            directory: layout.directory,
+            identity: layout.identity.clone(),
+            directory: layout.directory.clone(),
+            installed,
             executable,
             installation,
             owner: owner.clone(),
@@ -256,21 +263,11 @@ impl Runtime {
     }
     fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         self.verify_original_context(pin, context)?;
-        // Reauthenticate actual installed signatures and every runtime payload
-        // hash; this is deliberately not dispatcher::trusted() on a path.
-        // It does not pin/load a DLL and grants no module/driver authority.
-        #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step(
-            "runtime begin installed payload authentication",
-        );
-        let live = self
-            .installation
-            .load_engine(&self.executable)
-            .map_err(|_| Error::Conflict)?;
-        #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step(
-            "runtime end installed payload authentication",
-        );
+        // Full signed byte proof survives only with SAME deny-write/delete OS
+        // handles. Recheck every original/path/security inside ancestor fences;
+        // mutable runtime/context/lease/boot still have independent postflight.
+        self.installed.verify()?;
+        let live = self.installed.layout();
         if live.identity != self.identity
             || live.directory != self.directory
             || std::fs::canonicalize(live.engine_path()).map_err(|_| Error::Native)?

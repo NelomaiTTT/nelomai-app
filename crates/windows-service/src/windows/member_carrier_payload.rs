@@ -70,8 +70,11 @@ fn library_entry(
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
-    use crate::windows::member_files::{pin_private_directory, pin_runtime_payload, PinnedPayload};
-    use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard};
+    use crate::windows::member_files::{
+        pin_installed_files, pin_private_directory, pin_runtime_payload, PinnedDirectory,
+        PinnedInstalledFiles, PinnedPayload,
+    };
+    use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard, VerifiedLayout};
     use std::{
         fs::File,
         path::{Path, PathBuf},
@@ -79,11 +82,168 @@ pub(crate) mod native {
         sync::Arc,
     };
 
+    /// Trace attribution only; neither variant changes authentication or pins.
+    #[derive(Clone, Copy)]
+    pub(in crate::windows) enum InstalledRuntimeOrigin {
+        Runtime,
+        Source,
+    }
+
+    /// Complete installed byte proof coupled to SAME original deny-write/delete
+    /// handles. Only construction authenticates signatures/hashes; every later
+    /// use rechecks actual originals, paths/security, owner and private root.
+    /// This grants no module mapping, mutable-context or effect authority.
+    pub(in crate::windows) struct PinnedInstalledRuntime {
+        layout: VerifiedLayout,
+        executable: PathBuf,
+        owner: Arc<MutationGuard>,
+        root_path: PathBuf,
+        root: PinnedDirectory,
+        files: PinnedInstalledFiles,
+    }
+    impl PinnedInstalledRuntime {
+        pub(in crate::windows) fn new(
+            installation: &Installation,
+            executable: &Path,
+            owner: Arc<MutationGuard>,
+            origin: InstalledRuntimeOrigin,
+        ) -> Result<Self> {
+            owner
+                .verify_at(&installation.root.join("engine-owner.lock"))
+                .map_err(|_| Error::Conflict)?;
+            let layout = Self::authenticate(installation, executable, origin)?;
+            Self::acquire_after_authentication(installation, executable, owner, layout, origin)
+        }
+        fn authenticate(
+            installation: &Installation,
+            executable: &Path,
+            _origin: InstalledRuntimeOrigin,
+        ) -> Result<VerifiedLayout> {
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(match _origin {
+                InstalledRuntimeOrigin::Runtime => "runtime begin installed payload authentication",
+                InstalledRuntimeOrigin::Source => "source begin installed payload authentication",
+            });
+            let layout = installation
+                .load_engine(executable)
+                .map_err(|_| Error::Conflict)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(match _origin {
+                InstalledRuntimeOrigin::Runtime => "runtime end installed payload authentication",
+                InstalledRuntimeOrigin::Source => "source end installed payload authentication",
+            });
+            Ok(layout)
+        }
+        fn acquire_after_authentication(
+            installation: &Installation,
+            executable: &Path,
+            owner: Arc<MutationGuard>,
+            layout: VerifiedLayout,
+            origin: InstalledRuntimeOrigin,
+        ) -> Result<Self> {
+            let root = pin_private_directory(&installation.root).map_err(|_| Error::Conflict)?;
+            let pointer = d::read_bounded(&installation.root.join(d::POINTER_NAME), 96)
+                .map_err(|_| Error::Conflict)?;
+            let generation = std::str::from_utf8(&pointer).map_err(|_| Error::Conflict)?;
+            if installation.root.join("releases").join(generation) != layout.directory {
+                return Err(Error::Conflict);
+            }
+            let (manifest, manifest_size) =
+                read_signed_manifest(&layout.directory, &layout.identity)?;
+            let policy_size =
+                d::read_bounded(&layout.directory.join("installation-policy.json"), 8192)
+                    .map_err(|_| Error::Conflict)?
+                    .len() as u64;
+            let mut inventory = vec![
+                (
+                    installation.root.join(d::POINTER_NAME),
+                    Some(pointer.len() as u64),
+                ),
+                (layout.directory.join(d::MANIFEST_NAME), Some(manifest_size)),
+                (layout.directory.join(d::SIGNATURE_NAME), Some(64)),
+                (
+                    layout.directory.join("installation-policy.json"),
+                    Some(policy_size),
+                ),
+            ];
+            // Include equal-version packaging slots as well as selectable ones.
+            for slot in &manifest.manifest().slots {
+                let name = match slot.slot {
+                    nelomai_contracts::RuntimeSlot::Latest => "latest",
+                    nelomai_contracts::RuntimeSlot::Stable => "stable",
+                };
+                let directory = layout
+                    .directory
+                    .join("engines")
+                    .join(name)
+                    .join(&slot.manifest.runtime_version);
+                for entry in &slot.manifest.files {
+                    inventory.push((directory.join(&entry.path), Some(entry.size_bytes)));
+                }
+            }
+            inventory.push((
+                layout.dispatcher_path(),
+                Some(layout.dispatcher_payload_identity().0),
+            ));
+            // BrokerPolicy authenticates a digest, not a length. Capture the
+            // original handle's length; final full broker hashing below binds
+            // it without imposing the DLL's unrelated 16 MiB ceiling.
+            inventory.push((layout.broker.executable.clone(), None));
+            let files = pin_installed_files(&inventory).map_err(|_| Error::Conflict)?;
+            let current = Self::authenticate(installation, executable, origin)?;
+            if current.identity != layout.identity
+                || current.directory != layout.directory
+                || current.engine_path() != layout.engine_path()
+                || current.dispatcher_path() != layout.dispatcher_path()
+                || current.dispatcher_payload_identity() != layout.dispatcher_payload_identity()
+                || current.broker != layout.broker
+                || std::fs::canonicalize(current.engine_path()).map_err(|_| Error::Native)?
+                    != executable
+            {
+                return Err(Error::Conflict);
+            }
+            let pinned = Self {
+                layout,
+                executable: executable.to_path_buf(),
+                owner,
+                root_path: installation.root.clone(),
+                root,
+                files,
+            };
+            pinned.verify()?;
+            Ok(pinned)
+        }
+        pub(in crate::windows) fn layout(&self) -> &VerifiedLayout {
+            &self.layout
+        }
+        pub(in crate::windows) fn verify(&self) -> Result<()> {
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "installation original pin recheck",
+            );
+            self.owner
+                .verify_at(&self.root_path.join("engine-owner.lock"))
+                .map_err(|_| Error::Conflict)?;
+            self.root.verify().map_err(|_| Error::Conflict)?;
+            self.files.verify().map_err(|_| Error::Conflict)?;
+            if std::fs::canonicalize(self.layout.engine_path()).map_err(|_| Error::Native)?
+                != self.executable
+            {
+                return Err(Error::Conflict);
+            }
+            self.root.verify().map_err(|_| Error::Conflict)?;
+            self.owner
+                .verify_at(&self.root_path.join("engine-owner.lock"))
+                .map_err(|_| Error::Conflict)
+        }
+    }
+
     /// No path/name/manifest/identity supplied by IPC can construct this.
     /// Holds the SAME actual runtime owner lock and non-replaceable source
     /// handles. A borrow is still NOT permission to execute the module.
     struct LibrarySource {
         installation: Installation,
+        installed: PinnedInstalledRuntime,
         identity: EngineIdentity,
         directory: PathBuf,
         executable: PathBuf,
@@ -106,9 +266,13 @@ pub(crate) mod native {
             #[cfg(not(test))]
             let installation = Installation::production(root).map_err(|_| Error::Conflict)?;
             let executable = actual_executable()?;
-            let layout = installation
-                .load_engine(&executable)
-                .map_err(|_| Error::Conflict)?;
+            let installed = PinnedInstalledRuntime::new(
+                &installation,
+                &executable,
+                owner.clone(),
+                InstalledRuntimeOrigin::Source,
+            )?;
+            let layout = installed.layout();
             let entry = read_signed_entry(&layout.directory, &layout.identity, kind)?;
             // Fixed sibling of the authenticated kernel executable, NEVER a
             // caller path or a platform DLL-search fallback.
@@ -117,8 +281,9 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)?;
             let source = Self {
                 installation,
-                identity: layout.identity,
-                directory: layout.directory,
+                identity: layout.identity.clone(),
+                directory: layout.directory.clone(),
+                installed,
                 executable,
                 owner,
                 root: Box::new(move || root_pin.verify().map_err(|_| Error::Conflict)),
@@ -133,22 +298,14 @@ pub(crate) mod native {
                 .verify_at(&self.installation.root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
             (self.root)()?;
-            self.payload.verify().map_err(|_| Error::Conflict)?;
+            self.payload
+                .verify_original()
+                .map_err(|_| Error::Conflict)?;
             if actual_executable()? != self.executable {
                 return Err(Error::Conflict);
             }
-            #[cfg(test)]
-            super::super::member_carrier_factory_test_os::trace_step(
-                "source begin installed payload authentication",
-            );
-            let layout = self
-                .installation
-                .load_engine(&self.executable)
-                .map_err(|_| Error::Conflict)?;
-            #[cfg(test)]
-            super::super::member_carrier_factory_test_os::trace_step(
-                "source end installed payload authentication",
-            );
+            self.installed.verify()?;
+            let layout = self.installed.layout();
             if layout.identity != self.identity
                 || layout.directory != self.directory
                 || std::fs::canonicalize(layout.engine_path()).map_err(|_| Error::Native)?
@@ -157,10 +314,12 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            // load_engine independently verifies BOTH signed slots' payloads.
-            // The exact original DLL remains write/delete-denied through that
-            // verification and all data-only/resource/module borrows.
-            self.payload.verify().map_err(|_| Error::Conflict)?;
+            // BOTH signed slots' complete byte proof stays coupled to retained
+            // original OS handles. The strict exact DLL pin is also checked on
+            // both sides of every data-only/resource/module borrow.
+            self.payload
+                .verify_original()
+                .map_err(|_| Error::Conflict)?;
             (self.root)()?;
             self.owner
                 .verify_at(&self.installation.root.join("engine-owner.lock"))
@@ -175,7 +334,7 @@ pub(crate) mod native {
             self.verify()
         }
         /// Bind already opaque originals; equal path data cannot create a Source
-        /// or replace current full signature/hash and retained-handle checks.
+        /// or replace the complete pinned signed proof and current original checks.
         fn require_runtime_binding(
             &self,
             owner: &Arc<MutationGuard>,
@@ -368,10 +527,9 @@ pub(crate) mod native {
             if self.libraries.len() != expected.len() {
                 return Err(Error::Conflict);
             }
-            // One complete signed runtime read covers BOTH slots and ALL of
-            // their payloads. Join every original library to that SAME owner,
-            // root, executable and manifest before and after that read; do not
-            // reload/hash the entire runtime once per individual library pin.
+            // The complete pinned signed proof covers BOTH slots and ALL
+            // payloads. Join every original library to that SAME owner, root,
+            // executable and manifest before/after current inventory checks.
             let pins = || {
                 let carrier = &self.carrier.0;
                 if !Arc::ptr_eq(&carrier.owner, owner) {
@@ -382,7 +540,10 @@ pub(crate) mod native {
                     .verify_at(&carrier.installation.root.join("engine-owner.lock"))
                     .map_err(|_| Error::Conflict)?;
                 (carrier.root)()?;
-                carrier.payload.verify().map_err(|_| Error::Conflict)?;
+                carrier
+                    .payload
+                    .verify_original()
+                    .map_err(|_| Error::Conflict)?;
                 for (library, kind) in self.libraries.iter().zip(&expected) {
                     // Both payload pins use the signed layout's path spelling;
                     // the kernel executable is canonical (verbatim on Windows).
@@ -398,7 +559,10 @@ pub(crate) mod native {
                         return Err(Error::Conflict);
                     }
                     (library.root)()?;
-                    library.payload.verify().map_err(|_| Error::Conflict)?;
+                    library
+                        .payload
+                        .verify_original()
+                        .map_err(|_| Error::Conflict)?;
                 }
                 carrier
                     .owner
@@ -425,7 +589,7 @@ pub(crate) mod native {
                 executable,
             )?;
             // Retain all member kind/path/root/owner/DLL pin comparisons before
-            // and after the carrier's complete signed-runtime authentication.
+            // and after the carrier's current complete installed-proof checks.
             self.verify_owner(owner)
         }
         pub(crate) fn identity(&self) -> &EngineIdentity {
@@ -454,6 +618,13 @@ pub(crate) mod native {
         identity: &EngineIdentity,
         kind: LibraryKind,
     ) -> Result<RuntimeFileV1> {
+        let (manifest, _) = read_signed_manifest(directory, identity)?;
+        library_entry(&manifest, &identity.manifest_sha256, identity, kind)
+    }
+    fn read_signed_manifest(
+        directory: &Path,
+        identity: &EngineIdentity,
+    ) -> Result<(VerifiedContainerManifest, u64)> {
         let bytes = d::read_bounded(&directory.join(d::MANIFEST_NAME), 1024 * 1024)
             .map_err(|_| Error::Conflict)?;
         let signature =
@@ -469,7 +640,135 @@ pub(crate) mod native {
             &bytes, &signature, &key, "windows", "x86_64",
         )
         .map_err(|_| Error::Conflict)?;
-        library_entry(&manifest, &d::digest(&bytes), identity, kind)
+        if d::digest(&bytes) != identity.manifest_sha256 {
+            return Err(Error::Conflict);
+        }
+        Ok((manifest, bytes.len() as u64))
+    }
+
+    #[cfg(test)]
+    mod installed_runtime_native_tests {
+        use super::*;
+
+        #[test]
+        fn installed_runtime_pins_every_authenticated_dependency_until_drop() {
+            use ed25519_dalek::{Signer, SigningKey};
+            use std::collections::BTreeSet;
+            let _fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
+                .expect("actual private signed fixture");
+            let executable = actual_executable().unwrap();
+            let root = executable.ancestors().nth(6).unwrap();
+            let installation =
+                super::super::super::member_carrier_factory_test_os::installation(root).unwrap();
+            let initial = installation.load_engine(&executable).unwrap();
+            let directory = &initial.directory;
+            // Stage a real signed second slot in our owned fixture. The expected
+            // inventory below uses fixed fixture paths, not verifier enumeration.
+            let names = [
+                "nelomai-windows-service.exe",
+                "wintun.dll",
+                "wireguard.dll",
+                "tunnel.dll",
+                "amneziawg-tunnel.dll",
+            ];
+            let stable = directory.join("engines/stable/0.3.2");
+            std::fs::create_dir_all(&stable).unwrap();
+            for name in names {
+                std::fs::copy(
+                    directory.join("engines/latest/0.3.3").join(name),
+                    stable.join(name),
+                )
+                .unwrap();
+            }
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join(d::MANIFEST_NAME)).unwrap())
+                    .unwrap();
+            let mut slot = manifest["slots"][0].clone();
+            slot["slot"] = "stable".into();
+            slot["manifest"]["runtime_version"] = "0.3.2".into();
+            manifest["slots"].as_array_mut().unwrap().push(slot);
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            let message = [
+                nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN,
+                &bytes,
+            ]
+            .concat();
+            std::fs::write(directory.join(d::MANIFEST_NAME), &bytes).unwrap();
+            std::fs::write(
+                directory.join(d::SIGNATURE_NAME),
+                SigningKey::from_bytes(&[83; 32]).sign(&message).to_bytes(),
+            )
+            .unwrap();
+            let policy_path = directory.join("installation-policy.json");
+            let mut policy: d::BrokerPolicy =
+                serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
+            policy.manifest_sha256 = d::digest(&bytes);
+            std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+            let mut expected = BTreeSet::from([
+                root.join("container-manifest.json"),
+                directory.join("container-manifest-v1.json"),
+                directory.join("container-manifest-v1.sig"),
+                policy_path,
+                directory.join("dispatcher/1/nelomai-windows-service.exe"),
+                policy.executable,
+            ]);
+            for relative in ["engines/latest/0.3.3", "engines/stable/0.3.2"] {
+                for name in names {
+                    expected.insert(directory.join(relative).join(name));
+                }
+            }
+            let owner = Arc::new(MutationGuard::at(&root.join("engine-owner.lock")).unwrap());
+            let pinned = PinnedInstalledRuntime::new(
+                &installation,
+                &executable,
+                owner,
+                InstalledRuntimeOrigin::Source,
+            )
+            .unwrap();
+            pinned.verify().unwrap();
+            assert_eq!(
+                pinned
+                    .files
+                    .paths()
+                    .map(Path::to_path_buf)
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            for path in &expected {
+                assert!(std::fs::OpenOptions::new().write(true).open(path).is_err());
+                assert!(std::fs::rename(path, path.with_extension("renamed")).is_err());
+                assert!(std::fs::remove_file(path).is_err());
+            }
+            let pointer = root.join(d::POINTER_NAME);
+            drop(pinned);
+            let bytes = std::fs::read(&pointer).unwrap();
+            std::fs::write(pointer, bytes).unwrap();
+        }
+
+        #[test]
+        fn installed_runtime_acquisition_rejects_payload_drift_after_initial_authentication() {
+            let _fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
+                .expect("actual private signed fixture");
+            let executable = actual_executable().unwrap();
+            let root = executable.ancestors().nth(6).unwrap();
+            let installation =
+                super::super::super::member_carrier_factory_test_os::installation(root).unwrap();
+            let owner = Arc::new(MutationGuard::at(&root.join("engine-owner.lock")).unwrap());
+            let layout = installation.load_engine(&executable).unwrap();
+            let path = layout.engine_path().with_file_name("tunnel.dll");
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[0] ^= 1; // Same length; metadata cannot authenticate this drift.
+            std::fs::write(&path, bytes).unwrap();
+            assert!(PinnedInstalledRuntime::acquire_after_authentication(
+                &installation,
+                &executable,
+                owner,
+                layout,
+                InstalledRuntimeOrigin::Source,
+            )
+            .is_err());
+            assert!(std::fs::OpenOptions::new().write(true).open(path).is_ok());
+        }
     }
 }
 
