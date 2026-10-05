@@ -1078,6 +1078,7 @@ pub(crate) mod native {
     }
     pub(crate) struct NativeNoConstructorReleaseProof {
         candidate: Rc<NativeStartupModuleOnlyCandidate>,
+        never: Rc<NativeNeverMemberEffects>,
         load: Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>,
         pair: Rc<NativePairIntentRead>,
         expected: pair::Record,
@@ -2763,6 +2764,7 @@ pub(crate) mod native {
                 let bootstrap = candidate.assembly()?.bootstrap()?;
                 let proof = Rc::new(NativeNoConstructorReleaseProof {
                     candidate,
+                    never: self.never_effects.as_ref().ok_or(Error::Pending)?.clone(),
                     load,
                     pair: pair.clone(),
                     expected: expected.clone(),
@@ -4928,7 +4930,10 @@ pub(crate) mod native {
                                 .as_ref()
                                 .is_none_or(|original| !Rc::ptr_eq(data, original))
                         })
-                        || raw.prepared.iter().any(Option::is_some)
+                        || raw
+                            .never_effects
+                            .as_ref()
+                            .is_none_or(|never| !Rc::ptr_eq(never, &proof.never))
                         || raw
                             .retired_members
                             .as_ref()
@@ -4939,6 +4944,25 @@ pub(crate) mod native {
                     {
                         return Err(std::io::Error::other("module_disposal_original"));
                     }
+                    // Readonly preparation precedes LoadLibrary. Authenticate
+                    // its SAME private member-generation history and raw owners;
+                    // absence of a prepared wrapper is not required or authority.
+                    // The whole native module release above independently proves
+                    // SDK/WFP absence; this pure check only permits owning Drop.
+                    proof
+                        .never
+                        .verify_terminal_original_roots(
+                            &raw.prepared,
+                            [None, None],
+                            raw.retired_members
+                                .as_deref()
+                                .ok_or_else(|| std::io::Error::other("module_disposal_members"))?,
+                            &self.runtime,
+                            &self.context,
+                            expected,
+                            &[],
+                        )
+                        .map_err(|_| std::io::Error::other("module_disposal_members"))?;
                     let lock = raw
                         .lock
                         .try_borrow()
