@@ -487,12 +487,29 @@ impl RuntimeRead {
         &self,
         source: &super::member_carrier_payload::native::WintunSource,
     ) -> Result<()> {
-        self.verify(&self.runtime.context)?;
+        let context = &self.runtime.context;
+        let current = || {
+            self.runtime
+                .files
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .native_carrier_access(&context.intent.scope)
+                .map_err(|_| Error::Journal)?
+                .require_native_context(context)
+                .map_err(|_| Error::Conflict)
+        };
+        // One full authentication bracket spans this readonly composition.
+        // Preserve BOTH current protected-context reads around the original
+        // source's independent full signed-runtime/payload verification.
+        // No native effect or permission can precede the final authentication.
+        self.runtime.verify(&self.lease, context)?;
+        current()?;
         self.lease.verify_source(source)?;
         if source.identity() != &self.runtime.identity {
             return Err(Error::Conflict);
         }
-        self.verify(&self.runtime.context)
+        current()?;
+        self.runtime.verify(&self.lease, context)
     }
     /// Actual signed member sources, not member service/NIC ownership or effect
     /// permission. Compare the SAME held serialized owner, not equal JSON or a
