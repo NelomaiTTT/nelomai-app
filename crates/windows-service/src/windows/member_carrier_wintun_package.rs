@@ -1044,7 +1044,7 @@ pub(crate) mod native {
             Devices::DeviceAndDriverInstallation::*,
             Foundation::{
                 GetLastError, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_DATA,
-                ERROR_NO_MORE_ITEMS, FILETIME, INVALID_HANDLE_VALUE,
+                ERROR_NO_MORE_ITEMS, ERROR_SERVICE_DOES_NOT_EXIST, FILETIME, INVALID_HANDLE_VALUE,
             },
             Security::{Cryptography::Catalog::*, WinTrust::*},
             Storage::FileSystem::*,
@@ -1705,6 +1705,14 @@ pub(crate) mod native {
         }
     }
     fn service(system_sys: &Path, windows_root: &Path) -> Result<(u32, u32, u32)> {
+        observe_service(system_sys, windows_root)?.ok_or(Error::Native(
+            "OpenServiceW Wintun",
+            ERROR_SERVICE_DOES_NOT_EXIST,
+        ))
+    }
+    /// Absence is an independently queried SCM fact, not a stopped/running state.
+    /// Production still requires the actual service through service() above.
+    fn observe_service(system_sys: &Path, windows_root: &Path) -> Result<Option<(u32, u32, u32)>> {
         let manager =
             ServiceHandle(unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT) });
         if manager.0.is_null() {
@@ -1718,7 +1726,12 @@ pub(crate) mod native {
             )
         });
         if service.0.is_null() {
-            return Err(last("OpenServiceW Wintun"));
+            let error = unsafe { GetLastError() };
+            return if error == ERROR_SERVICE_DOES_NOT_EXIST {
+                Ok(None)
+            } else {
+                Err(Error::Native("OpenServiceW Wintun", error))
+            };
         }
         let mut storage = service_query_buffer();
         let capacity = std::mem::size_of_val(storage.as_slice());
@@ -1769,11 +1782,11 @@ pub(crate) mod native {
         if status.dwServiceType != config.dwServiceType {
             return Err(Error::Changed);
         }
-        Ok((
+        Ok(Some((
             config.dwServiceType,
             config.dwStartType,
             status.dwCurrentState,
-        ))
+        )))
     }
 
     struct CatalogContext(isize);
@@ -2074,6 +2087,9 @@ pub(crate) mod native {
             if !native_amd64_win10_plus {
                 return Err(Error::Unsupported("native platform"));
             }
+            let root = os_directory(false)?;
+            let system_root = os_directory(true)?;
+            let system = system_root.join("drivers").join("wintun.sys");
             #[cfg(test)]
             if let Some(paths) = super::super::member_carrier_factory_test_os::package_paths(
                 &final_path(self.source.file()?)?,
@@ -2082,6 +2098,13 @@ pub(crate) mod native {
             {
                 let [published_inf, store_inf, store_cat, store_sys, system_sys] =
                     paths.map(|path| path.to_string_lossy().into_owned());
+                let devices = devices()?;
+                // This external OS fixture stages only package files. ONLY an
+                // actual missing-service observation keeps its staged cold tuple;
+                // existing SCM type/start/state and the complete census stay real.
+                // A running original plus absent SCM still fails original_inventory.
+                let (service_type, service_start, service_state) =
+                    observe_service(&system, &root)?.unwrap_or((1, 3, 1));
                 return Ok(Inventory {
                     native_amd64_win10_plus,
                     candidates: vec![Candidate {
@@ -2093,18 +2116,16 @@ pub(crate) mod native {
                         store_cat,
                         store_sys,
                     }],
-                    devices: vec![],
-                    service_type: 1,
-                    service_start: 3,
-                    service_state: 1,
+                    devices,
+                    service_type,
+                    service_start,
+                    service_state,
+                    // Existing staged queue assumption; fixture input only.
                     pending_maintenance: false,
                     pending: PendingSnapshot::default(),
                     system_sys,
                 });
             }
-            let root = os_directory(false)?;
-            let system_root = os_directory(true)?;
-            let system = system_root.join("drivers").join("wintun.sys");
             let candidates = candidates(&root)?;
             let devices = devices()?;
             let (service_type, service_start, service_state) = service(&system, &root)?;

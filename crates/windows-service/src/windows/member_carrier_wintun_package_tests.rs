@@ -878,7 +878,7 @@ fn original_owned_refresh_rechecks_creator_after_slow_trust_calls() {
 
 #[test]
 fn original_owned_foreign_legacy_duplicate_problem_and_unbound_driver_deny() {
-    for case in 0..14 {
+    for case in 0..15 {
         let (mut checked, mut originals) = owned_package();
         match case {
             0 => checked.kernel.inventory.devices.clear(),
@@ -901,6 +901,9 @@ fn original_owned_foreign_legacy_duplicate_problem_and_unbound_driver_deny() {
             11 => originals.version = Some(15),
             12 => checked.kernel.inventory.service_state = 2,
             13 => originals.devices = vec![live_original(); 4],
+            // A retained running-driver 14 ACK cannot accept the staged cold
+            // SCM tuple, even with a matching complete device census.
+            14 => checked.kernel.inventory.service_state = 1,
             _ => unreachable!(),
         }
         assert!(
