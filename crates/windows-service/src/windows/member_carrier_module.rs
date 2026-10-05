@@ -1126,7 +1126,11 @@ pub(crate) mod native {
     /// Factual original image read, independent of client Release/valid state.
     /// Used for authenticating the process anchor; never resolves a new owner.
     fn verify_mapping(source: &WintunSource, mapping: NonNull<c_void>) -> Result<()> {
-        source.verify().map_err(|_| Error::Conflict)?;
+        // path() performs the full original source/runtime/owner verification.
+        // Acquire it BEFORE any mapping query, then reauthenticate the same
+        // source after all bounds/exports. A separate verify() immediately
+        // before path() repeats the complete signed payload read.
+        let expected_path = source.path().map_err(|_| Error::Conflict)?.to_path_buf();
         let mut path = vec![0; 32768];
         let count =
             unsafe { GetModuleFileNameW(mapping.as_ptr(), path.as_mut_ptr(), path.len() as u32) }
@@ -1139,8 +1143,7 @@ pub(crate) mod native {
         // sides in that same representation; the original source's payload
         // and ancestors remain pinned and authenticated before and after this
         // mapping read. Canonical equality supplies no SDK/resource authority.
-        let expected = std::fs::canonicalize(source.path().map_err(|_| Error::Conflict)?)
-            .map_err(|_| Error::Native)?;
+        let expected = std::fs::canonicalize(expected_path).map_err(|_| Error::Native)?;
         if std::fs::canonicalize(actual).map_err(|_| Error::Native)? != expected {
             return Err(Error::Conflict);
         }
