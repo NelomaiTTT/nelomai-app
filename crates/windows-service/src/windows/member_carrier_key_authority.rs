@@ -17,15 +17,19 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
-};
 
 /// Must inspect the actual retained original-creator capabilities under the
-/// SAME engine-owner lease. Absence of journal proofs or native name lookup
-/// alone is not absence of live creator handles. No successful default exists.
+/// SAME engine-owner lease. The complete independent MIB/PnP query checks the
+/// target name/GUID on every read, with original handles and current protected
+/// revision/runtime/image fenced before/after. Returned booleans are current
+/// facts only; neither journal proofs nor name lookup supply a creator ACK.
+/// No successful default exists.
 pub(crate) trait OriginalCreatorInventory {
-    fn assert_absent(&mut self, context: &Context, binding: &Binding) -> Result<()>;
+    fn inspect_absence(
+        &mut self,
+        context: &Context,
+        binding: &Binding,
+    ) -> Result<(bool, bool, bool)>;
 }
 
 static KEY_MUTATIONS: Mutex<()> = Mutex::new(());
@@ -668,7 +672,9 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
             .ok_or(Error::Journal)?;
         let actual = Record::decode(&bytes)?;
         effect_matches_storage(pending, binding, effect, &actual, access.is_fresh())?;
-        self.originals.assert_absent(&pending.context, binding)?;
+        if self.originals.inspect_absence(&pending.context, binding)? != (true, true, true) {
+            return Err(Error::Conflict);
+        }
         self.verify(lock, &pending.context)?;
         // Runtime hashing/boot queries may take time. Re-read the protected
         // permission and exact pending bytes LAST before returning authority.
@@ -692,12 +698,10 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
             .ok_or(Error::Journal)?;
         let actual = Record::decode(&bytes)?;
         effect_matches_storage(pending, binding, effect, &actual, access.is_fresh())?;
-        self.originals.assert_absent(&pending.context, binding)?;
-        let absence = native_absence(binding)?;
-        if absence != (true, true) {
-            return Err(Error::Conflict);
-        }
-        self.originals.assert_absent(&pending.context, binding)?;
+        // The complete original inventory above already brackets both physical
+        // MIB/PnP snapshots and every original handle. Repeating that entire
+        // query here would not provide another native ACK. The exact effect
+        // permission/bytes just read remain LAST after expensive authentication.
         self.runtime
             .owner
             .verify_at(&self.runtime.installation.root.join("engine-owner.lock"))
@@ -718,66 +722,17 @@ impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
             return Err(Error::Conflict);
         }
         #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step("key absence originals before begin");
-        self.originals.assert_absent(context, binding)?;
+        super::member_carrier_factory_test_os::trace_step(
+            "key absence full original inventory begin",
+        );
+        let absence = self.originals.inspect_absence(context, binding)?;
         #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step("key absence originals before end");
-        let (name_absent, guid_absent) = native_absence(binding)?;
-        #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step("key absence native inventory end");
-        // Check retained creators again after the bounded native inventory.
-        // There is no reconstruction from a numeric index or saved JSON.
-        self.originals.assert_absent(context, binding)?;
-        #[cfg(test)]
-        super::member_carrier_factory_test_os::trace_step("key absence originals after end");
+        super::member_carrier_factory_test_os::trace_step(
+            "key absence full original inventory end",
+        );
         self.verify(lock, context)?;
         #[cfg(test)]
         super::member_carrier_factory_test_os::trace_step("key absence runtime postflight end");
-        Ok((name_absent, guid_absent, true))
+        Ok(absence)
     }
-}
-fn native_absence(binding: &Binding) -> Result<(bool, bool)> {
-    struct Table(*mut MIB_IF_TABLE2);
-    impl Drop for Table {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe {
-                    FreeMibTable(self.0.cast());
-                }
-            }
-        }
-    }
-    let mut table = Table(std::ptr::null_mut());
-    if unsafe { GetIfTable2(&mut table.0) } != 0 || table.0.is_null() {
-        return Err(Error::Native);
-    }
-    let count = unsafe { (*table.0).NumEntries } as usize;
-    if count > 4096 {
-        return Err(Error::Invalid);
-    }
-    let rows = unsafe {
-        std::slice::from_raw_parts(
-            std::ptr::addr_of!((*table.0).Table).cast::<MIB_IF_ROW2>(),
-            count,
-        )
-    };
-    let mut name_absent = true;
-    let mut guid_absent = true;
-    for row in rows {
-        let end = row
-            .Alias
-            .iter()
-            .position(|c| *c == 0)
-            .ok_or(Error::Invalid)?;
-        let alias = String::from_utf16(&row.Alias[..end]).map_err(|_| Error::Invalid)?;
-        let guid = &row.InterfaceGuid;
-        let mut bytes = [0; 16];
-        bytes[..4].copy_from_slice(&guid.data1.to_be_bytes());
-        bytes[4..6].copy_from_slice(&guid.data2.to_be_bytes());
-        bytes[6..8].copy_from_slice(&guid.data3.to_be_bytes());
-        bytes[8..].copy_from_slice(&guid.data4);
-        name_absent &= !alias.eq_ignore_ascii_case(&binding.name);
-        guid_absent &= bytes != binding.guid;
-    }
-    Ok((name_absent, guid_absent))
 }

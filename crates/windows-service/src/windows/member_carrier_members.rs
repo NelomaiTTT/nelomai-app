@@ -2068,6 +2068,17 @@ pub(crate) mod native {
 
         fn read_all_inner(&mut self) -> Result<Vec<ExpectedProvider>> {
             let before = self.revision()?;
+            let wants = self.read_all_in_revision(&before)?;
+            if before != self.revision()? {
+                return Err(Error::Conflict);
+            }
+            Ok(wants)
+        }
+
+        // Factual member reads inside the caller's complete revision frame.
+        // Original service/process/close receipts are still read twice; this
+        // does not grant Start or reconstruct an owner from the saved bytes.
+        fn read_all_in_revision(&mut self, revision: &[u8]) -> Result<Vec<ExpectedProvider>> {
             let mut wants = Vec::with_capacity(2);
             for (index, entry) in self.entries.iter_mut().enumerate() {
                 let Some(entry) = entry else {
@@ -2098,11 +2109,8 @@ pub(crate) mod native {
                 wants.push(provider);
             }
             wants.extend(
-                self.pending_members(Record::decode(&before)?.phase == Phase::Closing, false)?,
+                self.pending_members(Record::decode(revision)?.phase == Phase::Closing, false)?,
             );
-            if before != self.revision()? {
-                return Err(Error::Conflict);
-            }
             Ok(wants)
         }
 
@@ -2398,7 +2406,11 @@ pub(crate) mod native {
             if context != &self.context {
                 return Err(Error::Conflict);
             }
-            self.matches_original_runtime_image(runtime, image)?;
+            if !self.runtime.same_original_runtime(runtime) || !image.matches_source(&self.carrier)
+            {
+                return Err(Error::Conflict);
+            }
+            image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
             let before = self.revision()?;
             if Record::decode(&before)?.phase != phase {
                 return Err(Error::Conflict);
@@ -2409,12 +2421,12 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            let members = self.read_all_inner()?;
+            let members = self.read_all_in_revision(&before)?;
             let facts = inspect(&members)?;
-            if self.read_all_inner()? != members || self.revision()? != before {
+            if self.read_all_in_revision(&before)? != members || self.revision()? != before {
                 return Err(Error::Conflict);
             }
-            self.matches_original_runtime_image(runtime, image)?;
+            image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
             if self.revision()? != before {
                 return Err(Error::Conflict);
             }

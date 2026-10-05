@@ -575,7 +575,16 @@ fn copy_facts(f: &NativeFacts) -> NativeFacts {
 #[test]
 fn registry_is_journaled_before_each_effect_and_exactly_disabled_before_creation() {
     let (mut owner, shared, mut lock) = setup();
-    let record = prepare_all(&mut owner, &mut lock);
+    let mut steps = 0;
+    owner
+        .prepare_role_in(Role::RoleCarrier, &mut lock, |call| {
+            steps += 1;
+            call()
+        })
+        .unwrap();
+    assert_eq!(steps, 7);
+    owner.prepare_role(Role::MemberA, &mut lock).unwrap();
+    let record = owner.prepare_role(Role::MemberB, &mut lock).unwrap();
     assert_eq!(record.version, 2);
     assert_eq!(record.generation, 13);
     assert!(record.keys.iter().all(|k| k.phase == KeyPhase::Disabled
@@ -606,6 +615,21 @@ fn registry_is_journaled_before_each_effect_and_exactly_disabled_before_creation
             .is_err(),
         "single-use prerequisite"
     );
+    for repeat in [false, true] {
+        let (mut owner, shared, mut lock) = setup();
+        assert!(owner
+            .prepare_role_in(Role::RoleCarrier, &mut lock, |call| {
+                if repeat {
+                    call()?;
+                    call()
+                } else {
+                    Ok(()) // Missing callback is not a completed native step.
+                }
+            })
+            .is_err());
+        assert!(shared.borrow().keys.iter().all(Option::is_none));
+        assert!(owner.prepare_role(Role::RoleCarrier, &mut lock).is_err());
+    }
 }
 #[test]
 fn cleanup_restores_only_owned_values_after_nic_absence_and_never_deletes_keys() {
@@ -1145,6 +1169,42 @@ fn cleanup_lost_ack_recovers_each_revision_without_repeating_accepted_effects() 
 }
 #[test]
 fn crash_at_every_prepare_revision_cannot_enable_creation_or_manufacture_handle_authority() {
+    // A whole native step may return its real NEW ACK and then lose timing /
+    // authentication postflight. The SAME owner must retain it on Err/unwind.
+    for failed_step in 1..=7 {
+        for unwind in [false, true] {
+            let (mut owner, shared, mut lock) = setup();
+            let mut calls = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.prepare_role_in(Role::RoleCarrier, &mut lock, |call| {
+                    calls += 1;
+                    call()?;
+                    if calls == failed_step {
+                        if unwind {
+                            panic!("native preparation postflight unwind");
+                        }
+                        return Err(Error::Pending);
+                    }
+                    Ok(())
+                })
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(calls, failed_step);
+            let saved = owner.snapshot().unwrap().unwrap();
+            assert_eq!(owner.current.as_ref(), Some(&saved));
+            let held = owner.retained.keys[0].as_ref();
+            assert_eq!(held.is_some(), failed_step >= 4);
+            if let Some(held) = held {
+                assert_eq!(held.ack.retained_handle().0, 10);
+                assert_eq!(shared.borrow().keys[0], Some(10));
+            }
+            assert!(owner
+                .before_adapter_create(Role::RoleCarrier, &mut lock)
+                .is_err());
+            assert!(owner.prepare_role(Role::MemberA, &mut lock).is_err());
+            assert_eq!(owner.retained.keys[0].is_some(), failed_step >= 4);
+        }
+    }
     for revision in 1..=13 {
         let (mut owner, shared, mut lock) = setup();
         shared.borrow_mut().save_fault = Some((revision, Ack::Unreadable));

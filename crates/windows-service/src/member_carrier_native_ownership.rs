@@ -1085,16 +1085,38 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         role: Role,
         lock: &mut I::MutationLock,
     ) -> Result<Record> {
+        self.prepare_role_in(role, lock, |call| call())
+    }
+    /// One original owner throughout independently bounded durable steps.
+    /// The runner supplies timing/authentication, never a key or create ACK.
+    pub(crate) fn prepare_role_in(
+        &mut self,
+        role: Role,
+        lock: &mut I::MutationLock,
+        mut run: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<Record> {
         if self.cleanup_only || self.attempted[role.index()] {
             return Err(Error::Retired);
         }
         self.io.assert_serialized_lock(lock, &self.context)?;
         self.attempted[role.index()] = true;
-        let result = self.prepare_inner(role, lock);
-        if result.is_err() {
-            self.cleanup_only = true;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.prepare_inner(role, lock, &mut run)
+        }));
+        match outcome {
+            Ok(result) => {
+                if result.is_err() {
+                    self.cleanup_only = true;
+                }
+                result
+            }
+            Err(unwind) => {
+                // Returned originals stay in self. Resume the SAME unwind;
+                // it is no successful native ACK or permission to create.
+                self.cleanup_only = true;
+                std::panic::resume_unwind(unwind)
+            }
         }
-        result
     }
     pub(crate) fn restore_member_key(
         &mut self,
@@ -1222,119 +1244,165 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         }
         result
     }
-    fn prepare_inner(&mut self, role: Role, lock: &mut I::MutationLock) -> Result<Record> {
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step("key prepare original current");
+    fn prepare_inner(
+        &mut self,
+        role: Role,
+        lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<Record> {
         let i = role.index();
-        let mut record = match &self.current {
-            Some(record) => record.clone(),
-            None => {
-                if self.snapshot()?.is_some() {
-                    return Err(Error::Retired);
+        let mut original = None;
+        preparation_call(run, || {
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare original current",
+            );
+            let record = match &self.current {
+                Some(record) => record.clone(),
+                None => {
+                    if self.snapshot()?.is_some() {
+                        return Err(Error::Retired);
+                    }
+                    let record = initial(&self.context);
+                    self.persist(None, &record, lock)?;
+                    record
                 }
-                let record = initial(&self.context);
-                self.persist(None, &record, lock)?;
-                record
+            };
+            self.require_current(&record)?;
+            if record.phase != Phase::Preparing || record.keys[i].phase != KeyPhase::Unstarted {
+                return Err(Error::Retired);
             }
-        };
-        self.require_current(&record)?;
-        if record.phase != Phase::Preparing || record.keys[i].phase != KeyPhase::Unstarted {
-            return Err(Error::Retired);
-        }
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare initial absence begin",
-        );
-        let absent = self.observe(&record, role, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare initial absence end",
-        );
-        require_nic_absent(&absent)?;
-        require_value(&absent, Value::Absent)?;
-        if absent.key != KeyPresence::Absent {
-            return Err(Error::Conflict);
-        }
-        let mut pending = next(&record)?;
-        pending.keys[i].phase = KeyPhase::CreatePending;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare CreatePending begin",
-        );
-        self.persist(Some(&record), &pending, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step("key prepare CreatePending end");
-        record = pending;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare pending absence begin",
-        );
-        let absent = self.observe(&record, role, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare pending absence end",
-        );
-        require_nic_absent(&absent)?;
-        require_value(&absent, Value::Absent)?;
-        if absent.key != KeyPresence::Absent {
-            return Err(Error::Conflict);
-        }
-        next(&record)?; // Captured ACK must have a representable revision.
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        let binding = self.context.bindings[i].clone();
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step("key prepare native NEW begin");
-        let ack = self
-            .io
-            .create_new_key(lock, &record, &binding, &absent)
-            .map_err(|_| Error::Pending)?;
-        self.retained.keys[i] = Some(HeldKey {
-            context: self.context.clone(),
-            binding,
-            ack,
-        });
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare native NEW retained",
-        );
-        let mut captured = next(&record)?;
-        captured.keys[i].phase = KeyPhase::Captured;
-        captured.keys[i].new_key_ack = true;
-        self.persist(Some(&record), &captured, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare Captured acknowledged",
-        );
-        record = captured;
-        let facts = self.observe(&record, role, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step("key prepare Captured readback");
-        require_owned(&facts)?;
-        require_nic_absent(&facts)?;
-        require_value(&facts, Value::Absent)?;
-        let mut pending = next(&record)?;
-        pending.keys[i].phase = KeyPhase::DisablePending;
-        pending.keys[i].pending = Some(Value::DwordZero);
-        self.persist(Some(&record), &pending, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare DisablePending acknowledged",
-        );
-        self.write_value(&pending, role, Value::Absent, Value::DwordZero, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare disabled value readback",
-        );
-        let mut disabled = next(&pending)?;
-        disabled.keys[i].phase = KeyPhase::Disabled;
-        disabled.keys[i].current = Value::DwordZero;
-        disabled.keys[i].pending = None;
-        self.persist(Some(&pending), &disabled, lock)?;
-        #[cfg(all(windows, test))]
-        crate::windows::member_carrier_factory_test_os::trace_step(
-            "key prepare Disabled acknowledged",
-        );
-        Ok(disabled)
+            original = Some(record);
+            Ok(())
+        })?;
+        let mut record = original.ok_or(Error::Pending)?;
+        preparation_call(run, || {
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare initial absence begin",
+            );
+            let absent = self.observe(&record, role, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare initial absence end",
+            );
+            require_nic_absent(&absent)?;
+            require_value(&absent, Value::Absent)?;
+            if absent.key != KeyPresence::Absent {
+                return Err(Error::Conflict);
+            }
+            let mut pending = next(&record)?;
+            pending.keys[i].phase = KeyPhase::CreatePending;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare CreatePending begin",
+            );
+            self.persist(Some(&record), &pending, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare CreatePending end",
+            );
+            record = pending;
+            Ok(())
+        })?;
+        let mut absence = None;
+        preparation_call(run, || {
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare pending absence begin",
+            );
+            let absent = self.observe(&record, role, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare pending absence end",
+            );
+            require_nic_absent(&absent)?;
+            require_value(&absent, Value::Absent)?;
+            if absent.key != KeyPresence::Absent {
+                return Err(Error::Conflict);
+            }
+            absence = Some(absent);
+            Ok(())
+        })?;
+        preparation_call(run, || {
+            next(&record)?; // Captured ACK must have a representable revision.
+            self.io.assert_serialized_lock(lock, &self.context)?;
+            let binding = self.context.bindings[i].clone();
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare native NEW begin",
+            );
+            let ack = self
+                .io
+                .create_new_key(
+                    lock,
+                    &record,
+                    &binding,
+                    absence.as_ref().ok_or(Error::Pending)?,
+                )
+                .map_err(|_| Error::Pending)?;
+            self.retained.keys[i] = Some(HeldKey {
+                context: self.context.clone(),
+                binding,
+                ack,
+            });
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare native NEW retained",
+            );
+            let mut captured = next(&record)?;
+            captured.keys[i].phase = KeyPhase::Captured;
+            captured.keys[i].new_key_ack = true;
+            self.persist(Some(&record), &captured, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare Captured acknowledged",
+            );
+            record = captured;
+            Ok(())
+        })?;
+        preparation_call(run, || {
+            let facts = self.observe(&record, role, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare Captured readback",
+            );
+            require_owned(&facts)?;
+            require_nic_absent(&facts)?;
+            require_value(&facts, Value::Absent)?;
+            let mut pending = next(&record)?;
+            pending.keys[i].phase = KeyPhase::DisablePending;
+            pending.keys[i].pending = Some(Value::DwordZero);
+            self.persist(Some(&record), &pending, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare DisablePending acknowledged",
+            );
+            record = pending;
+            Ok(())
+        })?;
+        preparation_call(run, || {
+            self.write_value(&record, role, Value::Absent, Value::DwordZero, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare disabled value readback",
+            );
+            Ok(())
+        })?;
+        preparation_call(run, || {
+            let mut disabled = next(&record)?;
+            disabled.keys[i].phase = KeyPhase::Disabled;
+            disabled.keys[i].current = Value::DwordZero;
+            disabled.keys[i].pending = None;
+            self.persist(Some(&record), &disabled, lock)?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key prepare Disabled acknowledged",
+            );
+            record = disabled;
+            Ok(())
+        })?;
+        Ok(record)
     }
     /// A single-use registry prerequisite, tied to a borrowed captured token.
     /// The eventual adapter must consume it under the SAME caller lock and
@@ -1649,6 +1717,18 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         self.require_current(record)?;
         Ok(facts)
     }
+}
+
+fn preparation_call(
+    run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    call: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let mut call = Some(call);
+    run(&mut || call.take().ok_or(Error::Retired)?())?;
+    if call.is_some() {
+        return Err(Error::Pending);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

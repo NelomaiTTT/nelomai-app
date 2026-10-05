@@ -497,21 +497,23 @@ impl OriginalKeyInventory {
 impl crate::windows::member_carrier_key_authority::OriginalCreatorInventory
     for OriginalKeyInventory
 {
-    fn assert_absent(
+    fn inspect_absence(
         &mut self,
         context: &receipt::Context,
         binding: &receipt::Binding,
-    ) -> crate::member_carrier::Result<()> {
+    ) -> crate::member_carrier::Result<(bool, bool, bool)> {
         if self.members.is_none() {
             // Preserve the legacy reader's original two complete rounds.
             self.recheck(context, binding)
                 .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
         }
-        // Integrated recheck fences current source/record and the whole native
-        // universe on both sides of its independent target observation.
-        // KeyAuthority also brackets its actual OS reads with this recheck.
+        // This succeeds only after complete native MIB/PnP target absence AND
+        // private Never/exact original closure, with actual raw originals,
+        // member receipts, image/runtime/current revision checked on both sides.
+        // No saved record or numeric identity constructs an owning receipt.
         self.recheck(context, binding)
-            .map_err(|_| crate::member_carrier::CarrierError::Conflict)
+            .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+        Ok((true, true, true))
     }
 }
 fn original_error(_: impl std::fmt::Debug) -> creators::Error {

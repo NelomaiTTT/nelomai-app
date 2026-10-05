@@ -720,18 +720,24 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         Ok(())
     }
     fn prepare_carrier(&mut self, lock: &mut I::MutationLock) -> Result<()> {
+        self.prepare_carrier_in(lock, |call| call())
+    }
+    fn prepare_carrier_in(
+        &mut self,
+        lock: &mut I::MutationLock,
+        run: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
         self.module_only_allowed.set(false);
         self.no_sdk.set(false);
         enter(&mut self.prepare_attempted)?;
         if !self.attached {
             return Err(Error::Pending);
         }
-        self.disabled = Some(
-            self.owner
-                .as_mut()
-                .ok_or(Error::Pending)?
-                .prepare_role(receipt::Role::RoleCarrier, lock)?,
-        );
+        self.disabled = Some(self.owner.as_mut().ok_or(Error::Pending)?.prepare_role_in(
+            receipt::Role::RoleCarrier,
+            lock,
+            run,
+        )?);
         let record = self.disabled.as_ref().expect("retained Disabled return");
         receipt::validate_carrier_create_stage(
             record,
@@ -1787,10 +1793,8 @@ pub(crate) mod native {
             );
             Ok(())
         }
-        /// Actual prepareCkeys; handles already returned by key IO stay in
-        /// owner on journal Err, unwind, cancellation or supervisor postflight.
-        /// Main must close Keys' internal post-create ACK retention gap before
-        /// enabling this path; see the active dependency regression tests.
+        /// Actual prepareCkeys. Every durable step uses the SAME supervisor;
+        /// returned handles stay in the original owner through all postflights.
         pub(crate) fn prepare_carrier(&mut self, lock: &mut KeyLock) -> Result<()> {
             self.root.module_only_allowed.set(false);
             enter(&mut self.prepare_call_attempted)?;
@@ -1798,32 +1802,27 @@ pub(crate) mod native {
                 return Err(Error::Pending);
             }
             let assets = self.root.assets.as_ref().ok_or(Error::Pending)?;
+            if !assets.runtime.matches_lock(lock) {
+                return Err(Error::Conflict);
+            }
             let supervisor = assets.supervisor.clone();
             let intent = assets.pair_intent.clone();
             let context = assets.context.clone();
             let expected = assets.expected.clone();
             let cancelled = assets.cancelled.clone();
-            supervisor.run_intent(
-                &context,
-                &intent,
-                &expected,
-                pair::Effect::CarrierReady,
-                || {
-                    check_cancelled(&cancelled)?;
-                    if !self
-                        .root
-                        .assets
-                        .as_ref()
-                        .ok_or(Error::Pending)?
-                        .runtime
-                        .matches_lock(lock)
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    self.root.prepare_carrier(lock)?;
-                    check_cancelled(&cancelled)
-                },
-            )?;
+            self.root.prepare_carrier_in(lock, |call| {
+                supervisor.run_intent(
+                    &context,
+                    &intent,
+                    &expected,
+                    pair::Effect::CarrierReady,
+                    || {
+                        check_cancelled(&cancelled)?;
+                        call()?;
+                        check_cancelled(&cancelled)
+                    },
+                )
+            })?;
             self.prepared = true;
             Ok(())
         }
