@@ -787,18 +787,18 @@ fn actual_executable() -> Result<PathBuf> {
 impl<I: OriginalCreatorInventory> NativeAuthority for KeyAuthority<I> {
     type Lock = KeyLock;
     fn verify(&mut self, lock: &mut KeyLock, context: &Context) -> Result<()> {
-        self.runtime(lock, context)?;
+        if !lock.matches_pin(&self.runtime.lease) {
+            return Err(Error::Conflict);
+        }
         let read = RuntimeRead {
             runtime: self.runtime.clone(),
             lease: lock.pin(),
         };
+        // The canonical read fully authenticates this SAME runtime on both
+        // sides, joins the original storage/execution origin and reads the
+        // protected context LAST. Further outer reads add no distinct facts.
         self.files = read.native_files_for_original(context, &self.original_files)?;
-        self.files
-            .native_carrier_access(&context.intent.scope)
-            .map_err(|_| Error::Journal)?
-            .require_native_context(context)
-            .map_err(|_| Error::Conflict)?;
-        self.runtime(lock, context)
+        Ok(())
     }
     fn authorize_effect(
         &mut self,
