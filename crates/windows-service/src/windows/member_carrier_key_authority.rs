@@ -351,13 +351,24 @@ impl RuntimeRead {
         context: &Context,
         original: &NativeSessionFiles,
     ) -> Result<NativeSessionFiles> {
-        self.verify(context)?;
-        let canonical = self
-            .runtime
-            .files
-            .try_borrow()
-            .map_err(|_| Error::Conflict)?
-            .clone();
+        // One complete runtime authentication bracket surrounds the SAME
+        // protected context, backend and execution-origin comparisons. Nesting
+        // RuntimeRead::verify here authenticates the identical runtime twice
+        // on each side without adding another original owner or ACK.
+        self.runtime.verify(&self.lease, context)?;
+        let canonical = {
+            let mut files = self
+                .runtime
+                .files
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            files
+                .native_carrier_access(&context.intent.scope)
+                .map_err(|_| Error::Journal)?
+                .require_native_context(context)
+                .map_err(|_| Error::Conflict)?;
+            files.clone()
+        };
         if !canonical.same_original_backend(original) {
             return Err(Error::Conflict);
         }
@@ -372,7 +383,15 @@ impl RuntimeRead {
             }
         }
         drop(execution);
-        self.verify(context)?;
+        self.runtime.verify(&self.lease, context)?;
+        self.runtime
+            .files
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)?
+            .native_carrier_access(&context.intent.scope)
+            .map_err(|_| Error::Journal)?
+            .require_native_context(context)
+            .map_err(|_| Error::Conflict)?;
         Ok(canonical)
     }
     /// Explicit authenticated Stop entry: only SAME original private storage.
@@ -470,15 +489,11 @@ impl RuntimeRead {
         context: &Context,
         files: &NativeSessionFiles,
     ) -> Result<()> {
-        // native_files_for_original already brackets this SAME backend
-        // comparison with full runtime authentication and also checks the
-        // original execution birth/view. Keep its original owner checks once.
-        self.native_files_for_original(context, files)?
-            .native_carrier_access(&context.intent.scope)
-            .map_err(|_| Error::Journal)?
-            .require_native_context(context)
-            .map_err(|_| Error::Conflict)?;
-        self.verify(context)
+        // The canonical original view already requires the protected context
+        // before and after full runtime authentication, in addition to backend
+        // and execution-origin identity. Returning it creates no native grant.
+        self.native_files_for_original(context, files)?;
+        Ok(())
     }
     pub(super) fn matches_lock(&self, lock: &KeyLock) -> bool {
         lock.matches_pin(&self.lease)
