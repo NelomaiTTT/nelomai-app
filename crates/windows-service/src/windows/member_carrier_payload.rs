@@ -226,7 +226,9 @@ pub(crate) mod native {
                 ))
             };
             original.verify()?;
-            self.verify()?;
+            if !std::ptr::eq(self, original) {
+                self.verify()?;
+            }
             let held = id(original)?;
             let compare = |current| {
                 super::super::member_carrier_module::compare_process_source_origin(
@@ -241,7 +243,9 @@ pub(crate) mod native {
             };
             compare(id(self)?)?;
             original.verify()?;
-            self.verify()?;
+            if !std::ptr::eq(self, original) {
+                self.verify()?;
+            }
             if id(original)? != held {
                 return Err(Error::Conflict);
             }
@@ -291,7 +295,6 @@ pub(crate) mod native {
             Ok(source)
         }
         pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
-            self.carrier.verify_owner(owner)?;
             let wanted = member_libraries(self.transport);
             let expected = wanted
                 .into_iter()
@@ -300,19 +303,43 @@ pub(crate) mod native {
             if self.libraries.len() != expected.len() {
                 return Err(Error::Conflict);
             }
-            for (library, kind) in self.libraries.iter().zip(expected) {
-                if library.kind != kind || library.identity() != self.carrier.identity() {
+            // One complete signed runtime read covers BOTH slots and ALL of
+            // their payloads. Join every original library to that SAME owner,
+            // root, executable and manifest before and after that read; do not
+            // reload/hash the entire runtime once per individual library pin.
+            let pins = || {
+                let carrier = &self.carrier.0;
+                if !Arc::ptr_eq(&carrier.owner, owner) {
                     return Err(Error::Conflict);
                 }
-                library.verify_owner(owner)?;
-            }
-            // Repeat every actual pin after the complete signed-runtime reads.
-            // A later failure does not turn this source into native authority.
+                carrier
+                    .owner
+                    .verify_at(&carrier.installation.root.join("engine-owner.lock"))
+                    .map_err(|_| Error::Conflict)?;
+                (carrier.root)()?;
+                carrier.payload.verify().map_err(|_| Error::Conflict)?;
+                for (library, kind) in self.libraries.iter().zip(&expected) {
+                    if library.kind != *kind
+                        || !Arc::ptr_eq(&library.owner, owner)
+                        || library.identity() != carrier.identity()
+                        || library.installation.root != carrier.installation.root
+                        || library.directory != carrier.directory
+                        || library.executable != carrier.executable
+                        || library.payload.path() != carrier.executable.with_file_name(kind.path())
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    (library.root)()?;
+                    library.payload.verify().map_err(|_| Error::Conflict)?;
+                }
+                carrier
+                    .owner
+                    .verify_at(&carrier.installation.root.join("engine-owner.lock"))
+                    .map_err(|_| Error::Conflict)
+            };
+            pins()?;
             self.carrier.verify_owner(owner)?;
-            for library in &self.libraries {
-                library.verify_owner(owner)?;
-            }
-            self.carrier.verify_owner(owner)
+            pins()
         }
         pub(crate) fn identity(&self) -> &EngineIdentity {
             self.carrier.identity()

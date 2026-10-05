@@ -6051,6 +6051,12 @@ pub(crate) mod native {
                 Use::Live
             };
             let before = self.current(use_)?;
+            #[cfg(test)]
+            if stage == Stage::Resolve {
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "C Resolve current native receipt accepted",
+                );
+            }
             if stage == Stage::AfterClose {
                 self.complete_original_close()?;
                 // Actual owning once-close ACK exists before this handoff.
@@ -6073,7 +6079,19 @@ pub(crate) mod native {
             // Acquire new recursive lease BEFORE replacing/releasing the old
             // one; no unlocked gap before a later EndSession/CloseAdapter.
             let held = self.refresh(use_)?;
+            #[cfg(test)]
+            if stage == Stage::Resolve {
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "C Resolve original module lease accepted",
+                );
+            }
             self.gate.authorize(&self.scope, stage, &self.observer)?;
+            #[cfg(test)]
+            if stage == Stage::Resolve {
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "C Resolve full lifecycle gate accepted",
+                );
+            }
             same_record(&before, self.current(use_)?).map_err(denied)?;
             self.effect = Some(held);
             if stage == Stage::BeforeClose && self.retirement.is_none() {
