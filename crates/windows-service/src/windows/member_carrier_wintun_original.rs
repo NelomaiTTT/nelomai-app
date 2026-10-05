@@ -654,11 +654,13 @@ impl OriginalUniverse {
         Ok(members.read_pin())
     }
     fn verify(&self, context: &receipt::Context) -> creators::Result<()> {
+        // Bind the supplied context first. The complete original-image read
+        // then authenticates this SAME runtime/context on both sides of the
+        // actual mapping/source query; an extra outer reread adds no facts.
         self.runtime.verify(context).map_err(original_error)?;
         self.image
             .verify_runtime(&self.runtime)
-            .map_err(original_error)?;
-        self.runtime.verify(context).map_err(original_error)
+            .map_err(original_error)
     }
 }
 

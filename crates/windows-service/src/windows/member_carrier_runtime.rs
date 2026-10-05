@@ -5287,15 +5287,15 @@ pub(crate) mod native {
                     let authority = parts.authority.as_mut().ok_or(Error::Pending)?;
                     let before = authority.current(Use::Create)?;
                     let raw = authority.image.module().map_err(denied)?;
-                    // The native resolver independently refreshes this SAME
-                    // retained authority and runs the complete Resolve gate
-                    // LAST before GetModuleHandleExW. Alias construction below
-                    // performs no SDK effect and cannot grant native permission.
+                    // The resolver independently authenticates this SAME live
+                    // original image/runtime and current Preparing receipt LAST
+                    // before adding its reference. It cannot initialize a DLL,
+                    // touch drivers/NICs or issue a pending creation token.
+                    // Alias construction below performs only field moves.
                     // LoadedWintun and OriginalImage retain the actual original
                     // HMODULE in this root throughout the infallible alias move.
-                    // Acquire the cooperative effect lease only inside the
-                    // resolver's final gate, whose call guard also releases it
-                    // on Err/unwind before C exists.
+                    // The complete package/G/HKEY creation gate and cooperative
+                    // effect lease remain at authorize_create before SDK creation.
                     same_record(&before, authority.current(Use::Create)?).map_err(denied)?;
                     let binding = authority.binding.clone();
                     let signal = authority.shared_revocation.clone();

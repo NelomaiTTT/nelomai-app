@@ -1877,12 +1877,15 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             image: &OriginalImage,
         ) -> Result<()> {
-            self.revision()?;
             if !self.runtime.same_original_runtime(runtime) || !image.matches_source(&self.carrier)
             {
                 return Err(Error::Conflict);
             }
-            runtime.verify(&self.context)?;
+            // One complete image read authenticates the SAME runtime/source,
+            // lease and protected context on both sides of the mapping read.
+            // This method compares opaque origins only; it invokes no member
+            // callback or native effect. The final revision independently
+            // authenticates and rereads the current full native receipt.
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
             self.revision()?;
             Ok(())
