@@ -3721,6 +3721,8 @@ pub(crate) mod native {
                     { return Err(conflict()); }
                     raw.startup.as_ref().ok_or_else(conflict)?.clone()
                 };
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition canonical origin accepted");
                 {
                     let mut retained = self.module_only.try_borrow_mut()?;
                     if retained.is_some() { return Err(conflict()); }
@@ -3742,17 +3744,25 @@ pub(crate) mod native {
                     { return Err(conflict()); }
                     local.require_unconstructed_originals()?; // shape only, NOT Never authority
                 }
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition actor origin accepted");
                 startup.try_borrow().map_err(denied)?.verify_module_only_release(original, expected).map_err(denied)?;
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition loader ACK accepted");
                 {
                     let mut retained = self.module_only.try_borrow_mut()?;
                     startup.try_borrow_mut().map_err(denied)?.drain_terminal_into(
                         &mut retained.as_mut().ok_or_else(conflict)?.raw,
                     ).map_err(denied)?;
                 }
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition Startup drained");
                 // Last actual journal read while the original held KeyLock is
                 // still alive. No native/storage query after owning disposal.
                 let (pin, record) = self.readback_terminal(&expected.scope)?;
                 witness.verify_original(self, &pin, &record)?;
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition original journal accepted");
                 {
                     let mut retained = self.module_only.try_borrow_mut()?;
                     let retained = retained.as_mut().ok_or_else(conflict)?;
@@ -3761,6 +3771,8 @@ pub(crate) mod native {
                         original, expected, &mut retained.raw,
                     ).map_err(denied)?;
                 }
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step("module-only disposition Startup completed");
                 startup.try_borrow().map_err(denied)?.verify_module_only_disposition(original, expected).map_err(denied)?;
                 local.locals.parts.release_with(|| {
                     local.require_unconstructed_originals()?;
