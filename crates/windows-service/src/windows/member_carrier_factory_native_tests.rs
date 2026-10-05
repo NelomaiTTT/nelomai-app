@@ -112,8 +112,21 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
+        let elapsed = started.elapsed();
         let stdout = std::fs::read_to_string(stdout_path).unwrap();
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
+        let runtime_auth = stderr
+            .lines()
+            .filter(|line| line.contains("runtime begin installed payload authentication"))
+            .count();
+        let source_auth = stderr
+            .lines()
+            .filter(|line| line.contains("source begin installed payload authentication"))
+            .count();
+        println!(
+            "actual native factory cost case={case} runtime_full_auth_attempts={runtime_auth} source_full_auth_attempts={source_auth} elapsed_ms={}",
+            elapsed.as_millis()
+        );
         assert!(
             !timed_out,
             "actual native factory {case} exceeded whole-case {case_budget:?}: {stdout} {stderr}"

@@ -522,10 +522,9 @@ impl OriginalWintun {
         {
             return Err(creators::Error::Conflict);
         }
-        self.runtime.verify(context).map_err(original_error)?;
         if self
             .image
-            .cleanup_read_module_for_runtime(&self.runtime)
+            .cleanup_read_module_for_runtime(&self.runtime, context)
             .map_err(original_error)?
             != self.original.original_module()
         {
@@ -584,16 +583,12 @@ impl OriginalUniverse {
         runtime: &RuntimeRead,
         image: &OriginalImage,
     ) -> creators::Result<()> {
-        self.image.verify_runtime(runtime).map_err(original_error)?;
-        image.verify_runtime(runtime).map_err(original_error)?;
-        if !self.runtime.same_original_runtime(runtime)
-            || self.image.cleanup_read_module().map_err(original_error)?
-                != image.cleanup_read_module().map_err(original_error)?
-        {
+        if !self.runtime.same_original_runtime(runtime) {
             return Err(creators::Error::Conflict);
         }
-        self.image.verify_runtime(runtime).map_err(original_error)?;
-        image.verify_runtime(runtime).map_err(original_error)?;
+        self.image
+            .verify_same_runtime_image(runtime, image)
+            .map_err(original_error)?;
         if let Some(members) = &self.members {
             members
                 .matches_original_runtime_image(runtime, image)
@@ -639,9 +634,8 @@ impl OriginalUniverse {
         // Bind the supplied context first. The complete original-image read
         // then authenticates this SAME runtime/context on both sides of the
         // actual mapping/source query; an extra outer reread adds no facts.
-        self.runtime.verify(context).map_err(original_error)?;
         self.image
-            .verify_runtime(&self.runtime)
+            .verify_runtime_for_context(&self.runtime, context)
             .map_err(original_error)
     }
 }

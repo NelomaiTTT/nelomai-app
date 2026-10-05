@@ -483,6 +483,15 @@ impl RuntimeRead {
             .map_err(|_| Error::Conflict)?;
         self.runtime.verify(&self.lease, context)
     }
+    /// Factual equality to this retained runtime's original context only.
+    /// No authentication, freshness or effect grant: the full bound image read
+    /// must still authenticate the actual runtime/source/context afterwards.
+    pub(super) fn require_original_context(&self, context: &Context) -> Result<()> {
+        if *context != self.runtime.context {
+            return Err(Error::Conflict);
+        }
+        Ok(())
+    }
     /// Bind storage to THIS retained authenticated runtime and shared backend,
     /// not an independent reopen with equal directory/scope/JSON. Identity
     /// comparison is bracketed by actual lease, private-root/runtime and current

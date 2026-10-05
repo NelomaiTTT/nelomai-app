@@ -1550,6 +1550,39 @@ pub(crate) mod native {
         ) -> Result<()> {
             image_cleanup_read(&self.valid, || self.verify_runtime_facts(runtime))
         }
+        /// Bind the supplied context BEFORE the full factual image read. Wrong
+        /// caller context cannot enter authentication or change image poison.
+        pub(crate) fn verify_runtime_for_context(
+            &self,
+            runtime: &RuntimeRead,
+            context: &crate::member_carrier_native_ownership::Context,
+        ) -> Result<()> {
+            runtime
+                .require_original_context(context)
+                .map_err(|_| Error::Conflict)?;
+            self.verify_runtime(runtime)
+        }
+        /// Freshly authenticate both actual images; only exact retained
+        /// module/source/valid/serialized-pin aliases share one factual read.
+        /// Equal HMODULE values alone never bypass a distinct source's read.
+        pub(crate) fn verify_same_runtime_image(
+            &self,
+            runtime: &RuntimeRead,
+            other: &OriginalImage,
+        ) -> Result<()> {
+            self.verify_runtime(runtime)?;
+            if !Rc::ptr_eq(&self.module, &other.module)
+                || !Rc::ptr_eq(&self.source, &other.source)
+                || !Rc::ptr_eq(&self.valid, &other.valid)
+                || !other.matches_runtime(runtime)
+            {
+                other.verify_runtime(runtime)?;
+            }
+            if self.module.0 != other.module.0 {
+                return Err(Error::Conflict);
+            }
+            Ok(())
+        }
         /// Fresh forward image read, not cleanup-only resurrection of a
         /// poisoned load observation. Actual effect permission is separate.
         pub(crate) fn verify_live_runtime(
@@ -1584,8 +1617,9 @@ pub(crate) mod native {
         pub(crate) fn cleanup_read_module_for_runtime(
             &self,
             runtime: &RuntimeRead,
+            context: &crate::member_carrier_native_ownership::Context,
         ) -> Result<NonNull<c_void>> {
-            self.verify_runtime(runtime)?;
+            self.verify_runtime_for_context(runtime, context)?;
             Ok(self.module.0)
         }
         /// Comparison/read only. Never a raw-handle authority constructor.
