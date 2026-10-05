@@ -1403,7 +1403,9 @@ pub(crate) mod native {
         fn verify_mode(&mut self, cancelled: &AtomicBool, cleanup: bool) -> Result<()> {
             self.held
                 .verify_with(&self.valid, cleanup, cancelled, |module, lease| {
-                    require_process_anchor(&self.source, module)?;
+                    if !module.1.image_available() {
+                        return Err(Error::Conflict);
+                    }
                     if !self.runtime.matches_pin(&self.lock) {
                         return Err(Error::Conflict);
                     }
@@ -1413,7 +1415,10 @@ pub(crate) mod native {
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
-                    verify_image(&self.source, module)?;
+                    // The full original anchor read also checks this SAME
+                    // mapping, image bounds and audited exports. Keep both
+                    // original lease/runtime fences around that complete read.
+                    require_process_anchor(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     self.runtime
                         .verify_source(&self.source)
@@ -1538,14 +1543,17 @@ pub(crate) mod native {
             image_read(&self.valid, || self.verify_runtime_facts(runtime))
         }
         fn verify_runtime_facts(&self, runtime: &RuntimeRead) -> Result<()> {
-            require_process_anchor(&self.source, &self.module)?;
-            if !self.matches_runtime(runtime) {
+            if !self.module.1.image_available() || !self.matches_runtime(runtime) {
                 return Err(Error::Conflict);
             }
             runtime
                 .verify_source(&self.source)
                 .map_err(|_| Error::Conflict)?;
-            verify_image(&self.source, &self.module)?;
+            // This full anchor read also verifies the SAME current source's
+            // actual mapping/bounds/exports, including distinct repeat sources.
+            // Bracket it with the original runtime rather than reading the
+            // same image again immediately after the anchor's complete read.
+            require_process_anchor(&self.source, &self.module)?;
             runtime
                 .verify_source(&self.source)
                 .map_err(|_| Error::Conflict)
