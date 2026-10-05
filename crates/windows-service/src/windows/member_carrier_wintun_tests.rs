@@ -1,11 +1,8 @@
-// Standalone host harness: main owns mod.rs/Cargo integration.
+// Host lifecycle harness integrated with the actual service crate modules.
 // Native metadata checks include the actual service root and its main-owned
 // Wintun declaration exactly once, never substitute receipt/owner types.
 #[cfg(windows)]
 include!("../lib.rs");
-#[cfg(not(windows))]
-#[path = "../member_interface_description.rs"]
-mod member_interface_description;
 #[cfg(not(windows))]
 #[path = "member_carrier_wintun.rs"]
 mod subject;

@@ -201,6 +201,8 @@ jobs:
           - primary
           - module-load-read-error
           - module-load-read-unwind
+          - resolver-reference-error
+          - resolver-reference-unwind
           - carrier-ack
           - carrier-unwind
           - member-ack

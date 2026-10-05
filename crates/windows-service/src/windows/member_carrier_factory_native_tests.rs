@@ -39,6 +39,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         "primary",
         "module-load-read-error",
         "module-load-read-unwind",
+        "resolver-reference-error",
+        "resolver-reference-unwind",
         "carrier-ack",
         "carrier-unwind",
         "member-ack",
@@ -143,6 +145,10 @@ fn carrier_factory_actual_cold_child() {
         "module-load-read-error" | "module-load-read-unwind"
     );
     let full_primary = case == "primary";
+    let resolver_partial = matches!(
+        case.as_str(),
+        "resolver-reference-error" | "resolver-reference-unwind"
+    );
     let native_partial = match case.as_str() {
         "carrier-ack" => Some((NativePublication::Carrier, false)),
         "carrier-unwind" => Some((NativePublication::Carrier, true)),
@@ -152,7 +158,8 @@ fn carrier_factory_actual_cold_child() {
         "running-unwind" => Some((NativePublication::Running, true)),
         _ => None,
     };
-    let fixture = if module_partial || full_primary || native_partial.is_some() {
+    let fixture = if module_partial || resolver_partial || full_primary || native_partial.is_some()
+    {
         Fixture::new_native_modules()
     } else {
         Fixture::new()
@@ -179,6 +186,7 @@ fn carrier_factory_actual_cold_child() {
     match case.as_str() {
         "cold" | "primary-data-denial" | "primary" => (),
         "module-load-read-error" | "module-load-read-unwind" => (),
+        "resolver-reference-error" | "resolver-reference-unwind" => (),
         "carrier-ack" | "carrier-unwind" | "member-ack" | "member-unwind" | "running-ack"
         | "running-unwind" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
@@ -198,6 +206,7 @@ fn carrier_factory_actual_cold_child() {
     }
     if matches!(case.as_str(), "cold" | "primary-data-denial")
         || module_partial
+        || resolver_partial
         || full_primary
         || native_partial.is_some()
     {
@@ -215,6 +224,42 @@ fn carrier_factory_actual_cold_child() {
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
     eprintln!("actual factory {case}: retained Starting");
     fixture.verify_files().unwrap();
+    if resolver_partial {
+        fixture.lose_resolver_reference_postflight(case == "resolver-reference-unwind");
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            original.start_primary(primary, options)
+        }));
+        assert!(
+            started.is_err() || started.unwrap().is_err(),
+            "resolver fault accepted"
+        );
+        assert!(original.snapshot().cleanup_pending);
+        fixture.require_retained_resolver_reference(false);
+        assert!(
+            original.start_primary(primary, options).is_err(),
+            "uncertain resolver retried"
+        );
+        fixture.require_retained_resolver_reference(false);
+        let stopped = original.execute(
+            Command::Stop {
+                scope: scope.clone(),
+            },
+            8,
+        );
+        assert!(stopped.is_err(), "uncertain resolver became completed Stop");
+        assert!(original.snapshot().cleanup_pending);
+        fixture.require_retained_resolver_reference(true);
+        // Process exit is not a completed release or protected retirement ACK.
+        std::mem::forget(original);
+        std::mem::forget(factory);
+        return;
+    }
     if let Some((target, unwind)) = native_partial {
         fixture.lose_native_publication_ack(target, unwind);
         let Command::Start {

@@ -98,6 +98,9 @@ mod member_carrier_wintun_lock;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_wintun_package.rs"]
 mod member_carrier_wintun_package;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_wintun_tests.rs"]
+mod member_carrier_wintun_tests;
 mod member_dns;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_files.rs"]

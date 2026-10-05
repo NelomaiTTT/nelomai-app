@@ -391,7 +391,7 @@ pub(crate) mod native {
         /// by metadata or converts this acknowledged create to a zero-ACK Err.
         fn acknowledged_original(&mut self, original: OriginalAdapterRead);
         /// Infallible retention of the SAME Carrier's private session state,
-        /// installed by retained_carrier before it can perform any Start.
+        /// installed from the rooted carrier before reference acquisition or Start.
         /// Neither metadata nor a second read may replace this original.
         fn retain_original_session(&mut self, original: SessionEndRead);
         /// Infallibly release ONLY cooperative installation leases at the
@@ -399,46 +399,6 @@ pub(crate) mod native {
         /// uncertain ACK/retirement state, module/source/serialized actor pins
         /// and irreversible forward revocation. This grants no effect rights.
         fn release_call_resources(&mut self);
-    }
-
-    #[cfg(test)]
-    unsafe fn owned_native_controller_compile_contract<'a, 'p, A: ModuleRuntimeAuthority + 'a>(
-        original_loaded_module: NonNull<c_void>,
-        authority: A,
-        binding: Binding,
-        prerequisite: PrecreationReceipt<'p, A::Key, A::MutationLock>,
-    ) -> Result<Carrier<NativeKernel<'a, A>>>
-    where
-        A::Key: 'p,
-        A::MutationLock: 'p,
-    {
-        // Compile-only real Windows API/borrow contract, NOT native execution.
-        // Caller independently authenticated the original loaded HMODULE and A
-        // under the same safety contract as AuthenticatedModule::own.
-        // The returned carrier owns this local A; it cannot borrow this stack.
-        let module = unsafe { AuthenticatedModule::own(original_loaded_module, authority) };
-        let mut carrier = retained_carrier(module, binding)?;
-        // Every lifecycle API remains usable through the actual NativeKernel.
-        // These statements are type-checked only; this function is never run.
-        let _ = carrier.create(prerequisite);
-        let _ = carrier.reattest();
-        let _ = carrier.start();
-        let _ = carrier.drain(&AtomicBool::new(false), 100, 2);
-        let _ = carrier.original_adapter_read();
-        let _ = carrier.close_bounded(&AtomicBool::new(false), 100);
-        Ok(carrier)
-    }
-
-    #[cfg(test)]
-    unsafe fn borrowed_native_controller_compile_contract<'a, A: ModuleRuntimeAuthority>(
-        original_loaded_module: NonNull<c_void>,
-        authority: &'a mut A,
-        binding: Binding,
-    ) -> Result<Carrier<NativeKernel<'a, A>>> {
-        // Compile-only preservation of the existing borrowed Windows API.
-        // Caller meets AuthenticatedModule::borrow's original safety contract.
-        let module = unsafe { AuthenticatedModule::borrow(original_loaded_module, authority) };
-        retained_carrier(module, binding)
     }
 
     /// Opaque borrowed or owned authenticated module/runtime/lock capability. No Clone,
@@ -601,6 +561,8 @@ pub(crate) mod native {
         module: AuthenticatedModule<'a, A>,
         functions: Functions,
         pin: Option<NonNull<c_void>>,
+        reference_attempted: bool,
+        reference_returned: bool,
         reference: std::rc::Rc<ClosedReferenceRelease>,
         clock: Instant,
     }
@@ -636,6 +598,14 @@ pub(crate) mod native {
         }
     }
     impl<A: ModuleRuntimeAuthority> Carrier<NativeKernel<'_, A>> {
+        #[cfg(test)]
+        pub(in crate::windows) fn inspect_retained_resolver_reference(&self) {
+            super::super::member_carrier_factory_test_os::native_resolver_retained_owner(
+                &self.kernel.reference,
+                self.kernel.reference_returned
+                    && self.kernel.pin == Some(self.kernel.module.module),
+            );
+        }
         pub(crate) fn kernel_reference_read(&self) -> std::rc::Rc<NativeKernelReferenceRead> {
             std::rc::Rc::new(NativeKernelReferenceRead(self.kernel.reference.clone()))
         }
@@ -665,83 +635,100 @@ pub(crate) mod native {
             Ok(())
         }
     }
-    /// The only safe construction seam returns the owning lifecycle, not raw
-    /// function/adapter/session access. This is NOT product factory selection;
-    /// no authenticated module authority implementation or loader exists here.
-    pub(crate) fn retained_carrier<A: ModuleRuntimeAuthority>(
+    /// Prepares the carrier without acquiring a native module reference. The
+    /// caller must root it before initializing its extra original reference.
+    pub(crate) fn prepare_carrier<A: ModuleRuntimeAuthority>(
         module: AuthenticatedModule<'_, A>,
         binding: Binding,
     ) -> Result<Carrier<NativeKernel<'_, A>>> {
         validate_binding(&binding)?;
-        let kernel = NativeKernel::resolve(module, &binding)?;
-        let mut carrier = Carrier::new(kernel, binding)?;
-        let original = carrier.session_end_read();
-        carrier
-            .kernel
-            .module
-            .authority
-            .as_mut()
-            .retain_original_session(original);
-        Ok(carrier)
+        Carrier::new(NativeKernel::prepare(module, &binding)?, binding)
+    }
+    impl<A: ModuleRuntimeAuthority> Carrier<NativeKernel<'_, A>> {
+        /// Invoke only on the caller's retained slot. The SAME carrier and its
+        /// actual returned reference survive every subsequent Err or unwind.
+        pub(crate) fn initialize_original_reference(&mut self) -> Result<()> {
+            if std::mem::replace(&mut self.kernel.reference_attempted, true) {
+                return Err(Error::Pending);
+            }
+            with_call_resources(self, |carrier| {
+                let original = carrier.session_end_read();
+                carrier
+                    .kernel
+                    .module
+                    .authority
+                    .as_mut()
+                    .retain_original_session(original);
+                carrier.kernel.initialize_reference(&carrier.binding)
+            })
+        }
     }
     impl<'a, A: ModuleRuntimeAuthority> NativeKernel<'a, A> {
-        fn resolve(mut module: AuthenticatedModule<'a, A>, binding: &Binding) -> Result<Self> {
+        fn prepare(mut module: AuthenticatedModule<'a, A>, binding: &Binding) -> Result<Self> {
             if !cfg!(target_arch = "x86_64") {
                 return Err(Error::Unsupported);
             }
-            let (pin, functions) = with_call_resources(&mut module, |module| {
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "C native Resolve authorization",
-                );
+            let functions = with_call_resources(&mut module, |module| {
                 module.authority.as_mut().verify(binding, Stage::Resolve)?;
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "C native Resolve GetModuleHandleExW",
-                );
-                let mut pin: HMODULE = ptr::null_mut();
-                // Adds a module reference without executing another DLL initialization.
-                if unsafe {
-                    GetModuleHandleExW(
-                        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                        module.module.as_ptr().cast(),
-                        &mut pin,
-                    )
-                } == 0
-                {
-                    return Err(Error::Native);
+                // Resolve exports through the already-held original HMODULE.
+                // Failure here precedes acquiring any extra native reference.
+                unsafe {
+                    Functions::resolve(|name| {
+                        GetProcAddress(module.module.as_ptr(), name.as_ptr().cast())
+                    })
                 }
-                if pin != module.module.as_ptr() {
-                    if !pin.is_null() {
-                        unsafe {
-                            FreeLibrary(pin);
-                        }
-                    }
-                    return Err(Error::Conflict);
-                }
-                let functions =
-                    unsafe { Functions::resolve(|name| GetProcAddress(pin, name.as_ptr().cast())) };
-                let functions = match functions {
-                    Ok(functions) => functions,
-                    Err(error) => {
-                        unsafe {
-                            FreeLibrary(pin);
-                        }
-                        return Err(error);
-                    }
-                };
-                Ok((pin, functions))
             })?;
             Ok(Self {
                 module,
                 functions,
-                pin: NonNull::new(pin),
+                pin: None,
+                reference_attempted: false,
+                reference_returned: false,
                 reference: std::rc::Rc::new(ClosedReferenceRelease::new()),
                 clock: Instant::now(),
             })
         }
+        fn initialize_reference(&mut self, binding: &Binding) -> Result<()> {
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "C native Resolve authorization",
+            );
+            self.module
+                .authority
+                .as_mut()
+                .verify(binding, Stage::Resolve)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "C native Resolve GetModuleHandleExW",
+            );
+            let mut pin: HMODULE = ptr::null_mut();
+            // Adds a reference to the SAME original, without DLL initialization.
+            let returned = unsafe {
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                    self.module.module.as_ptr().cast(),
+                    &mut pin,
+                )
+            };
+            // FIRST retain the actual OS output in the caller's owning kernel.
+            // Neither an unexpected identity nor any later fault unloads it.
+            self.pin = NonNull::new(pin);
+            self.reference_returned = returned != 0;
+            if returned == 0 {
+                return Err(Error::Native);
+            }
+            if pin != self.module.module.as_ptr() {
+                return Err(Error::Conflict);
+            }
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::native_resolver_reference_returned(
+                &self.reference,
+            )
+            .map_err(|_| Error::Native)?;
+            Ok(())
+        }
         fn live(&self) -> Result<()> {
-            if self.pin.is_none() {
+            if !self.reference_returned || self.pin != Some(self.module.module) {
                 Err(Error::Retired)
             } else {
                 Ok(())
@@ -1030,6 +1017,8 @@ pub(crate) mod native {
             self.reference.run(
                 || Ok(()),
                 || {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::native_resolver_reference_release_attempted();
                     if unsafe { FreeLibrary(pin.as_ptr()) } == 0 {
                         return Err(Error::Native);
                     }

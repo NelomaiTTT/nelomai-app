@@ -5317,7 +5317,15 @@ pub(crate) mod native {
                     // keeps the SAME authority even if resolution consumes its alias.
                     let module = unsafe { AuthenticatedModule::own(raw, shared.other_pin()) };
                     parts.components =
-                        Some((wintun::native::retained_carrier(module, binding)?, rows));
+                        Some((wintun::native::prepare_carrier(module, binding)?, rows));
+                    // Root BOTH exact components before the first extra native
+                    // reference acquisition; Err/unwind cannot lose that owner.
+                    parts
+                        .components
+                        .as_mut()
+                        .expect("retained carrier and rows")
+                        .0
+                        .initialize_original_reference()?;
                     // Carrier AND rows now occupy the caller slot BEFORE postflight.
                     let mut owner = parts
                         .shared
@@ -5360,6 +5368,10 @@ pub(crate) mod native {
         /// Keep the slot alive on errors; removal/release needs independent ACKs.
         pub(crate) fn retained_parts(&mut self) -> NativeConstructionParts<'_, 'a, G> {
             let parts = self.root.retained_parts();
+            #[cfg(test)]
+            if let Some((carrier, _)) = &parts.components {
+                carrier.inspect_retained_resolver_reference();
+            }
             NativeConstructionParts {
                 inputs: &mut parts.inputs,
                 authority: &mut parts.authority,
@@ -5516,60 +5528,6 @@ pub(crate) mod native {
             let authority = Self::from_prepared(inputs, prepared, shared_revocation, source_fence);
             authority.current(Use::Create)?;
             Ok(authority)
-        }
-        /// Owns A with its REAL lifetimes. No leaked Box, fabricated static
-        /// borrow, Send conversion, reopened module or path authentication.
-        pub(crate) fn into_carrier<'a>(mut self) -> Result<Carrier<NativeKernel<'a, Self>>>
-        where
-            G: 'a,
-        {
-            let before = self.current(Use::Create)?;
-            let held = self.refresh(Use::Create)?;
-            let raw = held.module();
-            if self.image.module().map_err(denied)? != raw {
-                return Err(Error::Conflict);
-            }
-            self.gate
-                .authorize(&self.scope, Stage::Resolve, &self.observer)?;
-            same_record(&before, self.current(Use::Create)?).map_err(denied)?;
-            self.effect = Some(held);
-            let binding = self.binding.clone();
-            // SAFETY: real cold loader/package, SAME authenticated runtime,
-            // signed source, original image, serialized and cooperative leases
-            // are retained in Self; the mandatory unsafe lifecycle gate grants
-            // the independent actual effects, never this HMODULE number.
-            let module = unsafe { AuthenticatedModule::own(raw, self) };
-            wintun::native::retained_carrier(module, binding)
-        }
-        pub(crate) fn into_components<'a>(mut self) -> Result<CarrierComponents<'a, G>>
-        where
-            G: 'a,
-        {
-            let before = self.current(Use::Create)?;
-            let held = self.refresh(Use::Create)?;
-            let raw = held.module();
-            if self.image.module().map_err(denied)? != raw {
-                return Err(Error::Conflict);
-            }
-            self.gate
-                .authorize(&self.scope, Stage::Resolve, &self.observer)?;
-            same_record(&before, self.current(Use::Create)?).map_err(denied)?;
-            self.effect = Some(held);
-            let binding = self.binding.clone();
-            let signal = self.shared_revocation.clone();
-            let shared = SharedCarrierAuthority {
-                original: super::SharedOriginal::with_signal(self, signal),
-            };
-            let rows = NativeRowsAuthority {
-                shared: shared.other_pin(),
-                role: rows::Role::Carrier,
-            };
-            // SAFETY: both components retain ONE actual authority, not equal
-            // source/creator/lock metadata. G's required unsafe contract remains
-            // unchanged and has no permissive factory implementation.
-            let module = unsafe { AuthenticatedModule::own(raw, shared) };
-            let carrier = wintun::native::retained_carrier(module, binding)?;
-            Ok((carrier, rows))
         }
         fn row_use(&self) -> Result<Use> {
             let bytes = self
@@ -6248,85 +6206,9 @@ pub(crate) mod native {
     }
 }
 
-#[cfg(all(test, windows))]
-fn actual_original_runtime_composes_without_fabricating_or_borrowing_an_owner<
-    'a,
-    G: native::NativeLifecycleGate + 'a,
->(
-    module: super::member_carrier_module::native::LoadedWintun,
-    runtime: super::member_carrier_key_authority::RuntimeRead,
-    image: super::member_carrier_module::native::OriginalImage,
-    producer: super::member_carrier_creators::Producer<
-        super::member_carrier_wintun::native::OriginalWintun,
-    >,
-    scope: super::member_carrier_creators::Scope,
-    gate: G,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> super::member_carrier_wintun::Result<
-    super::member_carrier_wintun::Carrier<
-        super::member_carrier_wintun::native::NativeKernel<'a, native::NativeCarrierAuthority<G>>,
-    >,
-> {
-    // Compile-only integration: ALL arguments are actual privileged opaque
-    // owners. No mocked native authority or Windows execution is claimed.
-    native::NativeCarrierAuthority::new(module, runtime, image, producer, scope, gate, cancelled)?
-        .into_carrier()
-}
-
 #[cfg(test)]
 #[path = "member_carrier_construction_tests.rs"]
 mod construction_tests;
 #[cfg(test)]
 #[path = "member_carrier_runtime_tests.rs"]
 mod tests;
-
-#[cfg(all(test, windows))]
-fn actual_row_owner_and_carrier_share_one_retained_original_authority<
-    'a,
-    'p,
-    G: native::NativeLifecycleGate + 'a,
->(
-    authority: native::NativeCarrierAuthority<G>,
-    files: super::member_session::NativeSessionFiles,
-    prerequisite: crate::member_carrier_native_ownership::PrecreationReceipt<
-        'p,
-        super::member_carrier_keys::Held<super::member_carrier_keys::win32::Handle>,
-        super::member_carrier_key_authority::KeyLock,
-    >,
-    policy: crate::member_carrier_rows::AddressPolicy,
-    cancelled: &std::sync::atomic::AtomicBool,
-) -> super::member_carrier_wintun::Result<()> {
-    // Compile only. Not a factory caller, authority implementation or claim
-    // this stage was executed on Windows. Every owner is an actual native type.
-    let (mut carrier, mut rows) = authority.into_components()?;
-    carrier.create(prerequisite)?;
-    carrier.start()?;
-    let binding = rows
-        .binding()
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    let (store, old) = super::member_session::WindowsCarrierRowsStore::open(files, binding.clone())
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    if old.is_some() {
-        return Err(super::member_carrier_wintun::Error::Pending);
-    }
-    let row_read = rows.read_pin();
-    let mut owner = super::member_carrier_rows::RowOwner::capture_native(binding, rows, store)
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    owner
-        .create_address(policy)
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    owner
-        .wait_address_ready(cancelled)
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    let source = row_read.source_read(
-        owner
-            .created_address_read_pin()
-            .map_err(|_| super::member_carrier_wintun::Error::Conflict)?,
-    )?;
-    source.inspect_bindings(|_| Ok(()))?;
-    owner
-        .stop()
-        .map_err(|_| super::member_carrier_wintun::Error::Conflict)?;
-    drop(owner);
-    carrier.close_bounded(cancelled, 1000)
-}

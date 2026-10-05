@@ -69,7 +69,7 @@ def run() -> None:
         raise RuntimeError("Native factory cases require isolated Windows runners")
     matrix = native_job[1].split("    steps:", 1)[0]
     selected = re.findall(r"^          - ([a-z-]+)$", matrix, re.MULTILINE)
-    if len(cases) != 16 or len(set(cases)) != 16 or len(selected) != len(cases) or set(selected) != set(cases):
+    if len(cases) != 18 or len(set(cases)) != 18 or len(selected) != len(cases) or set(selected) != set(cases):
         raise RuntimeError("Native matrix must cover every actual factory case exactly once")
     if "-Case ${{ matrix.case }}" not in native_job[1]:
         raise RuntimeError("Native runner must select its explicit factory case")

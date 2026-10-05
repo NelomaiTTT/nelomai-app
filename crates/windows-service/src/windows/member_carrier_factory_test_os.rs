@@ -29,6 +29,12 @@ struct Inputs {
     module_originals: Vec<Weak<dyn Any>>,
     inventory_fault: Option<bool>,
     inventory_fault_reached: bool,
+    resolver_reference_fault: Option<bool>,
+    resolver_reference_fault_reached: bool,
+    resolver_reference_acquisitions: usize,
+    resolver_reference_releases: usize,
+    resolver_reference_original: Option<Weak<dyn Any>>,
+    resolver_retained_owner_inspections: usize,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativePublication {
@@ -178,6 +184,67 @@ pub(crate) fn native_module_loaded<T: Any>(module: &Rc<T>) {
             let original: Rc<dyn Any> = module.clone();
             inputs.module_originals.push(Rc::downgrade(&original));
         }
+    });
+}
+/// External failure after the real OS return, never a synthetic acquisition.
+pub(crate) fn native_resolver_reference_returned<T: Any>(original: &Rc<T>) -> io::Result<()> {
+    INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        let Some(inputs) = inputs.as_mut() else {
+            return Ok(());
+        };
+        inputs.resolver_reference_acquisitions += 1;
+        let original: Rc<dyn Any> = original.clone();
+        inputs.resolver_reference_original = Some(Rc::downgrade(&original));
+        if let Some(unwind) = inputs.resolver_reference_fault.take() {
+            inputs.resolver_reference_fault_reached = true;
+            assert_eq!(inputs.resolver_reference_acquisitions, 1);
+            assert_eq!(inputs.native_loads, 1);
+            assert!(inputs.module_originals[0].upgrade().is_some());
+            if unwind {
+                panic!("fixture post-GetModuleHandleEx reference return unwind");
+            }
+            return Err(io::Error::other(
+                "fixture resolver reference postflight lost",
+            ));
+        }
+        Ok(())
+    })
+}
+pub(crate) fn native_resolver_reference_release_attempted() {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            inputs.resolver_reference_releases += 1;
+        }
+    });
+}
+/// Inspect the actual kernel borrowed from the caller's construction slot.
+/// A release-counter alias alone cannot attest retention of the native pin.
+pub(crate) fn native_resolver_retained_owner<T: Any>(original: &Rc<T>, retains_original_pin: bool) {
+    INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        let Some(inputs) = inputs
+            .as_mut()
+            .filter(|v| v.resolver_reference_fault_reached)
+        else {
+            return;
+        };
+        let captured = inputs
+            .resolver_reference_original
+            .as_ref()
+            .expect("returned reference origin")
+            .upgrade()
+            .expect("retained reference origin");
+        let actual: Rc<dyn Any> = original.clone();
+        assert!(
+            Rc::ptr_eq(&actual, &captured),
+            "substituted kernel reference origin"
+        );
+        assert!(
+            retains_original_pin,
+            "rooted kernel lost its actual native reference"
+        );
+        inputs.resolver_retained_owner_inspections += 1;
     });
 }
 pub(crate) fn package_paths(source: &Path) -> io::Result<Option<[PathBuf; 5]>> {
@@ -337,6 +404,12 @@ impl Fixture {
                 module_originals: vec![],
                 inventory_fault: None,
                 inventory_fault_reached: false,
+                resolver_reference_fault: None,
+                resolver_reference_fault_reached: false,
+                resolver_reference_acquisitions: 0,
+                resolver_reference_releases: 0,
+                resolver_reference_original: None,
+                resolver_retained_owner_inspections: 0,
             })
         });
         // Real private-directory/ancestor/lock/CAS implementation creates state.
@@ -492,6 +565,50 @@ impl Fixture {
                 .as_mut()
                 .expect("fixture inputs")
                 .inventory_fault = Some(unwind)
+        });
+    }
+    pub(crate) fn lose_resolver_reference_postflight(&self, unwind: bool) {
+        INPUTS.with(|inputs| {
+            inputs
+                .borrow_mut()
+                .as_mut()
+                .expect("fixture inputs")
+                .resolver_reference_fault = Some(unwind);
+        });
+    }
+    pub(crate) fn require_retained_resolver_reference(&self, require_owner_inspection: bool) {
+        INPUTS.with(|inputs| {
+            let inputs = inputs.borrow();
+            let inputs = inputs.as_ref().expect("fixture inputs");
+            assert!(inputs.resolver_reference_fault_reached);
+            assert!(inputs.resolver_reference_fault.is_none());
+            if require_owner_inspection {
+                assert!(
+                    inputs.resolver_retained_owner_inspections > 0,
+                    "actual rooted kernel not inspected after original Stop"
+                );
+            }
+            assert_eq!(
+                inputs.resolver_reference_acquisitions, 1,
+                "native reference acquisition retried"
+            );
+            assert_eq!(
+                inputs.resolver_reference_releases, 0,
+                "uncertain resolver reference released"
+            );
+            assert!(
+                inputs
+                    .resolver_reference_original
+                    .as_ref()
+                    .expect("actual reference origin")
+                    .upgrade()
+                    .is_some(),
+                "caller lost the original native kernel reference owner"
+            );
+            assert!(
+                inputs.module_originals[0].upgrade().is_some(),
+                "caller lost the original loaded module owner"
+            );
         });
     }
     pub(crate) fn require_original_load_and_fault(&self, cleanup_pending: bool) {
