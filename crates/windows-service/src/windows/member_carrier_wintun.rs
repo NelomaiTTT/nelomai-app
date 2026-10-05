@@ -830,10 +830,12 @@ pub(crate) mod native {
             Self::Key: 'p,
             Self::MutationLock: 'p,
         {
-            self.verify(binding, Stage::BeforeCreate)?;
-            if !matches!(self.driver_version()?, None | Some(14)) {
-                return Err(Error::Unsupported);
-            }
+            self.live()?;
+            // Carrier already performed the factual driver/absence queries
+            // under BeforeCreate. The mandatory authorize_create below again
+            // verifies the FULL original package/running driver/universe and
+            // exact NEW-HKEY/lock LAST before the SDK effect. Repeating those
+            // early queries here cannot replace or strengthen that final gate.
             receipt::validate_record(prerequisite.record).map_err(|_| Error::Invalid)?;
             if prerequisite.binding.role != receipt::Role::RoleCarrier
                 || prerequisite.binding.guid != binding.guid
@@ -844,7 +846,6 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            self.absent(binding)?;
             // An additional actual reference to the SAME acknowledged image
             // stays with this original adapter ACK, including lost publication.
             // Acquired BEFORE final effect authorization; failure creates no NIC.

@@ -1643,9 +1643,9 @@ pub(crate) mod native {
             }
             let pair = self.pair.clone();
             #[cfg(test)]
-            if stage == StartupStage::Resolve {
+            if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
                 crate::windows::member_carrier_factory_test_os::trace_step(
-                    "C Resolve G original Pair inspection",
+                    "C creation G original Pair inspection",
                 );
             }
             pair.inspect_effect(
@@ -1656,9 +1656,9 @@ pub(crate) mod native {
                 |actual_pair| {
                     let before = self.sample(stage).map_err(io_denied)?;
                     #[cfg(test)]
-                    if stage == StartupStage::Resolve {
+                    if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
                         crate::windows::member_carrier_factory_test_os::trace_step(
-                            "C Resolve G first complete sample accepted",
+                            "C creation G first complete sample accepted",
                         );
                     }
                     let native = receipts::Record::decode(&before.native).map_err(io_denied)?;
@@ -1682,9 +1682,9 @@ pub(crate) mod native {
                         return Err(io_denied(()));
                     }
                     #[cfg(test)]
-                    if stage == StartupStage::Resolve {
+                    if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
                         crate::windows::member_carrier_factory_test_os::trace_step(
-                            "C Resolve G second complete sample accepted",
+                            "C creation G second complete sample accepted",
                         );
                     }
                     self.absence
