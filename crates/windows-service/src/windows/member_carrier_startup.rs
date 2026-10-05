@@ -1094,6 +1094,8 @@ pub(crate) mod native {
         /// but no image queries and no successful-native-return inference.
         pub(crate) fn verify_entry(&self, supervisor: &NativeDeadline) -> Result<()> {
             self.verify_origins(supervisor)?;
+            self.candidate
+                .verify_read_origin(&self.pair, &self.expected)?;
             let input = self.bootstrap.original_inputs();
             self.pair
                 .verify_module_only_read_entry(input.runtime, input.context, &self.expected)
@@ -1116,12 +1118,11 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            self.candidate
-                .verify_read_origin(&self.pair, &self.expected)?;
-            supervisor.verify_cleanup_runtime_entry(input.runtime, input.context)?;
-            self.lock
-                .verify_source(input.source)
-                .map_err(|_| Error::Conflict)
+            // Pure original joins only. The caller then performs the SAME
+            // complete candidate authentication (idle entry or actual Calling).
+            // That check includes cleanup Runtime entry and full Source/owner/
+            // original lease verification; nesting it here repeats the frame.
+            Ok(())
         }
         fn verify_call(&self) -> Result<()> {
             // The SAME Pair inspect frame is already active. Entry would begin
