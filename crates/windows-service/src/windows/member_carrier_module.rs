@@ -1578,6 +1578,16 @@ pub(crate) mod native {
             self.verify_cleanup_read()?;
             Ok(self.module.0)
         }
+        /// Factual SAME retained module comparison after the full runtime-bound
+        /// source/mapping read. Preserves cleanup poisoning and grants no native
+        /// effect permission or new module ownership.
+        pub(crate) fn cleanup_read_module_for_runtime(
+            &self,
+            runtime: &RuntimeRead,
+        ) -> Result<NonNull<c_void>> {
+            self.verify_runtime(runtime)?;
+            Ok(self.module.0)
+        }
         /// Comparison/read only. Never a raw-handle authority constructor.
         pub(crate) fn module(&self) -> Result<NonNull<c_void>> {
             self.verify()?;

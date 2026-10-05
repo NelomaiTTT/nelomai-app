@@ -523,15 +523,15 @@ impl OriginalWintun {
             return Err(creators::Error::Conflict);
         }
         self.runtime.verify(context).map_err(original_error)?;
-        self.image
-            .verify_runtime(&self.runtime)
-            .map_err(original_error)?;
-        if self.image.cleanup_read_module().map_err(original_error)?
+        if self
+            .image
+            .cleanup_read_module_for_runtime(&self.runtime)
+            .map_err(original_error)?
             != self.original.original_module()
         {
             return Err(creators::Error::Conflict);
         }
-        self.runtime.verify(context).map_err(original_error)
+        Ok(())
     }
     /// Opaque receipt can exist only after consuming this original Adapter in
     /// NativeKernel.close and its native void close call returning once. This
