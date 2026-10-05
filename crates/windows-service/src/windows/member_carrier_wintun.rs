@@ -437,26 +437,13 @@ pub(crate) mod native {
             }
         }
     }
-    struct ModuleReference(NonNull<c_void>, ClosedReferenceRelease);
-    impl Drop for ModuleReference {
-        fn drop(&mut self) {
-            if !self.1.was_attempted() {
-                // Legacy acknowledged native-close teardown only. The new
-                // explicit terminal path releases this reference beforehand;
-                // failed/unwound explicit attempts NEVER retry through Drop.
-                unsafe {
-                    FreeLibrary(self.0.as_ptr());
-                }
-            }
-        }
-    }
     struct AdapterResource {
         raw: NonNull<c_void>,
         context: receipt::Context,
         binding: receipt::Binding,
         generation: u64,
         tunnel_type: String,
-        module: ModuleReference,
+        module: std::rc::Rc<NativeKernelReferenceRead>,
         luid: Luid,
     }
     pub(crate) struct Adapter(OriginalReceipt<AdapterResource>);
@@ -477,7 +464,7 @@ pub(crate) mod native {
         ) -> Result<()> {
             original.verify_closed(closed)?;
             if !std::rc::Rc::ptr_eq(&self.0 .0, &original.0 .0)
-                || !self.0 .0.resource.module.1.acknowledged()
+                || self.0 .0.resource.module.verify_released().is_err()
             {
                 return Err(Error::Conflict);
             }
@@ -493,7 +480,7 @@ pub(crate) mod native {
             (&r.context, &r.binding, r.generation)
         }
         pub(super) fn original_module(&self) -> NonNull<c_void> {
-            self.0 .0.resource.module.0
+            self.0 .0.resource.module.original
         }
         pub(super) fn original_luid(&self) -> Result<u64> {
             let r = self.0.live_resource()?;
@@ -524,10 +511,14 @@ pub(crate) mod native {
         ) -> Result<()> {
             self.verify_closed(closed)?;
             let module = &self.0 .0.resource.module;
-            module.1.run(
-                || self.verify_closed(closed),
+            let pin = module.pin.get().ok_or(Error::Retired)?;
+            module.release.run(
                 || {
-                    if unsafe { FreeLibrary(module.0.as_ptr()) } == 0 {
+                    self.verify_closed(closed)?;
+                    module.verify_acquired_original()
+                },
+                || {
+                    if unsafe { FreeLibrary(pin.as_ptr()) } == 0 {
                         return Err(Error::Native);
                     }
                     Ok(())
@@ -535,6 +526,7 @@ pub(crate) mod native {
                 || {
                     // Factual ACK state is retained in the SAME original BEFORE
                     // external callback/postflight, even on Err/unwind.
+                    module.pin.set(None);
                     let ack = std::rc::Rc::new(OriginalAdapterModuleReleased(self.0.read_pin()));
                     retain(ack)?;
                     self.verify_closed(closed)
@@ -549,9 +541,7 @@ pub(crate) mod native {
             closed: &OriginalAdapterClosed,
         ) -> Result<std::rc::Rc<OriginalAdapterModuleReleased>> {
             self.verify_closed(closed)?;
-            if !self.0 .0.resource.module.1.acknowledged() {
-                return Err(Error::Pending);
-            }
+            self.0 .0.resource.module.verify_released()?;
             Ok(std::rc::Rc::new(OriginalAdapterModuleReleased(
                 self.0.read_pin(),
             )))
@@ -563,6 +553,7 @@ pub(crate) mod native {
         module: AuthenticatedModule<'a, A>,
         functions: Functions,
         reference: std::rc::Rc<NativeKernelReferenceRead>,
+        adapter_reference: Option<std::rc::Rc<NativeKernelReferenceRead>>,
         clock: Instant,
     }
     /// SAME actual extra-reference owner and its original acquire/release
@@ -577,11 +568,15 @@ pub(crate) mod native {
     }
     pub(crate) struct NativeCarrierComponentsTerminalRead {
         reference: std::rc::Rc<NativeKernelReferenceRead>,
+        adapter_reference: Option<std::rc::Rc<NativeKernelReferenceRead>>,
         session: SessionEndRead,
     }
     impl NativeCarrierComponentsTerminalRead {
         pub(crate) fn verify_released(&self) -> Result<()> {
             self.reference.verify_released()?;
+            if let Some(reference) = &self.adapter_reference {
+                reference.verify_released()?;
+            }
             if !matches!(
                 self.session.0.state.get(),
                 SessionEndState::NeverStarted | SessionEndState::Acknowledged
@@ -607,6 +602,12 @@ pub(crate) mod native {
             }
             Ok(())
         }
+        fn verify_acquired_original(&self) -> Result<()> {
+            if !self.attempted.get() {
+                return Err(Error::Pending);
+            }
+            self.live()
+        }
         #[cfg(test)]
         pub(in crate::windows) fn verify_retained_original(&self) -> Result<()> {
             if !self.attempted.get() || self.release.was_attempted() {
@@ -626,12 +627,7 @@ pub(crate) mod native {
         fn release_original(&self) -> Result<()> {
             let pin = self.pin.get().ok_or(Error::Retired)?;
             self.release.run(
-                || {
-                    if !self.attempted.get() {
-                        return Err(Error::Pending);
-                    }
-                    self.live()
-                },
+                || self.verify_acquired_original(),
                 || {
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::native_resolver_reference_release_attempted();
@@ -658,6 +654,7 @@ pub(crate) mod native {
         ) -> std::rc::Rc<NativeCarrierComponentsTerminalRead> {
             std::rc::Rc::new(NativeCarrierComponentsTerminalRead {
                 reference: self.kernel_reference_read(),
+                adapter_reference: self.kernel.adapter_reference.clone(),
                 session: self.session_end_read(),
             })
         }
@@ -666,6 +663,11 @@ pub(crate) mod native {
                 || self.adapter.is_some()
                 || self.session.is_some()
                 || self.kernel.reference.verify_released().is_err()
+                || self
+                    .kernel
+                    .adapter_reference
+                    .as_ref()
+                    .is_some_and(|reference| reference.verify_released().is_err())
                 || !matches!(
                     self.session_end.state.get(),
                     SessionEndState::NeverStarted | SessionEndState::Acknowledged
@@ -721,6 +723,7 @@ pub(crate) mod native {
             })?;
             Ok(Self {
                 reference: std::rc::Rc::new(NativeKernelReferenceRead::new(module.module)),
+                adapter_reference: None,
                 module,
                 functions,
                 clock: Instant::now(),
@@ -867,25 +870,32 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            // An additional actual reference to the SAME acknowledged image
-            // stays with this original adapter ACK, including lost publication.
-            // Acquired BEFORE final effect authorization; failure creates no NIC.
+            // Root this DISTINCT extra-reference owner before the OS attempt.
+            // Failed authorization/create keeps it in the original kernel;
+            // successful create shares this SAME owner with the adapter ACK.
+            if self.adapter_reference.is_some() {
+                return Err(Error::Pending);
+            }
+            let original_module =
+                std::rc::Rc::new(NativeKernelReferenceRead::new(self.module.module));
+            self.adapter_reference = Some(original_module.clone());
+            original_module.attempted.set(true);
             let mut raw_pin: HMODULE = ptr::null_mut();
-            if unsafe {
+            let returned = unsafe {
                 GetModuleHandleExW(
                     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                     self.module.module.as_ptr().cast(),
                     &mut raw_pin,
                 )
-            } == 0
-            {
+            };
+            // FIRST preserve the actual returned output, including unexpected
+            // identity/failure. No Err/unwind or Drop can unload or retry it.
+            original_module.pin.set(NonNull::new(raw_pin));
+            original_module.returned.set(returned != 0);
+            if returned == 0 {
                 return Err(Error::Native);
             }
-            let original_module = ModuleReference(
-                NonNull::new(raw_pin).ok_or(Error::Native)?,
-                ClosedReferenceRelease::new(),
-            );
-            if original_module.0 != self.module.module {
+            if raw_pin != self.module.module.as_ptr() {
                 return Err(Error::Conflict);
             }
             let context = prerequisite.record.context.clone();
