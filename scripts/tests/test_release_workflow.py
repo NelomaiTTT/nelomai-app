@@ -4,13 +4,143 @@ import shlex
 import os
 import subprocess
 import unittest
+import hashlib
+import json
+import tempfile
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 import yaml
 
-from scripts.tests.test_runtime_artifact import ROOT
+from scripts.tests.test_runtime_artifact import ROOT, module
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_windows_build_artifact_is_source_bound_and_every_byte_is_checked(self):
+        artifact = module("windows/carrier-factory-artifact")
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "input"
+            runtime.mkdir()
+            test = root / "suite.exe"
+            test.write_bytes(b"service library test bytes")
+            for name in artifact.RUNTIME_FILES:
+                (runtime / name).write_bytes(name.encode())
+            output = root / "artifact"
+            digest = artifact.create(test, runtime, output, source)
+            artifact.verify(output, source, digest)
+            for relative in artifact.PAYLOAD_FILES:
+                with self.subTest(file=relative):
+                    path = output / relative
+                    original = path.read_bytes()
+                    path.write_bytes(original + b"changed")
+                    with self.assertRaises(ValueError):
+                        artifact.verify(output, source, digest)
+                    path.write_bytes(original)
+            manifest = output / "manifest.json"
+            original = manifest.read_bytes()
+            data = json.loads(original)
+            data["source_sha"] = "0" * 40
+            manifest.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, digest)  # external build digest, not self-described
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, hashlib.sha256(manifest.read_bytes()).hexdigest())
+            data["source_sha"] = source
+            data["files"]["../outside"] = data["files"].pop("runtime/wintun.dll")
+            manifest.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, hashlib.sha256(manifest.read_bytes()).hexdigest())
+            manifest.write_bytes(original)
+            with self.assertRaises(ValueError):
+                artifact.verify(output, "0" * 40, digest)  # actual checkout HEAD remains mandatory
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, "")  # missing build output cannot fall back
+            outputs = root / "github-output"
+            cli_output = root / "cli-artifact"
+            name = "windows-factory-99-1-" + source
+            subprocess.run([sys.executable, str(ROOT / "scripts/windows/carrier-factory-artifact.py"), "create",
+                            "--test-executable", str(test), "--runtime-directory", str(runtime),
+                            "--output", str(cli_output), "--source-sha", source, "--artifact-name", name],
+                           env={**os.environ, "GITHUB_OUTPUT": str(outputs)}, check=True)
+            self.assertEqual(outputs.read_text().splitlines(), ["manifest_sha256=" + digest, "artifact_name=" + name])
+            subprocess.run([sys.executable, str(ROOT / "scripts/windows/carrier-factory-artifact.py"), "verify",
+                            "--directory", str(cli_output), "--source-sha", source, "--manifest-sha256", digest], check=True)
+
+    def test_windows_artifact_rejects_extra_missing_and_nonregular_paths(self):
+        artifact = module("windows/carrier-factory-artifact")
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "input"
+            runtime.mkdir()
+            test = root / "suite.exe"
+            test.write_bytes(b"suite")
+            for name in artifact.RUNTIME_FILES:
+                (runtime / name).write_bytes(name.encode())
+            output = root / "artifact"
+            digest = artifact.create(test, runtime, output, source)
+            for directory in (False, True):
+                extra = output / "unexpected"
+                extra.mkdir() if directory else extra.write_bytes(b"extra")
+                with self.assertRaises(ValueError):
+                    artifact.verify(output, source, digest)
+                extra.rmdir() if directory else extra.unlink()
+            path = output / "factory-tests.exe"
+            path.unlink()
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, digest)
+            path.mkdir()
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, digest)
+            path.rmdir()
+            path.symlink_to(test)
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, digest)
+            path.unlink()
+            path.write_bytes(b"suite")
+            original_runtime = root / "original-runtime"
+            (output / "runtime").rename(original_runtime)
+            (output / "runtime").symlink_to(original_runtime, target_is_directory=True)
+            with self.assertRaises(ValueError):
+                artifact.verify(output, source, digest)
+
+    def test_windows_factory_build_and_native_graph_rejects_guard_bypasses(self):
+        import copy
+        checker = module("release-workflow-check")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+        checker.assert_windows_factory_jobs(workflow, factory)
+        mutations = (
+            lambda jobs: jobs["windows"]["needs"].remove("windows-build"),
+            lambda jobs: jobs["windows"]["steps"][0].update(run='test "$NATIVE_RESULT" = success'),
+            lambda jobs: jobs["windows-native"].update(needs=[]),
+            lambda jobs: jobs["windows-native"]["strategy"]["matrix"]["case"].pop(),
+            lambda jobs: jobs["windows-native"]["steps"][2]["with"].update(name="old-artifact"),
+            lambda jobs: jobs["windows-native"]["env"].update(MANIFEST_SHA256="self-described"),
+            lambda jobs: jobs["windows-native"]["steps"][3].update(run="echo verify skipped"),
+            lambda jobs: jobs["windows-native"]["steps"][4].update(**{"continue-on-error": True}),
+            lambda jobs: jobs["windows-build"]["steps"][3].update(run="cargo check -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
+            lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),
+            lambda jobs: jobs["windows-build"]["steps"][6].update(run="cargo build -p nelomai-windows-service"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                changed = copy.deepcopy(workflow)
+                mutate(changed["jobs"])
+                with self.assertRaises((RuntimeError, KeyError, ValueError)):
+                    checker.assert_windows_factory_jobs(changed, factory)
+        for build in ("success", "failure", "skipped", "cancelled"):
+            for native in ("success", "failure", "skipped", "cancelled"):
+                result = subprocess.run(["bash", "-e", "-c", workflow["jobs"]["windows"]["steps"][0]["run"]],
+                                        env={**os.environ, "BUILD_RESULT": build, "NATIVE_RESULT": native},
+                                        capture_output=True)
+                self.assertEqual(result.returncode == 0, build == native == "success")
+        with self.assertRaises(RuntimeError):
+            checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 2", "None => cases.len()"))
+
     def expression(self, expression, *, mode, result="success", cancelled=False):
         """Evaluate the boolean/string expressions used by our dispatch graph."""
         expression = expression.removeprefix("${{").removesuffix("}}").strip()

@@ -190,35 +190,18 @@ jobs:
             -p plugins/push-android/android \
             testDebugUnitTest
 
-  windows-native:
+  windows-build:
     if: github.event_name != 'workflow_dispatch'
-    name: windows-native (${{ matrix.case }})
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        case:
-          - primary
-          - module-load-read-error
-          - module-load-read-unwind
-          - resolver-reference-error
-          - resolver-reference-unwind
-          - carrier-ack
-          - carrier-unwind
-          - member-ack
-          - member-unwind
-          - running-ack
-          - running-unwind
-          - cold
-          - primary-data-denial
-          - creator-ack
-          - initial-native-ack
-          - initial-native-unwind
-          - fresh-ack
-          - starting-ack
+    outputs:
+      manifest_sha256: ${{ steps.artifact.outputs.manifest_sha256 }}
+      artifact_name: ${{ steps.artifact.outputs.artifact_name }}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -251,18 +234,6 @@ jobs:
       # lease. Run this one test separately under its real production principal;
       # its selector/coordinator/ownership/native gates are not replaced.
       - run: cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair
-      - name: Actual factory lifecycle under SYSTEM
-        timeout-minutes: 55
-        run: |
-          $build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
-            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_service' -and $_.profile.test -and $_.executable
-          })
-          if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
-          ./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable $tests[0].executable `
-            -RuntimeDirectory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
-            -OutputDirectory $env:RUNNER_TEMP -Case ${{ matrix.case }}
       # Read-only existing HKCU key. Log the actual native in/out-size contract;
       # this cannot grant SACL access, product key ownership or disposition.
       - name: Readonly original-key security buffer gate
@@ -283,16 +254,99 @@ jobs:
           $selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
           if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
           cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1
+      - name: Assemble exact factory test artifact
+        id: artifact
+        env:
+          ARTIFACT_NAME: windows-factory-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+        run: |
+          $build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_service' -and $_.profile.test -and $_.executable
+          })
+          if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
+          python scripts/windows/carrier-factory-artifact.py create `
+            --test-executable $tests[0].executable --runtime-directory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
+            --output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.artifact_name }}
+          path: ${{ runner.temp }}/factory-artifact/
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-native:
+    if: github.event_name != 'workflow_dispatch'
+    needs: [windows-build]
+    name: windows-native (${{ matrix.case }})
+    runs-on: windows-latest
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      MANIFEST_SHA256: ${{ needs.windows-build.outputs.manifest_sha256 }}
+      ARTIFACT_NAME: ${{ needs.windows-build.outputs.artifact_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - primary
+          - module-load-read-error
+          - module-load-read-unwind
+          - resolver-reference-error
+          - resolver-reference-unwind
+          - carrier-ack
+          - carrier-unwind
+          - member-ack
+          - member-unwind
+          - running-ack
+          - running-unwind
+          - cold
+          - primary-data-denial
+          - creator-ack
+          - initial-native-ack
+          - initial-native-unwind
+          - fresh-ack
+          - starting-ack
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: Require successful build artifact outputs
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_NAME) -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$') {
+            throw 'Missing successful build artifact outputs; no fallback'
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.windows-build.outputs.artifact_name }}
+          path: ${{ runner.temp }}/factory-artifact/
+      - name: Verify current-source factory artifact before execution
+        run: |
+          python scripts/windows/carrier-factory-artifact.py verify `
+            --directory "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --manifest-sha256 $env:MANIFEST_SHA256
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # One fresh runner per case; retain the SAME unimpersonated SYSTEM harness
+      # and its exact fault/completion counts. No build or previous-run fallback.
+      - name: Actual factory lifecycle under SYSTEM
+        timeout-minutes: 55
+        run: |
+          ./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable "$env:RUNNER_TEMP/factory-artifact/factory-tests.exe" `
+            -RuntimeDirectory "$env:RUNNER_TEMP/factory-artifact/runtime" `
+            -OutputDirectory $env:RUNNER_TEMP -Case ${{ matrix.case }}
 
   windows:
     if: ${{ always() && github.event_name != 'workflow_dispatch' }}
-    needs: [windows-native]
+    needs: [windows-build, windows-native]
     runs-on: ubuntu-latest
     steps:
-      - name: Require every isolated native factory case
+      - name: Require common build and every isolated native factory case
         env:
+          BUILD_RESULT: ${{ needs.windows-build.result }}
           NATIVE_RESULT: ${{ needs.windows-native.result }}
-        run: test "$NATIVE_RESULT" = success
+        run: |
+          test "$BUILD_RESULT" = success
+          test "$NATIVE_RESULT" = success
 
   macos:
     if: github.event_name != 'workflow_dispatch'

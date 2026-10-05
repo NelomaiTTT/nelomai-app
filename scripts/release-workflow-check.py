@@ -11,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 
+import yaml
+
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
@@ -25,6 +27,146 @@ def assert_amneziawg_go_workflow_revision(workflow: str, label: str) -> None:
     checked_revision = re.search(r"[a-f0-9]{40}", workflow.split(marker, 1)[1][:256])
     if checked_revision is None or checked_revision.group(0) != AMNEZIAWG_GO_REVISION:
         raise RuntimeError(f"{label} uses another AmneziaWG Go revision")
+
+
+def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
+    """Require the actual producer/consumer graph and its critical programs."""
+    def require(condition, message):
+        if not condition:
+            raise RuntimeError(message)
+
+    def program(step):
+        return "\n".join(line.strip() for line in step.get("run", "").splitlines()
+                         if line.strip() and not line.strip().startswith("#"))
+
+    jobs = workflow["jobs"]
+    require(set(jobs) == {"linux-package-diagnostic", "frontend", "rust", "android-plugin",
+                          "windows-build", "windows-native", "windows", "macos", "contracts-python"},
+            "Checks must retain all six required checks and the isolated Windows graph")
+    require("defaults" not in workflow, "Checks cannot override critical command shells")
+    build, native, aggregate = (jobs[name] for name in ("windows-build", "windows-native", "windows"))
+    for name, job in (("windows-build", build), ("windows-native", native), ("windows", aggregate)):
+        require(set(job) <= {"if", "name", "runs-on", "env", "steps", "outputs", "needs", "strategy"},
+                f"{name} cannot mask or replace its execution/status gates")
+        for step in job["steps"]:
+            require(set(step) <= {"name", "uses", "with", "run", "id", "env", "timeout-minutes"},
+                    f"{name} steps must execute unconditionally and fail normally")
+    for name in ("frontend", "rust", "android-plugin", "windows-build", "windows-native", "macos", "contracts-python"):
+        require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
+                f"{name} cannot skip normal checks")
+    require(build["runs-on"] == native["runs-on"] == "windows-latest", "Every native case needs a fresh Windows runner")
+    require("strategy" not in build and "needs" not in build, "Windows common build must execute only once")
+    require(native.get("needs") == ["windows-build"], "Native execution must require the successful common build")
+    require(build.get("env") == {"SOURCE_SHA": "${{ github.sha }}"}, "Build must pin the current source")
+    require(build.get("outputs") == {
+        "manifest_sha256": "${{ steps.artifact.outputs.manifest_sha256 }}",
+        "artifact_name": "${{ steps.artifact.outputs.artifact_name }}"}, "Build must expose its original artifact name and digest")
+    require(native.get("env") == {
+        "SOURCE_SHA": "${{ github.sha }}",
+        "MANIFEST_SHA256": "${{ needs.windows-build.outputs.manifest_sha256 }}",
+        "ARTIFACT_NAME": "${{ needs.windows-build.outputs.artifact_name }}"}, "Consumer must bind the successful build outputs")
+    inventory = re.search(r"(?:for case in|let cases =)\s*\[([^]]+)\]", factory_test)
+    require(inventory is not None, "Missing actual factory case inventory")
+    cases = re.findall(r'"([a-z-]+)"', inventory.group(1))
+    parent_count = re.search(r"let expected = match selected\.as_deref\(\) \{(.*?)\};\s*assert_eq!\(completed, expected\);", factory_test, re.DOTALL)
+    require(parent_count is not None and " ".join(parent_count.group(1).split()) ==
+            'Some("resolver-reference-error" | "resolver-reference-unwind") => 2, Some(_) => 1, None => cases.len() + 2,',
+            "Actual native parent must require exact resolver/adapter and ordinary child completion counts")
+    harness = (ROOT / "scripts/windows/test-carrier-factory-system.ps1").read_text()
+    completion = re.search(r"^ *\$expectedCompleted =.*?^ *\}", harness, re.MULTILINE | re.DOTALL)
+    require(completion is not None and "\n".join(line.strip() for line in completion.group(0).splitlines()) == r"""$expectedCompleted = if ($Case -in @('resolver-reference-error', 'resolver-reference-unwind')) { 2 } else { 1 }
+if ($output -notmatch ('(?m)^actual native factory coverage case=' + [regex]::Escape($Case) + ' completed=' + $expectedCompleted + '\r?$')) {
+throw 'Missing exact selected factory case completion; no partial-matrix PASS'
+}""", "SYSTEM harness must reject incomplete selected child coverage")
+    strategy = native["strategy"]
+    selected = strategy.get("matrix", {}).get("case", [])
+    require(set(strategy) == {"fail-fast", "matrix"} and strategy["fail-fast"] is False
+            and set(strategy["matrix"]) == {"case"}, "Native matrix cannot suppress remaining cases")
+    require(len(cases) == len(set(cases)) == len(selected) == len(set(selected)) == 18
+            and set(selected) == set(cases), "Native matrix must cover every actual factory case exactly once")
+    checkout = {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "submodules": "recursive"}}
+    require(build["steps"][0] == native["steps"][0] == checkout, "Producer and consumer checkouts must use exact current SHA")
+    require(build["steps"][1] == {"uses": "dtolnay/rust-toolchain@master", "with": {
+        "toolchain": "1.88.0", "components": "rustfmt, clippy"}}, "Common build must retain the audited toolchain")
+    build_programs = [
+        'cargo check -p nelomai-windows-service --all-targets',
+        'cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings',
+        'cargo check -p nelomai-app',
+        'cargo test -p nelomai-client-updater',
+        """cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
+Write-Output "Actual factory release engine bytes=$((Get-Item -LiteralPath $engine).Length)"
+$runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
+./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wintun.dll')).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
+throw 'Audited factory Wintun input hash mismatch'
+}
+if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.dll')).Hash.ToLowerInvariant() -ne 'b1b85e072c45d81358be29d94c599dc76652f912be8c0f0a41e2d5d89a6461d3') {
+throw 'Audited factory WireGuard DLL hash mismatch'
+}
+"NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append""",
+        'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
+        """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$selected = @($tests | Where-Object { $_ -match 'native_security_buffer_sizes_readonly_descriptor_without_capacity_padding: test$' })
+if ($selected.Count -ne 1) { throw 'Expected exactly one readonly security-size gate; no empty-filter PASS' }
+cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --nocapture --test-threads=1""",
+        """$tests = & cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --list
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
+if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
+cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1""",
+        """$build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
+$_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_service' -and $_.profile.test -and $_.executable
+})
+if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
+python scripts/windows/carrier-factory-artifact.py create `
+--test-executable $tests[0].executable --runtime-directory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
+--output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
+    ]
+    require(len(build["steps"]) == 12 and [program(step) for step in build["steps"][2:-1]] == build_programs,
+            "Common build must retain all strict compile/test/release/DLL/security/TxR gates before artifact assembly")
+    require(all("env" not in step for step in build["steps"][:10]), "Common gates cannot override their source/runtime environment")
+    require(build["steps"][8].get("timeout-minutes") == build["steps"][9].get("timeout-minutes") == 2,
+            "Native readonly and isolated TxR gate budgets must remain unchanged")
+    artifact = build["steps"][-2]
+    require(artifact.get("id") == "artifact" and artifact.get("env") == {
+        "ARTIFACT_NAME": "windows-factory-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}"},
+        "Artifact name must identify its build run, attempt and source")
+    require(build["steps"][-1] == {"uses": "actions/upload-artifact@v4", "with": {
+        "name": "${{ steps.artifact.outputs.artifact_name }}", "path": "${{ runner.temp }}/factory-artifact/",
+        "if-no-files-found": "error", "retention-days": 1}}, "Upload only the exact successful build artifact for one day")
+    require(len(native["steps"]) == 5, "Native cases must only download/verify and execute, never rebuild or fall back")
+    native_programs = [
+        """if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_NAME) -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$') {
+throw 'Missing successful build artifact outputs; no fallback'
+}""",
+        """python scripts/windows/carrier-factory-artifact.py verify `
+--directory "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --manifest-sha256 $env:MANIFEST_SHA256
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
+        """./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable "$env:RUNNER_TEMP/factory-artifact/factory-tests.exe" `
+-RuntimeDirectory "$env:RUNNER_TEMP/factory-artifact/runtime" `
+-OutputDirectory $env:RUNNER_TEMP -Case ${{ matrix.case }}""",
+    ]
+    require([program(step) for step in native["steps"] if "run" in step] == native_programs,
+            "Native artifact outputs/manifest must be checked before the unchanged explicit-case SYSTEM harness")
+    require(native["steps"][2] == {"uses": "actions/download-artifact@v4", "with": {
+        "name": "${{ needs.windows-build.outputs.artifact_name }}", "path": "${{ runner.temp }}/factory-artifact/"}},
+        "Native case must download only this successful build, without previous-run or cache fallback")
+    require(all("env" not in step for step in native["steps"]), "Native steps cannot override pinned build outputs")
+    require(native["steps"][-1].get("timeout-minutes") == 55, "SYSTEM factory aperture must remain unchanged")
+    require(aggregate.get("if") == "${{ always() && github.event_name != 'workflow_dispatch' }}"
+            and aggregate.get("needs") == ["windows-build", "windows-native"]
+            and aggregate["runs-on"] == "ubuntu-latest" and len(aggregate["steps"]) == 1,
+            "Required Windows check must observe both producer and every native case even on failure")
+    require(aggregate["steps"][0].get("env") == {
+        "BUILD_RESULT": "${{ needs.windows-build.result }}", "NATIVE_RESULT": "${{ needs.windows-native.result }}"}
+        and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\ntest "$NATIVE_RESULT" = success',
+        "Required Windows check must reject cancelled/skipped/failed producer or matrix")
 
 
 def run() -> None:
@@ -57,29 +199,10 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     assert_amneziawg_go_workflow_revision(workflow, "release workflow")
     assert_amneziawg_go_workflow_revision(checks_workflow, "checks workflow")
-    # Unknown partial cleanup cannot establish a clean starting VM for the next
-    # case. Keep every existing case mandatory, on its own disposable runner.
+    # Parsed topology and exact critical programs; a token in a comment cannot
+    # stand in for an executing build, digest comparison or failure gate.
     factory_test = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
-    factory_cases = re.search(r"(?:for case in|let cases =)\s*\[([^]]+)\]", factory_test)
-    if factory_cases is None:
-        raise RuntimeError("Missing actual factory case inventory")
-    cases = re.findall(r'"([a-z-]+)"', factory_cases.group(1))
-    native_job = checks_workflow.split("  windows-native:", 1)
-    if len(native_job) != 2:
-        raise RuntimeError("Native factory cases require isolated Windows runners")
-    matrix = native_job[1].split("    steps:", 1)[0]
-    selected = re.findall(r"^          - ([a-z-]+)$", matrix, re.MULTILINE)
-    if len(cases) != 18 or len(set(cases)) != 18 or len(selected) != len(cases) or set(selected) != set(cases):
-        raise RuntimeError("Native matrix must cover every actual factory case exactly once")
-    if "-Case ${{ matrix.case }}" not in native_job[1]:
-        raise RuntimeError("Native runner must select its explicit factory case")
-    runtime_input = native_job[1].split("      - name: Actual factory runtime input\n", 1)[1].split("      # The actual factory", 1)[0]
-    if "cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release" not in runtime_input or "target/release/nelomai-windows-service.exe" not in runtime_input:
-        raise RuntimeError("Actual factory signed runtime must use the shipping release engine")
-    aggregate = checks_workflow.split("  windows:", 1)[1].split("  macos:", 1)[0]
-    for token in ("needs: [windows-native]", "always()", "needs.windows-native.result", 'test "$NATIVE_RESULT" = success'):
-        if token not in aggregate:
-            raise RuntimeError(f"Windows required check misses matrix completion guard: {token}")
+    assert_windows_factory_jobs(yaml.safe_load(checks_workflow), factory_test)
     submodule_entry = subprocess.run(
         ["git", "-C", str(ROOT), "ls-files", "--stage", "vendor/amneziawg-go"],
         check=True,
