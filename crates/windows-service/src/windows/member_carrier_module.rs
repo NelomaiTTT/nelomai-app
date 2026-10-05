@@ -1935,12 +1935,21 @@ pub(crate) mod native {
                 },
                 |boundary, originals| {
                     let package = boundary.package.as_mut().ok_or(Error::Conflict)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "C module original package reattestation begin",
+                    );
                     if cleanup {
                         package.reattest_owned_cleanup(&mut originals.cleanup_devices())
                     } else {
                         package.reattest_owned(originals)
                     }
-                    .map_err(|_| Error::Conflict)
+                    .map_err(|_| Error::Conflict)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "C module original package reattestation accepted",
+                    );
+                    Ok(())
                 },
             )?;
             let Some(runtime) = retained_runtime else {

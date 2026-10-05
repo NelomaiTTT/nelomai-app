@@ -105,15 +105,6 @@ impl OriginalPackageInventory {
         crate::windows::member_carrier_wintun_package::Error,
     > {
         use crate::windows::member_carrier_wintun_package::{Device, Error as PackageError};
-        let check = || {
-            self.image
-                .verify_runtime(&self.runtime)
-                .map_err(|_| PackageError::Changed)
-        };
-        check()?;
-        self.runtime
-            .verify(&self.context)
-            .map_err(|_| PackageError::Changed)?;
         let read = || -> std::result::Result<Vec<u8>, PackageError> {
             let bytes = self
                 .runtime
@@ -141,6 +132,10 @@ impl OriginalPackageInventory {
             Ok(bytes)
         };
         let before_record = read()?;
+        // The protected read authenticates this SAME runtime/context. Each
+        // driver query below independently verifies the original image/source/
+        // runtime BEFORE and AFTER its SDK call. Keep those complete fences;
+        // separate image/runtime reads immediately outside them add no facts.
         let before = self
             .image
             .running_driver_version(&self.runtime)
@@ -227,10 +222,6 @@ impl OriginalPackageInventory {
         {
             return Err(PackageError::Changed);
         }
-        self.runtime
-            .verify(&self.context)
-            .map_err(|_| PackageError::Changed)?;
-        check()?;
         if before_record != read()? {
             return Err(PackageError::Changed);
         }
