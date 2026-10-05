@@ -611,30 +611,32 @@ pub(crate) mod native {
         fn records(&mut self) -> ReadResult<[Option<Vec<u8>>; 10]> {
             let bootstrap = self.bootstrap()?;
             let input = bootstrap.original_inputs();
-            let mut observed = std::array::from_fn(|_| None);
-            for (i, kind) in [
-                RecordKind::Session,
-                RecordKind::Pair,
-                RecordKind::Network,
-                RecordKind::Carrier,
-                RecordKind::NativeCarrierReceipts,
-                RecordKind::CarrierGuard,
-                RecordKind::CarrierRows,
-                RecordKind::MemberARows,
-                RecordKind::MemberBRows,
-                RecordKind::NativeCreator,
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                observed[i] = boundary(input.runtime.optional_record(input.context, kind))
-                    .inspect_err(|_error| {
-                        #[cfg(test)]
-                        crate::windows::member_carrier_factory_test_os::trace_step(
-                            "module-only original inventory read denied",
-                        );
-                    })?;
-            }
+            // Two complete inventories bracket runtime authentication through
+            // the existing batch reader. Separate per-kind authentication
+            // repeats the same package work and cannot form a stronger join.
+            let observed: [Option<Vec<u8>>; 10] = boundary(input.runtime.optional_records(
+                input.context,
+                &[
+                    RecordKind::Session,
+                    RecordKind::Pair,
+                    RecordKind::Network,
+                    RecordKind::Carrier,
+                    RecordKind::NativeCarrierReceipts,
+                    RecordKind::CarrierGuard,
+                    RecordKind::CarrierRows,
+                    RecordKind::MemberARows,
+                    RecordKind::MemberBRows,
+                    RecordKind::NativeCreator,
+                ],
+            ))
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "module-only original inventory read denied",
+                );
+            })?
+            .try_into()
+            .map_err(|_| ReadError::Changed)?;
             // SAME protected Pair store publishes an envelope, not a bare
             // Record. Decode its strict scope-bound carrier payload; a legacy
             // or foreign envelope must still deny, never supply native rights.
