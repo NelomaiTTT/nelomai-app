@@ -6059,6 +6059,21 @@ pub(crate) mod native {
                 Use::Live
             };
             let before = self.current(use_)?;
+            if stage == Stage::BeforeCreate {
+                // Carrier and native kernel perform factual driver/absence
+                // queries before the final SDK effect seam. They cannot create
+                // a pending token or grant SDK creation. Authenticate the SAME
+                // live original image/runtime and exact Preparing receipt here.
+                // authorize_create independently runs the complete package/G,
+                // actual NEW-HKEY/DWORD0 and lock gate LAST before CreateAdapter.
+                self.image
+                    .verify_live_runtime(&self.runtime)
+                    .map_err(denied)?;
+                same_record(&before, self.current(Use::Create)?).map_err(denied)?;
+                self.verify_supervised()?;
+                self.failed = false;
+                return Ok(());
+            }
             #[cfg(test)]
             if stage == Stage::Resolve {
                 super::super::member_carrier_factory_test_os::trace_step(

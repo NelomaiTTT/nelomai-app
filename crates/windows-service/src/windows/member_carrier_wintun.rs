@@ -341,9 +341,12 @@ pub(crate) mod native {
     /// BEFORE original executable DLL load it must inspect embedded INF AS DATA,
     /// exact installed matching package, signed system driver, ALL legacy/problem
     /// and foreign Wintun devices. DLL initialization itself removes legacy NICs.
-    /// Resolve/BeforeCreate/BeforeClose recheck maintenance safety and package
-    /// continuity: upstream create invokes DriverInstall and close queues orphan
-    /// cleanup. Missing/older/mismatched packages never permit install/upgrade.
+    /// Resolve/BeforeClose and the mandatory LAST authorize_create seam recheck
+    /// maintenance safety and package continuity: upstream create invokes
+    /// DriverInstall and close queues orphan cleanup. BeforeCreate authenticates
+    /// only factual driver/absence queries through the live original image;
+    /// it cannot issue a pending creation token or replace authorize_create.
+    /// Missing/older/mismatched packages never permit install/upgrade.
     /// Each call must independently revalidate full scope/boot/runtime/epoch and
     /// actual held lock AND effect permission. BeforeSession/BeforeDrain need
     /// fresh live permission; BeforeEnd/BeforeClose need cleanup permission and

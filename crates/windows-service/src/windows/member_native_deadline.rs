@@ -901,13 +901,20 @@ impl NativeDeadlineReadPin {
         {
             return Err(CarrierError::Conflict);
         }
-        self.runtime.verify(context)?;
+        // Owner/pin comparisons are readonly. Bracket the one complete
+        // RuntimeRead authentication with both original owner/pin checks,
+        // rather than nesting two full runtime brackets around those facts.
         owner.verify_lease()?;
         owner
             .deadline
             .verify_pin(&self.policy, context)
             .map_err(denied)?;
         self.runtime.verify(context)?;
+        owner.verify_lease()?;
+        owner
+            .deadline
+            .verify_pin(&self.policy, context)
+            .map_err(denied)?;
         attempt.succeeded = true;
         Ok(())
     }

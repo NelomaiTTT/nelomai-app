@@ -1355,7 +1355,9 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify_source(&self.source).map_err(denied)?;
+            if !self.image.matches_source(&self.source) {
+                return Err(wintun::Error::Conflict);
+            }
             self.image
                 .verify_live_runtime(&self.runtime)
                 .map_err(denied)?;
@@ -1374,7 +1376,9 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify_source(&self.source).map_err(denied)?;
+            if !self.image.matches_source(&self.source) {
+                return Err(wintun::Error::Conflict);
+            }
             self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
             self.members
