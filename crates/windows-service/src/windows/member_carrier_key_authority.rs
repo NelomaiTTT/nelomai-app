@@ -550,11 +550,14 @@ impl RuntimeRead {
     /// original-creator/native ordering remain separate mandatory gates.
     pub(super) fn fresh(&self, context: &Context) -> Result<bool> {
         crate::member_fresh_read::read(
-            || self.verify(context),
+            // The actual current read below requires the SAME protected
+            // context on BOTH observations. Authenticate the original runtime
+            // around those reads directly: RuntimeRead::verify would add a
+            // second full authentication around the identical context read.
+            // Both signed slots, boot, owner and serialized pin are checked
+            // twice here; no cached verification or effect grant is returned.
+            || self.runtime.verify(&self.lease, context),
             || {
-                if self.runtime.forward_closed.get() {
-                    return Ok(false);
-                }
                 let access = self
                     .runtime
                     .files
@@ -565,7 +568,7 @@ impl RuntimeRead {
                 access
                     .require_native_context(context)
                     .map_err(|_| Error::Conflict)?;
-                Ok(access.is_fresh())
+                Ok(!self.runtime.forward_closed.get() && access.is_fresh())
             },
         )
     }
@@ -594,13 +597,27 @@ impl RuntimeRead {
         kinds: &[RecordKind],
     ) -> Result<Vec<Option<Vec<u8>>>> {
         crate::member_fresh_read::read(
-            || self.verify(context),
+            // The actual current read below requires the SAME protected
+            // context on BOTH observations. Authenticate the original runtime
+            // around those reads directly: RuntimeRead::verify would add a
+            // second full authentication around the identical context read.
+            // Both signed slots, boot, owner and serialized pin are checked
+            // twice here; no cached verification or effect grant is returned.
+            || self.runtime.verify(&self.lease, context),
             || {
                 let mut files = self
                     .runtime
                     .files
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
+                // An empty batch still authenticates the protected context.
+                if kinds.is_empty() {
+                    files
+                        .native_carrier_access(&context.intent.scope)
+                        .map_err(|_| Error::Journal)?
+                        .require_native_context(context)
+                        .map_err(|_| Error::Conflict)?;
+                }
                 let mut records = Vec::with_capacity(kinds.len());
                 for &kind in kinds {
                     files
