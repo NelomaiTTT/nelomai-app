@@ -308,6 +308,8 @@ struct State {
     create_result_lost: bool,
     deleted: bool,
     nic: bool,
+    nic_reads: usize,
+    effect_reads: usize,
     lock_valid: bool,
     panic_after_write: bool,
     effect_denied: bool,
@@ -340,7 +342,9 @@ impl NativeAuthority for Authority {
         _: Effect,
     ) -> Result<()> {
         self.verify(lock, &pending.context)?;
-        if self.0.borrow().effect_denied {
+        let mut state = self.0.borrow_mut();
+        state.effect_reads += 1;
+        if state.effect_denied || state.nic {
             Err(Error::Conflict)
         } else {
             Ok(())
@@ -352,7 +356,9 @@ impl NativeAuthority for Authority {
         _: &Context,
         _: &Binding,
     ) -> Result<(bool, bool, bool)> {
-        let absent = !self.0.borrow().nic;
+        let mut state = self.0.borrow_mut();
+        state.nic_reads += 1;
+        let absent = !state.nic;
         Ok((absent, absent, absent))
     }
 }
@@ -615,6 +621,8 @@ fn original_birth_uses_distinct_complete_metadata_prerequisite_before_create() {
     io.create_new_key(&mut true, &record, binding, &facts)
         .unwrap();
     assert_eq!(state.borrow().birth_reads, 1);
+    assert_eq!(state.borrow().effect_reads, 1);
+    assert_eq!(state.borrow().nic_reads, 1, "NEW ACK does not repeat the complete authorized census; Captured consumer rereads independently");
 }
 
 #[test]

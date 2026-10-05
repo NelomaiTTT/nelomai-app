@@ -459,6 +459,7 @@ fn actual_assembly_drain_moves_all_owner_slots_and_unknown_destination_retains()
         creates: 0,
         writes: 0,
         key_drops: Rc::new(Cell::new(0)),
+        nic_after_create: false,
     }));
     let mut assembly = Assembly::<Journal, keys::Keys<Kernel, Authority>, _, _>::new(
         context(),
@@ -535,6 +536,7 @@ struct State {
     creates: u32,
     writes: u32,
     key_drops: Rc<Cell<u32>>,
+    nic_after_create: bool,
 }
 type Shared = Rc<RefCell<State>>;
 struct Journal(Shared);
@@ -601,7 +603,11 @@ impl NativeAuthority for Authority {
             e,
             self.0.borrow().record.as_ref().ok_or(Error::Pending)?,
             true,
-        )
+        )?;
+        if self.nic_absence(lock, &pending.context, binding)? != (true, true, true) {
+            return Err(Error::Conflict);
+        }
+        Ok(())
     }
     fn nic_absence(
         &mut self,
@@ -610,7 +616,8 @@ impl NativeAuthority for Authority {
         _: &Binding,
     ) -> Result<(bool, bool, bool)> {
         self.verify(lock, c)?;
-        Ok((true, true, true))
+        let absent = !self.0.borrow().nic_after_create || self.0.borrow().creates == 0;
+        Ok((absent, absent, absent))
     }
 }
 const PARENT: &str = r"\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\Tcpip\Parameters\Interfaces";
@@ -1213,6 +1220,7 @@ fn setup(fault: Fault) -> (Root, Shared, Rc<()>, Rc<Cell<u32>>) {
         creates: 0,
         writes: 0,
         key_drops: Rc::new(Cell::new(0)),
+        nic_after_create: false,
     }));
     (
         Root::new(context(), Journal(s.clone()), Resource(drops.clone())),
@@ -1327,6 +1335,24 @@ fn terminal_owner_borrow_keeps_same_keys_and_never_rearms_preparation() {
 #[test]
 fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     // Break: prepare a replacement owner, predict generation, or replace ACK.
+    let (mut rejected, state, mut rejected_lock, drops) = attached(Fault::None);
+    state.borrow_mut().nic_after_create = true;
+    assert!(rejected.prepare_carrier(&mut rejected_lock).is_err());
+    let record = state.borrow().record.clone().unwrap();
+    assert_eq!(record.keys[0].phase, KeyPhase::Captured);
+    assert!(
+        record.keys[0].new_key_ack,
+        "actual returned NEW ACK retained before independent Captured readback"
+    );
+    assert_eq!((state.borrow().creates, state.borrow().writes), (1, 0));
+    assert!(rejected
+        .with_precreation(&mut rejected_lock, |_, _, _| panic!(
+            "NIC conflict allowed create"
+        ))
+        .is_err());
+    drop(rejected);
+    assert_eq!(drops.get(), 0);
+    assert_eq!(state.borrow().key_drops.get(), 0);
     let (mut root, s, mut lock, drops) = attached(Fault::None);
     root.prepare_carrier(&mut lock).unwrap();
     assert_eq!((s.borrow().creates, s.borrow().writes), (1, 1));

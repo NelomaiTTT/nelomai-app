@@ -498,6 +498,8 @@ pub(crate) trait NativeAuthority {
     fn verify(&mut self, lock: &mut Self::Lock, context: &Context) -> Result<()>;
     /// Separate native-effect authorization from read-only context/lock checks.
     /// Must re-read the protected pending record and actual fresh/cleanup claim.
+    /// Must independently read the complete native universe and original
+    /// creator retention, rejecting name/GUID/retained-NIC presence for binding.
     fn authorize_effect(
         &mut self,
         lock: &mut Self::Lock,
@@ -1659,11 +1661,37 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
         retained: Option<&NewKeyAck<Held<K::Handle>>>,
         challenge: u64,
     ) -> Result<NativeFacts> {
-        self.assert_serialized_lock(lock, &record.context)?;
-        self.binding(record, binding)?;
         if challenge == 0 {
             return Err(Error::Pending);
         }
+        let (key, value) = self.registry_observed(lock, record, binding, retained)?;
+        let (name_absent, guid_absent, retained_nic_absent) =
+            self.authority.nic_absence(lock, &self.context, binding)?;
+        self.assert_serialized_lock(lock, &record.context)?;
+        Ok(NativeFacts {
+            context: self.context.clone(),
+            binding: binding.clone(),
+            generation: record.generation,
+            challenge,
+            key,
+            value,
+            name_absent,
+            guid_absent,
+            retained_nic_absent,
+        })
+    }
+    // Shared original registry observation only. It grants neither complete
+    // NIC absence nor effect permission. inspect adds its independent census;
+    // create separately requires the native authority's complete final census.
+    fn registry_observed(
+        &mut self,
+        lock: &mut A::Lock,
+        record: &Record,
+        binding: &Binding,
+        retained: Option<&NewKeyAck<Held<K::Handle>>>,
+    ) -> Result<(KeyPresence, NativeValue)> {
+        self.assert_serialized_lock(lock, &record.context)?;
+        self.binding(record, binding)?;
         let child = Self::child(binding)?;
         let cleanup_original =
             retained.filter(|_| matches!(record.phase, Phase::Closing | Phase::Stopped));
@@ -1732,20 +1760,8 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
                 (KeyPresence::ExactRetainedNewKey, value)
             }
         };
-        let (name_absent, guid_absent, retained_nic_absent) =
-            self.authority.nic_absence(lock, &self.context, binding)?;
         self.assert_serialized_lock(lock, &record.context)?;
-        Ok(NativeFacts {
-            context: self.context.clone(),
-            binding: binding.clone(),
-            generation: record.generation,
-            challenge,
-            key,
-            value,
-            name_absent,
-            guid_absent,
-            retained_nic_absent,
-        })
+        Ok((key, value))
     }
     fn check_fact(record: &Record, binding: &Binding, f: &NativeFacts) -> Result<()> {
         if f.context != record.context
@@ -1806,9 +1822,9 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         {
             return Err(Error::Conflict);
         }
-        let fresh = self.observed(lock, pending, binding, None, absent.challenge)?;
-        Self::check_fact(pending, binding, &fresh)?;
-        if fresh.key != KeyPresence::Absent || fresh.value != NativeValue::Absent {
+        if self.registry_observed(lock, pending, binding, None)?
+            != (KeyPresence::Absent, NativeValue::Absent)
+        {
             return Err(Error::Conflict);
         }
         #[cfg(all(windows, test))]
@@ -1879,14 +1895,16 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             .flush(ack.retained_handle().handle.parent_handle())
             .inspect_err(|_| self.poisoned = true)?;
         let read = self
-            .observed_inner(lock, pending, binding, Some(ack.as_ref()), absent.challenge)
+            .registry_observed(lock, pending, binding, Some(ack.as_ref()))
             .inspect_err(|_| self.poisoned = true)?;
-        Self::check_fact(pending, binding, &read)?;
-        if read.key != KeyPresence::ExactRetainedNewKey || read.value != NativeValue::Absent {
+        if read != (KeyPresence::ExactRetainedNewKey, NativeValue::Absent) {
             self.poisoned = true;
             return Err(Error::Conflict);
         }
         drop(ack);
+        // Return ONLY the actual CREATED_NEW original ACK. The owner retains
+        // it before Captured publication; its next independent full inspect
+        // must still prove NIC absence before DisablePending/value effects.
         let retained = self.pending_key.take().expect("retained NEW-key ACK");
         match Rc::try_unwrap(retained) {
             Ok(original) => {
