@@ -2527,7 +2527,8 @@ pub(super) mod cold_wireguard_data {
                 Devices::DeviceAndDriverInstallation::*,
                 Foundation::{
                     GetLastError, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_DATA,
-                    ERROR_NO_MORE_ITEMS, FILETIME, INVALID_HANDLE_VALUE,
+                    ERROR_NO_MORE_ITEMS, ERROR_SERVICE_DOES_NOT_EXIST, FILETIME,
+                    INVALID_HANDLE_VALUE,
                 },
                 Security::{Cryptography::Catalog::*, WinTrust::*},
                 Storage::FileSystem::*,
@@ -3156,6 +3157,17 @@ pub(super) mod cold_wireguard_data {
             }
         }
         fn service(system_sys: &Path, windows_root: &Path) -> Result<(u32, u32, u32)> {
+            observe_service(system_sys, windows_root)?.ok_or(Error::Native(
+                "OpenServiceW WireGuard",
+                ERROR_SERVICE_DOES_NOT_EXIST,
+            ))
+        }
+        /// Absence is an actual SCM observation. Production still requires
+        /// the original service through service() rather than a cold substitute.
+        fn observe_service(
+            system_sys: &Path,
+            windows_root: &Path,
+        ) -> Result<Option<(u32, u32, u32)>> {
             let manager = ServiceHandle(unsafe {
                 OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CONNECT)
             });
@@ -3170,7 +3182,12 @@ pub(super) mod cold_wireguard_data {
                 )
             });
             if service.0.is_null() {
-                return Err(last("OpenServiceW WireGuard"));
+                let error = unsafe { GetLastError() };
+                return if error == ERROR_SERVICE_DOES_NOT_EXIST {
+                    Ok(None)
+                } else {
+                    Err(Error::Native("OpenServiceW WireGuard", error))
+                };
             }
             let mut storage = service_query_buffer();
             let capacity = std::mem::size_of_val(storage.as_slice());
@@ -3222,11 +3239,11 @@ pub(super) mod cold_wireguard_data {
             if status.dwServiceType != config.dwServiceType {
                 return Err(Error::Changed);
             }
-            Ok((
+            Ok(Some((
                 config.dwServiceType,
                 config.dwStartType,
                 status.dwCurrentState,
-            ))
+            )))
         }
 
         struct CatalogContext(isize);
@@ -3436,12 +3453,21 @@ pub(super) mod cold_wireguard_data {
                 if !native_amd64_win10_plus {
                     return Err(Error::Unsupported("native platform"));
                 }
+                let root = os_directory(false)?;
+                let system_root = os_directory(true)?;
+                let system = system_root.join("drivers").join("wireguard.sys");
                 #[cfg(test)]
                 if let Some((paths, date)) =
                     crate::windows::wireguard_package_paths(&final_path(self.source.file()?)?)
                 {
                     let [published_inf, store_inf, store_cat, store_sys, system_sys] =
                         paths.map(|path| path.to_string_lossy().into_owned());
+                    let devices = devices()?;
+                    // The fixture stages package files. ONLY actual SCM
+                    // absence preserves its staged cold tuple; real service
+                    // type/start/state/path and the complete census stay real.
+                    let (service_type, service_start, service_state) =
+                        observe_service(&system, &root)?.unwrap_or((1, 3, 1));
                     return Ok(Inventory {
                         native_amd64_win10_plus,
                         candidates: vec![Candidate {
@@ -3453,18 +3479,15 @@ pub(super) mod cold_wireguard_data {
                             store_cat,
                             store_sys,
                         }],
-                        devices: vec![],
-                        service_type: 1,
-                        service_start: 3,
-                        service_state: 1,
+                        devices,
+                        service_type,
+                        service_start,
+                        service_state,
                         pending_maintenance: false,
                         pending: PendingSnapshot::default(),
                         system_sys,
                     });
                 }
-                let root = os_directory(false)?;
-                let system_root = os_directory(true)?;
-                let system = system_root.join("drivers").join("wireguard.sys");
                 let candidates = candidates(&root)?;
                 let devices = devices()?;
                 let (service_type, service_start, service_state) = service(&system, &root)?;
