@@ -274,9 +274,10 @@ pub(crate) fn interface_input(
 ) -> Result<MIB_IPINTERFACE_ROW> {
     k.validate()?;
     p.validate()?;
-    // MS docs REQUIRE zero for IPv4. Do not normalize an unsupported baseline
-    // (including 255) behind the journal's back: capability fails before mutation.
-    if p.site_prefix_length != 0 {
+    // IPv4 Set requires zero for this nonmodifiable field. Get's exact 0/64
+    // stays in the protected policy and post-Set CAS; 255/other baselines still
+    // fail capability before mutation. Zero is an SDK input, not a Get rewrite.
+    if !matches!(p.site_prefix_length, 0 | 64) {
         return Err(Error::Unsupported);
     }
     r.Family = AF_INET;
@@ -299,7 +300,7 @@ pub(crate) fn interface_input(
     r.LinkLocalAddressBehavior = p.link_local_behavior;
     r.LinkLocalAddressTimeout = p.link_local_timeout;
     r.ZoneIndices = p.zone_indices;
-    r.SitePrefixLength = p.site_prefix_length;
+    r.SitePrefixLength = 0;
     r.Metric = p.metric;
     r.NlMtu = p.mtu;
     r.DisableDefaultRoutes = p.disable_default_routes;

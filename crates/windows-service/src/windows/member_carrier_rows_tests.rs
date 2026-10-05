@@ -1072,32 +1072,47 @@ fn cleanup_write_attempt_does_not_claim_application_of_false_or_failed_cas() {
 // local record and cannot retire its own known attempted interface write.
 #[test]
 fn cleanup_reconciles_own_interface_write_after_cas_readback_error_or_unwind() {
-    for revision in [2, 3] {
-        for unwind in [false, true] {
-            let fake = Fake::new();
-            let mut owner = fake.owner();
-            let b = binding();
-            let pin = owner.record_read_pin().unwrap();
-            fake.0.borrow_mut().journal_load_fault = Some((revision, unwind));
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                owner.change_interface(weak())
-            }));
-            assert!(result.is_err() || result.unwrap().is_err());
-            let ack = row_pin_record(&pin, &b, true);
-            assert_eq!(ack.revision, revision - 1);
-            assert!(owner.change_interface(weak()).is_err());
-            owner.stop().unwrap();
-            assert_eq!(row_pin_record(&pin, &b, true).phase, Phase::Stopped);
-            assert_eq!(fake.0.borrow().effects, if revision == 3 { 2 } else { 0 });
-            assert!(
-                !decode_interface(&fake.0.borrow().ip)
-                    .unwrap()
-                    .policy
-                    .weak_host_send
-            );
-            assert!(pin
-                .with_record(&b.scope, b.network_epoch, |_| Ok(()))
-                .is_err());
+    for site_prefix in [0, 64] {
+        for revision in [2, 3] {
+            for unwind in [false, true] {
+                let fake = Fake::new();
+                fake.0.borrow_mut().ip.SitePrefixLength = site_prefix;
+                let mut owner = fake.owner();
+                let mut desired = owner.snapshot().unwrap().interface.policy;
+                desired.weak_host_send = true;
+                desired.weak_host_receive = true;
+                let b = binding();
+                let pin = owner.record_read_pin().unwrap();
+                fake.0.borrow_mut().journal_load_fault = Some((revision, unwind));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    owner.change_interface(desired.clone())
+                }));
+                assert!(result.is_err() || result.unwrap().is_err());
+                let ack = row_pin_record(&pin, &b, true);
+                assert_eq!(ack.revision, revision - 1);
+                assert!(owner.change_interface(desired).is_err());
+                owner.stop().unwrap();
+                assert_eq!(row_pin_record(&pin, &b, true).phase, Phase::Stopped);
+                assert_eq!(
+                    row_pin_record(&pin, &b, true)
+                        .baseline
+                        .interface
+                        .policy
+                        .site_prefix_length,
+                    site_prefix
+                );
+                assert_eq!(fake.0.borrow().ip.SitePrefixLength, site_prefix);
+                assert_eq!(fake.0.borrow().effects, if revision == 3 { 2 } else { 0 });
+                assert!(
+                    !decode_interface(&fake.0.borrow().ip)
+                        .unwrap()
+                        .policy
+                        .weak_host_send
+                );
+                assert!(pin
+                    .with_record(&b.scope, b.network_epoch, |_| Ok(()))
+                    .is_err());
+            }
         }
     }
 }
@@ -2542,6 +2557,7 @@ enum Fault {
     Unapplied,
     FalseAck,
     Partial,
+    SitePrefixChanged,
 }
 struct State {
     binding: Binding,
@@ -2767,6 +2783,17 @@ impl Kernel for Fake {
         }
         let observed = decode_interface(&s.ip)?.observed;
         let mut next = *row;
+        assert_eq!(
+            row.SitePrefixLength, 0,
+            "IPv4 Set requires SDK sentinel input"
+        );
+        // This IPv4 field cannot be modified by Set. Get retains its original
+        // value, except for the explicit post-Set OS drift regression.
+        next.SitePrefixLength = if matches!(fault, Fault::SitePrefixChanged) {
+            0
+        } else {
+            s.ip.SitePrefixLength
+        };
         next.MinRouterAdvertisementInterval = observed.min_router_advertisement_interval;
         next.MaxRouterAdvertisementInterval = observed.max_router_advertisement_interval;
         next.Connected = observed.connected;
@@ -5376,23 +5403,51 @@ fn readiness_store_ack_failure_is_not_redeemed_by_exact_bytes_or_created_receipt
 }
 #[test]
 fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
-    let fake = Fake::new();
-    let mut owner = fake.owner();
-    let baseline = owner.snapshot().unwrap();
-    assert_eq!(baseline.interface.observed.transmit_offload, 0xa5);
-    assert!(baseline.address.is_none());
-    owner.change_interface(weak()).unwrap();
-    owner.create_address(address_policy()).unwrap();
-    let created = owner.snapshot().unwrap();
-    assert_eq!(created.address.unwrap().observed.dad_state, 1);
-    owner.stop().unwrap();
-    let saved = fake.0.borrow().saved.clone().unwrap();
-    assert_eq!(saved.phase, Phase::Stopped);
-    assert!(saved.pending.is_none());
-    assert_eq!(saved.current.interface.policy, baseline.interface.policy);
-    assert!(saved.current.address.is_none());
-    assert!(fake.0.borrow().address.is_none());
-    assert_eq!(fake.0.borrow().effects, 4);
+    for site_prefix in [0, 64] {
+        let fake = Fake::new();
+        if site_prefix == 64 {
+            let mut s = fake.0.borrow_mut();
+            s.ip.SitePrefixLength = 64;
+            s.ip.Metric = 5;
+            s.ip.NlMtu = 65535;
+        }
+        let mut owner = fake.owner();
+        let baseline = owner.snapshot().unwrap();
+        assert_eq!(baseline.interface.observed.transmit_offload, 0xa5);
+        assert!(baseline.address.is_none());
+        let mut desired = baseline.interface.policy.clone();
+        desired.weak_host_send = true;
+        desired.weak_host_receive = true;
+        owner.change_interface(desired).unwrap();
+        assert_eq!(
+            fake.0
+                .borrow()
+                .saved
+                .as_ref()
+                .unwrap()
+                .current
+                .interface
+                .policy
+                .site_prefix_length,
+            site_prefix
+        );
+        owner.create_address(address_policy()).unwrap();
+        let created = owner.snapshot().unwrap();
+        assert_eq!(created.address.unwrap().observed.dad_state, 1);
+        owner.stop().unwrap();
+        let saved = fake.0.borrow().saved.clone().unwrap();
+        assert_eq!(saved.phase, Phase::Stopped);
+        assert!(saved.pending.is_none());
+        assert_eq!(saved.current.interface.policy, baseline.interface.policy);
+        assert_eq!(
+            saved.baseline.interface.policy.site_prefix_length,
+            site_prefix
+        );
+        assert_eq!(fake.0.borrow().ip.SitePrefixLength, site_prefix);
+        assert!(saved.current.address.is_none());
+        assert!(fake.0.borrow().address.is_none());
+        assert_eq!(fake.0.borrow().effects, 4);
+    }
 }
 #[test]
 fn exact_readback_resolves_lost_set_and_delete_ack_without_blind_retry() {
@@ -5407,15 +5462,51 @@ fn exact_readback_resolves_lost_set_and_delete_ack_without_blind_retry() {
 }
 #[test]
 fn partial_or_false_set_ack_keeps_durable_pending_and_no_active_resume() {
-    for fault in [Fault::Unapplied, Fault::FalseAck, Fault::Partial] {
+    for fault in [
+        Fault::Unapplied,
+        Fault::FalseAck,
+        Fault::Partial,
+        Fault::SitePrefixChanged,
+    ] {
         let fake = Fake::new();
+        if matches!(fault, Fault::SitePrefixChanged) {
+            fake.0.borrow_mut().ip.SitePrefixLength = 64;
+        }
         let mut owner = fake.owner();
+        let mut desired = owner.snapshot().unwrap().interface.policy;
+        desired.weak_host_send = true;
+        desired.weak_host_receive = true;
         fake.0.borrow_mut().kernel_fault = fault;
-        assert!(owner.change_interface(weak()).is_err());
+        assert!(owner.change_interface(desired).is_err());
         assert!(fake.0.borrow().saved.as_ref().unwrap().pending.is_some());
         assert!(owner.create_address(address_policy()).is_err());
-        if matches!(fault, Fault::Partial) {
+        if matches!(fault, Fault::Partial | Fault::SitePrefixChanged) {
+            let effects = fake.0.borrow().effects;
             assert!(owner.stop().is_err());
+            assert_eq!(
+                fake.0.borrow().effects,
+                effects,
+                "no retry/rollback over foreign drift"
+            );
+            if matches!(fault, Fault::SitePrefixChanged) {
+                let s = fake.0.borrow();
+                let saved = s.saved.as_ref().unwrap();
+                assert_eq!(effects, 1);
+                assert_eq!(s.ip.SitePrefixLength, 0);
+                assert_eq!(saved.baseline.interface.policy.site_prefix_length, 64);
+                assert_eq!(saved.current.interface.policy.site_prefix_length, 64);
+                assert_eq!(
+                    saved
+                        .pending
+                        .as_ref()
+                        .unwrap()
+                        .before
+                        .interface
+                        .policy
+                        .site_prefix_length,
+                    64
+                );
+            }
         } else {
             owner.stop().unwrap();
         }
@@ -5812,6 +5903,29 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
     assert_eq!(row.observed.reachable_time, 32123);
     assert_eq!(row.observed.transmit_offload, 0xa5);
     assert_eq!(row.observed.receive_offload, 0x5a);
+    // Actual native Wintun tuple rejected in CI: retain Get's nonmodifiable
+    // IPv4 value in the model while Set encodes the documented zero input.
+    let mut raw = interface_raw();
+    raw.RouterDiscoveryBehavior = 2;
+    raw.LinkLocalAddressBehavior = 0;
+    raw.Metric = 5;
+    raw.NlMtu = 65535;
+    raw.SitePrefixLength = 64;
+    let captured = decode_interface(&raw).unwrap();
+    assert_eq!(captured.policy.site_prefix_length, 64);
+    let mut desired = captured.policy.clone();
+    desired.weak_host_send = true;
+    desired.weak_host_receive = true;
+    validate_interface_delta(&captured.policy, &desired).unwrap();
+    let encoded = interface_input(MIB_IPINTERFACE_ROW::default(), captured.key, &desired).unwrap();
+    assert_eq!(encoded.SitePrefixLength, 0);
+    assert_eq!(
+        desired.site_prefix_length, 64,
+        "SDK sentinel must not rewrite protected policy"
+    );
+    let mut input_policy = desired;
+    input_policy.site_prefix_length = 0;
+    assert_eq!(decode_interface(&encoded).unwrap().policy, input_policy);
 }
 #[test]
 fn address_codec_rejects_unknown_origins_family_and_unsupported_sockaddr_attributes() {
@@ -5892,4 +6006,20 @@ fn readonly_and_unsupported_deltas_fail_capability_instead_of_silently_omitting(
     next.weak_host_send = true;
     next.weak_host_receive = true;
     assert!(validate_interface_delta(&before, &next).is_ok());
+    for site_prefix in [0, 64] {
+        let mut before = before.clone();
+        before.site_prefix_length = site_prefix;
+        for changed in [0, 1, 32, 64, 255] {
+            if changed == site_prefix {
+                continue;
+            }
+            let mut next = before.clone();
+            next.weak_host_send = true;
+            next.site_prefix_length = changed;
+            assert!(
+                validate_interface_delta(&before, &next).is_err(),
+                "foreign site prefix {site_prefix}->{changed}"
+            );
+        }
+    }
 }
