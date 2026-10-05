@@ -128,8 +128,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-build"]["steps"].insert(6, jobs["windows-build"]["steps"].pop(
                 next(index for index, step in enumerate(jobs["windows-build"]["steps"])
                      if step.get("name") == "Actual factory runtime input"))),
-            lambda jobs: jobs["contracts-python"].pop("env", None),
-            lambda jobs: jobs["contracts-python"].update(env={"RUSTUP_HOME": "/home/runner/.rustup"}),
+            lambda jobs: jobs["contracts-python"].update(steps=[
+                step for step in jobs["contracts-python"]["steps"]
+                if step.get("name") != "Isolated contracts Rustup home"]),
+            lambda jobs: jobs["contracts-python"]["steps"][3].update(
+                run='echo "RUSTUP_HOME=/home/runner/.rustup" >> "$GITHUB_ENV"'),
+            lambda jobs: jobs["contracts-python"]["steps"].append(
+                jobs["contracts-python"]["steps"].pop(3)),
+            lambda jobs: jobs["contracts-python"].update(env={"RUSTUP_HOME": "${{ runner.temp }}/nelomai-contracts-rustup"}),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):

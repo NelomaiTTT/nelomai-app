@@ -364,14 +364,14 @@ jobs:
   contracts-python:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    env:
-      RUSTUP_HOME: ${{ runner.temp }}/nelomai-contracts-rustup
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: python -m pip install "cryptography>=45,<46" "PyYAML>=6,<7"
+      - name: Isolated contracts Rustup home
+        run: echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0

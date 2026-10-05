@@ -54,10 +54,15 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     for name in ("frontend", "rust", "android-plugin", "windows-build", "windows-native", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
-    require(jobs["contracts-python"].get("env") == {
-        "RUSTUP_HOME": "${{ runner.temp }}/nelomai-contracts-rustup"}
-        and all("RUSTUP_HOME" not in step.get("env", {}) for step in jobs["contracts-python"]["steps"]),
-            "Contracts Python must use its isolated runner-temp Rustup home without step overrides")
+    contracts = jobs["contracts-python"]
+    require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
+        and all("RUSTUP_HOME" not in step.get("env", {}) for step in contracts["steps"]),
+            "Contracts Python cannot override its isolated Rustup home through workflow/job/step env")
+    require(len(contracts["steps"]) == 8 and contracts["steps"][3] == {
+        "name": "Isolated contracts Rustup home",
+        "run": 'echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"'}
+        and contracts["steps"][4] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
+            "Contracts Python must export its runner-temp Rustup home before installing the unchanged toolchain")
     require(build["runs-on"] == native["runs-on"] == "windows-latest", "Every native case needs a fresh Windows runner")
     require("strategy" not in build and "needs" not in build, "Windows common build must execute only once")
     require(native.get("needs") == ["windows-build"], "Native execution must require the successful common build")
