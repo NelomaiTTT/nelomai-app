@@ -688,18 +688,26 @@ pub(crate) mod native {
             slot["slot"] = "stable".into();
             slot["manifest"]["runtime_version"] = "0.3.2".into();
             manifest["slots"].as_array_mut().unwrap().push(slot);
+            manifest["stable_release_set_sha256"] = "b".repeat(64).into();
+            manifest["stable_platform_manifest_sha256"] = "c".repeat(64).into();
             let bytes = serde_json::to_vec(&manifest).unwrap();
             let message = [
                 nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN,
                 &bytes,
             ]
             .concat();
-            std::fs::write(directory.join(d::MANIFEST_NAME), &bytes).unwrap();
-            std::fs::write(
-                directory.join(d::SIGNATURE_NAME),
-                SigningKey::from_bytes(&[83; 32]).sign(&message).to_bytes(),
+            let key = SigningKey::from_bytes(&[83; 32]);
+            let signature = key.sign(&message).to_bytes();
+            nelomai_contracts::verify_container_manifest(
+                &bytes,
+                &signature,
+                &key.verifying_key().to_bytes(),
+                "windows",
+                "x86_64",
             )
-            .unwrap();
+            .expect("signed two-slot fixture must satisfy distinct Stable manifest schema before pinning");
+            std::fs::write(directory.join(d::MANIFEST_NAME), &bytes).unwrap();
+            std::fs::write(directory.join(d::SIGNATURE_NAME), signature).unwrap();
             let policy_path = directory.join("installation-policy.json");
             let mut policy: d::BrokerPolicy =
                 serde_json::from_slice(&std::fs::read(&policy_path).unwrap()).unwrap();
@@ -756,6 +764,14 @@ pub(crate) mod native {
                 super::super::super::member_carrier_factory_test_os::installation(root)
                     .expect("signed installation registered for the fixture's original root");
             let owner = Arc::new(MutationGuard::at(&root.join("engine-owner.lock")).unwrap());
+            let pristine = PinnedInstalledRuntime::new(
+                &installation,
+                &executable,
+                owner.clone(),
+                InstalledRuntimeOrigin::Source,
+            )
+            .expect("pristine signed fixture must successfully pin before testing payload drift");
+            drop(pristine);
             let layout = installation.load_engine(&executable).unwrap();
             let path = layout.engine_path().with_file_name("tunnel.dll");
             let mut bytes = std::fs::read(&path).unwrap();

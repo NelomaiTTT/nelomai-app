@@ -125,6 +125,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),
             lambda jobs: jobs["windows-build"]["steps"][6].update(run="cargo build -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"].insert(6, jobs["windows-build"]["steps"].pop(
+                next(index for index, step in enumerate(jobs["windows-build"]["steps"])
+                     if step.get("name") == "Actual factory runtime input"))),
+            lambda jobs: jobs["contracts-python"].pop("env", None),
+            lambda jobs: jobs["contracts-python"].update(env={"RUSTUP_HOME": "/home/runner/.rustup"}),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):

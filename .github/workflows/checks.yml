@@ -211,25 +211,6 @@ jobs:
       - run: cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
-      - name: Actual factory runtime input
-        run: |
-          # The installed engine is the exact shipping build. Keep the ordinary
-          # test suite/debug assertions separate from the signed runtime fixture.
-          cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
-          Write-Output "Actual factory release engine bytes=$((Get-Item -LiteralPath $engine).Length)"
-          $runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
-          # Reuse the pinned production dependency builder: SCM executes this
-          # exact-source engine with genuine WG/AWG tunnel DLLs, never DATA.
-          ./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wintun.dll')).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
-            throw 'Audited factory Wintun input hash mismatch'
-          }
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.dll')).Hash.ToLowerInvariant() -ne 'b1b85e072c45d81358be29d94c599dc76652f912be8c0f0a41e2d5d89a6461d3') {
-            throw 'Audited factory WireGuard DLL hash mismatch'
-          }
-          "NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
       # The actual factory invokes the audited unimpersonated SYSTEM cooperative
       # lease. Run this one test separately under its real production principal;
       # its selector/coordinator/ownership/native gates are not replaced.
@@ -254,6 +235,25 @@ jobs:
           $selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
           if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
           cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1
+      - name: Actual factory runtime input
+        run: |
+          # The installed engine is the exact shipping build. Keep the ordinary
+          # test suite/debug assertions separate from the signed runtime fixture.
+          cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
+          Write-Output "Actual factory release engine bytes=$((Get-Item -LiteralPath $engine).Length)"
+          $runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
+          # Reuse the pinned production dependency builder: SCM executes this
+          # exact-source engine with genuine WG/AWG tunnel DLLs, never DATA.
+          ./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wintun.dll')).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
+            throw 'Audited factory Wintun input hash mismatch'
+          }
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.dll')).Hash.ToLowerInvariant() -ne 'b1b85e072c45d81358be29d94c599dc76652f912be8c0f0a41e2d5d89a6461d3') {
+            throw 'Audited factory WireGuard DLL hash mismatch'
+          }
+          "NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Assemble exact factory test artifact
         id: artifact
         env:
@@ -364,6 +364,8 @@ jobs:
   contracts-python:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_HOME: ${{ runner.temp }}/nelomai-contracts-rustup
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -54,6 +54,10 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     for name in ("frontend", "rust", "android-plugin", "windows-build", "windows-native", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
+    require(jobs["contracts-python"].get("env") == {
+        "RUSTUP_HOME": "${{ runner.temp }}/nelomai-contracts-rustup"}
+        and all("RUSTUP_HOME" not in step.get("env", {}) for step in jobs["contracts-python"]["steps"]),
+            "Contracts Python must use its isolated runner-temp Rustup home without step overrides")
     require(build["runs-on"] == native["runs-on"] == "windows-latest", "Every native case needs a fresh Windows runner")
     require("strategy" not in build and "needs" not in build, "Windows common build must execute only once")
     require(native.get("needs") == ["windows-build"], "Native execution must require the successful common build")
@@ -93,6 +97,17 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
         'cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings',
         'cargo check -p nelomai-app',
         'cargo test -p nelomai-client-updater',
+        'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
+        """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$selected = @($tests | Where-Object { $_ -match 'native_security_buffer_sizes_readonly_descriptor_without_capacity_padding: test$' })
+if ($selected.Count -ne 1) { throw 'Expected exactly one readonly security-size gate; no empty-filter PASS' }
+cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --nocapture --test-threads=1""",
+        """$tests = & cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --list
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
+if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
+cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1""",
         """cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
@@ -106,17 +121,6 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.
 throw 'Audited factory WireGuard DLL hash mismatch'
 }
 "NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append""",
-        'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
-        """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$selected = @($tests | Where-Object { $_ -match 'native_security_buffer_sizes_readonly_descriptor_without_capacity_padding: test$' })
-if ($selected.Count -ne 1) { throw 'Expected exactly one readonly security-size gate; no empty-filter PASS' }
-cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --nocapture --test-threads=1""",
-        """$tests = & cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --list
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$selected = @($tests | Where-Object { $_ -match 'txr_transient_enlist_isolated_gate: test$' })
-if ($selected.Count -ne 1) { throw 'Expected exactly one isolated TxR gate; no empty-filter PASS' }
-cargo test --locked -p nelomai-windows-service --lib txr_transient_enlist_isolated_gate -- --ignored --nocapture --test-threads=1""",
         """$build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
@@ -129,9 +133,9 @@ python scripts/windows/carrier-factory-artifact.py create `
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     ]
     require(len(build["steps"]) == 12 and [program(step) for step in build["steps"][2:-1]] == build_programs,
-            "Common build must retain all strict compile/test/release/DLL/security/TxR gates before artifact assembly")
+            "Common build must run ordinary/security/TxR gates before factory runtime preparation and retain all strict gates before artifact assembly")
     require(all("env" not in step for step in build["steps"][:10]), "Common gates cannot override their source/runtime environment")
-    require(build["steps"][8].get("timeout-minutes") == build["steps"][9].get("timeout-minutes") == 2,
+    require(build["steps"][7].get("timeout-minutes") == build["steps"][8].get("timeout-minutes") == 2,
             "Native readonly and isolated TxR gate budgets must remain unchanged")
     artifact = build["steps"][-2]
     require(artifact.get("id") == "artifact" and artifact.get("env") == {
