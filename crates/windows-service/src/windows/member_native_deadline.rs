@@ -832,8 +832,10 @@ impl NativeDeadlineReadPin {
         if !self.runtime.same_original_runtime(runtime) {
             return Err(CarrierError::Conflict);
         }
+        // verify authenticates this SAME RuntimeRead before and after the
+        // original owner/policy checks. No effect intervenes that requires
+        // another authentication through its pointer-identical alias.
         self.verify(owner, context)?;
-        runtime.verify(context)?;
         attempt.succeeded = true;
         Ok(())
     }
@@ -844,13 +846,23 @@ impl NativeDeadlineReadPin {
             owner,
             succeeded: false,
         };
-        self.verify(owner, context)?;
+        if !Rc::ptr_eq(&self.owner, &owner.owner)
+            || !self.runtime.same_original_runtime(&owner.runtime)
+        {
+            return Err(CarrierError::Conflict);
+        }
+        // Join the SAME owner, read pin and current Calling around one complete
+        // fresh runtime authentication. Calling/pin checks perform no native
+        // effect and cannot grant permission before that authentication returns.
+        owner.verify_lease()?;
+        // policy.verify_call includes the exact original read-pin check.
         owner
             .deadline
             .verify_call(&self.policy, context)
             .map_err(denied)?;
         self.runtime.verify(context)?;
         // Runtime read itself may have exhausted the same native budget.
+        owner.verify_lease()?;
         owner
             .deadline
             .verify_call(&self.policy, context)
