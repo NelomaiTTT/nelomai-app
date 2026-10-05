@@ -1305,6 +1305,13 @@ pub(crate) mod native {
             if assets.context != scope.context || assets.cancelled.load(Ordering::Acquire) {
                 return Err(wintun::Error::Conflict);
             }
+            // Join immutable private origins before retaining this gate.
+            // MemberInventory cannot replace its Runtime or carrier Source;
+            // every sample still authenticates/read-backs the current inventory.
+            assets
+                .members
+                .matches_original_runtime_image(&assets.runtime, &assets.image)
+                .map_err(denied)?;
             // Open ONLY inside the authenticated original operation callback;
             // equal Pair bytes cannot mint this actual opaque read capability.
             let absence = assets
@@ -1364,9 +1371,9 @@ pub(crate) mod native {
             if !self.runtime.fresh(&self.scope.context).map_err(denied)? {
                 return Err(wintun::Error::Conflict);
             }
-            self.members
-                .matches_original_runtime_image(&self.runtime, &self.image)
-                .map_err(denied)?;
+            // Dynamic member health, signed source/runtime and full current
+            // receipt reads are revalidated by read_all in BOTH complete samples.
+            // Their immutable origin join was checked in open_with_upgrade.
             Ok(())
         }
         fn continuity_cleanup(&self) -> wintun::Result<()> {
