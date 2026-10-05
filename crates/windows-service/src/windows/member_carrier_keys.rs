@@ -1976,9 +1976,18 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         if fresh.key != KeyPresence::ExactRetainedNewKey || fresh.value != expected {
             return Err(Error::Conflict);
         }
-        let current = self.observed(lock, pending, binding, Some(retained), fresh.challenge)?;
-        Self::check_fact(pending, binding, &current)?;
-        if current.key != KeyPresence::ExactRetainedNewKey || current.value != expected {
+        let root = matches!(pending.phase, Phase::Closing | Phase::Stopped)
+            .then(|| terminal_original_key_obligation(retained));
+        let mut sample = root.as_ref().map(|r| r.sampling.begin()).transpose()?;
+        let current = self.registry_observed(lock, pending, binding, Some(retained))?;
+        if let Some(root) = &root {
+            root.check_health()?;
+        }
+        if let Some(sample) = &mut sample {
+            sample.complete = true;
+        }
+        drop(sample);
+        if current != (KeyPresence::ExactRetainedNewKey, expected) {
             return Err(Error::Conflict);
         }
         self.assert_serialized_lock(lock, &pending.context)?;
@@ -1997,11 +2006,13 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             Value::Absent => self.kernel.delete_value(h)?,
         }
         self.kernel.flush(h)?;
+        // The complete final effect census precedes the syscall; original
+        // registry readback confirms its ACK. Owner.write_value independently
+        // rereads complete NativeFacts before publishing the next key phase.
         let after = self
-            .observed_inner(lock, pending, binding, Some(retained), fresh.challenge)
+            .registry_observed(lock, pending, binding, Some(retained))
             .inspect_err(|_| self.poisoned = true)?;
-        Self::check_fact(pending, binding, &after).inspect_err(|_| self.poisoned = true)?;
-        if after.key != KeyPresence::ExactRetainedNewKey || after.value != desired {
+        if after != (KeyPresence::ExactRetainedNewKey, desired) {
             self.poisoned = true;
             return Err(Error::Conflict);
         }

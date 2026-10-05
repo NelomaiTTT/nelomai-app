@@ -460,6 +460,7 @@ fn actual_assembly_drain_moves_all_owner_slots_and_unknown_destination_retains()
         writes: 0,
         key_drops: Rc::new(Cell::new(0)),
         nic_after_create: false,
+        nic_after_write: false,
     }));
     let mut assembly = Assembly::<Journal, keys::Keys<Kernel, Authority>, _, _>::new(
         context(),
@@ -537,6 +538,7 @@ struct State {
     writes: u32,
     key_drops: Rc<Cell<u32>>,
     nic_after_create: bool,
+    nic_after_write: bool,
 }
 type Shared = Rc<RefCell<State>>;
 struct Journal(Shared);
@@ -616,7 +618,9 @@ impl NativeAuthority for Authority {
         _: &Binding,
     ) -> Result<(bool, bool, bool)> {
         self.verify(lock, c)?;
-        let absent = !self.0.borrow().nic_after_create || self.0.borrow().creates == 0;
+        let state = self.0.borrow();
+        let absent = (!state.nic_after_create || state.creates == 0)
+            && (!state.nic_after_write || state.writes == 0);
         Ok((absent, absent, absent))
     }
 }
@@ -1221,6 +1225,7 @@ fn setup(fault: Fault) -> (Root, Shared, Rc<()>, Rc<Cell<u32>>) {
         writes: 0,
         key_drops: Rc::new(Cell::new(0)),
         nic_after_create: false,
+        nic_after_write: false,
     }));
     (
         Root::new(context(), Journal(s.clone()), Resource(drops.clone())),
@@ -1348,6 +1353,21 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     assert!(rejected
         .with_precreation(&mut rejected_lock, |_, _, _| panic!(
             "NIC conflict allowed create"
+        ))
+        .is_err());
+    drop(rejected);
+    assert_eq!(drops.get(), 0);
+    assert_eq!(state.borrow().key_drops.get(), 0);
+    let (mut rejected, state, mut rejected_lock, drops) = attached(Fault::None);
+    state.borrow_mut().nic_after_write = true;
+    assert!(rejected.prepare_carrier(&mut rejected_lock).is_err());
+    let record = state.borrow().record.clone().unwrap();
+    assert_eq!(record.keys[0].phase, KeyPhase::DisablePending);
+    assert!(record.keys[0].new_key_ack);
+    assert_eq!((state.borrow().creates, state.borrow().writes), (1, 1));
+    assert!(rejected
+        .with_precreation(&mut rejected_lock, |_, _, _| panic!(
+            "NIC conflict after value mutation allowed create"
         ))
         .is_err());
     drop(rejected);

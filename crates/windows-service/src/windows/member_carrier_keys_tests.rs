@@ -640,6 +640,8 @@ fn module_precreation_read_uses_same_new_key_ack_and_never_writes() {
     let facts = io
         .inspect(&mut true, &record, &binding, Some(&ack), 2)
         .unwrap();
+    let nic_reads = shared.borrow().nic_reads;
+    let effect_reads = shared.borrow().effect_reads;
     io.compare_exchange_value(
         &mut true,
         &record,
@@ -653,6 +655,8 @@ fn module_precreation_read_uses_same_new_key_ack_and_never_writes() {
         },
     )
     .unwrap();
+    assert_eq!(shared.borrow().effect_reads, effect_reads + 1);
+    assert_eq!(shared.borrow().nic_reads, nic_reads, "value ACK uses the complete final effect authorization; owner independently confirms the mutation");
     record.keys[0].phase = KeyPhase::Disabled;
     record.keys[0].current = Value::DwordZero;
     record.keys[0].pending = None;
