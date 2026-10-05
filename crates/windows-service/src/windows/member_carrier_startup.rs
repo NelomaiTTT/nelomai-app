@@ -5015,6 +5015,10 @@ pub(crate) mod native {
                         // No fallible/native work after inner original disposal.
                     })
                 })
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    eprintln!("actual module-only Startup owning disposition: {_error}");
+                })
                 .map_err(|_| Error::Retired)?;
             drop(ack_guard);
             let outcome = Rc::new(NativeModuleOnlyOutcome { original: root });
