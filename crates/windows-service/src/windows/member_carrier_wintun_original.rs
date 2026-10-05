@@ -98,9 +98,9 @@ impl OriginalPackageInventory {
     > {
         use crate::windows::member_carrier_wintun_package::{Device, Error as PackageError};
         let read = || -> std::result::Result<Vec<u8>, PackageError> {
-            let bytes = self
+            let (bytes, fresh) = self
                 .runtime
-                .record(
+                .record_with_fresh(
                     &self.context,
                     crate::windows::member_session::RecordKind::NativeCarrierReceipts,
                 )
@@ -111,14 +111,7 @@ impl OriginalPackageInventory {
             } else {
                 receipt::Phase::Preparing
             };
-            if record.context != self.context
-                || record.phase != expected
-                || !cleanup
-                    && !self
-                        .runtime
-                        .fresh(&self.context)
-                        .map_err(|_| PackageError::Changed)?
-            {
+            if record.context != self.context || record.phase != expected || !cleanup && !fresh {
                 return Err(PackageError::Changed);
             }
             Ok(bytes)
@@ -138,10 +131,10 @@ impl OriginalPackageInventory {
             self.observer.observe_all(&self.context)
         }
         .map_err(|_| PackageError::Changed)?;
-        // The SAME registry read already brackets the complete native
-        // C+member census with actual original C identities and member owners.
-        // Preserve that full result instead of querying the member census again
-        // merely because the raw-C projection used to discard it.
+        // This observer reads every SAME raw original identity/close receipt
+        // before and again after the complete C+member PnP/MIB/SCM universe.
+        // Preserve its full census and completed raw-original revalidation;
+        // the package independently observes originals around ALL trust checks.
         let kinds = observations
             .complete
             .iter()
@@ -158,17 +151,6 @@ impl OriginalPackageInventory {
             .collect::<Vec<_>>();
         let devices = crate::windows::member_carrier_members::package_devices(&kinds, &devices)
             .map_err(|_| PackageError::Changed)?;
-        // Actual raw C is checked AGAIN after all independent SCM/provider
-        // member reads; stale C facts cannot seed an owned package projection.
-        let after = if cleanup {
-            self.observer.observe_all_for_cleanup(&self.context)
-        } else {
-            self.observer.observe_all(&self.context)
-        }
-        .map_err(|_| PackageError::Changed)?;
-        if observations != after {
-            return Err(PackageError::Changed);
-        }
         if before
             != self
                 .image
