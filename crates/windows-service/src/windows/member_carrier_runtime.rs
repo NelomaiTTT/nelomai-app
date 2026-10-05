@@ -5286,16 +5286,16 @@ pub(crate) mod native {
                 .attempt(super::ConstructionStep::Components, |parts| {
                     let authority = parts.authority.as_mut().ok_or(Error::Pending)?;
                     let before = authority.current(Use::Create)?;
-                    let held = authority.refresh(Use::Create)?;
-                    let raw = held.module();
-                    authority.effect = Some(held);
-                    if authority.image.module().map_err(denied)? != raw {
-                        return Err(Error::Conflict);
-                    }
+                    let raw = authority.image.module().map_err(denied)?;
                     // The native resolver independently refreshes this SAME
                     // retained authority and runs the complete Resolve gate
                     // LAST before GetModuleHandleExW. Alias construction below
                     // performs no SDK effect and cannot grant native permission.
+                    // LoadedWintun and OriginalImage retain the actual original
+                    // HMODULE in this root throughout the infallible alias move.
+                    // Acquire the cooperative effect lease only inside the
+                    // resolver's final gate, whose call guard also releases it
+                    // on Err/unwind before C exists.
                     same_record(&before, authority.current(Use::Create)?).map_err(denied)?;
                     let binding = authority.binding.clone();
                     let signal = authority.shared_revocation.clone();
@@ -5752,7 +5752,9 @@ pub(crate) mod native {
                 return Err(Error::Pending);
             }
             self.checkpoint()?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
+            // record already authenticates this SAME runtime before and after
+            // its complete reread. No effect precedes it here; retain that one
+            // full bracket rather than authenticate its alias again.
             let bytes = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
