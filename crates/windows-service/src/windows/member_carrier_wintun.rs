@@ -518,6 +518,8 @@ pub(crate) mod native {
                     module.verify_acquired_original()
                 },
                 || {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::native_adapter_reference_release_attempted();
                     if unsafe { FreeLibrary(pin.as_ptr()) } == 0 {
                         return Err(Error::Native);
                     }
@@ -898,6 +900,11 @@ pub(crate) mod native {
             if raw_pin != self.module.module.as_ptr() {
                 return Err(Error::Conflict);
             }
+            #[cfg(test)]
+            crate::windows::member_carrier_factory_test_os::native_adapter_reference_returned(
+                &original_module,
+            )
+            .map_err(|_| Error::Native)?;
             let context = prerequisite.record.context.clone();
             let original_binding = prerequisite.binding.clone();
             let generation = prerequisite.record.generation;
@@ -917,6 +924,8 @@ pub(crate) mod native {
             crate::windows::member_carrier_factory_test_os::trace_step(
                 "C native CreateAdapter entered",
             );
+            #[cfg(test)]
+            crate::windows::member_carrier_factory_test_os::native_adapter_create_attempted();
             let raw = unsafe { (self.functions.create)(name.as_ptr(), kind.as_ptr(), &guid) };
             // Consume the actual borrowed receipt AFTER the native call. The
             // caller-held lock/token, not this record, supply live authority.

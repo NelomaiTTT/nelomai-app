@@ -22,7 +22,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     // Each unknown publication retains the original process KeyLock. Run each
     // case in its OWN child; process exit is not a synthesized cleanup receipt.
     // libtest names start at the crate's modules; module_path! includes the
-    // crate name. Retain the exact single-child count check below.
+    // crate name. Each resolver lane also exercises its distinct adapter
+    // reference in a fresh child; retain the exact count checks below.
     let child_module = module_path!()
         .split_once("::")
         .expect("crate-qualified module")
@@ -70,6 +71,14 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     for case in cases
         .into_iter()
         .filter(|case| selected.as_deref().is_none_or(|selected| *case == selected))
+        .flat_map(|case| {
+            let adapter = match case {
+                "resolver-reference-error" => Some("adapter-reference-error"),
+                "resolver-reference-unwind" => Some("adapter-reference-unwind"),
+                _ => None,
+            };
+            std::iter::once(case).chain(adapter)
+        })
     {
         // The case spans preparation, many independently supervised cleanup
         // calls and a second session. This outer bound is not a native Calling
@@ -129,7 +138,12 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         }
         completed += 1;
     }
-    assert_eq!(completed, if selected.is_some() { 1 } else { cases.len() });
+    let expected = match selected.as_deref() {
+        Some("resolver-reference-error" | "resolver-reference-unwind") => 2,
+        Some(_) => 1,
+        None => cases.len() + 2,
+    };
+    assert_eq!(completed, expected);
     println!(
         "actual native factory coverage case={} completed={completed}",
         selected.as_deref().unwrap_or("all")
@@ -149,6 +163,10 @@ fn carrier_factory_actual_cold_child() {
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
     );
+    let adapter_partial = matches!(
+        case.as_str(),
+        "adapter-reference-error" | "adapter-reference-unwind"
+    );
     let native_partial = match case.as_str() {
         "carrier-ack" => Some((NativePublication::Carrier, false)),
         "carrier-unwind" => Some((NativePublication::Carrier, true)),
@@ -158,7 +176,11 @@ fn carrier_factory_actual_cold_child() {
         "running-unwind" => Some((NativePublication::Running, true)),
         _ => None,
     };
-    let fixture = if module_partial || resolver_partial || full_primary || native_partial.is_some()
+    let fixture = if module_partial
+        || resolver_partial
+        || adapter_partial
+        || full_primary
+        || native_partial.is_some()
     {
         Fixture::new_native_modules()
     } else {
@@ -187,6 +209,7 @@ fn carrier_factory_actual_cold_child() {
         "cold" | "primary-data-denial" | "primary" => (),
         "module-load-read-error" | "module-load-read-unwind" => (),
         "resolver-reference-error" | "resolver-reference-unwind" => (),
+        "adapter-reference-error" | "adapter-reference-unwind" => (),
         "carrier-ack" | "carrier-unwind" | "member-ack" | "member-unwind" | "running-ack"
         | "running-unwind" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
@@ -207,6 +230,7 @@ fn carrier_factory_actual_cold_child() {
     if matches!(case.as_str(), "cold" | "primary-data-denial")
         || module_partial
         || resolver_partial
+        || adapter_partial
         || full_primary
         || native_partial.is_some()
     {
@@ -256,6 +280,45 @@ fn carrier_factory_actual_cold_child() {
         assert!(original.snapshot().cleanup_pending);
         fixture.require_retained_resolver_reference();
         // Process exit is not a completed release or protected retirement ACK.
+        std::mem::forget(original);
+        std::mem::forget(factory);
+        return;
+    }
+    if adapter_partial {
+        fixture.lose_adapter_reference_postflight(case == "adapter-reference-unwind");
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            original.start_primary(primary, options)
+        }));
+        assert!(
+            started.is_err() || started.unwrap().is_err(),
+            "adapter reference fault accepted"
+        );
+        assert!(original.snapshot().cleanup_pending);
+        fixture.require_retained_adapter_reference();
+        assert!(
+            original.start_primary(primary, options).is_err(),
+            "uncertain adapter reference retried"
+        );
+        fixture.require_retained_adapter_reference();
+        let stopped = original.execute(
+            Command::Stop {
+                scope: scope.clone(),
+            },
+            8,
+        );
+        assert!(
+            stopped.is_err(),
+            "no-C adapter reference became completed Stop"
+        );
+        assert!(original.snapshot().cleanup_pending);
+        fixture.require_retained_adapter_reference();
+        // No adapter CloseACK exists, and process exit supplies no release ACK.
         std::mem::forget(original);
         std::mem::forget(factory);
         return;
