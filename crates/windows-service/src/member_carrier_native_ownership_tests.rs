@@ -639,7 +639,19 @@ fn registry_is_journaled_before_each_effect_and_exactly_disabled_before_creation
 fn cleanup_restores_only_owned_values_after_nic_absence_and_never_deletes_keys() {
     let (mut owner, shared, mut lock) = setup();
     let record = prepare_all(&mut owner, &mut lock);
-    let stopped = owner.cleanup(&record, &mut lock).unwrap();
+    let mut calls = 0;
+    let stopped = owner
+        .cleanup_in(&record, &mut lock, |call| {
+            calls += 1;
+            let before = shared.borrow().inspection_count;
+            call()?;
+            assert!(
+                shared.borrow().inspection_count - before <= 1,
+                "cleanup must independently supervise each complete owner census"
+            );
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(stopped.phase, Phase::Stopped);
     assert!(stopped
         .keys
@@ -657,6 +669,52 @@ fn cleanup_restores_only_owned_values_after_nic_absence_and_never_deletes_keys()
     let effects = shared.borrow().events.len();
     assert_eq!(owner.cleanup(&stopped, &mut lock), Ok(stopped));
     assert_eq!(shared.borrow().events.len(), effects);
+    for failed_call in 1..=calls {
+        for unwind in [false, true] {
+            let (mut owner, shared, mut lock) = setup();
+            let record = prepare_all(&mut owner, &mut lock);
+            let mut current_call = 0;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.cleanup_in(&record, &mut lock, |call| {
+                    current_call += 1;
+                    call()?;
+                    if current_call == failed_call {
+                        if unwind {
+                            panic!("cleanup original postflight");
+                        }
+                        return Err(Error::Pending);
+                    }
+                    Ok(())
+                })
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(current_call, failed_call);
+            let actual = owner.snapshot().unwrap().unwrap();
+            assert_eq!(owner.current.as_ref(), Some(&actual));
+            for (index, original) in owner.retained.keys.iter().enumerate() {
+                assert_eq!(
+                    original.as_ref().unwrap().ack.retained_handle().0,
+                    10 + index as u64
+                );
+            }
+            assert!(owner
+                .before_adapter_create(Role::RoleCarrier, &mut lock)
+                .is_err());
+            let stopped = owner.cleanup(&actual, &mut lock).unwrap();
+            assert_eq!(stopped.phase, Phase::Stopped);
+            assert_eq!(shared.borrow().keys, [Some(10), Some(11), Some(12)]);
+            assert_eq!(
+                shared
+                    .borrow()
+                    .events
+                    .iter()
+                    .filter(|event| event.ends_with(":Absent"))
+                    .count(),
+                3,
+                "accepted native value restoration is not repeated after postflight {failed_call}"
+            );
+        }
+    }
 }
 
 #[test]

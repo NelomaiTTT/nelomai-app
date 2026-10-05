@@ -7583,7 +7583,9 @@ pub(crate) mod native {
                         .map_err(denied)
                 });
             }
-            self.in_call(record, |this, _| {
+            // Establish the SAME original Closing capture and snapshot inside
+            // its existing whole call; retain the owner in Assembly throughout.
+            let current = self.in_call(record, |this, _| {
                 if record.phase != pair::Phase::Closing
                     || record.stop_stage != 11
                     || record.pending != Some(pair::Effect::RestoreKeys)
@@ -7593,9 +7595,38 @@ pub(crate) mod native {
                 let r = this.roots_mut()?;
                 let (owner, _) = r.assembly.retained_parts();
                 let owner = owner.as_mut().ok_or_else(conflict)?;
-                let current = owner.snapshot().map_err(denied)?.ok_or_else(conflict)?;
-                owner.cleanup(&current, &mut r.lock).map_err(denied)?;
-                Ok(())
+                owner.snapshot().map_err(denied)?.ok_or_else(conflict)
+            })?;
+            let serial = self.serial.clone();
+            serial.run(true, || {
+                let pin = self.current(record)?;
+                let r = self.roots_mut()?;
+                let context = r.context.clone();
+                let runtime = r.runtime.clone();
+                let supervisor = r.pins.supervisor.clone();
+                let (owner, _) = r.assembly.retained_parts();
+                owner
+                    .as_mut()
+                    .ok_or_else(conflict)?
+                    .cleanup_in(&current, &mut r.lock, |call| {
+                        supervisor.run_cleanup(&context, &pin, || {
+                            pin.inspect_cleanup_effect(&runtime, &supervisor, record, 11, |_| {
+                                Ok(())
+                            })
+                            .map_err(carrier_denied)?;
+                            call()?;
+                            pin.inspect_cleanup_effect(
+                                &runtime,
+                                &supervisor,
+                                record,
+                                11,
+                                |_| Ok(()),
+                            )
+                            .map_err(carrier_denied)
+                        })
+                    })
+                    .map(|_| ())
+                    .map_err(denied)
             })
         }
 

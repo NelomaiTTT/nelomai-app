@@ -1464,33 +1464,56 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         expected: &Record,
         lock: &mut I::MutationLock,
     ) -> Result<Record> {
-        let mut record = self.begin_cleanup(expected, lock)?;
+        self.cleanup_in(expected, lock, |call| call())
+    }
+    pub(crate) fn cleanup_in(
+        &mut self,
+        expected: &Record,
+        lock: &mut I::MutationLock,
+        mut run: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<Record> {
+        // A missing/failed runner cannot leave this original forward-capable.
+        self.cleanup_only = true;
+        self.consumed = [true; 3];
+        let mut current = None;
+        preparation_call(&mut run, || {
+            current = Some(self.begin_cleanup(expected, lock)?);
+            Ok(())
+        })?;
+        let mut record = current.ok_or(Error::Pending)?;
         if record.phase == Phase::Stopped {
-            self.verify_clean(&record, lock)?;
+            self.verify_clean_in(&record, lock, &mut run)?;
             return Ok(record);
         }
         for role in [Role::RoleCarrier, Role::MemberA, Role::MemberB] {
-            record = self.clean_key(record, role, lock)?;
+            record = self.clean_key_in(record, role, lock, &mut run)?;
         }
-        self.verify_clean(&record, lock)?;
+        self.verify_clean_in(&record, lock, &mut run)?;
         let mut stopped = next(&record)?;
         stopped.phase = Phase::Stopped;
-        self.persist(Some(&record), &stopped, lock)?;
-        self.verify_clean(&stopped, lock)?;
+        preparation_call(&mut run, || self.persist(Some(&record), &stopped, lock))?;
+        self.verify_clean_in(&stopped, lock, &mut run)?;
         Ok(stopped)
     }
-    fn clean_key(
+    fn clean_key_in(
         &mut self,
         mut record: Record,
         role: Role,
         lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
     ) -> Result<Record> {
         let i = role.index();
-        if record.keys[i].phase == KeyPhase::CreatePending {
-            return Err(Error::Pending);
-        }
-        let mut facts = self.observe(&record, role, lock)?;
-        require_nic_absent(&facts)?;
+        let mut observed = None;
+        preparation_call(run, || {
+            if record.keys[i].phase == KeyPhase::CreatePending {
+                return Err(Error::Pending);
+            }
+            let facts = self.observe(&record, role, lock)?;
+            require_nic_absent(&facts)?;
+            observed = Some(facts);
+            Ok(())
+        })?;
+        let mut facts = observed.ok_or(Error::Pending)?;
         // Cleanup-only factual lane: SAME retained NEW original was deleted by
         // SDK. No value effect on that handle and no native ACK adoption. Only
         // publish our next Clean obligation through the ordinary exact CAS.
@@ -1508,21 +1531,24 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
                     pending.keys[i].phase = KeyPhase::Captured;
                     pending.keys[i].pending = None;
                 }
-                self.persist(Some(&record), &pending, lock)?;
+                preparation_call(run, || self.persist(Some(&record), &pending, lock))?;
                 record = pending;
-                let reread = self.observe(&record, role, lock)?;
-                require_nic_absent(&reread)?;
-                require_value(&reread, Value::Absent)?;
-                if reread.key != KeyPresence::OriginalSdkDeleted {
-                    return Err(Error::Conflict);
-                }
+                preparation_call(run, || {
+                    let reread = self.observe(&record, role, lock)?;
+                    require_nic_absent(&reread)?;
+                    require_value(&reread, Value::Absent)?;
+                    if reread.key != KeyPresence::OriginalSdkDeleted {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                })?;
             }
             if record.keys[i].phase != KeyPhase::Clean {
                 let mut clean = next(&record)?;
                 clean.keys[i].phase = KeyPhase::Clean;
                 clean.keys[i].current = Value::Absent;
                 clean.keys[i].pending = None;
-                self.persist(Some(&record), &clean, lock)?;
+                preparation_call(run, || self.persist(Some(&record), &clean, lock))?;
                 record = clean;
             }
             return Ok(record);
@@ -1543,27 +1569,31 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
                 _ => return Err(Error::Conflict),
             }
             confirmed.keys[i].pending = None;
-            self.persist(Some(&record), &confirmed, lock)?;
+            preparation_call(run, || self.persist(Some(&record), &confirmed, lock))?;
             record = confirmed;
-            facts = self.observe(&record, role, lock)?;
-            require_nic_absent(&facts)?;
-            require_owned(&facts)?;
+            preparation_call(run, || {
+                facts = self.observe(&record, role, lock)?;
+                require_nic_absent(&facts)?;
+                require_owned(&facts)
+            })?;
         }
         if record.keys[i].phase == KeyPhase::Disabled {
             require_value(&facts, Value::DwordZero)?;
             let mut pending = next(&record)?;
             pending.keys[i].phase = KeyPhase::RestorePending;
             pending.keys[i].pending = Some(Value::Absent);
-            self.persist(Some(&record), &pending, lock)?;
+            preparation_call(run, || self.persist(Some(&record), &pending, lock))?;
             record = pending;
-            facts = self.observe(&record, role, lock)?;
-            require_nic_absent(&facts)?;
-            require_owned(&facts)?;
+            preparation_call(run, || {
+                facts = self.observe(&record, role, lock)?;
+                require_nic_absent(&facts)?;
+                require_owned(&facts)
+            })?;
         }
         if record.keys[i].phase == KeyPhase::RestorePending {
             match facts.value {
                 NativeValue::Dword(0) => {
-                    self.write_value(&record, role, Value::DwordZero, Value::Absent, lock)?
+                    self.write_value_in(&record, role, Value::DwordZero, Value::Absent, lock, run)?
                 }
                 NativeValue::Absent => {} // Exact owned pending restore readback.
                 _ => return Err(Error::Conflict),
@@ -1576,26 +1606,37 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             clean.keys[i].phase = KeyPhase::Clean;
             clean.keys[i].current = Value::Absent;
             clean.keys[i].pending = None;
-            self.persist(Some(&record), &clean, lock)?;
+            preparation_call(run, || self.persist(Some(&record), &clean, lock))?;
             record = clean;
         }
         Ok(record)
     }
     fn verify_clean(&mut self, record: &Record, lock: &mut I::MutationLock) -> Result<()> {
+        self.verify_clean_in(record, lock, &mut |call| call())
+    }
+    fn verify_clean_in(
+        &mut self,
+        record: &Record,
+        lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
         for role in [Role::RoleCarrier, Role::MemberA, Role::MemberB] {
-            if record.keys[role.index()].phase != KeyPhase::Clean {
-                return Err(Error::Pending);
-            }
-            let facts = self.observe(record, role, lock)?;
-            require_nic_absent(&facts)?;
-            require_value(&facts, Value::Absent)?;
-            if record.keys[role.index()].new_key_ack {
-                if facts.key != KeyPresence::OriginalSdkDeleted {
-                    require_owned(&facts)?;
+            preparation_call(run, || {
+                if record.keys[role.index()].phase != KeyPhase::Clean {
+                    return Err(Error::Pending);
                 }
-            } else if facts.key != KeyPresence::Absent {
-                return Err(Error::Conflict);
-            }
+                let facts = self.observe(record, role, lock)?;
+                require_nic_absent(&facts)?;
+                require_value(&facts, Value::Absent)?;
+                if record.keys[role.index()].new_key_ack {
+                    if facts.key != KeyPresence::OriginalSdkDeleted {
+                        require_owned(&facts)?;
+                    }
+                } else if facts.key != KeyPresence::Absent {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }

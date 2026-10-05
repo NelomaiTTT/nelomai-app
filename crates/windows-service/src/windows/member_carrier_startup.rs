@@ -5779,7 +5779,7 @@ pub(crate) mod native {
             self.read_pregraph_key_restore_root(original, expected, Some(false))?;
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
-            supervisor.run_cleanup(&context, original, || {
+            let current = supervisor.run_cleanup(&context, original, || {
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
                 self.graph
                     .try_borrow()
@@ -5796,11 +5796,46 @@ pub(crate) mod native {
                 if current.context != context {
                     return Err(Error::Conflict);
                 }
-                owner.cleanup(&current, lock)?;
+                Ok(current)
+            })?;
+            let runtime = self.runtime.clone();
+            let graph = self.graph.clone();
+            let lock = self.lock.as_mut().ok_or(Error::Retired)?;
+            let assembly = self.assembly.as_mut().ok_or(Error::Pending)?;
+            let (owner, _) = assembly.retained_parts();
+            owner
+                .as_mut()
+                .ok_or(Error::Pending)?
+                .cleanup_in(&current, lock, |call| {
+                    supervisor.run_cleanup(&context, original, || {
+                        original
+                            .inspect_cleanup_effect(&runtime, &supervisor, expected, 11, |_| Ok(()))
+                            .map_err(|_| Error::Conflict)?;
+                        graph
+                            .try_borrow()
+                            .map_err(|_| Error::Conflict)?
+                            .require_pristine()?;
+                        call()?;
+                        graph
+                            .try_borrow()
+                            .map_err(|_| Error::Conflict)?
+                            .require_pristine()?;
+                        original
+                            .inspect_cleanup_effect(&runtime, &supervisor, expected, 11, |_| Ok(()))
+                            .map_err(|_| Error::Conflict)
+                    })
+                })?;
+            supervisor.run_cleanup(&context, original, || {
                 self.graph
                     .try_borrow()
                     .map_err(|_| Error::Conflict)?
                     .require_pristine()?;
+                if !self
+                    .runtime
+                    .matches_lock(self.lock.as_ref().ok_or(Error::Retired)?)
+                {
+                    return Err(Error::Conflict);
+                }
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)
             })?;
             self.read_pregraph_key_restore_root(original, expected, Some(true))
