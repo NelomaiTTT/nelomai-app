@@ -501,6 +501,33 @@ impl RuntimeRead {
     pub(super) fn matches_lock(&self, lock: &KeyLock) -> bool {
         lock.matches_pin(&self.lease)
     }
+    /// Original source/runtime/lease and current protected-context facts only.
+    /// Signed payload/DLL authentication must remain in the surrounding full
+    /// source read; this check cannot replace standalone verify_source or grant
+    /// mapping, module, freshness or native effect authority.
+    pub(super) fn verify_original_source_context(
+        &self,
+        source: &super::member_carrier_payload::native::WintunSource,
+    ) -> Result<()> {
+        let context = &self.runtime.context;
+        self.runtime.verify_original_context(&self.lease, context)?;
+        source.require_runtime_binding(
+            &self.runtime.owner,
+            &self.runtime.identity,
+            &self.runtime.installation.root,
+            &self.runtime.directory,
+            &self.runtime.executable,
+        )?;
+        self.runtime
+            .files
+            .try_borrow_mut()
+            .map_err(|_| Error::Conflict)?
+            .native_carrier_access(&context.intent.scope)
+            .map_err(|_| Error::Journal)?
+            .require_native_context(context)
+            .map_err(|_| Error::Conflict)?;
+        self.runtime.verify_original_context(&self.lease, context)
+    }
     pub(super) fn verify_source(
         &self,
         source: &super::member_carrier_payload::native::WintunSource,
@@ -520,16 +547,7 @@ impl RuntimeRead {
                 )?;
                 self.runtime.verify_original_context(&self.lease, context)
             },
-            || {
-                self.runtime
-                    .files
-                    .try_borrow_mut()
-                    .map_err(|_| Error::Conflict)?
-                    .native_carrier_access(&context.intent.scope)
-                    .map_err(|_| Error::Journal)?
-                    .require_native_context(context)
-                    .map_err(|_| Error::Conflict)
-            },
+            || self.verify_original_source_context(source),
         )
     }
     /// Actual signed member sources, not member service/NIC ownership or effect

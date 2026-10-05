@@ -224,7 +224,9 @@ pub(crate) mod native {
         pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
             self.0.verify_owner(owner)
         }
-        pub(in crate::windows) fn verify_runtime_binding(
+        /// Compare immutable originals only. This does not authenticate current
+        /// signed payloads or the DLL pin and cannot grant mapping/effect authority.
+        pub(in crate::windows) fn require_runtime_binding(
             &self,
             owner: &Arc<MutationGuard>,
             identity: &EngineIdentity,
@@ -233,6 +235,22 @@ pub(crate) mod native {
             executable: &Path,
         ) -> Result<()> {
             self.0.require_runtime_binding(
+                owner,
+                identity,
+                installation_root,
+                directory,
+                executable,
+            )
+        }
+        pub(in crate::windows) fn verify_runtime_binding(
+            &self,
+            owner: &Arc<MutationGuard>,
+            identity: &EngineIdentity,
+            installation_root: &Path,
+            directory: &Path,
+            executable: &Path,
+        ) -> Result<()> {
+            self.require_runtime_binding(
                 owner,
                 identity,
                 installation_root,

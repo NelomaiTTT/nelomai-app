@@ -1419,19 +1419,19 @@ pub(crate) mod native {
                     if !self.runtime.matches_pin(&self.lock) {
                         return Err(Error::Conflict);
                     }
-                    // Exact pin identity joins our lock to RuntimeRead's lock;
-                    // verify_source checks that same owner and signed source.
+                    // Join the SAME serialized owner/source and actual protected
+                    // context around the anchor's full source authentication.
                     self.runtime
-                        .verify_source(&self.source)
+                        .verify_original_source_context(&self.source)
                         .map_err(|_| Error::Conflict)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     // The full original anchor read also checks this SAME
                     // mapping, image bounds and audited exports. Keep both
-                    // original lease/runtime fences around that complete read.
+                    // original lease/runtime/context fences around that read.
                     require_process_anchor(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     self.runtime
-                        .verify_source(&self.source)
+                        .verify_original_source_context(&self.source)
                         .map_err(|_| Error::Conflict)?;
                     if !self.runtime.matches_pin(&self.lock) {
                         return Err(Error::Conflict);
@@ -1563,15 +1563,15 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             runtime
-                .verify_source(&self.source)
+                .verify_original_source_context(&self.source)
                 .map_err(|_| Error::Conflict)?;
             // This full anchor read also verifies the SAME current source's
             // actual mapping/bounds/exports, including distinct repeat sources.
-            // Bracket it with the original runtime rather than reading the
-            // same image again immediately after the anchor's complete read.
+            // Both source authentications remain inside that mapping read;
+            // retain the original runtime/context facts on its two sides.
             require_process_anchor(&self.source, &self.module)?;
             runtime
-                .verify_source(&self.source)
+                .verify_original_source_context(&self.source)
                 .map_err(|_| Error::Conflict)
         }
         pub(crate) fn cleanup_read_module(&self) -> Result<NonNull<c_void>> {
