@@ -54,8 +54,25 @@ pub(crate) fn decode_identity(row: &MIB_IF_ROW2) -> Result<NativeIdentity> {
         .Alias
         .iter()
         .position(|c| *c == 0)
-        .ok_or(Error::Unsupported)?;
-    let name = String::from_utf16(&row.Alias[..end]).map_err(|_| Error::Unsupported)?;
+        .ok_or(Error::Unsupported)
+        .inspect_err(|_| {
+            #[cfg(all(test, windows))]
+            if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                trace_observe(&format!(
+                    "C actual identity Unsupported Alias unterminated units={}",
+                    row.Alias.len()
+                ));
+            }
+        })?;
+    let name = String::from_utf16(&row.Alias[..end]).map_err(|_| {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!(
+                "C actual identity Unsupported Alias invalid UTF16 units={end}"
+            ));
+        }
+        Error::Unsupported
+    })?;
     let guid = guid_bytes(&row.InterfaceGuid);
     if guid == [0; 16]
         || name.is_empty()
@@ -66,6 +83,11 @@ pub(crate) fn decode_identity(row: &MIB_IF_ROW2) -> Result<NativeIdentity> {
         // SDK bits, not invented flags; readiness/power bits remain observations.
         || row.InterfaceAndOperStatusFlags._bitfield & 0x83 != 0
     {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!("C actual identity Unsupported guidzero={} aliasbytes={} aliascontrol={} Type={} InterfaceAndOperStatusFlags={:#x}",
+                guid == [0; 16], name.len(), name.chars().any(|c| c.is_control()), row.Type, row.InterfaceAndOperStatusFlags._bitfield));
+        }
         return Err(Error::Unsupported);
     }
     Ok(NativeIdentity {
@@ -79,6 +101,12 @@ pub(crate) fn decode_identity(row: &MIB_IF_ROW2) -> Result<NativeIdentity> {
 pub(crate) fn decode_address(r: &MIB_UNICASTIPADDRESS_ROW) -> Result<AddressRow> {
     // Read only the family-selected SDK union arm, never padding/inactive bytes.
     if unsafe { r.Address.si_family } != AF_INET {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!("C actual address Unsupported Family={}", unsafe {
+                r.Address.si_family
+            }));
+        }
         return Err(Error::Unsupported);
     }
     let (addr, luid, scope) = unsafe {
@@ -89,6 +117,14 @@ pub(crate) fn decode_address(r: &MIB_UNICASTIPADDRESS_ROW) -> Result<AddressRow>
         )
     };
     if addr.sin_port != 0 || addr.sin_zero != [0; 8] {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!(
+                "C actual address Unsupported sin_port={} sin_zero_nonzero={}",
+                addr.sin_port,
+                addr.sin_zero != [0; 8]
+            ));
+        }
         return Err(Error::Unsupported);
     }
     let row = AddressRow {
@@ -112,8 +148,23 @@ pub(crate) fn decode_address(r: &MIB_UNICASTIPADDRESS_ROW) -> Result<AddressRow>
         },
     };
     row.key.validate()?;
-    row.policy.validate()?;
+    row.policy.validate().inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        if *_error == Error::Unsupported
+            && crate::windows::member_carrier_factory_test_os::state().is_some()
+        {
+            trace_observe(&format!("C actual address policy Unsupported address={:?} PrefixOrigin={} SuffixOrigin={} ValidLifetime={} PreferredLifetime={} OnLinkPrefixLength={} SkipAsSource={}",
+                row.policy.address, row.policy.prefix_origin, row.policy.suffix_origin, row.policy.valid_lifetime, row.policy.preferred_lifetime, row.policy.on_link_prefix_length, row.policy.skip_as_source));
+        }
+    })?;
     if !(0..=4).contains(&row.observed.dad_state) || row.observed.creation_timestamp < 0 {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!(
+                "C actual address observed Unsupported DadState={} ScopeId={} CreationTimeStamp={}",
+                row.observed.dad_state, row.observed.scope_id, row.observed.creation_timestamp
+            ));
+        }
         return Err(Error::Unsupported);
     }
     Ok(row)
@@ -170,7 +221,15 @@ pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> 
         },
     };
     row.key.validate()?;
-    row.policy.validate()?;
+    row.policy.validate().inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        if *_error == Error::Unsupported
+            && crate::windows::member_carrier_factory_test_os::state().is_some()
+        {
+            trace_observe(&format!("C actual interface policy Unsupported RouterDiscoveryBehavior={} LinkLocalAddressBehavior={} Metric={} NlMtu={} SitePrefixLength={}",
+                row.policy.router_discovery, row.policy.link_local_behavior, row.policy.metric, row.policy.mtu, row.policy.site_prefix_length));
+        }
+    })?;
     Ok(row)
 }
 /// Caller passes a row from InitializeUnicastIpAddressEntry, NOT a saved raw blob.
