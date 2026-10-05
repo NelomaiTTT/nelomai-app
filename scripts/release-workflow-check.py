@@ -73,6 +73,9 @@ def run() -> None:
         raise RuntimeError("Native matrix must cover every actual factory case exactly once")
     if "-Case ${{ matrix.case }}" not in native_job[1]:
         raise RuntimeError("Native runner must select its explicit factory case")
+    runtime_input = native_job[1].split("      - name: Actual factory runtime input\n", 1)[1].split("      # The actual factory", 1)[0]
+    if "cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release" not in runtime_input or "target/release/nelomai-windows-service.exe" not in runtime_input:
+        raise RuntimeError("Actual factory signed runtime must use the shipping release engine")
     aggregate = checks_workflow.split("  windows:", 1)[1].split("  macos:", 1)[0]
     for token in ("needs: [windows-native]", "always()", "needs.windows-native.result", 'test "$NATIVE_RESULT" = success'):
         if token not in aggregate:

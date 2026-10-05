@@ -228,9 +228,12 @@ jobs:
       - run: cargo test -p nelomai-client-updater
       - name: Actual factory runtime input
         run: |
-          cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --profile test
+          # The installed engine is the exact shipping build. Keep the ordinary
+          # test suite/debug assertions separate from the signed runtime fixture.
+          cargo build --locked -p nelomai-windows-service --bin nelomai-windows-service --release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $engine = (Resolve-Path -LiteralPath 'target/debug/nelomai-windows-service.exe').Path
+          $engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
+          Write-Output "Actual factory release engine bytes=$((Get-Item -LiteralPath $engine).Length)"
           $runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
           # Reuse the pinned production dependency builder: SCM executes this
           # exact-source engine with genuine WG/AWG tunnel DLLs, never DATA.
