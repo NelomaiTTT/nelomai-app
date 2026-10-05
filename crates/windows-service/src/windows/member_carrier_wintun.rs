@@ -1,5 +1,7 @@
 //! Retained original-creator Wintun substrate. Factory deliberately disconnected.
 #![allow(dead_code)]
+#[cfg(all(test, windows))]
+use crate::windows::member_carrier_factory_test_os::trace_step as trace_observe;
 use std::ffi::{c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1394,7 +1396,18 @@ impl<K: Kernel> Carrier<K> {
         self.capture_for(Stage::Observe)
     }
     fn capture_for(&mut self, stage: Stage) -> Result<()> {
-        self.kernel.verify(&self.binding, stage)?;
+        self.kernel
+            .verify(&self.binding, stage)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                if stage == Stage::Observe {
+                    trace_observe(&format!("C Observe capture kernel error={_error:?}"));
+                }
+            })?;
+        #[cfg(all(test, windows))]
+        if stage == Stage::Observe {
+            trace_observe("C Observe capture kernel verify accepted");
+        }
         let adapter = self.adapter.as_ref().ok_or(Error::Pending)?;
         let luid = self.kernel.luid(adapter)?;
         if luid == 0 {
@@ -1413,13 +1426,32 @@ impl<K: Kernel> Carrier<K> {
             )
             || self.original.as_ref().is_some_and(|old| *old != identity)
         {
+            #[cfg(all(test, windows))]
+            if stage == Stage::Observe {
+                trace_observe("C Observe capture raw identity mismatch: Conflict");
+            }
             return Err(Error::Conflict);
         }
         let by_index = self.kernel.row_index(identity.index)?;
         if self.kernel.identity(&by_index)? != identity || self.kernel.luid(adapter)? != luid {
+            #[cfg(all(test, windows))]
+            if stage == Stage::Observe {
+                trace_observe("C Observe capture by-index mismatch: Conflict");
+            }
             return Err(Error::Conflict);
         }
-        self.kernel.attest(&self.binding, &identity, stage)?;
+        self.kernel
+            .attest(&self.binding, &identity, stage)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                if stage == Stage::Observe {
+                    trace_observe(&format!("C Observe capture provider error={_error:?}"));
+                }
+            })?;
+        #[cfg(all(test, windows))]
+        if stage == Stage::Observe {
+            trace_observe("C Observe capture provider attest accepted");
+        }
         if self.original.is_none() {
             self.original = Some(identity);
             self.captured = Some(row);

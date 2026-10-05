@@ -1,6 +1,8 @@
 //! Full native IPv4 rows, deliberately disconnected from the production factory.
 #![allow(dead_code)]
 pub(crate) use crate::member_carrier_rows::*;
+#[cfg(all(test, windows))]
+use crate::windows::member_carrier_factory_test_os::trace_step as trace_observe;
 use nelomai_client_tunnel::redundancy::SessionScope;
 use std::{
     cell::{Cell, RefCell},
@@ -118,6 +120,11 @@ pub(crate) fn decode_address(r: &MIB_UNICASTIPADDRESS_ROW) -> Result<AddressRow>
 }
 pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> {
     if r.Family != AF_INET || r.MaxReassemblySize != 0 || r.InterfaceIdentifier != 0 {
+        #[cfg(all(test, windows))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            trace_observe(&format!("C actual interface Unsupported Family={} MaxReassemblySize={} InterfaceIdentifier={}",
+                r.Family, r.MaxReassemblySize, r.InterfaceIdentifier));
+        }
         return Err(Error::Unsupported);
     }
     let row = InterfaceRow {

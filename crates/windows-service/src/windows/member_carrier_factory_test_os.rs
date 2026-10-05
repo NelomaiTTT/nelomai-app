@@ -290,7 +290,7 @@ pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::Ca
         });
     }
 }
-pub(crate) fn trace_step(step: &'static str) {
+pub(crate) fn trace_step(step: &str) {
     if state().is_some() {
         eprintln!("actual native step {step} tick={}", unsafe {
             windows_sys::Win32::System::SystemInformation::GetTickCount64()

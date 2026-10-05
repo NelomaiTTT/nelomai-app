@@ -1420,6 +1420,8 @@ pub(crate) mod native {
         GenerationProjection, GenerationWriteSelection, RetiredReadStage, Use,
     };
     use crate::member_carrier_native_ownership as receipts;
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step as trace_observe;
     use crate::windows::{
         member_carrier_creators::{self as creators, NativeAbsence, OriginalNative},
         member_carrier_key_authority::{KeyLock, RuntimeRead},
@@ -6045,9 +6047,38 @@ pub(crate) mod native {
             }
             // Acquire new recursive lease BEFORE replacing/releasing the old
             // one; no unlocked gap before a later EndSession/CloseAdapter.
-            let held = self.refresh(use_)?;
-            self.gate.authorize(&self.scope, stage, &self.observer)?;
-            same_record(&before, self.current(use_)?).map_err(denied)?;
+            let held = self.refresh(use_).inspect_err(|_error| {
+                #[cfg(test)]
+                if stage == Stage::Observe {
+                    trace_observe(&format!("C Observe authority refresh error={_error:?}"));
+                }
+            })?;
+            self.gate
+                .authorize(&self.scope, stage, &self.observer)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    if stage == Stage::Observe {
+                        trace_observe(&format!("C Observe authority G error={_error:?}"));
+                    }
+                })?;
+            same_record(
+                &before,
+                self.current(use_).inspect_err(|_error| {
+                    #[cfg(test)]
+                    if stage == Stage::Observe {
+                        trace_observe(&format!("C Observe authority current error={_error:?}"));
+                    }
+                })?,
+            )
+            .map_err(denied)
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                if stage == Stage::Observe {
+                    trace_observe(&format!(
+                        "C Observe authority current equality error={_error:?}"
+                    ));
+                }
+            })?;
             self.effect = Some(held);
             if stage == Stage::BeforeClose && self.retirement.is_none() {
                 self.retirement = Some(self.producer.retire(&self.scope).map_err(denied)?);

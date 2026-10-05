@@ -570,6 +570,8 @@ fn validate_unpublished_after_close(
 pub(crate) mod native {
     use super::*;
     use crate::member_carrier_pair::{self as pair, Record as PairRecord};
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step as trace_observe;
     use crate::windows::{
         member_carrier_assembly::native::NativeAssemblyAssets,
         member_carrier_guard::{ScopedGuardAbsence, Wfp},
@@ -1526,6 +1528,10 @@ pub(crate) mod native {
             result
         }
         fn sample(&self, stage: StartupStage) -> wintun::Result<Sample> {
+            #[cfg(test)]
+            if stage == StartupStage::Observe {
+                trace_observe("C Observe G sample entered");
+            }
             self.continuity()?;
             let context = &self.scope.context;
             let [native, network, member_a, member_b, guard, rows]: [Option<Vec<u8>>; 6] = self
@@ -1548,9 +1554,22 @@ pub(crate) mod native {
             let record = receipts::Record::decode(&native).map_err(denied)?;
             // All original members, not a model projection or names-only query.
             if !self.members.read_all().map_err(denied)?.is_empty() {
+                #[cfg(test)]
+                if stage == StartupStage::Observe {
+                    trace_observe("C Observe G sample unexpected members: Conflict");
+                }
                 return Err(wintun::Error::Conflict);
             }
-            let originals = self.originals.observe_all(context).map_err(denied)?;
+            let originals = self
+                .originals
+                .observe_all(context)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe(&format!("C Observe G original inventory error={_error:?}"));
+                    }
+                })
+                .map_err(denied)?;
             let identities = originals
                 .originals
                 .iter()
@@ -1559,11 +1578,22 @@ pub(crate) mod native {
                     identity: o.identity.clone(),
                 })
                 .collect::<Vec<_>>();
-            validate_startup(&record, &self.scope, stage, &identities).map_err(denied)?;
+            validate_startup(&record, &self.scope, stage, &identities)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe(&format!("C Observe G validate_startup error={_error:?}"));
+                    }
+                })
+                .map_err(denied)?;
             if [network, member_a, member_b, guard]
                 .iter()
                 .any(Option::is_some)
             {
+                #[cfg(test)]
+                if stage == StartupStage::Observe {
+                    trace_observe("C Observe G sample forbidden saved journal: Conflict");
+                }
                 return Err(wintun::Error::Conflict);
             }
             let snapshot = if let Some(original) = identities.first() {
@@ -1572,12 +1602,30 @@ pub(crate) mod native {
                     &original.identity,
                 )
                 .map_err(denied)?;
-                let actual = rows::native::read_original_snapshot(&binding).map_err(denied)?;
+                let actual = rows::native::read_original_snapshot(&binding)
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        if stage == StartupStage::Observe {
+                            trace_observe(&format!("C Observe G actual rows error={_error:?}"));
+                        }
+                    })
+                    .map_err(denied)?;
+                #[cfg(test)]
+                if stage == StartupStage::Observe {
+                    trace_observe(&format!(
+                        "C Observe G actual interface policy={:?}",
+                        actual.interface.policy
+                    ));
+                }
                 if actual.interface.policy.weak_host_send
                     || actual.interface.policy.weak_host_receive
                     || actual.interface.policy.forwarding
                     || actual.interface.policy.advertising
                 {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G forbidden interface flags: Conflict");
+                    }
                     return Err(wintun::Error::Conflict);
                 }
                 if let Some(raw) = &rows {
@@ -1587,6 +1635,10 @@ pub(crate) mod native {
                         || saved.current.interface.policy != saved.baseline.interface.policy
                         || actual.interface.policy != saved.baseline.interface.policy
                     {
+                        #[cfg(test)]
+                        if stage == StartupStage::Observe {
+                            trace_observe("C Observe G saved interface mismatch: Conflict");
+                        }
                         return Err(wintun::Error::Conflict);
                     }
                     // Pending creation may have returned natively before its
@@ -1603,6 +1655,10 @@ pub(crate) mod native {
                         rows::same_owned(&actual, &saved.current)
                     };
                     if !address_matches {
+                        #[cfg(test)]
+                        if stage == StartupStage::Observe {
+                            trace_observe("C Observe G saved address mismatch: Conflict");
+                        }
                         return Err(wintun::Error::Conflict);
                     }
                     if stage == StartupStage::AddressCreate
@@ -1613,6 +1669,10 @@ pub(crate) mod native {
                         return Err(wintun::Error::Conflict);
                     }
                 } else if actual.address.is_some() || stage == StartupStage::AddressCreate {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G address without saved row: Conflict");
+                    }
                     return Err(wintun::Error::Conflict);
                 }
                 if stage == StartupStage::BeforeSession && rows.is_some() {
@@ -1621,11 +1681,20 @@ pub(crate) mod native {
                 Some(actual)
             } else {
                 if rows.is_some() {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G saved row without original: Conflict");
+                    }
                     return Err(wintun::Error::Conflict);
                 }
                 None
             };
-            self.continuity()?;
+            self.continuity().inspect_err(|_error| {
+                #[cfg(test)]
+                if stage == StartupStage::Observe {
+                    trace_observe(&format!("C Observe G sample continuity error={_error:?}"));
+                }
+            })?;
             Ok(Sample {
                 native,
                 rows,
@@ -1650,6 +1719,10 @@ pub(crate) mod native {
             }
             let pair = self.pair.clone();
             #[cfg(test)]
+            if stage == StartupStage::Observe {
+                trace_observe("C Observe G entering Pair inspection");
+            }
+            #[cfg(test)]
             if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
                 crate::windows::member_carrier_factory_test_os::trace_step(
                     "C creation G original Pair inspection",
@@ -1661,7 +1734,15 @@ pub(crate) mod native {
                 &self.expected,
                 pair::Effect::CarrierReady,
                 |actual_pair| {
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G Pair callback entered");
+                    }
                     let before = self.sample(stage).map_err(io_denied)?;
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G first sample accepted");
+                    }
                     #[cfg(test)]
                     if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
                         crate::windows::member_carrier_factory_test_os::trace_step(
@@ -1669,7 +1750,20 @@ pub(crate) mod native {
                         );
                     }
                     let native = receipts::Record::decode(&before.native).map_err(io_denied)?;
-                    validate_carrier_ready_pair(&native, actual_pair).map_err(io_denied)?;
+                    validate_carrier_ready_pair(&native, actual_pair)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            if stage == StartupStage::Observe {
+                                trace_observe(&format!(
+                                    "C Observe G validatePair error={_error:?}"
+                                ));
+                            }
+                        })
+                        .map_err(io_denied)?;
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G validatePair accepted; first absence");
+                    }
                     if let Some((binding, target)) = row {
                         let raw = before.rows.as_ref().ok_or_else(|| io_denied(()))?;
                         let saved = rows::Record::decode(raw).map_err(io_denied)?;
@@ -1684,9 +1778,31 @@ pub(crate) mod native {
                         .try_borrow_mut()
                         .map_err(io_denied)?
                         .verify(&scope.context.intent.scope)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            if stage == StartupStage::Observe {
+                                trace_observe(&format!(
+                                    "C Observe G first absence error={_error:?}"
+                                ));
+                            }
+                        })
                         .map_err(io_denied)?;
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe("C Observe G first absence accepted; second sample");
+                    }
                     if before != self.sample(stage).map_err(io_denied)? {
+                        #[cfg(test)]
+                        if stage == StartupStage::Observe {
+                            trace_observe("C Observe G second sample equality failed: Conflict");
+                        }
                         return Err(io_denied(()));
+                    }
+                    #[cfg(test)]
+                    if stage == StartupStage::Observe {
+                        trace_observe(
+                            "C Observe G second sample equality accepted; second absence",
+                        );
                     }
                     #[cfg(test)]
                     if matches!(stage, StartupStage::Resolve | StartupStage::BeforeCreate) {
@@ -1698,10 +1814,35 @@ pub(crate) mod native {
                         .try_borrow_mut()
                         .map_err(io_denied)?
                         .verify(&scope.context.intent.scope)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            if stage == StartupStage::Observe {
+                                trace_observe(&format!(
+                                    "C Observe G second absence error={_error:?}"
+                                ));
+                            }
+                        })
                         .map_err(io_denied)?;
-                    self.continuity().map_err(io_denied)
+                    self.continuity()
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            if stage == StartupStage::Observe {
+                                trace_observe(&format!("C Observe G continuity error={_error:?}"));
+                            }
+                        })
+                        .map_err(io_denied)
                 },
             )
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                if stage == StartupStage::Observe {
+                    trace_observe(&format!(
+                        "C Observe G Pair error kind={:?} native={:?}",
+                        _error.kind(),
+                        _error.raw_os_error()
+                    ));
+                }
+            })
             .map_err(denied)?;
             self.failed = false;
             Ok(())
