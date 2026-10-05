@@ -484,6 +484,10 @@ pub(crate) mod native {
     impl ReadIo for NativeIo<'_> {
         type Snapshot = Snapshot;
         fn fence(&mut self) -> ReadResult<()> {
+            #[cfg(test)]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "module-only original fence begin",
+            );
             macro_rules! step {
                 ($label:literal, $read:expr) => {
                     $read.inspect_err(|_error| {
@@ -554,41 +558,11 @@ pub(crate) mod native {
             {
                 return Err(ReadError::Changed);
             }
-            step!(
-                "module-only original storage fence denied",
-                boundary(
-                    input
-                        .runtime
-                        .verify_same_session_files(input.context, input.files),
-                )
-            );
-            step!(
-                "module-only original source fence denied",
-                boundary(input.runtime.verify_source(input.source))
-            );
-            step!(
-                "module-only original deadline runtime fence denied",
-                boundary(input.deadline.verify_runtime(
-                    input.supervisor,
-                    input.runtime,
-                    input.context,
-                ))
-            );
-            step!(
-                "module-only original Calling fence denied",
-                boundary(input.deadline.verify_call(input.supervisor, input.context))
-            );
-            step!(
-                "module-only original Pair fence denied",
-                root.pair
-                    .verify_module_only_read_bracket(
-                        input.runtime,
-                        input.supervisor,
-                        input.context,
-                        record,
-                    )
-                    .map_err(|_| ReadError::Boundary)
-            );
+            // verify_read_origin_in_call above already authenticates these
+            // SAME bootstrap roots: original storage/source, supervisor runtime
+            // and Calling, exact protected Pair ACK and no-constructor seal.
+            // Bracket the loader's independent image/lease read with that full
+            // original check rather than nesting duplicate checks between them.
             step!(
                 "module-only original native image read denied",
                 if self.release_pre {
@@ -600,13 +574,18 @@ pub(crate) mod native {
                 }
                 .map_err(|_| ReadError::Boundary)
             );
-            boundary(input.runtime.verify_source(input.source))?;
-            boundary(
-                input
-                    .runtime
-                    .verify_same_session_files(input.context, input.files),
-            )?;
-            boundary(input.deadline.verify_call(input.supervisor, input.context))
+            step!(
+                "module-only candidate postflight fence denied",
+                boundary(
+                    root.candidate
+                        .verify_read_origin_in_call(&root.pair, &root.expected),
+                )
+            );
+            #[cfg(test)]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "module-only original fence accepted",
+            );
+            Ok(())
         }
         fn records(&mut self) -> ReadResult<[Option<Vec<u8>>; 10]> {
             let bootstrap = self.bootstrap()?;
