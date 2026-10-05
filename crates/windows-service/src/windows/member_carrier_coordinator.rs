@@ -1340,7 +1340,7 @@ pub(crate) mod native {
                     },
                 )
                 .map_err(denied)?;
-            let mut gate = Self {
+            Ok(Self {
                 runtime: assets.runtime.read_pin().map_err(denied)?,
                 image: assets.image.read_pin().map_err(denied)?,
                 originals: assets.observer.clone(),
@@ -1358,11 +1358,7 @@ pub(crate) mod native {
                 failed: false,
                 original_rows_binding: RefCell::new(None),
                 upgrade,
-            };
-            let scope = gate.scope.clone();
-            let originals = gate.originals.clone();
-            gate.authorize(&scope, Stage::Resolve, &originals)?;
-            Ok(gate)
+            })
         }
         fn continuity(&self) -> wintun::Result<()> {
             if self.cancelled.load(Ordering::Acquire) {

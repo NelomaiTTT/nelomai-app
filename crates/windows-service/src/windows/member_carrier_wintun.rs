@@ -685,7 +685,15 @@ pub(crate) mod native {
                 return Err(Error::Unsupported);
             }
             let (pin, functions) = with_call_resources(&mut module, |module| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "C native Resolve authorization",
+                );
                 module.authority.as_mut().verify(binding, Stage::Resolve)?;
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "C native Resolve GetModuleHandleExW",
+                );
                 let mut pin: HMODULE = ptr::null_mut();
                 // Adds a module reference without executing another DLL initialization.
                 if unsafe {

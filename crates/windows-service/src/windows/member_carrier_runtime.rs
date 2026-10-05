@@ -5292,11 +5292,10 @@ pub(crate) mod native {
                     if authority.image.module().map_err(denied)? != raw {
                         return Err(Error::Conflict);
                     }
-                    authority.gate.authorize(
-                        &authority.scope,
-                        Stage::Resolve,
-                        &authority.observer,
-                    )?;
+                    // The native resolver independently refreshes this SAME
+                    // retained authority and runs the complete Resolve gate
+                    // LAST before GetModuleHandleExW. Alias construction below
+                    // performs no SDK effect and cannot grant native permission.
                     same_record(&before, authority.current(Use::Create)?).map_err(denied)?;
                     let binding = authority.binding.clone();
                     let signal = authority.shared_revocation.clone();

@@ -2736,7 +2736,13 @@ pub(crate) mod native {
                     ));
                     self.meta = Some(meta);
                     let root = self.construction.as_ref().expect("retained construction");
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "C construct authority",
+                    );
                     root.construct().map_err(denied)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("C construct resolve");
                     root.resolve_components().map_err(denied)
                 }
                 ReadyStep::Create => {
