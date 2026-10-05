@@ -120,6 +120,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         for line in stderr.lines().filter(|line| {
             !line.contains("runtime begin installed payload authentication")
                 && !line.contains("runtime end installed payload authentication")
+                && !line.contains("source begin installed payload authentication")
+                && !line.contains("source end installed payload authentication")
         }) {
             println!("{line}");
         }

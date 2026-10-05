@@ -1278,6 +1278,28 @@ pub(crate) mod native {
                 health: self.health.clone(),
             }
         }
+        /// Pure retained-owner shape/origin comparison, including after DLL
+        /// release. No native absence, load/release ACK or effect authority.
+        pub(crate) fn verify_never_populated(
+            &self,
+            context: &Context,
+            runtime: &RuntimeRead,
+            carrier: &Rc<WintunSource>,
+        ) -> Result<()> {
+            let inventory = self.inventory.try_borrow().map_err(|_| Error::Conflict)?;
+            if &inventory.context != context
+                || !inventory.runtime.same_original_runtime(runtime)
+                || !Rc::ptr_eq(&inventory.carrier, carrier)
+                || inventory.entries.iter().any(Option::is_some)
+                || inventory.pending.iter().any(Option::is_some)
+                || !inventory.retired.is_empty()
+                || !inventory.retired_generations.is_empty()
+                || !inventory.rebound.is_empty()
+            {
+                return Err(Error::Conflict);
+            }
+            Ok(())
+        }
         /// Explicit, read-only generation transition. This grants NO Start,
         /// key/row reuse or WFP permission. The original actor additionally
         /// brackets all 48 filters and the retained row/key closure ACKs.

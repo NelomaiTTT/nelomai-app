@@ -219,7 +219,9 @@ impl RuntimeRead {
     }
 }
 impl Runtime {
-    fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
+    /// Check the actual original context, serialized owner, root and boot.
+    /// This does not authenticate installed signatures or grant any authority.
+    fn verify_original_context(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         if *context != self.context
             || !pin.0.matches(&self.lease.0)
             || !Arc::ptr_eq(pin.0.owner(), &self.owner)
@@ -237,6 +239,10 @@ impl Runtime {
         {
             return Err(Error::Conflict);
         }
+        Ok(())
+    }
+    fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
+        self.verify_original_context(pin, context)?;
         // Reauthenticate actual installed signatures and every runtime payload
         // hash; this is deliberately not dispatcher::trusted() on a path.
         // It does not pin/load a DLL and grants no module/driver authority.
@@ -259,10 +265,7 @@ impl Runtime {
         {
             return Err(Error::Conflict);
         }
-        (self.pin)()?;
-        self.owner
-            .verify_at(&self.installation.root.join("engine-owner.lock"))
-            .map_err(|_| Error::Conflict)
+        self.verify_original_context(pin, context)
     }
 }
 impl RuntimeRead {
@@ -503,28 +506,31 @@ impl RuntimeRead {
         source: &super::member_carrier_payload::native::WintunSource,
     ) -> Result<()> {
         let context = &self.runtime.context;
-        let current = || {
-            self.runtime
-                .files
-                .try_borrow_mut()
-                .map_err(|_| Error::Conflict)?
-                .native_carrier_access(&context.intent.scope)
-                .map_err(|_| Error::Journal)?
-                .require_native_context(context)
-                .map_err(|_| Error::Conflict)
-        };
-        // One full authentication bracket spans this readonly composition.
-        // Preserve BOTH current protected-context reads around the original
-        // source's independent full signed-runtime/payload verification.
-        // No native effect or permission can precede the final authentication.
-        self.runtime.verify(&self.lease, context)?;
-        current()?;
-        self.lease.verify_source(source)?;
-        if source.identity() != &self.runtime.identity {
-            return Err(Error::Conflict);
-        }
-        current()?;
-        self.runtime.verify(&self.lease, context)
+        crate::member_fresh_read::read(
+            || {
+                self.runtime.verify_original_context(&self.lease, context)?;
+                // The opaque original Source authenticates the identical installed
+                // engine, including its own root/owner and retained DLL pin.
+                source.verify_runtime_binding(
+                    &self.runtime.owner,
+                    &self.runtime.identity,
+                    &self.runtime.installation.root,
+                    &self.runtime.directory,
+                    &self.runtime.executable,
+                )?;
+                self.runtime.verify_original_context(&self.lease, context)
+            },
+            || {
+                self.runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)
+            },
+        )
     }
     /// Actual signed member sources, not member service/NIC ownership or effect
     /// permission. Compare the SAME held serialized owner, not equal JSON or a
@@ -534,14 +540,31 @@ impl RuntimeRead {
         context: &Context,
         source: &super::member_carrier_payload::native::MemberSource,
     ) -> Result<()> {
-        self.verify(context)?;
-        source.verify_owner(self.lease.0.owner())?;
-        if source.identity() != &self.runtime.identity {
-            return Err(Error::Conflict);
-        }
-        self.verify(context)?;
-        source.verify_owner(self.lease.0.owner())?;
-        self.verify(context)
+        crate::member_fresh_read::read(
+            || {
+                self.runtime.verify_original_context(&self.lease, context)?;
+                // MemberSource retains every original library pin and joins it
+                // to its original carrier around one complete installed read.
+                source.verify_runtime_binding(
+                    &self.runtime.owner,
+                    &self.runtime.identity,
+                    &self.runtime.installation.root,
+                    &self.runtime.directory,
+                    &self.runtime.executable,
+                )?;
+                self.runtime.verify_original_context(&self.lease, context)
+            },
+            || {
+                self.runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)
+            },
+        )
     }
     /// Current SAME runtime/source and the actual retained member intent, not
     /// a service name or caller path. This is factual comparison, never Start.
@@ -589,6 +612,60 @@ impl RuntimeRead {
     }
     pub(super) fn record(&self, context: &Context, kind: RecordKind) -> Result<Vec<u8>> {
         self.optional_record(context, kind)?.ok_or(Error::Journal)
+    }
+    /// Current bytes and freshness are one factual snapshot under the SAME
+    /// original backend/lease. Full signed-runtime authentication brackets both
+    /// observations; a change in either fact rejects the complete read. This
+    /// returns no publication ACK, native effect authority or reusable permission.
+    pub(super) fn record_with_fresh(
+        &self,
+        context: &Context,
+        kind: RecordKind,
+    ) -> Result<(Vec<u8>, bool)> {
+        crate::member_fresh_read::read(
+            || self.runtime.verify(&self.lease, context),
+            || {
+                let mut files = self
+                    .runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?;
+                files
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)?;
+                let bytes = if kind == RecordKind::Network {
+                    // Preserve the legacy factual read through the SAME original
+                    // backend; the birth-bound native facet denies this journal.
+                    if !files.same_original_backend(&self.runtime.original_files) {
+                        return Err(Error::Conflict);
+                    }
+                    self.runtime
+                        .original_files
+                        .clone()
+                        .read(&context.intent.scope, kind)
+                        .map_err(|_| Error::Journal)?
+                } else {
+                    files
+                        .read(&context.intent.scope, kind)
+                        .map_err(|_| Error::Journal)?
+                }
+                .ok_or(Error::Journal)?;
+                // Freshness is queried LAST, after the protected bytes read.
+                // Both observations independently check the native context.
+                let access = files
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?;
+                access
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)?;
+                Ok((
+                    bytes,
+                    !self.runtime.forward_closed.get() && access.is_fresh(),
+                ))
+            },
+        )
     }
     /// Factual authenticated absence only. No fresh permission is inferred from
     /// an absent file; the same private claim/context and runtime fence remain

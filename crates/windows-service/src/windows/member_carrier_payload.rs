@@ -137,12 +137,22 @@ pub(crate) mod native {
             if actual_executable()? != self.executable {
                 return Err(Error::Conflict);
             }
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "source begin installed payload authentication",
+            );
             let layout = self
                 .installation
                 .load_engine(&self.executable)
                 .map_err(|_| Error::Conflict)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "source end installed payload authentication",
+            );
             if layout.identity != self.identity
                 || layout.directory != self.directory
+                || std::fs::canonicalize(layout.engine_path()).map_err(|_| Error::Native)?
+                    != self.executable
                 || layout.engine_path().with_file_name(self.kind.path()) != self.payload.path()
             {
                 return Err(Error::Conflict);
@@ -163,6 +173,26 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             self.verify()
+        }
+        /// Bind already opaque originals; equal path data cannot create a Source
+        /// or replace current full signature/hash and retained-handle checks.
+        fn require_runtime_binding(
+            &self,
+            owner: &Arc<MutationGuard>,
+            identity: &EngineIdentity,
+            installation_root: &Path,
+            directory: &Path,
+            executable: &Path,
+        ) -> Result<()> {
+            if !Arc::ptr_eq(&self.owner, owner)
+                || &self.identity != identity
+                || self.installation.root != installation_root
+                || self.directory != directory
+                || self.executable != executable
+            {
+                return Err(Error::Conflict);
+            }
+            Ok(())
         }
         fn file(&self) -> Result<&File> {
             self.verify()?;
@@ -193,6 +223,23 @@ pub(crate) mod native {
         }
         pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
             self.0.verify_owner(owner)
+        }
+        pub(in crate::windows) fn verify_runtime_binding(
+            &self,
+            owner: &Arc<MutationGuard>,
+            identity: &EngineIdentity,
+            installation_root: &Path,
+            directory: &Path,
+            executable: &Path,
+        ) -> Result<()> {
+            self.0.require_runtime_binding(
+                owner,
+                identity,
+                installation_root,
+                directory,
+                executable,
+            )?;
+            self.0.verify()
         }
         /// Repeat-load comparison only. Both independently authenticated held
         /// sources must identify the SAME original file and engine owner. Never
@@ -343,6 +390,25 @@ pub(crate) mod native {
             pins()?;
             self.carrier.verify_owner(owner)?;
             pins()
+        }
+        pub(in crate::windows) fn verify_runtime_binding(
+            &self,
+            owner: &Arc<MutationGuard>,
+            identity: &EngineIdentity,
+            installation_root: &Path,
+            directory: &Path,
+            executable: &Path,
+        ) -> Result<()> {
+            self.carrier.0.require_runtime_binding(
+                owner,
+                identity,
+                installation_root,
+                directory,
+                executable,
+            )?;
+            // Retain all member kind/path/root/owner/DLL pin comparisons before
+            // and after the carrier's complete signed-runtime authentication.
+            self.verify_owner(owner)
         }
         pub(crate) fn identity(&self) -> &EngineIdentity {
             self.carrier.identity()

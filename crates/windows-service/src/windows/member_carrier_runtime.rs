@@ -5752,38 +5752,22 @@ pub(crate) mod native {
                 return Err(Error::Pending);
             }
             self.checkpoint()?;
-            // record already authenticates this SAME runtime before and after
-            // its complete reread. No effect precedes it here; retain that one
-            // full bracket rather than authenticate its alias again.
-            let bytes = self
+            // One full authentication bracket compares BOTH current bytes and
+            // freshness, including the final sample after runtime hashing.
+            let (bytes, fresh) = self
                 .runtime
-                .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
+                .record_with_fresh(&self.scope.context, RecordKind::NativeCarrierReceipts)
                 .map_err(denied)?;
             let record = receipts::Record::decode(&bytes).map_err(denied)?;
-            let fresh = if use_ == Use::Cleanup {
-                false
-            } else {
-                self.runtime.fresh(&self.scope.context).map_err(denied)?
-            };
             validate_stage(
                 &record,
                 &self.scope.context,
                 &self.scope.binding,
                 self.scope.generation,
-                fresh,
+                use_ != Use::Cleanup && fresh,
                 use_,
             )
             .map_err(denied)?;
-            // Freshness/runtime reads above can be expensive. Exact bytes must
-            // still match AFTER them, under the original serialized owner.
-            if bytes
-                != self
-                    .runtime
-                    .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                    .map_err(denied)?
-            {
-                return Err(Error::Conflict);
-            }
             self.checkpoint()?;
             if use_ != Use::Cleanup && self.shared_revocation.get() {
                 return Err(Error::Pending);

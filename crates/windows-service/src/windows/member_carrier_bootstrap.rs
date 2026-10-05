@@ -947,6 +947,7 @@ pub(crate) mod native {
     pub(crate) struct NativeBootstrapModuleOnlyRead {
         origin: Rc<()>,
         inputs: Rc<Inputs>,
+        members: Option<MemberInventoryRead>,
         pair: Rc<NativePairIntentRead>,
         expected: PairRecord,
         load: std::cell::RefCell<Option<Rc<ModuleOnlyLoadRead>>>,
@@ -1134,6 +1135,7 @@ pub(crate) mod native {
             *destination = Some(Rc::new(NativeBootstrapModuleOnlyRead {
                 origin: self.terminal_origin.clone(),
                 inputs: input.clone(),
+                members: self.members.as_ref().map(MemberInventoryRead::read_pin),
                 pair: pair.clone(),
                 expected: expected.clone(),
                 load: std::cell::RefCell::new(None),
@@ -1447,12 +1449,21 @@ pub(crate) mod native {
                 || raw.compose_attempted
                 || raw.transferred_to_assembly
                 || raw.image.is_some()
-                || raw.members.is_some()
                 || raw.registry.is_some()
                 || raw.keys.is_some()
             {
                 return Err(Error::Conflict);
             }
+            let members = raw.members.as_ref().ok_or(Error::Pending)?;
+            let captured_members = original.members.as_ref().ok_or(Error::Pending)?;
+            if !members.same_original(captured_members) {
+                return Err(Error::Conflict);
+            }
+            members.verify_never_populated(
+                &original.inputs.context,
+                &original.inputs.runtime,
+                &original.inputs.source,
+            )?;
             self.module
                 .verify_module_only_terminal_cut(
                     raw.module.as_ref().ok_or(Error::Pending)?,
