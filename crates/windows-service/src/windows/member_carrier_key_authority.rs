@@ -167,6 +167,19 @@ impl RuntimeRead {
             lease: self.lease.read_pin(),
         })
     }
+    /// Retain this SAME runtime/guard after full current bound-source
+    /// authentication and protected-context reads. The pin supplies lifetime
+    /// retention only, never cached authentication or native effect authority.
+    pub(super) fn read_pin_for_source(
+        &self,
+        source: &super::member_carrier_payload::native::WintunSource,
+    ) -> Result<Self> {
+        self.verify_source(source)?;
+        Ok(Self {
+            runtime: self.runtime.clone(),
+            lease: self.lease.read_pin(),
+        })
+    }
     pub(super) fn matches_pin(&self, pin: &KeyLockPin) -> bool {
         self.lease.0.matches(&pin.0)
     }

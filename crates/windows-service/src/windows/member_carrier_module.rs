@@ -1994,11 +1994,14 @@ pub(crate) mod native {
                     if !originals.matches_source(source) || !runtime.matches_pin(lock) {
                         return Err(Error::Conflict);
                     }
-                    lock.verify_source(source).map_err(|_| Error::Conflict)?;
-                    runtime.verify_source(source).map_err(|_| Error::Conflict)?;
                     // This actual read pin retains the same Runtime and guard;
-                    // a failed/unwound pin read is inside the shared poison gate.
-                    retained_runtime = Some(runtime.read_pin().map_err(|_| Error::Conflict)?);
+                    // full bound-source/context reads already authenticate that
+                    // runtime twice, inside the shared error/unwind poison gate.
+                    retained_runtime = Some(
+                        runtime
+                            .read_pin_for_source(source)
+                            .map_err(|_| Error::Conflict)?,
+                    );
                     Ok(())
                 },
                 |boundary, originals| {
