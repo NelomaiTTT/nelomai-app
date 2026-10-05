@@ -5370,10 +5370,6 @@ pub(crate) mod native {
         /// Keep the slot alive on errors; removal/release needs independent ACKs.
         pub(crate) fn retained_parts(&mut self) -> NativeConstructionParts<'_, 'a, G> {
             let parts = self.root.retained_parts();
-            #[cfg(test)]
-            if let Some((carrier, _)) = &parts.components {
-                carrier.inspect_retained_resolver_reference();
-            }
             NativeConstructionParts {
                 inputs: &mut parts.inputs,
                 authority: &mut parts.authority,

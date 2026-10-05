@@ -562,16 +562,19 @@ pub(crate) mod native {
     pub(crate) struct NativeKernel<'a, A: ModuleRuntimeAuthority> {
         module: AuthenticatedModule<'a, A>,
         functions: Functions,
-        pin: Option<NonNull<c_void>>,
-        reference_attempted: bool,
-        reference_returned: bool,
-        reference: std::rc::Rc<ClosedReferenceRelease>,
+        reference: std::rc::Rc<NativeKernelReferenceRead>,
         clock: Instant,
     }
-    /// Actual NativeKernel extra-reference return ACK only. It can be read
-    /// without reborrowing the actual Authority while its loader is borrowed.
-    /// No handle, metadata, equality-by-value or success constructor exists.
-    pub(crate) struct NativeKernelReferenceRead(std::rc::Rc<ClosedReferenceRelease>);
+    /// SAME actual extra-reference owner and its original acquire/release
+    /// outcomes. Read aliases retain this object without reborrowing Authority.
+    /// No public handle/metadata/success constructor or implicit unload exists.
+    pub(crate) struct NativeKernelReferenceRead {
+        original: NonNull<c_void>,
+        attempted: std::cell::Cell<bool>,
+        returned: std::cell::Cell<bool>,
+        pin: std::cell::Cell<Option<NonNull<c_void>>>,
+        release: ClosedReferenceRelease,
+    }
     pub(crate) struct NativeCarrierComponentsTerminalRead {
         reference: std::rc::Rc<NativeKernelReferenceRead>,
         session: SessionEndRead,
@@ -589,27 +592,64 @@ pub(crate) mod native {
         }
     }
     impl NativeKernelReferenceRead {
+        fn new(original: NonNull<c_void>) -> Self {
+            Self {
+                original,
+                attempted: std::cell::Cell::new(false),
+                returned: std::cell::Cell::new(false),
+                pin: std::cell::Cell::new(None),
+                release: ClosedReferenceRelease::new(),
+            }
+        }
+        fn live(&self) -> Result<()> {
+            if !self.returned.get() || self.pin.get() != Some(self.original) {
+                return Err(Error::Retired);
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        pub(in crate::windows) fn verify_retained_original(&self) -> Result<()> {
+            if !self.attempted.get() || self.release.was_attempted() {
+                return Err(Error::Pending);
+            }
+            self.live()
+        }
         pub(crate) fn verify_released(&self) -> Result<()> {
-            if !self.0.acknowledged() {
+            if self.pin.get().is_some() || !self.release.acknowledged() {
                 return Err(Error::Pending);
             }
             Ok(())
         }
         pub(crate) fn same_original(&self, other: &Self) -> bool {
-            std::rc::Rc::ptr_eq(&self.0, &other.0)
+            std::ptr::eq(self, other)
+        }
+        fn release_original(&self) -> Result<()> {
+            let pin = self.pin.get().ok_or(Error::Retired)?;
+            self.release.run(
+                || {
+                    if !self.attempted.get() {
+                        return Err(Error::Pending);
+                    }
+                    self.live()
+                },
+                || {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::native_resolver_reference_release_attempted();
+                    if unsafe { FreeLibrary(pin.as_ptr()) } == 0 {
+                        return Err(Error::Native);
+                    }
+                    Ok(())
+                },
+                || {
+                    self.pin.set(None);
+                    Ok(())
+                },
+            )
         }
     }
     impl<A: ModuleRuntimeAuthority> Carrier<NativeKernel<'_, A>> {
-        #[cfg(test)]
-        pub(in crate::windows) fn inspect_retained_resolver_reference(&self) {
-            super::super::member_carrier_factory_test_os::native_resolver_retained_owner(
-                &self.kernel.reference,
-                self.kernel.reference_returned
-                    && self.kernel.pin == Some(self.kernel.module.module),
-            );
-        }
         pub(crate) fn kernel_reference_read(&self) -> std::rc::Rc<NativeKernelReferenceRead> {
-            std::rc::Rc::new(NativeKernelReferenceRead(self.kernel.reference.clone()))
+            self.kernel.reference.clone()
         }
         /// Roots factual reads before fallible checks. The actual original
         /// counters, never a phase/Option or caller snapshot, acknowledge release.
@@ -625,8 +665,7 @@ pub(crate) mod native {
             if self.phase != Phase::Closed
                 || self.adapter.is_some()
                 || self.session.is_some()
-                || self.kernel.pin.is_some()
-                || !self.kernel.reference.acknowledged()
+                || self.kernel.reference.verify_released().is_err()
                 || !matches!(
                     self.session_end.state.get(),
                     SessionEndState::NeverStarted | SessionEndState::Acknowledged
@@ -650,7 +689,7 @@ pub(crate) mod native {
         /// Invoke only on the caller's retained slot. The SAME carrier and its
         /// actual returned reference survive every subsequent Err or unwind.
         pub(crate) fn initialize_original_reference(&mut self) -> Result<()> {
-            if std::mem::replace(&mut self.kernel.reference_attempted, true) {
+            if self.kernel.reference.attempted.replace(true) {
                 return Err(Error::Pending);
             }
             with_call_resources(self, |carrier| {
@@ -681,12 +720,9 @@ pub(crate) mod native {
                 }
             })?;
             Ok(Self {
+                reference: std::rc::Rc::new(NativeKernelReferenceRead::new(module.module)),
                 module,
                 functions,
-                pin: None,
-                reference_attempted: false,
-                reference_returned: false,
-                reference: std::rc::Rc::new(ClosedReferenceRelease::new()),
                 clock: Instant::now(),
             })
         }
@@ -714,8 +750,8 @@ pub(crate) mod native {
             };
             // FIRST retain the actual OS output in the caller's owning kernel.
             // Neither an unexpected identity nor any later fault unloads it.
-            self.pin = NonNull::new(pin);
-            self.reference_returned = returned != 0;
+            self.reference.pin.set(NonNull::new(pin));
+            self.reference.returned.set(returned != 0);
             if returned == 0 {
                 return Err(Error::Native);
             }
@@ -730,11 +766,7 @@ pub(crate) mod native {
             Ok(())
         }
         fn live(&self) -> Result<()> {
-            if !self.reference_returned || self.pin != Some(self.module.module) {
-                Err(Error::Retired)
-            } else {
-                Ok(())
-            }
+            self.reference.live()
         }
     }
     impl<A: ModuleRuntimeAuthority> CallResources for AuthenticatedModule<'_, A> {
@@ -1015,22 +1047,7 @@ pub(crate) mod native {
                 .close(|r| unsafe { (self.functions.close)(r.raw.as_ptr()) });
         }
         fn release_module(&mut self) -> Result<()> {
-            let pin = self.pin.ok_or(Error::Retired)?;
-            self.reference.run(
-                || Ok(()),
-                || {
-                    #[cfg(test)]
-                    super::super::member_carrier_factory_test_os::native_resolver_reference_release_attempted();
-                    if unsafe { FreeLibrary(pin.as_ptr()) } == 0 {
-                        return Err(Error::Native);
-                    }
-                    Ok(())
-                },
-                || {
-                    self.pin = None;
-                    Ok(())
-                },
-            )
+            self.reference.release_original()
         }
         fn release_call_resources(&mut self) {
             self.module.authority.as_mut().release_call_resources();

@@ -2,7 +2,10 @@
 //! coordinator, ownership, native-effect or completion implementation is fake.
 //! Cold fixtures use signed DATA. Native fixtures use the audited genuine DLLs
 //! and external package inventory; SDK effects remain in the production path.
-use super::{member_files, member_pair::NativePairFactory, member_session::*};
+use super::{
+    member_carrier_wintun::native::NativeKernelReferenceRead, member_files,
+    member_pair::NativePairFactory, member_session::*,
+};
 use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard};
 use std::{
     any::Any,
@@ -33,8 +36,7 @@ struct Inputs {
     resolver_reference_fault_reached: bool,
     resolver_reference_acquisitions: usize,
     resolver_reference_releases: usize,
-    resolver_reference_original: Option<Weak<dyn Any>>,
-    resolver_retained_owner_inspections: usize,
+    resolver_reference_original: Option<Weak<NativeKernelReferenceRead>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativePublication {
@@ -187,15 +189,16 @@ pub(crate) fn native_module_loaded<T: Any>(module: &Rc<T>) {
     });
 }
 /// External failure after the real OS return, never a synthetic acquisition.
-pub(crate) fn native_resolver_reference_returned<T: Any>(original: &Rc<T>) -> io::Result<()> {
+pub(crate) fn native_resolver_reference_returned(
+    original: &Rc<NativeKernelReferenceRead>,
+) -> io::Result<()> {
     INPUTS.with(|inputs| {
         let mut inputs = inputs.borrow_mut();
         let Some(inputs) = inputs.as_mut() else {
             return Ok(());
         };
         inputs.resolver_reference_acquisitions += 1;
-        let original: Rc<dyn Any> = original.clone();
-        inputs.resolver_reference_original = Some(Rc::downgrade(&original));
+        inputs.resolver_reference_original = Some(Rc::downgrade(original));
         if let Some(unwind) = inputs.resolver_reference_fault.take() {
             inputs.resolver_reference_fault_reached = true;
             assert_eq!(inputs.resolver_reference_acquisitions, 1);
@@ -216,35 +219,6 @@ pub(crate) fn native_resolver_reference_release_attempted() {
         if let Some(inputs) = inputs.borrow_mut().as_mut() {
             inputs.resolver_reference_releases += 1;
         }
-    });
-}
-/// Inspect the actual kernel borrowed from the caller's construction slot.
-/// A release-counter alias alone cannot attest retention of the native pin.
-pub(crate) fn native_resolver_retained_owner<T: Any>(original: &Rc<T>, retains_original_pin: bool) {
-    INPUTS.with(|inputs| {
-        let mut inputs = inputs.borrow_mut();
-        let Some(inputs) = inputs
-            .as_mut()
-            .filter(|v| v.resolver_reference_fault_reached)
-        else {
-            return;
-        };
-        let captured = inputs
-            .resolver_reference_original
-            .as_ref()
-            .expect("returned reference origin")
-            .upgrade()
-            .expect("retained reference origin");
-        let actual: Rc<dyn Any> = original.clone();
-        assert!(
-            Rc::ptr_eq(&actual, &captured),
-            "substituted kernel reference origin"
-        );
-        assert!(
-            retains_original_pin,
-            "rooted kernel lost its actual native reference"
-        );
-        inputs.resolver_retained_owner_inspections += 1;
     });
 }
 pub(crate) fn package_paths(source: &Path) -> io::Result<Option<[PathBuf; 5]>> {
@@ -409,7 +383,6 @@ impl Fixture {
                 resolver_reference_acquisitions: 0,
                 resolver_reference_releases: 0,
                 resolver_reference_original: None,
-                resolver_retained_owner_inspections: 0,
             })
         });
         // Real private-directory/ancestor/lock/CAS implementation creates state.
@@ -576,18 +549,12 @@ impl Fixture {
                 .resolver_reference_fault = Some(unwind);
         });
     }
-    pub(crate) fn require_retained_resolver_reference(&self, require_owner_inspection: bool) {
+    pub(crate) fn require_retained_resolver_reference(&self) {
         INPUTS.with(|inputs| {
             let inputs = inputs.borrow();
             let inputs = inputs.as_ref().expect("fixture inputs");
             assert!(inputs.resolver_reference_fault_reached);
             assert!(inputs.resolver_reference_fault.is_none());
-            if require_owner_inspection {
-                assert!(
-                    inputs.resolver_retained_owner_inspections > 0,
-                    "actual rooted kernel not inspected after original Stop"
-                );
-            }
             assert_eq!(
                 inputs.resolver_reference_acquisitions, 1,
                 "native reference acquisition retried"
@@ -596,15 +563,16 @@ impl Fixture {
                 inputs.resolver_reference_releases, 0,
                 "uncertain resolver reference released"
             );
-            assert!(
-                inputs
-                    .resolver_reference_original
-                    .as_ref()
-                    .expect("actual reference origin")
-                    .upgrade()
-                    .is_some(),
-                "caller lost the original native kernel reference owner"
-            );
+            // Upgrade only for this read. The fixture keeps no owning alias;
+            // this SAME object owns the actual native pin, not a counter copy.
+            inputs
+                .resolver_reference_original
+                .as_ref()
+                .expect("actual reference origin")
+                .upgrade()
+                .expect("caller lost the original native kernel reference owner")
+                .verify_retained_original()
+                .expect("original native pin/return was lost or released");
             assert!(
                 inputs.module_originals[0].upgrade().is_some(),
                 "caller lost the original loaded module owner"

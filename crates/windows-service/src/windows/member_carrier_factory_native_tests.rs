@@ -240,12 +240,12 @@ fn carrier_factory_actual_cold_child() {
             "resolver fault accepted"
         );
         assert!(original.snapshot().cleanup_pending);
-        fixture.require_retained_resolver_reference(false);
+        fixture.require_retained_resolver_reference();
         assert!(
             original.start_primary(primary, options).is_err(),
             "uncertain resolver retried"
         );
-        fixture.require_retained_resolver_reference(false);
+        fixture.require_retained_resolver_reference();
         let stopped = original.execute(
             Command::Stop {
                 scope: scope.clone(),
@@ -254,7 +254,7 @@ fn carrier_factory_actual_cold_child() {
         );
         assert!(stopped.is_err(), "uncertain resolver became completed Stop");
         assert!(original.snapshot().cleanup_pending);
-        fixture.require_retained_resolver_reference(true);
+        fixture.require_retained_resolver_reference();
         // Process exit is not a completed release or protected retirement ACK.
         std::mem::forget(original);
         std::mem::forget(factory);
