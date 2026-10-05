@@ -1811,15 +1811,29 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         if fresh.key != KeyPresence::Absent || fresh.value != NativeValue::Absent {
             return Err(Error::Conflict);
         }
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key create birth parent begin");
         let (parent, parent_name) = self.birth_parent()?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key create birth parent end");
         let child = Self::child(binding)?.to_owned();
         // Complete allocating metadata BEFORE a native owning handle exists.
         let key_context = self.context.clone();
         let key_binding = binding.clone();
         self.assert_serialized_lock(lock, &pending.context)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key create authorization begin",
+        );
         self.authority
             .authorize_effect(lock, pending, binding, Effect::Create)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("key create authorization end");
         self.poisoned = true;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key create RegCreateKeyEx begin",
+        );
         let (handle, disposition) = self
             .kernel
             .create(&parent, &child)
@@ -1850,8 +1864,16 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         // SAME original and raw DATA owner are retained before the first
         // fallible native query. Errors/unwind leave pending_key poisoned.
         self.assert_serialized_lock(lock, &pending.context)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key create original metadata begin",
+        );
         self.kernel
             .capture_created_metadata(ack.retained_handle().handle.handle(), &capture)?;
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "key create original metadata end",
+        );
         self.assert_serialized_lock(lock, &pending.context)?;
         self.kernel
             .flush(ack.retained_handle().handle.parent_handle())
@@ -2306,6 +2328,10 @@ pub(crate) mod win32 {
         if rc == NO_ERROR {
             Ok(())
         } else {
+            #[cfg(test)]
+            if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                eprintln!("actual native key Win32 status={rc}");
+            }
             Err(Error::Pending)
         }
     }
