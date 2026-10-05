@@ -469,56 +469,60 @@ fn retained_control_validates_without_consuming_inputs_and_never_replaces_occupi
 #[test]
 fn retained_control_terminal_save_error_lost_ack_and_unwind_keep_closed_original_pending() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    for fault in 0..3 {
-        let world = Rc::new(RefCell::new(World::default()));
-        world.borrow_mut().fail_save = true;
-        world.borrow_mut().native = [true, true];
-        let mut native = Some(Pair(world.clone()));
-        let mut store = Some(Store(world.clone()));
-        let mut retained = None;
-        assert!(Owner::prepare_retained_into(
-            &mut retained,
-            RuntimeSlot::Latest,
-            &start(true),
-            &mut native,
-            &mut store,
-            0
-        )
-        .is_err());
-        {
-            let mut w = world.borrow_mut();
-            w.fail_save = false;
-            w.fail_save_phase = (fault == 0).then_some(SessionPhase::Stopped);
-            w.lose_save_ack_phase = (fault == 1).then_some(SessionPhase::Stopped);
-            w.panic_save_phase = (fault == 2).then_some(SessionPhase::Stopped);
+    for preparation_failed in [false, true] {
+        for fault in 0..3 {
+            let world = Rc::new(RefCell::new(World::default()));
+            world.borrow_mut().fail_save = preparation_failed;
+            world.borrow_mut().native = [true, true];
+            let mut native = Some(Pair(world.clone()));
+            let mut store = Some(Store(world.clone()));
+            let mut retained = None;
+            let prepared = Owner::prepare_retained_into(
+                &mut retained,
+                RuntimeSlot::Latest,
+                &start(true),
+                &mut native,
+                &mut store,
+                0,
+            );
+            assert_eq!(prepared.is_err(), preparation_failed);
+            {
+                let mut w = world.borrow_mut();
+                w.fail_save = false;
+                w.fail_save_phase = (fault == 0).then_some(SessionPhase::Stopped);
+                w.lose_save_ack_phase = (fault == 1).then_some(SessionPhase::Stopped);
+                w.panic_save_phase = (fault == 2).then_some(SessionPhase::Stopped);
+            }
+            let owner = retained.as_mut().unwrap();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                owner.execute(Command::Stop { scope: scope() }, 1)
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(
+                world.borrow().native,
+                [false, false],
+                "actual native close acknowledged first"
+            );
+            assert_eq!(world.borrow().closed_scopes, vec![scope()]);
+            assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+            assert!(owner.snapshot().cleanup_pending);
+            assert_eq!(world.borrow().native_drops, 0);
+            assert_eq!(world.borrow().store_drops, 0);
+            if preparation_failed {
+                assert!(owner.tick(2).is_err());
+            }
+            {
+                let mut w = world.borrow_mut();
+                w.fail_save_phase = None;
+                w.lose_save_ack_phase = None;
+                w.panic_save_phase = None;
+            }
+            owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
+            assert!(!owner.snapshot().cleanup_pending);
+            assert!(owner
+                .execute(Command::NetworkChanged { scope: scope() }, 3)
+                .is_err());
         }
-        let owner = retained.as_mut().unwrap();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            owner.execute(Command::Stop { scope: scope() }, 1)
-        }));
-        assert!(result.is_err() || result.unwrap().is_err());
-        assert_eq!(
-            world.borrow().native,
-            [false, false],
-            "actual native close acknowledged first"
-        );
-        assert_eq!(world.borrow().closed_scopes, vec![scope()]);
-        assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
-        assert!(owner.snapshot().cleanup_pending);
-        assert_eq!(world.borrow().native_drops, 0);
-        assert_eq!(world.borrow().store_drops, 0);
-        assert!(owner.tick(2).is_err());
-        {
-            let mut w = world.borrow_mut();
-            w.fail_save_phase = None;
-            w.lose_save_ack_phase = None;
-            w.panic_save_phase = None;
-        }
-        owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
-        assert!(!owner.snapshot().cleanup_pending);
-        assert!(owner
-            .execute(Command::NetworkChanged { scope: scope() }, 3)
-            .is_err());
     }
 }
 
@@ -2463,6 +2467,10 @@ fn stop_disables_native_even_when_snapshot_store_fails() {
     assert!(owner.execute(Command::Stop { scope: scope() }, 1).is_err());
     assert_eq!(world.borrow().native, [false; 2]);
     assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopped);
+    assert!(owner.snapshot().cleanup_pending);
+    world.borrow_mut().fail_save = false;
+    owner.execute(Command::Stop { scope: scope() }, 2).unwrap();
+    assert!(!owner.snapshot().cleanup_pending);
 }
 
 #[test]

@@ -166,7 +166,12 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         &self.native
     }
     pub(super) fn retained_cleanup_pending(&self) -> bool {
-        !self.preparation_acknowledged && !self.cleanup_acknowledged
+        // Native close may move state to Stopped before the protected terminal
+        // save completes. Its Err/lost ACK/unwind must still fence replacement
+        // even when initial preparation was acknowledged.
+        !self.cleanup_acknowledged
+            && (!self.preparation_acknowledged
+                || self.state.snapshot().phase == SessionPhase::Stopped)
     }
     pub fn state(&self) -> &SessionState {
         &self.state

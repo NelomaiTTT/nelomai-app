@@ -1563,6 +1563,7 @@ mod terminal_control {
             sessions: Vec<SessionSnapshot>,
             scopes: Vec<SessionScope>,
             lose_starting_ack: bool,
+            lose_stopped_ack: bool,
             fail_native: Option<(String, bool)>,
             fail_fresh_ack: bool,
         }
@@ -1574,6 +1575,11 @@ mod terminal_control {
                 state.sessions.push(snapshot.clone());
                 if snapshot.phase == SessionPhase::Starting
                     && std::mem::take(&mut state.lose_starting_ack)
+                {
+                    return Err(failed());
+                }
+                if snapshot.phase == SessionPhase::Stopped
+                    && std::mem::take(&mut state.lose_stopped_ack)
                 {
                     return Err(failed());
                 }
@@ -1714,30 +1720,46 @@ mod terminal_control {
         fn carrier_factory_primary_start_stop_repeat_uses_fresh_session() {
             // Real actor + SessionControl + cold CarrierPairControl/coordinator;
             // only native IO/private storage/terminal SDK ACK are external doubles.
-            let (mut actor, external, single) = setup();
-            let first = actor.redundant(start(scope())).unwrap();
-            assert_eq!(first.session.phase, SessionPhase::Running);
-            actor.redundant(Command::Stop { scope: scope() }).unwrap();
-            actor.redundant(Command::Stop { scope: scope() }).unwrap();
-            let mut next = scope();
-            next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
-            next.connection_generation += 1;
-            let second = actor.redundant(start(next.clone())).unwrap();
-            assert_eq!(second.session.scope, next);
-            actor.redundant(Command::Stop { scope: next }).unwrap();
-            let state = external.borrow();
-            assert_eq!(state.worlds.len(), 2);
-            assert!(state.prepared.iter().all(|calls| calls.get() == 1));
-            assert!(state.finalized.iter().all(|calls| calls.get() == 1));
-            for world in &state.worlds {
-                let native = world.borrow();
-                assert_eq!(native.counts.get("carrier-ready"), Some(&1));
-                assert!(native.carrier.is_none());
-                assert!(native.members.iter().all(Option::is_none));
-                assert_eq!(native.network.routes.len(), 0);
-                assert!(native.disk.as_ref().unwrap().phase == Phase::Stopped);
+            for lost_completion_ack in [false, true] {
+                let (mut actor, external, single) = setup();
+                let first = actor.redundant(start(scope())).unwrap();
+                assert_eq!(first.session.phase, SessionPhase::Running);
+                let mut next = scope();
+                next.session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+                next.connection_generation += 1;
+                external.borrow_mut().lose_stopped_ack = lost_completion_ack;
+                let stopped = actor.redundant(Command::Stop { scope: scope() });
+                if lost_completion_ack {
+                    assert!(stopped.is_err());
+                    let snapshot = actor.current_redundancy_snapshot().unwrap();
+                    assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
+                    assert!(snapshot.cleanup_pending, "protected completion ACK lost");
+                    assert!(actor.redundant(start(next.clone())).is_err());
+                    assert_eq!(external.borrow().worlds.len(), 1);
+                    assert_eq!(external.borrow().finalized[0].get(), 1);
+                } else {
+                    stopped.unwrap();
+                }
+                let stopped = actor.redundant(Command::Stop { scope: scope() }).unwrap();
+                assert!(!stopped.cleanup_pending);
+                actor.redundant(Command::Stop { scope: scope() }).unwrap();
+                let second = actor.redundant(start(next.clone())).unwrap();
+                assert_eq!(second.session.scope, next);
+                actor.redundant(Command::Stop { scope: next }).unwrap();
+                let state = external.borrow();
+                assert_eq!(state.worlds.len(), 2);
+                assert!(state.prepared.iter().all(|calls| calls.get() == 1));
+                assert!(state.finalized.iter().all(|calls| calls.get() == 1));
+                for world in &state.worlds {
+                    let native = world.borrow();
+                    assert_eq!(native.counts.get("carrier-ready"), Some(&1));
+                    assert!(native.carrier.is_none());
+                    assert!(native.members.iter().all(Option::is_none));
+                    assert_eq!(native.network.routes.len(), 0);
+                    assert!(native.disk.as_ref().unwrap().phase == Phase::Stopped);
+                }
+                assert_eq!(single.get(), 0);
             }
-            assert_eq!(single.get(), 0);
         }
         #[test]
         fn carrier_factory_partial_start_retains_cleanup_owner() {
