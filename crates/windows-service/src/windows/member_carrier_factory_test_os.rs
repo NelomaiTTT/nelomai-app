@@ -139,6 +139,9 @@ pub(crate) fn native_original_retained<T: Any>(kind: &'static str, original: &Rc
             inputs.native_originals.push((kind, Rc::downgrade(&root)));
         }
     });
+    if kind == "carrier" {
+        trace_step("C native CreateAdapter original ACK retained");
+    }
 }
 fn require_native_originals(inputs: &Inputs, target: NativePublication) {
     for kind in ["carrier", "member"] {

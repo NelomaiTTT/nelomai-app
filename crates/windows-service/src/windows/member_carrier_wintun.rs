@@ -882,6 +882,10 @@ pub(crate) mod native {
             let name: Vec<u16> = binding.name.encode_utf16().chain(Some(0)).collect();
             let kind: Vec<u16> = binding.tunnel_type.encode_utf16().chain(Some(0)).collect();
             let guid = Guid::new(binding.guid);
+            #[cfg(test)]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "C native CreateAdapter entered",
+            );
             let raw = unsafe { (self.functions.create)(name.as_ptr(), kind.as_ptr(), &guid) };
             // Consume the actual borrowed receipt AFTER the native call. The
             // caller-held lock/token, not this record, supply live authority.
