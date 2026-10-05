@@ -328,6 +328,9 @@ pub(crate) struct Fixture {
     executable: PathBuf,
 }
 impl Fixture {
+    pub(crate) fn original_root(&self) -> &Path {
+        &self.root
+    }
     pub(crate) fn new() -> io::Result<Self> {
         Self::with_runtime(None)
     }

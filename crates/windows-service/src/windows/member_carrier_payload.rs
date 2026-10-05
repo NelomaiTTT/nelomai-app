@@ -654,12 +654,13 @@ pub(crate) mod native {
         fn installed_runtime_pins_every_authenticated_dependency_until_drop() {
             use ed25519_dalek::{Signer, SigningKey};
             use std::collections::BTreeSet;
-            let _fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
+            let fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
                 .expect("actual private signed fixture");
             let executable = actual_executable().unwrap();
-            let root = executable.ancestors().nth(6).unwrap();
+            let root = fixture.original_root();
             let installation =
-                super::super::super::member_carrier_factory_test_os::installation(root).unwrap();
+                super::super::super::member_carrier_factory_test_os::installation(root)
+                    .expect("signed installation registered for the fixture's original root");
             let initial = installation.load_engine(&executable).unwrap();
             let directory = &initial.directory;
             // Stage a real signed second slot in our owned fixture. The expected
@@ -747,12 +748,13 @@ pub(crate) mod native {
 
         #[test]
         fn installed_runtime_acquisition_rejects_payload_drift_after_initial_authentication() {
-            let _fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
+            let fixture = super::super::super::member_carrier_factory_test_os::Fixture::new()
                 .expect("actual private signed fixture");
             let executable = actual_executable().unwrap();
-            let root = executable.ancestors().nth(6).unwrap();
+            let root = fixture.original_root();
             let installation =
-                super::super::super::member_carrier_factory_test_os::installation(root).unwrap();
+                super::super::super::member_carrier_factory_test_os::installation(root)
+                    .expect("signed installation registered for the fixture's original root");
             let owner = Arc::new(MutationGuard::at(&root.join("engine-owner.lock")).unwrap());
             let layout = installation.load_engine(&executable).unwrap();
             let path = layout.engine_path().with_file_name("tunnel.dll");

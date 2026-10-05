@@ -942,7 +942,11 @@ mod tests {
                 &[peer_with_allowed_ips(vec!["192.0.2.0/24".parse().unwrap()])],
             )
             .unwrap_err();
-        assert!(matches!(error, ServiceError::Backend(code) if code == "interface_up_failed"));
+        assert!(
+            matches!(&error, ServiceError::Backend(code) if code == "interface_up_failed"),
+            "unexpected apply error: {error:?}; owned fixture calls: {:?}",
+            fs::read_to_string(&calls)
+        );
         let output = fs::read_to_string(calls).unwrap();
         assert!(!output.contains("route add"));
         assert!(!output.contains("rule add"));
