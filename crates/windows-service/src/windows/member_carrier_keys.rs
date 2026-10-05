@@ -2033,9 +2033,22 @@ pub(crate) mod win32 {
     use windows_sys::{
         Wdk::System::Registry::{KeyNameInformation, NtDeleteKey, NtQueryKey},
         Win32::{
-            Foundation::{CloseHandle, GetLastError, ERROR_FILE_NOT_FOUND, NO_ERROR},
+            Foundation::{
+                CloseHandle, GetLastError, SetLastError, ERROR_FILE_NOT_FOUND, ERROR_NO_TOKEN,
+                HANDLE, NO_ERROR,
+            },
+            Security::{
+                AdjustTokenPrivileges, GetTokenInformation, IsValidSid, IsWellKnownSid,
+                LookupPrivilegeValueW, TokenUser, WinLocalSystemSid, SE_PRIVILEGE_ENABLED,
+                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+            },
             Storage::FileSystem::{CommitTransaction, CreateTransaction, RollbackTransaction},
-            System::Registry::*,
+            System::{
+                Registry::*,
+                Threading::{
+                    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+                },
+            },
         },
     };
     struct OwnedDispositionNativeIo<'a, F> {
@@ -2156,6 +2169,7 @@ pub(crate) mod win32 {
         }
         fn derive(&mut self, c: &OriginalOwnedKeyDisposition) -> Result<()> {
             let raw = self.original.raw()?;
+            enable_original_key_security_access()?;
             let rc = unsafe {
                 RegOpenKeyTransactedW(
                     raw,
@@ -2318,6 +2332,110 @@ pub(crate) mod win32 {
         }
     }
     pub(crate) struct Kernel;
+    // Process policy for the already privileged carrier service: enable ONLY
+    // its existing SeSecurityPrivilege. SYSTEM SID alone does not enable SACL
+    // access. Keep it enabled for later original/TxR handle opens; no temporary
+    // process-token toggles race another thread or lose restoration ACKs after
+    // a native key has been created. No privilege assignment, impersonation,
+    // ACL mutation or reduced-access retry. Read-only absence never calls this.
+    fn enable_original_key_security_access() -> Result<()> {
+        struct Token(HANDLE);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+        let mut raw = ptr::null_mut();
+        if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw) } != 0 {
+            let _token = Token(raw);
+            return Err(Error::Conflict);
+        }
+        if unsafe { GetLastError() } != ERROR_NO_TOKEN {
+            return Err(Error::Conflict);
+        }
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                &mut raw,
+            )
+        } == 0
+        {
+            return Err(Error::Pending);
+        }
+        let token = Token(raw);
+        let mut user = [0usize; 64];
+        let mut length = 0;
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                std::mem::size_of_val(&user) as u32,
+                &mut length,
+            )
+        } == 0
+            || length < std::mem::size_of::<TOKEN_USER>() as u32
+            || length as usize > std::mem::size_of_val(&user)
+        {
+            return Err(Error::Pending);
+        }
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let start = user.as_ptr() as usize;
+        // LocalSystem SID is twelve bytes. Bound it before either SDK reads it.
+        if (sid as usize) < start
+            || (sid as usize)
+                .checked_add(12)
+                .is_none_or(|end| end > start + length as usize)
+        {
+            return Err(Error::Conflict);
+        }
+        // Only the bounded revision-one, one-subauthority SID can be SYSTEM.
+        let header = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), 2) };
+        if header != [1, 1]
+            || unsafe { IsValidSid(sid) } == 0
+            || unsafe { IsWellKnownSid(sid, WinLocalSystemSid) } == 0
+        {
+            return Err(Error::Conflict);
+        }
+        let mut requested = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        if unsafe {
+            LookupPrivilegeValueW(
+                ptr::null(),
+                wide("SeSecurityPrivilege")?.as_ptr(),
+                &mut requested.Privileges[0].Luid,
+            )
+        } == 0
+        {
+            return Err(Error::Pending);
+        }
+        requested.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut returned = 0;
+        unsafe { SetLastError(NO_ERROR) };
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                token.0,
+                0,
+                &requested,
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                &mut previous,
+                &mut returned,
+            )
+        };
+        let error = unsafe { GetLastError() };
+        #[cfg(test)]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            eprintln!("actual native key SeSecurityPrivilege adjusted={adjusted} status={error} previous_count={} previous_attributes={}", previous.PrivilegeCount, previous.Privileges[0].Attributes);
+        }
+        if adjusted == 0 || error != NO_ERROR {
+            return Err(Error::Pending);
+        }
+        Ok(())
+    }
     fn wide(s: &str) -> Result<Vec<u16>> {
         if s.is_empty() || s.len() > 1024 || s.chars().any(|c| c.is_control()) {
             return Err(Error::Invalid);
@@ -2428,10 +2546,11 @@ pub(crate) mod win32 {
         fn birth_interfaces(&mut self) -> Result<Handle> {
             let p = wide(PARENT)?;
             let mut h = ptr::null_mut();
-            // This non-mutating open is BEFORE RegCreateKeyEx. Require the
+            enable_original_key_security_access()?;
+            // This open is BEFORE RegCreateKeyEx. Require the
             // current token's complete metadata access now, never create an
-            // original whose rights guarantee a later SACL denial. No token
-            // privilege/ACL change or retry with fewer rights is performed.
+            // original whose rights guarantee a later SACL denial. No ACL
+            // change or retry with fewer rights is performed.
             owned(
                 unsafe {
                     RegOpenKeyExW(
@@ -2488,6 +2607,7 @@ pub(crate) mod win32 {
             let child = wide(child)?;
             let mut h = ptr::null_mut();
             let mut disposition = 0;
+            enable_original_key_security_access()?;
             let rc = unsafe {
                 RegCreateKeyExW(
                     parent.raw()?,
