@@ -191,6 +191,9 @@ fn carrier_factory_actual_cold_child() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
+    if let Ok(Err(error)) = &result {
+        eprintln!("actual factory {case}: preparation error {error:?}");
+    }
     if matches!(case.as_str(), "cold" | "primary-data-denial")
         || module_partial
         || full_primary

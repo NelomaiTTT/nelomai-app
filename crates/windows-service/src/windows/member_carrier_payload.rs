@@ -319,13 +319,16 @@ pub(crate) mod native {
                 (carrier.root)()?;
                 carrier.payload.verify().map_err(|_| Error::Conflict)?;
                 for (library, kind) in self.libraries.iter().zip(&expected) {
+                    // Both payload pins use the signed layout's path spelling;
+                    // the kernel executable is canonical (verbatim on Windows).
                     if library.kind != *kind
                         || !Arc::ptr_eq(&library.owner, owner)
                         || library.identity() != carrier.identity()
                         || library.installation.root != carrier.installation.root
                         || library.directory != carrier.directory
                         || library.executable != carrier.executable
-                        || library.payload.path() != carrier.executable.with_file_name(kind.path())
+                        || library.payload.path()
+                            != carrier.payload.path().with_file_name(kind.path())
                     {
                         return Err(Error::Conflict);
                     }
