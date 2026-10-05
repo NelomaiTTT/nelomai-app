@@ -6076,6 +6076,12 @@ pub(crate) mod native {
                         registration: reader.registration().map_err(owner_error)?,
                         acknowledged: std::cell::Cell::new(false),
                     })); // Root actual initial original BEFORE inventory/postflight.
+                    #[cfg(test)]
+                    self.started_initial
+                        .as_ref()
+                        .expect("retained initial member")
+                        .registration
+                        .observe_native_factory_root();
                 }
                 let token = self.started_initial.as_ref().ok_or(Error::Pending)?;
                 if self.context != origin.context

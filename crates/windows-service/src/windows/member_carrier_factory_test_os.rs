@@ -19,6 +19,9 @@ struct Inputs {
     executable: Option<PathBuf>,
     key: [u8; 32],
     fault: Option<(member_files::PrivateFile, bool)>,
+    native_fault: Option<(NativePublication, bool)>,
+    native_fault_reached: Option<NativePublication>,
+    native_originals: Vec<(&'static str, Weak<dyn Any>)>,
     package_source_reads: usize,
     package_paths: Option<[PathBuf; 5]>,
     wireguard_package: Option<([PathBuf; 5], u64)>,
@@ -26,6 +29,12 @@ struct Inputs {
     module_originals: Vec<Weak<dyn Any>>,
     inventory_fault: Option<bool>,
     inventory_fault_reached: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativePublication {
+    Carrier,
+    Member,
+    Running,
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
@@ -54,12 +63,61 @@ pub(crate) fn key(directory: &Path) -> Option<[u8; 32]> {
 pub(crate) fn state() -> Option<PathBuf> {
     INPUTS.with(|inputs| inputs.borrow().as_ref().map(|v| v.state.clone()))
 }
-pub(crate) fn publication_ack(file: member_files::PrivateFile) -> io::Result<()> {
+pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -> io::Result<()> {
     INPUTS.with(|inputs| {
         let mut inputs = inputs.borrow_mut();
         let Some(inputs) = inputs.as_mut() else {
             return Ok(());
         };
+        if let Some((target, unwind)) = inputs.native_fault.filter(|(target, _)| {
+            file == match target {
+                NativePublication::Carrier | NativePublication::Member => {
+                    member_files::PrivateFile::Pair
+                }
+                NativePublication::Running => member_files::PrivateFile::Session,
+            }
+        }) {
+            // Only external filesystem ACK selection. These published DATA
+            // do not choose the production path or supply owning receipts.
+            let envelope: serde_json::Value = serde_json::from_slice(desired)?;
+            let wrapped: serde_json::Value = serde_json::from_str(
+                envelope["data"]
+                    .as_str()
+                    .ok_or_else(|| io::Error::other("fixture envelope"))?,
+            )?;
+            let payload = &wrapped["payload"];
+            let reached = match (target, file) {
+                (
+                    NativePublication::Carrier | NativePublication::Member,
+                    member_files::PrivateFile::Pair,
+                ) => {
+                    let record: crate::member_carrier_pair::Record =
+                        serde_json::from_value(payload.clone())?;
+                    record.pending.is_none()
+                        && record.carrier.is_some()
+                        && if target == NativePublication::Carrier {
+                            record.members.iter().all(Option::is_none)
+                        } else {
+                            record.members.iter().flatten().any(|member| {
+                                member.owner.phase == crate::member_owner::Phase::Running
+                            })
+                        }
+                }
+                (NativePublication::Running, member_files::PrivateFile::Session) => {
+                    payload["session"]["phase"] == "Running"
+                }
+                _ => false,
+            };
+            if reached {
+                require_native_originals(inputs, target);
+                inputs.native_fault = None;
+                inputs.native_fault_reached = Some(target);
+                if unwind {
+                    panic!("fixture {target:?} native publication ACK unwind");
+                }
+                return Err(io::Error::other("fixture native publication ACK lost"));
+            }
+        }
         if inputs
             .fault
             .as_ref()
@@ -73,6 +131,35 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile) -> io::Result<()>
         }
         Ok(())
     })
+}
+pub(crate) fn native_original_retained<T: Any>(kind: &'static str, original: &Rc<T>) {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            let root: Rc<dyn Any> = original.clone();
+            inputs.native_originals.push((kind, Rc::downgrade(&root)));
+        }
+    });
+}
+fn require_native_originals(inputs: &Inputs, target: NativePublication) {
+    for kind in ["carrier", "member"] {
+        if kind == "member" && target == NativePublication::Carrier {
+            continue;
+        }
+        let originals: Vec<_> = inputs
+            .native_originals
+            .iter()
+            .filter(|(actual, _)| *actual == kind)
+            .collect();
+        assert_eq!(
+            originals.len(),
+            1,
+            "missing/repeated actual {kind} return before {target:?}"
+        );
+        assert!(
+            originals[0].1.upgrade().is_some(),
+            "actual {kind} discarded before {target:?} ACK/protected completion"
+        );
+    }
 }
 pub(crate) fn package_source_read() {
     INPUTS.with(|inputs| {
@@ -237,6 +324,9 @@ impl Fixture {
                 executable: None,
                 key: key.verifying_key().to_bytes(),
                 fault: None,
+                native_fault: None,
+                native_fault_reached: None,
+                native_originals: vec![],
                 package_source_reads: 0,
                 package_paths: None,
                 wireguard_package: None,
@@ -362,6 +452,34 @@ impl Fixture {
     pub(crate) fn lose_ack(&self, target: member_files::PrivateFile, unwind: bool) {
         INPUTS.with(|inputs| {
             inputs.borrow_mut().as_mut().expect("fixture inputs").fault = Some((target, unwind))
+        });
+    }
+    pub(crate) fn lose_native_publication_ack(&self, target: NativePublication, unwind: bool) {
+        INPUTS.with(|inputs| {
+            inputs
+                .borrow_mut()
+                .as_mut()
+                .expect("fixture inputs")
+                .native_fault = Some((target, unwind))
+        });
+    }
+    pub(crate) fn require_native_publication_fault(
+        &self,
+        target: NativePublication,
+        pending: bool,
+    ) {
+        INPUTS.with(|inputs| {
+            let inputs = inputs.borrow();
+            let inputs = inputs.as_ref().expect("fixture inputs");
+            assert_eq!(
+                inputs.native_fault_reached,
+                Some(target),
+                "actual publication fault not reached"
+            );
+            assert!(inputs.native_fault.is_none());
+            if pending {
+                require_native_originals(inputs, target);
+            }
         });
     }
     pub(crate) fn lose_inventory_after_load(&self, unwind: bool) {

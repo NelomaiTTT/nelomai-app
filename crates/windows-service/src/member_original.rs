@@ -60,6 +60,19 @@ pub(crate) struct OriginalMemberRegistration<J, I> {
     generation: u64,
 }
 impl<J, I> OriginalMemberRegistration<J, I> {
+    #[cfg(all(windows, test))]
+    pub(crate) fn observe_native_factory_root(&self)
+    where
+        J: 'static,
+        I: 'static,
+    {
+        // Nonowning test observation of SAME MemberOwner/files/native IO, not
+        // the outer started-generation ticket or copied native proof.
+        crate::windows::member_carrier_factory_test_os::native_original_retained(
+            "member",
+            &self.shared,
+        );
+    }
     pub(crate) fn proof(&self) -> NativeProof {
         self.proof
     }

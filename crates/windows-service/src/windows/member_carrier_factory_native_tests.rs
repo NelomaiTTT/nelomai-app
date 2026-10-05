@@ -3,7 +3,8 @@ use super::*;
 use crate::{
     member_actor::PairFactory,
     windows::{
-        member_carrier_factory_test_os::Fixture, member_files::PrivateFile,
+        member_carrier_factory_test_os::{Fixture, NativePublication},
+        member_files::PrivateFile,
         member_pair::NativePairFactory,
     },
 };
@@ -38,6 +39,12 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         "primary",
         "module-load-read-error",
         "module-load-read-unwind",
+        "carrier-ack",
+        "carrier-unwind",
+        "member-ack",
+        "member-unwind",
+        "running-ack",
+        "running-unwind",
         "cold",
         "primary-data-denial",
         "creator-ack",
@@ -103,7 +110,16 @@ fn carrier_factory_actual_cold_child() {
         "module-load-read-error" | "module-load-read-unwind"
     );
     let full_primary = case == "primary";
-    let fixture = if module_partial || full_primary {
+    let native_partial = match case.as_str() {
+        "carrier-ack" => Some((NativePublication::Carrier, false)),
+        "carrier-unwind" => Some((NativePublication::Carrier, true)),
+        "member-ack" => Some((NativePublication::Member, false)),
+        "member-unwind" => Some((NativePublication::Member, true)),
+        "running-ack" => Some((NativePublication::Running, false)),
+        "running-unwind" => Some((NativePublication::Running, true)),
+        _ => None,
+    };
+    let fixture = if module_partial || full_primary || native_partial.is_some() {
         Fixture::new_native_modules()
     } else {
         Fixture::new()
@@ -130,6 +146,8 @@ fn carrier_factory_actual_cold_child() {
     match case.as_str() {
         "cold" | "primary-data-denial" | "primary" => (),
         "module-load-read-error" | "module-load-read-unwind" => (),
+        "carrier-ack" | "carrier-unwind" | "member-ack" | "member-unwind" | "running-ack"
+        | "running-unwind" => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
         "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
         "initial-native-unwind" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, true),
@@ -142,7 +160,11 @@ fn carrier_factory_actual_cold_child() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         factory.prepare_retained_into(&mut retained, RuntimeSlot::Latest, &command, 7)
     }));
-    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial || full_primary {
+    if matches!(case.as_str(), "cold" | "primary-data-denial")
+        || module_partial
+        || full_primary
+        || native_partial.is_some()
+    {
         result
             .expect("actual cold prepare unwound")
             .expect("actual cold factory preparation");
@@ -157,6 +179,32 @@ fn carrier_factory_actual_cold_child() {
     assert_eq!(original.snapshot().session.phase, SessionPhase::Starting);
     eprintln!("actual factory {case}: retained Starting");
     fixture.verify_files().unwrap();
+    if let Some((target, unwind)) = native_partial {
+        fixture.lose_native_publication_ack(target, unwind);
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        eprintln!("actual factory {case}: primary through {target:?} publication");
+        let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            original.start_primary(primary, options)
+        }));
+        assert!(
+            started.is_err() || started.unwrap().is_err(),
+            "lost native publication ACK accepted"
+        );
+        let snapshot = original.snapshot();
+        fixture.require_native_publication_fault(target, snapshot.cleanup_pending);
+        if !snapshot.cleanup_pending {
+            assert_eq!(
+                snapshot.session.phase,
+                SessionPhase::Stopped,
+                "owner discarded without actual completion"
+            );
+        }
+    }
     if full_primary {
         let Command::Start {
             primary, options, ..
@@ -311,6 +359,9 @@ fn carrier_factory_actual_cold_child() {
             }
             Err(_) => {
                 assert!(original.snapshot().cleanup_pending);
+                if let Some((target, _)) = native_partial {
+                    fixture.require_native_publication_fault(target, true);
+                }
                 // Unknown native/record ACK remains with the original owner.
                 // Process exit is not an invented successful disposition.
                 std::mem::forget(original);

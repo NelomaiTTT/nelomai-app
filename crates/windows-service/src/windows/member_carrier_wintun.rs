@@ -886,6 +886,10 @@ pub(crate) mod native {
                     luid: self.functions.luid,
                 },
                 |read| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::native_original_retained(
+                        "carrier", &read.0,
+                    );
                     self.module
                         .authority
                         .as_mut()

@@ -1315,7 +1315,7 @@ mod native {
                 self.0
                     .publish(TunnelSlot::A, &path, current, desired, file.limit())?;
                 #[cfg(test)]
-                crate::windows::member_carrier_factory_test_os::publication_ack(file)
+                crate::windows::member_carrier_factory_test_os::publication_ack(file, desired)
                     .map_err(|_| OwnerError::Native)?;
                 Ok(())
             })()
