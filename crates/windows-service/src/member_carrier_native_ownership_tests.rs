@@ -579,10 +579,14 @@ fn registry_is_journaled_before_each_effect_and_exactly_disabled_before_creation
     owner
         .prepare_role_in(Role::RoleCarrier, &mut lock, |call| {
             steps += 1;
-            call()
+            let before = shared.borrow().inspection_count;
+            call()?;
+            assert!(shared.borrow().inspection_count - before <= 1,
+                "a supervised preparation call must not combine independent complete owner censuses");
+            Ok(())
         })
         .unwrap();
-    assert_eq!(steps, 7);
+    assert_eq!(steps, 9);
     owner.prepare_role(Role::MemberA, &mut lock).unwrap();
     let record = owner.prepare_role(Role::MemberB, &mut lock).unwrap();
     assert_eq!(record.version, 2);
@@ -1171,7 +1175,7 @@ fn cleanup_lost_ack_recovers_each_revision_without_repeating_accepted_effects() 
 fn crash_at_every_prepare_revision_cannot_enable_creation_or_manufacture_handle_authority() {
     // A whole native step may return its real NEW ACK and then lose timing /
     // authentication postflight. The SAME owner must retain it on Err/unwind.
-    for failed_step in 1..=7 {
+    for failed_step in 1..=9 {
         for unwind in [false, true] {
             let (mut owner, shared, mut lock) = setup();
             let mut calls = 0;

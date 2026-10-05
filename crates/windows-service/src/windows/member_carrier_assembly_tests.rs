@@ -1419,8 +1419,8 @@ fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_pe
             |receipt| {
                 assert_eq!(
                     calls.get(),
-                    8,
-                    "seven durable calls precede the independent create seam"
+                    10,
+                    "nine durable calls precede the independent create seam"
                 );
                 assert_eq!(receipt.binding, &context().bindings[index]);
                 assert_eq!(receipt.record.keys[0].phase, KeyPhase::Disabled);
@@ -1441,7 +1441,7 @@ fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_pe
             },
         )
         .unwrap();
-        assert_eq!(calls.get(), 8);
+        assert_eq!(calls.get(), 10);
         assert_eq!(
             root.with_member_precreation(role, &mut lock, |_| panic!("repeat")),
             Err(Error::Retired)
@@ -1476,7 +1476,7 @@ fn member_prerequisite_before_c_preparation_and_after_wrong_lock_fail_without_ef
 #[test]
 fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_original_keys() {
     // Break: a failed/unknown A Start permits new B key effects before cleanup.
-    for failed_step in 1..=8 {
+    for failed_step in 1..=10 {
         for unwind in [false, true] {
             let (mut root, s, mut lock, drops) = attached(Fault::None);
             root.prepare_carrier(&mut lock).unwrap();
@@ -1505,7 +1505,7 @@ fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_origi
             }));
             assert!(result.is_err() || result.unwrap().is_err());
             assert_eq!(calls.get(), failed_step);
-            assert_eq!(callback.get(), failed_step == 8);
+            assert_eq!(callback.get(), failed_step == 10);
             assert_eq!(s.borrow().creates, if failed_step >= 4 { 2 } else { 1 });
             assert!(root
                 .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("sibling effect"))

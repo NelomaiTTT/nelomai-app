@@ -1381,14 +1381,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             record = pending;
             Ok(())
         })?;
-        preparation_call(run, || {
-            self.write_value(&record, role, Value::Absent, Value::DwordZero, lock)?;
-            #[cfg(all(windows, test))]
-            crate::windows::member_carrier_factory_test_os::trace_step(
-                "key prepare disabled value readback",
-            );
-            Ok(())
-        })?;
+        self.write_value_in(&record, role, Value::Absent, Value::DwordZero, lock, run)?;
         preparation_call(run, || {
             let mut disabled = next(&record)?;
             disabled.keys[i].phase = KeyPhase::Disabled;
@@ -1614,35 +1607,76 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         desired: Value,
         lock: &mut I::MutationLock,
     ) -> Result<()> {
-        next(record)?; // Refuse an effect whose confirmation cannot be recorded.
-        let facts = self.observe(record, role, lock)?;
-        require_nic_absent(&facts)?;
-        require_owned(&facts)?;
-        require_value(&facts, expected)?;
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        let i = role.index();
-        let held = self.retained.keys[i].as_ref().ok_or(Error::Pending)?;
-        let result = self.io.compare_exchange_value(
-            lock,
-            record,
-            &self.context.bindings[i],
-            &held.ack,
-            &facts,
-            ValueCas {
-                expected,
-                desired,
-                value_name: VALUE_NAME,
-            },
-        );
-        // Both success and failure need exact fresh readback. An error is not
-        // proof of absence of effects; a successful ACK is not proof of a write.
-        let after = self.observe(record, role, lock)?;
-        require_nic_absent(&after)?;
-        require_owned(&after)?;
-        if require_value(&after, desired).is_err() {
-            return Err(result.err().unwrap_or(Error::Pending));
-        }
-        Ok(())
+        self.write_value_in(record, role, expected, desired, lock, &mut |call| call())
+    }
+    fn write_value_in(
+        &mut self,
+        record: &Record,
+        role: Role,
+        expected: Value,
+        desired: Value,
+        lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<()> {
+        // The same owner retains the original key throughout. Facts and the
+        // mutation's result are DATA; neither supplies a native effect permit.
+        let mut fresh = None;
+        preparation_call(run, || {
+            next(record)?; // Confirmation must have a representable revision.
+            let facts = self.observe(record, role, lock)?;
+            require_nic_absent(&facts)?;
+            require_owned(&facts)?;
+            require_value(&facts, expected)?;
+            fresh = Some(facts);
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key value expected full readback",
+            );
+            Ok(())
+        })?;
+        let mut result = None;
+        preparation_call(run, || {
+            self.io.assert_serialized_lock(lock, &self.context)?;
+            self.require_current(record)?;
+            let i = role.index();
+            let held = self.retained.keys[i].as_ref().ok_or(Error::Pending)?;
+            result = Some(self.io.compare_exchange_value(
+                lock,
+                record,
+                &self.context.bindings[i],
+                &held.ack,
+                fresh.as_ref().ok_or(Error::Pending)?,
+                ValueCas {
+                    expected,
+                    desired,
+                    value_name: VALUE_NAME,
+                },
+            ));
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key value native mutation returned",
+            );
+            // A native Err can still have effects. The next independent call
+            // must reread it; an Err/unwind from the runner retains this owner.
+            Ok(())
+        })?;
+        preparation_call(run, || {
+            let after = self.observe(record, role, lock)?;
+            require_nic_absent(&after)?;
+            require_owned(&after)?;
+            if require_value(&after, desired).is_err() {
+                return Err(result
+                    .take()
+                    .ok_or(Error::Pending)?
+                    .err()
+                    .unwrap_or(Error::Pending));
+            }
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "key value desired full readback",
+            );
+            Ok(())
+        })
     }
     fn validate(&self, record: &Record) -> Result<()> {
         validate_record(record)?;
