@@ -5815,6 +5815,10 @@ pub(crate) mod native {
                 )
             }
             .map_err(denied)?;
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "C refresh retained full original module lease",
+            );
             if self.current(use_)? != before {
                 return Err(Error::Conflict);
             }
@@ -5827,6 +5831,10 @@ pub(crate) mod native {
             if held.module() != original {
                 return Err(Error::Conflict);
             }
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step(
+                "C refresh same original module image accepted",
+            );
             held.verify(&self.cancelled).map_err(denied)?;
             same_record(&before, self.current(use_)?).map_err(denied)?;
             Ok(held)

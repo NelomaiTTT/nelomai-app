@@ -931,7 +931,9 @@ pub(crate) mod native {
             .verify_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)?;
         verify_mapping(original, mapping)?;
-        verify_mapping(current, mapping)?;
+        if !std::ptr::eq(original, current) {
+            verify_mapping(current, mapping)?;
+        }
         current
             .verify_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)
@@ -1405,9 +1407,8 @@ pub(crate) mod native {
                     if !self.runtime.matches_pin(&self.lock) {
                         return Err(Error::Conflict);
                     }
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
+                    // Exact pin identity joins our lock to RuntimeRead's lock;
+                    // verify_source checks that same owner and signed source.
                     self.runtime
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
@@ -1420,9 +1421,6 @@ pub(crate) mod native {
                     if !self.runtime.matches_pin(&self.lock) {
                         return Err(Error::Conflict);
                     }
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
                     Ok(())
                 })
         }
@@ -1547,13 +1545,7 @@ pub(crate) mod native {
             runtime
                 .verify_source(&self.source)
                 .map_err(|_| Error::Conflict)?;
-            self.lock
-                .verify_source(&self.source)
-                .map_err(|_| Error::Conflict)?;
             verify_image(&self.source, &self.module)?;
-            self.lock
-                .verify_source(&self.source)
-                .map_err(|_| Error::Conflict)?;
             runtime
                 .verify_source(&self.source)
                 .map_err(|_| Error::Conflict)
