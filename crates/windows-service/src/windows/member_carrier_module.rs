@@ -927,13 +927,19 @@ pub(crate) mod native {
         if pin.mapping != mapping.as_ptr() {
             return Err(Error::Conflict);
         }
+        if std::ptr::eq(original, current) {
+            // The registry retained this exact original Source at successful
+            // PIN creation, including its nonzero file ID. Full mapping reads
+            // reverify that SAME pinned file/ancestors/owner/signed runtime
+            // before and after bounds/exports. There is no second source to
+            // join; repeated comparisons of this object to itself add no facts.
+            return verify_mapping(original, mapping);
+        }
         current
             .verify_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)?;
         verify_mapping(original, mapping)?;
-        if !std::ptr::eq(original, current) {
-            verify_mapping(current, mapping)?;
-        }
+        verify_mapping(current, mapping)?;
         current
             .verify_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)

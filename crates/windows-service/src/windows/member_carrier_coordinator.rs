@@ -1656,6 +1656,12 @@ pub(crate) mod native {
                 return Err(wintun::Error::Conflict);
             }
             let pair = self.pair.clone();
+            #[cfg(test)]
+            if stage == StartupStage::Resolve {
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "C Resolve G original Pair inspection",
+                );
+            }
             pair.inspect_effect(
                 &self.runtime,
                 &self.supervisor,
@@ -1663,6 +1669,12 @@ pub(crate) mod native {
                 pair::Effect::CarrierReady,
                 |actual_pair| {
                     let before = self.sample(stage).map_err(io_denied)?;
+                    #[cfg(test)]
+                    if stage == StartupStage::Resolve {
+                        crate::windows::member_carrier_factory_test_os::trace_step(
+                            "C Resolve G first complete sample accepted",
+                        );
+                    }
                     let native = receipts::Record::decode(&before.native).map_err(io_denied)?;
                     validate_carrier_ready_pair(&native, actual_pair).map_err(io_denied)?;
                     if let Some((binding, target)) = row {
@@ -1682,6 +1694,12 @@ pub(crate) mod native {
                         .map_err(io_denied)?;
                     if before != self.sample(stage).map_err(io_denied)? {
                         return Err(io_denied(()));
+                    }
+                    #[cfg(test)]
+                    if stage == StartupStage::Resolve {
+                        crate::windows::member_carrier_factory_test_os::trace_step(
+                            "C Resolve G second complete sample accepted",
+                        );
                     }
                     self.absence
                         .try_borrow_mut()
