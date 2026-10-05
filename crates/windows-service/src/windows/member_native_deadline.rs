@@ -839,6 +839,27 @@ impl NativeDeadlineReadPin {
         attempt.succeeded = true;
         Ok(())
     }
+    /// SAME supplied original runtime plus actual Calling in one authenticated
+    /// read. `verify_call` already checks the original read pin/owner/lease and
+    /// brackets full runtime authentication with both Calling observations.
+    /// This replaces adjacent verify_runtime + verify_call, never idle entry.
+    pub(crate) fn verify_runtime_call(
+        &self,
+        owner: &NativeDeadline,
+        runtime: &RuntimeRead,
+        context: &Context,
+    ) -> Result<()> {
+        let mut attempt = ReadAttempt {
+            owner,
+            succeeded: false,
+        };
+        if !self.runtime.same_original_runtime(runtime) {
+            return Err(CarrierError::Conflict);
+        }
+        self.verify_call(owner, context)?;
+        attempt.succeeded = true;
+        Ok(())
+    }
     /// Timing/retention only: independent native/WFP/network authority is still
     /// mandatory. An idle valid owner/pin cannot authorize an unsupervised call.
     pub(crate) fn verify_call(&self, owner: &NativeDeadline, context: &Context) -> Result<()> {

@@ -866,19 +866,13 @@ pub(crate) mod native_store {
                         return Err(conflict());
                     }
                     deadline
-                        .verify_runtime(supervisor, runtime, context)
-                        .map_err(|_| conflict())?;
-                    deadline
-                        .verify_call(supervisor, context)
+                        .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())?;
                     self.verify()?;
                     self.intent.terminal_entry(expected)?;
                     self.verify()?;
                     deadline
-                        .verify_runtime(supervisor, runtime, context)
-                        .map_err(|_| conflict())?;
-                    deadline
-                        .verify_call(supervisor, context)
+                        .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())
                 });
             if result.is_err() {
@@ -924,10 +918,7 @@ pub(crate) mod native_store {
                         return Err(conflict());
                     }
                     deadline
-                        .verify_runtime(supervisor, runtime, context)
-                        .map_err(|_| conflict())?;
-                    deadline
-                        .verify_call(supervisor, context)
+                        .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())?;
                     self.verify()?;
                     self.intent.cleanup()?;
@@ -936,10 +927,7 @@ pub(crate) mod native_store {
                     }
                     self.verify()?;
                     deadline
-                        .verify_runtime(supervisor, runtime, context)
-                        .map_err(|_| conflict())?;
-                    deadline
-                        .verify_call(supervisor, context)
+                        .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())
                 });
             if result.is_err() {
@@ -978,10 +966,7 @@ pub(crate) mod native_store {
             }
             let deadline = std::rc::Rc::new(supervisor.read_pin().map_err(|_| conflict())?);
             deadline
-                .verify_runtime(supervisor, runtime, &self.context)
-                .map_err(|_| conflict())?;
-            deadline
-                .verify_call(supervisor, &self.context)
+                .verify_runtime_call(supervisor, runtime, &self.context)
                 .map_err(|_| conflict())?;
             self.verify()?;
             // The protected reread itself can exhaust the original budget.
@@ -994,10 +979,7 @@ pub(crate) mod native_store {
             // its postflight before propagating it. Unwind revokes via Drop.
             self.verify()?;
             deadline
-                .verify_runtime(supervisor, runtime, &self.context)
-                .map_err(|_| conflict())?;
-            deadline
-                .verify_call(supervisor, &self.context)
+                .verify_runtime_call(supervisor, runtime, &self.context)
                 .map_err(|_| conflict())?;
             let result = result?;
             call.completed = true;
@@ -1089,10 +1071,7 @@ pub(crate) mod native_store {
             }
             let deadline = supervisor.read_pin().map_err(|_| conflict())?;
             deadline
-                .verify_runtime(supervisor, runtime, &self.context)
-                .map_err(|_| conflict())?;
-            deadline
-                .verify_call(supervisor, &self.context)
+                .verify_runtime_call(supervisor, runtime, &self.context)
                 .map_err(|_| conflict())?;
             self.verify()?;
             deadline
@@ -1101,10 +1080,7 @@ pub(crate) mod native_store {
             let result = self.span.inspect_record(expected, inspect);
             self.verify()?;
             deadline
-                .verify_runtime(supervisor, runtime, &self.context)
-                .map_err(|_| conflict())?;
-            deadline
-                .verify_call(supervisor, &self.context)
+                .verify_runtime_call(supervisor, runtime, &self.context)
                 .map_err(|_| conflict())?;
             let result = result?;
             call.completed = true;

@@ -928,10 +928,7 @@ pub(crate) mod native {
             let input = bootstrap.original_inputs();
             input
                 .deadline
-                .verify_runtime(input.supervisor, input.runtime, input.context)?;
-            input
-                .deadline
-                .verify_call(input.supervisor, input.context)?;
+                .verify_runtime_call(input.supervisor, input.runtime, input.context)?;
             pair.verify_module_only_read_bracket(
                 input.runtime,
                 input.supervisor,

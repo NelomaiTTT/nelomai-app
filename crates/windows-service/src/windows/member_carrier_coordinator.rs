@@ -639,10 +639,7 @@ pub(crate) mod native {
                 return Err(crate::member_carrier_guard::GuardError::Conflict);
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(guard_denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(guard_denied)?;
             self.runtime.verify(&self.context).map_err(guard_denied)?;
             if !self.runtime.fresh(&self.context).map_err(guard_denied)? {
@@ -883,10 +880,7 @@ pub(crate) mod native {
             };
             let deadline = input.supervisor.read_pin().map_err(|_| Error::Conflict)?;
             deadline
-                .verify_runtime(&input.supervisor, &input.runtime, &input.context)
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(&input.supervisor, &input.context)
+                .verify_runtime_call(&input.supervisor, &input.runtime, &input.context)
                 .map_err(|_| Error::Conflict)?;
             if !input.pair.matches_runtime(&input.runtime)
                 || input.cancelled.load(Ordering::Acquire)
@@ -924,10 +918,7 @@ pub(crate) mod native {
                 return Err(wintun::Error::Conflict);
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime.verify(&self.context).map_err(denied)?;
             if !self.runtime.fresh(&self.context).map_err(denied)? {
@@ -1309,10 +1300,7 @@ pub(crate) mod native {
             }
             let deadline = assets.supervisor.read_pin().map_err(denied)?;
             deadline
-                .verify_runtime(&assets.supervisor, &assets.runtime, &scope.context)
-                .map_err(denied)?;
-            deadline
-                .verify_call(&assets.supervisor, &scope.context)
+                .verify_runtime_call(&assets.supervisor, &assets.runtime, &scope.context)
                 .map_err(denied)?;
             if assets.context != scope.context || assets.cancelled.load(Ordering::Acquire) {
                 return Err(wintun::Error::Conflict);
@@ -1365,10 +1353,7 @@ pub(crate) mod native {
                 return Err(wintun::Error::Cancelled);
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.scope.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.scope.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.scope.context)
                 .map_err(denied)?;
             self.runtime.verify_source(&self.source).map_err(denied)?;
             self.image
@@ -1387,10 +1372,7 @@ pub(crate) mod native {
                 return Err(wintun::Error::Cancelled);
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.scope.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.scope.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.scope.context)
                 .map_err(denied)?;
             self.runtime.verify_source(&self.source).map_err(denied)?;
             self.runtime.verify(&self.scope.context).map_err(denied)?;
