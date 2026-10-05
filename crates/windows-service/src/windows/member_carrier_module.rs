@@ -1286,7 +1286,7 @@ pub(crate) mod native {
             let module = &self.original.module;
             self.original
                 .inspect_release_pre_with(&module.1, &module.2, cancelled, |module| {
-                    if !self.matches_runtime(runtime) {
+                    if !module.1.image_available() || !self.matches_runtime(runtime) {
                         return Err(Error::Conflict);
                     }
                     runtime
@@ -1301,8 +1301,9 @@ pub(crate) mod native {
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
+                    // The complete anchor read includes this SAME source's
+                    // mapping/bounds/exports and independently joins repeat sources.
                     require_process_anchor(&self.source, module)?;
-                    verify_image(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     self.lock
                         .verify_source(&self.source)
@@ -1351,7 +1352,7 @@ pub(crate) mod native {
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
-                    verify_image(&self.source, module)?;
+                    require_process_anchor(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     self.lock
                         .verify_source(&self.source)
@@ -1477,11 +1478,14 @@ pub(crate) mod native {
         }
         pub(super) fn verify(&self) -> Result<()> {
             image_read(&self.valid, || {
-                require_process_anchor(&self.source, &self.module)?;
+                if !self.module.1.image_available() {
+                    return Err(Error::Conflict);
+                }
                 self.lock
                     .verify_source(&self.source)
                     .map_err(|_| Error::Conflict)?;
-                verify_image(&self.source, &self.module)?;
+                // One full source/mapping read through the SAME retained PIN.
+                require_process_anchor(&self.source, &self.module)?;
                 self.lock
                     .verify_source(&self.source)
                     .map_err(|_| Error::Conflict)
@@ -1492,11 +1496,14 @@ pub(crate) mod native {
         }
         pub(crate) fn verify_cleanup_read(&self) -> Result<()> {
             image_cleanup_read(&self.valid, || {
-                require_process_anchor(&self.source, &self.module)?;
+                if !self.module.1.image_available() {
+                    return Err(Error::Conflict);
+                }
                 self.lock
                     .verify_source(&self.source)
                     .map_err(|_| Error::Conflict)?;
-                verify_image(&self.source, &self.module)?;
+                // One full source/mapping read through the SAME retained PIN.
+                require_process_anchor(&self.source, &self.module)?;
                 self.lock
                     .verify_source(&self.source)
                     .map_err(|_| Error::Conflict)
