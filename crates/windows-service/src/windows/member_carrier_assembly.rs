@@ -771,6 +771,14 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         lock: &mut I::MutationLock,
         call: impl FnOnce(&mut Option<A>, Receipt<'_, I>, u64) -> Result<()>,
     ) -> Result<()> {
+        self.with_precreation_in(lock, &mut |call| call(), call)
+    }
+    fn with_precreation_in(
+        &mut self,
+        lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        call: impl FnOnce(&mut Option<A>, Receipt<'_, I>, u64) -> Result<()>,
+    ) -> Result<()> {
         self.no_sdk.set(false);
         enter(&mut self.precreation_attempted)?;
         if !self.prepared {
@@ -783,7 +791,7 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
             .owner
             .as_mut()
             .ok_or(Error::Pending)?
-            .before_adapter_create(receipt::Role::RoleCarrier, lock)?;
+            .before_adapter_create_in(receipt::Role::RoleCarrier, lock, run)?;
         // Use the actual CURRENT borrowed receipt, including later legitimate
         // journal revisions. A remembered/precomputed generation is not used.
         receipt::validate_carrier_create_stage(
@@ -1844,7 +1852,8 @@ pub(crate) mod native {
             self.prepared = true;
             Ok(())
         }
-        /// Main's actual G/carrier construction callback, inside SAME Calling.
+        /// Independently supervised precreation read, then caller's existing
+        /// G/carrier steps under the SAME supervisor and original borrowed ACK.
         /// Scope is derived only from the actual CURRENT borrowed Disabled
         /// receipt, never from bootstrap or a future predicted revision.
         /// Callback returns only (), and must retain every owning construction
@@ -1869,33 +1878,31 @@ pub(crate) mod native {
             let context = assets.context.clone();
             let expected = assets.expected.clone();
             let cancelled = assets.cancelled.clone();
-            supervisor.run_intent(
-                &context,
-                &intent,
-                &expected,
-                pair::Effect::CarrierReady,
-                || {
-                    check_cancelled(&cancelled)?;
-                    if !self
-                        .root
-                        .assets
-                        .as_ref()
-                        .ok_or(Error::Pending)?
-                        .runtime
-                        .matches_lock(lock)
-                    {
-                        return Err(Error::Conflict);
-                    }
-                    self.root
-                        .with_precreation(lock, |assets, receipt, generation| {
-                            let scope = creators::Scope {
-                                context: receipt.record.context.clone(),
-                                binding: receipt.binding.clone(),
-                                generation,
-                            };
-                            call(assets, receipt, scope)
-                        })?;
-                    check_cancelled(&cancelled)
+            if !assets.runtime.matches_lock(lock) {
+                return Err(Error::Conflict);
+            }
+            self.root.with_precreation_in(
+                lock,
+                &mut |body| {
+                    supervisor.run_intent(
+                        &context,
+                        &intent,
+                        &expected,
+                        pair::Effect::CarrierReady,
+                        || {
+                            check_cancelled(&cancelled)?;
+                            body()?;
+                            check_cancelled(&cancelled)
+                        },
+                    )
+                },
+                |assets, receipt, generation| {
+                    let scope = creators::Scope {
+                        context: receipt.record.context.clone(),
+                        binding: receipt.binding.clone(),
+                        generation,
+                    };
+                    call(assets, receipt, scope)
                 },
             )
         }

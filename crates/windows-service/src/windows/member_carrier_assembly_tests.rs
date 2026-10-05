@@ -1377,22 +1377,34 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     root.prepare_carrier(&mut lock).unwrap();
     assert_eq!((s.borrow().creates, s.borrow().writes), (1, 1));
     assert_eq!(root.disabled.as_ref().unwrap().generation, 5);
-    root.with_precreation(&mut lock, |assets, r, generation| {
-        assert!(Rc::ptr_eq(&assets.as_ref().unwrap().0, &drops));
-        assert_eq!(generation, 5);
-        assert_eq!(r.record.generation, 5);
-        assert_eq!(r.binding, &context().bindings[0]);
-        assert!(Rc::ptr_eq(r.mutation_lock, &s.borrow().lease));
-        keys::reattest_disabled_original_key(
-            &mut Kernel(s.clone()),
-            r.record,
-            r.binding,
-            r.new_key_ack,
-        )
-        .unwrap();
-        Ok(())
-    })
+    let mut calls = 0;
+    root.with_precreation_in(
+        &mut lock,
+        &mut |call| {
+            calls += 1;
+            call()
+        },
+        |assets, r, generation| {
+            assert!(Rc::ptr_eq(&assets.as_ref().unwrap().0, &drops));
+            assert_eq!(generation, 5);
+            assert_eq!(r.record.generation, 5);
+            assert_eq!(r.binding, &context().bindings[0]);
+            assert!(Rc::ptr_eq(r.mutation_lock, &s.borrow().lease));
+            keys::reattest_disabled_original_key(
+                &mut Kernel(s.clone()),
+                r.record,
+                r.binding,
+                r.new_key_ack,
+            )
+            .unwrap();
+            Ok(())
+        },
+    )
     .unwrap();
+    assert_eq!(
+        calls, 1,
+        "precreation check is separate from C construction steps"
+    );
     assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Retired));
     assert_eq!(root.attach_keys(&mut lock), Err(Error::Retired));
     assert_eq!(

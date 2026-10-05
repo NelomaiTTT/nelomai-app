@@ -209,7 +209,14 @@ impl ReadyRun {
             revoked: Rc::new(Cell::new(false)),
         }
     }
-    fn execute(&self, mut effect: impl FnMut(ReadyStep) -> Result<()>) -> Result<()> {
+    fn execute(&self, effect: impl FnMut(ReadyStep) -> Result<()>) -> Result<()> {
+        self.execute_in(&mut |call| call(), effect)
+    }
+    fn execute_in(
+        &self,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        mut effect: impl FnMut(ReadyStep) -> Result<()>,
+    ) -> Result<()> {
         if self.attempted.replace(true) || self.revoked.get() {
             self.revoked.set(true);
             return Err(CarrierError::Retired);
@@ -228,7 +235,7 @@ impl ReadyRun {
             ReadyStep::Drain,
             ReadyStep::PublishSource,
         ] {
-            effect(step)?;
+            crate::member_carrier_native_ownership::preparation_call(run, || effect(step))?;
             if self.revoked.get() {
                 return Err(CarrierError::Retired);
             }
@@ -1682,8 +1689,8 @@ pub(crate) mod native {
             Ok(())
         }
         /// SAME actual assembly's current borrowed key ACK determines scope.
-        /// The Assembly wraps this callback in the whole original Pair/Calling
-        /// before and AFTER, so a postflight error cannot publish readiness.
+        /// The precreation read and each existing C step use the SAME original
+        /// Pair/supervisor. Readiness follows all independently checked returns.
         pub(crate) fn create_ready(
             &mut self,
             assembly: &mut NativeAssemblySlot,
@@ -1699,8 +1706,48 @@ pub(crate) mod native {
                 return Err(CarrierError::Retired);
             }
             assembly.with_carrier_precreation(lock, |assets, receipt, scope| {
+                let original = assets.as_ref().ok_or(CarrierError::Pending)?;
+                let supervisor = original.supervisor.clone();
+                let intent = original.pair_intent.clone();
+                let expected = original.expected.clone();
+                let cancelled = original.cancelled.clone();
                 let mut prerequisite = Some(receipt);
-                run.execute(|step| self.step(step, assets, &scope, &mut prerequisite, files))
+                run.execute_in(
+                    &mut |call| {
+                        supervisor.run_intent(
+                            &scope.context,
+                            &intent,
+                            &expected,
+                            crate::member_carrier_pair::Effect::CarrierReady,
+                            || {
+                                if cancelled.load(Ordering::SeqCst) {
+                                    return Err(CarrierError::Retired);
+                                }
+                                call()?;
+                                if cancelled.load(Ordering::SeqCst) {
+                                    return Err(CarrierError::Retired);
+                                }
+                                Ok(())
+                            },
+                        )
+                    },
+                    |step| {
+                        #[cfg(test)]
+                        let label = match step {
+                            ReadyStep::Construct => "C ready Construct",
+                            ReadyStep::Create => "C ready Create",
+                            ReadyStep::Session => "C ready Session",
+                            ReadyStep::CaptureRows => "C ready CaptureRows",
+                            ReadyStep::Address => "C ready Address",
+                            ReadyStep::Readiness => "C ready Readiness",
+                            ReadyStep::Drain => "C ready Drain",
+                            ReadyStep::PublishSource => "C ready PublishSource",
+                        };
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_step(label);
+                        self.step(step, assets, &scope, &mut prerequisite, files)
+                    },
+                )
             })?;
             if run.revoked.get() {
                 return Err(CarrierError::Retired);

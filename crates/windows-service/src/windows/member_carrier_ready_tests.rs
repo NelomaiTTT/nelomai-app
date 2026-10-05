@@ -1192,7 +1192,16 @@ fn full_carrier_stage3_restore_is_interface_only_before_member_stop() {
 fn original_pins_are_not_published_before_whole_call_ack_or_after_revocation() {
     let run = ReadyRun::new();
     assert!(run.published(true).is_err());
-    run.execute(|_| Ok(())).unwrap();
+    let mut calls = 0;
+    run.execute_in(
+        &mut |call| {
+            calls += 1;
+            call()
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(calls, STEPS.len());
     assert!(run.published(false).is_err());
     run.published(true).unwrap();
     assert!(run.execute(|_| Ok(())).is_err());
@@ -1414,6 +1423,37 @@ fn c_stop_boundaries_are_separate_current_effects_and_cannot_authorize_end_from_
 
 #[test]
 fn every_failed_native_boundary_prevents_later_effects_and_new_attempt() {
+    for failed in 1..=STEPS.len() {
+        for unwind in [false, true] {
+            let run = ReadyRun::new();
+            let mut calls = 0;
+            let mut seen = vec![];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run.execute_in(
+                    &mut |call| {
+                        calls += 1;
+                        call()?;
+                        if calls == failed {
+                            if unwind {
+                                panic!("original C native postflight");
+                            }
+                            return Err(CarrierError::Pending);
+                        }
+                        Ok(())
+                    },
+                    |step| {
+                        seen.push(step);
+                        Ok(())
+                    },
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(seen, STEPS[..failed]);
+            assert!(run.revoked.get());
+            assert!(run.published(true).is_err());
+            assert!(run.execute(|_| panic!("C retry after postflight")).is_err());
+        }
+    }
     for failed in 0..STEPS.len() {
         let run = ReadyRun::new();
         let mut seen = vec![];

@@ -1405,17 +1405,37 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         role: Role,
         lock: &'a mut I::MutationLock,
     ) -> Result<Precreation<'a, I>> {
+        self.before_adapter_create_in(role, lock, &mut |call| call())
+    }
+    pub(crate) fn before_adapter_create_in<'a>(
+        &'a mut self,
+        role: Role,
+        lock: &'a mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+    ) -> Result<Precreation<'a, I>> {
         let i = role.index();
         if self.cleanup_only || self.consumed[i] {
             return Err(Error::Retired);
         }
-        self.io.assert_serialized_lock(lock, &self.context)?;
         self.consumed[i] = true;
-        let result = self.check_precreation(role, lock);
-        if result.is_err() {
-            self.cleanup_only = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            preparation_call(run, || {
+                self.io.assert_serialized_lock(lock, &self.context)?;
+                self.check_precreation(role, lock)
+            })
+        }));
+        match result {
+            Ok(result) => {
+                if result.is_err() {
+                    self.cleanup_only = true;
+                }
+                result?;
+            }
+            Err(unwind) => {
+                self.cleanup_only = true;
+                std::panic::resume_unwind(unwind)
+            }
         }
-        result?;
         Ok(PrecreationReceipt {
             record: self.current.as_ref().ok_or(Error::Pending)?,
             binding: &self.context.bindings[i],

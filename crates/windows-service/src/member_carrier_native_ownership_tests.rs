@@ -1474,10 +1474,42 @@ fn native_ack_constructor_rejects_every_non_created_disposition() {
 fn precreation_handoff_retains_the_callers_serialized_mutation_lock() {
     let (mut owner, _, mut lock) = setup();
     owner.prepare_role(Role::RoleCarrier, &mut lock).unwrap();
+    let mut calls = 0;
     let receipt = owner
-        .before_adapter_create(Role::RoleCarrier, &mut lock)
+        .before_adapter_create_in(Role::RoleCarrier, &mut lock, &mut |call| {
+            calls += 1;
+            call()
+        })
         .unwrap();
     assert!(receipt.mutation_lock.held);
+    assert_eq!(calls, 1);
+    for unwind in [false, true] {
+        let (mut owner, state, mut lock) = setup();
+        owner.prepare_role(Role::RoleCarrier, &mut lock).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner
+                .before_adapter_create_in(Role::RoleCarrier, &mut lock, &mut |call| {
+                    call()?;
+                    if unwind {
+                        panic!("original precreation postflight");
+                    }
+                    Err(Error::Pending)
+                })
+                .map(|_| ())
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert_eq!(
+            owner.retained.keys[0]
+                .as_ref()
+                .unwrap()
+                .ack
+                .retained_handle()
+                .0,
+            10
+        );
+        assert_eq!(state.borrow().keys[0], Some(10));
+        assert!(owner.prepare_role(Role::MemberA, &mut lock).is_err());
+    }
 }
 
 #[test]
