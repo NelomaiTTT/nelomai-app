@@ -1362,25 +1362,40 @@ fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_pe
     let original_assets = root.assets.take().unwrap();
     assert!(Rc::ptr_eq(&original_assets.0, &drops));
     for (role, index) in [(Role::MemberA, 1), (Role::MemberB, 2)] {
-        root.with_member_precreation(role, &mut lock, |receipt| {
-            assert_eq!(receipt.binding, &context().bindings[index]);
-            assert_eq!(receipt.record.keys[0].phase, KeyPhase::Disabled);
-            assert_eq!(receipt.record.keys[index].phase, KeyPhase::Disabled);
-            assert_eq!(
-                receipt.record.generation,
-                s.borrow().record.as_ref().unwrap().generation
-            );
-            keys::reattest_disabled_original_member_key(
-                &mut Kernel(s.clone()),
-                receipt.record,
-                &context(),
-                receipt.binding,
-                receipt.record.generation,
-                receipt.new_key_ack,
-            )?;
-            Ok(())
-        })
+        let calls = std::cell::Cell::new(0);
+        root.with_member_precreation_in(
+            role,
+            &mut lock,
+            &mut |call| {
+                calls.set(calls.get() + 1);
+                call()
+            },
+            |receipt| {
+                assert_eq!(
+                    calls.get(),
+                    8,
+                    "seven durable calls precede the independent create seam"
+                );
+                assert_eq!(receipt.binding, &context().bindings[index]);
+                assert_eq!(receipt.record.keys[0].phase, KeyPhase::Disabled);
+                assert_eq!(receipt.record.keys[index].phase, KeyPhase::Disabled);
+                assert_eq!(
+                    receipt.record.generation,
+                    s.borrow().record.as_ref().unwrap().generation
+                );
+                keys::reattest_disabled_original_member_key(
+                    &mut Kernel(s.clone()),
+                    receipt.record,
+                    &context(),
+                    receipt.binding,
+                    receipt.record.generation,
+                    receipt.new_key_ack,
+                )?;
+                Ok(())
+            },
+        )
         .unwrap();
+        assert_eq!(calls.get(), 8);
         assert_eq!(
             root.with_member_precreation(role, &mut lock, |_| panic!("repeat")),
             Err(Error::Retired)
@@ -1415,6 +1430,49 @@ fn member_prerequisite_before_c_preparation_and_after_wrong_lock_fail_without_ef
 #[test]
 fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_original_keys() {
     // Break: a failed/unknown A Start permits new B key effects before cleanup.
+    for failed_step in 1..=8 {
+        for unwind in [false, true] {
+            let (mut root, s, mut lock, drops) = attached(Fault::None);
+            root.prepare_carrier(&mut lock).unwrap();
+            let calls = std::cell::Cell::new(0);
+            let callback = std::cell::Cell::new(false);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                root.with_member_precreation_in(
+                    Role::MemberA,
+                    &mut lock,
+                    &mut |call| {
+                        calls.set(calls.get() + 1);
+                        call()?;
+                        if calls.get() == failed_step {
+                            if unwind {
+                                panic!("member durable postflight");
+                            }
+                            return Err(Error::Pending);
+                        }
+                        Ok(())
+                    },
+                    |_| {
+                        callback.set(true);
+                        Ok(())
+                    },
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert_eq!(calls.get(), failed_step);
+            assert_eq!(callback.get(), failed_step == 8);
+            assert_eq!(s.borrow().creates, if failed_step >= 4 { 2 } else { 1 });
+            assert!(root
+                .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("sibling effect"))
+                .is_err());
+            drop(root);
+            assert_eq!(drops.get(), 0);
+            assert_eq!(
+                s.borrow().key_drops.get(),
+                0,
+                "same C/member originals survive postflight {failed_step}"
+            );
+        }
+    }
     for unwind in [false, true] {
         let (mut root, s, mut lock, drops) = attached(Fault::None);
         root.prepare_carrier(&mut lock).unwrap();

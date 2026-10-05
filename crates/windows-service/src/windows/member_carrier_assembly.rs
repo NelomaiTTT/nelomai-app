@@ -605,6 +605,15 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         lock: &mut I::MutationLock,
         call: impl FnOnce(Receipt<'_, I>) -> Result<()>,
     ) -> Result<()> {
+        self.with_member_precreation_in(role, lock, &mut |call| call(), call)
+    }
+    fn with_member_precreation_in(
+        &mut self,
+        role: receipt::Role,
+        lock: &mut I::MutationLock,
+        run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        call: impl FnOnce(Receipt<'_, I>) -> Result<()>,
+    ) -> Result<()> {
         self.no_sdk.set(false);
         if self.member_cleanup_only {
             return Err(Error::Retired);
@@ -630,39 +639,48 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         // attached key owner prepares A/B; no replacement owner or key IO.
         let owner = self.owner.as_mut().ok_or(Error::Pending)?;
         self.member_disabled[member] = Some(if repeated {
-            let current = owner.snapshot()?.ok_or(Error::Pending)?;
-            owner.redisable_member_key(
-                &current,
-                role,
-                self.member_key_retired[member]
-                    .as_deref()
-                    .ok_or(Error::Retired)?,
-                lock,
-            )?
+            let mut disabled = None;
+            receipt::preparation_call(run, || {
+                let current = owner.snapshot()?.ok_or(Error::Pending)?;
+                disabled = Some(
+                    owner.redisable_member_key(
+                        &current,
+                        role,
+                        self.member_key_retired[member]
+                            .as_deref()
+                            .ok_or(Error::Retired)?,
+                        lock,
+                    )?,
+                );
+                Ok(())
+            })?;
+            disabled.ok_or(Error::Pending)?
         } else {
-            owner.prepare_role(role, lock)?
+            owner.prepare_role_in(role, lock, &mut *run)?
         });
-        let receipt = owner.before_adapter_create(role, lock)?;
-        receipt::validate_record(receipt.record)?;
-        let index = member + 1;
-        let key = &receipt.record.keys[index];
-        if receipt.record.phase != receipt::Phase::Preparing
-            || receipt.binding != &receipt.record.context.bindings[index]
-            || key.phase != receipt::KeyPhase::Disabled
-            || !key.new_key_ack
-            || key.baseline != receipt::Value::Absent
-            || key.current != receipt::Value::DwordZero
-            || key.pending.is_some()
-        {
-            return Err(Error::Conflict);
-        }
-        receipt::validate_carrier_create_stage(
-            receipt.record,
-            &receipt.record.context,
-            &receipt.record.context.bindings[0],
-            receipt.record.generation,
-        )?;
-        call(receipt)?;
+        receipt::preparation_call(run, || {
+            let receipt = owner.before_adapter_create(role, lock)?;
+            receipt::validate_record(receipt.record)?;
+            let index = member + 1;
+            let key = &receipt.record.keys[index];
+            if receipt.record.phase != receipt::Phase::Preparing
+                || receipt.binding != &receipt.record.context.bindings[index]
+                || key.phase != receipt::KeyPhase::Disabled
+                || !key.new_key_ack
+                || key.baseline != receipt::Value::Absent
+                || key.current != receipt::Value::DwordZero
+                || key.pending.is_some()
+            {
+                return Err(Error::Conflict);
+            }
+            receipt::validate_carrier_create_stage(
+                receipt.record,
+                &receipt.record.context,
+                &receipt.record.context.bindings[0],
+                receipt.record.generation,
+            )?;
+            call(receipt)
+        })?;
         attempt.succeeded = true;
         Ok(())
     }
@@ -1991,7 +2009,7 @@ pub(crate) mod native {
             check()
         }
 
-        /// SAME Calling for first create or acknowledged target-only rearm.
+        /// SAME supervisor for each durable key step and the final native create.
         pub(crate) fn with_member_precreation(
             &mut self,
             lock: &mut KeyLock,
@@ -2017,69 +2035,76 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             let effect = pair::Effect::MemberStart(target);
-            pins.supervisor
-                .run_intent(&pins.context, intent, expected, effect, || {
-                    check_cancelled(&pins.cancelled)?;
-                    let check = || -> Result<()> {
-                        intent
-                            .inspect_effect(
-                                &pins.runtime,
-                                &pins.supervisor,
-                                expected,
-                                effect,
-                                |_| Ok(()),
-                            )
-                            .map_err(|_| Error::Conflict)?;
-                        pins.source
-                            .inspect_bindings(|bindings| {
-                                validate_member_key_window(
-                                    &pins.context,
-                                    expected,
-                                    role,
-                                    bindings.carrier.as_ref().ok_or(
-                                        super::super::member_carrier_wintun::Error::Conflict,
-                                    )?,
-                                    &bindings.egress,
-                                )
-                                .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
-                            })
-                            .map_err(|_| Error::Conflict)
-                    };
-                    check()?;
-                    self.root.with_member_precreation(role, lock, |receipt| {
-                        // Registry changes advance NativeReceipt revision. A fresh
-                        // read-only source bracket follows them, never encloses CAS.
-                        check()?;
-                        let scope = creators::Scope {
-                            context: receipt.record.context.clone(),
-                            binding: receipt.binding.clone(),
-                            generation: receipt.record.generation,
-                        };
-                        if scope.context != pins.context {
-                            return Err(Error::Conflict);
-                        }
-                        call(receipt, scope)
-                    })?;
-                    // The callback may have started the member. Full original
-                    // Source inventory, not the pre-NIC egress shape, is read here.
-                    pins.source
-                        .inspect(|c| {
-                            if Some(c.identity.proof) != expected.carrier
-                                || c.identity.scope != expected.scope
-                                || c.sources
-                                    != expected
-                                        .addresses
-                                        .iter()
-                                        .map(|a| a.addr())
-                                        .collect::<Vec<_>>()
-                            {
-                                return Err(super::super::member_carrier_wintun::Error::Conflict);
-                            }
+            let check =
+                || -> Result<()> {
+                    intent
+                        .inspect_effect(&pins.runtime, &pins.supervisor, expected, effect, |_| {
                             Ok(())
                         })
                         .map_err(|_| Error::Conflict)?;
-                    check_cancelled(&pins.cancelled)
-                })
+                    pins.source
+                        .inspect_bindings(|bindings| {
+                            validate_member_key_window(
+                                &pins.context,
+                                expected,
+                                role,
+                                bindings
+                                    .carrier
+                                    .as_ref()
+                                    .ok_or(super::super::member_carrier_wintun::Error::Conflict)?,
+                                &bindings.egress,
+                            )
+                            .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
+                        })
+                        .map_err(|_| Error::Conflict)
+                };
+            self.root.with_member_precreation_in(
+                role,
+                lock,
+                &mut |call| {
+                    pins.supervisor
+                        .run_intent(&pins.context, intent, expected, effect, || {
+                            check_cancelled(&pins.cancelled)?;
+                            check()?;
+                            call()?;
+                            // A final callback may have started the member. Read the
+                            // full original Source, not the pre-NIC egress shape.
+                            pins.source
+                                .inspect(|c| {
+                                    if Some(c.identity.proof) != expected.carrier
+                                        || c.identity.scope != expected.scope
+                                        || c.sources
+                                            != expected
+                                                .addresses
+                                                .iter()
+                                                .map(|a| a.addr())
+                                                .collect::<Vec<_>>()
+                                    {
+                                        return Err(
+                                            super::super::member_carrier_wintun::Error::Conflict,
+                                        );
+                                    }
+                                    Ok(())
+                                })
+                                .map_err(|_| Error::Conflict)?;
+                            check_cancelled(&pins.cancelled)
+                        })
+                },
+                |receipt| {
+                    // Registry changes advance NativeReceipt revision. A fresh
+                    // read-only source bracket follows them, never encloses CAS.
+                    check()?;
+                    let scope = creators::Scope {
+                        context: receipt.record.context.clone(),
+                        binding: receipt.binding.clone(),
+                        generation: receipt.record.generation,
+                    };
+                    if scope.context != pins.context {
+                        return Err(Error::Conflict);
+                    }
+                    call(receipt, scope)
+                },
+            )
         }
     }
     impl Drop for NativeAssemblySlot {

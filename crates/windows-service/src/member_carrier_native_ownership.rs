@@ -1719,7 +1719,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
     }
 }
 
-fn preparation_call(
+pub(crate) fn preparation_call(
     run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
     call: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
