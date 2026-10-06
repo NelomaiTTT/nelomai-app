@@ -540,37 +540,6 @@ enum PregraphRead {
     KeyRestoreBefore,
     KeyRestoreAfter,
     FullEmpty,
-    Stopped,
-}
-fn compare_pregraph_stopped_frame(
-    context: &crate::member_carrier_native_ownership::Context,
-    record: &crate::member_carrier_pair::Record,
-    original: crate::member_owner::InterfaceProof,
-) -> Result<()> {
-    use crate::{member_carrier_guard as g, member_carrier_pair as p};
-    crate::member_carrier_native_ownership::validate_context(context).map_err(denied_comparison)?;
-    record.validate().map_err(denied_comparison)?;
-    if record.scope != context.intent.scope
-        || record.provenance != context.provenance
-        || record.addresses != context.intent.addresses
-        || record.options.is_none()
-        || record.phase != p::Phase::Stopped
-        || record.stop_stage != 12
-        || record.pending.is_some()
-        || record.pending_guard.is_some()
-        || record.carrier.is_some()
-        || record.members.iter().any(Option::is_some)
-        || record.active.is_some()
-        || record.operation.is_some()
-        || record.network.is_some()
-        || record.guard != g::Model::empty(record.scope.clone()).map_err(denied_comparison)?
-        || original.guid != context.bindings[0].guid
-        || original.index == 0
-        || original.luid == 0
-    {
-        return Err(CarrierError::Conflict);
-    }
-    Ok(())
 }
 fn denied_comparison<E>(_: E) -> CarrierError {
     CarrierError::Conflict
@@ -1466,60 +1435,6 @@ pub(crate) mod native {
             attempt.completed = true;
             Ok(())
         }
-        /// Bounded late drain inside the caller's actual Calling operation.
-        /// Every native read/receive requires the registered full gate, which
-        /// receives THIS current opaque Pair before every authorization.
-        pub(crate) fn drain_in_call(
-            &mut self,
-            current: Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            milliseconds: u32,
-            packets: u32,
-        ) -> Result<wintun::Drain> {
-            let mut attempt = RootCall {
-                root: self,
-                completed: false,
-            };
-            let root = &mut attempt.root;
-            root.run.published(root.ready)?;
-            root.lifecycle
-                .require_forward_registration()
-                .map_err(denied)?;
-            let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
-            let effect = expected.pending.ok_or(CarrierError::Pending)?;
-            current
-                .inspect_effect(
-                    &meta.runtime,
-                    &meta.supervisor,
-                    expected,
-                    effect,
-                    |_| Ok(()),
-                )
-                .map_err(denied)?;
-            let construction = root.construction.as_mut().ok_or(CarrierError::Pending)?;
-            let (carrier, authority) = construction
-                .retained_parts()
-                .components
-                .as_mut()
-                .ok_or(CarrierError::Pending)?;
-            authority
-                .select_pair_intent(current.clone(), expected)
-                .map_err(denied)?;
-            let drained = carrier
-                .drain(&meta.cancelled, milliseconds, packets)
-                .map_err(denied)?;
-            current
-                .inspect_effect(
-                    &meta.runtime,
-                    &meta.supervisor,
-                    expected,
-                    effect,
-                    |_| Ok(()),
-                )
-                .map_err(denied)?;
-            attempt.completed = true;
-            Ok(drained)
-        }
         /// SAME original C authority only. Returning this alias grants no row
         /// effect: each locked/authorize path still enters the mandatory full
         /// gate and freshly authenticates the selected current opaque Pair.
@@ -1761,44 +1676,6 @@ pub(crate) mod native {
             self.ready = true;
             flight.succeeded = true;
             Ok(proof)
-        }
-        /// Compatibility entry for bootstrap C-only cleanup. Once upgrade was
-        /// attempted this ALWAYS delegates to full G, never a narrow fallback.
-        pub(crate) fn cleanup_c_only(
-            &mut self,
-            original: Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-        ) -> Result<()> {
-            self.cleanup_carrier(original, expected)
-        }
-        /// Three distinct C Closing operations, under each current original
-        /// Pair/supervisor. Actual A/B/network/guard cleanup is independently
-        /// required by full G; static bases remain until final removal.
-        pub(crate) fn cleanup_carrier(
-            &mut self,
-            original: Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-        ) -> Result<()> {
-            let mut attempt = RootCall {
-                root: self,
-                completed: false,
-            };
-            let root = &mut attempt.root;
-            root.run.revoked.set(true);
-            root.ready = false;
-            root.lifecycle.retire_forward();
-            root.construction
-                .as_ref()
-                .ok_or(CarrierError::Pending)?
-                .revoke_forward();
-            let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
-            let context = meta.scope.context.clone();
-            let supervisor = meta.supervisor.clone();
-            supervisor.run_cleanup(&context, &original, || {
-                root.cleanup_carrier_in_call(original.clone(), expected)
-            })?;
-            attempt.completed = true;
-            Ok(())
         }
         /// Caller already owns the SAME whole cleanup Calling. Selecting the
         /// actual Guard/G before this entry is possible without opening a
@@ -2340,18 +2217,6 @@ pub(crate) mod native {
             .map_err(denied)?;
             Ok(value)
         }
-        /// Genuine Stopped caller, never a projected Closing12 record. Caller
-        /// MUST already hold this exact Pair.inspect frame and terminal Calling.
-        /// The original Retired SDK and private row ACK are checked before/after
-        /// callback; this is factual preparation, not module/disposal permission.
-        pub(crate) fn inspect_pregraph_stopped_in_call<T>(
-            &mut self,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            inspect: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
-        ) -> Result<T> {
-            self.inspect_pregraph_originals_in_call(pair, expected, PregraphRead::Stopped, inspect)
-        }
         fn inspect_pregraph_originals_in_call<T>(
             &mut self,
             pair: &Rc<NativePairIntentRead>,
@@ -2389,9 +2254,9 @@ pub(crate) mod native {
                     | PregraphRead::KeyRestoreBefore => {
                         authority.verify_retired_cleanup_original_in_call(&retired)
                     }
-                    PregraphRead::KeyRestoreAfter
-                    | PregraphRead::FullEmpty
-                    | PregraphRead::Stopped => authority.verify_retired_original_in_call(&retired),
+                    PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty => {
+                        authority.verify_retired_original_in_call(&retired)
+                    }
                 }
                 .map_err(denied)?;
             } // release authority borrow BEFORE Retired SDK callback
@@ -2406,18 +2271,8 @@ pub(crate) mod native {
                 |owner| verify_row_owner_original(owner, row_pin),
             )?;
             let verify_pair = || -> Result<()> {
-                match channel {
-                    PregraphRead::CarrierClosed
-                    | PregraphRead::NativeEmpty
-                    | PregraphRead::KeyRestoreBefore
-                    | PregraphRead::KeyRestoreAfter
-                    | PregraphRead::FullEmpty => pair
-                        .verify_cleanup_entry_for(&runtime, &context, expected)
-                        .map_err(denied),
-                    PregraphRead::Stopped => pair
-                        .verify_terminal_bracket(&runtime, &meta.supervisor, &context, expected)
-                        .map_err(denied),
-                }
+                pair.verify_cleanup_entry_for(&runtime, &context, expected)
+                    .map_err(denied)
             };
             verify_pair()?;
             let pair_before = runtime.record(&context, RecordKind::Pair)?;
@@ -2438,9 +2293,6 @@ pub(crate) mod native {
                     }
                     PregraphRead::FullEmpty => {
                         compare_prepublication_terminal_frame(&context, expected, c.identity.proof)?
-                    }
-                    PregraphRead::Stopped => {
-                        compare_pregraph_stopped_frame(&context, expected, c.identity.proof)?
                     }
                 }
                 if bindings.scope != expected.scope
@@ -2507,7 +2359,7 @@ pub(crate) mod native {
                         return Err(wintun::Error::Conflict);
                     }
                     let before = read_rows(bindings).map_err(native_denied)?;
-                    if matches!(channel, PregraphRead::FullEmpty | PregraphRead::Stopped) && self.rows.is_none() {
+                    if matches!(channel, PregraphRead::FullEmpty) && self.rows.is_none() {
                         // This exact private row ACK/protected payload and the
                         // independent full SDK absence have been authenticated
                         // ABOVE, inside the actual Retired terminal bracket.
@@ -2556,7 +2408,7 @@ pub(crate) mod native {
                 | PregraphRead::KeyRestoreBefore => {
                     retired.inspect_bindings_and_history(inspect_originals)
                 }
-                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty | PregraphRead::Stopped => {
+                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty => {
                     retired.inspect_terminal_bindings_and_history(inspect_originals)
                 }
             }
@@ -2577,7 +2429,7 @@ pub(crate) mod native {
                 | PregraphRead::KeyRestoreBefore => {
                     authority.verify_retired_cleanup_original_in_call(&retired)
                 }
-                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty | PregraphRead::Stopped => {
+                PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty => {
                     authority.verify_retired_original_in_call(&retired)
                 }
             }

@@ -2241,129 +2241,6 @@ pub(crate) mod native {
             }
             Ok(())
         }
-        /// Original capture/write tokens remain in local T even on failed
-        /// capture/registration/postflight. This is not their native authority
-        /// or proof that the raw/native attempts successfully completed.
-        pub(crate) fn inspect_member_row_captures<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeRowGenerationCapture>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            read(&self.parts.try_borrow().map_err(denied)?.member_row_captures)
-        }
-        /// SAME controller-issued receipts, including failed publication or
-        /// postflight. These are original history, not a successful terminal
-        /// disposition or permission to query their retired processes/NICs.
-        pub(crate) fn inspect_member_rebind_receipts<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeMemberRebindReceipt>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            if let Some(original) = self
-                .generation_terminal
-                .try_borrow()
-                .map_err(denied)?
-                .read_cut()?
-            {
-                return original.inspect_rebind_receipts(read);
-            }
-            read(
-                &self
-                    .parts
-                    .try_borrow()
-                    .map_err(denied)?
-                    .member_rebind_receipts,
-            )
-        }
-        /// Borrow actual SDK-original read pins retained by a partial/successful
-        /// rebind seal. No proof is imported or revived, no SDK/Authority call.
-        /// Terminal G must account for THESE aliases when proving all references
-        /// and destructors inert; missing/unsealed proof is NOT an empty graph.
-        pub(crate) fn inspect_rebind_read_origins<T>(
-            &self,
-            read: impl FnOnce(Option<NativeRebindReadOrigins<'_>>) -> io::Result<T>,
-        ) -> io::Result<T> {
-            let parts = self.parts.try_borrow().map_err(denied)?;
-            let slot = parts.rebind_proof.try_borrow().map_err(denied)?;
-            read(slot.original.as_ref().map(|p| p.read_origins()))
-        }
-        pub(crate) fn inspect_startup_read_origins<T>(
-            &self,
-            read: impl FnOnce(Option<NativeRebindReadOrigins<'_>>) -> io::Result<T>,
-        ) -> io::Result<T> {
-            let parts = self.parts.try_borrow().map_err(denied)?;
-            let original = parts.startup_proof.try_borrow().map_err(denied)?;
-            read(original.as_ref().map(|p| p.read_origins()))
-        }
-        /// Factual pin access only, safe under caller's original terminal row
-        /// bracket. None is unknown/not captured, NEVER a successful absence.
-        pub(crate) fn member_row_pin(&self, slot: Slot) -> io::Result<Rc<RowRecordReadPin>> {
-            self.parts.try_borrow().map_err(denied)?.row_pins[idx(slot)]
-                .clone()
-                .ok_or_else(conflict)
-        }
-        /// Original historical Stop seal only, not current absence or storage
-        /// reuse permission. The supplied original row pin is checked by seal.
-        pub(crate) fn stopped_row_generation(
-            &self,
-            slot: Slot,
-        ) -> io::Result<Rc<rows::StoppedRowGeneration>> {
-            self.parts
-                .try_borrow()
-                .map_err(denied)?
-                .stopped_row_generations[idx(slot)]
-            .clone()
-            .ok_or_else(conflict)
-        }
-        /// Original row-generation roots, including failed postflight. Receipt
-        /// presence is not current absence or a future private-storage grant.
-        pub(crate) fn inspect_row_generation_receipts<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeRowGenerationReceipt>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            if let Some(original) = self
-                .generation_terminal
-                .try_borrow()
-                .map_err(denied)?
-                .read_cut()?
-            {
-                return original.inspect_row_receipts(read);
-            }
-            read(
-                &self
-                    .parts
-                    .try_borrow()
-                    .map_err(denied)?
-                    .row_generation_receipts,
-            )
-        }
-        pub(crate) fn inspect_histories<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeNetworkIntentRead>], &[policy::Model]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            let parts = self.parts.try_borrow().map_err(denied)?;
-            read(&parts.network_intents, &parts.guard_acks)
-        }
-        /// Original Stop-bound generation pins, including failed projections.
-        /// Pure borrowed facts; no native cleanup or replacement permission.
-        pub(crate) fn inspect_member_generation_tickets<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeMemberPreparationGeneration>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            if let Some(original) = self
-                .generation_terminal
-                .try_borrow()
-                .map_err(denied)?
-                .read_cut()?
-            {
-                return original.inspect_tickets(read);
-            }
-            read(
-                &self
-                    .parts
-                    .try_borrow()
-                    .map_err(denied)?
-                    .member_generation_tickets,
-            )
-        }
         /// SAME canonical probe membership and actual clone/base close ACKs
         /// ONLY. No Source/Retired/Pair/WFP/SDK reentry or terminal effect grant.
         /// The caller still must independently prove the full scoped universe.
@@ -2417,24 +2294,6 @@ pub(crate) mod native {
                 }
             }
             inventory.inspect_retired().map_err(denied)?;
-            Ok(())
-        }
-        pub(crate) fn verify_member_row_origin(&self, slot: Slot) -> io::Result<()> {
-            let parts = self.parts.try_borrow().map_err(denied)?;
-            let pin = parts.row_pins[idx(slot)].as_ref().ok_or_else(conflict)?;
-            let rows = parts.canonical_rows.as_ref().ok_or_else(conflict)?;
-            if !rows.matches_row_original(
-                if slot == Slot::A {
-                    rows::Role::MemberA
-                } else {
-                    rows::Role::MemberB
-                },
-                pin,
-            ) {
-                return Err(conflict());
-            }
-            // No authority/kernel call: original capture/CAS facts are compared
-            // independently with the protected record + SDK by terminal G.
             Ok(())
         }
     }
@@ -2895,30 +2754,6 @@ pub(crate) mod native {
         guard: Rc<RefCell<Guard>>,
         members: Rc<MemberInventoryRead>,
         observed: NativeRebindSnapshot,
-    }
-    impl NativeRebindProof {
-        fn read_origins(&self) -> NativeRebindReadOrigins<'_> {
-            NativeRebindReadOrigins {
-                pair: &self.pair,
-                expected: &self.record,
-                source: &self.source,
-                rows: &self.rows,
-                probes: &self.probes,
-                network: &self.network,
-                guard: &self.guard,
-                members: &self.members,
-            }
-        }
-    }
-    pub(crate) struct NativeRebindReadOrigins<'a> {
-        pub(crate) pair: &'a Rc<NativePairIntentRead>,
-        pub(crate) expected: &'a pair::Record,
-        pub(crate) source: &'a Rc<NativeSourceRead>,
-        pub(crate) rows: &'a Rc<NativeResourceRowsRead>,
-        pub(crate) probes: &'a Rc<ProbeRead>,
-        pub(crate) network: &'a Rc<NativeNetworkRead>,
-        pub(crate) guard: &'a Rc<RefCell<Guard>>,
-        pub(crate) members: &'a Rc<MemberInventoryRead>,
     }
     struct NativeActorExecution {
         root: Rc<NativeExecutionRoot>,

@@ -1116,43 +1116,6 @@ fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
     }
 }
 
-// Break: genuine Stopped is routed as Closing12, or a stopped row/frame grants
-// permission without its original SDK reader. This is a strict comparison only.
-#[test]
-fn pregraph_stopped_frame_is_not_a_closing_projection() {
-    use crate::{member_carrier_guard as g, member_carrier_pair as p};
-    let (context, mut stopped, proof) = full_cleanup_fixture();
-    stopped.phase = p::Phase::Stopped;
-    stopped.stop_stage = 12;
-    stopped.pending = None;
-    stopped.carrier = None;
-    stopped.members = [None, None];
-    stopped.network = None;
-    stopped.guard = g::Model::empty(stopped.scope.clone()).unwrap();
-    compare_pregraph_stopped_frame(&context, &stopped, proof).unwrap();
-    assert!(compare_prepublication_terminal_frame(&context, &stopped, proof).is_err());
-    for fault in 0..7 {
-        let mut wrong = stopped.clone();
-        let mut original = proof;
-        match fault {
-            0 => {
-                wrong.phase = p::Phase::Closing;
-                wrong.pending = Some(p::Effect::FullEmpty);
-            }
-            1 => wrong.stop_stage = 9,
-            2 => wrong.addresses.clear(),
-            3 => wrong.carrier = Some(proof),
-            4 => wrong.provenance.network_epoch += 1,
-            5 => original.guid = [9; 16],
-            _ => original.luid = 0,
-        }
-        assert!(
-            compare_pregraph_stopped_frame(&context, &wrong, original).is_err(),
-            "fault {fault}"
-        );
-    }
-}
-
 #[test]
 fn full_carrier_stage3_restore_is_interface_only_before_member_stop() {
     use crate::{member_carrier_pair as p, member_owner as o};
