@@ -4693,7 +4693,12 @@ pub(crate) mod native {
             expected: &pair::Record,
             retain: &mut dyn FnMut(NativeActorInputs<'static>) -> Result<()>,
         ) -> Result<()> {
-            self.continuity(original, expected)?;
+            self.continuity(original, expected).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("Startup attach entry continuity error={_error:?}"));
+            })?;
+            #[cfg(test)]
+            trace_step("Startup attach entry continuity accepted");
             let pins = self.pins.as_ref().ok_or(Error::Pending)?;
             if !self.runtime.same_original_runtime(&pins.runtime)
                 || self.context != pins.context
@@ -4702,30 +4707,65 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
+            #[cfg(test)]
+            trace_step("Startup attach prepared records entered");
             for (i, member) in expected.members.iter().enumerate() {
                 if let Some(member) = member {
                     if self.prepared[i]
                         .as_mut()
                         .ok_or(Error::Pending)?
-                        .prepared_record(self.lock.as_mut().ok_or(Error::Retired)?)?
+                        .prepared_record(self.lock.as_mut().ok_or(Error::Retired)?)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            trace_step(&format!(
+                                "Startup attach prepared record error={_error:?} slot={i}"
+                            ));
+                        })?
                         != member.owner
                     {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "Startup attach prepared record comparison: Conflict slot={i}"
+                        ));
                         return Err(Error::Conflict);
                     }
                 } else if self.prepared[i].is_some() {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "Startup attach extra prepared record: Conflict slot={i}"
+                    ));
                     return Err(Error::Conflict);
                 }
             }
+            #[cfg(test)]
+            trace_step("Startup attach prepared records accepted; graph construct entered");
             let graph_root = self.graph.clone();
             let mut graph = graph_root.try_borrow_mut().map_err(|_| Error::Conflict)?;
             // Root is already owned independently by self.graph. Capture/read
             // failure never returns the sole native graph through Result.
-            graph.construct_in_call(self, pins, original, expected)?;
-            graph.complete()?;
+            graph
+                .construct_in_call(self, pins, original, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("Startup attach graph construct error={_error:?}"));
+                })?;
+            #[cfg(test)]
+            trace_step("Startup attach graph construct accepted; complete entered");
+            graph.complete().inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("Startup attach graph complete error={_error:?}"));
+            })?;
+            #[cfg(test)]
+            trace_step("Startup attach graph complete accepted");
             if self.lock.is_none() || self.assembly.is_none() || self.carrier.is_none() {
                 return Err(Error::Pending);
             }
-            self.continuity(original, expected)?;
+            self.continuity(original, expected).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "Startup attach transfer continuity error={_error:?}"
+                ));
+            })?;
             let source = pins.source.clone();
             if graph.input_transfer.is_some() {
                 return Err(Error::Conflict);
@@ -4780,10 +4820,23 @@ pub(crate) mod native {
                 member_gates: std::mem::take(&mut graph.member_gates),
             };
             drop(graph);
-            let result = retain(input);
+            #[cfg(test)]
+            trace_step("Startup attach retain entered");
+            let result = retain(input).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("Startup attach retain error={_error:?}"));
+            });
+            #[cfg(test)]
+            trace_step("Startup attach retain returned; postflight entered");
             // SAME runtime/store Source factual postflight. KeyLock is now in
             // the actor, not recreated or borrowed from an unrelated owner.
-            self.continuity_runtime(original, expected)?;
+            self.continuity_runtime(original, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "Startup attach postflight continuity error={_error:?}"
+                    ));
+                })?;
             source
                 .inspect_bindings(|bindings| {
                     if bindings.carrier.as_ref().map(|c| c.identity.proof) != self.proof {
@@ -4791,7 +4844,15 @@ pub(crate) mod native {
                     }
                     Ok(())
                 })
-                .map_err(|_| Error::Conflict)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "Startup attach postflight source error={_error:?}"
+                    ));
+                    Error::Conflict
+                })?;
+            #[cfg(test)]
+            trace_step("Startup attach postflight accepted");
             result
         }
     }
@@ -5916,11 +5977,23 @@ pub(crate) mod native {
             expected: &pair::Record,
             retain: &mut dyn FnMut(NativeActorInputs<'static>) -> Result<()>,
         ) -> Result<()> {
-            self.invocation.begin(true)?;
+            #[cfg(test)]
+            trace_step("Startup attach invocation entered");
+            self.invocation.begin(true).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("Startup attach invocation error={_error:?}"));
+            })?;
+            #[cfg(test)]
+            trace_step("Startup attach invocation accepted; supervisor entered");
             self.attach_attempted = true;
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
-            supervisor.run(&context, || self.attach_in_call(original, expected, retain))
+            supervisor
+                .run(&context, || self.attach_in_call(original, expected, retain))
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("Startup attach supervisor error={_error:?}"));
+                })
         }
         fn attach_member(
             &mut self,

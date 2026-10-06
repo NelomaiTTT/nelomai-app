@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     member_actor::PairFactory,
     windows::{
-        member_carrier_factory_test_os::{Fixture, NativePublication},
+        member_carrier_factory_test_os::{ChildCurrentCheckReport, Fixture, NativePublication},
         member_files::PrivateFile,
         member_pair::NativePairFactory,
     },
@@ -123,14 +123,25 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             .lines()
             .filter(|line| line.contains("source begin installed payload authentication"))
             .count();
-        let runtime_current_checks = stderr
+        let current_check_footers = stderr
             .lines()
-            .filter(|line| line.contains("runtime current check"))
-            .count();
-        let source_current_checks = stderr
-            .lines()
-            .filter(|line| line.contains("source current check"))
-            .count();
+            .filter_map(|line| {
+                line.strip_prefix(
+                    "actual native factory current checks runtime_current_check_attempts=",
+                )
+            })
+            .collect::<Vec<_>>();
+        let current_checks = match current_check_footers.as_slice() {
+            [footer] => footer
+                .split_once(" source_current_check_attempts=")
+                .and_then(|(runtime, source)| {
+                    Some((runtime.parse::<u64>().ok()?, source.parse::<u64>().ok()?))
+                }),
+            _ => None,
+        };
+        let (runtime_current_checks, source_current_checks) = current_checks
+            .map(|(runtime, source)| (runtime.to_string(), source.to_string()))
+            .unwrap_or_else(|| ("unknown".into(), "unknown".into()));
         let lifetime_rechecks = stderr
             .lines()
             .filter(|line| line.contains("installation lifetime recheck"))
@@ -163,8 +174,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 && !line.contains("runtime end installed payload authentication")
                 && !line.contains("source begin installed payload authentication")
                 && !line.contains("source end installed payload authentication")
-                && !line.contains("runtime current check")
-                && !line.contains("source current check")
+                && !line.starts_with("actual native factory current checks ")
                 && !line.contains("installation lifetime recheck")
         }) {
             println!("{line}");
@@ -186,6 +196,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
 #[test]
 #[ignore = "executed exactly by the bounded native factory parent, one OS case per process"]
 fn carrier_factory_actual_cold_child() {
+    let _current_check_report = ChildCurrentCheckReport::new();
     let case = std::env::var("NELOMAI_FACTORY_OS_CASE").expect("bounded factory parent required");
     let module_partial = matches!(
         case.as_str(),

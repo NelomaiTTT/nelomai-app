@@ -9,7 +9,7 @@ use super::{
 use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard};
 use std::{
     any::Any,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io,
     path::{Path, PathBuf},
     rc::{Rc, Weak},
@@ -52,6 +52,8 @@ pub(crate) enum NativePublication {
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
+    static RUNTIME_CURRENT_CHECKS: Cell<u64> = const { Cell::new(0) };
+    static SOURCE_CURRENT_CHECKS: Cell<u64> = const { Cell::new(0) };
 }
 pub(crate) fn installation(root: &Path) -> Option<Installation> {
     INPUTS.with(|inputs| {
@@ -110,7 +112,19 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                     record.pending.is_none()
                         && record.carrier.is_some()
                         && if target == NativePublication::Carrier {
-                            record.members.iter().all(Option::is_none)
+                            record.phase == crate::member_carrier_pair::Phase::Starting
+                                && match record.operation {
+                                    Some(crate::member_carrier_pair::Operation::Start(slot)) => {
+                                        let i = usize::from(
+                                            slot == nelomai_client_tunnel::redundancy::Slot::B,
+                                        );
+                                        record.members[i].as_ref().is_some_and(|member| {
+                                            member.owner.phase
+                                                == crate::member_owner::Phase::Prepared
+                                        }) && record.members[1 - i].is_none()
+                                    }
+                                    _ => false,
+                                }
                         } else {
                             record.members.iter().flatten().any(|member| {
                                 member.owner.phase == crate::member_owner::Phase::Running
@@ -313,10 +327,45 @@ pub(crate) fn trace_native(step: &'static str, error: &crate::member_carrier::Ca
     }
 }
 pub(crate) fn trace_step(step: &str) {
-    if state().is_some() {
+    if INPUTS.with(|inputs| inputs.borrow().is_some()) {
+        match step {
+            "runtime current check" => {
+                RUNTIME_CURRENT_CHECKS.with(|count| count.set(count.get() + 1));
+                return;
+            }
+            "source current check" => {
+                SOURCE_CURRENT_CHECKS.with(|count| count.set(count.get() + 1));
+                return;
+            }
+            _ => {}
+        }
         eprintln!("actual native step {step} tick={}", unsafe {
             windows_sys::Win32::System::SystemInformation::GetTickCount64()
         });
+    }
+}
+
+// Created before Fixture so ordinary return/unwind reports after its teardown.
+// Counters live separately from INPUTS, which Fixture::drop clears first.
+pub(crate) struct ChildCurrentCheckReport;
+impl ChildCurrentCheckReport {
+    pub(crate) fn new() -> Self {
+        RUNTIME_CURRENT_CHECKS.with(|count| count.set(0));
+        SOURCE_CURRENT_CHECKS.with(|count| count.set(0));
+        Self
+    }
+}
+impl Drop for ChildCurrentCheckReport {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        let runtime = RUNTIME_CURRENT_CHECKS.with(Cell::get);
+        let source = SOURCE_CURRENT_CHECKS.with(Cell::get);
+        // A lost footer is unknown to the parent. Never double-panic on stderr
+        // failure while already unwinding an actual native scenario.
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "actual native factory current checks runtime_current_check_attempts={runtime} source_current_check_attempts={source}"
+        );
     }
 }
 

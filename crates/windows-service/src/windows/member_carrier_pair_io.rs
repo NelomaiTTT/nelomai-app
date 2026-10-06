@@ -6426,6 +6426,8 @@ pub(crate) mod native {
         }
 
         pub(crate) fn verify_carrier_ready(&mut self, record: &pair::Record) -> io::Result<()> {
+            #[cfg(test)]
+            super::super::member_carrier_factory_test_os::trace_step("CarrierReady verify entered");
             if self.roots.is_none() {
                 // C proof is now actually published by coordinator.finish.
                 // Startup owns whole pendingNone run; capture callback roots
@@ -6435,13 +6437,37 @@ pub(crate) mod native {
                     if record.carrier.is_none() || record.pending.is_some() {
                         return Err(conflict());
                     }
-                    let pin = self.current(record)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "CarrierReady verify current entered",
+                    );
+                    let pin = self.current(record).inspect_err(|_error| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_step(&format!(
+                            "CarrierReady verify current error kind={:?}",
+                            _error.kind()
+                        ));
+                    })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "CarrierReady verify current accepted; attach entered",
+                    );
                     let startup = self.startup.clone().ok_or_else(conflict)?;
                     startup
                         .try_borrow_mut()
                         .map_err(denied)?
                         .attach_full(&pin, record, &mut |input| self.retain_full_inputs(input))
-                        .map_err(denied)?;
+                        .map_err(|_error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                "CarrierReady verify attach error={_error:?}"
+                            ));
+                            denied(_error)
+                        })?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "CarrierReady verify attach accepted",
+                    );
                     self.roots().map(|_| ())
                 })?;
                 self.register_originals(record)?;

@@ -1186,7 +1186,6 @@ pub(crate) mod native_store {
             expected: &Record,
         ) -> io::Result<NativePairIntentRead> {
             let result = (|| {
-                self.verify()?;
                 self.synchronize_native_view()?;
                 let intent = self.inner.record_intent(expected)?;
                 let pin = NativePairIntentRead {
@@ -1213,7 +1212,6 @@ pub(crate) mod native_store {
             expected: &Record,
         ) -> io::Result<NativeNetworkIntentRead> {
             let result = (|| {
-                self.verify()?;
                 self.synchronize_native_view()?;
                 let span = self.inner.network_intent(expected)?;
                 let pin = NativeNetworkIntentRead {
@@ -1325,7 +1323,6 @@ pub(crate) mod native_store {
         }
         fn load(&mut self, scope: &SessionScope) -> io::Result<Option<Record>> {
             let result = (|| {
-                self.verify()?;
                 self.synchronize_native_view()?;
                 let read = self.inner.load(scope);
                 let after = self.verify();
@@ -1343,7 +1340,6 @@ pub(crate) mod native_store {
             desired: &Record,
         ) -> io::Result<()> {
             let result = (|| {
-                self.verify()?;
                 self.synchronize_native_view()?;
                 let ack = self.inner.compare_exchange(expected, desired);
                 let after = self.verify();
