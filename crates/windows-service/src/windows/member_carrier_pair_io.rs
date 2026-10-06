@@ -8402,14 +8402,28 @@ pub(crate) mod native {
                         record,
                         role,
                         |receipt, _| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_step(
+                                "member start final callback entered",
+                            );
                             if needs_network_binding {
                                 gate.try_borrow_mut()
                                     .map_err(|_| CarrierError::Pending)?
-                                    .bind_network(&r.network_ack, &r.network_gate)?;
+                                    .bind_network(&r.network_ack, &r.network_gate)
+                                    .inspect_err(|_error| {
+                                        #[cfg(test)]
+                                        eprintln!(
+                                            "actual member start bind_network error={_error:?}"
+                                        );
+                                    })?;
                             }
                             gate.try_borrow_mut()
                                 .map_err(|_| CarrierError::Pending)?
-                                .select_pair(pin.clone())?;
+                                .select_pair(pin.clone())
+                                .inspect_err(|_error| {
+                                    #[cfg(test)]
+                                    eprintln!("actual member start select_pair error={_error:?}");
+                                })?;
                             if controller.is_none() {
                                 let attachment = NativeMemberAttachment {
                                     image: r
@@ -8432,7 +8446,13 @@ pub(crate) mod native {
                                         attachment,
                                         controller,
                                         receipt.mutation_lock,
-                                    )?;
+                                    )
+                                    .inspect_err(|_error| {
+                                        #[cfg(test)]
+                                        eprintln!(
+                                            "actual member start attach_member error={_error:?}"
+                                        );
+                                    })?;
                             }
                             let controller = controller.as_mut().ok_or(CarrierError::Pending)?;
                             if controller.prepared_intent().config_sha256 != hash
@@ -8442,11 +8462,27 @@ pub(crate) mod native {
                                 return Err(CarrierError::Conflict);
                             }
                             let prior = controller.retained_stopped().cloned();
-                            acknowledged =
-                                Some(controller.start(&pin, record, receipt, prior.as_ref())?);
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_step(
+                                "member start controller.start entered",
+                            );
+                            acknowledged = Some(
+                                controller
+                                    .start(&pin, record, receipt, prior.as_ref())
+                                    .inspect_err(|_error| {
+                                        #[cfg(test)]
+                                        eprintln!(
+                                            "actual member start controller.start error={_error:?}"
+                                        );
+                                    })?,
+                            );
                             Ok(())
                         },
                     )
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        eprintln!("actual member start with_member_precreation error={_error:?}");
+                    })
                     .map_err(denied)?;
                 acknowledged.ok_or_else(conflict)
             })

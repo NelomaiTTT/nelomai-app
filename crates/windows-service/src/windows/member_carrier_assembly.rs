@@ -659,7 +659,12 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
             owner.prepare_role_in(role, lock, &mut *run)?
         });
         receipt::preparation_call(run, || {
-            let receipt = owner.before_adapter_create(role, lock)?;
+            let receipt = owner
+                .before_adapter_create(role, lock)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    eprintln!("actual member precreation before_adapter_create error={_error:?}");
+                })?;
             receipt::validate_record(receipt.record)?;
             let index = member + 1;
             let key = &receipt.record.keys[index];
@@ -2100,7 +2105,10 @@ pub(crate) mod native {
                 |receipt| {
                     // Registry changes advance NativeReceipt revision. A fresh
                     // read-only source bracket follows them, never encloses CAS.
-                    check()?;
+                    check().inspect_err(|_error| {
+                        #[cfg(test)]
+                        eprintln!("actual member precreation final source check error={_error:?}");
+                    })?;
                     let scope = creators::Scope {
                         context: receipt.record.context.clone(),
                         binding: receipt.binding.clone(),
