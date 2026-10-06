@@ -866,6 +866,8 @@ impl LifecycleFence {
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::windows::{
         member_carrier_creators as creators,
         member_carrier_guard::{Bindings, NativeGuard, Wfp, WindowBindingAttestor},
@@ -2694,14 +2696,38 @@ pub(crate) mod native {
             shared
                 .fence
                 .run(cleanup, || {
-                    compare_row_stage(&shared.context, &record, binding.role, target)?;
+                    compare_row_stage(&shared.context, &record, binding.role, target).inspect_err(
+                        |_error| {
+                            #[cfg(test)]
+                            trace_step(&format!("lifecycle row stage error={_error:?}"));
+                        },
+                    )?;
                     if !cleanup {
                         self.session.live().map_err(denied)?;
                     }
-                    shared.current(&record)?;
-                    let registry = shared.registry(scope, originals, cleanup)?;
+                    shared.current(&record).inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("lifecycle row current before error={_error:?}"));
+                    })?;
+                    let registry =
+                        shared
+                            .registry(scope, originals, cleanup)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!(
+                                    "lifecycle row registry before error={_error:?}"
+                                ));
+                            })?;
                     let verify = |window: &NativeBindingsWindow<'_>| {
-                        shared.window(&record, window).map_err(native_denied)?;
+                        shared
+                            .window(&record, window)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!(
+                                    "lifecycle row window before error={_error:?}"
+                                ));
+                            })
+                            .map_err(native_denied)?;
                         let member_slot = match binding.role {
                             rows::Role::Carrier => None,
                             rows::Role::MemberA => {
@@ -2714,10 +2740,24 @@ pub(crate) mod native {
                         if member_slot.is_some_and(|slot| window.closed_member(slot).is_some()) {
                             return Err(wintun::Error::Conflict);
                         }
-                        let before = shared.blocks(&record, window).map_err(native_denied)?;
+                        let before = shared
+                            .blocks(&record, window)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!(
+                                    "lifecycle row blocks before error={_error:?}"
+                                ));
+                            })
+                            .map_err(native_denied)?;
                         if cleanup {
                             shared
                                 .resources_restored(&record, window)
+                                .inspect_err(|_error| {
+                                    #[cfg(test)]
+                                    trace_step(&format!(
+                                        "lifecycle row resources_restored error={_error:?}"
+                                    ));
+                                })
                                 .map_err(native_denied)?;
                         }
                         if target == &rows::Target::Delete {
@@ -2730,6 +2770,12 @@ pub(crate) mod native {
                             // become effect ACKs for the selected target below.
                             shared
                                 .closing_rows_observe(&record, window)
+                                .inspect_err(|_error| {
+                                    #[cfg(test)]
+                                    trace_step(&format!(
+                                        "lifecycle row closing_rows_observe error={_error:?}"
+                                    ));
+                                })
                                 .map_err(native_denied)?;
                         } else {
                             shared
@@ -2748,11 +2794,31 @@ pub(crate) mod native {
                                     actual,
                                 )
                             })
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!("lifecycle row row_ack error={_error:?}"));
+                            })
                             .map_err(native_denied)?;
-                        if shared.blocks(&record, window).map_err(native_denied)? != before {
+                        if shared
+                            .blocks(&record, window)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!("lifecycle row blocks after error={_error:?}"));
+                            })
+                            .map_err(native_denied)?
+                            != before
+                        {
+                            #[cfg(test)]
+                            trace_step("lifecycle row blocks drift");
                             return Err(wintun::Error::Conflict);
                         }
-                        shared.window(&record, window).map_err(native_denied)
+                        shared
+                            .window(&record, window)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!("lifecycle row window after error={_error:?}"));
+                            })
+                            .map_err(native_denied)
                     };
                     if cleanup {
                         shared.closing.read()?.inspect_window(verify)
@@ -2764,11 +2830,31 @@ pub(crate) mod native {
                     } else {
                         shared.source.read()?.inspect_window(verify)
                     }
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "lifecycle row Source/Closing window error={_error:?}"
+                        ));
+                    })
                     .map_err(denied)?;
-                    if registry != shared.registry(scope, originals, cleanup)? {
+                    if registry
+                        != shared
+                            .registry(scope, originals, cleanup)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                trace_step(&format!(
+                                    "lifecycle row registry after error={_error:?}"
+                                ));
+                            })?
+                    {
+                        #[cfg(test)]
+                        trace_step("lifecycle row registry drift");
                         return Err(conflict());
                     }
-                    shared.current(&record)?;
+                    shared.current(&record).inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("lifecycle row current after error={_error:?}"));
+                    })?;
                     if !cleanup {
                         self.session.live().map_err(denied)?;
                     }

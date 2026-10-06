@@ -1822,6 +1822,32 @@ pub(crate) mod native {
                 fence: GateFence::default(),
             })
         }
+        /// Retain the actual Closing origin before validation, including when
+        /// cleanup begins before the first logical Network record exists.
+        /// Factual registration grants no Pair/SDK read or effect rights; the
+        /// caller retains its root and later actual Guard checks still apply.
+        pub(crate) fn retain_closing_origin(
+            &self,
+            original: &Rc<NativeClosingRead>,
+        ) -> io::Result<()> {
+            let mut slot = self.closing.try_borrow_mut().map_err(denied)?;
+            if let Some(old) = slot.as_ref() {
+                if !Rc::ptr_eq(old, original) {
+                    return Err(conflict());
+                }
+            } else {
+                *slot = Some(original.clone());
+            }
+            let retained = slot.as_ref().ok_or_else(conflict)?;
+            if !retained.matches_source_origin(&self.source) {
+                return Err(conflict());
+            }
+            if self.closing_network.try_borrow().map_err(denied)?.is_none() {
+                *self.closing_network.try_borrow_mut().map_err(denied)? =
+                    Some(self.live_network.closing_read(retained.clone())?);
+            }
+            Ok(())
+        }
         pub(crate) fn retain_owner_ack(
             self: &Rc<Self>,
             original: NativeNetworkAckRead<Self>,
@@ -3627,22 +3653,7 @@ pub(crate) mod native {
                     .verify_same_session_files(&self.context, files)
                     .map_err(denied)?;
                 if let Some(original) = closing {
-                    let mut slot = self.closing.try_borrow_mut().map_err(denied)?;
-                    if let Some(old) = slot.as_ref() {
-                        if !Rc::ptr_eq(old, original) {
-                            return Err(conflict());
-                        }
-                    } else {
-                        *slot = Some(original.clone());
-                    }
-                    let retained = slot.as_ref().ok_or_else(conflict)?;
-                    if !retained.matches_source_origin(&self.source) {
-                        return Err(conflict());
-                    }
-                    if self.closing_network.try_borrow().map_err(denied)?.is_none() {
-                        *self.closing_network.try_borrow_mut().map_err(denied)? =
-                            Some(self.live_network.closing_read(retained.clone())?);
-                    }
+                    self.retain_closing_origin(original)?;
                 }
                 let selected = self.selected.try_borrow().map_err(denied)?;
                 if selected.network.is_none() && !cleanup {

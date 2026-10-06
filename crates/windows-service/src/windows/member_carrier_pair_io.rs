@@ -1429,6 +1429,8 @@ fn compare_network_ack(
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::{
         member_carrier::CarrierError,
         member_carrier_guard as policy,
@@ -5231,6 +5233,9 @@ pub(crate) mod native {
                     let n = network
                         .as_ref()
                         .ok_or(crate::windows::member_carrier_wintun::Error::Conflict)?;
+                    r.network_gate
+                        .retain_closing_origin(original)
+                        .map_err(native_denied)?;
                     r.rows.bind_closing(original.clone())?;
                     r.lifecycle.retain_closing(original)?;
                     r.lifecycle.retain_closing_network(n)?;
@@ -5519,21 +5524,25 @@ pub(crate) mod native {
             // Assembly's member key precreation. Later calls still authenticate
             // THIS Pair/Calling and sample originals, not cached registration.
             self.in_call(record, |this, pin| {
-                this.select_guard(pin, record)?;
+                if record.phase == pair::Phase::Closing
+                    || record.pending.is_none()
+                    || effect == pair::Effect::CarrierReady
+                {
+                    this.select_guard(pin, record)?;
+                    this.roots()?
+                        .probe_state
+                        .select(pin.clone(), record.clone())
+                        .map_err(|error| denied(error))?;
+                }
                 let r = this.roots()?;
-                r.probe_state
-                    .select(pin.clone(), record.clone())
-                    .map_err(|error| denied(error))?;
-                r.runtime.verify(&r.context).map_err(|error| denied(error))?;
-                r.runtime.verify_source(&r.pins.wintun).map_err(|error| denied(error))?;
                 r.runtime
                     .verify_same_session_files(&r.context, &r.files)
                     .map_err(|error| denied(error))?;
-                r.image.verify_runtime(&r.runtime).map_err(|error| denied(error))?;
                 r.members
                     .matches_original_runtime_image(&r.runtime, &r.image)
                     .map_err(|error| denied(error))?;
-                if !r.originals.same_original_registry(&r.pins.originals)
+                if !r.image.matches_source(&r.pins.wintun)
+                    || !r.originals.same_original_registry(&r.pins.originals)
                     || !r
                         .rows
                         .matches_row_original(rows::Role::Carrier, &r.pins.carrier_rows)
@@ -5545,8 +5554,9 @@ pub(crate) mod native {
                 {
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::trace_step(&format!(
-                        "actor attest {:?}/{effect:?} original caps mismatch registry={} carrier_rows={} network_ack={} baseline_source={} baseline_reader={}",
+                        "actor attest {:?}/{effect:?} original caps mismatch image_source={} registry={} carrier_rows={} network_ack={} baseline_source={} baseline_reader={}",
                         record.phase,
+                        r.image.matches_source(&r.pins.wintun),
                         r.originals.same_original_registry(&r.pins.originals),
                         r.rows.matches_row_original(rows::Role::Carrier, &r.pins.carrier_rows),
                         r.network_ack.matches_origin(&r.pins.source, &r.network_gate),
@@ -6893,11 +6903,15 @@ pub(crate) mod native {
             record: &pair::Record,
             active: Slot,
         ) -> io::Result<pair::NetworkSnapshot> {
-            self.in_call(record, |this, _| {
+            #[cfg(test)]
+            trace_step("plan_network entered");
+            let result = self.in_call(record, |this, _| {
                 let r = this.roots()?;
                 r.pins
                     .source
                     .inspect_window(|window| {
+                        #[cfg(test)]
+                        trace_step("plan_network Source callback entered");
                         Self::network_plan_in_window(
                             r,
                             record,
@@ -6905,11 +6919,27 @@ pub(crate) mod native {
                             window,
                             NetworkPlanUse::BeforeMutation,
                         )
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            trace_step(&format!("plan_network Source callback error={_error:?}"));
+                        })
                         .map(|plan| plan.snapshot)
                         .map_err(native_denied)
                     })
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "plan_network outer Source window error={_error:?}"
+                        ));
+                    })
                     .map_err(denied)
-            })
+            });
+            #[cfg(test)]
+            trace_step(&format!(
+                "plan_network returned {:?}",
+                result.as_ref().map(|_| ())
+            ));
+            result
         }
 
         pub(crate) fn plan_retirement_network(
@@ -7070,7 +7100,13 @@ pub(crate) mod native {
                     guid: id.proof.guid,
                 })
                 .collect::<Vec<_>>();
-            let before = crate::windows::member_physical::capture(&owned)?;
+            let before =
+                crate::windows::member_physical::capture(&owned).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "network plan physical capture before error={_error:?}"
+                    ));
+                })?;
             let ack = r.network_ack.acknowledgements()?;
             let leases = r.network_ack.physical_leases()?;
             for lease in &leases {
@@ -7115,6 +7151,10 @@ pub(crate) mod native {
             let facts = r
                 .rows
                 .inspect_in_window(window, |facts| Ok(facts.clone()))
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("network plan rows facts error={_error:?}"));
+                })
                 .map_err(denied)?;
             let mut exclusions = options
                 .excluded_ipv4_cidrs
@@ -7147,9 +7187,17 @@ pub(crate) mod native {
                     || !observed.interface.policy.weak_host_send
                     || !observed.interface.policy.weak_host_receive
                 {
+                    #[cfg(test)]
+                    trace_step("network plan member rows facts conflict");
                     return Err(conflict());
                 }
-                physical.resolve_host(m.endpoint).map_err(denied)?;
+                physical
+                    .resolve_host(m.endpoint)
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("network plan endpoint resolve error={_error:?}"));
+                    })
+                    .map_err(denied)?;
                 exclusions.push(ipnet::IpNet::from(m.endpoint));
                 members.push(MemberRoutes {
                     slot,
@@ -7179,7 +7227,10 @@ pub(crate) mod native {
             if destinations.len() > MAX_ROUTES {
                 return Err(conflict());
             }
-            let bypasses = physical_bypasses(&physical, &destinations)?;
+            let bypasses = physical_bypasses(&physical, &destinations).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("network plan physical bypasses error={_error:?}"));
+            })?;
             for proof in physical.proofs().values() {
                 metrics.push(InterfaceMetric {
                     interface: proof.identity.index,
@@ -7195,6 +7246,10 @@ pub(crate) mod native {
                 &metrics,
                 0,
             )
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("network plan native route plan error={_error:?}"));
+            })
             .map_err(denied)?;
             crate::member_plan::validate_retained_probe_routes(
                 &plan,
@@ -7202,20 +7257,43 @@ pub(crate) mod native {
                 &bypasses.retained,
                 &metrics,
             )
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "network plan retained route validation error={_error:?}"
+                ));
+            })
             .map_err(denied)?;
-            let dns = r.network_read.inspect_in_window(window, |facts| {
-                facts.dns.with_servers(&record.dns).map_err(denied)
+            let dns = r
+                .network_read
+                .inspect_in_window(window, |facts| {
+                    facts.dns.with_servers(&record.dns).map_err(denied)
+                })
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("network plan DNS error={_error:?}"));
+                })?;
+            let after = crate::windows::member_physical::capture(&owned).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "network plan physical capture after error={_error:?}"
+                ));
             })?;
-            let after = crate::windows::member_physical::capture(&owned)?;
             if before.rows() != after.rows()
                 || before.proofs() != after.proofs()
                 || r.network_ack.acknowledgements()? != ack
                 || r.network_ack.physical_leases()? != leases
                 || r.rows
                     .inspect_in_window(window, |f| Ok(f.clone()))
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("network plan rows postflight error={_error:?}"));
+                    })
                     .map_err(denied)?
                     != facts
             {
+                #[cfg(test)]
+                trace_step("network plan postflight drift");
                 return Err(conflict());
             }
             Ok(NativeNetworkPlan {
@@ -7879,65 +7957,75 @@ pub(crate) mod native {
         }
 
         pub(crate) fn apply_weak_rows(&mut self, record: &pair::Record) -> io::Result<()> {
-            self.in_call(record, |this, pin| {
-                if record.pending != Some(pair::Effect::WeakRows) {
-                    return Err(conflict());
-                }
-                weak_rows_sequence(
-                    record.members.each_ref().map(|member| member.is_some()),
-                    |step| match step {
-                        WeakRowsBoundary::Capture(slot) => {
-                            this.capture_member_rows(pin, record, slot)
+            weak_rows_sequence(
+                record.members.each_ref().map(|member| member.is_some()),
+                |step| {
+                    self.in_call(record, |this, pin| {
+                        if record.pending != Some(pair::Effect::WeakRows) {
+                            return Err(conflict());
                         }
-                        WeakRowsBoundary::Carrier => {
-                            let policy = this
-                                .roots()?
-                                .pins
-                                .carrier_rows
-                                .with_record(
-                                    &record.scope,
-                                    record.provenance.network_epoch,
-                                    |facts| {
-                                        let mut desired =
-                                            facts.acknowledged.baseline.interface.policy.clone();
-                                        desired.weak_host_send = true;
-                                        desired.weak_host_receive = true;
-                                        Ok(desired)
-                                    },
-                                )
-                                .map_err(|error| denied(error))?;
-                            this.roots_mut()?
-                                .carrier
-                                .change_interface_in_call(pin.clone(), record, policy)
-                                .map_err(|error| denied(error))
+                        match step {
+                            WeakRowsBoundary::Capture(slot) => {
+                                this.capture_member_rows(pin, record, slot)
+                            }
+                            WeakRowsBoundary::Carrier => {
+                                let policy = this
+                                    .roots()?
+                                    .pins
+                                    .carrier_rows
+                                    .with_record(
+                                        &record.scope,
+                                        record.provenance.network_epoch,
+                                        |facts| {
+                                            let mut desired = facts
+                                                .acknowledged
+                                                .baseline
+                                                .interface
+                                                .policy
+                                                .clone();
+                                            desired.weak_host_send = true;
+                                            desired.weak_host_receive = true;
+                                            Ok(desired)
+                                        },
+                                    )
+                                    .map_err(|error| denied(error))?;
+                                this.roots_mut()?
+                                    .carrier
+                                    .change_interface_in_call(pin.clone(), record, policy)
+                                    .map_err(|error| denied(error))
+                            }
+                            WeakRowsBoundary::Member(slot) => {
+                                let policy = this.row_pins[idx(slot)]
+                                    .as_ref()
+                                    .ok_or_else(|| conflict())?
+                                    .with_record(
+                                        &record.scope,
+                                        record.provenance.network_epoch,
+                                        |facts| {
+                                            let mut desired = facts
+                                                .acknowledged
+                                                .baseline
+                                                .interface
+                                                .policy
+                                                .clone();
+                                            desired.weak_host_send = true;
+                                            desired.weak_host_receive = true;
+                                            Ok(desired)
+                                        },
+                                    )
+                                    .map_err(|error| denied(error))?;
+                                this.row_owners[idx(slot)]
+                                    .as_mut()
+                                    .ok_or_else(|| conflict())?
+                                    .owner_mut()
+                                    .map_err(|error| denied(error))?
+                                    .change_interface(policy)
+                                    .map_err(|error| denied(error))
+                            }
                         }
-                        WeakRowsBoundary::Member(slot) => {
-                            let policy = this.row_pins[idx(slot)]
-                                .as_ref()
-                                .ok_or_else(|| conflict())?
-                                .with_record(
-                                    &record.scope,
-                                    record.provenance.network_epoch,
-                                    |facts| {
-                                        let mut desired =
-                                            facts.acknowledged.baseline.interface.policy.clone();
-                                        desired.weak_host_send = true;
-                                        desired.weak_host_receive = true;
-                                        Ok(desired)
-                                    },
-                                )
-                                .map_err(|error| denied(error))?;
-                            this.row_owners[idx(slot)]
-                                .as_mut()
-                                .ok_or_else(|| conflict())?
-                                .owner_mut()
-                                .map_err(|error| denied(error))?
-                                .change_interface(policy)
-                                .map_err(|error| denied(error))
-                        }
-                    },
-                )
-            })
+                    })
+                },
+            )
         }
 
         pub(crate) fn restore_member_weak_rows(
@@ -8042,17 +8130,25 @@ pub(crate) mod native {
                         this.enter_member_rows_storage_cleanup_in_call(record, slot)?;
                     }
                 }
-                // Closing3 is interface-only: SAME original C address stays
-                // owned until stage6 invokes actual RowOwner.stop.
+                Ok(())
+            })?;
+            // Closing3 is interface-only: SAME original C address stays owned
+            // until stage6 invokes actual RowOwner.stop. Each owner operation
+            // has its own Calling after every retained storage handoff.
+            self.in_call(record, |this, pin| {
+                this.select_guard(pin, record)?;
                 this.roots_mut()?
                     .carrier
                     .restore_interface_in_call(pin.clone(), record)
-                    .map_err(|error| denied(error))?;
-                for slot in [Slot::A, Slot::B] {
-                    let i = idx(slot);
-                    if this.row_owners[i].is_none() {
-                        continue;
-                    }
+                    .map_err(|error| denied(error))
+            })?;
+            for slot in [Slot::A, Slot::B] {
+                let i = idx(slot);
+                if self.row_owners[i].is_none() {
+                    continue;
+                }
+                self.in_call(record, |this, pin| {
+                    this.select_guard(pin, record)?;
                     this.row_authorities[i]
                         .as_mut()
                         .ok_or_else(|| conflict())?
@@ -8066,10 +8162,10 @@ pub(crate) mod native {
                         .owner_mut()
                         .map_err(|error| denied(error))?
                         .stop()
-                        .map_err(|error| denied(error))?;
-                }
-                Ok(())
-            })
+                        .map_err(|error| denied(error))
+                })?;
+            }
+            Ok(())
         }
 
         pub(crate) fn start_member(
