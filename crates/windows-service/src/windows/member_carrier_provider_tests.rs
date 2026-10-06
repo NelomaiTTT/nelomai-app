@@ -764,8 +764,17 @@ fn mixed_fixture() -> (Vec<ExpectedProvider>, MixedScript) {
 fn mixed_c_wireguard_awg_returns_every_concrete_observation_in_caller_order() {
     // Break: validating an expected WG-NT as Wintun, or hiding it as foreign.
     let (wants, mut q) = mixed_fixture();
+    // The driver key is opaque metadata from the same node, not parsed identity.
+    for nodes in &mut q.source.nodes {
+        for node in nodes {
+            node.driver.driver_key = "opaque-driver-key\\12345".into();
+        }
+    }
     let got = inspect_mixed_queries(&wants, &mut q).unwrap();
     assert_eq!(got.len(), 3);
+    assert!(got
+        .iter()
+        .all(|o| o.instance.driver.driver_key == "opaque-driver-key\\12345"));
     assert_eq!(
         got.iter()
             .map(|o| o.interface.name.as_str())
@@ -947,7 +956,7 @@ fn mixed_wireguard_closed_metadata_rejects_wrong_egos_versions_dates_and_states(
                 13 => d.driver.date_filetime += 1,
                 14 => d.driver.matching_device_id = "Wintun".into(),
                 15 => d.driver.inf = "path\\oem43.inf".into(),
-                16 => d.driver.driver_key = "{4d36e972-e325-11ce-bfc1-08002be10318}\\43".into(),
+                16 => d.driver.driver_key.clear(),
                 17 => d.net_luid_index += 1,
                 18 => d.if_type = 6,
                 19 => d.class_guid = [7; 16],
@@ -2457,7 +2466,7 @@ fn wrong_driver_service_provider_version_date_binding_or_properties_fail() {
             13 => d.description.push('x'),
             14 => d.driver.inf = "C:\\oem42.inf".into(),
             15 => d.driver.inf = "wintun.inf".into(),
-            16 => d.driver.driver_key.push('x'),
+            16 => d.driver.driver_key.push('\0'),
             17 => d.devinst = 0,
             18 => d.net_luid_index |= 1 << 24,
             _ => d.driver.provider.push('\0'),

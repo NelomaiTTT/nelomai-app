@@ -167,13 +167,6 @@ fn inf_name(inf: &str) -> bool {
         .and_then(|s| s.strip_suffix(".inf"))
         .is_some_and(|s| !s.is_empty() && s.len() <= 10 && s.bytes().all(|b| b.is_ascii_digit()))
 }
-fn driver_key(value: &str) -> bool {
-    value.split_once('\\').is_some_and(|(class, slot)| {
-        parse_guid(class) == Ok(NET_CLASS)
-            && slot.len() == 4
-            && slot.bytes().all(|b| b.is_ascii_digit())
-    })
-}
 fn validate_device(want: &Expected, devices: &[Device]) -> Result<()> {
     validate_provider_device(want, ProviderKind::Wintun, devices)
 }
@@ -247,42 +240,8 @@ fn validate_provider_device(want: &Expected, kind: ProviderKind, devices: &[Devi
         || d.driver.date_filetime != date
         || !inf_name(&d.driver.inf)
         || !d.driver.matching_device_id.eq_ignore_ascii_case(hardware)
-        || !driver_key(&d.driver.driver_key)
+        || !text(&d.driver.driver_key, MAX_BYTES / 2)
     {
-        #[cfg(all(windows, test))]
-        if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            eprintln!(
-                "actual native provider crossbinding: kind={kind:?} actual_version={:?} actual_date={} compatible_ids={:?} standard_equals_description={} mismatch[guid={} netcfg={} class={} devinst={} luid={} iftype={} hardware={} compatible={} service={} private_name={} description={} provider={} version={} date={} inf={} matching_id={} driver_key={}]",
-                d.driver.version,
-                d.driver.date_filetime,
-                d.compatible_ids,
-                d.standard_name.as_deref() == Some(d.description.as_str()),
-                parse_guid(suffix).ok() != Some(want.guid),
-                parse_guid(&d.netcfg_instance_id).ok() != Some(want.guid),
-                d.class_guid != NET_CLASS,
-                d.devinst == 0,
-                d.net_luid_index == 0
-                    || d.net_luid_index > 0xff_ffff
-                    || u64::from(d.net_luid_index) != (want.luid >> 24) & 0xff_ffff,
-                d.if_type != 53,
-                d.hardware_ids.len() != 1
-                    || !d.hardware_ids[0].eq_ignore_ascii_case(hardware),
-                d.compatible_ids.len() != 1
-                    || !d.compatible_ids[0].eq_ignore_ascii_case("SWD\\Generic"),
-                !d.service.eq_ignore_ascii_case(hardware),
-                private_name != want.name,
-                !crate::member_interface_description::matches_requested(
-                    &d.description,
-                    &want.description,
-                ),
-                d.driver.provider != "WireGuard LLC",
-                d.driver.version != version,
-                d.driver.date_filetime != date,
-                !inf_name(&d.driver.inf),
-                !d.driver.matching_device_id.eq_ignore_ascii_case(hardware),
-                !driver_key(&d.driver.driver_key),
-            );
-        }
         return Err(Error::Conflict("provider/driver/interface crossbinding"));
     }
     // CM_Locate_DevNodeW(NORMAL) additionally proves presence natively.
@@ -638,7 +597,7 @@ fn validate_foreign_metadata(d: &Device) -> Result<()> {
         || !text(&d.driver.inf, 256)
         || d.driver.inf.contains(['/', '\\'])
         || !d.driver.inf.to_ascii_lowercase().ends_with(".inf")
-        || !driver_key(&d.driver.driver_key)
+        || !text(&d.driver.driver_key, MAX_BYTES / 2)
         || !d
             .hardware_ids
             .iter()
