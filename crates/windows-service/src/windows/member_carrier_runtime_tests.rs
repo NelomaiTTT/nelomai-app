@@ -518,7 +518,7 @@ fn source_closing_facts_never_rearm_forward_and_cannot_ignore_reentrant_cleanup(
 
 #[test]
 fn shared_original_is_the_same_retained_owner_not_equal_reconstructed_data() {
-    let original = SharedOriginal::new(vec![1_u8]);
+    let original = SharedOriginal::with_signal(vec![1_u8], Rc::new(Cell::new(false)));
     let second = original.pin();
     second.borrow().unwrap().push(2);
     assert_eq!(*original.borrow().unwrap(), vec![1, 2]);
@@ -529,7 +529,7 @@ fn shared_original_is_the_same_retained_owner_not_equal_reconstructed_data() {
 
 #[test]
 fn cleanup_write_root_is_registered_original_without_reborrowing_effect_owner() {
-    let original = SharedOriginal::new(vec![1_u8]);
+    let original = SharedOriginal::with_signal(vec![1_u8], Rc::new(Cell::new(false)));
     let root = CleanupWriteRoot::new(&original);
     assert!(root.verify().is_err());
     root.admit().unwrap();
@@ -539,13 +539,13 @@ fn cleanup_write_root_is_registered_original_without_reborrowing_effect_owner() 
     drop(held);
     drop(original);
     // Equal data elsewhere never revives the dead original owner.
-    let _equal = SharedOriginal::new(vec![1_u8]);
+    let _equal = SharedOriginal::with_signal(vec![1_u8], Rc::new(Cell::new(false)));
     assert!(root.verify().is_err());
 }
 
 #[test]
 fn cleanup_write_root_failure_is_permanent_and_revokes_shared_forward_only() {
-    let original = SharedOriginal::new(vec![1_u8]);
+    let original = SharedOriginal::with_signal(vec![1_u8], Rc::new(Cell::new(false)));
     let root = CleanupWriteRoot::new(&original);
     root.admit().unwrap();
     root.fail();
@@ -558,7 +558,7 @@ fn cleanup_write_root_failure_is_permanent_and_revokes_shared_forward_only() {
 
 #[test]
 fn caught_reentrant_borrow_irreversibly_revokes_both_actual_components() {
-    let original = SharedOriginal::new(7_u8);
+    let original = SharedOriginal::with_signal(7_u8, Rc::new(Cell::new(false)));
     let second = original.pin();
     let held = original.borrow().unwrap();
     assert!(second.borrow().is_err());

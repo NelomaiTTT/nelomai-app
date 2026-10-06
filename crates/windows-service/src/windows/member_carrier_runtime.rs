@@ -1,5 +1,4 @@
-//! Original carrier runtime composition. Native factory remains disconnected.
-#![allow(dead_code)]
+//! Original carrier runtime composition.
 
 use crate::member_carrier::{CarrierError, Result};
 #[cfg(not(windows))]
@@ -148,9 +147,6 @@ struct SharedOriginal<T> {
     revoked: Rc<Cell<bool>>,
 }
 impl<T> SharedOriginal<T> {
-    fn new(owner: T) -> Self {
-        Self::with_signal(owner, Rc::new(Cell::new(false)))
-    }
     fn with_signal(owner: T, revoked: Rc<Cell<bool>>) -> Self {
         Self {
             owner: Rc::new(RefCell::new(owner)),
@@ -1670,11 +1666,6 @@ pub(crate) mod native {
         pub supervisor: &'a NativeDeadline,
     }
     impl NativeRowGenerationReceipt {
-        /// Exact immutable original Stop payload for the typed generation
-        /// store. This is not absence, native creation or write authority.
-        pub(crate) fn stopped_payload(&self) -> Vec<u8> {
-            self.protected.clone()
-        }
         fn verify_origin(self: &Rc<Self>, rows: &Rc<NativeResourceRowsRead>) -> Result<()> {
             if self
                 .origin
@@ -5100,7 +5091,6 @@ pub(crate) mod native {
         binding: Binding,
         supervisor: NativeDeadlineReadPin,
     }
-    pub(crate) type RootedCarrierComponents<'a, G> = CarrierComponents<'a, G>;
     impl From<super::ConstructionFailure> for Error {
         fn from(failure: super::ConstructionFailure) -> Self {
             match failure {
@@ -5124,9 +5114,6 @@ pub(crate) mod native {
         >,
     }
     pub(crate) struct NativeConstructionParts<'r, 'a, G: NativeLifecycleGate + 'a> {
-        pub(crate) inputs: &'r mut Option<NativeConstructionInputs<G>>,
-        pub(crate) authority: &'r mut Option<NativeCarrierAuthority<G>>,
-        pub(crate) shared: &'r mut Option<SharedCarrierAuthority<G>>,
         pub(crate) components: &'r mut Option<CarrierComponents<'a, G>>,
     }
     impl<'a, G: NativeLifecycleGate + 'a> NativeConstructionSlot<'a, G> {
@@ -5244,9 +5231,6 @@ pub(crate) mod native {
         pub(crate) fn retained_parts(&mut self) -> NativeConstructionParts<'_, 'a, G> {
             let parts = self.root.retained_parts();
             NativeConstructionParts {
-                inputs: &mut parts.inputs,
-                authority: &mut parts.authority,
-                shared: &mut parts.shared,
                 components: &mut parts.components,
             }
         }
