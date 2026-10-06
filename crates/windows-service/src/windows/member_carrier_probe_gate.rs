@@ -290,7 +290,7 @@ fn compare_retired_target(
     Ok(())
 }
 fn compare_closing_registration(context: &Context, r: &pair::Record) -> Result<()> {
-    compare_identity(context, r)?;
+    compare_origin(context, r)?;
     if r.phase != pair::Phase::Closing
         || r.active.is_some()
         || r.operation.is_some()
@@ -301,11 +301,8 @@ fn compare_closing_registration(context: &Context, r: &pair::Record) -> Result<(
     {
         return Err(GuardError::Conflict);
     }
+    compare_model(r, &r.guard)?;
     if r.stop_stage == 0 {
-        compare_model(r, &r.guard)?;
-        if !r.guard.installed || r.guard.assigned_sublayer_weight.is_none() {
-            return Err(GuardError::Conflict);
-        }
         if let Some(plan) = &r.pending_guard {
             plan.validate()?;
             for model in [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired] {
@@ -315,10 +312,10 @@ fn compare_closing_registration(context: &Context, r: &pair::Record) -> Result<(
                 return Err(GuardError::Conflict);
             }
         }
-        Ok(())
-    } else {
-        compare_stage(context, r, Purpose::Closing)
+    } else if r.pending_guard.is_some() {
+        return Err(GuardError::Conflict);
     }
+    Ok(())
 }
 fn compare_tuple(r: &pair::Record, s: Slot, t: &ProbeTuple) -> Result<()> {
     let member = r.members[idx(s)].as_ref().ok_or(GuardError::Conflict)?;

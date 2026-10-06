@@ -1007,6 +1007,59 @@ fn closing_registration_can_precede_withdrawal_but_port_release_cannot() {
     assert_eq!(compare_guard_target(&c, &r, &withdrawn), Ok(()));
     assert!(compare_stage(&c, &r, Purpose::Closing).is_err());
     assert!(compare_guard_target(&c, &r, &r.guard).is_err());
+
+    for member_phase in [owner::Phase::Prepared, owner::Phase::Running] {
+        for stop_stage in [0, 1] {
+            let mut partial = r.clone();
+            partial.guard = policy::Model::empty(partial.scope.clone()).unwrap();
+            partial.network = None;
+            partial.pending_guard = None;
+            partial.stop_stage = stop_stage;
+            partial.pending = Some(if stop_stage == 0 {
+                pair::Effect::Guard
+            } else {
+                pair::Effect::ReleaseProbes
+            });
+            let member = &mut partial.members[0].as_mut().unwrap().owner;
+            member.phase = member_phase;
+            if member_phase == owner::Phase::Prepared {
+                member.proof = None;
+            }
+            partial.validate().unwrap();
+            assert_eq!(
+                compare_closing_registration(&c, &partial),
+                Ok(()),
+                "partial Closing {stop_stage}, {member_phase:?}"
+            );
+            for purpose in [
+                Purpose::Closing,
+                Purpose::Open(Slot::A),
+                Purpose::Use(Slot::A),
+            ] {
+                assert!(compare_stage(&c, &partial, purpose).is_err());
+            }
+            assert!(compare_guard_target(&c, &partial, &partial.guard).is_err());
+            let mut foreign = partial.clone();
+            foreign.provenance.boot_id = [9; 16];
+            assert!(compare_closing_registration(&c, &foreign).is_err());
+            foreign = partial.clone();
+            foreign.scope.connection_generation += 1;
+            assert!(compare_closing_registration(&c, &foreign).is_err());
+            let mut wrong_stage = partial.clone();
+            wrong_stage.stop_stage = 2;
+            assert!(compare_closing_registration(&c, &wrong_stage).is_err());
+            if stop_stage == 0 {
+                let mut wrong_plan = partial.clone();
+                wrong_plan.pending_guard = r.pending_guard.clone();
+                assert!(compare_closing_registration(&c, &wrong_plan).is_err());
+            } else {
+                let mut unexpected_plan = partial.clone();
+                unexpected_plan.pending_guard =
+                    Some(policy::ExchangePlan::new(&partial.guard, &partial.guard).unwrap());
+                assert!(compare_closing_registration(&c, &unexpected_plan).is_err());
+            }
+        }
+    }
 }
 // Break: requiring a future ExchangePlan to retain actual Closing before the
 // normal close_permits ACK, or rejecting a factual already-withdrawn ACK.
