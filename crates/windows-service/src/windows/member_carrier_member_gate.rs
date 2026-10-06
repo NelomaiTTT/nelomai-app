@@ -675,8 +675,6 @@ impl<T> Registration<T> {
 pub(crate) mod native {
     use super::*;
     use crate::member_carrier_native_ownership as receipts;
-    #[cfg(test)]
-    use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::windows::{
         member_carrier_guard::{NativeGuard, Wfp, WindowBindingAttestor},
         member_carrier_key_authority::RuntimeRead,
@@ -749,7 +747,6 @@ pub(crate) mod native {
         closing: Registration<NativeClosingRead>,
         closing_network: Registration<NativeClosingNetworkRead>,
         network_ack: Option<NetworkRegistration<N>>,
-        generation: Option<u64>,
     }
     pub(crate) struct NativeMemberGate<
         A: WindowBindingAttestor,
@@ -797,7 +794,6 @@ pub(crate) mod native {
                     closing: Registration::default(),
                     closing_network: Registration::default(),
                     network_ack: None,
-                    generation: None,
                 }),
                 fence: GateFence::default(),
             }
@@ -813,17 +809,8 @@ pub(crate) mod native {
                     return Err(Error::Pending);
                 }
                 state.attempted_pairs.push(original.clone());
-                state
-                    .continuity(state.closing.first.is_some())
-                    .inspect_err(|_error| {
-                        #[cfg(test)]
-                        trace_step(&format!(
-                            "member gate select_pair first continuity error={_error:?}"
-                        ));
-                    })?;
+                state.continuity(state.closing.first.is_some())?;
                 if !original.matches_runtime(&state.runtime) {
-                    #[cfg(test)]
-                    trace_step("member gate select_pair runtime_original=false");
                     return Err(Error::Conflict);
                 }
                 let record = original
@@ -831,42 +818,20 @@ pub(crate) mod native {
                     .map_err(denied)?;
                 let cleanup = record.phase == pair::Phase::Closing;
                 if cleanup != state.closing.first.is_some() {
-                    #[cfg(test)]
-                    trace_step(&format!(
-                        "member gate select_pair cleanup={cleanup} closing_registered={}",
-                        state.closing.first.is_some()
-                    ));
                     return Err(Error::Conflict);
                 }
                 if let Some(old) = &state.selected {
                     if Rc::ptr_eq(&old.original, &original) {
                         if old.record != record {
-                            #[cfg(test)]
-                            trace_step("member gate select_pair same_original_record_equal=false");
                             return Err(Error::Conflict);
                         }
                     } else {
-                        advance(&old.record, &record).inspect_err(|_error| {
-                            #[cfg(test)]
-                            trace_step(&format!(
-                                "member gate select_pair advance error={_error:?}"
-                            ));
-                        })?;
+                        advance(&old.record, &record)?;
                     }
                 }
                 state.selected = Some(Selected { original, record });
-                state.continuity(cleanup).inspect_err(|_error| {
-                    #[cfg(test)]
-                    trace_step(&format!(
-                        "member gate select_pair second continuity error={_error:?}"
-                    ));
-                })?;
-                state.verify_pair().inspect_err(|_error| {
-                    #[cfg(test)]
-                    trace_step(&format!(
-                        "member gate select_pair verify_pair error={_error:?}"
-                    ));
-                })
+                state.continuity(cleanup)?;
+                state.verify_pair()
             })
         }
         /// Actor must also bind its SAME rows sampler to this Closing pin.
@@ -915,8 +880,6 @@ pub(crate) mod native {
     {
         fn continuity(&mut self, cleanup: bool) -> Result<Vec<u8>> {
             if !cleanup && self.cancelled.load(Ordering::Acquire) {
-                #[cfg(test)]
-                trace_step("member gate continuity cleanup=false cancelled=true");
                 return Err(Error::Conflict);
             }
             let deadline = self.supervisor.read_pin().map_err(denied)?;
@@ -926,8 +889,6 @@ pub(crate) mod native {
             self.runtime
                 .verify_member_intent(&self.context, &self.member_source, &self.intent)?;
             if !cleanup && !self.runtime.fresh(&self.context)? {
-                #[cfg(test)]
-                trace_step("member gate continuity cleanup=false fresh=false");
                 return Err(Error::Conflict);
             }
             let native = self
@@ -943,24 +904,9 @@ pub(crate) mod native {
                     } else {
                         receipts::Phase::Preparing
                     }
-                || self.generation.is_some_and(|g| g != record.generation)
             {
-                #[cfg(test)]
-                trace_step(&format!(
-                    "member gate continuity cleanup={cleanup} context_equal={} generation_expected={:?} generation_actual={} phase_expected={:?} phase_actual={:?}",
-                    record.context == self.context,
-                    self.generation,
-                    record.generation,
-                    if cleanup {
-                        receipts::Phase::Closing
-                    } else {
-                        receipts::Phase::Preparing
-                    },
-                    record.phase
-                ));
                 return Err(Error::Conflict);
             }
-            self.generation = Some(record.generation);
             let source = upgrade(&self.source)?;
             let guard = upgrade(&self.guard)?;
             let probes = upgrade(&self.probes)?;
