@@ -2196,10 +2196,24 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<()> {
+            // Attribute existing enum errors without another read or constructor.
+            macro_rules! graph_result {
+                ($result:expr, $step:literal) => {
+                    $result.inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("startup graph {} error={_error:?}", $step));
+                    })
+                };
+            }
             // Consume before any field move, constructor, private read or SDK
             // postflight. Failed empty-looking partial graphs are never cold.
-            begin_graph_construction(&self.construction_attempted)?;
+            graph_result!(
+                begin_graph_construction(&self.construction_attempted),
+                "construction attempted"
+            )?;
             if self.terminal_attempted {
+                #[cfg(test)]
+                trace_step("startup graph terminal attempted error=Retired");
                 return Err(Error::Retired);
             }
             if expected.carrier != input.proof
@@ -2208,69 +2222,90 @@ pub(crate) mod native {
                 || expected.phase != pair::Phase::Starting
                 || expected.network.is_some()
                 || expected.guard
-                    != crate::member_carrier_guard::Model::empty(expected.scope.clone())
-                        .map_err(|_| Error::Conflict)?
+                    != graph_result!(
+                        crate::member_carrier_guard::Model::empty(expected.scope.clone()),
+                        "empty guard model"
+                    )
+                    .map_err(|_| Error::Conflict)?
             {
+                #[cfg(test)]
+                trace_step("startup graph preconditions error=Conflict");
                 return Err(Error::Conflict);
             }
             // These SAME strong roots outlive every gate's Weak registration.
             // Equal readers minted per gate would disappear after construction.
             self.members = Some(Rc::new(pins.members.read_pin()));
-            self.image = Some(Rc::new(pins.image.read_pin().map_err(|_| Error::Conflict)?));
+            self.image = Some(Rc::new(
+                graph_result!(pins.image.read_pin(), "image pin").map_err(|_| Error::Conflict)?,
+            ));
             self.originals = Some(Rc::new(pins.originals.clone()));
             let rows = Rc::new(NativeResourceRowsRead::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "rows runtime pin")?,
                 pins.source.clone(),
                 pins.carrier_rows.clone(),
             ));
             self.rows = Some(rows.clone());
             let (g, selection) = NativeResourceGuardGate::<actor::OriginalGuardAttestor>::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "guard resources runtime pin")?,
                 &pins.source,
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "guard resources deadline pin")?,
                 input.cancelled.clone(),
             );
             let selection = Rc::new(selection);
             self.guard_resources = Some(selection.clone());
             let (attestor, handle) = NativeGuardAttestor::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "attestor runtime pin")?,
                 Some(pins.source.clone()),
                 None,
                 original.clone(),
                 expected.clone(),
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "attestor deadline pin")?,
                 input.cancelled.clone(),
                 g,
             );
             self.attestor = Some(Rc::new(handle));
             self.guard = Some(Rc::new(RefCell::new(
-                actor::Guard::open(
-                    expected.scope.clone(),
-                    actor::OriginalGuardAttestor::original(attestor),
+                graph_result!(
+                    actor::Guard::open(
+                        expected.scope.clone(),
+                        actor::OriginalGuardAttestor::original(attestor),
+                    ),
+                    "Guard open"
                 )
                 .map_err(|_| Error::Native)?,
             )));
             let guard = self.guard.as_ref().ok_or(Error::Pending)?.clone();
             let (journal, saved) =
                 WindowsCarrierGuardStore::open(input.files.clone(), input.context.clone())
-                    .map_err(|_| Error::Journal)?;
+                    .map_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "startup graph GuardStore open error kind={:?}",
+                            _error.kind()
+                        ));
+                        Error::Journal
+                    })?;
             self.guard_journal = Some(journal);
             if saved.is_some() {
+                #[cfg(test)]
+                trace_step("startup graph GuardStore saved present error=Conflict");
                 return Err(Error::Conflict);
             }
-            selection
-                .select(original.clone(), expected.clone())
-                .map_err(|_| Error::Conflict)?;
+            graph_result!(
+                selection.select(original.clone(), expected.clone()),
+                "guard selection"
+            )
+            .map_err(|_| Error::Conflict)?;
             self.network_read = Some(Rc::new(NativeNetworkRead::new(pins.source.clone())));
             let network = self.network_read.as_ref().ok_or(Error::Pending)?.clone();
             self.probe_state = Some(NativeProbeResourceState::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "probe state runtime pin")?,
                 pins.source.clone(),
                 guard.clone(),
                 rows.clone(),
@@ -2278,7 +2313,7 @@ pub(crate) mod native {
                 original.clone(),
                 expected.clone(),
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "probe state deadline pin")?,
                 input.cancelled.clone(),
             ));
             let state = self.probe_state.as_ref().ok_or(Error::Pending)?.clone();
@@ -2296,7 +2331,7 @@ pub(crate) mod native {
             ));
             self.network_gate = Some(NativeNetworkGate::new_pre_network(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "network gate runtime pin")?,
                 input.files.clone(),
                 pins.source.clone(),
                 original.clone(),
@@ -2304,7 +2339,7 @@ pub(crate) mod native {
                 guard.clone(),
                 rows.clone(),
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "network gate deadline pin")?,
                 input.cancelled.clone(),
             ));
             let network_gate = self.network_gate.as_ref().ok_or(Error::Pending)?.clone();
@@ -2316,7 +2351,14 @@ pub(crate) mod native {
                     network_gate.clone(),
                     input.files.clone(),
                 )
-                .map_err(|_| Error::Conflict)?,
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "startup graph network fresh error kind={:?}",
+                        _error.kind()
+                    ));
+                    Error::Conflict
+                })?,
             );
             self.network_ack = Some(Rc::new(
                 self.network_owner
@@ -2326,12 +2368,12 @@ pub(crate) mod native {
             ));
             self.baseline_root = Some(NativeNetworkBaselineRoot::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "baseline runtime pin")?,
                 pins.source.clone(),
                 network.clone(),
                 guard.clone(),
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "baseline deadline pin")?,
                 input.cancelled.clone(),
             ));
             let capture = self.baseline_root.as_ref().ok_or(Error::Pending)?.clone();
@@ -2339,15 +2381,33 @@ pub(crate) mod native {
                 .inspect_window(|window| {
                     capture
                         .capture_in_window(window, original, expected)
-                        .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+                        .map_err(|_error| {
+                            #[cfg(test)]
+                            trace_step(&format!(
+                                "startup graph baseline capture error kind={:?}",
+                                _error.kind()
+                            ));
+                            crate::windows::member_carrier_wintun::Error::Conflict
+                        })
                 })
-                .map_err(|_| Error::Conflict)?;
-            self.baseline = Some(capture.read_pin().map_err(|_| Error::Conflict)?);
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("startup graph baseline window error={_error:?}"));
+                    Error::Conflict
+                })?;
+            self.baseline = Some(capture.read_pin().map_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "startup graph baseline pin error kind={:?}",
+                    _error.kind()
+                ));
+                Error::Conflict
+            })?);
             let (full, lifecycle) = FullNativeLifecycleGate::<actor::OriginalGuardAttestor>::new(
                 input.context.clone(),
-                input.runtime.read_pin()?,
+                graph_result!(input.runtime.read_pin(), "lifecycle runtime pin")?,
                 input.supervisor.clone(),
-                input.supervisor.read_pin()?,
+                graph_result!(input.supervisor.read_pin(), "lifecycle deadline pin")?,
                 input.cancelled.clone(),
             );
             self.lifecycle = Some(lifecycle);
@@ -2357,13 +2417,17 @@ pub(crate) mod native {
                     self.member_gates[i] = Some(Rc::new(RefCell::new(NativeMemberGate::new(
                         NativeMemberGateInputs {
                             context: input.context.clone(),
-                            intent: expected.members[i]
-                                .as_ref()
-                                .ok_or(Error::Conflict)?
-                                .owner
-                                .intent
-                                .clone(),
-                            runtime: input.runtime.read_pin()?,
+                            intent: graph_result!(
+                                expected.members[i].as_ref().ok_or(Error::Conflict),
+                                "prepared member intent"
+                            )?
+                            .owner
+                            .intent
+                            .clone(),
+                            runtime: graph_result!(
+                                input.runtime.read_pin(),
+                                "member gate runtime pin"
+                            )?,
                             member_source: input.member_source.clone(),
                             source: pins.source.clone(),
                             guard: guard.clone(),

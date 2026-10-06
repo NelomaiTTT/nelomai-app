@@ -552,10 +552,29 @@ impl RuntimeRead {
         &self,
         source: &super::member_carrier_payload::native::WintunSource,
     ) -> Result<()> {
-        // Two independent actual protected-context reads fence the SAME bound
-        // source verification. Each also brackets original owner/root/lease/boot;
-        // the retained signed proof and strict DLL checks remain in Source.
-        self.verify_original_source_context(source)?;
+        // Two actual protected-context reads fence one complete bound Source
+        // check. Reject foreign original context/source before the first read;
+        // owner/root/lease/boot postflight follows the second.
+        let context = &self.runtime.context;
+        self.runtime.verify_original_context(&self.lease, context)?;
+        source.require_runtime_binding(
+            &self.runtime.owner,
+            &self.runtime.identity,
+            &self.runtime.installation.root,
+            &self.runtime.directory,
+            &self.runtime.executable,
+        )?;
+        let read_context = || {
+            self.runtime
+                .files
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .native_carrier_access(&context.intent.scope)
+                .map_err(|_| Error::Journal)?
+                .require_native_context(context)
+                .map_err(|_| Error::Conflict)
+        };
+        read_context()?;
         source.verify_runtime_binding(
             &self.runtime.owner,
             &self.runtime.identity,
@@ -563,7 +582,8 @@ impl RuntimeRead {
             &self.runtime.directory,
             &self.runtime.executable,
         )?;
-        self.verify_original_source_context(source)
+        read_context()?;
+        self.runtime.verify_original_context(&self.lease, context)
     }
     /// Actual signed member sources, not member service/NIC ownership or effect
     /// permission. Compare the SAME held serialized owner, not equal JSON or a
