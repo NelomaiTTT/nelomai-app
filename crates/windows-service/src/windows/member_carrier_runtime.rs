@@ -5090,11 +5090,8 @@ pub(crate) mod native {
             if call.owner.failed && use_ != Use::Cleanup {
                 return Err(rows::Error::Retired);
             }
-            let held = call
-                .owner
-                .refresh(use_)
-                .map_err(|_| rows::Error::Conflict)?;
-            call.owner.effect = Some(held);
+            // Row callbacks use IPHelper; this borrow retains the actual
+            // module/creator originals without an installation effect lease.
             let result = action(&mut call.owner);
             call.succeeded = result.is_ok();
             result
@@ -5521,11 +5518,10 @@ pub(crate) mod native {
                 return self.member_row_binding(role);
             }
             let (use_, before) = self.row_state().map_err(|_| rows::Error::Conflict)?;
-            let held = self.effect.as_mut().ok_or(rows::Error::Retired)?;
             if use_ == Use::Cleanup {
-                held.verify_for_cleanup(&self.cancelled)
+                self.image.verify_runtime(&self.runtime)
             } else {
-                held.verify(&self.cancelled)
+                self.image.verify_live_runtime(&self.runtime)
             }
             .map_err(|_| rows::Error::Conflict)?;
             let stage = if use_ == Use::Cleanup {
@@ -5562,11 +5558,10 @@ pub(crate) mod native {
             if self.active_row_role != Some(role) || (self.failed && use_ != Use::Cleanup) {
                 return Err(rows::Error::Retired);
             }
-            let held = self.effect.as_mut().ok_or(rows::Error::Retired)?;
             if use_ == Use::Cleanup {
-                held.verify_for_cleanup(&self.cancelled)
+                self.image.verify_runtime(&self.runtime)
             } else {
-                held.verify(&self.cancelled)
+                self.image.verify_live_runtime(&self.runtime)
             }
             .map_err(|_| rows::Error::Conflict)?;
             let stage = if use_ == Use::Cleanup {
