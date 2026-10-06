@@ -830,7 +830,7 @@ pub(crate) mod native_store {
             if self.intent.record != *expected {
                 return Err(conflict());
             }
-            self.verify_cleanup_entry(runtime, context)
+            Ok(())
         }
         /// Separate terminal factual channel. Does not accept Closing or
         /// pending effects, arm a watchdog, or revive forward execution.
@@ -1147,7 +1147,9 @@ pub(crate) mod native_store {
         /// its canonical runtime's explicitly bound native storage view. This
         /// cannot clear cleanup-only/recovery or import an arbitrary old epoch.
         fn synchronize_native_view(&mut self) -> io::Result<()> {
-            self.verify()?;
+            if !self.runtime.matches_pin(&self.lock) {
+                return Err(conflict());
+            }
             if !self.inner.cleanup_only {
                 self.inner.files = self
                     .runtime
