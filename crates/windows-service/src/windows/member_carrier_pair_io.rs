@@ -6700,13 +6700,6 @@ pub(crate) mod native {
             self.in_call(record, |this, pin| {
                 let r = this.roots_mut()?;
                 let i = idx(slot);
-                r.member_gates[i]
-                    .as_ref()
-                    .ok_or_else(conflict)?
-                    .try_borrow_mut()
-                    .map_err(denied)?
-                    .select_pair(pin.clone())
-                    .map_err(denied)?;
                 r.controllers[i]
                     .as_mut()
                     .ok_or_else(conflict)?
@@ -6840,13 +6833,6 @@ pub(crate) mod native {
                 let closing = this.closing.clone();
                 let r = this.roots_mut()?;
                 let i = idx(slot);
-                r.member_gates[i]
-                    .as_ref()
-                    .ok_or_else(conflict)?
-                    .try_borrow_mut()
-                    .map_err(denied)?
-                    .select_pair(pin.clone())
-                    .map_err(denied)?;
                 // Actual controller opaque Stop receipt + fresh full SDK. No
                 // missing lookup/equal Pair record can supply absence success.
                 r.controllers[i]
@@ -8339,11 +8325,6 @@ pub(crate) mod native {
                 let executor = this.executor.clone();
                 let r = this.roots_mut()?;
                 let member = record.members[idx(slot)].as_ref().ok_or_else(conflict)?;
-                let gate = r.member_gates[idx(slot)].as_ref().ok_or_else(conflict)?;
-                gate.try_borrow_mut()
-                    .map_err(denied)?
-                    .select_pair(pin.clone())
-                    .map_err(denied)?;
                 let before = r.controllers[idx(slot)]
                     .as_mut()
                     .ok_or_else(conflict)?
