@@ -2252,7 +2252,6 @@ pub(crate) mod native {
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            self.runtime.verify(&self.context).map_err(denied)?;
             let old = self.selected.try_borrow().map_err(denied)?;
             // The old Network intent is stale after its owning operation. It
             // establishes original lineage ONLY; NEVER inspect it recursively
@@ -2312,7 +2311,6 @@ pub(crate) mod native {
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            self.runtime.verify(&self.context).map_err(denied)?;
             let old = self.selected.try_borrow().map_err(denied)?;
             let c = &baseline.snapshot().interface;
             if !old.pair.matches_runtime(&self.runtime)
