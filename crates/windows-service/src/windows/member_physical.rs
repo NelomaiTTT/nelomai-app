@@ -25,8 +25,7 @@ use windows_sys::Win32::{
 /// IPHelper has no atomic route+interface snapshot; races observed during this
 /// capture fail closed. Callers still need fresh verification before mutation.
 pub(crate) fn capture(owned: &[InterfaceIdentity]) -> io::Result<PhysicalSnapshot> {
-    let mut rows = read_family(Family::V4)?;
-    rows.extend(read_family(Family::V6)?);
+    let rows = full_route_table()?;
     let mut keys = BTreeMap::new();
     for row in &rows {
         let key = (
@@ -47,6 +46,22 @@ pub(crate) fn capture(owned: &[InterfaceIdentity]) -> io::Result<PhysicalSnapsho
         interfaces.push(read_interface(family, index, luid)?);
     }
     PhysicalSnapshot::new(rows, interfaces, owned).map_err(io::Error::other)
+}
+
+/// Route tables only, from both families. No NIC inventory or path selection.
+/// Keep duplicate/competing rows; table order is not an ownership fact.
+pub(crate) fn full_route_table() -> io::Result<Vec<Row>> {
+    let mut rows = read_family(Family::V4)?;
+    rows.extend(read_family(Family::V6)?);
+    rows.sort_by_key(|r| {
+        (
+            (r.route.destination, r.route.interface),
+            r.route.gateway,
+            r.route.metric,
+            r.luid,
+        )
+    });
+    Ok(rows)
 }
 
 /// Re-enumerates both families and interface evidence on EVERY invocation.

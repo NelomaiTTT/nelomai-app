@@ -1662,6 +1662,7 @@ pub(crate) mod native {
             NativeResourceRowsRead, NativeSourceRead, RetiredCarrierRead,
         },
         member_native_deadline::{NativeDeadline, NativeDeadlineReadPin},
+        member_physical::full_route_table,
         member_session::{NativeNetworkRecord, NativeSessionFiles, PhysicalLease, RecordKind},
     };
     use std::{
@@ -2375,6 +2376,7 @@ pub(crate) mod native {
                 let ack = self.ack_pin()?;
                 let before_acks = ack.acknowledgements()?;
                 let before_dns = ack.dns_exchange_history()?;
+                let obligations = ack.physical_obligations()?;
                 let facts = self.network_facts(true, window)?;
                 self.lifecycle_journal(record, baseline, facts.protected_record.as_deref(), &ack)?;
                 if facts.dns != *baseline.snapshot()
@@ -2400,20 +2402,24 @@ pub(crate) mod native {
                     &table,
                     matches!(record.stop_stage, 3 | 6),
                 )?;
-                // Keep exact original physical lease checks. Historical member
-                // identities remain EXCLUSIONS, not live NIC lookups/adoption.
-                let physical = self.capture_physical(window)?;
-                for lease in ack.physical_obligations()? {
-                    physical.verify(&physical_route(&lease)).map_err(denied)?;
+                if !obligations.is_empty() {
+                    // Keep exact original physical lease checks. Historical member
+                    // identities remain EXCLUSIONS, not live NIC lookups/adoption.
+                    let physical = self.capture_physical(window)?;
+                    for lease in &obligations {
+                        physical.verify(&physical_route(lease)).map_err(denied)?;
+                    }
+                    let after = self.capture_physical(window)?;
+                    if after.rows() != physical.rows() || after.proofs() != physical.proofs() {
+                        return Err(conflict());
+                    }
                 }
-                let after = self.capture_physical(window)?;
-                if after.rows() != physical.rows()
-                    || after.proofs() != physical.proofs()
-                    || full_route_table()? != table
+                if full_route_table()? != table
                     || self.network_facts(true, window)? != facts
                     || self.protected_pair(record)? != pair
                     || !same_network_ack_reads(&before_acks, &ack.acknowledgements()?)
                     || ack.dns_exchange_history()? != before_dns
+                    || ack.physical_obligations()? != obligations
                 {
                     return Err(conflict());
                 }
@@ -2446,6 +2452,7 @@ pub(crate) mod native {
                 let ack = self.ack_pin()?;
                 let before_acks = ack.acknowledgements()?;
                 let before_dns = ack.dns_exchange_history()?;
+                let obligations = ack.physical_obligations()?;
                 self.lifecycle_journal(record, baseline, raw.as_deref(), &ack)?;
                 let proofs = [
                     bindings.carrier.as_ref().map(|c| c.identity.proof),
@@ -2454,25 +2461,28 @@ pub(crate) mod native {
                 ];
                 let table = full_route_table()?;
                 compare_lifecycle_route_table(record, proofs, &before_acks.0, &table, false)?;
-                // Query only actual remaining table rows' physical interfaces;
-                // retired identities are exclusions. Never old C DNS/NIC SDK.
-                let owned = proofs
-                    .iter()
-                    .flatten()
-                    .map(|p| InterfaceIdentity {
-                        index: p.index,
-                        luid: p.luid,
-                        guid: p.guid,
-                    })
-                    .collect::<Vec<_>>();
-                let physical = crate::windows::member_physical::capture(&owned).map_err(denied)?;
-                for lease in ack.physical_obligations()? {
-                    physical.verify(&physical_route(&lease)).map_err(denied)?;
-                }
-                let after = crate::windows::member_physical::capture(&owned).map_err(denied)?;
+                let physical_changed = !obligations.is_empty() && {
+                    // Query only actual remaining table rows' physical interfaces;
+                    // retired identities are exclusions. Never old C DNS/NIC SDK.
+                    let owned = proofs
+                        .iter()
+                        .flatten()
+                        .map(|p| InterfaceIdentity {
+                            index: p.index,
+                            luid: p.luid,
+                            guid: p.guid,
+                        })
+                        .collect::<Vec<_>>();
+                    let physical =
+                        crate::windows::member_physical::capture(&owned).map_err(denied)?;
+                    for lease in &obligations {
+                        physical.verify(&physical_route(lease)).map_err(denied)?;
+                    }
+                    let after = crate::windows::member_physical::capture(&owned).map_err(denied)?;
+                    after.rows() != physical.rows() || after.proofs() != physical.proofs()
+                };
                 if full_route_table()? != table
-                    || after.rows() != physical.rows()
-                    || after.proofs() != physical.proofs()
+                    || physical_changed
                     || self
                         .runtime
                         .optional_record(&self.context, RecordKind::Network)
@@ -2481,6 +2491,7 @@ pub(crate) mod native {
                     || self.protected_pair(record)? != before_pair
                     || !same_network_ack_reads(&before_acks, &ack.acknowledgements()?)
                     || ack.dns_exchange_history()? != before_dns
+                    || ack.physical_obligations()? != obligations
                 {
                     return Err(conflict());
                 }
@@ -2637,30 +2648,33 @@ pub(crate) mod native {
                             )?
                         }
                     }
-                    // Full route table capture resolves ONLY interfaces of
-                    // actual remaining rows. Historical identities stay
-                    // exclusions; never adopt a foreign/old member path.
-                    let owned = proofs
-                        .iter()
-                        .flatten()
-                        .map(|proof| InterfaceIdentity {
-                            index: proof.index,
-                            luid: proof.luid,
-                            guid: proof.guid,
-                        })
-                        .collect::<Vec<_>>();
-                    let physical =
-                        crate::windows::member_physical::capture(&owned).map_err(denied)?;
-                    for lease in &obligations {
-                        physical.verify(&physical_route(lease)).map_err(denied)?;
-                    }
-                    let after = crate::windows::member_physical::capture(&owned).map_err(denied)?;
-                    for lease in &obligations {
-                        after.verify(&physical_route(lease)).map_err(denied)?;
-                    }
+                    let physical_changed = !obligations.is_empty() && {
+                        // Full route table capture resolves ONLY interfaces of
+                        // actual remaining rows. Historical identities stay
+                        // exclusions; never adopt a foreign/old member path.
+                        let owned = proofs
+                            .iter()
+                            .flatten()
+                            .map(|proof| InterfaceIdentity {
+                                index: proof.index,
+                                luid: proof.luid,
+                                guid: proof.guid,
+                            })
+                            .collect::<Vec<_>>();
+                        let physical =
+                            crate::windows::member_physical::capture(&owned).map_err(denied)?;
+                        for lease in &obligations {
+                            physical.verify(&physical_route(lease)).map_err(denied)?;
+                        }
+                        let after =
+                            crate::windows::member_physical::capture(&owned).map_err(denied)?;
+                        for lease in &obligations {
+                            after.verify(&physical_route(lease)).map_err(denied)?;
+                        }
+                        after.rows() != physical.rows() || after.proofs() != physical.proofs()
+                    };
                     if full_route_table()? != table
-                        || after.rows() != physical.rows()
-                        || after.proofs() != physical.proofs()
+                        || physical_changed
                         || read_rows()? != rows
                         || self.protected_pair(record)? != pair_bytes
                         || !same_network_ack_reads(&before_acks, &ack.acknowledgements()?)
@@ -3722,60 +3736,6 @@ pub(crate) mod native {
                 self.verify_pair(&selected, cleanup)
             })
         }
-    }
-    /// Route tables ONLY. Does not resolve/read historical NICs or C DNS.
-    /// SDK allocation layout/count are checked before decoding each family.
-    fn full_route_table() -> io::Result<Vec<Row>> {
-        use windows_sys::Win32::{
-            Foundation::{ERROR_NOT_FOUND, NO_ERROR},
-            NetworkManagement::IpHelper::{
-                FreeMibTable, GetIpForwardTable2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
-            },
-            Networking::WinSock::{AF_INET, AF_INET6},
-        };
-        struct Table(*mut MIB_IPFORWARD_TABLE2);
-        impl Drop for Table {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe { FreeMibTable(self.0.cast()) };
-                }
-            }
-        }
-        let mut result = Vec::new();
-        for family in [AF_INET, AF_INET6] {
-            let mut raw = std::ptr::null_mut();
-            let status = unsafe { GetIpForwardTable2(family, &mut raw) };
-            let memory = Table(raw);
-            if status == ERROR_NOT_FOUND {
-                continue;
-            }
-            if status != NO_ERROR {
-                return Err(io::Error::from_raw_os_error(status as i32));
-            }
-            if memory.0.is_null() {
-                return Err(conflict());
-            }
-            let count = unsafe { std::ptr::addr_of!((*memory.0).NumEntries).read() } as usize;
-            if count > crate::member_routes::MAX_TABLE_ROWS {
-                return Err(conflict());
-            }
-            if count == 0 {
-                continue;
-            }
-            let first =
-                unsafe { std::ptr::addr_of!((*memory.0).Table).cast::<MIB_IPFORWARD_ROW2>() };
-            for native in unsafe { std::slice::from_raw_parts(first, count) } {
-                let prefix = crate::windows::member_routes::decode_prefix(native)?;
-                if prefix.addr().is_ipv6() != (family == AF_INET6) {
-                    return Err(conflict());
-                }
-                result.push(crate::windows::member_routes::decode_row(native, prefix)?);
-            }
-        }
-        // Table order isn't an ownership fact. Canonicalize without dedup so
-        // duplicate or competing native rows remain visible to comparisons.
-        result.sort_by_key(|r| (key(&r.route), r.route.gateway, r.route.metric, r.luid));
-        Ok(result)
     }
     fn compare_physical_plan(paths: &[PhysicalRoute], leases: &[PhysicalLease]) -> io::Result<()> {
         let mut expected = BTreeMap::new();

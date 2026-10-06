@@ -472,60 +472,74 @@ pub(crate) mod native {
         saved: &NativeNetworkRecord,
         protected_record: Option<Vec<u8>>,
     ) -> io::Result<NativeNetworkFacts> {
-        let ids = std::iter::once(&s.carrier.identity)
-            .chain(s.members.iter().flatten())
-            .map(|id| InterfaceIdentity {
-                index: id.proof.index,
-                luid: id.proof.luid,
-                guid: id.proof.guid,
-            })
-            .collect::<Vec<_>>();
-        // ONE full table capture per sample, not an unbounded per-key table
-        // reader. Both families and exact physical identity/metrics are retained.
-        let physical = crate::windows::member_physical::capture(&ids).inspect_err(|_error| {
-            #[cfg(test)]
-            trace_step(&format!(
-                "network read physical capture error={_error:?} raw_os_error={:?}",
-                _error.raw_os_error(),
-            ));
-        })?;
-        let mut leases = Vec::with_capacity(saved.physical.len());
-        for p in &saved.physical {
-            let expected = PhysicalRoute {
-                proof: PhysicalProof {
-                    identity: InterfaceIdentity {
-                        index: p.interface,
-                        luid: p.luid,
-                        guid: p.guid,
-                    },
-                    family: if p.ipv6 { Family::V6 } else { Family::V4 },
-                    metric: p.interface_metric,
-                },
-                row: Row {
-                    route: p.route.clone(),
-                    luid: p.luid,
-                    protocol: p.protocol,
-                    origin: p.origin,
-                    site_prefix_length: p.site_prefix_length,
-                    valid_lifetime: p.valid_lifetime,
-                    preferred_lifetime: p.preferred_lifetime,
-                    flags: p.flags,
-                },
-            };
-            physical
-                .verify(&expected)
-                .inspect_err(|_| {
+        let routes = if saved.physical.is_empty() {
+            // Without physical obligations only full route facts are consumed.
+            let rows =
+                crate::windows::member_physical::full_route_table().inspect_err(|_error| {
                     #[cfg(test)]
-                    trace_step("network read physical lease verification error");
+                    trace_step(&format!(
+                        "network read route table error={_error:?} raw_os_error={:?}",
+                        _error.raw_os_error(),
+                    ));
+                })?;
+            compare_routes(s, &saved.journal, &[], &rows)
+        } else {
+            let ids = std::iter::once(&s.carrier.identity)
+                .chain(s.members.iter().flatten())
+                .map(|id| InterfaceIdentity {
+                    index: id.proof.index,
+                    luid: id.proof.luid,
+                    guid: id.proof.guid,
                 })
-                .map_err(io::Error::other)?;
-            leases.push((p.interface, p.luid, p.guid));
+                .collect::<Vec<_>>();
+            // Saved physical obligations require the full current NIC inventory
+            // and exact family/identity/metric verification.
+            let physical =
+                crate::windows::member_physical::capture(&ids).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "network read physical capture error={_error:?} raw_os_error={:?}",
+                        _error.raw_os_error(),
+                    ));
+                })?;
+            let mut leases = Vec::with_capacity(saved.physical.len());
+            for p in &saved.physical {
+                let expected = PhysicalRoute {
+                    proof: PhysicalProof {
+                        identity: InterfaceIdentity {
+                            index: p.interface,
+                            luid: p.luid,
+                            guid: p.guid,
+                        },
+                        family: if p.ipv6 { Family::V6 } else { Family::V4 },
+                        metric: p.interface_metric,
+                    },
+                    row: Row {
+                        route: p.route.clone(),
+                        luid: p.luid,
+                        protocol: p.protocol,
+                        origin: p.origin,
+                        site_prefix_length: p.site_prefix_length,
+                        valid_lifetime: p.valid_lifetime,
+                        preferred_lifetime: p.preferred_lifetime,
+                        flags: p.flags,
+                    },
+                };
+                physical
+                    .verify(&expected)
+                    .inspect_err(|_| {
+                        #[cfg(test)]
+                        trace_step("network read physical lease verification error");
+                    })
+                    .map_err(io::Error::other)?;
+                leases.push((p.interface, p.luid, p.guid));
+            }
+            compare_routes(s, &saved.journal, &leases, physical.rows())
         }
-        let routes =
-            compare_routes(s, &saved.journal, &leases, physical.rows()).inspect_err(|_| {
-                #[cfg(test)]
-                trace_step("network read compare_routes error");
-            })?;
+        .inspect_err(|_| {
+            #[cfg(test)]
+            trace_step("network read compare_routes error");
+        })?;
         let c = &s.carrier.identity;
         let interface = dns::OwnedInterface {
             scope: c.scope.clone(),
