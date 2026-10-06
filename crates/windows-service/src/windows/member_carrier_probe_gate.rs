@@ -1,6 +1,5 @@
 //! Concrete original-Wfp probe authorization. Factory remains disconnected.
 //! Portable comparisons confer no socket/resource permission.
-#![allow(dead_code)]
 use crate::{
     member_carrier_guard as policy,
     member_carrier_native_ownership::Context,

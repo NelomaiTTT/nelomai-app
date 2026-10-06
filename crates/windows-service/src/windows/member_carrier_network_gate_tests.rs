@@ -1924,10 +1924,10 @@ fn resource_records(c: &Context, r: &pair::Record) -> [Option<rows::Record>; 3] 
         })
     })
 }
-fn resource_facts(records: &[Option<rows::Record>; 3]) -> ResourceRows<'_> {
+fn resource_facts(records: &[Option<rows::Record>; 3]) -> GuardResourceRows<'_> {
     records
         .each_ref()
-        .map(|r| r.as_ref().map(|r| (&r.binding, r, &r.current)))
+        .map(|r| r.as_ref().map(|r| (&r.binding, r, Some(&r.current))))
 }
 
 fn normal_retire_fixture() -> (
@@ -2116,7 +2116,8 @@ fn normal_retire_lineage_only_removes_exact_target_and_preserves_network() {
 fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
     let (c, r) = fixture();
     let resources = resource_records(&c, &r);
-    let metrics = compare_resource_rows(&c, &r, resource_facts(&resources)).unwrap();
+    let metrics =
+        compare_sampled_resource_rows(&c, &r, resource_facts(&resources), [None, None]).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 8);
     assert_eq!(metrics[0].metric, 5);
@@ -2148,7 +2149,7 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
             _ => carrier.creation = None,
         }
         assert!(
-            compare_resource_rows(&c, &r, resource_facts(&wrong)).is_err(),
+            compare_sampled_resource_rows(&c, &r, resource_facts(&wrong), [None, None]).is_err(),
             "fault {fault}"
         );
     }
@@ -2156,14 +2157,15 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
     actual.interface.policy.metric += 1;
     let carrier = resources[0].as_ref().unwrap();
     let member = resources[1].as_ref().unwrap();
-    assert!(compare_resource_rows(
+    assert!(compare_sampled_resource_rows(
         &c,
         &r,
         [
-            Some((&carrier.binding, carrier, &actual)),
-            Some((&member.binding, member, &member.current)),
+            Some((&carrier.binding, carrier, Some(&actual))),
+            Some((&member.binding, member, Some(&member.current))),
             None
-        ]
+        ],
+        [None, None]
     )
     .is_err());
 }

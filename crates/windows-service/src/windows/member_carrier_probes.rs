@@ -1,7 +1,6 @@
 //! Retained original C-source / addressless A-B-egress probe sockets.
 //! Comparison tuples are factual values, not grants. Concrete G must supply the
 //! required original-runtime/guard/lifecycle authorization before integration.
-#![allow(dead_code)] // Native factory remains gated; no successful gate is supplied.
 
 use crate::{
     member_carrier_guard::{Action, Carrier, Identity, ProbeTuple, Snapshot},
@@ -177,6 +176,7 @@ impl<S: SocketOwner, C> Held<S, C> {
         }
         self.closed.as_ref().ok_or(GuardError::RemovalUnconfirmed)
     }
+    #[cfg(test)]
     fn clone_held(&mut self) -> Result<u64> {
         if self.revoked {
             return Err(GuardError::Conflict);
@@ -599,9 +599,6 @@ pub(crate) mod native {
                 inventory: self.original.upgrade().ok_or(GuardError::Conflict)?,
             })
         }
-        pub(crate) fn same_inventory(&self, other: &Self) -> bool {
-            self.original.same_original(&other.original)
-        }
     }
     /// Opaque SAME-original closed witness. Only actual cloned/base close ACKs
     /// create it; no bool/numeric/import/constructor-based retirement grant.
@@ -784,7 +781,7 @@ pub(crate) mod native {
             &mut self,
             closing: &NativeClosingRead,
         ) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
-            self.release_inventory(ReleasePhase::Closing(closing), true)
+            self.release_inventory(ReleasePhase::Closing(closing))
         }
         /// Healthy SAME Source Preparing only. A Source-postflight failure may
         /// irrevocably revoke Live reads, in which case this refuses and the real
@@ -792,21 +789,11 @@ pub(crate) mod native {
         pub(crate) fn release_unpublished_preparing(
             &mut self,
         ) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
-            self.release_inventory(ReleasePhase::Preparing, true)
-        }
-        /// Whole-actor protected cleanup remains retrievable even if a published
-        /// alias was dropped. Live clones still deny base close; no second owner
-        /// or constructor is exposed to the caller.
-        pub(crate) fn release_all(
-            &mut self,
-            closing: &NativeClosingRead,
-        ) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
-            self.release_inventory(ReleasePhase::Closing(closing), false)
+            self.release_inventory(ReleasePhase::Preparing)
         }
         fn release_inventory(
             &mut self,
             phase: ReleasePhase<'_>,
-            unpublished: bool,
         ) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
             let call = self.inventory.serial.call(true)?;
             self.inventory.gate.verify_inventory(&self.read_pin())?;
@@ -815,11 +802,7 @@ pub(crate) mod native {
                 .entries
                 .try_borrow()
                 .map_err(|_| GuardError::Conflict)?;
-            let originals: Vec<_> = if unpublished {
-                entries.unpublished().cloned().collect()
-            } else {
-                entries.all().cloned().collect()
-            };
+            let originals: Vec<_> = entries.unpublished().cloned().collect();
             drop(entries);
             let mut retired = Vec::new();
             for original in originals {
@@ -1129,11 +1112,6 @@ pub(crate) mod native {
                 .map_err(|_| GuardError::Conflict)?
                 .retired()?;
             Ok(())
-        }
-        pub(crate) fn pin(&self) -> Self {
-            Self {
-                original: self.original.clone(),
-            }
         }
     }
     impl<N: NativeApi, A: BindingAttestor, G: NativeProbeGate<N, A>> HeldProbeRead<N, A, G> {

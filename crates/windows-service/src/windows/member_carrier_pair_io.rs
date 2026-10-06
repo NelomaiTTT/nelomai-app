@@ -980,7 +980,6 @@ fn capture_once<T>(
 #[cfg(any(windows, test))]
 struct PhysicalBypasses {
     routes: Vec<nelomai_client_tunnel::redundancy::network::RouteValue>,
-    originals: Vec<crate::member_physical::PhysicalRoute>,
     retained: Vec<nelomai_client_tunnel::redundancy::network::RouteValue>,
 }
 
@@ -1347,8 +1346,7 @@ fn network_sample(
     }
 }
 
-/// Pure planning facts, never an owner capture or mutation grant. Preserve the
-/// COMPLETE source path, not the narrower bypass value derived from that path.
+/// Pure planning facts, never an owner capture or mutation grant.
 #[cfg(any(windows, test))]
 fn physical_bypasses(
     physical: &crate::member_physical::PhysicalSnapshot,
@@ -1357,7 +1355,6 @@ fn physical_bypasses(
     use nelomai_client_tunnel::redundancy::network::{RouteScope, RouteValue};
     let mut result = PhysicalBypasses {
         routes: Vec::new(),
-        originals: Vec::new(),
         retained: Vec::new(),
     };
     for destination in destinations {
@@ -1375,7 +1372,6 @@ fn physical_bypasses(
             result.retained.push(route.clone());
         }
         result.routes.push(route);
-        result.originals.push(path);
     }
     Ok(result)
 }
@@ -2247,12 +2243,11 @@ pub(crate) mod native {
         }
     }
 
-    /// Fresh comparison data only. Raman's actual native capture protocol must
-    /// independently retain/verify these exact paths before owner.select; the
+    /// Fresh comparison data only. The actual native capture protocol must
+    /// independently retain/verify physical paths before owner.select; the
     /// copied Snapshot alone cannot seed an original physical ACK.
     struct NativeNetworkPlan {
         snapshot: pair::NetworkSnapshot,
-        physical: Vec<crate::member_physical::PhysicalRoute>,
     }
 
     /// Both coordinator CAS and actor pin minting use THIS SAME actual store.
@@ -7311,7 +7306,6 @@ pub(crate) mod native {
                         .collect(),
                     dns: Some(dns),
                 },
-                physical: bypasses.originals,
             })
         }
 

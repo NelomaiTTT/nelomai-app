@@ -2556,7 +2556,7 @@ fn unstarted_cleanup_dispatch_requires_exact_slot_stage_and_member_stop_edge() {
 }
 
 #[test]
-fn bypass_planning_preserves_original_full_physical_path_not_derived_host_route() {
+fn bypass_planning_derives_host_route_and_retains_existing_routes() {
     use crate::member_physical::{
         Family, InterfaceIdentity, InterfaceRecord, PhysicalProof, PhysicalSnapshot,
     };
@@ -2610,17 +2610,6 @@ fn bypass_planning_preserves_original_full_physical_path_not_derived_host_route(
         "198.18.0.1/32".parse::<ipnet::IpNet>().unwrap()
     );
     assert_eq!(planned.retained, vec![row.route.clone()]);
-    assert_eq!(planned.originals.len(), 2);
-    for original in &planned.originals {
-        assert_eq!(original.proof, proof);
-        assert_eq!(original.row, row);
-        physical.verify(original).unwrap();
-    }
-    // Replacing complete source rows with narrower derived routes cannot pass
-    // the independent physical snapshot's exact original-path comparison.
-    let mut substituted = planned.originals[0].clone();
-    substituted.row.route = planned.routes[0].clone();
-    assert!(physical.verify(&substituted).is_err());
 }
 
 #[test]

@@ -1354,7 +1354,6 @@ fn compare_route_reads(
 
 /// Read-only comparison DATA extracted inside Main's concrete resource sampler.
 /// Never instantiated from a permissive trait or used as an original read pin.
-type ResourceRows<'a> = [Option<(&'a rows::Binding, &'a rows::Record, &'a rows::Snapshot)>; 3];
 type GuardResourceRows<'a> = [Option<(
     &'a rows::Binding,
     &'a rows::Record,
@@ -1483,18 +1482,6 @@ fn compare_guard_resource_rows(
 ) -> io::Result<Vec<InterfaceMetric>> {
     compare_guard_resource_stage(context, record)?;
     compare_sampled_resource_rows(context, record, resources, closed)
-}
-fn compare_resource_rows(
-    context: &Context,
-    record: &pair::Record,
-    resources: ResourceRows<'_>,
-) -> io::Result<Vec<InterfaceMetric>> {
-    compare_sampled_resource_rows(
-        context,
-        record,
-        resources.map(|r| r.map(|(binding, ack, actual)| (binding, ack, Some(actual)))),
-        [None, None],
-    )
 }
 fn compare_sampled_resource_rows(
     context: &Context,
@@ -1724,40 +1711,6 @@ pub(crate) mod native {
         fence: GateFence,
     }
     impl<A: WindowBindingAttestor> NativeNetworkGate<A> {
-        /// Retain every root BEFORE fallible validation. The actor wraps fresh
-        /// network-owner construction in its actual supervisor Calling scope,
-        /// then registers owner.read_pin() BEFORE invoking select/cleanup.
-        /// Main owns the sampler's once-only member/Closing registrations.
-        #[allow(clippy::too_many_arguments)]
-        pub(crate) fn new(
-            context: Context,
-            runtime: RuntimeRead,
-            files: NativeSessionFiles,
-            source: Rc<NativeSourceRead>,
-            pair: Rc<NativePairIntentRead>,
-            network: Rc<NativeNetworkIntentRead>,
-            expected: pair::Record,
-            guard: Rc<RefCell<NativeGuard<Wfp, A>>>,
-            rows: Rc<NativeResourceRowsRead>,
-            supervisor: Rc<NativeDeadline>,
-            deadline: NativeDeadlineReadPin,
-            cancelled: Arc<AtomicBool>,
-        ) -> Rc<Self> {
-            Self::with_roots(
-                context,
-                runtime,
-                files,
-                source,
-                pair,
-                Some(network),
-                expected,
-                guard,
-                rows,
-                supervisor,
-                deadline,
-                cancelled,
-            )
-        }
         /// Actual composition root before the first logical Network CAS.
         /// Actor retains this Rc BEFORE fallible validation/owner construction;
         /// no future span or initial DNS capability is fabricated here.
@@ -1768,26 +1721,6 @@ pub(crate) mod native {
             files: NativeSessionFiles,
             source: Rc<NativeSourceRead>,
             pair: Rc<NativePairIntentRead>,
-            expected: pair::Record,
-            guard: Rc<RefCell<NativeGuard<Wfp, A>>>,
-            rows: Rc<NativeResourceRowsRead>,
-            supervisor: Rc<NativeDeadline>,
-            deadline: NativeDeadlineReadPin,
-            cancelled: Arc<AtomicBool>,
-        ) -> Rc<Self> {
-            Self::with_roots(
-                context, runtime, files, source, pair, None, expected, guard, rows, supervisor,
-                deadline, cancelled,
-            )
-        }
-        #[allow(clippy::too_many_arguments)]
-        fn with_roots(
-            context: Context,
-            runtime: RuntimeRead,
-            files: NativeSessionFiles,
-            source: Rc<NativeSourceRead>,
-            pair: Rc<NativePairIntentRead>,
-            network: Option<Rc<NativeNetworkIntentRead>>,
             expected: pair::Record,
             guard: Rc<RefCell<NativeGuard<Wfp, A>>>,
             rows: Rc<NativeResourceRowsRead>,
@@ -1809,7 +1742,7 @@ pub(crate) mod native {
                 rows,
                 selected: RefCell::new(Selected {
                     pair,
-                    network,
+                    network: None,
                     record: expected,
                 }),
                 guard_selected: RefCell::new(None),
@@ -3081,23 +3014,6 @@ pub(crate) mod native {
                 || c.sources != r.addresses.iter().map(|a| a.addr()).collect::<Vec<_>>()
             {
                 return Err(conflict());
-            }
-            Ok(())
-        }
-        fn compare_bindings(
-            &self,
-            r: &pair::Record,
-            b: &crate::windows::member_carrier_guard::Bindings,
-        ) -> io::Result<()> {
-            self.compare_carrier_binding(r, b)?;
-            for (member, egress) in r.members.iter().zip(&b.egress) {
-                match (member, egress) {
-                    (None, None) => (),
-                    (Some(m), Some(e))
-                        if m.owner.proof.is_some_and(|p| p.interface == e.proof)
-                            && e.scope == r.scope => {}
-                    _ => return Err(conflict()),
-                }
             }
             Ok(())
         }
