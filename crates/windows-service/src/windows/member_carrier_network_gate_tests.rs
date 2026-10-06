@@ -113,7 +113,7 @@ fn pre_network_root_accepts_bootstrap_pair_but_not_effect_or_restored_metadata()
 }
 
 // Break: first real store span is rejected because old Network was None, or
-// that exception permits later baseline replacement/Closing-first exchange.
+// that exception permits later baseline replacement or non-stage-two Closing.
 #[test]
 fn first_network_selection_requires_real_effect_record_and_keeps_later_baseline() {
     let (c, next) = fixture();
@@ -127,6 +127,23 @@ fn first_network_selection_requires_real_effect_record_and_keeps_later_baseline(
     assert!(compare_network_selection_records(&c, &old, &missing).is_err());
     let (c2, closing, _) = lifecycle_fixture(3);
     assert!(compare_network_selection_records(&c2, &old, &closing).is_err());
+    let mut cleanup = next.clone();
+    cleanup.phase = pair::Phase::Closing;
+    cleanup.operation = None;
+    cleanup.active = None;
+    cleanup.stop_stage = 2;
+    cleanup.pending = Some(pair::Effect::RestoreNetwork);
+    let network = cleanup.network.as_mut().unwrap();
+    network.pending = Some(network.baseline.clone());
+    assert!(compare_stage(&c, &cleanup, true).is_ok());
+    assert!(compare_network_selection_records(&c, &old, &cleanup).is_ok());
+    for revision in [old.revision, old.revision - 1] {
+        let mut stale = cleanup.clone();
+        stale.revision = revision;
+        assert!(compare_network_selection_records(&c, &old, &stale).is_err());
+    }
+    cleanup.stop_stage = 3;
+    assert!(compare_network_selection_records(&c, &old, &cleanup).is_err());
     let mut later = next.clone();
     later.revision += 1;
     later

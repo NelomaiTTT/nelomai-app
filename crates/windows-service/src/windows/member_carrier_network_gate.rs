@@ -248,9 +248,10 @@ fn compare_network_selection_records(
     } else {
         compare_pre_network_record(context, old)?;
         if next.revision <= old.revision
-            || next.phase != pair::Phase::Starting
-            || next.pending != Some(pair::Effect::Network)
-            || next.operation != old.operation
+            || (next.phase != pair::Phase::Closing
+                && (next.phase != pair::Phase::Starting
+                    || next.pending != Some(pair::Effect::Network)
+                    || next.operation != old.operation))
         {
             return Err(conflict());
         }
@@ -3353,7 +3354,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             let obligations = ack.physical_obligations()?;
-            let physical_leases = if capture.is_some() {
+            let physical_leases = if cleanup || capture.is_some() {
                 obligations.clone()
             } else {
                 ack.physical_leases()?

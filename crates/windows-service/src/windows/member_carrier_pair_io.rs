@@ -6868,12 +6868,22 @@ pub(crate) mod native {
                         .store
                         .try_borrow_mut()
                         .map_err(denied)?
-                        .network_intent(record)?,
+                        .network_intent(record)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            trace_step(&format!("exchange_network network_intent error={_error}"));
+                        })?,
                 );
                 this.network_intents.push(intent.clone()); // retain before gate read
                 let r = this.roots()?;
                 r.network_gate
-                    .select_pair_intent(pin.clone(), intent, record.clone())?;
+                    .select_pair_intent(pin.clone(), intent, record.clone())
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "exchange_network select_pair_intent error={_error}"
+                        ));
+                    })?;
                 if record.phase == pair::Phase::Closing {
                     r.network_owner
                         .cleanup(this.closing.as_ref().ok_or_else(conflict)?.clone())
@@ -6890,6 +6900,12 @@ pub(crate) mod native {
                         &record.dns,
                     )
                 }
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "exchange_network owner select/cleanup error={_error}"
+                    ));
+                })
             })
         }
 
