@@ -2386,19 +2386,15 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            match (&owned.prepared_origin, prepared) {
-                (Some(origin), Some(preparation)) => {
-                    self.terminal_prepared_origin(origin, index, runtime, context)?;
-                    if !Rc::ptr_eq(origin, &preparation.origin)
-                        || preparation.root.owner.is_some()
-                        || origin.intent != owned.intent
-                        || origin.generation != owned.generation
-                    {
-                        return Err(Error::Conflict);
-                    }
-                }
-                (None, None) => (), // Legacy construction still uses this SAME ledger.
-                _ => return Err(Error::Conflict),
+            let origin = &owned.prepared_origin;
+            let preparation = prepared.ok_or(Error::Conflict)?;
+            self.terminal_prepared_origin(origin, index, runtime, context)?;
+            if !Rc::ptr_eq(origin, &preparation.origin)
+                || preparation.root.owner.is_some()
+                || origin.intent != owned.intent
+                || origin.generation != owned.generation
+            {
+                return Err(Error::Conflict);
             }
             if !controller.root.attempted {
                 if !controller.rebinds.is_empty()
@@ -3769,11 +3765,6 @@ pub(crate) mod native {
         live_source: Option<PreparedSourceRegistration<NativeSourceRead>>,
         live_preparation: Option<PairRecord>,
     }
-    pub(crate) struct NativeMemberReplacementSlots<'a, G: NativeMemberLifecycle> {
-        pub prepared: &'a mut Option<NativePreparedMember>,
-        pub controller: &'a mut Option<NativeMemberController<G>>,
-        pub retired: &'a mut Vec<NativeRetiredMemberRoots<G>>,
-    }
     pub(crate) struct NativeMemberAttachment<G> {
         pub image: OriginalImage,
         pub original_source: Rc<NativeSourceRead>,
@@ -3885,65 +3876,6 @@ pub(crate) mod native {
                     let _ = error;
                 })
         }
-        pub(crate) fn origin(&self) -> &PreparedMemberOrigin {
-            &self.origin
-        }
-        /// SAME original completed Retire -> retain BOTH old roots -> readonly
-        /// next owner. No native effects, inventory/row removal or key rearm.
-        /// Err/unwind after the move retains old originals in caller storage.
-        pub(crate) fn prepare_replacement<G: NativeMemberLifecycle>(
-            slots: NativeMemberReplacementSlots<'_, G>,
-            input: NativePreparedMemberInputs,
-            logical: &str,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            lock: &mut KeyLock,
-        ) -> Result<Rc<NativeMemberPreparationGeneration>> {
-            Self::prepare_replacement_inner(slots, input, logical, pair, expected, lock)
-                .map_err(pending_unknown)
-        }
-        fn prepare_replacement_inner<G: NativeMemberLifecycle>(
-            slots: NativeMemberReplacementSlots<'_, G>,
-            input: NativePreparedMemberInputs,
-            logical: &str,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            lock: &mut KeyLock,
-        ) -> Result<Rc<NativeMemberPreparationGeneration>> {
-            let controller = slots.controller.as_mut().ok_or(Error::Pending)?;
-            let owned = controller.root.owner.as_ref().ok_or(Error::Retired)?;
-            if owned.intent.slot != input.slot
-                || owned.intent.engine != input.engine
-                || owned.context != input.context
-                || !owned.runtime.same_original_runtime(&input.runtime)
-                || !Rc::ptr_eq(&owned.never_effects, &input.never_effects)
-                || !Rc::ptr_eq(&owned.source, &input.source)
-                || !Rc::ptr_eq(&owned.carrier, &input.carrier)
-                || !Rc::ptr_eq(&owned.supervisor, &input.supervisor)
-            {
-                return Err(Error::Conflict);
-            }
-            let ticket = controller.retire_preparation_generation(pair, expected, lock)?;
-            ticket.verify_original(&input.never_effects, &input.runtime, &input.context)?;
-            Self::retain_closed_generation(
-                slots.prepared,
-                slots.controller,
-                &ticket,
-                slots.retired,
-            )?;
-            Self::prepare(slots.prepared, input, logical, lock)?;
-            let prepared = slots.prepared.as_ref().ok_or(Error::Pending)?;
-            if prepared
-                .origin
-                .replacement
-                .as_ref()
-                .is_none_or(|t| !Rc::ptr_eq(t, &ticket))
-            {
-                return Err(Error::Conflict);
-            }
-            prepared.origin.verify(lock)?;
-            Ok(ticket)
-        }
         /// Move both SAME closed roots into caller retention, not Drop/None
         /// inference. Does NOT replace inventory entries or admit native Start.
         pub(crate) fn retain_closed_generation<G: NativeMemberLifecycle>(
@@ -3965,10 +3897,7 @@ pub(crate) mod native {
                     .closed
                     .as_ref()
                     .is_none_or(|c| !Rc::ptr_eq(c, &ticket.receipt))
-                || owned
-                    .prepared_origin
-                    .as_ref()
-                    .is_none_or(|o| !Rc::ptr_eq(o, &old_prepared.origin))
+                || !Rc::ptr_eq(&owned.prepared_origin, &old_prepared.origin)
                 || old_prepared.root.owner.is_some()
                 || !owned
                     .never_effects
@@ -4871,7 +4800,7 @@ pub(crate) mod native {
                             gate: input.gate,
                             never_effects: origin.never_effects.clone(),
                             generation: origin.generation,
-                            prepared_origin: Some(origin),
+                            prepared_origin: origin,
                             started_generation: None,
                             started_initial: None,
                             prior: state.prior,
@@ -4884,11 +4813,7 @@ pub(crate) mod native {
                             .inventory
                             .read_pin()
                             .register_pending(owned.source.clone(), owned.pending.read_pin())?;
-                        owned
-                            .prepared_origin
-                            .as_ref()
-                            .ok_or(Error::Conflict)?
-                            .verify(lock)?;
+                        owned.prepared_origin.verify(lock)?;
                         pair.inspect_effect(
                             &owned.runtime,
                             &owned.supervisor,
@@ -4897,11 +4822,7 @@ pub(crate) mod native {
                             |_| Ok(()),
                         )
                         .map_err(|_| Error::Conflict)?;
-                        owned
-                            .prepared_origin
-                            .as_ref()
-                            .ok_or(Error::Conflict)?
-                            .verify(lock)
+                        owned.prepared_origin.verify(lock)
                     },
                 )
                 .map_err(root_error)
@@ -4998,7 +4919,7 @@ pub(crate) mod native {
         inventory: MemberInventoryRead,
         supervisor: Rc<NativeDeadline>,
         gate: Rc<RefCell<G>>,
-        prepared_origin: Option<Rc<PreparedMemberOrigin>>,
+        prepared_origin: Rc<PreparedMemberOrigin>,
         started_generation: Option<Rc<NativeMemberStartedGeneration>>,
         started_initial: Option<Rc<NativeMemberStartedInitial>>,
         never_effects: Rc<NativeNeverMemberEffects>,
@@ -5020,23 +4941,6 @@ pub(crate) mod native {
         NativeMemberPreparationGeneration,
     >;
 
-    /// Inputs are actual retained native capabilities. Engine is comparison
-    /// input only: RuntimeRead.verify_member_intent authenticates it against the
-    /// SAME current signed installed executable before any member effect.
-    pub(crate) struct NativeMemberInputs<G> {
-        pub context: Context,
-        pub runtime: RuntimeRead,
-        pub engine: PathBuf,
-        pub slot: TunnelSlot,
-        pub source: Rc<MemberSource>,
-        pub carrier: Rc<WintunSource>,
-        pub image: OriginalImage,
-        pub original_source: Rc<NativeSourceRead>,
-        pub inventory: MemberInventoryRead,
-        pub supervisor: Rc<NativeDeadline>,
-        pub gate: Rc<RefCell<G>>,
-        pub never_effects: Rc<NativeNeverMemberEffects>,
-    }
     impl<G: NativeMemberLifecycle> NativeMemberController<G> {
         /// First-generation counterpart: ONLY the actual prepared owner/read,
         /// no replacement ticket or imported generation. Retained before inventory.
@@ -5603,96 +5507,6 @@ pub(crate) mod native {
                 .expect("retained member owner")
                 .intent
         }
-        /// Populate the caller's persistent slot before authentication can
-        /// fail. Construction creates no service/process, writes no config and
-        /// loads no DLL. Duplicate preparation cannot overwrite a retained root.
-        pub(crate) fn prepare(
-            slot: &mut Option<Self>,
-            input: NativeMemberInputs<G>,
-            logical: &str,
-        ) -> Result<()> {
-            if slot.is_some() {
-                return Err(Error::Retired);
-            }
-            if !input.never_effects.matches(
-                &input.context,
-                &input.runtime,
-                &input.source,
-                &input.carrier,
-                &input.supervisor,
-            ) {
-                return Err(Error::Conflict);
-            }
-            let generation = input
-                .never_effects
-                .history
-                .prepare(slot_index(input.slot))?;
-            let transport = input.source.transport();
-            let io = NativeMemberIo::from_trusted_factory(
-                input.engine.clone(),
-                input.slot,
-                transport,
-                MemberFiles::new().map_err(owner_error)?,
-            )
-            .map_err(owner_error)?;
-            let owner = MemberOwner::from_trusted_carrier_engine(
-                &input.context.intent,
-                input.slot,
-                transport,
-                input.engine,
-                logical,
-                MemberFiles::new().map_err(owner_error)?,
-                io,
-            )
-            .map_err(owner_error)?;
-            let intent = owner.intent().clone();
-            let member = RetainedMember::new(owner);
-            let pending = member.pending_read().map_err(owner_error)?;
-            *slot = Some(Self {
-                rebinds: Vec::new(),
-                root: OperationRoot::new(OwnedMember {
-                    member,
-                    pending,
-                    partial_cleanup: None,
-                    context: input.context,
-                    intent,
-                    runtime: input.runtime,
-                    source: input.source,
-                    carrier: input.carrier,
-                    image: input.image,
-                    original_source: input.original_source,
-                    inventory: input.inventory,
-                    supervisor: input.supervisor,
-                    gate: input.gate,
-                    prepared_origin: None,
-                    started_generation: None,
-                    started_initial: None,
-                    never_effects: input.never_effects,
-                    generation,
-                    prior: None,
-                }),
-            });
-            let owned = slot
-                .as_ref()
-                .expect("caller-rooted member")
-                .root
-                .owner
-                .as_ref()
-                .expect("retained owner");
-            owned.verify_source_roots()?;
-            owned
-                .member
-                .prepare_readonly_native_profile()
-                .map_err(owner_error)?;
-            owned.verify_sources()?;
-            // Inventory roots its first actual owner/source receipt before any
-            // Start effect and before its own fallible publication postflight.
-            owned
-                .inventory
-                .read_pin()
-                .register_pending(owned.source.clone(), owned.pending.read_pin())
-        }
-
         /// Called INSIDE the SAME supervisor.run_intent Calling operation.
         /// The native typed receipt is borrowed from the caller's SAME actual
         /// NativeOwnership; it cannot be reconstructed from Pair JSON.
@@ -6012,13 +5826,7 @@ pub(crate) mod native {
 
     impl<G: NativeMemberLifecycle> OwnedMember<G> {
         fn root_started_generation(&mut self, reader: &Reader) -> Result<()> {
-            let Some(origin) = self.prepared_origin.as_ref() else {
-                return if self.generation == 1 {
-                    Ok(())
-                } else {
-                    Err(Error::Pending)
-                };
-            };
+            let origin = &self.prepared_origin;
             let Some(ticket) = origin.replacement.as_ref() else {
                 if self.generation != 1 {
                     return Err(Error::Pending);
@@ -6331,7 +6139,7 @@ pub(crate) mod native {
             {
                 return Ok(());
             }
-            let origin = self.prepared_origin.as_ref().ok_or(Error::Pending)?;
+            let origin = &self.prepared_origin;
             if origin.intent != self.intent
                 || !origin.runtime.same_original_runtime(&self.runtime)
                 || !Rc::ptr_eq(&origin.source, &self.source)
@@ -6387,11 +6195,7 @@ pub(crate) mod native {
             receipt: Receipt<'_>,
         ) -> Result<()> {
             self.verify_sources()?;
-            if let Some(ticket) = self
-                .prepared_origin
-                .as_ref()
-                .and_then(|o| o.replacement.as_ref())
-            {
+            if let Some(ticket) = &self.prepared_origin.replacement {
                 ticket.verify_original(&self.never_effects, &self.runtime, &self.context)?;
                 ticket.verify_source(&self.original_source)?;
                 validate_replacement_prior(
