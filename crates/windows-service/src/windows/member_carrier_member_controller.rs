@@ -2757,8 +2757,6 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            self.input.runtime.verify(&self.input.context)?;
-            self.input.runtime.verify_source(&self.input.carrier)?;
             self.input
                 .runtime
                 .verify_member_source(&self.input.context, &self.input.source)?;
@@ -6348,8 +6346,6 @@ pub(crate) mod native {
                 .map_err(owner_error)
         }
         fn verify_source_roots(&self) -> Result<()> {
-            self.runtime.verify(&self.context)?;
-            self.runtime.verify_source(&self.carrier)?;
             self.runtime
                 .verify_member_intent(&self.context, &self.source, &self.intent)?;
             if !self.source.matches_carrier(&self.carrier)

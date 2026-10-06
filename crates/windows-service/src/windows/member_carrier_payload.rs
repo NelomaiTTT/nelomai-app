@@ -472,10 +472,11 @@ pub(crate) mod native {
             )?;
             self.0.verify()
         }
-        /// Repeat-load comparison only. Both independently authenticated held
-        /// sources must identify the SAME original file and engine owner. Never
-        /// construct a source/module/permission from path, digest or file ID.
-        pub(in crate::windows) fn verify_process_anchor_origin(
+        /// Origin comparison only, inside the caller's full original/current
+        /// mapping authentication bracket. Held sources must identify the SAME
+        /// original file and engine owner; these facts grant no module/effect
+        /// permission or standalone signed-payload authentication.
+        pub(in crate::windows) fn compare_process_anchor_origin(
             &self,
             original: &Self,
         ) -> Result<()> {
@@ -503,10 +504,6 @@ pub(crate) mod native {
                     info.nFileIndexLow,
                 ))
             };
-            original.verify()?;
-            if !std::ptr::eq(self, original) {
-                self.verify()?;
-            }
             let held = id(original)?;
             let compare = |current| {
                 super::super::member_carrier_module::compare_process_source_origin(
@@ -520,10 +517,6 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)
             };
             compare(id(self)?)?;
-            original.verify()?;
-            if !std::ptr::eq(self, original) {
-                self.verify()?;
-            }
             if id(original)? != held {
                 return Err(Error::Conflict);
             }

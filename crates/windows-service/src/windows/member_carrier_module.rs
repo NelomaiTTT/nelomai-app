@@ -19,8 +19,8 @@ pub(crate) enum Error {
 }
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
-/// Private factual comparison used only after both native sources are freshly
-/// authenticated. Equal data never issues a module/PIN/SDK capability.
+/// Private factual comparison inside the caller's full source/mapping
+/// authentication bracket. Equal data never issues a module/PIN/SDK capability.
 pub(super) fn compare_process_source_origin<T>(
     original_owner: &std::sync::Arc<T>,
     current_owner: &std::sync::Arc<T>,
@@ -936,12 +936,12 @@ pub(crate) mod native {
             return verify_mapping(original, mapping);
         }
         current
-            .verify_process_anchor_origin(original)
+            .compare_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)?;
         verify_mapping(original, mapping)?;
         verify_mapping(current, mapping)?;
         current
-            .verify_process_anchor_origin(original)
+            .compare_process_anchor_origin(original)
             .map_err(|_| Error::Conflict)
     }
     fn require_process_anchor(source: &Rc<WintunSource>, module: &Module) -> Result<()> {
@@ -972,7 +972,7 @@ pub(crate) mod native {
                 || {
                     checkpoint(cancelled)?;
                     source
-                        .verify_process_anchor_origin(&root.source)
+                        .compare_process_anchor_origin(&root.source)
                         .map_err(|_| Error::Conflict)?;
                     verify_mapping(source, module.0)?;
                     checkpoint(cancelled)
@@ -1068,7 +1068,6 @@ pub(crate) mod native {
             // kernelcurrentexe, full signed installed payloads, held owner lock
             // and write/delete-denied source/ancestor handles. Only this fixed
             // absolute path can be loaded; dependencies search SYSTEM32 only.
-            self.source()?;
             let path = self.source.path().map_err(|_| Error::Conflict)?;
             let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
             let raw = unsafe {
