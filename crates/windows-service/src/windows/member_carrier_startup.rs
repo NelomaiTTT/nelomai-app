@@ -4842,6 +4842,7 @@ pub(crate) mod native {
                 ));
             })?;
             let source = pins.source.clone();
+            let never_effects = self.never_effects.as_ref().ok_or(Error::Pending)?.clone();
             if graph.input_transfer.is_some() {
                 return Err(Error::Conflict);
             }
@@ -4865,6 +4866,7 @@ pub(crate) mod native {
                 context: self.context.clone(),
                 runtime: self.runtime.clone(),
                 member_source: self.member_source.clone(),
+                never_effects,
                 lock: self.lock.take().expect("checked original lock"),
                 files: self.files.clone(),
                 store: self.store.clone(),

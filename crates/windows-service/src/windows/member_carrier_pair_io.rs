@@ -1472,10 +1472,12 @@ pub(crate) mod native {
                 NativeGuardResourceSelection, NativeResourceGuardGate,
             },
             member_carrier_key_authority::{KeyLock, RuntimeRead},
-            member_carrier_lifecycle_gate::native::NativeLifecycleSelection,
+            member_carrier_lifecycle_gate::native::{
+                NativeInitialMemberCaptureInputs, NativeLifecycleSelection,
+            },
             member_carrier_member_controller::native::{
                 NativeMemberAttachment, NativeMemberController, NativeMemberPreparationGeneration,
-                NativeMemberRebindReceipt, NativeMemberStartedGeneration, NativeNeverMemberEffects,
+                NativeMemberRebindReceipt, NativeNeverMemberEffects,
             },
             member_carrier_member_gate::native::{NativeMemberGate, NativeMemberGateInputs},
             member_carrier_members::native::{
@@ -2800,6 +2802,7 @@ pub(crate) mod native {
         pub image: Rc<OriginalImage>,
         /// SAME loaded source retained by startup, not reopened for reserve B.
         pub member_source: Rc<MemberSource>,
+        pub never_effects: Rc<NativeNeverMemberEffects>,
         pub members: Rc<MemberInventoryRead>,
         pub rows: Rc<NativeResourceRowsRead>,
         pub guard: Rc<RefCell<Guard>>,
@@ -6848,7 +6851,24 @@ pub(crate) mod native {
                     .as_mut()
                     .ok_or_else(conflict)?
                     .verify(pin, record, &mut r.lock)
-                    .map_err(denied)
+                    .map_err(denied)?;
+                // First committed Start/Attach captures the addressless baseline
+                // before static base or WeakRows can enter ordinary Observe G.
+                // Replacement generations keep their later typed capture path.
+                if this.row_owners[i].is_none()
+                    && this.stopped_row_generations[i].is_none()
+                    && !this
+                        .member_generation_originals
+                        .iter()
+                        .any(|entry| entry.ticket.slot() == crate::member_pair::slot_native(slot))
+                    && record.pending.is_none()
+                    && matches!((record.phase, record.operation),
+                        (pair::Phase::Starting, Some(pair::Operation::Start(s)))
+                        | (pair::Phase::Running, Some(pair::Operation::Attach(s))) if s == slot)
+                {
+                    this.capture_member_rows(pin, record, slot)?;
+                }
+                Ok(())
             })
         }
 
@@ -7817,18 +7837,40 @@ pub(crate) mod native {
             if std::mem::replace(&mut self.row_attempted[i], true) {
                 return Err(conflict());
             }
+            // Ordinary WeakRows may reuse this baseline, never perform the
+            // first initial capture after the pre-base registration window.
+            if record.pending.is_some() {
+                return Err(conflict());
+            }
+            self.select_guard(pin, record)?;
             let r = self.roots.as_mut().ok_or_else(conflict)?;
+            let started = r.controllers[i]
+                .as_ref()
+                .ok_or_else(conflict)?
+                .started_initial_registration(&r.never_effects)
+                .map_err(denied)?;
+            let proof = started.proof().map_err(denied)?;
+            let binding = Self::member_started_binding(r, record, slot, proof)?;
+            r.lifecycle
+                .begin_initial_member_row_capture(NativeInitialMemberCaptureInputs {
+                    started: &started,
+                    never: &r.never_effects,
+                    pair: pin,
+                    record,
+                    binding: &binding,
+                    supervisor: &r.pins.supervisor,
+                    guard: &r.guard,
+                    lock: &r.lock,
+                })
+                .map_err(denied)?;
             let authority = r
                 .carrier
                 .rows_authority_in_call(pin.clone(), record)
                 .map_err(denied)?;
-            let role = if slot == Slot::A {
-                rows::Role::MemberA
-            } else {
-                rows::Role::MemberB
-            };
-            let mut authority = authority.for_member(role).map_err(denied)?;
-            let binding = authority.binding().map_err(denied)?;
+            let mut authority = authority.for_member(binding.role).map_err(denied)?;
+            if authority.binding().map_err(denied)? != binding {
+                return Err(conflict());
+            }
             self.row_authorities[i] = Some(authority.read_pin()); // SAME owner alias before baseline capture
             let (journal, saved) = WindowsCarrierRowsStore::open(r.files.clone(), binding.clone())?;
             if saved.is_some() {
@@ -7846,26 +7888,27 @@ pub(crate) mod native {
                         .retain_member(slot, original.clone())
                         .map_err(|_| rows::Error::Conflict)?;
                     r.lifecycle
-                        .retain_row(role, &original)
+                        .retain_initial_member_row_capture(&started, &original)
                         .map_err(|_| rows::Error::Conflict)
                 },
             )
             .map_err(denied)?;
             self.row_owners[i] = Some(owner); // owner BEFORE any next SDK/check
-            Ok(())
+            r.lifecycle
+                .complete_initial_member_row_capture(&started)
+                .map_err(denied)
         }
 
         /// Derive comparison DATA from the actual Source window plus SAME C
         /// baseline pin. Authority.binding/capture still independently enter G;
         /// this does not mint a native binding/creator/effect capability.
-        fn member_generation_binding(
+        fn member_started_binding(
             r: &NativeActorInputs<'_>,
             record: &pair::Record,
             slot: Slot,
-            started: &NativeMemberStartedGeneration,
+            proof: crate::member_owner::NativeProof,
         ) -> io::Result<rows::Binding> {
             let i = idx(slot);
-            let proof = started.proof().map_err(denied)?;
             r.pins
                 .source
                 .inspect_window(|window| {
@@ -7968,7 +8011,8 @@ pub(crate) mod native {
                 .verify_original(&entry.ticket, &entry.never, &r.runtime, &r.context)
                 .map_err(denied)?;
             started.verify_source(&r.pins.source).map_err(denied)?;
-            let binding = Self::member_generation_binding(r, record, slot, &started)?;
+            let binding =
+                Self::member_started_binding(r, record, slot, started.proof().map_err(denied)?)?;
             let inputs = || NativeMemberCaptureInputs {
                 ticket: &entry.ticket,
                 never: &entry.never,

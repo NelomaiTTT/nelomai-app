@@ -346,6 +346,8 @@ pub(crate) mod native {
         expected: pair::Record,
         pins: crate::windows::member_carrier_ready::native::NativeCarrierPins,
         member_source: Rc<crate::windows::member_carrier_payload::native::MemberSource>,
+        _never_effects:
+            Rc<crate::windows::member_carrier_member_controller::native::NativeNeverMemberEffects>,
     }
     type OriginalGuardClose = (Rc<RefCell<actor::Guard>>, Rc<NativeGuardTerminalClose>);
     type OriginalKeyCloses = [Option<Rc<crate::windows::member_carrier_keys::KeyHandleClosed>>; 3];
@@ -1801,6 +1803,7 @@ pub(crate) mod native {
             originals,
             image,
             member_source,
+            never_effects,
             members,
             rows,
             guard,
@@ -1836,6 +1839,7 @@ pub(crate) mod native {
             expected,
             pins,
             member_source,
+            _never_effects: never_effects,
         });
         raw.controllers = controllers;
         let mut graph = NativeGraphTerminalResources::default();
