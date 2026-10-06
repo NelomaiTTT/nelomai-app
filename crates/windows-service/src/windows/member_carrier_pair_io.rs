@@ -4976,69 +4976,6 @@ pub(crate) mod native {
                 Ok(())
             })
         }
-        pub(crate) fn original(
-            input: NativeActorInputs<'a>,
-            executor: Rc<tokio::runtime::Runtime>,
-        ) -> Self {
-            let selected = Selected {
-                pin: input.pair.clone(),
-                record: input.expected.clone(),
-            };
-            let pair = Rc::new(OriginalPairCache {
-                store: input.store.clone(),
-                selected: RefCell::new(Some(selected)),
-                attempted: RefCell::new(Vec::new()),
-            });
-            let serial = Rc::new(ActorSerial::default());
-            let execution_pending = Rc::new(Cell::new(false));
-            let socket_context = Rc::new(SocketContext {
-                serial: serial.clone(),
-                execution_pending: execution_pending.clone(),
-                context: input.context.clone(),
-                supervisor: input.pins.supervisor.clone(),
-                runtime: input.runtime.clone(),
-                pair: pair.clone(),
-                probes: input.probe_state.clone(),
-                attestor: input.attestor.clone(),
-                guard_resources: input.guard_resources.clone(),
-                issued: RefCell::new(Vec::new()),
-            });
-            Self {
-                executor,
-                serial,
-                roots: Some(Box::new(input)),
-                pair,
-                socket_context: Some(socket_context),
-                startup: None,
-                full_capture_attempted: true,
-                rejected_inputs: Vec::new(),
-                network_intents: Vec::new(),
-                guard_acks: Vec::new(),
-                held: [None, None],
-                held_reads: [None, None],
-                closing: None,
-                closing_network: None,
-                closing_attempted: false,
-                row_owners: [None, None],
-                row_pins: [None, None],
-                row_authorities: [None, None],
-                row_attempted: [false, false],
-                registered: false,
-                member_generation_tickets: Vec::new(),
-                stopped_row_generations: [None, None],
-                row_generation_receipts: Vec::new(),
-                member_generation_originals: Vec::new(),
-                historical_member_rows: Vec::new(),
-                member_row_captures: Vec::new(),
-                member_rebind_receipts: Vec::new(),
-                lifecycle_upgrade: Rc::new(UpgradeRegistration::default()),
-                terminal_cut: ActorResourceTransfer::default(),
-                execution: None,
-                rebind_proof: Rc::new(RefCell::new(RebindProofSlot::default())),
-                startup_proof: Rc::new(RefCell::new(None)),
-                execution_pending,
-            }
-        }
         /// Caller-rooted BEFORE cold preflight/C construction. Pair cache is
         /// created ONCE here and stays the same across actual full graph capture.
         pub(crate) fn cold(

@@ -947,19 +947,6 @@ pub(crate) mod native {
         }
         /// Fresh only: an existing Network record is rejected, never imported
         /// as authority. Crash replay remains the enclosing cleanup-only actor.
-        pub(crate) fn fresh(
-            source: Rc<NativeSourceRead>,
-            gate: Rc<G>,
-            files: NativeSessionFiles,
-            physical: Vec<PhysicalLease>,
-        ) -> io::Result<Self> {
-            // Legacy empty construction means UNCAPTURED, never captured-empty.
-            // Caller-supplied physical data cannot mint an original capture.
-            if !physical.is_empty() {
-                return Err(conflict());
-            }
-            Self::fresh_uncaptured(source, gate, files)
-        }
         pub(crate) fn fresh_uncaptured(
             source: Rc<NativeSourceRead>,
             gate: Rc<G>,

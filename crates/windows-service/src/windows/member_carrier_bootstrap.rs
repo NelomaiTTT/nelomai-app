@@ -861,9 +861,10 @@ pub(crate) mod native {
 
         /// Transfer actual owners ONCE during main's SAME Calling assembly.
         /// The slot keeps a separately retained ORIGINAL image/source/runtime/
-        /// package/actor pin if NativeCarrierAuthority::new consumes the owners
-        /// and then fails. Main must keep this slot across construction, native
-        /// creation, and cleanup; dropping it retains unknown pins to process exit.
+        /// package/actor pin while NativeConstructionSlot retains the transferred
+        /// owners before fallible construction. Main must keep this slot across
+        /// construction, native creation, and cleanup; dropping it retains unknown
+        /// pins to process exit.
         pub(crate) fn take_for_assembly(&mut self, lock: &mut KeyLock) -> Result<BootstrapAssets> {
             if self.terminal_attempted || !self.ready || self.transferred {
                 return Err(Error::Pending);

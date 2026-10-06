@@ -354,16 +354,10 @@ fn original_bindings(
     {
         return Err(Error::Conflict);
     }
-    policy::Model::new(
-        record.scope.clone(),
-        carrier.clone(),
-        egress.clone().map(|identity| {
-            identity.map(|identity| policy::Member {
-                identity,
-                probes: vec![],
-            })
-        }),
-        None,
+    policy::validate_factual_bindings(
+        &record.scope,
+        Some(carrier),
+        egress.each_ref().map(Option::as_ref),
     )
     .map_err(|_| Error::Conflict)?;
     for (n, actual) in egress.iter().enumerate() {

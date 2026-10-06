@@ -285,6 +285,18 @@ fn row(index: u32) -> Row {
 
 #[test]
 fn network_facts_keep_committed_and_pending_values_separate_and_report_native_rows() {
+    let mut c_only = sources();
+    c_only.members = [None, None];
+    let empty = serde_json::from_value(serde_json::json!({
+        "owned": [], "active": null, "stopping": false, "pending": null
+    }))
+    .unwrap();
+    let baseline = compare_routes(&c_only, &empty, &[], &[row(33)]).unwrap();
+    assert!(baseline.current.is_empty());
+    assert!(baseline.pending.is_none());
+    assert_eq!(baseline.carrier_rows, vec![row(33)]);
+    assert_eq!(baseline.egress_rows, [vec![], vec![]]);
+    assert_eq!(baseline.active, None);
     let s = sources();
     let mut target = route(11);
     target.metric = 90;

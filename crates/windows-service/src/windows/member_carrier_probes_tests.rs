@@ -265,6 +265,9 @@ fn actual_source_and_selected_egress_are_distinct_and_rebound_facts_deny() {
     let b = facts();
     let target = Ipv4Addr::new(9, 9, 9, 9);
     let expected = Expected::from_facts(&b, Slot::B, target).unwrap();
+    let mut unstarted = b.clone();
+    unstarted.egress = [None, None];
+    assert!(Expected::from_facts(&unstarted, Slot::B, target).is_err());
     assert_eq!(expected.source, Ipv4Addr::new(10, 8, 0, 2));
     assert_eq!(expected.carrier.identity.proof.index, 33);
     assert_eq!(expected.egress.proof.index, 22);

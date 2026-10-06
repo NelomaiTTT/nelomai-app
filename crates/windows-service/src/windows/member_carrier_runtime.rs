@@ -5500,33 +5500,6 @@ pub(crate) mod native {
                 active_row_role: None,
             }
         }
-        pub(crate) fn new(
-            module: LoadedWintun,
-            runtime: RuntimeRead,
-            image: OriginalImage,
-            producer: creators::Producer<OriginalWintun>,
-            scope: creators::Scope,
-            gate: G,
-            cancelled: Arc<AtomicBool>,
-        ) -> Result<Self> {
-            // Legacy Result<Self> behavior/signature is preserved. New callers
-            // must retain NativeConstructionSlot before supervisory work.
-            let inputs = NativeConstructionInputs {
-                module,
-                runtime,
-                image,
-                producer,
-                scope,
-                gate,
-                cancelled,
-            };
-            let prepared = Self::prepare_construction(&inputs)?;
-            let shared_revocation = Rc::new(Cell::new(false));
-            let source_fence = Rc::new(super::SourceFence::new(shared_revocation.clone()));
-            let authority = Self::from_prepared(inputs, prepared, shared_revocation, source_fence);
-            authority.current(Use::Create)?;
-            Ok(authority)
-        }
         // Return the final factual receipt already compared with the first read.
         fn row_state(&self) -> Result<(Use, receipts::Record)> {
             let bytes = self

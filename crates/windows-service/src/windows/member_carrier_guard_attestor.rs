@@ -80,17 +80,7 @@ fn compare_terminal_bindings(
     }
     // Validate historical comparison identities, NEVER pass them as live SDK
     // inputs or adopt them as guard ownership.
-    Model::new(
-        record.scope.clone(),
-        carrier.clone(),
-        actual.egress.map(|identity| {
-            identity.map(|identity| policy::Member {
-                identity: identity.clone(),
-                probes: Vec::new(),
-            })
-        }),
-        None,
-    )?;
+    policy::validate_factual_bindings(&record.scope, Some(carrier), actual.egress)?;
     Ok(())
 }
 fn compare_retired_read(context: &Context, record: &pair::Record) -> Result<()> {

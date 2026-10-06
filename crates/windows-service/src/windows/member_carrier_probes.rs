@@ -264,18 +264,11 @@ struct Expected {
 impl Expected {
     fn from_facts(bindings: &Facts, slot: Slot, target: Ipv4Addr) -> Result<Self> {
         let carrier = bindings.carrier.as_ref().ok_or(GuardError::Conflict)?;
-        // Reuse the real v2 full identity/canonical-source policy. Matching one
-        // index or a selected-slot projection must not hide aliases/foreign B.
-        crate::member_carrier_guard::Model::new(
-            bindings.scope.clone(),
-            carrier.clone(),
-            bindings.egress.clone().map(|identity| {
-                identity.map(|identity| crate::member_carrier_guard::Member {
-                    identity,
-                    probes: vec![],
-                })
-            }),
-            None,
+        // Validate the whole observed inventory before selected-slot use.
+        crate::member_carrier_guard::validate_factual_bindings(
+            &bindings.scope,
+            Some(carrier),
+            bindings.egress.each_ref().map(Option::as_ref),
         )?;
         let index = match slot {
             Slot::A => 0,

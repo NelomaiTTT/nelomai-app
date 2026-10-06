@@ -2236,6 +2236,58 @@ fn live_readback_rechecks_priority_and_closes_only_own_dynamic_session_on_confli
 
 #[test]
 fn snapshot_brackets_the_whole_native_inventory_with_independent_owners() {
+    let world = Rc::new(RefCell::new(World::default()));
+    let mut io = Api(world.clone());
+    let c_only = Bindings {
+        scope: scope(),
+        carrier: pair(None).carrier,
+        egress: [None, None],
+    };
+    io.begin(SessionKind::StaticBase, true).unwrap();
+    let observed = read_native_snapshot(
+        &mut io,
+        &c_only,
+        &scope(),
+        SessionKind::StaticBase,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    io.commit(SessionKind::StaticBase).unwrap();
+    assert_eq!(observed, Model::empty(scope()).unwrap().expected);
+    assert_eq!(world.borrow().lookups.len(), 49);
+    for fault in 0..12 {
+        let mut changed = Bindings {
+            scope: c_only.scope.clone(),
+            carrier: c_only.carrier.clone(),
+            egress: c_only.egress.clone(),
+        };
+        let c = changed.carrier.as_mut().unwrap();
+        match fault {
+            0 => changed.scope.connection_generation = 0,
+            1 => c.identity.scope.runtime_generation += 1,
+            2 => c.identity.proof.index = 0,
+            3 => c.identity.proof.luid = 0,
+            4 => c.identity.proof.guid = [0; 16],
+            5 => c.sources.clear(),
+            6 => c.sources = vec!["127.0.0.1".parse().unwrap()],
+            7 => c.sources = vec!["10.8.0.2".parse().unwrap(), "10.8.0.3".parse().unwrap()],
+            8 => c.sources = vec!["fd00::2".parse().unwrap(), "10.8.0.2".parse().unwrap()],
+            9 => changed.egress[0] = Some(c.identity.clone()),
+            10 => {
+                changed.egress = pair(None).members.map(|m| m.map(|m| m.identity));
+                changed.carrier = None;
+            }
+            11 => {
+                changed.carrier = None;
+                changed.scope.connection_generation = 0;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_bindings(&changed.scope, &changed).is_err(),
+            "fault {fault}"
+        );
+    }
     for installed in [false, true] {
         for fault in [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12] {
             let (mut guard, w) = adapter();
@@ -2834,82 +2886,15 @@ fn adapter_snapshot_itself_rejects_later_priority_or_owned_policy_drift_without_
     }
 }
 
-#[derive(Default)]
-struct Journal(Option<crate::member_carrier_guard::ExchangePlan>);
-impl crate::member_carrier_guard::ExchangeJournal for Journal {
-    fn load(
-        &mut self,
-        _: &SessionScope,
-    ) -> Result<Option<crate::member_carrier_guard::ExchangePlan>> {
-        Ok(self.0.clone())
-    }
-    fn compare_exchange(
-        &mut self,
-        expected: Option<&crate::member_carrier_guard::ExchangePlan>,
-        desired: &crate::member_carrier_guard::ExchangePlan,
-    ) -> Result<()> {
-        if self.0.as_ref() != expected {
-            return Err(GuardError::Conflict);
-        }
-        self.0 = Some(desired.clone());
-        Ok(())
-    }
-}
-struct Authority;
-impl crate::member_carrier_guard::Authority for Authority {
-    fn before_base(&mut self, _: &Model, _: &Model) -> Result<()> {
-        Ok(())
-    }
-    fn before_install(&mut self, _: &Model) -> Result<()> {
-        Ok(())
-    }
-}
-#[test]
-fn real_portable_journaled_exchange_role_switch_and_allow_absence_use_native_adapter() {
-    use crate::member_carrier_guard::{apply_split, confirm_no_permits, ExchangePlan};
-    let (mut guard, w) = adapter();
-    let mut journal = Journal::default();
-    let empty = Model::empty(scope()).unwrap();
-    let plan = ExchangePlan::new(&empty, &pair(Some(Slot::A))).unwrap();
-    let token = plan.persist(&mut journal, None).unwrap();
-    let a = apply_split(&mut guard, &token, &mut Authority, &mut journal).unwrap();
-    assert_eq!(
-        journal.0.as_ref().unwrap().captured_sublayer_weight,
-        Some(65531)
-    );
-    let desired = pair(Some(Slot::B)).inherit_sublayer_weight(&a).unwrap();
-    let switch = ExchangePlan::new(&a, &desired).unwrap();
-    let saved = journal.0.clone();
-    let token = switch.persist(&mut journal, saved.as_ref()).unwrap();
-    let b = apply_split(&mut guard, &token, &mut Authority, &mut journal).unwrap();
-    assert_eq!(b.active, Some(Slot::B));
-    assert_eq!(guard.snapshot().unwrap(), b.expected);
-    guard.close_permits().unwrap();
-    assert_eq!(
-        confirm_no_permits(&mut guard, &switch).unwrap().expected,
-        b.without_permits().unwrap().expected
-    );
-    assert_eq!(w.borrow().objects.filters.len(), 16);
-    assert!(guard
-        .exchange(
-            SessionKind::DynamicPermits,
-            &b.without_permits().unwrap(),
-            &b
-        )
-        .is_err());
-}
-
 #[test]
 fn adapter_failed_close_or_foreign_static_allow_keeps_exact_absence_unconfirmed() {
-    use crate::member_carrier_guard::{confirm_no_permits, ExchangePlan};
     for foreign in [false, true] {
         let (mut guard, w) = adapter();
         let model = base(&mut guard);
         let desired = pair(Some(Slot::A)).inherit_sublayer_weight(&model).unwrap();
-        let live = guard
+        guard
             .exchange(SessionKind::DynamicPermits, &model, &desired)
             .unwrap();
-        let plan = ExchangePlan::new(&live, &live).unwrap();
         if foreign {
             w.borrow_mut()
                 .objects
@@ -2925,7 +2910,7 @@ fn adapter_failed_close_or_foreign_static_allow_keeps_exact_absence_unconfirmed(
         if !foreign {
             assert_eq!(close, Err(GuardError::RemovalUnconfirmed));
         }
-        assert!(confirm_no_permits(&mut guard, &plan).is_err());
+        assert!(guard.snapshot().is_err());
         assert!(w
             .borrow()
             .objects

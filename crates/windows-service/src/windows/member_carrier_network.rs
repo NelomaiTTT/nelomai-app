@@ -4,7 +4,7 @@
 #[cfg(test)]
 use crate::member_routes::NativeProof;
 use crate::{
-    member_carrier_guard::{Carrier, Identity, Member, Model},
+    member_carrier_guard::{validate_factual_bindings, Carrier, Identity},
     member_routes::Row,
 };
 use nelomai_client_tunnel::redundancy::{
@@ -95,22 +95,13 @@ fn compare_routes(
     native: &[Row],
 ) -> io::Result<NetworkFacts> {
     let scope = &s.carrier.identity.scope;
-    let model = Model::new(
-        scope.clone(),
-        s.carrier.clone(),
-        s.members.clone().map(|identity| {
-            identity.map(|identity| Member {
-                identity,
-                probes: vec![],
-            })
-        }),
-        None,
+    validate_factual_bindings(
+        scope,
+        Some(&s.carrier),
+        s.members.each_ref().map(Option::as_ref),
     )
     .map_err(|_| failed())?;
-    if model.carrier.as_ref() != Some(&s.carrier)
-        || physical.len() > 32768
-        || native.len() > crate::member_routes::MAX_TABLE_ROWS
-    {
+    if physical.len() > 32768 || native.len() > crate::member_routes::MAX_TABLE_ROWS {
         return Err(failed());
     }
     let mut ids = std::collections::BTreeMap::new();

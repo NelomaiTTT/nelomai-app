@@ -308,6 +308,54 @@ fn validate_identity(scope: &SessionScope, identity: &Identity) -> Result<()> {
     }
     Ok(())
 }
+/// Comparison facts only; no policy, filters or native-effect authority.
+pub(crate) fn validate_factual_bindings(
+    scope: &SessionScope,
+    carrier: Option<&Carrier>,
+    members: [Option<&Identity>; 2],
+) -> Result<()> {
+    if !scope.validate() {
+        return Err(GuardError::Invalid);
+    }
+    let Some(carrier) = carrier else {
+        return if members.iter().all(Option::is_none) {
+            Ok(())
+        } else {
+            Err(GuardError::Invalid)
+        };
+    };
+    validate_identity(scope, &carrier.identity)?;
+    if carrier.sources.is_empty()
+        || carrier.sources.len() > 2
+        || carrier.sources.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err(GuardError::Invalid);
+    }
+    let mut families = [false; 2];
+    for ip in &carrier.sources {
+        let i = usize::from(ip.is_ipv6());
+        if !usable(*ip) || families[i] {
+            return Err(GuardError::Invalid);
+        }
+        families[i] = true;
+    }
+    let aliases = |left: &InterfaceProof, right: &InterfaceProof| {
+        left.index == right.index || left.luid == right.luid || left.guid == right.guid
+    };
+    for (i, member) in members.iter().enumerate() {
+        let Some(member) = member else { continue };
+        validate_identity(scope, member)?;
+        if aliases(&carrier.identity.proof, &member.proof)
+            || members[..i]
+                .iter()
+                .flatten()
+                .any(|old| aliases(&old.proof, &member.proof))
+        {
+            return Err(GuardError::Invalid);
+        }
+    }
+    Ok(())
+}
 fn build(model: &Model) -> Result<Snapshot> {
     let keys = resource_keys(&model.scope)?;
     let mut snapshot = Snapshot {
@@ -330,21 +378,14 @@ fn build(model: &Model) -> Result<Snapshot> {
         return Ok(snapshot);
     }
     let carrier = model.carrier.as_ref().ok_or(GuardError::Invalid)?;
-    validate_identity(&model.scope, &carrier.identity)?;
-    if carrier.sources.is_empty()
-        || carrier.sources.len() > 2
-        || carrier.sources.windows(2).any(|p| p[0] >= p[1])
-    {
-        return Err(GuardError::Invalid);
-    }
-    let mut families = [false; 2];
-    for ip in &carrier.sources {
-        let i = usize::from(ip.is_ipv6());
-        if !usable(*ip) || families[i] {
-            return Err(GuardError::Invalid);
-        }
-        families[i] = true;
-    }
+    validate_factual_bindings(
+        &model.scope,
+        Some(carrier),
+        model
+            .members
+            .each_ref()
+            .map(|m| m.as_ref().map(|m| &m.identity)),
+    )?;
     let selected = model.active.map(|s| match s {
         Slot::A => 0,
         Slot::B => 1,
@@ -354,18 +395,8 @@ fn build(model: &Model) -> Result<Snapshot> {
     {
         return Err(GuardError::Invalid);
     }
-    let mut identities = vec![carrier.identity.proof];
     let mut ports = std::collections::BTreeSet::new();
     for member in model.members.iter().flatten() {
-        validate_identity(&model.scope, &member.identity)?;
-        let proof = member.identity.proof;
-        if identities
-            .iter()
-            .any(|p| p.index == proof.index || p.luid == proof.luid || p.guid == proof.guid)
-        {
-            return Err(GuardError::Invalid);
-        }
-        identities.push(proof);
         if member.probes.len() > 2
             || member
                 .probes
@@ -604,11 +635,6 @@ pub(crate) trait ExchangeJournal {
         desired: &ExchangePlan,
     ) -> Result<()>;
 }
-/// Only exact durable plan readback creates this token. It is not native
-/// authority; caller-held source/egress/port/route facts are required below.
-pub(crate) struct JournaledPlan {
-    plan: ExchangePlan,
-}
 impl ExchangePlan {
     pub(crate) fn new(expected: &Model, desired: &Model) -> Result<Self> {
         validate_exchange(&expected.scope, expected, desired)?;
@@ -670,7 +696,7 @@ impl ExchangePlan {
         &self,
         journal: &mut impl ExchangeJournal,
         expected: Option<&ExchangePlan>,
-    ) -> Result<JournaledPlan> {
+    ) -> Result<()> {
         self.validate()?;
         if let Some(old) = expected {
             old.validate()?;
@@ -688,7 +714,7 @@ impl ExchangePlan {
         let acknowledgement = journal.compare_exchange(expected, self);
         let actual = journal.load(&self.expected.scope)?;
         if actual.as_ref() == Some(self) {
-            return Ok(JournaledPlan { plan: self.clone() });
+            return Ok(());
         }
         if actual.as_ref() != expected {
             return Err(GuardError::Conflict);
@@ -697,7 +723,6 @@ impl ExchangePlan {
     }
 }
 pub(crate) trait SplitEngines {
-    fn scope(&self) -> &SessionScope;
     /// Full ordered snapshot AND independently attested scoped GUID bindings.
     fn snapshot(&mut self) -> Result<Snapshot>;
     /// Native transactions must enforce validate_session_exchange, reattest
@@ -705,15 +730,6 @@ pub(crate) trait SplitEngines {
     fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<Model>;
     /// Close only this owned dynamic session; never delete foreign allows.
     fn close_permits(&mut self) -> Result<()>;
-}
-pub(crate) trait Authority {
-    /// Reattest identities before base changes; removing a base requires native
-    /// absence/owned cleanup. This is NOT proved by a portable model or a GUID.
-    fn before_base(&mut self, previous: &Model, base: &Model) -> Result<()>;
-    /// Called with permits absent, after base readback. Caller verifies exact
-    /// source/DAD/egress/route/DNS facts and exclusively HELD sockets for every
-    /// probe tuple. A serialized flag or WFP condition is not port ownership.
-    fn before_install(&mut self, desired: &Model) -> Result<()>;
 }
 pub(crate) fn validate_session_exchange(
     scope: &SessionScope,
@@ -732,114 +748,6 @@ pub(crate) fn validate_session_exchange(
         _ => Ok(()),
     }
 }
-/// Three serialized commits, NOT cross-engine atomicity. Success describes an
-/// exact verified guard policy, not healthy traffic/established-flow acceptance.
-/// Factory publication still requires the separate native/data-plane gates.
-pub(crate) fn apply_split(
-    engines: &mut impl SplitEngines,
-    journaled: &JournaledPlan,
-    authority: &mut impl Authority,
-    journal: &mut impl ExchangeJournal,
-) -> Result<Model> {
-    let mut plan = journaled.plan.clone();
-    plan.validate()?;
-    validate_exchange(engines.scope(), &plan.expected, &plan.desired)?;
-    require_journal(journal, &plan)?;
-    let targets = [
-        (SessionKind::DynamicPermits, plan.withdrawn.clone()),
-        (SessionKind::StaticBase, plan.base.clone()),
-        (SessionKind::DynamicPermits, plan.desired.clone()),
-    ];
-    let outcome = (|| {
-        require_snapshot(&engines.snapshot()?, &plan.expected.expected)?;
-        let mut before = plan.expected.clone();
-        for (step, (kind, target)) in targets.into_iter().enumerate() {
-            let after = target.inherit_sublayer_weight(&before)?;
-            validate_session_exchange(engines.scope(), &before, &after, kind)?;
-            if step == 1 {
-                authority.before_base(&before, &after)?;
-            }
-            if step == 2 {
-                authority.before_install(&after)?;
-            }
-            require_journal(journal, &plan)?;
-            let committed = engines.exchange(kind, &before, &after)?;
-            let exact = after.readback_after(&before, &committed.expected)?;
-            if exact != committed {
-                return Err(GuardError::Conflict);
-            }
-            let previous_plan = plan.clone();
-            let capture = !before.installed && committed.installed;
-            if capture {
-                plan.captured_sublayer_weight = committed.assigned_sublayer_weight;
-                plan.base = plan.bound_candidate(&plan.base)?;
-                plan.desired = plan.bound_candidate(&plan.desired)?;
-                plan.validate()?;
-            }
-            require_snapshot(&engines.snapshot()?, &committed.expected)?;
-            if capture {
-                plan.persist(journal, Some(&previous_plan))?;
-            }
-            before = committed;
-        }
-        require_journal(journal, &plan)?;
-        Ok(before)
-    })();
-    if let Err(error) = outcome {
-        // A committed lost install ACK may leave allows. Close only the owned
-        // dynamic session, never roll back bases or enumerate foreign objects.
-        // Any uncertainty keeps exclusively held ports and cleanup obligations.
-        engines
-            .close_permits()
-            .map_err(|_| GuardError::RemovalUnconfirmed)?;
-        confirm_no_permits(engines, &plan)?;
-        return Err(error);
-    }
-    outcome
-}
-fn require_journal(journal: &mut impl ExchangeJournal, plan: &ExchangePlan) -> Result<()> {
-    let current = journal.load(&plan.expected.scope)?;
-    if current.as_ref() != Some(plan) {
-        return Err(GuardError::Conflict);
-    }
-    current.as_ref().ok_or(GuardError::Conflict)?.validate()
-}
-/// Must be freshly called under the serialized owner before socket release.
-/// Snapshot bindings must be independently attested, not copied from the plan.
-pub(crate) fn confirm_no_permits(
-    engines: &mut impl SplitEngines,
-    plan: &ExchangePlan,
-) -> Result<Model> {
-    plan.validate()?;
-    if engines.scope() != &plan.expected.scope {
-        return Err(GuardError::RemovalUnconfirmed);
-    }
-    let actual = engines
-        .snapshot()
-        .map_err(|_| GuardError::RemovalUnconfirmed)?;
-    let keys = resource_keys(&plan.expected.scope)?;
-    if actual.filters.iter().any(|f| {
-        f.action == Action::Permit
-            || keys
-                .filters
-                .iter()
-                .enumerate()
-                .any(|(i, key)| i % 24 >= 8 && *key == f.key)
-    }) {
-        return Err(GuardError::RemovalUnconfirmed);
-    }
-    // No-permit reconciliation uses exact base states rather than the original
-    // permit-bearing expected/desired states (same fixed ownership universe).
-    for candidate in [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired] {
-        let base = plan.bound_candidate(candidate)?.without_permits()?;
-        let matched = require_snapshot(&actual, &base.expected).map(|_| base);
-        if let Ok(model) = matched {
-            return Ok(model);
-        }
-    }
-    Err(GuardError::RemovalUnconfirmed)
-}
-
 #[cfg(test)]
 #[path = "member_carrier_guard_tests.rs"]
 mod tests;

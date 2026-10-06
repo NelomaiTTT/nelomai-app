@@ -1547,9 +1547,6 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
     }
 }
 impl<N: NativeApi, A: BindingAttestor> SplitEngines for NativeGuard<N, A> {
-    fn scope(&self) -> &SessionScope {
-        &self.scope
-    }
     fn snapshot(&mut self) -> Result<Snapshot> {
         if self.terminal.is_some() {
             return Err(GuardError::Conflict);
@@ -1811,22 +1808,11 @@ fn validate_bindings(scope: &SessionScope, b: &Bindings) -> Result<()> {
     if b.scope != *scope {
         return Err(GuardError::Conflict);
     }
-    match &b.carrier {
-        Some(c) => {
-            let members = b.egress.clone().map(|identity| {
-                identity.map(|identity| crate::member_carrier_guard::Member {
-                    identity,
-                    probes: vec![],
-                })
-            });
-            let model = Model::new(scope.clone(), c.clone(), members, None)?;
-            if model.carrier.as_ref() != Some(c) {
-                return Err(GuardError::Conflict);
-            } // Exact canonical observed sources.
-        }
-        None if b.egress.iter().any(Option::is_some) => return Err(GuardError::Conflict),
-        None => {}
-    }
+    crate::member_carrier_guard::validate_factual_bindings(
+        scope,
+        b.carrier.as_ref(),
+        b.egress.each_ref().map(Option::as_ref),
+    )?;
     Ok(())
 }
 fn read_locked<N: NativeApi, A: BindingAttestor>(

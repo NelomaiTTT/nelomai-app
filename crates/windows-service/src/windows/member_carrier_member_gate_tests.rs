@@ -400,6 +400,7 @@ fn retirement_stage_denies_wrong_target_active_generation_and_pending_effect() {
 fn member_stage_accepts_primary_reserve_and_each_exact_stop() {
     let (c, r, i) = fixture();
     assert_eq!(stage(&c, &r, &i, false).unwrap(), Use::Primary);
+    original_bindings(&c, &r, &i, Use::Primary, &carrier(&r), &[None, None], None).unwrap();
     let (c, r, i) = reserve();
     assert_eq!(stage(&c, &r, &i, false).unwrap(), Use::Reserve);
     for slot in [Slot::A, Slot::B] {

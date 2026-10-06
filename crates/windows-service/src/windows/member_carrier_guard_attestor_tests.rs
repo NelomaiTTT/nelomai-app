@@ -214,6 +214,12 @@ fn terminal_guard_read_is_separate_from_closing_and_compares_actual_closed_histo
     );
     assert!(compare_retired_read(&context, &record).is_err());
     assert!(compare_pair(&context, &record).is_err());
+    let c_only = BindingFacts {
+        scope: &bindings.scope,
+        carrier: bindings.carrier.as_ref(),
+        egress: [None, None],
+    };
+    compare_terminal_bindings(&context, &record, &c_only, &[]).unwrap();
     assert_eq!(
         bindings.members[0].as_ref().unwrap().identity.proof,
         history.proof.interface
