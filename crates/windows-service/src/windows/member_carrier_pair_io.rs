@@ -5949,57 +5949,6 @@ pub(crate) mod native {
             })
         }
 
-        /// Only independently original factual samples. No Source adoption,
-        /// journal write, nested Authority/RowOwner or mutation grant here.
-        /// Each subsequent native effect still calls its mandatory concrete G.
-        fn attest_window(
-            r: &NativeActorInputs<'_>,
-            window: &NativeBindingsWindow<'_>,
-        ) -> io::Result<()> {
-            let before_guard = r
-                .guard
-                .try_borrow_mut()
-                .map_err(denied)?
-                .snapshot_in_window(window)
-                .map_err(denied)?;
-            let before_rows = r
-                .rows
-                .inspect_in_window(window, |facts| Ok(facts.clone()))
-                .map_err(denied)?;
-            let before_network = r.network_read.inspect_in_window(window, |facts| {
-                Ok(network_sample(
-                    &facts.routes,
-                    &facts.dns,
-                    facts.protected_record.as_deref(),
-                ))
-            })?;
-            let before_ack = r.network_ack.acknowledgements()?;
-            let before_dns = r.network_ack.dns_exchange_history()?;
-            if r.guard
-                .try_borrow_mut()
-                .map_err(denied)?
-                .snapshot_in_window(window)
-                .map_err(denied)?
-                != before_guard
-                || r.rows
-                    .inspect_in_window(window, |facts| Ok(facts.clone()))
-                    .map_err(denied)?
-                    != before_rows
-                || r.network_read.inspect_in_window(window, |facts| {
-                    Ok(network_sample(
-                        &facts.routes,
-                        &facts.dns,
-                        facts.protected_record.as_deref(),
-                    ))
-                })? != before_network
-                || r.network_ack.acknowledgements()? != before_ack
-                || r.network_ack.dns_exchange_history()? != before_dns
-            {
-                return Err(conflict());
-            }
-            Ok(())
-        }
-
         /// Full original SDK observation under caller's EXISTING Calling. No
         /// nested actor/deadline, Source adoption, Authority lock or journal
         /// write. The row sampler joins actual same-owner ACKs/protected bytes;
@@ -8356,10 +8305,6 @@ pub(crate) mod native {
                 if before.0 != member.owner.intent || Some(before.1) != member.owner.proof {
                     return Err(conflict());
                 }
-                r.pins
-                    .source
-                    .inspect_window(|window| Self::attest_window(r, window).map_err(native_denied))
-                    .map_err(denied)?;
                 // The telemetry constructor is addressed ONLY by THIS actual
                 // owner proof. Numeric SCM/NIC lookup cannot adopt an original.
                 let metrics = crate::windows::member_metrics::MemberMetrics::capture_owned(
@@ -8379,10 +8324,6 @@ pub(crate) mod native {
                 {
                     return Err(conflict());
                 }
-                r.pins
-                    .source
-                    .inspect_window(|window| Self::attest_window(r, window).map_err(native_denied))
-                    .map_err(denied)?;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(denied)?
