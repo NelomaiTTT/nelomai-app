@@ -5394,12 +5394,11 @@ pub(crate) mod native {
                 return self.member_row_binding(role);
             }
             let (use_, before) = self.row_state().map_err(|_| rows::Error::Conflict)?;
-            if use_ == Use::Cleanup {
-                self.image.verify_runtime(&self.runtime)
-            } else {
-                self.image.verify_live_runtime(&self.runtime)
+            if use_ != Use::Cleanup {
+                self.image
+                    .verify_live_runtime(&self.runtime)
+                    .map_err(|_| rows::Error::Conflict)?;
             }
-            .map_err(|_| rows::Error::Conflict)?;
             // Factual identity reads do not authorize effects. Mutation G
             // remains mandatory in OriginalCreator::authorize.
             let facts = if use_ == Use::Cleanup {
@@ -5428,12 +5427,11 @@ pub(crate) mod native {
             if self.active_row_role != Some(role) || (self.failed && use_ != Use::Cleanup) {
                 return Err(rows::Error::Retired);
             }
-            if use_ == Use::Cleanup {
-                self.image.verify_runtime(&self.runtime)
-            } else {
-                self.image.verify_live_runtime(&self.runtime)
+            if use_ != Use::Cleanup {
+                self.image
+                    .verify_live_runtime(&self.runtime)
+                    .map_err(|_| rows::Error::Conflict)?;
             }
-            .map_err(|_| rows::Error::Conflict)?;
             // Factual identity reads do not authorize effects. Mutation G
             // remains mandatory in OriginalCreator::authorize.
             let all_before = if use_ == Use::Cleanup {
