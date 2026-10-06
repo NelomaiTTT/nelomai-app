@@ -466,24 +466,14 @@ pub(crate) mod native {
                                         || facts.routes.active.is_some()
                                         || facts.routes.pending_active.is_some()
                                         || facts.routes.stopping
-                                        || facts.routes.egress_rows.iter().any(|r| !r.is_empty())
                                     {
                                         return Err(io_denied(()));
                                     }
-                                    let c = window
+                                    window
                                         .bindings()
                                         .carrier
                                         .as_ref()
                                         .ok_or_else(|| io_denied(()))?;
-                                    if facts.routes.carrier_rows.iter().any(|r| {
-                                        r.route.destination != record.addresses[0]
-                                            || r.route.interface != c.identity.proof.index
-                                            || r.luid != c.identity.proof.luid
-                                            || r.route.gateway.is_some()
-                                            || r.flags[0] != 1
-                                    }) {
-                                        return Err(io_denied(()));
-                                    }
                                     Ok(())
                                 })
                                 .map_err(denied)?;

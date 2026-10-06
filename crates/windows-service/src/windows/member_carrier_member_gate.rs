@@ -439,12 +439,6 @@ fn network(
         || dns.interface.index != c.index
         || fact.routes.pending.is_some()
         || fact.routes.pending_active.is_some()
-        || fact.routes.carrier_rows.iter().any(|r| {
-            r.route.destination != record.addresses[0]
-                || r.route.gateway.is_some()
-                || r.flags[0] != 1
-                || r.luid != c.luid
-        })
     {
         return Err(Error::Conflict);
     }
@@ -453,7 +447,6 @@ fn network(
             || fact.protected.is_some()
             || ack.is_some_and(|(routes, dns)| !routes.is_empty() || !dns.is_empty())
             || !fact.routes.current.is_empty()
-            || fact.routes.egress_rows.iter().any(|r| !r.is_empty())
             || fact.routes.active.is_some()
             || fact.routes.stopping
             || dns
@@ -485,7 +478,6 @@ fn network(
         && (n.current != n.baseline
             || !n.baseline.routes.is_empty()
             || !fact.routes.current.is_empty()
-            || fact.routes.egress_rows.iter().any(|r| !r.is_empty())
             || fact.routes.active.is_some())
     {
         return Err(Error::Conflict);
@@ -500,11 +492,10 @@ fn network(
             .as_ref()
             .and_then(|m| m.owner.proof)
             .ok_or(Error::Conflict)?;
-        if !fact.routes.egress_rows[target].is_empty()
-            || n.current
-                .routes
-                .iter()
-                .any(|r| r.interface == proof.interface.index)
+        if n.current
+            .routes
+            .iter()
+            .any(|r| r.interface == proof.interface.index)
             || fact
                 .routes
                 .current
@@ -534,18 +525,6 @@ fn network(
     }
     if current.len() != n.current.routes.len() {
         return Err(Error::Conflict);
-    }
-    for rows in &fact.routes.egress_rows {
-        for row in rows {
-            if !fact
-                .routes
-                .current
-                .iter()
-                .any(|r| r.actual.as_ref() == Some(row))
-            {
-                return Err(Error::Conflict);
-            }
-        }
     }
     for (i, a) in routes.iter().enumerate() {
         if routes[i + 1..].iter().any(|b| {

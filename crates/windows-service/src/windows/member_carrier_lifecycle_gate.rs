@@ -2597,11 +2597,6 @@ pub(crate) mod native {
                     if &facts.dns != expected
                         || facts.routes.pending.is_some()
                         || !facts.routes.current.is_empty()
-                        // NetworkGate already checks the full table: the single
-                        // original connected VIP route may still exist before
-                        // stage6 Delete, but never at End/Close.
-                        || (record.stop_stage >= 7 && !facts.routes.carrier_rows.is_empty())
-                        || facts.routes.egress_rows.iter().any(|r| !r.is_empty())
                         || record.network.as_ref().is_some_and(|n| {
                             n.pending.is_some()
                                 || n.current != n.baseline

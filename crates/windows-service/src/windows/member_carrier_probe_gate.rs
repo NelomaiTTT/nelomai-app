@@ -860,16 +860,14 @@ fn compare_network(
     }
     let expected = routes(&n.current.routes)?;
     let mut read = BTreeMap::new();
-    let mut member_rows: [Vec<Row>; 2] = [vec![], vec![]];
     for fact in &facts.current {
         let row = fact.actual.as_ref().ok_or(GuardError::Conflict)?;
-        let proof = if let Some((i, m)) = r.members.iter().enumerate().find(|(_, m)| {
+        let proof = if let Some(m) = r.members.iter().find(|m| {
             m.as_ref()
                 .and_then(|m| m.owner.proof)
                 .is_some_and(|p| p.interface.index == fact.expected.interface)
         }) {
             let p = m.as_ref().unwrap().owner.proof.unwrap().interface;
-            member_rows[i].push(row.clone());
             NativeProof {
                 index: p.index,
                 luid: p.luid,
@@ -899,23 +897,6 @@ fn compare_network(
         }
     }
     if read != expected {
-        return Err(GuardError::Conflict);
-    }
-    for (expected, actual) in member_rows.iter_mut().zip(&facts.egress_rows) {
-        let mut actual = actual.clone();
-        expected.sort_by_key(|row| (row.route.destination, row.route.interface));
-        actual.sort_by_key(|row| (row.route.destination, row.route.interface));
-        if *expected != actual {
-            return Err(GuardError::Conflict);
-        }
-    }
-    if facts.carrier_rows.iter().any(|row| {
-        row.route.interface != c.index
-            || row.luid != c.luid
-            || r.addresses.as_slice() != [row.route.destination]
-            || row.route.gateway.is_some()
-            || row.flags[0] != 1
-    }) {
         return Err(GuardError::Conflict);
     }
     Ok(())

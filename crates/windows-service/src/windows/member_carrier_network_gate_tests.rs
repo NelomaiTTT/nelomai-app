@@ -786,40 +786,98 @@ fn lifecycle_full_route_table_requires_delete_ack_and_all_original_absence() {
         },
     );
     assert!(compare_lifecycle_route_table(&r, proofs, &[], &[old], false).is_err());
-}
-
-// Break: C's original connected VIP route is either mislabelled owned leftover
-// before Delete, or widened to arbitrary C routes/end-session leftovers.
-#[test]
-fn lifecycle_connected_vip_exception_is_exact_and_ends_after_address_delete() {
-    let (_, r, _) = lifecycle_fixture(6);
-    let c = r.carrier.unwrap();
-    let proofs = [
-        Some(c),
-        r.members[0]
-            .as_ref()
-            .unwrap()
-            .owner
-            .proof
-            .map(|p| p.interface),
-        None,
-    ];
-    let mut connected = Row::static_route(
-        route("10.7.0.2/32", c.index, 0, None),
+    let (_, before_stop, _) = lifecycle_fixture(3);
+    let mut incidental = Row::static_route(
+        route("224.0.0.0/4", a.index, 0, None),
         NativeProof {
-            index: c.index,
-            luid: c.luid,
+            index: a.index,
+            luid: a.luid,
         },
     );
-    connected.flags = [1, 0, 0, 0];
-    assert!(compare_lifecycle_route_table(&r, proofs, &[], &[connected.clone()], true).is_ok());
-    assert!(compare_lifecycle_route_table(&r, proofs, &[], &[connected.clone()], false).is_err());
-    let mut bad = connected.clone();
-    bad.route.destination = "10.7.0.3/32".parse().unwrap();
-    assert!(compare_lifecycle_route_table(&r, proofs, &[], &[bad], true).is_err());
-    let mut duplicate = connected.clone();
-    duplicate.route.metric += 1;
-    assert!(compare_lifecycle_route_table(&r, proofs, &[], &[connected, duplicate], true).is_err());
+    incidental.protocol = 2;
+    incidental.origin = 1;
+    incidental.flags = [0, 1, 0, 0];
+    assert!(
+        compare_lifecycle_route_table(&before_stop, proofs, &[], &[incidental.clone()], true)
+            .is_ok()
+    );
+    for stage in [6, 7, 8] {
+        let (_, after_stop, _) = lifecycle_fixture(stage);
+        assert!(compare_lifecycle_route_table(
+            &after_stop,
+            proofs,
+            &[],
+            &[incidental.clone()],
+            true
+        )
+        .is_err());
+    }
+    let mut alias = incidental.clone();
+    alias.luid += 1;
+    assert!(compare_lifecycle_route_table(&before_stop, proofs, &[], &[alias], true).is_err());
+    let owned_delete = RouteAttempt {
+        row: incidental.clone(),
+        deleting: true,
+        acknowledged: true,
+    };
+    assert!(compare_lifecycle_route_table(
+        &before_stop,
+        proofs,
+        &[owned_delete],
+        &[incidental],
+        true
+    )
+    .is_err());
+}
+
+// Break: treating kernel routes on live C as app-owned leftovers, or retaining them after native close.
+#[test]
+fn lifecycle_live_carrier_routes_end_only_after_native_close() {
+    for stage in [3, 6, 7, 8] {
+        let (_, r, _) = lifecycle_fixture(stage);
+        let c = r.carrier.unwrap();
+        let proofs = [
+            Some(c),
+            r.members[0]
+                .as_ref()
+                .unwrap()
+                .owner
+                .proof
+                .map(|p| p.interface),
+            None,
+        ];
+        let incidental_carrier = ["10.7.0.2/32", "224.0.0.0/4"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, destination)| {
+                let mut row = Row::static_route(
+                    route(destination, c.index, 0, None),
+                    NativeProof {
+                        index: c.index,
+                        luid: c.luid,
+                    },
+                );
+                row.protocol = 2;
+                row.origin = if i == 1 { 1 } else { 0 };
+                row.flags = if i == 0 { [1, 1, 0, 0] } else { [0, 1, 0, 0] };
+                row
+            })
+            .collect::<Vec<_>>();
+        assert!(compare_lifecycle_route_table(&r, proofs, &[], &incidental_carrier, true).is_ok());
+        assert!(
+            compare_lifecycle_route_table(&r, proofs, &[], &incidental_carrier, false).is_err()
+        );
+        for index_only in [false, true] {
+            let mut alias = incidental_carrier[0].clone();
+            if index_only {
+                alias.luid += 1;
+            } else {
+                alias.route.interface += 1;
+                alias.route.scope = RouteScope::WindowsInterface(alias.route.interface);
+            }
+            assert!(compare_lifecycle_route_table(&r, proofs, &[], &[alias], true).is_err());
+        }
+    }
 }
 
 fn fixture() -> (Context, pair::Record) {

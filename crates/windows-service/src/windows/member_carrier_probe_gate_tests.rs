@@ -839,7 +839,30 @@ fn network_requires_exact_current_route_dns_endpoint_and_physical_plan() {
     let mut expected = expected;
     expected.sort_by_key(|r| (r.destination, r.interface));
     assert_eq!(actual, expected);
-    let f = network(&r);
+    let mut f = network(&r);
+    let c = r.carrier.unwrap();
+    f.carrier_rows = ["10.7.0.2/32", "224.0.0.0/4"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, destination)| {
+            let mut row = Row::static_route(
+                route(destination, c.index, 0, None),
+                NativeProof {
+                    index: c.index,
+                    luid: c.luid,
+                },
+            );
+            row.protocol = 2;
+            row.origin = if i == 1 { 1 } else { 0 };
+            row.flags = if i == 0 { [1, 1, 0, 0] } else { [0, 1, 0, 0] };
+            row
+        })
+        .collect();
+    let mut incidental = f.carrier_rows[1].clone();
+    incidental.route.interface = 8;
+    incidental.route.scope = RouteScope::WindowsInterface(8);
+    incidental.luid = 91;
+    f.egress_rows[0].push(incidental);
     let d = r.network.as_ref().unwrap().current.dns.as_ref().unwrap();
     assert_eq!(
         compare_network(&r, &f, d, Some(b"actual protected sampler bytes"), &p, &m),
@@ -856,9 +879,7 @@ fn network_requires_exact_current_route_dns_endpoint_and_physical_plan() {
             2 => f.pending = Some(vec![]),
             3 => f.active = Some(Slot::B),
             4 => d.settings.enable_llmnr += 1,
-            5 => {
-                f.egress_rows[0].pop();
-            }
+            5 => f.current[0].actual.as_mut().unwrap().luid += 1,
             6 => f.stopping = true,
             _ => f.current[3].actual = None,
         }

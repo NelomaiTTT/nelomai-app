@@ -302,7 +302,9 @@ fn original_read_alias_and_weak_liveness_do_not_retain_or_adopt_another_capture(
 }
 
 use crate::{
-    member_carrier_guard::Identity, member_owner::InterfaceProof, member_routes::NativeProof,
+    member_carrier_guard::Identity,
+    member_owner::InterfaceProof,
+    member_routes::{NativeProof, Row},
 };
 use nelomai_client_tunnel::redundancy::{
     network::{RouteScope, RouteValue},
@@ -384,33 +386,62 @@ fn initial_sdk_baseline_accepts_no_child_or_owned_routes_without_granting_an_exc
     let mut f = facts();
     f.carrier_rows.push(onlink());
     assert!(compare_initial(&carrier(), &f, &baseline(), None).is_ok());
+    f.carrier_rows = ["10.7.0.2/32", "224.0.0.0/4"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, destination)| {
+            let mut row = onlink();
+            row.route.destination = destination.parse().unwrap();
+            row.flags = if i == 0 { [1, 1, 0, 0] } else { [0, 1, 0, 0] };
+            if i == 1 {
+                row.origin = 1;
+            }
+            row
+        })
+        .collect();
+    for i in 0..2 {
+        let mut incidental = onlink();
+        incidental.route.interface = 8 + i as u32;
+        incidental.route.scope = RouteScope::WindowsInterface(incidental.route.interface);
+        incidental.luid = 91 + i as u64;
+        incidental.route.destination = "224.0.0.0/4".parse().unwrap();
+        incidental.origin = 1;
+        incidental.flags = [0, 1, 0, 0];
+        f.egress_rows[i].push(incidental);
+    }
+    assert!(compare_initial(&carrier(), &f, &baseline(), None).is_ok());
 }
-// Break: treating a protected child, active/pending/stopping journal, member route or foreign C route as fresh.
+// Break: treating a protected child, active/pending/stopping journal or member route as fresh.
 #[test]
 fn initial_capture_refuses_every_child_network_or_route_obligation() {
     for fault in 0..8 {
         let mut f = facts();
         let mut raw = None;
+        let mut dns = baseline();
         match fault {
             0 => raw = Some(b"actual protected child".as_slice()),
             1 => f.pending = Some(vec![]),
             2 => f.active = Some(nelomai_client_tunnel::redundancy::Slot::A),
             3 => f.pending_active = Some(nelomai_client_tunnel::redundancy::Slot::B),
             4 => f.stopping = true,
-            5 => f.egress_rows[0].push(onlink()),
+            5 => {
+                f.pending = Some(vec![super::super::member_carrier_network::RouteFact {
+                    expected: onlink().route,
+                    actual: None,
+                }])
+            }
             6 => {
-                let mut row = onlink();
-                row.route.destination = "0.0.0.0/0".parse().unwrap();
-                f.carrier_rows.push(row);
+                let row = onlink();
+                f.current
+                    .push(super::super::member_carrier_network::RouteFact {
+                        expected: row.route.clone(),
+                        actual: Some(row),
+                    });
             }
-            _ => {
-                let mut row = onlink();
-                row.luid += 1;
-                f.carrier_rows.push(row);
-            }
+            _ => dns.interface.guid = [2; 16],
         }
         assert!(
-            compare_initial(&carrier(), &f, &baseline(), raw).is_err(),
+            compare_initial(&carrier(), &f, &dns, raw).is_err(),
             "fault {fault}"
         );
     }

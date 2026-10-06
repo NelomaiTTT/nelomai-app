@@ -2,8 +2,6 @@
 //! These comparisons/read pins are never resource, DNS-write or readiness grants.
 #![allow(dead_code)]
 use super::member_carrier_network::NetworkFacts;
-#[cfg(test)]
-use crate::member_routes::Row;
 #[cfg(all(test, windows))]
 use crate::windows::member_carrier_factory_test_os::trace_step;
 use crate::{member_carrier_guard::Carrier, member_dns as dns};
@@ -66,25 +64,8 @@ fn compare_initial(
         || facts.active.is_some()
         || facts.pending_active.is_some()
         || facts.stopping
-        || facts.egress_rows.iter().any(|rows| !rows.is_empty())
-        || facts.carrier_rows.len() > 1
     {
         return Err(conflict());
-    }
-    for row in &facts.carrier_rows {
-        crate::member_routes::validate_route(&row.route, carrier.sources[0].into(), c.proof.index)
-            .inspect_err(|_| {
-                #[cfg(all(test, windows))]
-                trace_step("network baseline compare_initial route validation error");
-            })?;
-        if row.route.interface != c.proof.index
-            || row.luid != c.proof.luid
-            || row.route.gateway.is_some()
-            || row.route.destination != ipnet::IpNet::from(carrier.sources[0])
-            || row.flags != [1, 0, 0, 0]
-        {
-            return Err(conflict());
-        }
     }
     Ok(())
 }
@@ -449,15 +430,13 @@ pub(crate) mod native {
                         {
                             let c = &carrier.identity;
                             trace_step(&format!(
-                                "network baseline compare_initial error sources={} current={} pending={} active={} pending_active={} stopping={} egress_rows={:?} carrier_rows={} protected_record={} dns_name_server_present={} dns_name_server_nonempty={} dns_profile_name_server_present={} dns_profile_name_server_nonempty={} dns_scope_match={} dns_guid_match={} dns_index_match={} dns_luid_match={}",
+                                "network baseline compare_initial error sources={} current={} pending={} active={} pending_active={} stopping={} protected_record={} dns_name_server_present={} dns_name_server_nonempty={} dns_profile_name_server_present={} dns_profile_name_server_nonempty={} dns_scope_match={} dns_guid_match={} dns_index_match={} dns_luid_match={}",
                                 carrier.sources.len(),
                                 facts.routes.current.len(),
                                 facts.routes.pending.is_some(),
                                 facts.routes.active.is_some(),
                                 facts.routes.pending_active.is_some(),
                                 facts.routes.stopping,
-                                facts.routes.egress_rows.each_ref().map(Vec::len),
-                                facts.routes.carrier_rows.len(),
                                 facts.protected_record.is_some(),
                                 facts.dns.settings.name_server.is_some(),
                                 facts.dns.settings.name_server.as_ref().is_some_and(|s| !s.is_empty()),
@@ -468,20 +447,6 @@ pub(crate) mod native {
                                 facts.dns.interface.index == c.proof.index,
                                 facts.dns.interface.luid == c.proof.luid,
                             ));
-                            for row in facts.routes.carrier_rows.iter().take(2) {
-                                trace_step(&format!(
-                                    "network baseline initial carrier row prefix_length={} site_prefix_length={} protocol={} origin={} flags={:?} index_match={} luid_match={} gateway_present={} destination_match={}",
-                                    row.route.destination.prefix_len(),
-                                    row.site_prefix_length,
-                                    row.protocol,
-                                    row.origin,
-                                    row.flags,
-                                    row.route.interface == c.proof.index,
-                                    row.luid == c.proof.luid,
-                                    row.route.gateway.is_some(),
-                                    carrier.sources.first().is_some_and(|source| row.route.destination == ipnet::IpNet::from(*source)),
-                                ));
-                            }
                         }
                     })?;
                     // No caller-supplied snapshot or public data constructor.

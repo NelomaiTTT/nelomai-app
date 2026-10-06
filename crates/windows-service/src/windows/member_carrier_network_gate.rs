@@ -782,7 +782,7 @@ fn compare_lifecycle_route_table(
     originals: [Option<crate::member_owner::InterfaceProof>; 3],
     attempts: &[RouteAttempt],
     actual: &[Row],
-    connected_vip: bool,
+    carrier_alive: bool,
 ) -> io::Result<()> {
     if attempts.len() > 32768
         || actual.len() > crate::member_routes::MAX_TABLE_ROWS * 2
@@ -804,7 +804,7 @@ fn compare_lifecycle_route_table(
             }
         }
     }
-    compare_original_route_absence(record, originals, attempts, actual, connected_vip, c)
+    compare_original_route_absence(record, originals, attempts, actual, carrier_alive, c)
 }
 
 /// Factual exact original-key exclusions. Terminal tombstones contain no live
@@ -815,7 +815,7 @@ fn compare_original_route_absence(
     originals: [Option<crate::member_owner::InterfaceProof>; 3],
     attempts: &[RouteAttempt],
     actual: &[Row],
-    connected_vip: bool,
+    carrier_alive: bool,
     c: crate::member_owner::InterfaceProof,
 ) -> io::Result<()> {
     if originals[0] != Some(c)
@@ -839,35 +839,35 @@ fn compare_original_route_absence(
     if last.values().any(|a| !a.acknowledged || !a.deleting) {
         return Err(conflict());
     }
-    let mut connected = 0usize;
+    let members_alive = carrier_alive
+        && record.phase == pair::Phase::Closing
+        && record.stop_stage == 3
+        && record.pending == Some(pair::Effect::RestoreWeak);
     for row in actual {
         crate::member_routes::validate_route(
             &row.route,
             row.route.destination,
             row.route.interface,
         )?;
+        // Owned journal keys must be absent even while their original NIC lives.
         if last.contains_key(&key(&row.route)) {
             return Err(conflict());
         }
         if row.route.interface == c.index || row.luid == c.luid {
-            connected += 1;
-            if !connected_vip
-                || connected > 1
-                || row.route.interface != c.index
-                || row.luid != c.luid
-                || record.addresses.len() != 1
-                || row.route.destination != record.addresses[0]
-                || row.route.gateway.is_some()
-                || row.flags != [1, 0, 0, 0]
-            {
+            if !carrier_alive || row.route.interface != c.index || row.luid != c.luid {
                 return Err(conflict());
             }
-        } else if originals[1..]
+            continue;
+        }
+        if let Some(member) = originals[1..]
             .iter()
             .flatten()
-            .any(|p| row.route.interface == p.index || row.luid == p.luid)
+            .find(|p| row.route.interface == p.index || row.luid == p.luid)
         {
-            return Err(conflict());
+            if !members_alive || row.route.interface != member.index || row.luid != member.luid {
+                return Err(conflict());
+            }
+            continue;
         }
     }
     Ok(())
@@ -2384,7 +2384,6 @@ pub(crate) mod native {
                     || facts.routes.pending.is_some()
                     || facts.routes.active.is_some()
                     || facts.routes.pending_active.is_some()
-                    || facts.routes.egress_rows.iter().any(|rows| !rows.is_empty())
                 {
                     return Err(conflict());
                 }
@@ -2395,13 +2394,7 @@ pub(crate) mod native {
                     bindings.egress[1].as_ref().map(|e| e.proof),
                 ];
                 let table = full_route_table()?;
-                compare_lifecycle_route_table(
-                    record,
-                    proofs,
-                    &before_acks.0,
-                    &table,
-                    matches!(record.stop_stage, 3 | 6),
-                )?;
+                compare_lifecycle_route_table(record, proofs, &before_acks.0, &table, true)?;
                 if !obligations.is_empty() {
                     // Keep exact original physical lease checks. Historical member
                     // identities remain EXCLUSIONS, not live NIC lookups/adoption.
