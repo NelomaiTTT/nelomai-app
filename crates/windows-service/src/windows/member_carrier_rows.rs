@@ -1831,6 +1831,12 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
     /// NOT a hard timeout/preemption guarantee for a blocked Windows API call.
     pub(crate) fn wait_address_ready(&mut self, cancelled: &AtomicBool) -> Result<AddressRow> {
         self.wait_address_ready_with(cancelled, &mut MonotonicClock)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!(
+                    "C readiness failure error={_error:?} budget_ms=5000"
+                ));
+            })
     }
     /// The same policy with a timing boundary; neither the budget nor ownership
     /// checks can be configured away by the clock. Sleep never holds our lock.
@@ -1894,6 +1900,8 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
                 }
                 clock.sleep(remaining.min(Duration::from_millis(25)), cancelled);
             }
+            #[cfg(all(test, windows))]
+            trace_observe("C readiness finite poll limit reached budget_ms=5000 polls=200");
             Err(Error::Retired)
         })();
         if result.is_ok() {
@@ -2120,7 +2128,15 @@ fn readiness_budget<C: ReadinessClock>(
     last: &mut Instant,
 ) -> Result<Duration> {
     let now = clock.now();
-    if cancelled.load(Ordering::Acquire) || now < *last || now >= deadline {
+    let cancelled = cancelled.load(Ordering::Acquire);
+    if cancelled || now < *last || now >= deadline {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!(
+            "C readiness budget refused cancelled={cancelled} clock_regressed={} deadline_expired={} late_ms={} remaining_ms={}",
+            now < *last, now >= deadline,
+            now.saturating_duration_since(deadline).as_millis(),
+            deadline.saturating_duration_since(now).as_millis(),
+        ));
         return Err(Error::Retired);
     }
     *last = now;

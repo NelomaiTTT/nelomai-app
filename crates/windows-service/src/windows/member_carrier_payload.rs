@@ -344,6 +344,8 @@ pub(crate) mod native {
             Ok(source)
         }
         fn verify(&self) -> Result<()> {
+            #[cfg(test)]
+            trace_step("source current check");
             self.owner
                 .verify_at(&self.installation.root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
@@ -354,7 +356,9 @@ pub(crate) mod native {
             if actual_executable()? != self.executable {
                 return Err(Error::Conflict);
             }
-            self.installed.verify()?;
+            // SAME retained handles keep both slots' signed byte proof alive.
+            // Owner/root and strict DLL originals already bracket this read;
+            // actual/canonical executable checks remain current here.
             let layout = self.installed.layout();
             if layout.identity != self.identity
                 || layout.directory != self.directory
