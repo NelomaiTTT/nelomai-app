@@ -3653,15 +3653,14 @@ pub(crate) mod native {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
-            if !self.runtime.fresh(&self.scope.context).map_err(denied)? {
+            let (native, fresh) = self
+                .runtime
+                .record_with_fresh(&self.scope.context, RecordKind::NativeCarrierReceipts)
+                .map_err(denied)?;
+            if !fresh {
                 return Err(Error::Retired);
             }
-            let native = self
-                .runtime
-                .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                .map_err(denied)?;
             let record = receipts::Record::decode(&native).map_err(denied)?;
             validate_stage(
                 &record,
@@ -3912,7 +3911,6 @@ pub(crate) mod native {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
             let native = self
                 .runtime
@@ -4125,7 +4123,6 @@ pub(crate) mod native {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
             let bytes = self
                 .runtime
@@ -4388,7 +4385,6 @@ pub(crate) mod native {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
             let bytes = self
                 .runtime
@@ -4477,7 +4473,6 @@ pub(crate) mod native {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
             let bytes = self
                 .runtime

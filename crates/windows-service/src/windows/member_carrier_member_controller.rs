@@ -5763,8 +5763,6 @@ pub(crate) mod native {
             let original_source = owner.original_source.clone();
             let supervisor = owner.supervisor.clone();
             let mut inventory = owner.inventory.read_pin();
-            let post_inventory = owner.inventory.read_pin();
-            let image = owner.image.read_pin().map_err(|_| Error::Conflict)?;
             self.root.start(
                 |owned| {
                     owned.start_preflight(pair_read, expected, receipt)?;
@@ -5797,10 +5795,7 @@ pub(crate) mod native {
                                 if !window.matches_source(&original_source) || !window.matches_runtime(&runtime) {
                                     return Err(super::super::member_carrier_wintun::Error::Conflict);
                                 }
-                                post_inventory.inspect_full(&context, &runtime, &image, |members| {
-                                    provider::native::inspect_mixed(&full_universe(&context, window.bindings(), members)?)
-                                        .map(|_| ()).map_err(|_| Error::Conflict)
-                                }).map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
+                                Ok(())
                             }).map_err(io_error)
                         }).map_err(|_| Error::Conflict)
                 },
