@@ -12,26 +12,15 @@ trait NeverRegistryRead {
         parent: &Self::Handle,
         child: &str,
     ) -> crate::member_carrier::Result<Option<Self::Handle>>;
-    fn value(
-        &mut self,
-        key: &Self::Handle,
-    ) -> crate::member_carrier::Result<crate::member_carrier_native_ownership::NativeValue>;
 }
 
-#[derive(Clone, Copy)]
-enum NeverKeyFact {
-    Absent,
-    Disabled,
-}
 fn inspect_never_member_key<K: NeverRegistryRead>(
     kernel: &mut K,
     context: &crate::member_carrier_native_ownership::Context,
     index: usize,
-    expected: NeverKeyFact,
 ) -> crate::member_carrier::Result<()> {
     use crate::{
-        member_carrier::CarrierError as Error,
-        member_carrier_native_ownership::{self as ownership, NativeValue},
+        member_carrier::CarrierError as Error, member_carrier_native_ownership as ownership,
     };
     ownership::validate_context(context)?;
     let binding = context.bindings.get(index).ok_or(Error::Invalid)?;
@@ -52,19 +41,8 @@ fn inspect_never_member_key<K: NeverRegistryRead>(
     if number.len() != 3 || !number.bytes().all(|b| b.is_ascii_digit()) || number == "000" {
         return Err(Error::Conflict);
     }
-    match (kernel.open(&parent, child)?, expected) {
-        (None, NeverKeyFact::Absent) => (),
-        (Some(key), NeverKeyFact::Disabled) => {
-            let expected = format!("{name}\\{child}");
-            if !kernel.name(&key)?.eq_ignore_ascii_case(&expected)
-                || kernel.value(&key)? != NativeValue::Dword(0)
-                || kernel.value(&key)? != NativeValue::Dword(0)
-                || !kernel.name(&key)?.eq_ignore_ascii_case(&expected)
-            {
-                return Err(Error::Conflict);
-            }
-        }
-        _ => return Err(Error::Pending),
+    if kernel.open(&parent, child)?.is_some() {
+        return Err(Error::Pending);
     }
     if !kernel.name(&parent)?.eq_ignore_ascii_case(&name) {
         return Err(Error::Conflict);
@@ -1598,9 +1576,6 @@ pub(crate) mod native {
         fn open(&mut self, parent: &Self::Handle, child: &str) -> Result<Option<Self::Handle>> {
             keys::RegistryKernel::open(&mut self.0, parent, child)
         }
-        fn value(&mut self, key: &Self::Handle) -> Result<keys_record::NativeValue> {
-            keys::RegistryKernel::value(&mut self.0, key)
-        }
     }
 
     pub(crate) struct NativeNeverMemberEffectInputs {
@@ -2696,7 +2671,7 @@ pub(crate) mod native {
                     self.services_absent(slot)?;
                 }
                 for index in 0..3 {
-                    self.key_fact(index, false)?;
+                    self.key_fact(index)?;
                 }
                 provider::native::inspect_mixed(&complete_provider_inputs(
                     &self.input.context,
@@ -2862,16 +2837,11 @@ pub(crate) mod native {
             }
             Ok(())
         }
-        fn key_fact(&self, index: usize, disabled: bool) -> Result<()> {
+        fn key_fact(&self, index: usize) -> Result<()> {
             inspect_never_member_key(
                 &mut NeverNativeRegistry(win32::Kernel),
                 &self.input.context,
                 index,
-                if disabled {
-                    NeverKeyFact::Disabled
-                } else {
-                    NeverKeyFact::Absent
-                },
             )
         }
         fn forward_no_effect_records(&self) -> Result<Vec<Option<Vec<u8>>>> {
@@ -3042,7 +3012,7 @@ pub(crate) mod native {
                 #[cfg(test)]
                 super::super::member_carrier_factory_test_os::trace_step("SCM absence completed");
                 for index in 0..3 {
-                    self.key_fact(index, false).inspect_err(|error| {
+                    self.key_fact(index).inspect_err(|error| {
                         #[cfg(test)]
                         super::super::member_carrier_factory_test_os::trace_native(
                             "native key absence",
@@ -3440,7 +3410,7 @@ pub(crate) mod native {
                             self.history.uncaptured(index)?;
                             self.file_absence(slot)?;
                             self.services_absent(slot)?;
-                            self.key_fact(index + 1, false)?;
+                            self.key_fact(index + 1)?;
                             if envelope.verify(pair, expected, slot, None, lock)? != before {
                                 return Err(Error::Conflict);
                             }
@@ -3476,10 +3446,10 @@ pub(crate) mod native {
                 if native.context != self.input.context
                     || native.phase != Phase::Closing
                     || native.generation == 0
-                    || key.phase != keys_record::KeyPhase::Disabled
-                    || !key.new_key_ack
+                    || key.phase != keys_record::KeyPhase::Unstarted
+                    || key.new_key_ack
                     || key.baseline != keys_record::Value::Absent
-                    || key.current != keys_record::Value::DwordZero
+                    || key.current != keys_record::Value::Absent
                     || key.pending.is_some()
                 {
                     return Err(Error::Pending);
@@ -3488,7 +3458,7 @@ pub(crate) mod native {
                     self.pair(pair, expected, lock)?;
                     self.file_absence(slot)?;
                     self.services_absent(slot)?;
-                    self.key_fact(index + 1, true)?; // Facts ONLY, not retained-key authority.
+                    self.key_fact(index + 1)?; // Facts ONLY, not retained-key authority.
                     closing
                         .inspect_window(|window| {
                             if !window.matches_runtime(&self.input.runtime)
@@ -4445,22 +4415,19 @@ pub(crate) mod native {
                         }
                         original_records = Some(records);
                         for index in 0..3 {
-                            origin
-                                .never_effects
-                                .key_fact(index, false)
-                                .inspect_err(|error| {
-                                    #[cfg(test)]
-                                    super::super::member_carrier_factory_test_os::trace_native(
-                                        [
-                                            "cold prerequisite C key",
-                                            "cold prerequisite A key",
-                                            "cold prerequisite B key",
-                                        ][index],
-                                        error,
-                                    );
-                                    #[cfg(not(test))]
-                                    let _ = error;
-                                })?;
+                            origin.never_effects.key_fact(index).inspect_err(|error| {
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_native(
+                                    [
+                                        "cold prerequisite C key",
+                                        "cold prerequisite A key",
+                                        "cold prerequisite B key",
+                                    ][index],
+                                    error,
+                                );
+                                #[cfg(not(test))]
+                                let _ = error;
+                            })?;
                         }
                         origin.verify(lock).inspect_err(|error| {
                             #[cfg(test)]
@@ -4534,22 +4501,19 @@ pub(crate) mod native {
                         }
                         original_records = Some(records);
                         for index in 0..3 {
-                            origin
-                                .never_effects
-                                .key_fact(index, false)
-                                .inspect_err(|error| {
-                                    #[cfg(test)]
-                                    super::super::member_carrier_factory_test_os::trace_native(
-                                        [
-                                            "cold prerequisite C key",
-                                            "cold prerequisite A key",
-                                            "cold prerequisite B key",
-                                        ][index],
-                                        error,
-                                    );
-                                    #[cfg(not(test))]
-                                    let _ = error;
-                                })?;
+                            origin.never_effects.key_fact(index).inspect_err(|error| {
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_native(
+                                    [
+                                        "cold prerequisite C key",
+                                        "cold prerequisite A key",
+                                        "cold prerequisite B key",
+                                    ][index],
+                                    error,
+                                );
+                                #[cfg(not(test))]
+                                let _ = error;
+                            })?;
                         }
                         origin.verify(lock).inspect_err(|error| {
                             #[cfg(test)]

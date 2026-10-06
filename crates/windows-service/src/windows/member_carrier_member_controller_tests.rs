@@ -1213,14 +1213,12 @@ fn never_member_file_absence_rechecks_original_parent_and_rejects_creation_betwe
     .is_err());
 }
 
-// Only native registry read boundary is doubled; actual policy reads exact
-// parent, child and values. This production reader has no effect methods.
+// Only native registry read boundary is doubled; actual policy reads the
+// original parent and requires the child to be absent, without mutation.
 struct NeverRegistry {
     present: bool,
-    value: crate::member_carrier_native_ownership::NativeValue,
     name_reads: Cell<usize>,
     drift_parent: bool,
-    foreign_child: bool,
     unknown: bool,
 }
 impl NeverRegistryRead for NeverRegistry {
@@ -1229,23 +1227,13 @@ impl NeverRegistryRead for NeverRegistry {
         Ok(false)
     }
     fn name(&mut self, child: &bool) -> crate::member_carrier::Result<String> {
+        assert!(!child);
         let parent = r"\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services\Tcpip\Parameters\Interfaces";
         self.name_reads.set(self.name_reads.get() + 1);
-        if !child && self.drift_parent && self.name_reads.get() > 1 {
+        if self.drift_parent && self.name_reads.get() > 1 {
             return Ok("foreign".into());
         }
-        if *child {
-            Ok(format!(
-                "{parent}\\{}",
-                if self.foreign_child {
-                    "{foreign}"
-                } else {
-                    "{02020202-0202-0202-0202-020202020202}"
-                }
-            ))
-        } else {
-            Ok(parent.into())
-        }
+        Ok(parent.into())
     }
     fn open(&mut self, parent: &bool, child: &str) -> crate::member_carrier::Result<Option<bool>> {
         assert!(!parent);
@@ -1255,49 +1243,23 @@ impl NeverRegistryRead for NeverRegistry {
         }
         Ok(self.present.then_some(true))
     }
-    fn value(
-        &mut self,
-        child: &bool,
-    ) -> crate::member_carrier::Result<crate::member_carrier_native_ownership::NativeValue> {
-        assert!(*child);
-        Ok(self.value.clone())
-    }
 }
 #[test]
-fn never_member_key_read_requires_exact_absence_or_disabled_facts_without_mutation() {
-    use crate::member_carrier_native_ownership::NativeValue;
+fn never_member_key_read_requires_exact_absence_without_mutation() {
     let (context, _, _) = operation_fixture();
     let mut registry = NeverRegistry {
         present: false,
-        value: NativeValue::Absent,
         name_reads: Cell::new(0),
         drift_parent: false,
-        foreign_child: false,
         unknown: false,
     };
-    inspect_never_member_key(&mut registry, &context, 1, NeverKeyFact::Absent).unwrap();
-    registry.present = true;
-    registry.value = NativeValue::Dword(0);
-    inspect_never_member_key(&mut registry, &context, 1, NeverKeyFact::Disabled).unwrap();
-    assert!(inspect_never_member_key(&mut registry, &context, 1, NeverKeyFact::Absent).is_err());
-    for fault in 0..5 {
+    inspect_never_member_key(&mut registry, &context, 1).unwrap();
+    for fault in 0..3 {
         registry.name_reads.set(0);
         registry.drift_parent = fault == 0;
-        registry.foreign_child = fault == 1;
+        registry.present = fault == 1;
         registry.unknown = fault == 2;
-        registry.value = if fault == 3 {
-            NativeValue::Dword(1)
-        } else if fault == 4 {
-            NativeValue::Other {
-                kind: 1,
-                bytes: vec![0; 4],
-            }
-        } else {
-            NativeValue::Dword(0)
-        };
-        assert!(
-            inspect_never_member_key(&mut registry, &context, 1, NeverKeyFact::Disabled).is_err()
-        );
+        assert!(inspect_never_member_key(&mut registry, &context, 1).is_err());
     }
 }
 

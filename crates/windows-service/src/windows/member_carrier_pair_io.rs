@@ -7669,9 +7669,9 @@ pub(crate) mod native {
                 if !original.same_original(
                     &owner
                         .owner()
-                        .map_err(denied)?
+                        .map_err(|error| denied(error))?
                         .record_read_pin()
-                        .map_err(denied)?,
+                        .map_err(|error| denied(error))?,
                 ) || self.row_authorities[i].is_none()
                     || self.stopped_row_generations[i].is_some()
                 {
@@ -7686,7 +7686,7 @@ pub(crate) mod native {
                         )
                         .map_err(|_| rows::Error::Conflict)
                     })
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 // This is only a factual reuse fence. The ensuing actual
                 // change_interface independently enters mandatory native G.
                 return Ok(());
@@ -7705,8 +7705,8 @@ pub(crate) mod native {
                 .as_ref()
                 .ok_or_else(conflict)?
                 .started_initial_registration(&r.never_effects)
-                .map_err(denied)?;
-            let proof = started.proof().map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            let proof = started.proof().map_err(|error| denied(error))?;
             let binding = Self::member_started_binding(r, record, slot, proof)?;
             r.lifecycle
                 .begin_initial_member_row_capture(NativeInitialMemberCaptureInputs {
@@ -7719,13 +7719,15 @@ pub(crate) mod native {
                     guard: &r.guard,
                     lock: &r.lock,
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let authority = r
                 .carrier
                 .rows_authority_in_call(pin.clone(), record)
-                .map_err(denied)?;
-            let mut authority = authority.for_member(binding.role).map_err(denied)?;
-            if authority.binding().map_err(denied)? != binding {
+                .map_err(|error| denied(error))?;
+            let mut authority = authority
+                .for_member(binding.role)
+                .map_err(|error| denied(error))?;
+            if authority.binding().map_err(|error| denied(error))? != binding {
                 return Err(conflict());
             }
             self.row_authorities[i] = Some(authority.read_pin()); // SAME owner alias before baseline capture
@@ -7750,11 +7752,11 @@ pub(crate) mod native {
                     .retain_initial_member_row_capture(&started, &original)
                     .map_err(|_| rows::Error::Conflict)
             })
-            .map_err(denied)?;
-            destination.owner_mut().map_err(denied)?; // pure normalization before next SDK/check
+            .map_err(|error| denied(error))?;
+            destination.owner_mut().map_err(|error| denied(error))?; // pure normalization before next SDK/check
             r.lifecycle
                 .complete_initial_member_row_capture(&started)
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
 
         /// Derive comparison DATA from the actual Source window plus SAME C
