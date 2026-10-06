@@ -1267,7 +1267,9 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
                 .map_err(|e| context("recovery_classify", e))?
             {
                 Some(super::member_carrier_recovery::RecoveryLayout::NativeCarrier) => {
-                    if entry.retained_facts()?.guard.is_some() {
+                    if entry.retained_facts()?.requirements.contains(
+                        &super::member_carrier_recovery::RecoveryRequirement::OriginalGuard,
+                    ) {
                         let cleanup = Rc::new(
                             super::member_carrier_recovery_guard::NativeColdGuardCleanup::new(
                                 entry.clone(),
