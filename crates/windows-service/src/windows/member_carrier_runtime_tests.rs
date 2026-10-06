@@ -426,9 +426,9 @@ fn source_callback_fence_retains_the_same_failure_signal_and_brackets_all_facts(
     let result = fence.inspect(
         || {
             calls.set(calls.get() + 1);
-            Ok::<_, CarrierError>(17)
+            Ok::<_, CarrierError>((17, [1, 2]))
         },
-        |facts| Ok(*facts + 1),
+        |facts| Ok(facts.0 + 1),
         || CarrierError::Conflict,
     );
     assert_eq!(result, Ok(18));
@@ -445,7 +445,7 @@ fn source_callback_fence_retains_the_same_failure_signal_and_brackets_all_facts(
                 if (fault == 0 && calls.get() == 1) || (fault == 2 && calls.get() == 2) {
                     Err(CarrierError::Journal)
                 } else {
-                    Ok(if fault == 3 { calls.get() } else { 1 })
+                    Ok((1, [1, if fault == 3 { calls.get() } else { 1 }]))
                 }
             },
             |_| {

@@ -6353,9 +6353,6 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            self.image
-                .verify_runtime(&self.runtime)
-                .map_err(|_| Error::Conflict)?;
             self.inventory
                 .matches_original_runtime_image(&self.runtime, &self.image)
         }

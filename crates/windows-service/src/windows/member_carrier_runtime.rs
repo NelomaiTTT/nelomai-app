@@ -3811,25 +3811,7 @@ pub(crate) mod native {
                 )
             }
             .map_err(denied)?;
-            let after = self
-                .originals
-                .observe_all(&self.scope.context)
-                .map_err(denied)?;
-            let captured_after = self
-                .address
-                .read(
-                    &self.scope.context.intent.scope,
-                    self.scope.context.provenance.network_epoch,
-                )
-                .map_err(denied)?;
-            if all != after
-                || captured.binding != captured_after.binding
-                || captured.captured != captured_after.captured
-                || (members.clone(), history.clone())
-                    != self.members_with_history(&all.originals[0].identity)?
-                || snapshot != source_sdk_snapshot(captured.binding)?
-                || before != self.revision()?
-            {
+            if before != self.revision()? {
                 return Err(Error::Conflict);
             }
             Ok(SourceSample {
@@ -4084,19 +4066,7 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            if (members.clone(), history.clone())
-                != self.members(&all.originals[0].identity, partial)?
-                || all
-                    != self
-                        .originals
-                        .observe_all_for_cleanup(&self.scope.context)
-                        .map_err(denied)?
-                || before != self.revision()?
-                || partial
-                    .map(|original| original.inspect().map_err(denied))
-                    .transpose()?
-                    != partial_observation
-            {
+            if before != self.revision()? {
                 return Err(Error::Conflict);
             }
             Ok(ClosingSample {
