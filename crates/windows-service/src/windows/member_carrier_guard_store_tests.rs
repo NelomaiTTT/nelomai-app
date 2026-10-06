@@ -259,13 +259,12 @@ fn guard_cleanup_raw_cannot_create_or_rearm() {
         .is_err());
 }
 
-type Store = WindowsCarrierGuardStore<ProtectedSessionFiles<Disk>>;
-fn store() -> (Disk, ProtectedSessionFiles<Disk>, Store) {
-    let (disk, files) = fixture();
-    let (mut store, old) = Store::open(files.clone(), context()).unwrap();
-    assert!(old.is_none());
-    store.initialize().unwrap();
-    (disk, files, store)
+fn stored() -> (Disk, ProtectedSessionFiles<Disk>) {
+    let (disk, mut files) = fixture();
+    files
+        .compare_exchange(&scope(), kind(), None, &initial_bytes())
+        .unwrap();
+    (disk, files)
 }
 fn plan() -> guard::ExchangePlan {
     guard::ExchangePlan::new(&guard::Model::empty(scope()).unwrap(), &installed()).unwrap()
@@ -284,186 +283,26 @@ fn captured(mut plan: guard::ExchangePlan) -> guard::ExchangePlan {
     plan.validate().unwrap();
     plan
 }
-#[test]
-fn guard_typed_persist_capture_finish_rereads_exact_desired_and_revision() {
-    use guard::ExchangeJournal;
-    for fault in 0..4 {
-        let (disk, files) = fixture();
-        WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
-            .unwrap()
-            .0
-            .save(
-                &nelomai_client_tunnel::redundancy::session::SessionState::new(
-                    scope(),
-                    nelomai_client_tunnel::redundancy::Slot::A,
-                    0,
-                    0,
-                )
-                .unwrap()
-                .snapshot(),
-            )
-            .unwrap();
-        let history = files.session_ack_root(&scope()).unwrap();
-        let ack = history.inspect(|facts| Ok(facts.ack.clone())).unwrap();
-        let root = history.bind_native_birth(&context(), &ack).unwrap();
-        let (mut store, saved) =
-            Store::open(files.native_birth_view(&root).unwrap(), context()).unwrap();
-        assert!(saved.is_none());
-        store.initialize().unwrap();
-        let first = plan();
-        first.persist(&mut store, None).unwrap();
-        assert_eq!(store.readback().unwrap().unwrap().revision, 2);
-        let bound = captured(first.clone());
-        bound.persist(&mut store, Some(&first)).unwrap();
-        let desired = bound.resolve(&bound.desired.expected).unwrap();
-        store.finish(&bound, &desired).unwrap();
-        let final_record = store.readback().unwrap().unwrap();
-        assert_eq!(final_record.revision, 4);
-        assert!(final_record.pending.is_none());
-        assert_eq!(final_record.current, desired);
-        assert!(store.load(&scope()).unwrap().is_none());
-        let saved: SavedRecord =
-            serde_json::from_slice(&disk.0.borrow().bytes[&kind().file()]).unwrap();
-        assert_eq!(
-            CarrierGuardRecord::decode(saved.data.as_bytes()).unwrap(),
-            final_record
-        );
-        let canonical = root.native_cleanup_view(&files).unwrap().into_files();
-        if fault == 3 {
-            let original = store.files.read_identity();
-            disk.0.borrow_mut().fail_read = Some(kind().file());
-            assert!(store.enter_cleanup(canonical).is_err());
-            assert!(store.files.read_identity().same_original(&original));
-            assert!(store.files.native_cleanup && store.cleanup_only && store.revoked);
-            assert!(store.readback().is_err());
-            continue;
-        }
-        if fault != 0 {
-            let original = store.files.read_identity();
-            let mut foreign = canonical;
-            if fault == 1 {
-                let (other_disk, other_files) = fixture();
-                other_disk.0.borrow_mut().bytes = disk.0.borrow().bytes.clone();
-                foreign.backend = other_files.backend;
-                foreign.epoch_history = other_files.epoch_history;
-            } else {
-                foreign.native_execution = Some(std::sync::Weak::new());
-            }
-            assert!(store.enter_cleanup(foreign).is_err());
-            assert!(store.files.read_identity().same_original(&original));
-            assert!(store.cleanup_only && store.revoked);
-            assert!(!store.files.native_cleanup);
-            assert!(store.readback().is_err());
-            continue;
-        }
-        store.enter_cleanup(canonical).unwrap();
-        assert_eq!(store.readback().unwrap(), Some(final_record));
-        let withdrawn = desired.without_permits().unwrap();
-        let withdrawal = guard::ExchangePlan::new(&desired, &withdrawn).unwrap();
-        withdrawal.persist(&mut store, None).unwrap();
-        store.finish(&withdrawal, &withdrawn).unwrap();
-        let removal =
-            guard::ExchangePlan::new(&withdrawn, &guard::Model::empty(scope()).unwrap()).unwrap();
-        removal.persist(&mut store, None).unwrap();
-        store.finish(&removal, &removal.desired).unwrap();
-        assert_eq!(store.readback().unwrap().unwrap().current, removal.desired);
-        assert!(store.load(&scope()).unwrap().is_none());
-    }
-}
-#[test]
-fn guard_missing_journal_and_reopen_never_manufacture_live_empty_authority() {
-    use guard::ExchangeJournal;
-    let (_, files) = fixture();
-    let mut missing = Store::open(files.clone(), context()).unwrap().0;
-    assert!(missing.load(&scope()).is_err());
-    let (_, files, mut live) = store();
-    let mut reopened = Store::open(files.clone(), context()).unwrap().0;
-    assert!(reopened.cleanup_only);
-    assert!(reopened.initialize().is_err());
-    assert!(plan().persist(&mut reopened, None).is_err());
-    assert!(!files
-        .clone()
-        .native_carrier_access(&scope())
-        .unwrap()
-        .is_fresh());
-    assert!(plan().persist(&mut live, None).is_err());
-}
+
 #[test]
 fn guard_every_unconfirmed_write_revokes_shared_fresh_even_when_file_missing() {
-    use guard::ExchangeJournal;
     for fault in [1, 2, 3, 4, 5, 7, 8] {
         let (disk, mut files) = fixture();
-        let mut store = Store::open(files.clone(), context()).unwrap().0;
         disk.0.borrow_mut().fault = fault;
-        assert!(store.initialize().is_err(), "fault {fault}");
+        assert!(
+            files
+                .compare_exchange(&scope(), kind(), None, &initial_bytes())
+                .is_err(),
+            "fault {fault}"
+        );
         assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
         disk.0.borrow_mut().unreadable = false;
-        assert!(store.load(&scope()).is_err());
-        let another = Store::open(files, context());
-        if let Ok((mut another, _)) = another {
-            assert!(another.initialize().is_err());
-        }
-    }
-}
-#[test]
-fn guard_lost_plan_ack_cannot_be_promoted_by_persist_readback() {
-    use guard::ExchangeJournal;
-    for fault in [1, 2, 3, 4, 5, 7, 8] {
-        let (disk, mut files, mut store) = store();
-        disk.0.borrow_mut().fault = fault;
-        assert!(plan().persist(&mut store, None).is_err(), "fault {fault}");
-        assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-        assert!(store.load(&scope()).is_err());
-    }
-}
-#[test]
-fn guard_cleanup_resolves_no_permits_then_exact_empty_and_reconciles_lost_ack() {
-    use guard::ExchangeJournal;
-    let (disk, mut files, mut live) = store();
-    let bound = captured(plan());
-    plan().persist(&mut live, None).unwrap();
-    bound.persist(&mut live, Some(&plan())).unwrap();
-    let mut cleanup = Store::open(files.clone(), context()).unwrap().0;
-    let base = bound.resolve(&bound.base.expected).unwrap();
-    disk.0.borrow_mut().fault = 2;
-    cleanup.finish(&bound, &base).unwrap();
-    let removal = guard::ExchangePlan::new(&base, &guard::Model::empty(scope()).unwrap()).unwrap();
-    removal.persist(&mut cleanup, None).unwrap();
-    cleanup.finish(&removal, &removal.desired).unwrap();
-    assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-    assert!(cleanup.load(&scope()).unwrap().is_none());
-    let record = cleanup.readback().unwrap().unwrap();
-    assert!(!record.current.installed && !record.current.permits);
-    assert!(
-        record.current.expected.filters.is_empty() && record.current.expected.sublayer.is_none()
-    );
-}
-#[test]
-fn guard_finish_cannot_skip_pending_or_claim_unbound_creation_priority_or_wrong_readback() {
-    for case in 0..4 {
-        let (_, _, mut store) = store();
-        let first = plan();
-        if case != 0 {
-            first.persist(&mut store, None).unwrap();
-        }
-        let mut desired = first.desired.clone();
-        if case == 2 {
-            desired = first.base.clone();
-        }
-        if case == 3 {
-            desired = guard::Model::empty(scope()).unwrap();
-        }
-        assert!(store.finish(&first, &desired).is_err(), "case {case}");
+        assert!(files
+            .compare_exchange(&scope(), kind(), None, &initial_bytes())
+            .is_err());
     }
 }
 
-#[test]
-fn guard_fresh_cas_requires_context_again_after_ack() {
-    let (disk, mut files, mut store) = store();
-    disk.0.borrow_mut().fault = 6;
-    assert!(plan().persist(&mut store, None).is_err());
-    assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-}
 #[test]
 fn guard_raw_fresh_cas_also_rechecks_epoch_after_ack() {
     let (disk, mut files) = fixture();
@@ -474,72 +313,65 @@ fn guard_raw_fresh_cas_also_rechecks_epoch_after_ack() {
     assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
 }
 #[test]
-fn guard_stale_epoch_boot_runtime_binding_and_scope_deny_open_or_live_write() {
+fn guard_stale_epoch_boot_runtime_binding_and_scope_deny_legacy_write() {
     for case in 0..5 {
-        let (_, mut files, mut store) = store();
-        let mut wrong = context();
+        let (_, mut files) = stored();
+        let raw = files.read(&scope(), kind()).unwrap().unwrap();
+        let mut next = CarrierGuardRecord::decode(&raw).unwrap();
+        next.revision += 1;
+        next.pending = Some(plan());
         match case {
-            0 => wrong.provenance.network_epoch = 2,
-            1 => wrong.provenance.boot_id[0] = 8,
-            2 => wrong.provenance.runtime.manifest_sha256 = "b".repeat(64),
-            3 => wrong.bindings[0].name = "foreign".into(),
-            _ => wrong.intent.scope.connection_generation += 1,
+            0 => next.context.provenance.network_epoch = 2,
+            1 => next.context.provenance.boot_id[0] = 8,
+            2 => next.context.provenance.runtime.manifest_sha256 = "b".repeat(64),
+            3 => next.context.bindings[0].name = "foreign".into(),
+            _ => next.context.intent.scope.connection_generation += 1,
         }
-        assert!(Store::open(files.clone(), wrong).is_err(), "case {case}");
-        if case == 0 {
-            let mut snapshot = nelomai_client_tunnel::redundancy::session::SessionState::new(
-                scope(),
-                nelomai_client_tunnel::redundancy::Slot::A,
-                1,
-                1,
-            )
-            .unwrap()
-            .snapshot();
-            snapshot.network_epoch = 2;
-            WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
-                .unwrap()
-                .0
-                .save(&snapshot)
-                .unwrap();
-            assert!(plan().persist(&mut store, None).is_err());
-            assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-        }
+        assert!(
+            files
+                .compare_exchange(
+                    &scope(),
+                    kind(),
+                    Some(&raw),
+                    &serde_json::to_vec(&next).unwrap()
+                )
+                .is_err(),
+            "case {case}"
+        );
+        assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
     }
 }
 #[test]
 fn guard_oversize_schema_and_exact_raw_cas_conflicts_revoke() {
     for case in 0..4 {
-        let (_, mut files, mut store) = store();
+        let (_, mut files) = stored();
         let raw = files.read(&scope(), kind()).unwrap().unwrap();
         let mut next = CarrierGuardRecord::decode(&raw).unwrap();
         next.revision += 1;
         next.pending = Some(plan());
-        let bytes = if case == 0 {
-            vec![b' '; 65537]
-        } else {
-            next.encode().unwrap()
-        };
-        if case < 2 {
-            let expected = if case == 1 {
-                Some(b"foreign".as_slice())
-            } else {
-                Some(raw.as_slice())
-            };
-            assert!(files
-                .compare_exchange(&scope(), kind(), expected, &bytes)
-                .is_err());
-        } else {
-            use guard::ExchangeJournal;
-            let wrong = if case == 2 { Some(plan()) } else { None };
-            if case == 3 {
-                files
-                    .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
-                    .unwrap();
+        let bytes = match case {
+            0 => vec![b' '; 65537],
+            2 => {
+                let mut value = serde_json::to_value(&next).unwrap();
+                value["extra"] = true.into();
+                serde_json::to_vec(&value).unwrap()
             }
-            assert!(store.compare_exchange(wrong.as_ref(), &plan()).is_err());
+            _ => next.encode().unwrap(),
+        };
+        if case == 3 {
+            files
+                .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+                .unwrap();
         }
+        let expected = if case == 1 {
+            b"foreign".as_slice()
+        } else {
+            raw.as_slice()
+        };
+        assert!(files
+            .compare_exchange(&scope(), kind(), Some(expected), &bytes)
+            .is_err());
         assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-        assert!(store.readback().is_err());
     }
 }
 fn terminal_legacy(files: &mut ProtectedSessionFiles<Disk>) {
@@ -576,21 +408,45 @@ fn terminal_legacy(files: &mut ProtectedSessionFiles<Disk>) {
 #[test]
 fn guard_completion_requires_exact_no_keys_no_permits_no_pending_terminal() {
     for mode in 0..3 {
-        let (disk, mut files, mut store) = store();
+        let (disk, mut files) = stored();
         terminal_legacy(&mut files);
-        let first = plan();
-        first.persist(&mut store, None).unwrap();
-        let bound = captured(first.clone());
-        bound.persist(&mut store, Some(&first)).unwrap();
-        if mode == 1 {
-            store.finish(&bound, &bound.desired).unwrap();
-        }
-        if mode == 2 {
-            Store::open(files.clone(), context())
-                .unwrap()
-                .0
-                .finish(&bound, &bound.base)
-                .unwrap();
+        let mut raw = files.read(&scope(), kind()).unwrap().unwrap();
+        let mut next = CarrierGuardRecord::decode(&raw).unwrap();
+        next.revision += 1;
+        next.pending = Some(plan());
+        let bytes = next.encode().unwrap();
+        files
+            .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+            .unwrap();
+        raw = bytes;
+        let bound = captured(plan());
+        next.revision += 1;
+        next.pending = Some(bound.clone());
+        let bytes = next.encode().unwrap();
+        files
+            .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+            .unwrap();
+        raw = bytes;
+        let (mut cleanup, _) = files.recovery_view(RuntimeSlot::Stable).unwrap().unwrap();
+        if mode != 0 {
+            next.revision += 1;
+            next.pending = None;
+            next.current = if mode == 1 {
+                bound.desired.clone()
+            } else {
+                bound.base.clone()
+            };
+            let bytes = next.encode().unwrap();
+            if mode == 1 {
+                files
+                    .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+                    .unwrap();
+            } else {
+                cleanup
+                    .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+                    .unwrap();
+            }
+            raw = bytes;
         }
         assert!(files.complete(&scope()).is_err());
         assert!(!disk
@@ -598,25 +454,36 @@ fn guard_completion_requires_exact_no_keys_no_permits_no_pending_terminal() {
             .borrow()
             .bytes
             .contains_key(&completed_file(&scope()).unwrap()));
-        let mut cleanup = Store::open(files.clone(), context()).unwrap().0;
-        let current = if mode == 1 {
-            bound.desired.clone()
-        } else if mode == 2 {
-            bound.base.clone()
-        } else {
-            cleanup.finish(&bound, &bound.base).unwrap();
-            bound.base.clone()
-        };
-        let removal =
-            guard::ExchangePlan::new(&current, &guard::Model::empty(scope()).unwrap()).unwrap();
-        removal.persist(&mut cleanup, None).unwrap();
-        cleanup.finish(&removal, &removal.desired).unwrap();
+        if mode == 0 {
+            next.revision += 1;
+            next.pending = None;
+            next.current = bound.base.clone();
+            let bytes = next.encode().unwrap();
+            cleanup
+                .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+                .unwrap();
+            raw = bytes;
+        }
+        let empty = guard::Model::empty(scope()).unwrap();
+        next.revision += 1;
+        next.pending = Some(guard::ExchangePlan::new(&next.current, &empty).unwrap());
+        let bytes = next.encode().unwrap();
+        cleanup
+            .compare_exchange(&scope(), kind(), Some(&raw), &bytes)
+            .unwrap();
+        raw = bytes;
+        next.revision += 1;
+        next.current = empty;
+        next.pending = None;
+        cleanup
+            .compare_exchange(&scope(), kind(), Some(&raw), &next.encode().unwrap())
+            .unwrap();
         files.complete(&scope()).unwrap();
         assert!(files.scopes(RuntimeSlot::Stable).unwrap().is_empty());
-        let mut next = scope();
-        next.connection_generation += 1;
-        files.claim(&next).unwrap();
-        assert!(files.read(&next, kind()).unwrap().is_none());
+        let mut next_scope = scope();
+        next_scope.connection_generation += 1;
+        files.claim(&next_scope).unwrap();
+        assert!(files.read(&next_scope, kind()).unwrap().is_none());
     }
 }
 #[test]
@@ -627,7 +494,7 @@ fn guard_namespace_read_errors_deny_claim_recovery_complete_and_empty_paths() {
     d.0.borrow_mut().fail_read = Some(kind().file());
     assert!(files.claim(&scope()).is_err());
     for path in 0..4 {
-        let (d, mut files, _) = store();
+        let (d, mut files) = stored();
         terminal_legacy(&mut files);
         d.0.borrow_mut().fail_read = Some(kind().file());
         let denied = match path {
@@ -643,7 +510,7 @@ fn guard_namespace_read_errors_deny_claim_recovery_complete_and_empty_paths() {
 #[test]
 fn guard_retired_pending_or_installed_record_cannot_become_absence_or_new_claim() {
     for mode in 0..3 {
-        let (disk, mut files, _) = store();
+        let (disk, mut files) = stored();
         terminal_legacy(&mut files);
         files.complete(&scope()).unwrap();
         let mut saved: SavedRecord =
@@ -671,9 +538,9 @@ fn guard_retired_pending_or_installed_record_cannot_become_absence_or_new_claim(
     }
 }
 #[test]
-fn guard_readback_rejects_malformed_foreign_extra_and_versioned_retained_bytes() {
+fn guard_read_rejects_malformed_foreign_extra_and_versioned_retained_bytes() {
     for case in 0..6 {
-        let (disk, mut files, mut store) = store();
+        let (disk, mut files) = stored();
         let mut saved: SavedRecord =
             serde_json::from_slice(&disk.0.borrow().bytes[&kind().file()]).unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&saved.data).unwrap();
@@ -681,7 +548,7 @@ fn guard_readback_rejects_malformed_foreign_extra_and_versioned_retained_bytes()
             0 => value["version"] = 1.into(),
             1 => value["extra"] = true.into(),
             2 => value["context"]["extra"] = true.into(),
-            3 => value["context"]["bindings"][0]["name"] = "foreign".into(),
+            3 => value["context"]["bindings"][0]["name"] = "".into(),
             4 => {
                 value["context"]["provenance"]["runtime"]["manifest_sha256"] = "b".repeat(64).into()
             }
@@ -692,43 +559,22 @@ fn guard_readback_rejects_malformed_foreign_extra_and_versioned_retained_bytes()
             .borrow_mut()
             .bytes
             .insert(kind().file(), serde_json::to_vec(&saved).unwrap());
-        assert!(store.readback().is_err(), "case {case}");
-        assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
+        assert!(files.read(&scope(), kind()).is_err(), "case {case}");
     }
 }
 #[test]
 fn guard_json_cannot_supply_storage_permission_or_fresh_claim() {
-    #[derive(Clone)]
-    struct Bare;
-    impl SessionFiles for Bare {
-        fn scopes(&mut self, _: RuntimeSlot) -> io::Result<Vec<SessionScope>> {
-            Ok(vec![scope()])
-        }
-        fn claim(&mut self, _: &SessionScope) -> io::Result<()> {
-            Ok(())
-        }
-        fn read(&mut self, _: &SessionScope, _: RecordKind) -> io::Result<Option<Vec<u8>>> {
-            Ok(Some(initial_bytes()))
-        }
-        fn compare_exchange(
-            &mut self,
-            _: &SessionScope,
-            _: RecordKind,
-            _: Option<&[u8]>,
-            _: &[u8],
-        ) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    assert!(WindowsCarrierGuardStore::open(Bare, context()).is_err());
     let disk = Disk::default();
-    let unclaimed =
+    let mut unclaimed =
         ProtectedSessionFiles::new(disk, context().provenance.runtime, [7; 16]).unwrap();
-    assert!(Store::open(unclaimed, context()).is_err());
+    assert!(unclaimed
+        .compare_exchange(&scope(), kind(), None, &initial_bytes())
+        .is_err());
     let (_, mut files) = fixture();
     files.revoke_native_carrier_access(&scope()).unwrap();
-    let mut cleanup = Store::open(files.clone(), context()).unwrap().0;
-    assert!(cleanup.initialize().is_err());
+    assert!(files
+        .compare_exchange(&scope(), kind(), None, &initial_bytes())
+        .is_err());
     assert!(files.read(&scope(), kind()).unwrap().is_none());
 }
 
@@ -755,7 +601,7 @@ fn guard_direct_deserialization_is_strict_v2_not_only_the_io_decoder() {
 }
 #[test]
 fn guard_revision_overflow_has_no_write_and_revokes_fresh_claim() {
-    let (disk, mut files, mut store) = store();
+    let (disk, mut files) = stored();
     let mut saved: SavedRecord =
         serde_json::from_slice(&disk.0.borrow().bytes[&kind().file()]).unwrap();
     let mut record = CarrierGuardRecord::decode(saved.data.as_bytes()).unwrap();
@@ -763,49 +609,11 @@ fn guard_revision_overflow_has_no_write_and_revokes_fresh_claim() {
     saved.data = String::from_utf8(record.encode().unwrap()).unwrap();
     let raw = serde_json::to_vec(&saved).unwrap();
     disk.0.borrow_mut().bytes.insert(kind().file(), raw.clone());
-    assert!(plan().persist(&mut store, None).is_err());
+    record.pending = Some(plan());
+    let bytes = record.encode().unwrap();
+    assert!(files
+        .compare_exchange(&scope(), kind(), Some(saved.data.as_bytes()), &bytes)
+        .is_err());
     assert_eq!(disk.0.borrow().bytes[&kind().file()], raw);
     assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-}
-
-#[test]
-fn guard_missing_after_initialization_cannot_be_reinitialized_as_live_empty() {
-    let (disk, mut files, mut store) = store();
-    disk.0.borrow_mut().bytes.remove(&kind().file());
-    assert!(store.readback().is_err());
-    assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-    assert!(store.initialize().is_err());
-    assert!(!disk.0.borrow().bytes.contains_key(&kind().file()));
-}
-
-#[test]
-fn guard_read_observation_retains_continuity_even_if_another_actual_store_created_it() {
-    let (disk, mut files) = fixture();
-    let mut observer = Store::open(files.clone(), context()).unwrap().0;
-    files
-        .compare_exchange(&scope(), kind(), None, &initial_bytes())
-        .unwrap();
-    assert!(observer.readback().unwrap().is_some());
-    disk.0.borrow_mut().bytes.remove(&kind().file());
-    assert!(observer.readback().is_err());
-    assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-    assert!(observer.initialize().is_err());
-}
-
-#[test]
-fn guard_failed_plan_load_revokes_the_same_store_and_shared_freshness() {
-    use guard::ExchangeJournal;
-    for foreign in [false, true] {
-        let (_, mut files) = fixture();
-        let mut store = Store::open(files.clone(), context()).unwrap().0;
-        let mut requested = scope();
-        if foreign {
-            store.initialize().unwrap();
-            requested.connection_generation += 1;
-        }
-        assert!(store.load(&requested).is_err());
-        assert!(!files.native_carrier_access(&scope()).unwrap().is_fresh());
-        assert!(store.initialize().is_err());
-        assert!(store.readback().is_err());
-    }
 }

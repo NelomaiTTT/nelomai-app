@@ -1,6 +1,5 @@
 use super::*;
 use nelomai_contracts::RuntimeSlot;
-use std::{cell::RefCell, rc::Rc};
 
 fn scope() -> SessionScope {
     SessionScope {
@@ -307,59 +306,6 @@ fn serialized_model_recomputes_exact_snapshot_and_never_accepts_legacy_or_unknow
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Ack {
-    Fail,
-    Lost,
-    FalseSuccess,
-    Foreign,
-    Unreadable,
-}
-type Events = Rc<RefCell<Vec<&'static str>>>;
-struct Journal {
-    current: Option<ExchangePlan>,
-    fault: Option<Ack>,
-    unreadable: bool,
-    events: Events,
-}
-impl ExchangeJournal for Journal {
-    fn load(&mut self, _: &SessionScope) -> Result<Option<ExchangePlan>> {
-        if self.unreadable {
-            self.unreadable = false;
-            return Err(GuardError::Native(10));
-        }
-        Ok(self.current.clone())
-    }
-    fn compare_exchange(
-        &mut self,
-        expected: Option<&ExchangePlan>,
-        desired: &ExchangePlan,
-    ) -> Result<()> {
-        self.events.borrow_mut().push("journal");
-        if self.current.as_ref() != expected {
-            return Err(GuardError::Conflict);
-        }
-        let fault = self.fault.take();
-        if matches!(fault, Some(Ack::Fail)) {
-            return Err(GuardError::Native(11));
-        }
-        if matches!(fault, Some(Ack::FalseSuccess)) {
-            return Ok(());
-        }
-        self.current = Some(desired.clone());
-        if matches!(fault, Some(Ack::Foreign)) {
-            self.current.as_mut().unwrap().version = 99;
-        }
-        if matches!(fault, Some(Ack::Unreadable)) {
-            self.unreadable = true;
-        }
-        if fault.is_some() {
-            Err(GuardError::Native(12))
-        } else {
-            Ok(())
-        }
-    }
-}
 fn installed(active: Option<Slot>) -> Model {
     let desired = pair(active);
     let mut native = desired.expected.clone();
@@ -367,28 +313,6 @@ fn installed(active: Option<Slot>) -> Model {
     desired
         .readback_after(&Model::empty(scope()).unwrap(), &native)
         .unwrap()
-}
-#[test]
-fn lost_journal_ack_requires_exact_durable_plan_before_any_engine_effect() {
-    let plan = ExchangePlan::new(&Model::empty(scope()).unwrap(), &pair(Some(Slot::A))).unwrap();
-    for fault in [
-        Ack::Fail,
-        Ack::Lost,
-        Ack::FalseSuccess,
-        Ack::Foreign,
-        Ack::Unreadable,
-    ] {
-        let events = Events::default();
-        let mut journal = Journal {
-            current: None,
-            fault: Some(fault),
-            unreadable: false,
-            events: events.clone(),
-        };
-        let result = plan.persist(&mut journal, None);
-        assert_eq!(result.is_ok(), matches!(fault, Ack::Lost));
-        assert_eq!(*events.borrow(), vec!["journal"]);
-    }
 }
 #[test]
 fn split_boundary_rejects_wrong_session_writes_and_tampered_journal_states() {

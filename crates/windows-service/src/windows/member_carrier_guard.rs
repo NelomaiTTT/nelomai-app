@@ -750,6 +750,15 @@ impl ColdGuardPolicies {
         } else {
             let pair = facts.pair.as_ref().ok_or(GuardError::Conflict)?;
             pair.validate().map_err(|_| GuardError::Conflict)?;
+            let context = facts.context.as_ref().ok_or(GuardError::Conflict)?;
+            crate::windows::member_session::validate_guard_model(context, &pair.guard)
+                .map_err(|_| GuardError::Conflict)?;
+            if let Some(plan) = &pair.pending_guard {
+                for model in [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired] {
+                    crate::windows::member_session::validate_guard_model(context, model)
+                        .map_err(|_| GuardError::Conflict)?;
+                }
+            }
             let protected_record = pair.encode().map_err(|_| GuardError::Conflict)?;
             (
                 pair.guard.clone(),

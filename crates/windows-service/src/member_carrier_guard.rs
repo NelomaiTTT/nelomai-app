@@ -627,14 +627,6 @@ impl TryFrom<PlanWire> for ExchangePlan {
         Ok(plan)
     }
 }
-pub(crate) trait ExchangeJournal {
-    fn load(&mut self, scope: &SessionScope) -> Result<Option<ExchangePlan>>;
-    fn compare_exchange(
-        &mut self,
-        expected: Option<&ExchangePlan>,
-        desired: &ExchangePlan,
-    ) -> Result<()>;
-}
 impl ExchangePlan {
     pub(crate) fn new(expected: &Model, desired: &Model) -> Result<Self> {
         validate_exchange(&expected.scope, expected, desired)?;
@@ -691,35 +683,6 @@ impl ExchangePlan {
             }
         }
         Ok(model)
-    }
-    pub(crate) fn persist(
-        &self,
-        journal: &mut impl ExchangeJournal,
-        expected: Option<&ExchangePlan>,
-    ) -> Result<()> {
-        self.validate()?;
-        if let Some(old) = expected {
-            old.validate()?;
-            if old.expected.scope != self.expected.scope {
-                return Err(GuardError::Conflict);
-            }
-        }
-        let current = journal.load(&self.expected.scope)?;
-        if let Some(current) = &current {
-            current.validate()?;
-        }
-        if current.as_ref() != expected {
-            return Err(GuardError::Conflict);
-        }
-        let acknowledgement = journal.compare_exchange(expected, self);
-        let actual = journal.load(&self.expected.scope)?;
-        if actual.as_ref() == Some(self) {
-            return Ok(());
-        }
-        if actual.as_ref() != expected {
-            return Err(GuardError::Conflict);
-        }
-        Err(acknowledgement.err().unwrap_or(GuardError::Conflict))
     }
 }
 pub(crate) trait SplitEngines {

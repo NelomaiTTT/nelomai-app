@@ -1784,9 +1784,16 @@ fn all_ten_fixed_record_owners_survive_retirement_and_partial_overwrite_without_
         if kind == RecordKind::CarrierGuard {
             let mut context = context();
             context.intent.scope = own.clone();
-            let (mut guard, old) = WindowsCarrierGuardStore::open(f.clone(), context).unwrap();
-            assert!(old.is_none());
-            guard.initialize().unwrap();
+            let legacy = CarrierGuardRecord {
+                version: 2,
+                current: carrier_guard::Model::empty(own.clone()).unwrap(),
+                context,
+                revision: 1,
+                pending: None,
+            };
+            assert!(f.read(&own, kind).unwrap().is_none());
+            f.compare_exchange(&own, kind, None, &legacy.encode().unwrap())
+                .unwrap();
         }
         let row_role = match kind {
             RecordKind::CarrierRows => Some(rows::Role::Carrier),
