@@ -316,7 +316,9 @@ fn resource_rows(
             return Err(Error::Pending);
         }
         if n == 0 {
-            let address = ack.current.address.as_ref().ok_or(Error::Conflict)?;
+            let address = observed
+                .and_then(|actual| actual.address.as_ref())
+                .ok_or(Error::Conflict)?;
             if ack
                 .creation
                 .as_ref()

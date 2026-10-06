@@ -272,10 +272,23 @@ fn rebind_stage_denies_foreign_scope_epoch_target_and_unfinished_guard() {
 #[test]
 fn rebind_rows_preserve_c_and_all_live_member_weak_rows_with_actual_readback() {
     let (c, r, _) = rebinding(Slot::B);
-    let records = std::array::from_fn(|n| Some(row(&c, &r, n, Use::Reserve)));
-    resource_rows(&c, &r, Use::Rebind(1), rowfacts(&records)).unwrap();
+    let mut records = std::array::from_fn(|n| Some(row(&c, &r, n, Use::Reserve)));
+    let actual = records[0].as_ref().unwrap().current.clone();
+    let acknowledged = records[0].as_mut().unwrap();
+    acknowledged
+        .current
+        .address
+        .as_mut()
+        .unwrap()
+        .observed
+        .dad_state = 1;
+    acknowledged.creation.as_mut().unwrap().observed.dad_state = 1;
+    let mut facts = rowfacts(&records);
+    facts[0].as_mut().unwrap().observed = Some(&actual);
+    resource_rows(&c, &r, Use::Rebind(1), facts).unwrap();
     for cut in 0..5 {
         let mut wrong = records.clone();
+        let mut observed = actual.clone();
         match cut {
             0 => {
                 wrong[2]
@@ -289,21 +302,14 @@ fn rebind_rows_preserve_c_and_all_live_member_weak_rows_with_actual_readback() {
             1 => wrong[1].as_mut().unwrap().phase = rows::Phase::Stopped,
             2 => wrong[0].as_mut().unwrap().binding.network_epoch += 1,
             3 => wrong[2] = None,
-            _ => {
-                wrong[0]
-                    .as_mut()
-                    .unwrap()
-                    .current
-                    .address
-                    .as_mut()
-                    .unwrap()
-                    .observed
-                    .dad_state = 1
-            }
+            _ => observed.address.as_mut().unwrap().observed.dad_state = 1,
         }
-        assert!(resource_rows(&c, &r, Use::Rebind(1), rowfacts(&wrong)).is_err());
+        let mut facts = rowfacts(&wrong);
+        facts[0].as_mut().unwrap().observed = Some(&observed);
+        assert!(resource_rows(&c, &r, Use::Rebind(1), facts).is_err());
     }
     let mut absent = rowfacts(&records);
+    absent[0].as_mut().unwrap().observed = Some(&actual);
     absent[2].as_mut().unwrap().observed = None;
     assert!(resource_rows(&c, &r, Use::Rebind(1), absent).is_err());
 }
@@ -629,8 +635,32 @@ fn rowfacts(records: &[Option<rows::Record>; 3]) -> [Option<RowFact<'_>>; 3] {
 #[test]
 fn resource_rows_require_original_ack_ready_c_and_exact_weak_baseline_before_stop() {
     let (c, r, _) = fixture();
-    let records = [Some(row(&c, &r, 0, Use::Primary)), None, None];
-    resource_rows(&c, &r, Use::Primary, rowfacts(&records)).unwrap();
+    let mut records = [Some(row(&c, &r, 0, Use::Primary)), None, None];
+    let actual = records[0].as_ref().unwrap().current.clone();
+    let acknowledged = records[0].as_mut().unwrap();
+    acknowledged
+        .current
+        .address
+        .as_mut()
+        .unwrap()
+        .observed
+        .dad_state = 1;
+    acknowledged.creation.as_mut().unwrap().observed.dad_state = 1;
+    let mut facts = rowfacts(&records);
+    facts[0].as_mut().unwrap().observed = Some(&actual);
+    resource_rows(&c, &r, Use::Primary, facts).unwrap();
+    for fault in 0..3 {
+        let mut unready = actual.clone();
+        let observed = &mut unready.address.as_mut().unwrap().observed;
+        match fault {
+            0 => observed.dad_state = 1,
+            1 => observed.dad_state = 9,
+            _ => observed.creation_timestamp += 1,
+        }
+        let mut facts = rowfacts(&records);
+        facts[0].as_mut().unwrap().observed = Some(&unready);
+        assert!(resource_rows(&c, &r, Use::Primary, facts).is_err());
+    }
     let (c, r, _) = reserve();
     let records = [
         Some(row(&c, &r, 0, Use::Reserve)),
