@@ -126,8 +126,11 @@ fn compare_row_stage(
     compare_context(context, record)?;
     if record.pending_guard.is_some()
         || record.guard.permits
-        || !record.guard.installed
-        || record.guard.assigned_sublayer_weight.is_none()
+        || !((record.guard.installed && record.guard.assigned_sublayer_weight.is_some())
+            || (role == rows::Role::Carrier
+                && target == &rows::Target::Delete
+                && record.network.is_none()
+                && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?))
     {
         return Err(conflict());
     }
@@ -254,6 +257,28 @@ fn compare_full_empty_row(
 }
 fn compare_guard_blocks(record: &pair::Record, observed: &policy::Snapshot) -> io::Result<()> {
     record.guard.validate().map_err(denied)?;
+    let empty = policy::Model::empty(record.scope.clone()).map_err(denied)?;
+    if record.guard == empty
+        && observed == &empty.expected
+        && record.pending_guard.is_none()
+        && record.active.is_none()
+        && record.operation.is_none()
+        && record.network.is_none()
+        && matches!(
+            (record.phase, record.stop_stage, record.pending),
+            (
+                pair::Phase::Closing,
+                6,
+                Some(pair::Effect::CarrierAddressDelete)
+            ) | (
+                pair::Phase::Closing,
+                7,
+                Some(pair::Effect::CarrierSessionEnd)
+            ) | (pair::Phase::Closing, 8, Some(pair::Effect::CarrierClose))
+        )
+    {
+        return Ok(());
+    }
     if !record.guard.installed
         || record.guard.permits
         || record.pending_guard.is_some()

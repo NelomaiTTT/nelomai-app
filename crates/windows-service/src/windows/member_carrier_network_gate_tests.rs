@@ -626,6 +626,30 @@ fn native_empty_network_read_stage_ten_retry_is_not_a_stage_nine_removal_grant()
     nine.stop_stage = 9;
     nine.pending = Some(pair::Effect::NativeEmpty);
     assert!(compare_native_empty_resource_stage(&context, &nine, &baseline).is_err());
+
+    for stage in [9, 10] {
+        let (c, mut prebase, b) = native_empty_fixture(stage);
+        let retained_guard = prebase.guard.clone();
+        prebase.guard = policy::Model::empty(prebase.scope.clone()).unwrap();
+        prebase.network = None;
+        prebase.validate().unwrap();
+        assert!(compare_native_empty_resource_stage(&c, &prebase, &b).is_ok());
+        let mut wrong = prebase.clone();
+        if stage == 9 {
+            wrong.network = nine.network.clone();
+            assert!(compare_native_empty_resource_stage(&c, &wrong, &b).is_err());
+            wrong = prebase.clone();
+        }
+        wrong.pending_guard = Some(policy::ExchangePlan::new(&wrong.guard, &wrong.guard).unwrap());
+        assert!(compare_native_empty_resource_stage(&c, &wrong, &b).is_err());
+        wrong = prebase.clone();
+        wrong.guard.expected.filters = retained_guard.expected.filters.clone();
+        assert!(compare_native_empty_resource_stage(&c, &wrong, &b).is_err());
+        wrong = prebase.clone();
+        wrong.stop_stage = 8;
+        wrong.pending = Some(pair::Effect::CarrierClose);
+        assert!(compare_native_empty_resource_stage(&c, &wrong, &b).is_err());
+    }
 }
 
 // Break: lifecycle read facade widens stage2 restore or stage10 base removal.
@@ -638,6 +662,30 @@ fn lifecycle_network_resources_require_exact_three_six_seven_eight() {
         wrong.pending = Some(pair::Effect::RestoreNetwork);
         assert!(compare_lifecycle_resource_stage(&c, &wrong, &b, stage == 8).is_err());
         assert!(compare_lifecycle_resource_stage(&c, &r, &b, stage != 8).is_ok() == (stage == 8));
+        let mut prebase = r.clone();
+        prebase.guard = policy::Model::empty(prebase.scope.clone()).unwrap();
+        prebase.network = None;
+        prebase.validate().unwrap();
+        assert_eq!(
+            compare_lifecycle_resource_stage(&c, &prebase, &b, stage == 8).is_ok(),
+            stage != 3
+        );
+        if stage != 3 {
+            let mut wrong = prebase.clone();
+            wrong.network = r.network.clone();
+            assert!(compare_lifecycle_resource_stage(&c, &wrong, &b, stage == 8).is_err());
+            wrong = prebase.clone();
+            wrong.pending_guard =
+                Some(policy::ExchangePlan::new(&wrong.guard, &wrong.guard).unwrap());
+            assert!(compare_lifecycle_resource_stage(&c, &wrong, &b, stage == 8).is_err());
+            wrong = prebase.clone();
+            wrong.guard.expected.filters = r.guard.expected.filters.clone();
+            assert!(compare_lifecycle_resource_stage(&c, &wrong, &b, stage == 8).is_err());
+            wrong = prebase;
+            wrong.stop_stage = 10;
+            wrong.pending = Some(pair::Effect::Guard);
+            assert!(compare_lifecycle_resource_stage(&c, &wrong, &b, stage == 8).is_err());
+        }
     }
     let (c, mut r, b) = lifecycle_fixture(8);
     r.stop_stage = 10;
@@ -1383,6 +1431,25 @@ fn static_base_checks_stable_network_without_future_operation_plan() {
     let current = n.current.clone();
     drift.network.as_mut().unwrap().pending = Some(current);
     assert!(compare_static_base_resource_stage(&context, &drift).is_err());
+
+    let mut first = record.clone();
+    let base = policy::Model::new(
+        first.scope.clone(),
+        first.guard.carrier.clone().unwrap(),
+        first.guard.members.clone(),
+        None,
+    )
+    .unwrap()
+    .without_permits()
+    .unwrap();
+    first.phase = pair::Phase::Starting;
+    first.operation = Some(pair::Operation::Start(Slot::A));
+    first.active = None;
+    first.network = None;
+    first.guard = policy::Model::empty(first.scope.clone()).unwrap();
+    first.pending_guard = Some(policy::ExchangePlan::new(&first.guard, &base).unwrap());
+    first.validate().unwrap();
+    assert!(compare_static_base_resource_stage(&context, &first).is_ok());
 }
 
 // Break: accepting RestoreNetwork outside exactly Closing stage 2, or live use through Closing.

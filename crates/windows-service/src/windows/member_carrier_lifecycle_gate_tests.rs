@@ -416,9 +416,67 @@ fn exact_end_close_and_address_delete_stages_do_not_cross_authorize() {
     let close = closing(r.clone(), 8, pair::Effect::CarrierClose);
     assert!(compare_lifecycle_stage(&c, &close, LifecycleStage::Close).is_ok());
     assert!(compare_lifecycle_stage(&c, &close, LifecycleStage::End).is_err());
-    let delete = closing(r, 6, pair::Effect::CarrierAddressDelete);
+    let delete = closing(r.clone(), 6, pair::Effect::CarrierAddressDelete);
     assert!(compare_row_stage(&c, &delete, rows::Role::Carrier, &rows::Target::Delete).is_ok());
     assert!(compare_row_stage(&c, &end, rows::Role::Carrier, &rows::Target::Delete).is_err());
+    let empty = policy::Model::empty(r.scope.clone()).unwrap();
+    for (stage, effect) in [
+        (6, pair::Effect::CarrierAddressDelete),
+        (7, pair::Effect::CarrierSessionEnd),
+        (8, pair::Effect::CarrierClose),
+    ] {
+        let mut prebase = closing(r.clone(), stage, effect);
+        prebase.guard = empty.clone();
+        assert!(compare_guard_blocks(&prebase, &empty.expected).is_ok());
+        assert!(compare_guard_blocks(&prebase, &r.guard.expected).is_err());
+        if stage == 6 {
+            assert!(
+                compare_row_stage(&c, &prebase, rows::Role::Carrier, &rows::Target::Delete).is_ok()
+            );
+            assert!(
+                compare_row_stage(&c, &prebase, rows::Role::MemberA, &rows::Target::Delete)
+                    .is_err()
+            );
+        }
+        for fault in 0..6 {
+            let mut wrong = prebase.clone();
+            match fault {
+                0 => wrong.stop_stage += 1,
+                1 => wrong.pending = Some(pair::Effect::Guard),
+                2 => wrong.active = Some(Slot::A),
+                3 => wrong.operation = Some(pair::Operation::Start(Slot::A)),
+                _ => {
+                    let baseline = pair::NetworkSnapshot {
+                        routes: vec![],
+                        dns: None,
+                    };
+                    wrong.network = Some(pair::NetworkState {
+                        baseline: baseline.clone(),
+                        current: baseline.clone(),
+                        pending: (fault == 5).then_some(baseline),
+                    });
+                }
+            }
+            assert!(
+                compare_guard_blocks(&wrong, &empty.expected).is_err(),
+                "{stage}/{fault}"
+            );
+            if stage == 6 {
+                assert!(
+                    compare_row_stage(&c, &wrong, rows::Role::Carrier, &rows::Target::Delete)
+                        .is_err(),
+                    "{stage}/{fault}"
+                );
+            }
+        }
+    }
+    let (row, target) = pending_weak(row_fixture(&c, &r, rows::Role::MemberA));
+    let mut prebase = r.clone();
+    prebase.guard = empty.clone();
+    assert!(compare_row_stage(&c, &prebase, row.binding.role, &target).is_err());
+    assert!(compare_guard_blocks(&prebase, &empty.expected).is_err());
+    let restore = closing(prebase, 3, pair::Effect::RestoreWeak);
+    assert!(compare_row_stage(&c, &restore, row.binding.role, &target).is_err());
 }
 // Break: weak-host CAS accepts a target before the exact whole-Pair WeakRows intent or captured bases.
 #[test]
@@ -647,17 +705,35 @@ fn address_delete_uses_original_creation_identity_after_dad_progress() {
         before: row.current.clone(),
         target: rows::Target::Delete,
     });
-    let r = closing(r, 6, pair::Effect::CarrierAddressDelete);
-    assert!(compare_row_effect(
-        &c,
-        &r,
-        &row.binding,
-        &rows::Target::Delete,
-        &row,
-        &row,
-        &row.current
-    )
-    .is_ok());
+    let mut r = closing(r, 6, pair::Effect::CarrierAddressDelete);
+    for guard in [
+        r.guard.clone(),
+        policy::Model::empty(r.scope.clone()).unwrap(),
+    ] {
+        r.guard = guard;
+        assert!(compare_row_effect(
+            &c,
+            &r,
+            &row.binding,
+            &rows::Target::Delete,
+            &row,
+            &row,
+            &row.current
+        )
+        .is_ok());
+        let mut missing = row.clone();
+        missing.creation = None;
+        assert!(compare_row_effect(
+            &c,
+            &r,
+            &missing.binding,
+            &rows::Target::Delete,
+            &missing,
+            &missing,
+            &missing.current
+        )
+        .is_err());
+    }
 }
 
 // Break: already-revoked cleanup swallows a nested denial and reports success.

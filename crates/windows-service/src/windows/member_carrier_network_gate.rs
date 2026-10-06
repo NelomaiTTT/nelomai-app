@@ -405,7 +405,7 @@ fn compare_static_base_resource_stage(context: &Context, record: &pair::Record) 
         || record
             .carrier
             .is_none_or(|c| c.guid != context.bindings[0].guid)
-        || record.network.as_ref().is_none_or(|n| n.pending.is_some())
+        || record.network.as_ref().is_some_and(|n| n.pending.is_some())
     {
         return Err(conflict());
     }
@@ -440,6 +440,9 @@ fn compare_lifecycle_resource_stage(
         8 => pair::Effect::CarrierClose,
         _ => return Err(conflict()),
     };
+    let prebase_empty = matches!(record.stop_stage, 6..=8)
+        && record.network.is_none()
+        && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?;
     baseline.with_servers(&record.dns).map_err(denied)?;
     if record.scope != context.intent.scope
         || record.provenance != context.provenance
@@ -453,8 +456,8 @@ fn compare_lifecycle_resource_stage(
         || record.operation.is_some()
         || record.pending_guard.is_some()
         || record.guard.permits
-        || !record.guard.installed
-        || record.guard.assigned_sublayer_weight.is_none()
+        || ((!record.guard.installed || record.guard.assigned_sublayer_weight.is_none())
+            && !prebase_empty)
         || baseline.interface.scope != record.scope
         || baseline.interface.guid != c.guid
         || baseline.interface.index != c.index
@@ -488,7 +491,7 @@ fn compare_native_empty_resource_stage(
         _ => return Err(conflict()),
     };
     let retained_base = record.guard.installed && record.guard.assigned_sublayer_weight.is_some();
-    let completed_removal = record.stop_stage == 10
+    let empty_guard = (record.stop_stage == 10 || record.network.is_none())
         && record.pending_guard.is_none()
         && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?;
     baseline.with_servers(&record.dns).map_err(denied)?;
@@ -502,7 +505,7 @@ fn compare_native_empty_resource_stage(
         || record.active.is_some()
         || record.operation.is_some()
         || record.guard.permits
-        || (!retained_base && !completed_removal)
+        || (!retained_base && !empty_guard)
         || baseline.interface.scope != record.scope
         || baseline.interface.guid != c.guid
         || baseline.interface.index != c.index
