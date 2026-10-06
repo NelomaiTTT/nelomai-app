@@ -6329,12 +6329,6 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            let members = self.inventory.inspect_closing_full(
-                &self.context,
-                &self.runtime,
-                &self.image,
-                |members| Ok(members.to_vec()),
-            )?;
             pair_read
                 .inspect_cleanup_effect(
                     &self.runtime,
@@ -6351,19 +6345,11 @@ pub(crate) mod native {
                     if !window.matches_closing(closing) || !window.matches_runtime(&self.runtime) {
                         return Err(super::super::member_carrier_wintun::Error::Conflict);
                     }
-                    let inspect = || -> Result<()> {
-                        provider::native::inspect_mixed(&full_universe(
-                            &self.context,
-                            window.bindings(),
-                            &members,
-                        )?)
-                        .map_err(|_| Error::Conflict)?;
-                        self.gate
-                            .try_borrow_mut()
-                            .map_err(|_| Error::Conflict)?
-                            .authorize_stop(&self.context, expected, &self.intent, window)
-                    };
-                    inspect().map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
+                    self.gate
+                        .try_borrow_mut()
+                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)?
+                        .authorize_stop(&self.context, expected, &self.intent, window)
+                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
                 })
                 .map_err(|_| Error::Conflict)?;
             pair_read
