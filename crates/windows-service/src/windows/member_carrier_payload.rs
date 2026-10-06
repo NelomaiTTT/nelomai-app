@@ -70,6 +70,8 @@ fn library_entry(
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::windows::member_files::{
         pin_installed_files, pin_private_directory, pin_runtime_payload, PinnedDirectory,
         PinnedInstalledFiles, PinnedPayload,
@@ -141,18 +143,42 @@ pub(crate) mod native {
             layout: VerifiedLayout,
             origin: InstalledRuntimeOrigin,
         ) -> Result<Self> {
-            let root = pin_private_directory(&installation.root).map_err(|_| Error::Conflict)?;
-            let pointer = d::read_bounded(&installation.root.join(d::POINTER_NAME), 96)
-                .map_err(|_| Error::Conflict)?;
-            let generation = std::str::from_utf8(&pointer).map_err(|_| Error::Conflict)?;
+            let root = pin_private_directory(&installation.root).map_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("installed acquire root pin: {_error:?}"));
+                Error::Conflict
+            })?;
+            let pointer = d::read_bounded(&installation.root.join(d::POINTER_NAME), 96).map_err(
+                |_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("installed acquire pointer read: {_error:?}"));
+                    Error::Conflict
+                },
+            )?;
+            let generation = std::str::from_utf8(&pointer).map_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("installed acquire pointer decode: {_error:?}"));
+                Error::Conflict
+            })?;
             if installation.root.join("releases").join(generation) != layout.directory {
+                #[cfg(test)]
+                trace_step("installed acquire pointer identity mismatch: Conflict");
                 return Err(Error::Conflict);
             }
             let (manifest, manifest_size) =
-                read_signed_manifest(&layout.directory, &layout.identity)?;
+                read_signed_manifest(&layout.directory, &layout.identity).inspect_err(
+                    |_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("installed acquire signed manifest: {_error:?}"));
+                    },
+                )?;
             let policy_size =
                 d::read_bounded(&layout.directory.join("installation-policy.json"), 8192)
-                    .map_err(|_| Error::Conflict)?
+                    .map_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("installed acquire policy read: {_error:?}"));
+                        Error::Conflict
+                    })?
                     .len() as u64;
             let mut inventory = vec![
                 (
@@ -182,14 +208,31 @@ pub(crate) mod native {
                 }
             }
             inventory.push((
-                layout.dispatcher_path(),
+                // dispatcher_path() uses a literal "dispatcher/1". Preserve
+                // the original lexical ancestors with native component joins;
+                // member_files intentionally rejects mixed-separator spelling.
+                layout.directory.join("dispatcher").join("1").join(
+                    layout
+                        .engine_path()
+                        .file_name()
+                        .expect("verified engine filename"),
+                ),
                 Some(layout.dispatcher_payload_identity().0),
             ));
             // BrokerPolicy authenticates a digest, not a length. Capture the
             // original handle's length; final full broker hashing below binds
             // it without imposing the DLL's unrelated 16 MiB ceiling.
             inventory.push((layout.broker.executable.clone(), None));
-            let files = pin_installed_files(&inventory).map_err(|_| Error::Conflict)?;
+            #[cfg(test)]
+            trace_step(&format!(
+                "installed acquire inventory count={}",
+                inventory.len()
+            ));
+            let files = pin_installed_files(&inventory).map_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("installed acquire inventory: {_error:?}"));
+                Error::Conflict
+            })?;
             let current = Self::authenticate(installation, executable, origin)?;
             if current.identity != layout.identity
                 || current.directory != layout.directory
@@ -718,7 +761,10 @@ pub(crate) mod native {
                 directory.join("container-manifest-v1.json"),
                 directory.join("container-manifest-v1.sig"),
                 policy_path,
-                directory.join("dispatcher/1/nelomai-windows-service.exe"),
+                directory
+                    .join("dispatcher")
+                    .join("1")
+                    .join("nelomai-windows-service.exe"),
                 policy.executable,
             ]);
             for relative in ["engines/latest/0.3.3", "engines/stable/0.3.2"] {

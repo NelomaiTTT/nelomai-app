@@ -425,6 +425,8 @@ pub(crate) use native::{
 mod native {
     use super::*;
     use crate::member_owner::Journal;
+    #[cfg(test)]
+    use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::windows::{install::state_directory, member_owner::PrivateConfig};
     use std::{
         ffi::c_void,
@@ -943,11 +945,17 @@ mod native {
         let mut paths = std::collections::BTreeSet::new();
         for (path, _) in inventory {
             if !path.is_absolute() {
+                #[cfg(test)]
+                trace_step(&format!("installed pin nonabsolute path={path:?}: Invalid"));
                 return Err(OwnerError::Invalid);
             }
             let parent = path.parent().ok_or(OwnerError::Invalid)?;
             let drive = parent.ancestors().last().ok_or(OwnerError::Invalid)?;
             if unsafe { GetDriveTypeW(wide(drive)?.as_ptr()) } != 3 {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin drive path={path:?} drive={drive:?}: Invalid"
+                ));
                 return Err(OwnerError::Invalid);
             }
             paths.extend(parent.ancestors().map(Path::to_path_buf));
@@ -956,36 +964,92 @@ mod native {
         paths.sort_by_key(|path| path.components().count());
         let mut directories = PinnedDirectory(Vec::new());
         for path in paths {
-            directories.verify()?;
-            let file = open_directory(&path).map_err(|_| OwnerError::Native)?;
+            directories.verify().inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin ancestors before path={path:?}: {_error:?}"
+                ));
+            })?;
+            let file = open_directory(&path).map_err(|_code| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin directory open path={path:?}: Native returned_code={_code}"
+                ));
+                OwnerError::Native
+            })?;
             let directory = Directory {
-                id: stamp(&file, true, 0)?.id,
-                acl: acl(&file, Protection::Ancestor)?,
+                id: stamp(&file, true, 0)
+                    .inspect_err(|_error| {
+                        #[cfg(test)]
+                        trace_step(&format!(
+                            "installed pin directory stamp path={path:?}: {_error:?}"
+                        ));
+                    })?
+                    .id,
+                acl: acl(&file, Protection::Ancestor).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "installed pin directory ACL path={path:?}: {_error:?}"
+                    ));
+                })?,
                 path,
                 file,
                 protection: Protection::Ancestor,
             };
-            directory.verify()?;
+            directory.verify().inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin directory recheck path={:?}: {_error:?}",
+                    directory.path
+                ));
+            })?;
             directories.0.push(directory);
         }
         let mut files = Vec::new();
         for (path, expected_size) in inventory {
-            let file = open_payload(path)?;
-            let stamp = stamp(&file, false, usize::MAX)?;
+            let file = open_payload(path).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin file open path={path:?}: {_error:?}"
+                ));
+            })?;
+            let stamp = stamp(&file, false, usize::MAX).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin file stamp path={path:?}: {_error:?}"
+                ));
+            })?;
             if expected_size.is_some_and(|size| size != stamp.facts.size) {
+                #[cfg(test)]
+                trace_step(&format!("installed pin file size path={path:?} expected={expected_size:?} actual={}: Conflict", stamp.facts.size));
                 return Err(OwnerError::Conflict);
             }
             let pin = InstalledFile {
                 path: path.clone(),
-                security: installed_security(&file)?,
+                security: installed_security(&file).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "installed pin file security path={path:?}: {_error:?}"
+                    ));
+                })?,
                 file,
                 stamp,
             };
-            pin.verify()?;
+            pin.verify().inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!(
+                    "installed pin file recheck path={path:?}: {_error:?}"
+                ));
+            })?;
             files.push(pin);
         }
         let pinned = PinnedInstalledFiles { directories, files };
-        pinned.verify()?;
+        pinned.verify().inspect_err(|_error| {
+            #[cfg(test)]
+            trace_step(&format!(
+                "installed pin final inventory recheck: {_error:?}"
+            ));
+        })?;
         Ok(pinned)
     }
     pub(crate) fn pin_runtime_payload(
