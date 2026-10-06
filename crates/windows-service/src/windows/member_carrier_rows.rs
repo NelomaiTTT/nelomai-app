@@ -1478,6 +1478,8 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
                 return Err(Error::Retired);
             }
             let baseline = read(creator, kernel, binding)?;
+            #[cfg(all(test, windows))]
+            trace_observe("rows capture initial read complete");
             if baseline.address.is_some() {
                 return Err(Error::Conflict);
             }
@@ -1545,10 +1547,16 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
                 .ok_or(Error::Pending)?
                 .acknowledged
                 .set(true);
+            #[cfg(all(test, windows))]
+            trace_observe("rows capture initial ACK accepted");
             retain(RowRecordReadPin {
                 original: receipt.clone(),
             })?;
+            #[cfg(all(test, windows))]
+            trace_observe("rows capture retain returned");
             let after = read(creator, &mut state.kernel, binding)?;
+            #[cfg(all(test, windows))]
+            trace_observe("rows capture final read returned");
             if !same_owned(&after, &state.record.current) {
                 return Err(Error::Conflict);
             }

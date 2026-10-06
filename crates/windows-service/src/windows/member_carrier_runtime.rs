@@ -5408,14 +5408,8 @@ pub(crate) mod native {
                 self.image.verify_live_runtime(&self.runtime)
             }
             .map_err(|_| rows::Error::Conflict)?;
-            let stage = if use_ == Use::Cleanup {
-                Stage::CleanupObserve
-            } else {
-                Stage::Observe
-            };
-            self.gate
-                .authorize(&self.scope, stage, &self.observer)
-                .map_err(|_| rows::Error::Conflict)?;
+            // Factual identity reads do not authorize effects. Mutation G
+            // remains mandatory in OriginalCreator::authorize.
             let facts = if use_ == Use::Cleanup {
                 self.observer.observe_all_for_cleanup(&self.scope.context)
             } else {
@@ -5448,14 +5442,8 @@ pub(crate) mod native {
                 self.image.verify_live_runtime(&self.runtime)
             }
             .map_err(|_| rows::Error::Conflict)?;
-            let stage = if use_ == Use::Cleanup {
-                Stage::CleanupObserve
-            } else {
-                Stage::Observe
-            };
-            self.gate
-                .authorize(&self.scope, stage, &self.observer)
-                .map_err(|_| rows::Error::Conflict)?;
+            // Factual identity reads do not authorize effects. Mutation G
+            // remains mandatory in OriginalCreator::authorize.
             let all_before = if use_ == Use::Cleanup {
                 self.observer.observe_all_for_cleanup(&self.scope.context)
             } else {
