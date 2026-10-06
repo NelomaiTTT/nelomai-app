@@ -205,6 +205,10 @@ impl RuntimeRead {
         #[cfg(not(test))]
         let installation = Installation::production(root).map_err(|_| Error::Conflict)?;
         let executable = actual_executable()?;
+        // This process remains in the same boot for the retained runtime's lifetime.
+        if super::member_boot::boot_id().map_err(|_| Error::Native)? != context.provenance.boot_id {
+            return Err(Error::Conflict);
+        }
         let installed = PinnedInstalledRuntime::new(
             &installation,
             &executable,
@@ -253,12 +257,6 @@ impl Runtime {
             .verify_at(&self.installation.root.join("engine-owner.lock"))
             .map_err(|_| Error::Conflict)?;
         (self.pin)()?;
-        if actual_executable()? != self.executable
-            || super::member_boot::boot_id().map_err(|_| Error::Native)?
-                != context.provenance.boot_id
-        {
-            return Err(Error::Conflict);
-        }
         Ok(())
     }
     fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
@@ -266,7 +264,7 @@ impl Runtime {
         super::member_carrier_factory_test_os::trace_step("runtime current check");
         self.verify_original_context(pin, context)?;
         // SAME retained deny-write/delete handles keep the signed byte proof
-        // alive. The outer original-context checks cover owner/root/executable
+        // alive. The outer original-context checks cover owner/root/context
         // before/after; duplicating those checks inside installed adds no fact.
         let live = self.installed.layout();
         if live.identity != self.identity

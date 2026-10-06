@@ -1007,19 +1007,18 @@ pub(crate) mod native {
                             window,
                         )
                         .map_err(native_denied)?;
-                    window.inspect(|bindings| {
-                        compare_bindings_with_history(
-                            &self.originals.context,
-                            &selected.record,
-                            &facts(bindings),
-                            window_history(window),
-                        )
-                        .map_err(native_denied)?;
-                        Ok(Bindings {
-                            scope: bindings.scope.clone(),
-                            carrier: bindings.carrier.clone(),
-                            egress: bindings.egress.clone(),
-                        })
+                    let bindings = window.bindings();
+                    compare_bindings_with_history(
+                        &self.originals.context,
+                        &selected.record,
+                        &facts(bindings),
+                        window_history(window),
+                    )
+                    .map_err(native_denied)?;
+                    Ok(Bindings {
+                        scope: bindings.scope.clone(),
+                        carrier: bindings.carrier.clone(),
+                        egress: bindings.egress.clone(),
                     })
                 })
             })

@@ -353,12 +353,9 @@ pub(crate) mod native {
             self.payload
                 .verify_original()
                 .map_err(|_| Error::Conflict)?;
-            if actual_executable()? != self.executable {
-                return Err(Error::Conflict);
-            }
             // SAME retained handles keep both slots' signed byte proof alive.
             // Owner/root and strict DLL originals already bracket this read;
-            // actual/canonical executable checks remain current here.
+            // the canonical executable binding remains current here.
             let layout = self.installed.layout();
             if layout.identity != self.identity
                 || layout.directory != self.directory

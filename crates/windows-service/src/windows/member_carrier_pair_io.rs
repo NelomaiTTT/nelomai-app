@@ -7138,22 +7138,19 @@ pub(crate) mod native {
             network_plan_channel(record.guard.permits, record.pending_guard.is_some(), usage)?;
             let options = record.options.as_ref().ok_or_else(conflict)?;
             options.validate().map_err(denied)?;
-            let owned = window
-                .inspect(|b| {
-                    let c = b.carrier.as_ref().ok_or_else(|| native_denied(()))?;
-                    if Some(c.identity.proof) != record.carrier {
-                        return Err(native_denied(()));
-                    }
-                    Ok(std::iter::once(&c.identity)
-                        .chain(b.egress.iter().flatten())
-                        .map(|id| InterfaceIdentity {
-                            index: id.proof.index,
-                            luid: id.proof.luid,
-                            guid: id.proof.guid,
-                        })
-                        .collect::<Vec<_>>())
+            let bindings = window.bindings();
+            let c = bindings.carrier.as_ref().ok_or_else(|| denied(()))?;
+            if Some(c.identity.proof) != record.carrier {
+                return Err(denied(()));
+            }
+            let owned = std::iter::once(&c.identity)
+                .chain(bindings.egress.iter().flatten())
+                .map(|id| InterfaceIdentity {
+                    index: id.proof.index,
+                    luid: id.proof.luid,
+                    guid: id.proof.guid,
                 })
-                .map_err(denied)?;
+                .collect::<Vec<_>>();
             let before = crate::windows::member_physical::capture(&owned)?;
             let ack = r.network_ack.acknowledgements()?;
             let leases = r.network_ack.physical_leases()?;
@@ -8422,17 +8419,16 @@ pub(crate) mod native {
                 r.pins
                     .source
                     .inspect_window(|window| {
-                        let owned = window.inspect(|bindings| {
-                            let c = bindings.carrier.as_ref().ok_or_else(|| native_denied(()))?;
-                            Ok(std::iter::once(&c.identity)
-                                .chain(bindings.egress.iter().flatten())
-                                .map(|id| crate::member_physical::InterfaceIdentity {
-                                    index: id.proof.index,
-                                    luid: id.proof.luid,
-                                    guid: id.proof.guid,
-                                })
-                                .collect::<Vec<_>>())
-                        })?;
+                        let bindings = window.bindings();
+                        let c = bindings.carrier.as_ref().ok_or_else(|| native_denied(()))?;
+                        let owned = std::iter::once(&c.identity)
+                            .chain(bindings.egress.iter().flatten())
+                            .map(|id| crate::member_physical::InterfaceIdentity {
+                                index: id.proof.index,
+                                luid: id.proof.luid,
+                                guid: id.proof.guid,
+                            })
+                            .collect::<Vec<_>>();
                         let before = crate::windows::member_physical::capture(&owned)
                             .map_err(native_denied)?;
                         let after = crate::windows::member_physical::capture(&owned)
