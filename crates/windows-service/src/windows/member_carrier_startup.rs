@@ -2296,6 +2296,11 @@ pub(crate) mod native {
                 trace_step("startup graph GuardStore saved present error=Conflict");
                 return Err(Error::Conflict);
             }
+            self.guard_journal
+                .as_mut()
+                .ok_or(Error::Pending)?
+                .initialize()
+                .map_err(|_| Error::Journal)?;
             graph_result!(
                 selection.select(original.clone(), expected.clone()),
                 "guard selection"

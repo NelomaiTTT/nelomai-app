@@ -5183,6 +5183,11 @@ pub(crate) mod native {
                             r.assembly
                                 .begin_cleanup(&mut r.lock, &r.runtime, &pin)
                                 .map_err(denied)?;
+                            let canonical = r
+                                .runtime
+                                .native_files_for_original(&r.context, &r.files)
+                                .map_err(denied)?;
+                            r.guard_journal.enter_cleanup(canonical)?;
                         }
                         supervisor
                             .run_cleanup(&context, &pin, || {

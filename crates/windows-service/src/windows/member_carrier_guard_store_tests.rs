@@ -287,25 +287,88 @@ fn captured(mut plan: guard::ExchangePlan) -> guard::ExchangePlan {
 #[test]
 fn guard_typed_persist_capture_finish_rereads_exact_desired_and_revision() {
     use guard::ExchangeJournal;
-    let (disk, _, mut store) = store();
-    let first = plan();
-    first.persist(&mut store, None).unwrap();
-    assert_eq!(store.readback().unwrap().unwrap().revision, 2);
-    let bound = captured(first.clone());
-    bound.persist(&mut store, Some(&first)).unwrap();
-    let desired = bound.resolve(&bound.desired.expected).unwrap();
-    store.finish(&bound, &desired).unwrap();
-    let final_record = store.readback().unwrap().unwrap();
-    assert_eq!(final_record.revision, 4);
-    assert!(final_record.pending.is_none());
-    assert_eq!(final_record.current, desired);
-    assert!(store.load(&scope()).unwrap().is_none());
-    let saved: SavedRecord =
-        serde_json::from_slice(&disk.0.borrow().bytes[&kind().file()]).unwrap();
-    assert_eq!(
-        CarrierGuardRecord::decode(saved.data.as_bytes()).unwrap(),
-        final_record
-    );
+    for fault in 0..4 {
+        let (disk, files) = fixture();
+        WindowsSessionStore::open(files.clone(), scope(), RecordKind::Session)
+            .unwrap()
+            .0
+            .save(
+                &nelomai_client_tunnel::redundancy::session::SessionState::new(
+                    scope(),
+                    nelomai_client_tunnel::redundancy::Slot::A,
+                    0,
+                    0,
+                )
+                .unwrap()
+                .snapshot(),
+            )
+            .unwrap();
+        let history = files.session_ack_root(&scope()).unwrap();
+        let ack = history.inspect(|facts| Ok(facts.ack.clone())).unwrap();
+        let root = history.bind_native_birth(&context(), &ack).unwrap();
+        let (mut store, saved) =
+            Store::open(files.native_birth_view(&root).unwrap(), context()).unwrap();
+        assert!(saved.is_none());
+        store.initialize().unwrap();
+        let first = plan();
+        first.persist(&mut store, None).unwrap();
+        assert_eq!(store.readback().unwrap().unwrap().revision, 2);
+        let bound = captured(first.clone());
+        bound.persist(&mut store, Some(&first)).unwrap();
+        let desired = bound.resolve(&bound.desired.expected).unwrap();
+        store.finish(&bound, &desired).unwrap();
+        let final_record = store.readback().unwrap().unwrap();
+        assert_eq!(final_record.revision, 4);
+        assert!(final_record.pending.is_none());
+        assert_eq!(final_record.current, desired);
+        assert!(store.load(&scope()).unwrap().is_none());
+        let saved: SavedRecord =
+            serde_json::from_slice(&disk.0.borrow().bytes[&kind().file()]).unwrap();
+        assert_eq!(
+            CarrierGuardRecord::decode(saved.data.as_bytes()).unwrap(),
+            final_record
+        );
+        let canonical = root.native_cleanup_view(&files).unwrap().into_files();
+        if fault == 3 {
+            let original = store.files.read_identity();
+            disk.0.borrow_mut().fail_read = Some(kind().file());
+            assert!(store.enter_cleanup(canonical).is_err());
+            assert!(store.files.read_identity().same_original(&original));
+            assert!(store.files.native_cleanup && store.cleanup_only && store.revoked);
+            assert!(store.readback().is_err());
+            continue;
+        }
+        if fault != 0 {
+            let original = store.files.read_identity();
+            let mut foreign = canonical;
+            if fault == 1 {
+                let (other_disk, other_files) = fixture();
+                other_disk.0.borrow_mut().bytes = disk.0.borrow().bytes.clone();
+                foreign.backend = other_files.backend;
+                foreign.epoch_history = other_files.epoch_history;
+            } else {
+                foreign.native_execution = Some(std::sync::Weak::new());
+            }
+            assert!(store.enter_cleanup(foreign).is_err());
+            assert!(store.files.read_identity().same_original(&original));
+            assert!(store.cleanup_only && store.revoked);
+            assert!(!store.files.native_cleanup);
+            assert!(store.readback().is_err());
+            continue;
+        }
+        store.enter_cleanup(canonical).unwrap();
+        assert_eq!(store.readback().unwrap(), Some(final_record));
+        let withdrawn = desired.without_permits().unwrap();
+        let withdrawal = guard::ExchangePlan::new(&desired, &withdrawn).unwrap();
+        withdrawal.persist(&mut store, None).unwrap();
+        store.finish(&withdrawal, &withdrawn).unwrap();
+        let removal =
+            guard::ExchangePlan::new(&withdrawn, &guard::Model::empty(scope()).unwrap()).unwrap();
+        removal.persist(&mut store, None).unwrap();
+        store.finish(&removal, &removal.desired).unwrap();
+        assert_eq!(store.readback().unwrap().unwrap().current, removal.desired);
+        assert!(store.load(&scope()).unwrap().is_none());
+    }
 }
 #[test]
 fn guard_missing_journal_and_reopen_never_manufacture_live_empty_authority() {

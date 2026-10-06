@@ -5370,6 +5370,24 @@ impl<F: SessionFiles> WindowsCarrierGuardStore<F> {
         self.initialized = true;
         Ok(next)
     }
+    /// Storage-only handoff of this initialized journal to its SAME canonical
+    /// cleanup view. The original record and native effect owners stay retained.
+    pub(crate) fn enter_cleanup(&mut self, files: F) -> io::Result<()> {
+        let failed_before = self.revoked;
+        self.cleanup_only = true;
+        self.revoked = true; // Err/unwind cannot restore forward journal access.
+        if failed_before || !self.initialized {
+            return Err(failed());
+        }
+        files.verify_native_row_cleanup_origin(&self.files)?; // pure, before IO
+        self.files = files; // retain accepted original cleanup view before IO
+        let (access, _, current) = guard_snapshot(&mut self.files, &self.context)?;
+        if access.is_fresh() || !access.is_registered_native_birth_view() || current.is_none() {
+            return Err(failed());
+        }
+        self.revoked = false;
+        Ok(())
+    }
     fn revoke(&mut self) {
         self.revoked = true;
         let _ = self
