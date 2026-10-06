@@ -1,5 +1,4 @@
 //! Retained original DLL loading only; never NIC/key/row/effect authority.
-#![allow(dead_code)] // Carrier factory is still gated on lifecycle integration.
 
 #[cfg(windows)]
 use super::member_carrier_terminal_release::TerminalCallState;
@@ -824,51 +823,6 @@ impl<K: Kernel> Loaded<K> {
         self.valid.set(was_valid);
         Ok(held)
     }
-    /// Factual full revalidation for separately authorized cleanup. Inherited
-    /// forward poison is preserved; native lifecycle effects are not exposed.
-    fn reattest_cleanup_with(
-        &mut self,
-        cancelled: &AtomicBool,
-        mut package: impl FnMut(&mut K) -> Result<()>,
-    ) -> Result<()> {
-        let valid = self.valid.clone();
-        image_cleanup_read(&valid, || {
-            checkpoint(cancelled)?;
-            let mut lease = self.kernel.lease(cancelled)?;
-            self.kernel.source()?;
-            package(&mut self.kernel)?;
-            self.kernel.source()?;
-            self.kernel.verify_lease(&mut lease, cancelled)?;
-            self.kernel.module(&self.module)?;
-            self.kernel.verify_lease(&mut lease, cancelled)?;
-            checkpoint(cancelled)
-        })
-    }
-    fn reattest_cold(&mut self, cancelled: &AtomicBool) -> Result<()> {
-        self.reattest_with(cancelled, K::package)
-    }
-    fn reattest_with(
-        &mut self,
-        cancelled: &AtomicBool,
-        mut package: impl FnMut(&mut K) -> Result<()>,
-    ) -> Result<()> {
-        if !self.valid.get() {
-            return Err(Error::Conflict);
-        }
-        // A late error, cancellation or unwind cannot revive cached load trust.
-        self.valid.set(false);
-        checkpoint(cancelled)?;
-        let mut lease = self.kernel.lease(cancelled)?;
-        self.kernel.source()?;
-        package(&mut self.kernel)?;
-        self.kernel.source()?;
-        self.kernel.verify_lease(&mut lease, cancelled)?;
-        self.kernel.module(&self.module)?;
-        self.kernel.verify_lease(&mut lease, cancelled)?;
-        checkpoint(cancelled)?;
-        self.valid.set(true);
-        Ok(())
-    }
 }
 
 #[cfg(windows)]
@@ -1257,14 +1211,6 @@ pub(crate) mod native {
         module: Rc<Module>,
     }
     impl NativeOriginalModuleLoadRead {
-        /// Actual registered process PIN/source origin only, including after
-        /// release of this session reference. Not a worker/resource/session ACK
-        /// or SDK permission, and never resurrects this client's valid gate.
-        pub(crate) fn verify_process_code_lifetime(&self) -> Result<()> {
-            image_cleanup_read(&self.original.valid, || {
-                require_process_anchor(&self.source, &self.original.module)
-            })
-        }
         pub(crate) fn same_original(&self, other: &Self) -> bool {
             std::ptr::eq(self, other)
         }
@@ -1492,9 +1438,6 @@ pub(crate) mod native {
                     .verify_source(&self.source)
                     .map_err(|_| Error::Conflict)
             })
-        }
-        pub(super) fn matches_lock(&self, lock: &KeyLock) -> bool {
-            lock.matches_pin(&self.lock)
         }
         pub(crate) fn verify_cleanup_read(&self) -> Result<()> {
             image_cleanup_read(&self.valid, || {
@@ -1924,32 +1867,6 @@ pub(crate) mod native {
             }
             Ok(())
         }
-        /// Full factual original-owned package/image read through an actual
-        /// RuntimeRead with the SAME serialized pin, authenticated source and
-        /// full runtime scope before and after. Drops the cooperative lease
-        /// before returning this comparison-only HMODULE; no effect rights.
-        pub(crate) fn original_owned_module_read(
-            &mut self,
-            runtime: &RuntimeRead,
-            cancelled: &AtomicBool,
-            originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-        ) -> Result<NonNull<c_void>> {
-            let held = self.retain_owned_module_read(runtime, cancelled, originals)?;
-            Ok(held.module())
-        }
-        /// Full factual cleanup read using actual current Closing observation.
-        /// Preserves forward poison and drops the cooperative lease on return.
-        /// Current record/HKEY and row/guard/network ordering remain main's
-        /// independent obligations; this HMODULE grants no end/close rights.
-        pub(crate) fn original_owned_module_read_for_cleanup(
-            &mut self,
-            runtime: &RuntimeRead,
-            cancelled: &AtomicBool,
-            originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-        ) -> Result<NonNull<c_void>> {
-            let held = self.retain_owned_module_read_for_cleanup(runtime, cancelled, originals)?;
-            Ok(held.module())
-        }
         /// Full forward package/original-image refresh; transfers the SAME
         /// actual cooperative lease to the returned factual resource owner.
         /// Main must retain it across its separately authorized Create/Close
@@ -2096,22 +2013,6 @@ pub(crate) mod native {
             loaded.valid.set(true);
             Ok(())
         }
-        #[cfg(test)]
-        fn new(
-            source: &Rc<WintunSource>,
-            lock: &mut KeyLock,
-            cancelled: &AtomicBool,
-        ) -> Result<Self> {
-            let mut slot = None;
-            Self::load_cold_into(
-                &mut slot,
-                source,
-                lock,
-                cancelled,
-                &Rc::new(Cell::new(false)),
-            )?;
-            slot.take().ok_or(Error::Conflict)
-        }
         /// Returning a number grants no effect authority. The unsafe native
         /// carrier seam additionally requires independently implemented real
         /// module/runtime/current protected context/key/fresh permission gates.
@@ -2137,62 +2038,6 @@ pub(crate) mod native {
                         .map_err(|_| Error::Conflict)
                 },
                 |boundary, ()| boundary.package(),
-            )?;
-            Ok(held.module.0)
-        }
-        /// Read-only post-create package/module refresh from actual original
-        /// ACKs, NEVER saved GUIDs. Still grants no native lifecycle effects.
-        pub(crate) fn original_owned_module(
-            &mut self,
-            lock: &mut KeyLock,
-            cancelled: &AtomicBool,
-            originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-        ) -> Result<NonNull<c_void>> {
-            self.original_owned_module_locked(lock, cancelled, originals, false)
-        }
-        /// Full factual cleanup package/module read through original pins.
-        /// Preserves any prior forward revocation and grants NO native effect.
-        /// Actual observation requires current protected Closing bytes on both
-        /// sides; end/close still need independent row/guard/network ordering.
-        pub(crate) fn original_owned_module_for_cleanup(
-            &mut self,
-            lock: &mut KeyLock,
-            cancelled: &AtomicBool,
-            originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-        ) -> Result<NonNull<c_void>> {
-            self.original_owned_module_locked(lock, cancelled, originals, true)
-        }
-        fn original_owned_module_locked(
-            &mut self,
-            lock: &mut KeyLock,
-            cancelled: &AtomicBool,
-            originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-            cleanup: bool,
-        ) -> Result<NonNull<c_void>> {
-            self.verify_code_lifetime()?;
-            let source = &self.original_source;
-            let pin = &self.lock;
-            let loaded = self.loaded.owner.as_mut().ok_or(Error::Conflict)?;
-            let held = loaded.retain_with(
-                cancelled,
-                cleanup,
-                originals,
-                |_, originals| {
-                    if !originals.matches_source(source) || !lock.matches_pin(pin) {
-                        return Err(Error::Conflict);
-                    }
-                    pin.verify_source(source).map_err(|_| Error::Conflict)?;
-                    lock.verify_source(source).map_err(|_| Error::Conflict)
-                },
-                |boundary, originals| {
-                    let package = boundary.package.as_mut().ok_or(Error::Conflict)?;
-                    if cleanup {
-                        package.reattest_owned_cleanup(&mut originals.cleanup_devices())
-                    } else {
-                        package.reattest_owned(originals)
-                    }
-                    .map_err(|_| Error::Conflict)
-                },
             )?;
             Ok(held.module.0)
         }
@@ -2237,84 +2082,6 @@ pub(crate) mod native {
                 && self.module.1.unloaded.get()
                 && self.permit.matches_root(root)
         }
-    }
-
-    #[cfg(test)]
-    fn actual_held_original_keeps_native_lease_after_loaded_is_dropped(
-        mut loaded: LoadedWintun,
-        runtime: &RuntimeRead,
-        cancelled: &AtomicBool,
-        originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-    ) -> Result<OriginalModuleLease> {
-        // Type-check actual RuntimeRead/inventory/module/native Lease ownership.
-        // No native execution, lifecycle effect or effect grant is claimed.
-        let mut held = loaded.retain_owned_module_read(runtime, cancelled, originals)?;
-        let _: &mut Lease = &mut held.held.lease;
-        drop(loaded);
-        held.verify(cancelled)?;
-        Ok(held)
-    }
-
-    // Compile-only integration regression: the independently held SAME key
-    // lock must remain usable to obtain the NEW-key receipt while our original
-    // source and DLL reference stay retained. No native execution in tests.
-    #[cfg(test)]
-    fn actual_same_module_cleanup_package_path_requires_real_serialized_lock(
-        module: &mut LoadedWintun,
-        lock: &mut KeyLock,
-        cancelled: &AtomicBool,
-        originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-    ) -> Result<()> {
-        // Compile-only: current Closing proof is checked in real observation,
-        // not manufactured from this API or assumed to have run on Windows.
-        module.original_owned_module_for_cleanup(lock, cancelled, originals)?;
-        Ok(())
-    }
-    #[cfg(test)]
-    fn cleanup_package_reader_requires_actual_originals_and_retains_revoked_forward_state(
-        originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-    ) -> std::result::Result<(), crate::windows::member_carrier_wintun_package::Error> {
-        // Compile-only real boundary contract, not native execution.
-        let mut cleanup = originals.cleanup_devices();
-        crate::windows::member_carrier_wintun_package::OriginalDevices::observe(&mut cleanup)
-            .map(|_| ())
-    }
-    #[cfg(test)]
-    fn original_image_keeps_actual_source_pins_after_caller_releases_source(
-        source: Rc<WintunSource>,
-        lock: &mut KeyLock,
-        cancelled: &AtomicBool,
-    ) -> Result<OriginalImage> {
-        let mut loaded = LoadedWintun::new(&source, lock, cancelled)?;
-        let image = loaded.original_image(lock, cancelled)?;
-        drop(loaded);
-        drop(source);
-        image.verify_cleanup_read()?;
-        Ok(image)
-    }
-    #[cfg(test)]
-    fn module_owns_cold_package_after_caller_source_drop_and_can_query_exact_originals(
-        source: Rc<WintunSource>,
-        lock: &mut KeyLock,
-        cancelled: &AtomicBool,
-        originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-    ) -> Result<LoadedWintun> {
-        let mut loaded = LoadedWintun::new(&source, lock, cancelled)?;
-        drop(source);
-        loaded.original_owned_module(lock, cancelled, originals)?;
-        Ok(loaded)
-    }
-    #[cfg(test)]
-    fn key_receipt_and_original_module_have_compatible_borrows(
-        source: &Rc<WintunSource>,
-        lock: &mut KeyLock,
-        cancelled: &AtomicBool,
-    ) -> Result<()> {
-        let mut module = LoadedWintun::new(source, lock, cancelled)?;
-        lock.verify_source(source).map_err(|_| Error::Conflict)?;
-        module.original_cold_module(lock, cancelled)?;
-        lock.verify_source(source).map_err(|_| Error::Conflict)?;
-        Ok(())
     }
 }
 

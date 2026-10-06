@@ -466,22 +466,6 @@ fn no_constructor_backend_factual_ack_denies_foreign_equal_and_missing_origins()
         .unwrap();
 }
 
-#[cfg(windows)]
-fn actual_no_constructor_release_backend_compile_contract<
-    P: native::NativeNoConstructorModuleReleaseProof,
->(
-    loaded: &mut native::LoadedWintun,
-    original: &Rc<native::NativeOriginalModuleLoadRead>,
-    proof: Rc<P>,
-    retained: &mut Option<native::NativeNoConstructorModuleReleased<P>>,
-) -> Result<()> {
-    // Actual fixed native API; no unsafe supplier implementation and no run.
-    loaded.release_no_constructor_into(original, proof, retained)?;
-    let ack = retained.as_ref().ok_or(Error::Conflict)?;
-    loaded.verify_original_no_constructor_native_release(ack)?;
-    loaded.verify_no_constructor_disposition(ack)
-}
-
 // Break: reopening ordinary image trust or admitting a factual image query
 // before selection, after effect/postflight, or after pre has returned.
 #[test]
@@ -717,15 +701,6 @@ fn no_constructor_backend_rechecks_actual_loans_across_pre_and_post() {
             .verify_original_disposition(&original, &terminal, &release, &loans, Rc::ptr_eq)
             .is_err());
     }
-}
-
-#[cfg(windows)]
-fn actual_no_constructor_release_pre_read_compile_contract(
-    original: &native::NativeOriginalModuleLoadRead,
-    runtime: &crate::windows::member_carrier_key_authority::RuntimeRead,
-    cancelled: &AtomicBool,
-) -> Result<()> {
-    original.verify_release_pre_read(runtime, cancelled)
 }
 
 // Break: retaining the returned native original only AFTER fallible postflight.
@@ -1545,102 +1520,6 @@ fn cancellation_at_last_native_absence_never_executes_dll_initialization() {
 }
 
 #[test]
-fn cleanup_owned_refresh_after_poison_queries_all_boundaries_without_rearming() {
-    let s = Shared::default();
-    let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
-    loaded.valid.set(false);
-    s.borrow_mut().calls.clear();
-    loaded
-        .reattest_cleanup_with(&AtomicBool::new(false), |boundary| {
-            assert!(boundary.0.borrow().lease_held);
-            boundary.call("cleanup package")
-        })
-        .unwrap();
-    assert_eq!(
-        s.borrow().calls,
-        [
-            "lease",
-            "source",
-            "cleanup package",
-            "source",
-            "verify_lease",
-            "module",
-            "verify_lease",
-            "release"
-        ]
-    );
-    assert!(!loaded.valid.get());
-    assert_eq!(
-        loaded.reattest_cold(&AtomicBool::new(false)),
-        Err(Error::Conflict)
-    );
-    assert_eq!(s.borrow().loaded, 1);
-    assert_eq!(s.borrow().unloads, 0);
-}
-
-#[test]
-fn cleanup_refresh_failure_or_unwind_never_revives_forward_module() {
-    for failure in 1..=7 {
-        for unwind in [false, true] {
-            let s = Shared::default();
-            let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
-            s.borrow_mut().calls.clear();
-            if unwind {
-                s.borrow_mut().panic = Some(failure);
-            } else {
-                s.borrow_mut().fail = Some(failure);
-            }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                loaded.reattest_cleanup_with(&AtomicBool::new(false), |boundary| {
-                    boundary.call("cleanup package")
-                })
-            }));
-            if unwind {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap(), Err(Error::Conflict));
-            }
-            assert!(!loaded.valid.get());
-            assert!(!s.borrow().lease_held);
-            assert_eq!(s.borrow().unloads, 0);
-        }
-    }
-}
-
-#[test]
-fn owned_package_refresh_uses_same_lease_and_factual_image_reads_without_reloading() {
-    let s = Shared::default();
-    let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
-    s.borrow_mut().calls.clear();
-    let valid = loaded.valid.clone();
-    loaded
-        .reattest_with(&AtomicBool::new(false), |boundary| {
-            assert!(boundary.0.borrow().lease_held);
-            assert!(!valid.get());
-            image_cleanup_read(&valid, || boundary.call("original image"))?;
-            assert!(!valid.get()); // the inner factual read cannot rearm the caller
-            boundary.call("owned package")
-        })
-        .unwrap();
-    assert_eq!(
-        s.borrow().calls,
-        [
-            "lease",
-            "source",
-            "original image",
-            "owned package",
-            "source",
-            "verify_lease",
-            "module",
-            "verify_lease",
-            "release"
-        ]
-    );
-    assert!(valid.get());
-    assert_eq!(s.borrow().loaded, 1);
-}
-
-#[test]
 fn owned_package_error_or_unwind_never_rearms_module_or_releases_its_original_pin() {
     for unwind in [false, true] {
         let s = Shared::default();
@@ -1648,13 +1527,21 @@ fn owned_package_error_or_unwind_never_rearms_module_or_releases_its_original_pi
         s.borrow_mut().calls.clear();
         let valid = loaded.valid.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            loaded.reattest_with(&AtomicBool::new(false), |_| {
-                image_cleanup_read(&valid, || Ok(()))?;
-                if unwind {
-                    panic!("unknown post-create package query");
-                }
-                Err(Error::Native)
-            })
+            loaded
+                .retain_with(
+                    &AtomicBool::new(false),
+                    false,
+                    &mut (),
+                    |boundary, ()| boundary.call("runtime"),
+                    |_, ()| {
+                        image_cleanup_read(&valid, || Ok(()))?;
+                        if unwind {
+                            panic!("unknown post-create package query");
+                        }
+                        Err(Error::Native)
+                    },
+                )
+                .map(drop)
         }));
         if unwind {
             assert!(result.is_err());
@@ -1665,72 +1552,19 @@ fn owned_package_error_or_unwind_never_rearms_module_or_releases_its_original_pi
         assert!(!s.borrow().lease_held);
         assert_eq!(s.borrow().unloads, 0);
         assert_eq!(
-            loaded.reattest_with(&AtomicBool::new(false), |_| {
-                panic!("revoked original must never query again")
-            }),
+            loaded
+                .retain_with(
+                    &AtomicBool::new(false),
+                    false,
+                    &mut (),
+                    |_, ()| panic!("revoked original must never query again"),
+                    |_, ()| panic!("revoked package must never query again"),
+                )
+                .map(drop),
             Err(Error::Conflict)
         );
         drop(loaded);
         assert_eq!(s.borrow().unloads, 1);
-    }
-}
-
-#[test]
-fn fresh_cold_module_borrow_never_reuses_prior_source_or_package_check() {
-    let s = Shared::default();
-    let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
-    s.borrow_mut().calls.clear();
-    loaded.reattest_cold(&AtomicBool::new(false)).unwrap();
-    assert_eq!(
-        s.borrow().calls,
-        [
-            "lease",
-            "source",
-            "package",
-            "source",
-            "verify_lease",
-            "module",
-            "verify_lease",
-            "release"
-        ]
-    );
-    assert!(loaded.valid.get());
-    assert_eq!(s.borrow().loaded, 1);
-    assert_eq!(s.borrow().unloads, 0);
-}
-
-#[test]
-fn cold_reattest_error_or_panic_permanently_revokes_executable_borrow() {
-    for failure in 1..=7 {
-        for panic in [false, true] {
-            let s = Shared::default();
-            let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
-            s.borrow_mut().calls.clear();
-            if panic {
-                s.borrow_mut().panic = Some(failure);
-            } else {
-                s.borrow_mut().fail = Some(failure);
-            }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                loaded.reattest_cold(&AtomicBool::new(false))
-            }));
-            if panic {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap(), Err(Error::Conflict));
-            }
-            assert!(!loaded.valid.get());
-            assert!(!s.borrow().lease_held);
-            let calls = s.borrow().calls.clone();
-            assert_eq!(
-                loaded.reattest_cold(&AtomicBool::new(false)),
-                Err(Error::Conflict)
-            );
-            assert_eq!(s.borrow().calls, calls);
-            assert_eq!(s.borrow().unloads, 0);
-            drop(loaded);
-            assert_eq!(s.borrow().unloads, 1);
-        }
     }
 }
 
@@ -1748,10 +1582,16 @@ fn revoked_cooperative_lease_cannot_initialize_or_return_executable_module() {
     let s = Shared::default();
     let mut loaded = load(Boundary(s.clone()), &AtomicBool::new(false)).unwrap();
     s.borrow_mut().deny_lease_verification = true;
-    assert_eq!(
-        loaded.reattest_cold(&AtomicBool::new(false)),
+    assert!(matches!(
+        loaded.retain_with(
+            &AtomicBool::new(false),
+            false,
+            &mut (),
+            |boundary, ()| boundary.call("runtime"),
+            |boundary, ()| boundary.package(),
+        ),
         Err(Error::Conflict)
-    );
+    ));
     assert!(!loaded.valid.get());
     assert!(!s.borrow().lease_held);
     assert_eq!(s.borrow().loaded, 1);
@@ -2316,53 +2156,6 @@ fn cancellation_at_held_verification_entry_or_exit_poisons_shared_forward_state(
     }
 }
 
-#[cfg(windows)]
-fn actual_original_native_load_reader_compile_contract(
-    loaded: &native::LoadedWintun,
-    runtime: &crate::windows::member_carrier_key_authority::RuntimeRead,
-    source: &Rc<crate::windows::member_carrier_payload::native::WintunSource>,
-    cancelled: &AtomicBool,
-) -> Result<()> {
-    // Actual native types and callsites only; never invoked on host/Windows.
-    let mut original = None;
-    loaded.retain_original_load_read_into(&mut original)?;
-    let original: Rc<native::NativeOriginalModuleLoadRead> = original.ok_or(Error::Conflict)?;
-    loaded.verify_original_load_read(&original)?;
-    if !original.same_original(&original.clone())
-        || !original.matches_source(source)
-        || !original.matches_runtime(runtime)
-    {
-        return Err(Error::Conflict);
-    }
-    original.verify_cleanup_read(runtime, cancelled)?;
-    original.verify_process_code_lifetime()?;
-    loaded.verify_original_load_read(&original)
-}
-
-#[cfg(windows)]
-fn actual_retained_runtime_and_native_lease_compile_contract(
-    loaded: &mut native::LoadedWintun,
-    runtime: &crate::windows::member_carrier_key_authority::RuntimeRead,
-    cancelled: &AtomicBool,
-    originals: &mut crate::windows::member_carrier_wintun::native::OriginalPackageInventory,
-) -> Result<()> {
-    // Compile-only regression with actual native types. Never executed.
-    let _ = loaded.original_owned_module_read(runtime, cancelled, originals)?;
-    let _ = loaded.original_owned_module_read_for_cleanup(runtime, cancelled, originals)?;
-    let mut held: native::OriginalModuleLease =
-        loaded.retain_owned_module_read(runtime, cancelled, originals)?;
-    held.verify(cancelled)?;
-    // Cleanup of the SAME previously forward-acquired holder remains factual
-    // after revocation; it must not require or revive its old forward grant.
-    held.verify_for_cleanup(cancelled)?;
-    let _: std::ptr::NonNull<std::ffi::c_void> = held.module();
-    drop(held);
-    let mut cleanup: native::OriginalModuleLease =
-        loaded.retain_owned_module_read_for_cleanup(runtime, cancelled, originals)?;
-    cleanup.verify(cancelled)?;
-    let _: std::ptr::NonNull<std::ffi::c_void> = cleanup.module();
-    Ok(())
-}
 // Break: pin native return is local until postflight, an uncertain pin retries,
 // or code can be exposed before the genuine original pin completes.
 #[test]
