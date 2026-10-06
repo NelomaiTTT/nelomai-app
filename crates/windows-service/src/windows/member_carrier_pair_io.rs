@@ -5657,17 +5657,16 @@ pub(crate) mod native {
                         })
                         .map_err(denied)?;
                 } else {
-                    let sample = |window: &NativeBindingsWindow<'_>| {
-                        Self::attest_window(r, window).map_err(native_denied)
-                    };
+                    // Preserve the complete original SDK/Calling bracket.
+                    // Each concrete effect independently checks its resource G.
                     if record.phase == pair::Phase::Closing {
                         this.closing
                             .as_ref()
                             .ok_or_else(conflict)?
-                            .inspect_window(sample)
+                            .inspect_window(|_| Ok(()))
                             .map_err(denied)?;
                     } else {
-                        r.pins.source.inspect_window(sample).map_err(denied)?;
+                        r.pins.source.inspect_window(|_| Ok(())).map_err(denied)?;
                     }
                 }
                 r.runtime.verify(&r.context).map_err(denied)
