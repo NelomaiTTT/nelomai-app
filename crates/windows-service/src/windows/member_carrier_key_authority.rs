@@ -552,23 +552,18 @@ impl RuntimeRead {
         &self,
         source: &super::member_carrier_payload::native::WintunSource,
     ) -> Result<()> {
-        let context = &self.runtime.context;
-        crate::member_fresh_read::read(
-            || {
-                self.runtime.verify_original_context(&self.lease, context)?;
-                // The opaque original Source authenticates the identical installed
-                // engine, including its own root/owner and retained DLL pin.
-                source.verify_runtime_binding(
-                    &self.runtime.owner,
-                    &self.runtime.identity,
-                    &self.runtime.installation.root,
-                    &self.runtime.directory,
-                    &self.runtime.executable,
-                )?;
-                self.runtime.verify_original_context(&self.lease, context)
-            },
-            || self.verify_original_source_context(source),
-        )
+        // Two independent actual protected-context reads fence the SAME bound
+        // source verification. Each also brackets original owner/root/lease/boot;
+        // the retained signed proof and strict DLL checks remain in Source.
+        self.verify_original_source_context(source)?;
+        source.verify_runtime_binding(
+            &self.runtime.owner,
+            &self.runtime.identity,
+            &self.runtime.installation.root,
+            &self.runtime.directory,
+            &self.runtime.executable,
+        )?;
+        self.verify_original_source_context(source)
     }
     /// Actual signed member sources, not member service/NIC ownership or effect
     /// permission. Compare the SAME held serialized owner, not equal JSON or a
