@@ -3295,8 +3295,6 @@ pub(crate) mod native {
                                     .pending
                                     .as_ref()
                                     .map(|v| v.iter().map(route).collect()),
-                                carrier_rows: facts.routes.carrier_rows.clone(),
-                                egress_rows: facts.routes.egress_rows.clone(),
                                 active: facts.routes.active,
                                 pending_active: facts.routes.pending_active,
                                 stopping: facts.routes.stopping,

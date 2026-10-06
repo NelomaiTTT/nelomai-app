@@ -1334,8 +1334,6 @@ struct NetworkSample {
             Option<crate::member_routes::Row>,
         )>,
     >,
-    carrier_rows: Vec<crate::member_routes::Row>,
-    egress_rows: [Vec<crate::member_routes::Row>; 2],
     active: Option<nelomai_client_tunnel::redundancy::Slot>,
     pending_active: Option<nelomai_client_tunnel::redundancy::Slot>,
     stopping: bool,
@@ -1361,8 +1359,6 @@ fn network_sample(
                 .map(|r| (r.expected.clone(), r.actual.clone()))
                 .collect()
         }),
-        carrier_rows: facts.carrier_rows.clone(),
-        egress_rows: facts.egress_rows.clone(),
         active: facts.active,
         pending_active: facts.pending_active,
         stopping: facts.stopping,

@@ -2113,8 +2113,6 @@ fn owned_network_sample_detects_pending_drift_without_borrowing_original_facts()
             actual: Some(row.clone()),
         }],
         pending: None,
-        carrier_rows: vec![],
-        egress_rows: [vec![], vec![]],
         active: Some(nelomai_client_tunnel::redundancy::Slot::A),
         pending_active: None,
         stopping: false,
@@ -2142,8 +2140,6 @@ fn owned_network_sample_keeps_full_sdk_metadata_dns_and_protected_bytes() {
             actual: Some(row.clone()),
         }],
         pending: None,
-        carrier_rows: vec![],
-        egress_rows: [vec![], vec![]],
         active: Some(nelomai_client_tunnel::redundancy::Slot::A),
         pending_active: None,
         stopping: false,
@@ -2160,8 +2156,8 @@ fn owned_network_sample_keeps_full_sdk_metadata_dns_and_protected_bytes() {
     for field in 0..6 {
         match field {
             0 => facts.current[0].actual.as_mut().unwrap().luid += 1,
-            1 => facts.carrier_rows.push(row.clone()),
-            2 => facts.egress_rows[1].push(row.clone()),
+            1 => facts.current[0].actual.as_mut().unwrap().protocol += 1,
+            2 => facts.current[0].actual.as_mut().unwrap().flags[0] = 1,
             3 => facts.active = Some(nelomai_client_tunnel::redundancy::Slot::B),
             4 => facts.pending_active = Some(nelomai_client_tunnel::redundancy::Slot::B),
             _ => facts.stopping = true,
@@ -2169,8 +2165,8 @@ fn owned_network_sample_keeps_full_sdk_metadata_dns_and_protected_bytes() {
         assert_ne!(network_sample(&facts, &dns, Some(&[1, 2, 3])), before);
         match field {
             0 => facts.current[0].actual.as_mut().unwrap().luid -= 1,
-            1 => facts.carrier_rows.clear(),
-            2 => facts.egress_rows[1].clear(),
+            1 => facts.current[0].actual.as_mut().unwrap().protocol -= 1,
+            2 => facts.current[0].actual.as_mut().unwrap().flags[0] = 0,
             3 => facts.active = Some(nelomai_client_tunnel::redundancy::Slot::A),
             4 => facts.pending_active = None,
             _ => facts.stopping = false,

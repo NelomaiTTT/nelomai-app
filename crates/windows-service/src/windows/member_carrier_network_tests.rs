@@ -294,8 +294,6 @@ fn network_facts_keep_committed_and_pending_values_separate_and_report_native_ro
     let baseline = compare_routes(&c_only, &empty, &[], &[row(33)]).unwrap();
     assert!(baseline.current.is_empty());
     assert!(baseline.pending.is_none());
-    assert_eq!(baseline.carrier_rows, vec![row(33)]);
-    assert_eq!(baseline.egress_rows, [vec![], vec![]]);
     assert_eq!(baseline.active, None);
     let s = sources();
     let mut target = route(11);
@@ -307,9 +305,19 @@ fn network_facts_keep_committed_and_pending_values_separate_and_report_native_ro
     assert_eq!(f.pending.as_ref().unwrap()[0].expected, target);
     assert_eq!(f.current[0].actual, Some(row(11)));
     assert_eq!(f.pending.as_ref().unwrap()[0].actual, Some(row(11)));
-    assert_eq!(f.carrier_rows, vec![row(33)]);
-    assert_eq!(f.egress_rows, [vec![row(11)], vec![row(12)]]);
     assert_eq!(f.active, Some(nelomai_client_tunnel::redundancy::Slot::A));
+    // Incidental kernel routes on the live C/A/B interfaces are outside the
+    // journal-owned keys and must not change the facts used by postflight.
+    let mut incidental = seen.clone();
+    for index in [33, 11, 12] {
+        let mut native = row(index);
+        native.route.destination = "224.0.0.0/4".parse().unwrap();
+        native.protocol = 2;
+        native.origin = 1;
+        native.flags = [0, 1, 0, 0];
+        incidental.push(native);
+    }
+    assert_eq!(compare_routes(&s, &j, &[], &incidental).unwrap(), f);
     // The read returns exact facts, NOT a fabricated successful transition.
     assert_ne!(
         f.pending.as_ref().unwrap()[0]

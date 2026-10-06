@@ -28,8 +28,6 @@ pub(crate) struct RouteFact {
 pub(crate) struct NetworkFacts {
     pub current: Vec<RouteFact>,
     pub pending: Option<Vec<RouteFact>>,
-    pub carrier_rows: Vec<Row>,
-    pub egress_rows: [Vec<Row>; 2],
     pub active: Option<Slot>,
     pub pending_active: Option<Slot>,
     pub stopping: bool,
@@ -179,22 +177,6 @@ fn compare_routes(
             .pending()
             .map(|values| read(values.collect()))
             .transpose()?,
-        carrier_rows: native
-            .iter()
-            .filter(|row| row.route.interface == s.carrier.identity.proof.index)
-            .cloned()
-            .collect(),
-        egress_rows: std::array::from_fn(|i| {
-            native
-                .iter()
-                .filter(|row| {
-                    s.members[i]
-                        .as_ref()
-                        .is_some_and(|m| row.route.interface == m.proof.index)
-                })
-                .cloned()
-                .collect()
-        }),
         active: view.recorded_active(),
         pending_active: view.pending_active(),
         stopping: view.stopping(),

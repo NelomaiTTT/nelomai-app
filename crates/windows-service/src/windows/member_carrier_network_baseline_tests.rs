@@ -357,8 +357,6 @@ fn facts() -> NetworkFacts {
     NetworkFacts {
         current: vec![],
         pending: None,
-        carrier_rows: vec![],
-        egress_rows: [vec![], vec![]],
         active: None,
         pending_active: None,
         stopping: false,
@@ -383,33 +381,6 @@ fn onlink() -> Row {
 #[test]
 fn initial_sdk_baseline_accepts_no_child_or_owned_routes_without_granting_an_exchange() {
     assert!(compare_initial(&carrier(), &facts(), &baseline(), None).is_ok());
-    let mut f = facts();
-    f.carrier_rows.push(onlink());
-    assert!(compare_initial(&carrier(), &f, &baseline(), None).is_ok());
-    f.carrier_rows = ["10.7.0.2/32", "224.0.0.0/4"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, destination)| {
-            let mut row = onlink();
-            row.route.destination = destination.parse().unwrap();
-            row.flags = if i == 0 { [1, 1, 0, 0] } else { [0, 1, 0, 0] };
-            if i == 1 {
-                row.origin = 1;
-            }
-            row
-        })
-        .collect();
-    for i in 0..2 {
-        let mut incidental = onlink();
-        incidental.route.interface = 8 + i as u32;
-        incidental.route.scope = RouteScope::WindowsInterface(incidental.route.interface);
-        incidental.luid = 91 + i as u64;
-        incidental.route.destination = "224.0.0.0/4".parse().unwrap();
-        incidental.origin = 1;
-        incidental.flags = [0, 1, 0, 0];
-        f.egress_rows[i].push(incidental);
-    }
-    assert!(compare_initial(&carrier(), &f, &baseline(), None).is_ok());
 }
 // Break: treating a protected child, active/pending/stopping journal or member route as fresh.
 #[test]

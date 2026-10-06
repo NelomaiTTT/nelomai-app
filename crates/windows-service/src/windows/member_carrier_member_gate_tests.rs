@@ -693,8 +693,6 @@ fn no_routes() -> super::super::member_carrier_network::NetworkFacts {
     super::super::member_carrier_network::NetworkFacts {
         current: vec![],
         pending: None,
-        carrier_rows: vec![],
-        egress_rows: [vec![], vec![]],
         active: None,
         pending_active: None,
         stopping: false,
@@ -705,38 +703,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
     use super::super::member_carrier_network_owner::RouteAttempt;
     use nelomai_client_tunnel::redundancy::network::{RouteScope, RouteValue};
     let (_, r, _) = fixture();
-    let mut actual = no_routes();
-    let c = r.carrier.unwrap();
-    actual.carrier_rows = ["10.7.0.2/32", "224.0.0.0/4"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, destination)| {
-            let mut row = crate::member_routes::Row::static_route(
-                RouteValue {
-                    destination: destination.parse().unwrap(),
-                    scope: RouteScope::WindowsInterface(c.index),
-                    interface: c.index,
-                    gateway: None,
-                    metric: 0,
-                },
-                crate::member_routes::NativeProof {
-                    index: c.index,
-                    luid: c.luid,
-                },
-            );
-            row.protocol = 2;
-            row.origin = if i == 1 { 1 } else { 0 };
-            row.flags = if i == 0 { [1, 1, 0, 0] } else { [0, 1, 0, 0] };
-            row
-        })
-        .collect();
-    for i in 0..2 {
-        let mut incidental = actual.carrier_rows[1].clone();
-        incidental.route.interface = 8 + i as u32;
-        incidental.route.scope = RouteScope::WindowsInterface(incidental.route.interface);
-        incidental.luid = 91 + i as u64;
-        actual.egress_rows[i].push(incidental);
-    }
+    let actual = no_routes();
     let dns = dns_snapshot(&r);
     let empty = (vec![], vec![]);
     let route = crate::member_routes::Row::static_route(
@@ -1156,7 +1123,6 @@ fn reserve_route_read_requires_exact_last_original_ack_and_no_unknown_or_extra_r
             expected: route.clone(),
             actual: Some(row.clone()),
         });
-        f.egress_rows[0].push(row.clone());
         f
     };
     let acks = || {
@@ -1403,13 +1369,6 @@ fn retirement_network_requires_other_active_and_target_routes_actually_removed()
         route.clone(),
         crate::member_routes::NativeProof { index: 9, luid: 92 },
     );
-    let mut incidental = row.clone();
-    incidental.route.destination = "224.0.0.0/4".parse().unwrap();
-    incidental.protocol = 2;
-    incidental.origin = 1;
-    incidental.flags = [0, 1, 0, 0];
-    facts.egress_rows[1].push(incidental);
-    check(&r, &facts, &ack).unwrap();
     r.network
         .as_mut()
         .unwrap()
@@ -1420,7 +1379,6 @@ fn retirement_network_requires_other_active_and_target_routes_actually_removed()
         expected: route,
         actual: Some(row.clone()),
     });
-    facts.egress_rows[1].push(row.clone());
     ack.0.push(RouteAttempt {
         row,
         deleting: false,
