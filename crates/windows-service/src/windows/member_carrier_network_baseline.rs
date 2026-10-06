@@ -4,6 +4,8 @@
 use super::member_carrier_network::NetworkFacts;
 #[cfg(test)]
 use crate::member_routes::Row;
+#[cfg(all(test, windows))]
+use crate::windows::member_carrier_factory_test_os::trace_step;
 use crate::{member_carrier_guard::Carrier, member_dns as dns};
 use std::{
     cell::{Cell, RefCell},
@@ -32,8 +34,17 @@ fn compare_initial(
     protected: Option<&[u8]>,
 ) -> io::Result<()> {
     crate::member_carrier_guard::Model::empty(carrier.identity.scope.clone())
+        .inspect_err(|_| {
+            #[cfg(all(test, windows))]
+            trace_step("network baseline compare_initial carrier scope error");
+        })
         .map_err(io::Error::other)?;
-    validate_dns(actual)?;
+    validate_dns(actual).inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_step(&format!(
+            "network baseline compare_initial DNS validation error={_error}",
+        ));
+    })?;
     let c = &carrier.identity;
     if carrier.sources.len() != 1
         || !carrier.sources[0].is_ipv4()
@@ -61,7 +72,11 @@ fn compare_initial(
         return Err(conflict());
     }
     for row in &facts.carrier_rows {
-        crate::member_routes::validate_route(&row.route, carrier.sources[0].into(), c.proof.index)?;
+        crate::member_routes::validate_route(&row.route, carrier.sources[0].into(), c.proof.index)
+            .inspect_err(|_| {
+                #[cfg(all(test, windows))]
+                trace_step("network baseline compare_initial route validation error");
+            })?;
         if row.route.interface != c.proof.index
             || row.luid != c.proof.luid
             || row.route.gateway.is_some()
@@ -405,28 +420,92 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             self.capture.capture(|sink| {
                 let origin = &self.origin;
-                origin.capture_window(window)?;
+                origin.capture_window(window).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline capture_window preflight error");
+                })?;
                 let carrier = window.bindings().carrier.as_ref().ok_or_else(conflict)?;
-                compare_capture_record(&origin.context, expected, carrier)?;
-                origin.current(pin, expected)?;
-                origin.no_allows(window, expected)?;
+                compare_capture_record(&origin.context, expected, carrier).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline compare_capture_record error");
+                })?;
+                origin.current(pin, expected).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline current preflight error");
+                })?;
+                origin.no_allows(window, expected).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline no_allows preflight error");
+                })?;
                 origin.reader.inspect_in_window(window, |facts| {
                     compare_initial(
                         carrier,
                         &facts.routes,
                         &facts.dns,
                         facts.protected_record.as_deref(),
-                    )?;
+                    )
+                    .inspect_err(|_| {
+                        #[cfg(test)]
+                        {
+                            let c = &carrier.identity;
+                            trace_step(&format!(
+                                "network baseline compare_initial error sources={} current={} pending={} active={} pending_active={} stopping={} egress_rows={:?} carrier_rows={} protected_record={} dns_name_server_present={} dns_name_server_nonempty={} dns_profile_name_server_present={} dns_profile_name_server_nonempty={} dns_scope_match={} dns_guid_match={} dns_index_match={} dns_luid_match={}",
+                                carrier.sources.len(),
+                                facts.routes.current.len(),
+                                facts.routes.pending.is_some(),
+                                facts.routes.active.is_some(),
+                                facts.routes.pending_active.is_some(),
+                                facts.routes.stopping,
+                                facts.routes.egress_rows.each_ref().map(Vec::len),
+                                facts.routes.carrier_rows.len(),
+                                facts.protected_record.is_some(),
+                                facts.dns.settings.name_server.is_some(),
+                                facts.dns.settings.name_server.as_ref().is_some_and(|s| !s.is_empty()),
+                                facts.dns.settings.profile_name_server.is_some(),
+                                facts.dns.settings.profile_name_server.as_ref().is_some_and(|s| !s.is_empty()),
+                                facts.dns.interface.scope == c.scope,
+                                facts.dns.interface.guid == c.proof.guid,
+                                facts.dns.interface.index == c.proof.index,
+                                facts.dns.interface.luid == c.proof.luid,
+                            ));
+                            for row in facts.routes.carrier_rows.iter().take(2) {
+                                trace_step(&format!(
+                                    "network baseline initial carrier row prefix_length={} site_prefix_length={} protocol={} origin={} flags={:?} index_match={} luid_match={} gateway_present={} destination_match={}",
+                                    row.route.destination.prefix_len(),
+                                    row.site_prefix_length,
+                                    row.protocol,
+                                    row.origin,
+                                    row.flags,
+                                    row.route.interface == c.proof.index,
+                                    row.luid == c.proof.luid,
+                                    row.route.gateway.is_some(),
+                                    carrier.sources.first().is_some_and(|source| row.route.destination == ipnet::IpNet::from(*source)),
+                                ));
+                            }
+                        }
+                    })?;
                     // No caller-supplied snapshot or public data constructor.
                     sink.retain(Rc::new(NativeNetworkBaselineRead {
                         origin: origin.clone(),
                         carrier: carrier.clone(),
                         snapshot: facts.dns.clone(),
                     }))
+                }).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline reader inspect error");
                 })?;
-                origin.no_allows(window, expected)?;
-                origin.current(pin, expected)?;
-                origin.capture_window(window)
+                origin.no_allows(window, expected).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline no_allows postflight error");
+                })?;
+                origin.current(pin, expected).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline current postflight error");
+                })?;
+                origin.capture_window(window).inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network baseline capture_window postflight error");
+                })
             })
         }
         /// Available even after capture postflight Err/unwind. Historical fact

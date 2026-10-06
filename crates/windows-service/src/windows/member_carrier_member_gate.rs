@@ -451,13 +451,21 @@ fn network(
     if usage == Use::Primary || matches!(usage, Use::ServiceStop(_)) && record.network.is_none() {
         if record.network.is_some()
             || fact.protected.is_some()
-            || ack.is_some()
+            || ack.is_some_and(|(routes, dns)| !routes.is_empty() || !dns.is_empty())
             || !fact.routes.current.is_empty()
             || fact.routes.egress_rows.iter().any(|r| !r.is_empty())
             || fact.routes.active.is_some()
             || fact.routes.stopping
-            || dns.settings.name_server.is_some()
-            || dns.settings.profile_name_server.is_some()
+            || dns
+                .settings
+                .name_server
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
+            || dns
+                .settings
+                .profile_name_server
+                .as_ref()
+                .is_some_and(|s| !s.is_empty())
         {
             return Err(Error::Conflict);
         }

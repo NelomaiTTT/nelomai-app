@@ -323,7 +323,7 @@ fn with_retained_row_original<T, P, U>(
     current: &mut Option<T>,
     history: &mut Vec<(T, P)>,
     receipt: P,
-    capture: impl FnOnce() -> io::Result<U>,
+    capture: impl FnOnce(&mut Option<T>) -> io::Result<U>,
 ) -> io::Result<U> {
     if current.is_none() {
         return Err(conflict());
@@ -331,7 +331,7 @@ fn with_retained_row_original<T, P, U>(
     history.try_reserve(1).map_err(denied_allocation)?;
     let original = current.take().ok_or_else(conflict)?;
     history.push((original, receipt)); // all originals BEFORE fallible capture.
-    capture()
+    capture(current)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1627,7 +1627,7 @@ pub(crate) mod native {
             }
         }
     }
-    type MemberRowOwner = rows::NativeRowOwner<RowAuthority, MemberRowJournal>;
+    type MemberRowCapture = rows::NativeRowCaptureSlot<RowAuthority, MemberRowJournal>;
     struct HistoricalMemberRows {
         pin: Rc<RowRecordReadPin>,
         authority: RowAuthority,
@@ -1710,7 +1710,7 @@ pub(crate) mod native {
         held_reads: [Option<HeldRead>; 2],
         closing: Option<Rc<NativeClosingRead>>,
         closing_network: Option<Rc<NativeClosingNetworkRead>>,
-        row_owners: [Option<MemberRowOwner>; 2],
+        row_owners: [Option<MemberRowCapture>; 2],
         row_pins: [Option<Rc<RowRecordReadPin>>; 2],
         row_authorities: [Option<RowAuthority>; 2],
         row_attempted: [bool; 2],
@@ -1718,11 +1718,51 @@ pub(crate) mod native {
         stopped_row_generations: [Option<Rc<rows::StoppedRowGeneration>>; 2],
         row_generation_receipts: Vec<Rc<NativeRowGenerationReceipt>>,
         member_generation_originals: Vec<Rc<MemberGenerationOriginal>>,
-        historical_member_rows: Vec<(MemberRowOwner, HistoricalMemberRows)>,
+        historical_member_rows: Vec<(MemberRowCapture, HistoricalMemberRows)>,
         member_row_captures: Vec<Rc<NativeRowGenerationCapture>>,
         member_rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
         rebind_proof: Rc<RefCell<RebindProofSlot<NativeRebindProof>>>,
         startup_proof: Rc<RefCell<Option<Rc<NativeRebindProof>>>>,
+    }
+    impl NativeActorLocalParts {
+        fn verify_stopped_member_rows(&self) -> io::Result<()> {
+            for (slot, pin) in self.row_owners.iter().zip(&self.row_pins) {
+                match (slot, pin) {
+                    (Some(slot), Some(pin)) => slot.verify_stopped_original(pin).map_err(denied)?,
+                    (None, None) => {}
+                    _ => return Err(conflict()),
+                }
+            }
+            for (slot, original) in &self.historical_member_rows {
+                slot.verify_stopped_original(&original.pin)
+                    .map_err(denied)?;
+            }
+            Ok(())
+        }
+        /// Only called AFTER the original root's authenticated whole terminal release.
+        fn release_stopped_member_rows(&mut self) -> io::Result<()> {
+            let current = self
+                .row_owners
+                .iter_mut()
+                .zip(&self.row_pins)
+                .filter_map(|(slot, pin)| slot.as_mut().zip(pin.as_ref()));
+            let history = self
+                .historical_member_rows
+                .iter_mut()
+                .map(|(slot, original)| (slot, &original.pin));
+            for (slot, pin) in current.chain(history) {
+                let mut stopped = None;
+                slot.drain_stopped_into(pin, &mut stopped).map_err(denied)?;
+                let mut owner = None;
+                stopped
+                    .as_mut()
+                    .ok_or_else(conflict)?
+                    .drain_owner_into(&mut owner)
+                    .map_err(denied)?;
+                drop(owner);
+            }
+            Ok(())
+        }
     }
     /// Caller-rooted transfer envelope OUTSIDE T. Rejected full inputs may
     /// still own the original loaded module via Ready/Assembly; Pauli must cut
@@ -2148,8 +2188,12 @@ pub(crate) mod native {
                                 {
                                     return Err(native_denied(()));
                                 }
-                                verify_terminal_member_row_original(owner, pin, &row.acknowledged)
-                                    .map_err(native_denied)?;
+                                verify_terminal_member_row_original(
+                                    owner.owner().map_err(native_denied)?,
+                                    pin,
+                                    &row.acknowledged,
+                                )
+                                .map_err(native_denied)?;
                             }
                             (None, None, None) if !parts.row_attempted[i] => {
                                 // Canonical rows independently proved the actual
@@ -2184,10 +2228,13 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             let parts = self.parts.try_borrow().map_err(denied)?;
             for (owner, original) in &parts.historical_member_rows {
-                if !original
-                    .pin
-                    .same_original(&owner.record_read_pin().map_err(denied)?)
-                {
+                if !original.pin.same_original(
+                    &owner
+                        .owner()
+                        .map_err(denied)?
+                        .record_read_pin()
+                        .map_err(denied)?,
+                ) {
                     return Err(conflict());
                 }
                 original
@@ -3243,7 +3290,7 @@ pub(crate) mod native {
         closing: Option<Rc<NativeClosingRead>>,
         closing_network: Option<Rc<NativeClosingNetworkRead>>,
         closing_attempted: bool,
-        row_owners: [Option<MemberRowOwner>; 2],
+        row_owners: [Option<MemberRowCapture>; 2],
         row_pins: [Option<Rc<RowRecordReadPin>>; 2],
         row_authorities: [Option<RowAuthority>; 2],
         row_attempted: [bool; 2],
@@ -3252,7 +3299,7 @@ pub(crate) mod native {
         stopped_row_generations: [Option<Rc<rows::StoppedRowGeneration>>; 2],
         row_generation_receipts: Vec<Rc<NativeRowGenerationReceipt>>,
         member_generation_originals: Vec<Rc<MemberGenerationOriginal>>,
-        historical_member_rows: Vec<(MemberRowOwner, HistoricalMemberRows)>,
+        historical_member_rows: Vec<(MemberRowCapture, HistoricalMemberRows)>,
         member_row_captures: Vec<Rc<NativeRowGenerationCapture>>,
         member_rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
         lifecycle_upgrade: Rc<UpgradeRegistration>,
@@ -4970,7 +5017,16 @@ pub(crate) mod native {
                 actual
                     .locals
                     .parts
-                    .release_with(|| root.release_resources(ack))?;
+                    .try_borrow()?
+                    .verify_stopped_member_rows()?;
+                actual.locals.parts.release_with(|| {
+                    root.release_resources(ack)?;
+                    actual
+                        .locals
+                        .parts
+                        .try_borrow_mut()?
+                        .release_stopped_member_rows()
+                })?;
                 self.terminal_cut.finish_release(&actual)?;
                 destination.take();
                 Ok(())
@@ -5925,16 +5981,25 @@ pub(crate) mod native {
                 for i in 0..2 {
                     match (&this.row_owners[i], &this.row_pins[i]) {
                         (Some(owner), Some(pin))
-                            if pin.same_original(&owner.record_read_pin().map_err(denied)?) => {}
+                            if pin.same_original(
+                                &owner
+                                    .owner()
+                                    .map_err(denied)?
+                                    .record_read_pin()
+                                    .map_err(denied)?,
+                            ) => {}
                         (None, None) => {} // not absence: mandatory G below proves originals
                         _ => return Err(conflict()),
                     }
                 }
                 for (owner, old) in &this.historical_member_rows {
-                    if !old
-                        .pin
-                        .same_original(&owner.record_read_pin().map_err(denied)?)
-                    {
+                    if !old.pin.same_original(
+                        &owner
+                            .owner()
+                            .map_err(denied)?
+                            .record_read_pin()
+                            .map_err(denied)?,
+                    ) {
                         return Err(conflict());
                     }
                     old.seal
@@ -7775,8 +7840,13 @@ pub(crate) mod native {
                 // old Stopped owner after inventory projection. Typed new-row
                 // capture/registration must retain and replace that bundle.
                 let original = self.row_pins[i].as_ref().ok_or_else(conflict)?;
-                if !original.same_original(&owner.record_read_pin().map_err(denied)?)
-                    || self.row_authorities[i].is_none()
+                if !original.same_original(
+                    &owner
+                        .owner()
+                        .map_err(denied)?
+                        .record_read_pin()
+                        .map_err(denied)?,
+                ) || self.row_authorities[i].is_none()
                     || self.stopped_row_generations[i].is_some()
                 {
                     return Err(conflict());
@@ -7838,23 +7908,24 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             let first = &mut self.row_pins[i];
-            let owner = RowOwner::capture_native_with_record_pin(
+            self.row_owners[i] = Some(MemberRowCapture::new_native(
                 binding,
                 authority.read_pin(),
                 MemberRowJournal::First(journal),
-                |actual| {
-                    let original = Rc::new(actual);
-                    *first = Some(original.clone());
-                    r.rows
-                        .retain_member(slot, original.clone())
-                        .map_err(|_| rows::Error::Conflict)?;
-                    r.lifecycle
-                        .retain_initial_member_row_capture(&started, &original)
-                        .map_err(|_| rows::Error::Conflict)
-                },
-            )
+            ));
+            let destination = self.row_owners[i].as_mut().ok_or_else(conflict)?;
+            RowOwner::capture_native_with_record_pin_into(destination, |actual| {
+                let original = Rc::new(actual);
+                *first = Some(original.clone());
+                r.rows
+                    .retain_member(slot, original.clone())
+                    .map_err(|_| rows::Error::Conflict)?;
+                r.lifecycle
+                    .retain_initial_member_row_capture(&started, &original)
+                    .map_err(|_| rows::Error::Conflict)
+            })
             .map_err(denied)?;
-            self.row_owners[i] = Some(owner); // owner BEFORE any next SDK/check
+            destination.owner_mut().map_err(denied)?; // pure normalization before next SDK/check
             r.lifecycle
                 .complete_initial_member_row_capture(&started)
                 .map_err(denied)
@@ -8002,11 +8073,11 @@ pub(crate) mod native {
             ));
             let first = &mut self.row_pins[i];
             let authority_pin = &mut self.row_authorities[i];
-            let owner = with_retained_row_original(
+            with_retained_row_original(
                 &mut self.row_owners[i],
                 &mut self.historical_member_rows,
                 old,
-                || {
+                |destination| {
                     // No attempted reset and no old Stopped owner reuse. The
                     // original old owner/pin/authority/seal are already inert.
                     let authority = r
@@ -8018,25 +8089,27 @@ pub(crate) mod native {
                         return Err(conflict());
                     }
                     *authority_pin = Some(authority.read_pin());
-                    RowOwner::capture_native_with_record_pin(
+                    *destination = Some(MemberRowCapture::new_native(
                         binding.clone(),
                         authority.read_pin(),
                         journal,
-                        |actual| {
-                            let original = Rc::new(actual);
-                            *first = Some(original.clone()); // actual ACK BEFORE registration.
-                            r.rows
-                                .retain_member_generation(&capture, original.clone())
-                                .map_err(|_| rows::Error::Conflict)?;
-                            r.lifecycle
-                                .retain_member_row_capture(&capture, &original)
-                                .map_err(|_| rows::Error::Conflict)
-                        },
-                    )
-                    .map_err(denied)
+                    ));
+                    let destination = destination.as_mut().ok_or_else(conflict)?;
+                    RowOwner::capture_native_with_record_pin_into(destination, |actual| {
+                        let original = Rc::new(actual);
+                        *first = Some(original.clone()); // actual ACK BEFORE registration.
+                        r.rows
+                            .retain_member_generation(&capture, original.clone())
+                            .map_err(|_| rows::Error::Conflict)?;
+                        r.lifecycle
+                            .retain_member_row_capture(&capture, &original)
+                            .map_err(|_| rows::Error::Conflict)
+                    })
+                    .map_err(denied)?;
+                    destination.owner_mut().map_err(denied)?;
+                    Ok(())
                 },
             )?;
-            self.row_owners[i] = Some(owner); // new owner BEFORE fallible final SDK check.
             self.stopped_row_generations[i] = None; // old seal remains in historical owner bundle.
             r.rows
                 .complete_member_capture(
@@ -8111,6 +8184,8 @@ pub(crate) mod native {
                             this.row_owners[idx(slot)]
                                 .as_mut()
                                 .ok_or_else(conflict)?
+                                .owner_mut()
+                                .map_err(denied)?
                                 .change_interface(policy)
                                 .map_err(denied)
                         }
@@ -8139,6 +8214,8 @@ pub(crate) mod native {
                 this.row_owners[i]
                     .as_mut()
                     .ok_or_else(conflict)?
+                    .owner_mut()
+                    .map_err(denied)?
                     .stop()
                     .map_err(denied)?;
                 if record.phase != pair::Phase::Running
@@ -8152,6 +8229,8 @@ pub(crate) mod native {
                 this.row_owners[i]
                     .as_mut()
                     .ok_or_else(conflict)?
+                    .owner_mut()
+                    .map_err(denied)?
                     .seal_stopped_generation_with_pin(|original| {
                         if first.is_some() {
                             return Err(rows::Error::Conflict);
@@ -8180,7 +8259,11 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             require_member_row_storage_cleanup_frame(record, slot)?;
             let r = self.roots.as_ref().ok_or_else(conflict)?;
-            let owner = self.row_owners[idx(slot)].as_mut().ok_or_else(conflict)?;
+            let owner = self.row_owners[idx(slot)]
+                .as_mut()
+                .ok_or_else(conflict)?
+                .owner_mut()
+                .map_err(denied)?;
             enter_original_row_storage_cleanup(
                 owner,
                 || {
@@ -8234,6 +8317,8 @@ pub(crate) mod native {
                     this.row_owners[i]
                         .as_mut()
                         .ok_or_else(conflict)?
+                        .owner_mut()
+                        .map_err(denied)?
                         .stop()
                         .map_err(denied)?;
                 }

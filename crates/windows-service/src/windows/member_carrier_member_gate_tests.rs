@@ -701,21 +701,104 @@ fn no_routes() -> super::super::member_carrier_network::NetworkFacts {
     }
 }
 #[test]
-fn network_before_primary_has_no_owner_and_closing_requires_actual_restored_dns_ack() {
+fn network_before_effects_accepts_empty_owner_history_and_closing_requires_restored_dns_ack() {
+    use super::super::member_carrier_network_owner::RouteAttempt;
+    use nelomai_client_tunnel::redundancy::network::{RouteScope, RouteValue};
     let (_, r, _) = fixture();
     let actual = no_routes();
     let dns = dns_snapshot(&r);
-    network(
-        &r,
-        Use::Primary,
-        NetworkFact {
-            routes: &actual,
-            dns: &dns,
-            protected: None,
+    let empty = (vec![], vec![]);
+    let route = crate::member_routes::Row::static_route(
+        RouteValue {
+            destination: "1.1.1.1/32".parse().unwrap(),
+            scope: RouteScope::WindowsInterface(8),
+            interface: 8,
+            gateway: None,
+            metric: 5,
         },
-        None,
-    )
-    .unwrap();
+        crate::member_routes::NativeProof { index: 8, luid: 91 },
+    );
+    for usage in [Use::Primary, Use::ServiceStop(0)] {
+        for ack in [None, Some(&empty)] {
+            network(
+                &r,
+                usage,
+                NetworkFact {
+                    routes: &actual,
+                    dns: &dns,
+                    protected: None,
+                },
+                ack,
+            )
+            .unwrap();
+        }
+        let mut empty_dns = dns.clone();
+        empty_dns.settings.name_server = Some(String::new());
+        empty_dns.settings.profile_name_server = Some(String::new());
+        network(
+            &r,
+            usage,
+            NetworkFact {
+                routes: &actual,
+                dns: &empty_dns,
+                protected: None,
+            },
+            Some(&empty),
+        )
+        .unwrap();
+        for profile in [false, true] {
+            let mut nonempty_dns = empty_dns.clone();
+            if profile {
+                nonempty_dns.settings.profile_name_server = Some("1.1.1.1".into());
+            } else {
+                nonempty_dns.settings.name_server = Some("1.1.1.1".into());
+            }
+            assert!(network(
+                &r,
+                usage,
+                NetworkFact {
+                    routes: &actual,
+                    dns: &nonempty_dns,
+                    protected: None
+                },
+                Some(&empty),
+            )
+            .is_err());
+        }
+        for acknowledged in [false, true] {
+            let attempts = (
+                vec![RouteAttempt {
+                    row: route.clone(),
+                    deleting: false,
+                    acknowledged,
+                }],
+                vec![],
+            );
+            assert!(network(
+                &r,
+                usage,
+                NetworkFact {
+                    routes: &actual,
+                    dns: &dns,
+                    protected: None
+                },
+                Some(&attempts),
+            )
+            .is_err());
+        }
+        let dns_history = (vec![], vec![dns.clone()]);
+        assert!(network(
+            &r,
+            usage,
+            NetworkFact {
+                routes: &actual,
+                dns: &dns,
+                protected: None
+            },
+            Some(&dns_history),
+        )
+        .is_err());
+    }
     let (_, mut r, _) = closing(Slot::A);
     let dns = dns_snapshot(&r);
     let n = r.network.as_mut().unwrap();

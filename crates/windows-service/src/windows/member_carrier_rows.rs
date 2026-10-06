@@ -746,6 +746,14 @@ impl<A, K, J> RowCaptureSlot<A, K, J> {
             stopped_transfer: None,
         }
     }
+    /// Pure borrow only; normalization remains an explicit mutable operation.
+    pub(crate) fn owner(&self) -> Result<&RowOwner<A, K, J>> {
+        self.owner.as_ref().ok_or(Error::Pending)
+    }
+    /// SAME stopped original comparison only, never destructor authority.
+    pub(crate) fn verify_stopped_original(&self, original: &RowRecordReadPin) -> Result<()> {
+        stopped_owner_ack(self.owner()?, original).map(|_| ())
+    }
     pub(crate) fn owner_mut(&mut self) -> Result<&mut RowOwner<A, K, J>> {
         if self.owner.is_none() {
             if self.authority.is_none() || self.state.is_none() {
@@ -2606,20 +2614,6 @@ mod ip_helper {
         }
         pub(crate) fn capture_native(binding: Binding, authority: A, journal: J) -> Result<Self> {
             Self::capture(binding, authority, IpHelper { _private: () }, journal)
-        }
-        pub(crate) fn capture_native_with_record_pin(
-            binding: Binding,
-            authority: A,
-            journal: J,
-            retain: impl FnOnce(RowRecordReadPin) -> Result<()>,
-        ) -> Result<Self> {
-            Self::capture_with_record_pin(
-                binding,
-                authority,
-                IpHelper { _private: () },
-                journal,
-                retain,
-            )
         }
     }
     impl<A, J> RowCaptureSlot<A, IpHelper, J> {

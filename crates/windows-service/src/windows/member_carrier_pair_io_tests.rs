@@ -1062,13 +1062,15 @@ fn replacement_capture_retains_original_owner_and_receipts_before_error() {
     let original = Rc::new(Cell::new(31));
     let pin = Rc::new(Cell::new(32));
     let seal = Rc::new(Cell::new(33));
+    let replacement = Rc::new(Cell::new(36));
     let mut current = Some(original.clone());
     let mut history = Vec::new();
     let result = with_retained_row_original::<_, _, ()>(
         &mut current,
         &mut history,
         (pin.clone(), seal.clone()),
-        || {
+        |destination| {
+            *destination = Some(replacement.clone());
             assert_eq!(Rc::strong_count(&original), 2);
             assert_eq!(Rc::strong_count(&pin), 2);
             assert_eq!(Rc::strong_count(&seal), 2);
@@ -1076,24 +1078,26 @@ fn replacement_capture_retains_original_owner_and_receipts_before_error() {
         },
     );
     assert!(result.is_err());
-    assert!(current.is_none());
+    assert!(Rc::ptr_eq(current.as_ref().unwrap(), &replacement));
     assert_eq!(history.len(), 1);
     assert!(Rc::ptr_eq(&history[0].0, &original));
     assert!(Rc::ptr_eq(&history[0].1 .0, &pin));
     assert!(Rc::ptr_eq(&history[0].1 .1, &seal));
+    drop(current.take()); // missing-original case keeps its independent denial.
     assert!(with_retained_row_original::<_, _, ()>(
         &mut current,
         &mut history,
         (pin.clone(), seal.clone()),
-        || panic!("missing original is never replacement authority"),
+        |_| panic!("missing original is never replacement authority"),
     )
     .is_err());
 }
 
 #[test]
-fn replacement_capture_unwind_keeps_original_without_rearming_slot() {
+fn replacement_capture_unwind_keeps_old_and_new_originals() {
     let original = Rc::new(Cell::new(34));
     let receipt = Rc::new(Cell::new(35));
+    let replacement = Rc::new(Cell::new(37));
     let mut current = Some(original.clone());
     let mut history = Vec::new();
     assert!(catch_unwind(AssertUnwindSafe(|| {
@@ -1101,11 +1105,14 @@ fn replacement_capture_unwind_keeps_original_without_rearming_slot() {
             &mut current,
             &mut history,
             receipt.clone(),
-            || panic!("real capture postflight unwind"),
+            |destination| {
+                *destination = Some(replacement.clone());
+                panic!("real capture postflight unwind");
+            },
         );
     }))
     .is_err());
-    assert!(current.is_none());
+    assert!(Rc::ptr_eq(current.as_ref().unwrap(), &replacement));
     assert!(Rc::ptr_eq(&history[0].0, &original));
     assert!(Rc::ptr_eq(&history[0].1, &receipt));
 }

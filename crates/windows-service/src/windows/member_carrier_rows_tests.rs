@@ -1267,25 +1267,29 @@ fn row_record_pin_capture_handoff_retains_baseline_ack_before_postflight_error_o
         }
         fake.0.borrow_mut().read_hook = Some(after_ack(unwind));
         let handed = Rc::new(RefCell::new(None));
+        let mut destination =
+            RowCaptureSlot::new(binding(), fake.clone(), fake.clone(), fake.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            RowOwner::capture_with_record_pin(
-                binding(),
-                fake.clone(),
-                fake.clone(),
-                fake.clone(),
-                |p| {
-                    assert!(fake.0.borrow().locked);
-                    assert_eq!(row_pin_record(&p, &binding(), false).revision, 1);
-                    *handed.borrow_mut() = Some(p);
-                    Ok(())
-                },
-            )
+            RowOwner::capture_with_record_pin_into(&mut destination, |p| {
+                assert!(fake.0.borrow().locked);
+                assert_eq!(row_pin_record(&p, &binding(), false).revision, 1);
+                *handed.borrow_mut() = Some(p);
+                Ok(())
+            })
         }));
         if unwind {
             assert!(result.is_err());
         } else {
             assert!(result.unwrap().is_err());
         }
+        let owner = destination
+            .owner_mut()
+            .expect("original owner survives capture failure");
+        assert!(owner
+            .record_read_pin()
+            .unwrap()
+            .same_original(handed.borrow().as_ref().unwrap()));
+        assert_eq!(owner.change_interface(weak()), Err(Error::Retired));
         let retained = handed.borrow();
         let p = retained
             .as_ref()
@@ -1308,26 +1312,30 @@ fn row_record_pin_capture_handoff_callback_error_or_unwind_retains_cleanup_facts
     for unwind in [false, true] {
         let fake = Fake::new();
         let handed = Rc::new(RefCell::new(None));
+        let mut destination =
+            RowCaptureSlot::new(binding(), fake.clone(), fake.clone(), fake.clone());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            RowOwner::capture_with_record_pin(
-                binding(),
-                fake.clone(),
-                fake.clone(),
-                fake.clone(),
-                |p| {
-                    *handed.borrow_mut() = Some(p);
-                    if unwind {
-                        panic!("capture handoff unwound after retention");
-                    }
-                    Err(Error::Conflict)
-                },
-            )
+            RowOwner::capture_with_record_pin_into(&mut destination, |p| {
+                *handed.borrow_mut() = Some(p);
+                if unwind {
+                    panic!("capture handoff unwound after retention");
+                }
+                Err(Error::Conflict)
+            })
         }));
         if unwind {
             assert!(result.is_err());
         } else {
             assert!(result.unwrap().is_err());
         }
+        let owner = destination
+            .owner_mut()
+            .expect("original owner survives capture failure");
+        assert!(owner
+            .record_read_pin()
+            .unwrap()
+            .same_original(handed.borrow().as_ref().unwrap()));
+        assert_eq!(owner.change_interface(weak()), Err(Error::Retired));
         let retained = handed.borrow();
         let p = retained.as_ref().expect("successful original ACK handoff");
         p.with_cleanup_record(&binding().scope, binding().network_epoch, |facts| {
@@ -1350,17 +1358,17 @@ fn row_record_pin_lost_capture_ack_never_hands_off_an_original_receipt() {
     let fake = Fake::new();
     fake.0.borrow_mut().journal_fault = Fault::LostAck;
     let invoked = std::cell::Cell::new(false);
-    let mut owner = RowOwner::capture_with_record_pin(
-        binding(),
-        fake.clone(),
-        fake.clone(),
-        fake.clone(),
-        |_| {
+    let mut destination = RowCaptureSlot::new(binding(), fake.clone(), fake.clone(), fake.clone());
+    assert!(
+        RowOwner::capture_with_record_pin_into(&mut destination, |_| {
             invoked.set(true);
             Ok(())
-        },
-    )
-    .unwrap();
+        },)
+        .is_err()
+    );
+    let owner = destination
+        .owner_mut()
+        .expect("lost ACK retains attempted baseline owner");
     assert!(!invoked.get());
     assert!(owner.record_read_pin().is_err());
     assert_eq!(owner.change_interface(weak()), Err(Error::Retired));

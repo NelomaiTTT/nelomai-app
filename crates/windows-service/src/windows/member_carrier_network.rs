@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 #[cfg(test)]
 use crate::member_routes::NativeProof;
+#[cfg(all(test, windows))]
+use crate::windows::member_carrier_factory_test_os::trace_step;
 use crate::{
     member_carrier_guard::{validate_factual_bindings, Carrier, Identity},
     member_routes::Row,
@@ -61,6 +63,8 @@ impl NetworkRecordHistory {
     ) -> io::Result<T> {
         let before = read()?;
         if self.seen.get() && before.is_none() {
+            #[cfg(all(test, windows))]
+            trace_step("network protected history previously seen record absent");
             return Err(failed());
         }
         if before.is_some() {
@@ -72,6 +76,12 @@ impl NetworkRecordHistory {
             self.seen.set(true);
         }
         if before != after {
+            #[cfg(all(test, windows))]
+            trace_step(&format!(
+                "network protected history postread changed before_present={} after_present={}",
+                before.is_some(),
+                after.is_some(),
+            ));
             return Err(failed());
         }
         result
@@ -410,14 +420,32 @@ pub(crate) mod native {
             carrier: bindings.carrier.clone().ok_or_else(failed)?,
             members: bindings.egress.clone(),
         };
-        history.inspect(read_record, |before| {
-            let saved = before
-                .as_deref()
-                .map(|bytes| NativeNetworkRecord::read_comparison(scope, bytes))
-                .transpose()?
-                .unwrap_or_default();
-            read(&sources, &saved, before)
-        })
+        let mut read_record = read_record;
+        history
+            .inspect(
+                || {
+                    read_record().inspect_err(|_| {
+                        #[cfg(test)]
+                        trace_step("network sample protected record read error");
+                    })
+                },
+                |before| {
+                    let saved = before
+                        .as_deref()
+                        .map(|bytes| NativeNetworkRecord::read_comparison(scope, bytes))
+                        .transpose()
+                        .inspect_err(|_| {
+                            #[cfg(test)]
+                            trace_step("network sample protected record comparison error");
+                        })?
+                        .unwrap_or_default();
+                    read(&sources, &saved, before)
+                },
+            )
+            .inspect_err(|_| {
+                #[cfg(test)]
+                trace_step("network sample protected history error");
+            })
     }
     fn denied() -> crate::windows::member_carrier_wintun::Error {
         crate::windows::member_carrier_wintun::Error::Conflict
@@ -454,7 +482,13 @@ pub(crate) mod native {
             .collect::<Vec<_>>();
         // ONE full table capture per sample, not an unbounded per-key table
         // reader. Both families and exact physical identity/metrics are retained.
-        let physical = crate::windows::member_physical::capture(&ids)?;
+        let physical = crate::windows::member_physical::capture(&ids).inspect_err(|_error| {
+            #[cfg(test)]
+            trace_step(&format!(
+                "network read physical capture error={_error:?} raw_os_error={:?}",
+                _error.raw_os_error(),
+            ));
+        })?;
         let mut leases = Vec::with_capacity(saved.physical.len());
         for p in &saved.physical {
             let expected = PhysicalRoute {
@@ -478,10 +512,20 @@ pub(crate) mod native {
                     flags: p.flags,
                 },
             };
-            physical.verify(&expected).map_err(io::Error::other)?;
+            physical
+                .verify(&expected)
+                .inspect_err(|_| {
+                    #[cfg(test)]
+                    trace_step("network read physical lease verification error");
+                })
+                .map_err(io::Error::other)?;
             leases.push((p.interface, p.luid, p.guid));
         }
-        let routes = compare_routes(s, &saved.journal, &leases, physical.rows())?;
+        let routes =
+            compare_routes(s, &saved.journal, &leases, physical.rows()).inspect_err(|_| {
+                #[cfg(test)]
+                trace_step("network read compare_routes error");
+            })?;
         let c = &s.carrier.identity;
         let interface = dns::OwnedInterface {
             scope: c.scope.clone(),
@@ -490,8 +534,18 @@ pub(crate) mod native {
             index: c.proof.index,
         };
         let mut dns = crate::windows::member_dns::owned(interface, DnsReadIdentity(&s.carrier))
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("network read DNS open error={_error:?}"));
+            })
             .map_err(io::Error::other)?;
-        let dns = dns.snapshot().map_err(io::Error::other)?;
+        let dns = dns
+            .snapshot()
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("network read DNS snapshot error={_error:?}"));
+            })
+            .map_err(io::Error::other)?;
         Ok(NativeNetworkFacts {
             routes,
             dns,
