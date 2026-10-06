@@ -2102,10 +2102,6 @@ pub(crate) mod native {
             {
                 return Err(conflict());
             }
-            self.image
-                .read()?
-                .verify_runtime(&self.runtime)
-                .map_err(denied)?;
             self.members
                 .read()?
                 .matches_original_runtime_image(&self.runtime, self.image.read()?.as_ref())
