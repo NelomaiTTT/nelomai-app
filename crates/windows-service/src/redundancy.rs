@@ -184,6 +184,10 @@ pub fn pair_configuration(input: &str) -> Result<PairConfiguration, ServiceError
     if addresses.len() != 1
         || !matches!(addresses[0], ipnet::IpNet::V4(a) if a.prefix_len() == 32 && usable_pair_v4(a.addr()))
         || parameters
+            .allowed
+            .iter()
+            .any(|a| !matches!(a, ipnet::IpNet::V4(_)))
+        || parameters
             .dns
             .iter()
             .any(|a| !matches!(a, std::net::IpAddr::V4(a) if usable_pair_v4(*a)))

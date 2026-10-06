@@ -104,6 +104,8 @@ fn pair_rejects_ambiguous_or_unsupported_network_intent_without_secret_errors() 
         PROFILE.replace("10.240.5.2/32", "10.240.5.2/32, 10.240.5.3/32"),
         PROFILE.replace("10.240.5.2/32", "10.240.5.2/32, 2001:db8::2/128"),
         PROFILE.replace("10.240.5.2/32", "2001:db8::2/128"),
+        PROFILE.replace("AllowedIPs = 0.0.0.0/0", "AllowedIPs = ::/0"),
+        PROFILE.replace("AllowedIPs = 0.0.0.0/0", "AllowedIPs = 0.0.0.0/0, ::/0"),
         PROFILE.replace(
             "Address = 10.240.5.2/32",
             "Address = 10.240.5.2/32\naDdReSs = 10.240.5.2/32",
