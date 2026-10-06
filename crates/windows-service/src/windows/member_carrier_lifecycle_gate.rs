@@ -53,43 +53,18 @@ fn compare_member_bindings(
     record: &pair::Record,
     egress: &[Option<policy::Identity>; 2],
 ) -> io::Result<()> {
-    use nelomai_client_tunnel::redundancy::Slot;
-
-    // Read-only initial primary metadata before MemberStart invokes the SDK.
-    // Neither slot has an actual interface yet; all effect gates stay separate.
-    if let (Some(pair::Operation::Start(slot)), Some(pair::Effect::MemberStart(target))) =
-        (record.operation, record.pending)
-    {
-        let i = usize::from(slot == Slot::B);
-        if slot == target
-            && record.phase == pair::Phase::Starting
-            && record.stop_stage == 0
-            && record.active.is_none()
-            && record.network.is_none()
-            && record.pending_guard.is_none()
-            && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?
-            && record.members[i].as_ref().is_some_and(|member| {
-                member.owner.phase == crate::member_owner::Phase::Prepared
-                    && member.owner.proof.is_none()
-                    && member.owner.retired_proof.is_none()
-            })
-            && record.members[1 - i].is_none()
-            && egress.iter().all(Option::is_none)
-        {
-            return Ok(());
-        }
-    }
     for (i, member) in record.members.iter().enumerate() {
         if let Some(member) = member {
-            let proof = member
-                .owner
-                .proof
-                .or(member.owner.retired_proof)
-                .ok_or_else(conflict)?
-                .interface;
-            if egress[i]
-                .as_ref()
-                .is_none_or(|identity| identity.proof != proof)
+            crate::member_owner::validate_record_shape(&member.owner).map_err(denied)?;
+            if let Some(proof) = member.owner.proof.or(member.owner.retired_proof) {
+                if egress[i]
+                    .as_ref()
+                    .is_none_or(|identity| identity.proof != proof.interface)
+                {
+                    return Err(conflict());
+                }
+            } else if member.owner.phase != crate::member_owner::Phase::Prepared
+                || egress[i].is_some()
             {
                 return Err(conflict());
             }
@@ -2237,7 +2212,12 @@ pub(crate) mod native {
                 let Some(baseline) = self.captured_row(i, true)? else {
                     if i == 0
                         || closed.is_some()
-                        || record.members[i - 1].is_some()
+                        || self.row_pins[i].attempted.get()
+                        || record.members[i - 1].as_ref().is_some_and(|member| {
+                            member.owner.phase != crate::member_owner::Phase::Prepared
+                                || member.owner.proof.is_some()
+                                || member.owner.retired_proof.is_some()
+                        })
                         || window.bindings().egress[i - 1].is_some()
                     {
                         return Err(conflict());
@@ -2478,7 +2458,13 @@ pub(crate) mod native {
                 let captured = self.captured_row(i, cleanup)?;
                 let Some(captured) = captured.as_ref() else {
                     if i == 0
-                        || record.members[i - 1].is_some()
+                        || closed.is_some()
+                        || self.row_pins[i].attempted.get()
+                        || record.members[i - 1].as_ref().is_some_and(|member| {
+                            member.owner.phase != crate::member_owner::Phase::Prepared
+                                || member.owner.proof.is_some()
+                                || member.owner.retired_proof.is_some()
+                        })
                         || window.bindings().egress[i - 1].is_some()
                     {
                         return Err(conflict());

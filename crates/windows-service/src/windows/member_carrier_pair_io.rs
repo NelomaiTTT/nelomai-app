@@ -8152,7 +8152,7 @@ pub(crate) mod native {
                     .map_err(denied)?;
                 for slot in [Slot::A, Slot::B] {
                     let i = idx(slot);
-                    if record.members[i].is_none() {
+                    if this.row_owners[i].is_none() {
                         continue;
                     }
                     this.row_authorities[i]
