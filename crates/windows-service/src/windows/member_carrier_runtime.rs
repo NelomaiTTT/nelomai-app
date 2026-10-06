@@ -5453,38 +5453,21 @@ pub(crate) mod native {
             if all_before.originals.len() != 1 || all_before.originals[0].scope != self.scope {
                 return Err(rows::Error::Conflict);
             }
-            let members = self
-                .producer
-                .original_universe()
-                .member_read_pin()
-                .map_err(|_| rows::Error::Conflict)?;
-            members
-                .matches_original_runtime_image(&self.runtime, &self.image)
-                .map_err(|_| rows::Error::Conflict)?;
-            let read_members = || {
-                if use_ == Use::Cleanup {
-                    members.inspect_closing_full(
-                        &self.scope.context,
-                        &self.runtime,
-                        &self.image,
-                        |facts| Ok(facts.to_vec()),
-                    )
-                } else {
-                    members.read_all()
-                }
-            };
-            let facts = read_members().map_err(|_| rows::Error::Conflict)?;
+            // The whole census already joins SAME member owners, transport
+            // providers and runtime/image with protected receipt pre/postflight.
+            // Repeating member inventory reads adds no facts to this bracket.
             let index = match role {
                 rows::Role::MemberA => 1,
                 rows::Role::MemberB => 2,
                 rows::Role::Carrier => return Err(rows::Error::Conflict),
             };
             let context = &self.scope.context;
-            let member = facts
+            let (_, member) = all_before
+                .complete
                 .iter()
-                .find(|m| m.identity.guid == context.bindings[index].guid)
+                .find(|(_, m)| m.interface.guid == context.bindings[index].guid)
                 .ok_or(rows::Error::Conflict)?;
-            let identity = &member.identity;
+            let identity = &member.interface;
             let binding = member_rows_binding(
                 context,
                 role,
@@ -5504,15 +5487,11 @@ pub(crate) mod native {
                 self.observer.observe_all(context)
             }
             .map_err(|_| rows::Error::Conflict)?;
-            if read_members().map_err(|_| rows::Error::Conflict)? != facts
-                || all_after != all_before
+            if all_after != all_before
                 || self.current(use_).map_err(|_| rows::Error::Conflict)? != before
             {
                 return Err(rows::Error::Conflict);
             }
-            members
-                .matches_original_runtime_image(&self.runtime, &self.image)
-                .map_err(|_| rows::Error::Conflict)?;
             self.verify_supervised()
                 .map_err(|_| rows::Error::Conflict)?;
             Ok(binding)

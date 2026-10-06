@@ -1987,6 +1987,116 @@ fn independently_fresh_empty_claim_cannot_use_a_stale_epoch_or_invalid_binding_t
 
 #[test]
 fn revoked_live_instances_stay_revoked_after_cleanup_reconciliation_and_disk_reopen() {
+    for fault in 0..5 {
+        let (disk, bound_files) = fixture();
+        let mut bound = open(&bound_files);
+        let records = sequence();
+        save(&mut bound, None, &records[0]);
+        WindowsSessionStore::open(bound_files.clone(), scope(), RecordKind::Session)
+            .unwrap()
+            .0
+            .save(
+                &SessionState::new(scope(), Slot::A, 0, 0)
+                    .unwrap()
+                    .snapshot(),
+            )
+            .unwrap();
+        let history = bound_files.session_ack_root(&scope()).unwrap();
+        let execution = history
+            .bind_native_birth(
+                &context(),
+                history.acknowledgements().unwrap().last().unwrap(),
+            )
+            .unwrap();
+        bound
+            .bind_original_native_view(bound_files.native_birth_view(&execution).unwrap())
+            .unwrap();
+        for pair in records[..5].windows(2) {
+            save(&mut bound, Some(&pair[0]), &pair[1]);
+        }
+        let acknowledged = &records[4];
+        let original = bound.selected_files().read_identity();
+        let canonical = execution
+            .native_cleanup_view(&bound_files)
+            .unwrap()
+            .into_files();
+        assert!(
+            bound.load(&context()).is_err(),
+            "birth forward view is revoked"
+        );
+        let candidate = if matches!(fault, 1 | 2) {
+            let (_, foreign_files) = fixture();
+            let mut foreign = open(&foreign_files);
+            save(&mut foreign, None, &records[0]);
+            WindowsSessionStore::open(foreign_files.clone(), scope(), RecordKind::Session)
+                .unwrap()
+                .0
+                .save(
+                    &SessionState::new(scope(), Slot::A, 0, 0)
+                        .unwrap()
+                        .snapshot(),
+                )
+                .unwrap();
+            let history = foreign_files.session_ack_root(&scope()).unwrap();
+            let root = history
+                .bind_native_birth(
+                    &context(),
+                    history.acknowledgements().unwrap().last().unwrap(),
+                )
+                .unwrap();
+            foreign
+                .bind_original_native_view(foreign_files.native_birth_view(&root).unwrap())
+                .unwrap();
+            for pair in records[..5].windows(2) {
+                save(&mut foreign, Some(&pair[0]), &pair[1]);
+            }
+            assert_eq!(
+                foreign.load(&context()).unwrap().as_ref(),
+                Some(acknowledged)
+            );
+            let other = root
+                .native_cleanup_view(&foreign_files)
+                .unwrap()
+                .into_files();
+            if fault == 1 {
+                other
+            } else {
+                let mut same_backend = canonical.clone();
+                same_backend.native_execution = other.native_execution;
+                same_backend
+            }
+        } else {
+            canonical.clone()
+        };
+        if fault >= 3 {
+            disk.0.borrow_mut().transaction_fault = Some(fault == 4);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bound.enter_original_cleanup(acknowledged, |_| Ok(candidate))
+        }));
+        if fault == 0 {
+            result.unwrap().unwrap();
+            bound
+                .enter_original_cleanup(acknowledged, |_| Ok(canonical))
+                .unwrap();
+            let mut closing = next(acknowledged);
+            closing.phase = Phase::Closing;
+            bound
+                .compare_exchange(&context(), Some(acknowledged), &closing)
+                .unwrap();
+            assert_eq!(bound.load(&context()).unwrap(), Some(closing));
+        } else {
+            assert!(result.is_err() || result.unwrap().is_err());
+            assert!(bound.cleanup_only && bound.binding_failed.get());
+            assert!(bound
+                .selected_files()
+                .read_identity()
+                .same_original(&original));
+            assert_eq!(bound.selected_files().cleanup_only, fault >= 3);
+            assert!(bound.load(&context()).is_err());
+        }
+    }
+
     let (disk, f) = fixture();
     let mut store = open(&f);
     let records = sequence();

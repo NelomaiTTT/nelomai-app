@@ -951,6 +951,42 @@ fn require_owned(facts: &NativeFacts) -> Result<()> {
         Err(Error::Pending)
     }
 }
+impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<InitializedJournal<J>, I> {
+    /// Storage-only handoff of THIS retained journal under the original lock.
+    /// The private current ACK remains unchanged; no key effect or J extraction.
+    pub(crate) fn with_original_cleanup_storage(
+        &mut self,
+        lock: &mut I::MutationLock,
+        handoff: impl FnOnce(&mut J, &Record) -> Result<()>,
+    ) -> Result<Record> {
+        self.cleanup_only = true;
+        self.consumed = [true; 3];
+        self.io.assert_serialized_lock(lock, &self.context)?;
+        let current = self.current.clone().ok_or(Error::Pending)?;
+        self.validate(&current)?;
+        {
+            if self.journal.health.initial_cleanup.get()
+                || self.journal.health.initial_retirement.get()
+            {
+                return Err(Error::Retired);
+            }
+            let operation = self.journal.health.enter()?;
+            let mut original = self
+                .journal
+                .shared
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            if original.context != self.context {
+                return Err(Error::Conflict);
+            }
+            handoff(&mut original.journal, &current)?;
+            operation.finish()?;
+        }
+        self.require_current(&current)?;
+        Ok(current)
+    }
+}
+
 impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
     pub(crate) fn new(context: Context, journal: J, io: I) -> Result<Self> {
         validate_context(&context)?;

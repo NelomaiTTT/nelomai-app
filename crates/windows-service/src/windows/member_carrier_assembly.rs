@@ -1926,12 +1926,21 @@ pub(crate) mod native {
                 .owner
                 .as_mut()
                 .ok_or(Error::Pending)?
-                .snapshot()?
-                .ok_or(Error::Pending)?;
-            runtime.verify(&current.context)?;
-            intent
-                .verify_cleanup_entry(runtime, &current.context)
-                .map_err(|_| Error::Conflict)?;
+                .with_original_cleanup_storage(lock, |journal, current| {
+                    runtime.verify(&current.context)?;
+                    intent
+                        .verify_cleanup_entry(runtime, &current.context)
+                        .map_err(|_| Error::Conflict)?;
+                    journal
+                        .enter_original_cleanup(current, |original| {
+                            runtime
+                                .native_files_for_original(&current.context, original)
+                                .map_err(|_| {
+                                    std::io::Error::other("native_cleanup_storage_conflict")
+                                })
+                        })
+                        .map_err(|_| Error::Journal)
+                })?;
             self.root.begin_cleanup(lock)?;
             intent
                 .verify_cleanup_entry(runtime, &current.context)

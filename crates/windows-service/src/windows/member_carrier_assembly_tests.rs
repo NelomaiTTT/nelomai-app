@@ -1562,6 +1562,18 @@ fn retained_owner_enters_closing_before_native_cleanup_without_restoring_live_ke
     root.assets.take();
     root.with_member_precreation(Role::MemberA, &mut lock, |_| Ok(()))
         .unwrap();
+    root.owner
+        .as_mut()
+        .unwrap()
+        .with_original_cleanup_storage(&mut lock, |journal, acknowledged| {
+            assert!(Rc::ptr_eq(&journal.0, &s));
+            assert_eq!(
+                journal.load(&acknowledged.context)?.as_ref(),
+                Some(acknowledged)
+            );
+            Ok(())
+        })
+        .unwrap();
     root.begin_cleanup(&mut lock).unwrap();
     let record = s.borrow().record.clone().unwrap();
     assert_eq!(record.phase, receipt::Phase::Closing);
@@ -1574,6 +1586,40 @@ fn retained_owner_enters_closing_before_native_cleanup_without_restoring_live_ke
         .is_err());
     root.begin_cleanup(&mut lock).unwrap();
     assert_eq!(s.borrow().record.as_ref().unwrap().generation, 10);
+    for fault in 0..3 {
+        let (mut root, state, mut lock, _) = attached(Fault::None);
+        root.prepare_carrier(&mut lock).unwrap();
+        root.assets.take();
+        let acknowledged = state.borrow().record.clone().unwrap();
+        let mut foreign_lock = Rc::new(());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.owner.as_mut().unwrap().with_original_cleanup_storage(
+                if fault == 0 {
+                    &mut foreign_lock
+                } else {
+                    &mut lock
+                },
+                |journal, current| {
+                    assert!(Rc::ptr_eq(&journal.0, &state));
+                    assert_eq!(current, &acknowledged);
+                    if fault == 2 {
+                        panic!("cleanup storage callback unwind");
+                    }
+                    Err(Error::Journal)
+                },
+            )
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert!(root.owner.is_some());
+        assert_eq!(state.borrow().record.as_ref(), Some(&acknowledged));
+        assert_eq!(state.borrow().key_drops.get(), 0);
+        assert!(root
+            .owner
+            .as_mut()
+            .unwrap()
+            .prepare_role(Role::MemberB, &mut lock)
+            .is_err());
+    }
 }
 
 // Break: returning/taking the actual native key owner through a fallible close

@@ -3612,6 +3612,41 @@ impl<I: SessionFileIo> WindowsNativeCarrierReceiptStore<ProtectedSessionFiles<I>
         self.initial_cleanup_failed = false;
         Ok(())
     }
+    /// Storage-only cleanup view for the SAME advanced original journal.
+    /// The owner supplies its retained current ACK; no journal is reopened.
+    pub(crate) fn enter_original_cleanup(
+        &mut self,
+        expected: &native_receipt::Record,
+        resolve: impl FnOnce(&ProtectedSessionFiles<I>) -> io::Result<ProtectedSessionFiles<I>>,
+    ) -> io::Result<()> {
+        let failed_before =
+            self.revoked || self.binding_failed.get() || self.initial_cleanup_failed;
+        self.cleanup_only = true;
+        self.binding_failed.set(true); // Err/unwind cannot restore a forward view.
+        if failed_before
+            || self.initial_cleanup_files.is_some()
+            || self.initial_retirement_attempted
+            || expected.context != self.context
+        {
+            return Err(failed());
+        }
+        let original = self.selected_files().clone();
+        let canonical = resolve(&original)?;
+        canonical.verify_native_row_cleanup_origin(&original)?; // pure SAME backend/root
+        *self.selected_files_mut() = canonical; // accepted view retained before private IO
+        let bytes = expected.encode().map_err(|_| failed())?;
+        let context = self.context.clone();
+        let (access, raw, current) = native_snapshot(self.selected_files_mut(), &context)?;
+        access.require_native_context(&context)?;
+        if access.fresh
+            || raw.as_deref() != Some(bytes.as_slice())
+            || current.as_ref() != Some(expected)
+        {
+            return Err(failed());
+        }
+        self.binding_failed.set(false);
+        Ok(())
+    }
     /// One storage-only handoff of the SAME initial journal, after real Runtime
     /// birth registration and before SDK/key attempts. Reopening an existing
     /// receipt remains cleanup-only. No context/epoch/SDK ACK is manufactured.
