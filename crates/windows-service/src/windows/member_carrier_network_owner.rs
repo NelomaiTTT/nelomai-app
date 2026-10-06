@@ -1,5 +1,4 @@
 //! Original-pin carrier network effect owner. Not factory selected.
-#![allow(dead_code)]
 use crate::{member_dns as dns, member_pair::DnsRecord};
 use std::{cell::Cell, io, net::IpAddr};
 fn conflict() -> io::Error {
@@ -860,9 +859,6 @@ pub(crate) mod native {
                 pins: self.original.upgrade().ok_or_else(conflict)?,
             })
         }
-        pub(crate) fn same_original(&self, other: &Self) -> bool {
-            self.original.same_original(&other.original)
-        }
     }
     impl<G: NativeNetworkEffectGate> NativeNetworkAckRead<G> {
         /// Exact captured native physical leases of this original owner, not
@@ -1082,13 +1078,6 @@ pub(crate) mod native {
                 s.dns.cleanup()?;
                 s.routes.cleanup()
             })
-        }
-        /// Factual ACKs only. Neither cloned rows nor DNS snapshots authorize
-        /// G, resume, adoption or repeating an unconfirmed native effect.
-        pub(crate) fn acknowledgements(
-            &self,
-        ) -> io::Result<(Vec<RouteAttempt>, Vec<dns::Snapshot>)> {
-            self.read_pin().acknowledgements()
         }
     }
 }
