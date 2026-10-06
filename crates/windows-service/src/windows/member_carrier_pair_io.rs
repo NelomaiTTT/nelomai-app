@@ -5122,10 +5122,10 @@ pub(crate) mod native {
             let r = self.roots()?;
             r.attestor
                 .select(pin.clone(), record.clone())
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             r.guard_resources
                 .select(pin.clone(), record.clone())
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(())
         }
         fn upgrade_in_call(
@@ -5202,18 +5202,73 @@ pub(crate) mod native {
                                     // The full upgrade immediately observes actual
                                     // siblings. Select THIS opaque Pair before that
                                     // observation, not in the later effect callback.
-                                    self.select_guard(&pin, record).map_err(carrier_denied)?;
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                        "actor Calling {:?}/{effect:?} before select_guard", record.phase
+                                    ));
+                                    self.select_guard(&pin, record).map_err(|error| {
+                                        #[cfg(test)]
+                                        super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                            "actor Calling {:?}/{effect:?} select_guard failed kind={:?}", record.phase, error.kind()
+                                        ));
+                                        carrier_denied(error)
+                                    })?;
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                        "actor Calling {:?}/{effect:?} select_guard accepted", record.phase
+                                    ));
                                     self.roots()
                                         .map_err(carrier_denied)?
                                         .probe_state
                                         .select(pin.clone(), record.clone())
-                                        .map_err(denied)
+                                        .map_err(|error| {
+                                            #[cfg(test)]
+                                            super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                                "actor Calling {:?}/{effect:?} probe select failed {error:?}", record.phase
+                                            ));
+                                            denied(error)
+                                        })
                                         .map_err(carrier_denied)?;
-                                    self.upgrade_in_call(&pin, record).map_err(carrier_denied)?;
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                        "actor Calling {:?}/{effect:?} probe select accepted", record.phase
+                                    ));
+                                    self.upgrade_in_call(&pin, record).map_err(|error| {
+                                        #[cfg(test)]
+                                        super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                            "actor Calling {:?}/{effect:?} upgrade failed kind={:?}", record.phase, error.kind()
+                                        ));
+                                        carrier_denied(error)
+                                    })?;
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                        "actor Calling {:?}/{effect:?} upgrade accepted", record.phase
+                                    ));
                                 }
-                                action(self, &pin).map_err(carrier_denied)
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                    "actor Calling {:?}/{effect:?} action entered", record.phase
+                                ));
+                                let value = action(self, &pin).map_err(|error| {
+                                    #[cfg(test)]
+                                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                        "actor Calling {:?}/{effect:?} action failed kind={:?}", record.phase, error.kind()
+                                    ));
+                                    carrier_denied(error)
+                                })?;
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                    "actor Calling {:?}/{effect:?} action accepted", record.phase
+                                ));
+                                Ok(value)
                             })
-                            .map_err(denied)
+                            .map_err(|error| {
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                    "actor Calling {:?}/{effect:?} run_intent failed {error:?}", record.phase
+                                ));
+                                denied(error)
+                            })
                     } else {
                         supervisor
                             .run(&context, || {
@@ -5260,10 +5315,10 @@ pub(crate) mod native {
             // none of these calls holds a Pair borrow across the next call.
             r.attestor
                 .select(pin.clone(), record.clone())
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             r.probe_state
                 .select(pin.clone(), record.clone())
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let closing = &mut self.closing;
             let network = &mut self.closing_network;
             r.carrier
@@ -5298,7 +5353,7 @@ pub(crate) mod native {
                     }
                     Ok(())
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(())
         }
 
@@ -5533,9 +5588,9 @@ pub(crate) mod native {
                             .as_ref()
                             .ok_or_else(conflict)?
                             .try_borrow_mut()
-                            .map_err(denied)?
+                            .map_err(|error| denied(error))?
                             .read_pregraph_key_restore(&pin, record)
-                            .map_err(denied)?;
+                            .map_err(|error| denied(error))?;
                         if actual != record.guard.expected {
                             return Err(conflict());
                         }
@@ -5555,10 +5610,10 @@ pub(crate) mod native {
                             .as_ref()
                             .ok_or_else(conflict)?
                             .try_borrow_mut()
-                            .map_err(denied)?;
+                            .map_err(|error| denied(error))?;
                         startup
                             .attest_bootstrap(&pin, record, effect)
-                            .map_err(denied)
+                            .map_err(|error| denied(error))
                     },
                 );
             }
@@ -5570,16 +5625,16 @@ pub(crate) mod native {
                 let r = this.roots()?;
                 r.probe_state
                     .select(pin.clone(), record.clone())
-                    .map_err(denied)?;
-                r.runtime.verify(&r.context).map_err(denied)?;
-                r.runtime.verify_source(&r.pins.wintun).map_err(denied)?;
+                    .map_err(|error| denied(error))?;
+                r.runtime.verify(&r.context).map_err(|error| denied(error))?;
+                r.runtime.verify_source(&r.pins.wintun).map_err(|error| denied(error))?;
                 r.runtime
                     .verify_same_session_files(&r.context, &r.files)
-                    .map_err(denied)?;
-                r.image.verify_runtime(&r.runtime).map_err(denied)?;
+                    .map_err(|error| denied(error))?;
+                r.image.verify_runtime(&r.runtime).map_err(|error| denied(error))?;
                 r.members
                     .matches_original_runtime_image(&r.runtime, &r.image)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if !r.originals.same_original_registry(&r.pins.originals)
                     || !r
                         .rows
@@ -5590,11 +5645,21 @@ pub(crate) mod native {
                     || !r.baseline.matches_source_origin(&r.pins.source)
                     || !r.baseline.matches_reader(&r.network_read)
                 {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(&format!(
+                        "actor attest {:?}/{effect:?} original caps mismatch registry={} carrier_rows={} network_ack={} baseline_source={} baseline_reader={}",
+                        record.phase,
+                        r.originals.same_original_registry(&r.pins.originals),
+                        r.rows.matches_row_original(rows::Role::Carrier, &r.pins.carrier_rows),
+                        r.network_ack.matches_origin(&r.pins.source, &r.network_gate),
+                        r.baseline.matches_source_origin(&r.pins.source),
+                        r.baseline.matches_reader(&r.network_read),
+                    ));
                     return Err(conflict());
                 }
                 r.probe_read
                     .matches_caps(&r.pins.source, &r.guard, &r.probe_state.gate())
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 let retired = if record.phase == pair::Phase::Closing && record.stop_stage >= 8 {
                     retired_at_boundary(record.stop_stage, r.carrier.retired_pin())?
                 } else {
@@ -5612,13 +5677,13 @@ pub(crate) mod native {
                                 &r.context,
                                 crate::windows::member_session::RecordKind::NativeCarrierReceipts,
                             )
-                            .map_err(denied)?;
+                            .map_err(|error| denied(error))?;
                         let native = crate::member_carrier_native_ownership::Record::decode(&raw)
-                            .map_err(denied)?;
+                            .map_err(|error| denied(error))?;
                         if crate::windows::member_carrier_ready::key_restore_read_is_terminal(
                             &r.context, record, &native,
                         )
-                        .map_err(denied)?
+                        .map_err(|error| denied(error))?
                         {
                             return retired
                                 .inspect_terminal_bindings_and_history(|bindings, history| {
@@ -5626,7 +5691,7 @@ pub(crate) mod native {
                                         pin, record, &retired, bindings, history,
                                     )
                                 })
-                                .map_err(denied);
+                                .map_err(|error| denied(error));
                         }
                         // Before effect: original Cleanup SDK requires Disabled.
                         // No caught denial/fallback to terminal or old Pair frame.
@@ -5655,7 +5720,7 @@ pub(crate) mod native {
                             }
                             Ok(())
                         })
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                 } else {
                     // Preserve the complete original SDK/Calling bracket.
                     // Each concrete effect independently checks its resource G.
@@ -5664,12 +5729,12 @@ pub(crate) mod native {
                             .as_ref()
                             .ok_or_else(conflict)?
                             .inspect_window(|_| Ok(()))
-                            .map_err(denied)?;
+                            .map_err(|error| denied(error))?;
                     } else {
-                        r.pins.source.inspect_window(|_| Ok(())).map_err(denied)?;
+                        r.pins.source.inspect_window(|_| Ok(())).map_err(|error| denied(error))?;
                     }
                 }
-                r.runtime.verify(&r.context).map_err(denied)
+                r.runtime.verify(&r.context).map_err(|error| denied(error))
             })
         }
 

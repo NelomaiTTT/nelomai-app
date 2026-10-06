@@ -3691,9 +3691,6 @@ pub(crate) mod native {
             effect: Option<(&rows::Binding, &rows::Target)>,
         ) -> Result<SourceSample> {
             let before = self.revision()?;
-            self.members
-                .matches_original_runtime_image(&self.runtime, &self.image)
-                .map_err(denied)?;
             let captured = self
                 .address
                 .read(
