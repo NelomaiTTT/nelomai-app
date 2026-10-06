@@ -98,13 +98,14 @@ impl OriginalPackageInventory {
     > {
         use crate::windows::member_carrier_wintun_package::{Device, Error as PackageError};
         let read = || -> std::result::Result<Vec<u8>, PackageError> {
-            let (bytes, fresh) = self
+            let (records, fresh) = self
                 .runtime
                 .record_with_fresh(
                     &self.context,
-                    crate::windows::member_session::RecordKind::NativeCarrierReceipts,
+                    &[crate::windows::member_session::RecordKind::NativeCarrierReceipts],
                 )
                 .map_err(|_| PackageError::Changed)?;
+            let [bytes]: [Vec<u8>; 1] = records.try_into().map_err(|_| PackageError::Changed)?;
             let record = receipt::Record::decode(&bytes).map_err(|_| PackageError::Changed)?;
             let expected = if cleanup {
                 receipt::Phase::Closing

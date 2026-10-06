@@ -3654,13 +3654,17 @@ pub(crate) mod native {
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
-            let (native, fresh) = self
+            let (records, fresh) = self
                 .runtime
-                .record_with_fresh(&self.scope.context, RecordKind::NativeCarrierReceipts)
+                .record_with_fresh(
+                    &self.scope.context,
+                    &[RecordKind::NativeCarrierReceipts, RecordKind::CarrierRows],
+                )
                 .map_err(denied)?;
             if !fresh {
                 return Err(Error::Retired);
             }
+            let [native, rows]: [Vec<u8>; 2] = records.try_into().map_err(|_| Error::Conflict)?;
             let record = receipts::Record::decode(&native).map_err(denied)?;
             validate_stage(
                 &record,
@@ -3671,10 +3675,6 @@ pub(crate) mod native {
                 Use::Live,
             )
             .map_err(denied)?;
-            let rows = self
-                .runtime
-                .record(&self.scope.context, RecordKind::CarrierRows)
-                .map_err(denied)?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
@@ -3898,10 +3898,17 @@ pub(crate) mod native {
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
             self.image.verify_runtime(&self.runtime).map_err(denied)?;
-            let native = self
+            let records = self
                 .runtime
-                .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
+                .optional_records(
+                    &self.scope.context,
+                    &[RecordKind::NativeCarrierReceipts, RecordKind::CarrierRows],
+                )
                 .map_err(denied)?;
+            let [native, rows]: [Option<Vec<u8>>; 2] =
+                records.try_into().map_err(|_| Error::Conflict)?;
+            let native = native.ok_or(Error::Conflict)?;
+            let rows = rows.ok_or(Error::Conflict)?;
             validate_stage(
                 &receipts::Record::decode(&native).map_err(denied)?,
                 &self.scope.context,
@@ -3911,10 +3918,6 @@ pub(crate) mod native {
                 Use::Cleanup,
             )
             .map_err(denied)?;
-            let rows = self
-                .runtime
-                .record(&self.scope.context, RecordKind::CarrierRows)
-                .map_err(denied)?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
@@ -5528,10 +5531,11 @@ pub(crate) mod native {
             self.checkpoint()?;
             // One full authentication bracket compares BOTH current bytes and
             // freshness, including the final sample after runtime hashing.
-            let (bytes, fresh) = self
+            let (records, fresh) = self
                 .runtime
-                .record_with_fresh(&self.scope.context, RecordKind::NativeCarrierReceipts)
+                .record_with_fresh(&self.scope.context, &[RecordKind::NativeCarrierReceipts])
                 .map_err(denied)?;
+            let [bytes]: [Vec<u8>; 1] = records.try_into().map_err(|_| Error::Conflict)?;
             let record = receipts::Record::decode(&bytes).map_err(denied)?;
             validate_stage(
                 &record,

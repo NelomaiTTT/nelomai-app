@@ -673,15 +673,15 @@ impl RuntimeRead {
     pub(super) fn record(&self, context: &Context, kind: RecordKind) -> Result<Vec<u8>> {
         self.optional_record(context, kind)?.ok_or(Error::Journal)
     }
-    /// Current bytes and freshness are one factual snapshot under the SAME
-    /// original backend/lease. Full signed-runtime authentication brackets both
-    /// observations; a change in either fact rejects the complete read. This
-    /// returns no publication ACK, native effect authority or reusable permission.
+    /// Required records and final freshness are one factual snapshot under the
+    /// SAME original backend/lease. Actual runtime verification brackets both
+    /// observations; any record or freshness change rejects the complete read.
+    /// This returns no publication ACK, native effect authority or permission.
     pub(super) fn record_with_fresh(
         &self,
         context: &Context,
-        kind: RecordKind,
-    ) -> Result<(Vec<u8>, bool)> {
+        kinds: &[RecordKind],
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
         crate::member_fresh_read::read(
             || self.runtime.verify(&self.lease, context),
             || {
@@ -690,29 +690,33 @@ impl RuntimeRead {
                     .files
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                files
-                    .native_carrier_access(&context.intent.scope)
-                    .map_err(|_| Error::Journal)?
-                    .require_native_context(context)
-                    .map_err(|_| Error::Conflict)?;
-                let bytes = if kind == RecordKind::Network {
-                    // Preserve the legacy factual read through the SAME original
-                    // backend; the birth-bound native facet denies this journal.
-                    if !files.same_original_backend(&self.runtime.original_files) {
-                        return Err(Error::Conflict);
-                    }
-                    self.runtime
-                        .original_files
-                        .clone()
-                        .read(&context.intent.scope, kind)
-                        .map_err(|_| Error::Journal)?
-                } else {
+                let mut records = Vec::with_capacity(kinds.len());
+                for &kind in kinds {
                     files
-                        .read(&context.intent.scope, kind)
+                        .native_carrier_access(&context.intent.scope)
                         .map_err(|_| Error::Journal)?
+                        .require_native_context(context)
+                        .map_err(|_| Error::Conflict)?;
+                    let bytes = if kind == RecordKind::Network {
+                        // Preserve the SAME original backend's legacy factual read;
+                        // the birth-bound native facet still denies this journal.
+                        if !files.same_original_backend(&self.runtime.original_files) {
+                            return Err(Error::Conflict);
+                        }
+                        self.runtime
+                            .original_files
+                            .clone()
+                            .read(&context.intent.scope, kind)
+                            .map_err(|_| Error::Journal)?
+                    } else {
+                        files
+                            .read(&context.intent.scope, kind)
+                            .map_err(|_| Error::Journal)?
+                    }
+                    .ok_or(Error::Journal)?;
+                    records.push(bytes);
                 }
-                .ok_or(Error::Journal)?;
-                // Freshness is queried LAST, after the protected bytes read.
+                // Freshness is queried LAST, after all protected records.
                 // Both observations independently check the native context.
                 let access = files
                     .native_carrier_access(&context.intent.scope)
@@ -721,7 +725,7 @@ impl RuntimeRead {
                     .require_native_context(context)
                     .map_err(|_| Error::Conflict)?;
                 Ok((
-                    bytes,
+                    records,
                     !self.runtime.forward_closed.get() && access.is_fresh(),
                 ))
             },
