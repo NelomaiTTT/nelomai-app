@@ -69,9 +69,8 @@ unsafe impl ColdStaticAuthorization for NativeColdGuardAuthority {
                     if facts.context.as_ref() != Some(&self.context) || self.failed.get() {
                         return Err(denied());
                     }
-                    let record = facts.guard.as_ref().ok_or_else(denied)?;
-                    let policies = ColdGuardPolicies::from_authenticated_record(record)
-                        .map_err(|_| denied())?;
+                    let policies =
+                        ColdGuardPolicies::from_authenticated_facts(facts).map_err(|_| denied())?;
                     let output = read(&policies).map_err(|_| denied())?;
                     if self.failed.get() {
                         return Err(denied());
@@ -103,9 +102,7 @@ impl NativeColdGuardCleanup {
     pub(crate) fn new(entry: Rc<NativeFactoryRecoveryEntry>) -> io::Result<Self> {
         let facts = entry.retained_facts()?;
         let context = facts.context.as_ref().ok_or_else(denied)?.clone();
-        if facts.guard.is_none() {
-            return Err(denied());
-        }
+        ColdGuardPolicies::from_authenticated_facts(&facts).map_err(|_| denied())?;
         entry.require_bounded_cleanup_execution()?;
         let timing = Rc::new(NativeColdDeadline::new(entry.clone(), context.clone())?);
         let non_wfp = entry.native_non_wfp_empty_authority();

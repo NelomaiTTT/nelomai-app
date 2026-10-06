@@ -560,11 +560,9 @@ impl Drop for SourceInspection<'_> {
     }
 }
 impl SourceFence {
-    fn joined_read<F: Eq, T, E>(
+    fn joined_read<T, E>(
         &self,
         cleanup: bool,
-        expected: &F,
-        mut sample: impl FnMut() -> std::result::Result<F, E>,
         read: impl FnOnce() -> std::result::Result<T, E>,
         conflict: impl Fn() -> E,
     ) -> std::result::Result<T, E> {
@@ -583,17 +581,8 @@ impl SourceFence {
             source: self,
             succeeded: false,
         };
-        if sample()? != *expected
-            || !self.busy.get()
-            || self.tainted.get()
-            || self.cleanup.get() != cleanup
-            || (!cleanup && self.revoked.get())
-        {
-            return Err(conflict());
-        }
         let result = read()?;
-        if sample()? != *expected
-            || !self.busy.get()
+        if !self.busy.get()
             || self.tainted.get()
             || self.cleanup.get() != cleanup
             || (!cleanup && self.revoked.get())
@@ -1518,18 +1507,15 @@ pub(crate) mod native {
     /// Borrowed comparison window, minted only INSIDE the actual original
     /// Source/Closing callback. It joins read-only BFE checks without reentering
     /// the owning source lease; it cannot be imported, cloned or serialized.
-    /// Each joined read freshly resamples ALL original/protected/SDK facts and
-    /// taints the outer callback on any error/unwind, even if caught by G.
+    /// Read-only joins share this active outer full pre/post sample bracket.
+    /// Rows/Network keep their own pre/post reads. A join error/unwind taints
+    /// the outer callback even if caught by G.
     pub(crate) struct NativeBindingsWindow<'a> {
         origin: WindowOrigin<'a>,
         bindings: crate::windows::member_carrier_guard::Bindings,
     }
     enum WindowOrigin<'a> {
-        Source(
-            &'a NativeSourceRead,
-            &'a SourceSample,
-            Option<(&'a rows::Binding, &'a rows::Target)>,
-        ),
+        Source(&'a NativeSourceRead, &'a SourceSample),
         Closing(&'a NativeClosingRead, &'a ClosingSample),
         PartialClosing(
             &'a NativeClosingRead,
@@ -1542,7 +1528,7 @@ pub(crate) mod native {
             &self.bindings
         }
         pub(crate) fn matches_source(&self, source: &NativeSourceRead) -> bool {
-            matches!(&self.origin, WindowOrigin::Source(original, _, _) if std::ptr::eq(*original, source))
+            matches!(&self.origin, WindowOrigin::Source(original, _) if std::ptr::eq(*original, source))
         }
         pub(crate) fn matches_closing(&self, closing: &NativeClosingRead) -> bool {
             matches!(&self.origin, WindowOrigin::Closing(original, _) | WindowOrigin::PartialClosing(original, _, _) if std::ptr::eq(*original, closing))
@@ -1558,7 +1544,7 @@ pub(crate) mod native {
         }
         pub(crate) fn matches_runtime(&self, runtime: &RuntimeRead) -> bool {
             match &self.origin {
-                WindowOrigin::Source(source, _, _) => source.runtime.same_original_runtime(runtime),
+                WindowOrigin::Source(source, _) => source.runtime.same_original_runtime(runtime),
                 WindowOrigin::Closing(closing, _) => closing.runtime.same_original_runtime(runtime),
                 WindowOrigin::PartialClosing(closing, _, _) => {
                     closing.runtime.same_original_runtime(runtime)
@@ -1572,13 +1558,14 @@ pub(crate) mod native {
             slot: nelomai_contracts::dispatcher::TunnelSlot,
         ) -> Option<&crate::windows::member_carrier_members::ClosedMemberBinding> {
             let history = match &self.origin {
-                WindowOrigin::Source(_, sample, _) => &sample.history,
+                WindowOrigin::Source(_, sample) => &sample.history,
                 WindowOrigin::Closing(_, sample) => &sample.history,
                 WindowOrigin::PartialClosing(_, _, sample) => &sample.history,
             };
             history.iter().find(|closed| closed.intent.slot == slot)
         }
-        /// Factual read bracket ONLY, not a lifecycle/native mutation grant.
+        /// Read-only join under the SAME active outer full pre/post bracket,
+        /// not a lifecycle/native mutation grant.
         /// Callback must be read-only and must not open another Source callback
         /// or join recursively. Original G registration remains mandatory.
         pub(crate) fn inspect<T>(
@@ -1586,28 +1573,20 @@ pub(crate) mod native {
             read: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
         ) -> Result<T> {
             match &self.origin {
-                WindowOrigin::Source(source, expected, effect) => source.fence.joined_read(
-                    false,
-                    *expected,
-                    || source.sample_for_row(*effect),
-                    || read(&self.bindings),
-                    || Error::Conflict,
-                ),
-                WindowOrigin::Closing(closing, expected) => closing.fence.joined_read(
-                    true,
-                    *expected,
-                    || closing.sample(),
-                    || read(&self.bindings),
-                    || Error::Conflict,
-                ),
-                WindowOrigin::PartialClosing(closing, partial, expected) => {
-                    closing.fence.joined_read(
-                        true,
-                        *expected,
-                        || closing.sample_partial(partial),
-                        || read(&self.bindings),
-                        || Error::Conflict,
-                    )
+                WindowOrigin::Source(source, _) => {
+                    source
+                        .fence
+                        .joined_read(false, || read(&self.bindings), || Error::Conflict)
+                }
+                WindowOrigin::Closing(closing, _) => {
+                    closing
+                        .fence
+                        .joined_read(true, || read(&self.bindings), || Error::Conflict)
+                }
+                WindowOrigin::PartialClosing(closing, _, _) => {
+                    closing
+                        .fence
+                        .joined_read(true, || read(&self.bindings), || Error::Conflict)
                 }
             }
         }
@@ -3843,7 +3822,7 @@ pub(crate) mod native {
                         return Err(Error::Conflict);
                     }
                     let window = NativeBindingsWindow {
-                        origin: WindowOrigin::Source(self, facts, effect),
+                        origin: WindowOrigin::Source(self, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
                             scope: projected.scope,
                             carrier: projected.carrier,
@@ -4016,8 +3995,8 @@ pub(crate) mod native {
             })
         }
         /// Only SAME retained partial SCM cleanup, never a live Source window.
-        /// Every joined row/network/BFE read reattests this exact original pin
-        /// and full SDK namespace; target comparison never enters Bindings.
+        /// The outer full pre/post samples reattest this exact original pin and
+        /// SDK namespace around read-only joins; target never enters Bindings.
         pub(crate) fn inspect_partial_member_window<T>(
             &self,
             partial: &Rc<crate::windows::member_carrier_member_controller::native::PartialCleanup>,

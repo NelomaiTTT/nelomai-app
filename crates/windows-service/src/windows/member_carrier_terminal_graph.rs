@@ -1807,7 +1807,6 @@ pub(crate) mod native {
             members,
             rows,
             guard,
-            guard_journal,
             attestor,
             guard_resources,
             lifecycle,
@@ -1850,7 +1849,6 @@ pub(crate) mod native {
         graph.originals = Some(originals);
         graph.rows = Some(rows);
         graph.guard = Some(guard);
-        graph.guard_journal = Some(guard_journal);
         graph.attestor = Some(attestor);
         graph.guard_resources = Some(guard_resources);
         graph.lifecycle = Some(lifecycle);

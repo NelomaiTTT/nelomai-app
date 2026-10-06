@@ -806,8 +806,7 @@ pub(crate) mod native {
             member_session::{
                 InitialDataRetirementAck, InitialNativeDataRead, NativeSessionFiles,
                 OriginalInitialNativeDataRetirement, ProtectedRecoveryRecords, RecordKind,
-                SessionFiles, WindowsCarrierGuardStore, WindowsNativeCarrierReceiptStore,
-                WindowsNativeCreatorStore,
+                SessionFiles, WindowsNativeCarrierReceiptStore, WindowsNativeCreatorStore,
             },
         },
     };
@@ -1936,7 +1935,6 @@ pub(crate) mod native {
                 || original.originals.is_some()
                 || original.rows.is_some()
                 || original.guard.is_some()
-                || original.guard_journal.is_some()
                 || original.attestor.is_some()
                 || original.guard_resources.is_some()
                 || original.lifecycle.is_some()
@@ -1988,7 +1986,6 @@ pub(crate) mod native {
         originals: Option<Rc<Observer<OriginalWintun>>>,
         rows: Option<Rc<NativeResourceRowsRead>>,
         guard: Option<Rc<RefCell<actor::Guard>>>,
-        guard_journal: Option<WindowsCarrierGuardStore<NativeSessionFiles>>,
         attestor: Option<Rc<NativeGuardSelection>>,
         guard_resources: Option<Rc<NativeGuardResourceSelection<actor::OriginalGuardAttestor>>>,
         lifecycle: Option<NativeLifecycleSelection<actor::OriginalGuardAttestor>>,
@@ -2018,7 +2015,6 @@ pub(crate) mod native {
         pub(crate) originals: Option<Rc<Observer<OriginalWintun>>>,
         pub(crate) rows: Option<Rc<NativeResourceRowsRead>>,
         pub(crate) guard: Option<Rc<RefCell<actor::Guard>>>,
-        pub(crate) guard_journal: Option<WindowsCarrierGuardStore<NativeSessionFiles>>,
         pub(crate) attestor: Option<Rc<NativeGuardSelection>>,
         pub(crate) guard_resources:
             Option<Rc<NativeGuardResourceSelection<actor::OriginalGuardAttestor>>>,
@@ -2065,7 +2061,6 @@ pub(crate) mod native {
                 originals,
                 rows,
                 guard,
-                guard_journal,
                 attestor,
                 guard_resources,
                 lifecycle,
@@ -2099,7 +2094,6 @@ pub(crate) mod native {
                 originals,
                 rows,
                 guard,
-                guard_journal,
                 attestor,
                 guard_resources,
                 lifecycle,
@@ -2138,7 +2132,6 @@ pub(crate) mod native {
                         originals,
                         rows,
                         guard,
-                        guard_journal,
                         attestor,
                         guard_resources,
                         lifecycle,
@@ -2173,7 +2166,6 @@ pub(crate) mod native {
                 originals,
                 rows,
                 guard,
-                guard_journal,
                 attestor,
                 guard_resources,
                 lifecycle,
@@ -2280,27 +2272,6 @@ pub(crate) mod native {
                 .map_err(|_| Error::Native)?,
             )));
             let guard = self.guard.as_ref().ok_or(Error::Pending)?.clone();
-            let (journal, saved) =
-                WindowsCarrierGuardStore::open(input.files.clone(), input.context.clone())
-                    .map_err(|_error| {
-                        #[cfg(test)]
-                        trace_step(&format!(
-                            "startup graph GuardStore open error kind={:?}",
-                            _error.kind()
-                        ));
-                        Error::Journal
-                    })?;
-            self.guard_journal = Some(journal);
-            if saved.is_some() {
-                #[cfg(test)]
-                trace_step("startup graph GuardStore saved present error=Conflict");
-                return Err(Error::Conflict);
-            }
-            self.guard_journal
-                .as_mut()
-                .ok_or(Error::Pending)?
-                .initialize()
-                .map_err(|_| Error::Journal)?;
             graph_result!(
                 selection.select(original.clone(), expected.clone()),
                 "guard selection"
@@ -2469,7 +2440,6 @@ pub(crate) mod native {
                 originals,
                 rows,
                 guard,
-                guard_journal,
                 attestor,
                 guard_resources,
                 lifecycle,
@@ -4700,7 +4670,6 @@ pub(crate) mod native {
                 members: take!(members),
                 rows: take!(rows),
                 guard: take!(guard),
-                guard_journal: take!(guard_journal),
                 attestor: take!(attestor),
                 guard_resources: take!(guard_resources),
                 lifecycle: take!(lifecycle),

@@ -426,11 +426,18 @@ impl CarrierPairIo for Io {
     }
     fn guard_exchange(
         &mut self,
-        _: &Record,
+        record: &Record,
         kind: guard::SessionKind,
         before: &guard::Model,
         after: &guard::Model,
     ) -> io::Result<guard::Model> {
+        // The real coordinator durably roots the full plan in its SAME Pair
+        // before this external WFP edge; no second Guard journal is required.
+        assert!(self.0.borrow().disk.as_ref() == Some(record));
+        assert_eq!(record.guard, *before);
+        assert_eq!(record.pending, Some(Effect::Guard));
+        let plan = record.pending_guard.as_ref().unwrap();
+        plan.validate().unwrap();
         guard::validate_session_exchange(&self.0.borrow().scope, before, after, kind)
             .map_err(|_| failed())?;
         assert_eq!(self.0.borrow().guard, *before);
@@ -1795,7 +1802,14 @@ mod terminal_control {
                     assert!(native.carrier.is_none());
                     assert!(native.members.iter().all(Option::is_none));
                     assert_eq!(native.network.routes.len(), 0);
-                    assert!(native.disk.as_ref().unwrap().phase == Phase::Stopped);
+                    let stopped = native.disk.as_ref().unwrap();
+                    assert_eq!(stopped.phase, Phase::Stopped);
+                    assert!(stopped.pending_guard.is_none());
+                    assert_eq!(stopped.guard, native.guard);
+                    assert_eq!(
+                        stopped.guard,
+                        guard::Model::empty(stopped.scope.clone()).unwrap()
+                    );
                 }
                 assert_eq!(single.get(), 0);
             }

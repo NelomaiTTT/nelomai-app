@@ -195,7 +195,7 @@ fn guard(record: &pair::Record, usage: Use, actual: &policy::Snapshot) -> Result
     {
         return Err(Error::Conflict);
     }
-    if usage == Use::Primary || matches!(usage, Use::ServiceStop(_)) && !record.guard.installed {
+    if usage == Use::Primary || cleanup_use(usage) && !record.guard.installed {
         if record.guard
             != policy::Model::empty(record.scope.clone()).map_err(|_| Error::Conflict)?
         {
@@ -208,7 +208,7 @@ fn guard(record: &pair::Record, usage: Use, actual: &policy::Snapshot) -> Result
     {
         return Err(Error::Conflict);
     }
-    if usage != Use::Primary {
+    if record.guard.installed {
         for (member, egress) in record.members.iter().zip(&actual.egress) {
             if member
                 .as_ref()
@@ -444,7 +444,7 @@ fn network(
     {
         return Err(Error::Conflict);
     }
-    if usage == Use::Primary || matches!(usage, Use::ServiceStop(_)) && record.network.is_none() {
+    if usage == Use::Primary || cleanup_use(usage) && record.network.is_none() {
         if record.network.is_some()
             || fact.protected.is_some()
             || ack.is_some_and(|(routes, dns)| !routes.is_empty() || !dns.is_empty())
@@ -560,12 +560,6 @@ fn advance(old: &pair::Record, next: &pair::Record) -> Result<()> {
         || old.phase == pair::Phase::Closing
             && (next.phase != pair::Phase::Closing || next.stop_stage < old.stop_stage)
     {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
-fn protected_continuity(before: Option<&[u8]>, after: Option<&[u8]>) -> Result<()> {
-    if before != after {
         return Err(Error::Conflict);
     }
     Ok(())
@@ -691,7 +685,7 @@ pub(crate) mod native {
             NativeBindingsWindow, NativeClosingRead, NativeResourceRowsRead, NativeSourceRead,
         },
         member_native_deadline::NativeDeadline,
-        member_session::{CarrierGuardRecord, RecordKind},
+        member_session::RecordKind,
     };
     use std::{
         cell::RefCell,
@@ -1052,23 +1046,6 @@ pub(crate) mod native {
                 .snapshot_in_window(window)
                 .map_err(denied)?;
             guard(record, usage, &observed_guard)?;
-            let protected = self
-                .runtime
-                .optional_record(&self.context, RecordKind::CarrierGuard)?;
-            match &protected {
-                None if usage == Use::Primary
-                    || matches!(usage, Use::ServiceStop(_)) && !record.guard.installed => {}
-                Some(bytes) => {
-                    let saved = CarrierGuardRecord::decode(bytes).map_err(denied)?;
-                    if saved.context != self.context
-                        || saved.current != record.guard
-                        || saved.pending.is_some()
-                    {
-                        return Err(Error::Conflict);
-                    }
-                }
-                _ => return Err(Error::Pending),
-            }
             let mut row_record = record.clone();
             if let Some(proof) = partial {
                 row_record.members[index(&self.intent)]
@@ -1217,10 +1194,6 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             guard(record, usage, &after_guard)?;
-            let after_protected = self
-                .runtime
-                .optional_record(&self.context, RecordKind::CarrierGuard)?;
-            protected_continuity(protected.as_deref(), after_protected.as_deref())?;
             // End all sibling borrows before the final original Pair lease.
             self.verify_pair()?;
             if self.continuity(cleanup)? != before {

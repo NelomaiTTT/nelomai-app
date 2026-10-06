@@ -1000,19 +1000,6 @@ fn installed_bases_cannot_omit_remaining_original_member_even_with_equal_guard_j
 }
 
 #[test]
-fn protected_guard_postflight_rejects_replacement_creation_and_disappearance() {
-    protected_continuity(None, None).unwrap();
-    protected_continuity(
-        Some(b"same protected revision"),
-        Some(b"same protected revision"),
-    )
-    .unwrap();
-    assert!(protected_continuity(Some(b"old"), Some(b"replacement")).is_err());
-    assert!(protected_continuity(None, Some(b"new")).is_err());
-    assert!(protected_continuity(Some(b"old"), None).is_err());
-}
-
-#[test]
 fn partial_stop_requires_exact_original_intent_and_actual_native_proof() {
     let (_, _, intent) = fixture();
     assert_eq!(
@@ -1051,7 +1038,21 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
         Use::ServiceStop(0)
     );
     guard(&record, Use::ServiceStop(0), &record.guard.expected).unwrap();
-    assert!(guard(&record, Use::Stop, &record.guard.expected).is_err());
+    assert!(service_window_usage(Use::Stop, true).is_err());
+    let live_target = policy::Identity {
+        scope: record.scope.clone(),
+        proof: proof(0).interface,
+    };
+    assert!(original_bindings(
+        &context,
+        &record,
+        &intent,
+        Use::Stop,
+        &carrier(&record),
+        &[Some(live_target.clone()), None],
+        None
+    )
+    .is_err());
     for cut in 0..8 {
         let mut wrong = record.clone();
         match cut {
@@ -1094,6 +1095,80 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
     assert!(network(
         &record,
         Use::ServiceStop(0),
+        NetworkFact {
+            routes: &polluted,
+            dns: &dns,
+            protected: None
+        },
+        None
+    )
+    .is_err());
+
+    // A published original may need Stop after row capture/restoration but
+    // before the first WFP base or Network write. Its NIC proof is independent
+    // of the exact empty WFP readback; this is an ordinary Closing window.
+    let mut published = record.clone();
+    published.members[0].as_mut().unwrap().owner.phase = owner::Phase::Running;
+    published.members[0].as_mut().unwrap().owner.proof = Some(proof(0));
+    published.validate().unwrap();
+    assert_eq!(stage(&context, &published, &intent, true), Ok(Use::Stop));
+    assert!(service_stop_stage(&context, &published, &intent).is_err());
+    service_window_usage(Use::Stop, false).unwrap();
+    guard(&published, Use::Stop, &published.guard.expected).unwrap();
+    original_bindings(
+        &context,
+        &published,
+        &intent,
+        Use::Stop,
+        &carrier(&published),
+        &[Some(live_target), None],
+        None,
+    )
+    .unwrap();
+    assert!(original_bindings(
+        &context,
+        &published,
+        &intent,
+        Use::Stop,
+        &carrier(&published),
+        &[None, None],
+        None
+    )
+    .is_err());
+    let rows = [
+        Some(row(&context, &published, 0, Use::Stop)),
+        Some(row(&context, &published, 1, Use::Stop)),
+        None,
+    ];
+    resource_rows(&context, &published, Use::Stop, rowfacts(&rows)).unwrap();
+    let mut missing_rows = rowfacts(&rows);
+    missing_rows[1] = None;
+    assert!(resource_rows(&context, &published, Use::Stop, missing_rows).is_err());
+    network(
+        &published,
+        Use::Stop,
+        NetworkFact {
+            routes: &facts,
+            dns: &dns,
+            protected: None,
+        },
+        None,
+    )
+    .unwrap();
+    assert!(network(
+        &published,
+        Use::Stop,
+        NetworkFact {
+            routes: &facts,
+            dns: &dns,
+            protected: Some(b"unjoined network")
+        },
+        None
+    )
+    .is_err());
+    assert!(network(
+        &published,
+        Use::Stop,
         NetworkFact {
             routes: &polluted,
             dns: &dns,

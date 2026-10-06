@@ -955,34 +955,6 @@ fn network_active(
 }
 
 #[cfg(any(windows, test))]
-fn guard_ack_plan(
-    plan: &crate::member_carrier_guard::ExchangePlan,
-    before: &crate::member_carrier_guard::Model,
-    acknowledged: &crate::member_carrier_guard::Model,
-) -> crate::member_carrier_guard::Result<crate::member_carrier_guard::ExchangePlan> {
-    use crate::member_carrier_guard::GuardError;
-    plan.validate()?;
-    before.validate()?;
-    acknowledged.validate()?;
-    let mut retained = plan.clone();
-    if !before.installed && acknowledged.installed {
-        retained.base = plan
-            .base
-            .readback_after(&plan.expected, &acknowledged.expected)?;
-        if retained.base != *acknowledged {
-            return Err(GuardError::Conflict);
-        }
-        retained.captured_sublayer_weight = acknowledged.assigned_sublayer_weight;
-        retained.desired = plan.desired.inherit_sublayer_weight(acknowledged)?;
-        retained.validate()?;
-    }
-    if retained.resolve(&acknowledged.expected)? != *acknowledged {
-        return Err(GuardError::Conflict);
-    }
-    Ok(retained)
-}
-
-#[cfg(any(windows, test))]
 fn capture_once<T>(
     slot: &mut Option<T>,
     rejected: &mut Vec<T>,
@@ -1509,8 +1481,8 @@ pub(crate) mod native {
             member_carrier_wintun::native::OriginalWintun,
             member_session::{
                 epoch::{NativeExecutionLease, NativeExecutionRoot, NativeSessionAckRoot},
-                NativeSessionFiles, OriginalRowGenerationWrite, WindowsCarrierGuardStore,
-                WindowsCarrierRowsGenerationStore, WindowsCarrierRowsStore,
+                NativeSessionFiles, OriginalRowGenerationWrite, WindowsCarrierRowsGenerationStore,
+                WindowsCarrierRowsStore,
             },
         },
     };
@@ -2711,7 +2683,6 @@ pub(crate) mod native {
         pub members: Rc<MemberInventoryRead>,
         pub rows: Rc<NativeResourceRowsRead>,
         pub guard: Rc<RefCell<Guard>>,
-        pub guard_journal: WindowsCarrierGuardStore<NativeSessionFiles>,
         pub attestor: Rc<NativeGuardSelection>,
         pub guard_resources: Rc<NativeGuardResourceSelection<OriginalGuardAttestor>>,
         pub lifecycle: NativeLifecycleSelection<OriginalGuardAttestor>,
@@ -5183,11 +5154,6 @@ pub(crate) mod native {
                             r.assembly
                                 .begin_cleanup(&mut r.lock, &r.runtime, &pin)
                                 .map_err(denied)?;
-                            let canonical = r
-                                .runtime
-                                .native_files_for_original(&r.context, &r.files)
-                                .map_err(denied)?;
-                            r.guard_journal.enter_cleanup(canonical)?;
                         }
                         supervisor
                             .run_cleanup(&context, &pin, || {
@@ -6507,22 +6473,8 @@ pub(crate) mod native {
                 this.select_guard(pin, record)?;
                 let guard_acks = &mut this.guard_acks;
                 let r = this.roots.as_mut().ok_or_else(conflict)?;
-                let plan = record.pending_guard.as_ref().ok_or_else(conflict)?;
-                if record.guard != *expected
-                    || plan.resolve(&expected.expected).map_err(denied)? != *expected
-                {
+                if record.guard != *expected || record.pending_guard.is_none() {
                     return Err(conflict());
-                }
-                let actual = r.guard_journal.readback()?.ok_or_else(conflict)?;
-                if actual.current != plan.expected {
-                    return Err(conflict());
-                }
-                match actual.pending.as_ref() {
-                    None => {
-                        plan.persist(&mut r.guard_journal, None).map_err(denied)?;
-                    }
-                    Some(p) if p == plan => {}
-                    _ => return Err(conflict()),
                 }
                 // Each edge is independently authorized by NativeGuard's actual
                 // locked attestor/full resource G. Journaled plan is not a grant.
@@ -6563,17 +6515,8 @@ pub(crate) mod native {
                     }?;
                 // This value is returned by THAT actual retained NativeGuard,
                 // not inferred from a recovery sample or private JSON. Root it
-                // BEFORE any fallible native-journal capture/finish/postflight.
+                // BEFORE any fallible coordinator Pair publication/postflight.
                 guard_acks.push(acknowledged.clone());
-                let captured = guard_ack_plan(plan, expected, &acknowledged).map_err(denied)?;
-                if captured != *plan {
-                    captured
-                        .persist(&mut r.guard_journal, Some(plan))
-                        .map_err(denied)?;
-                }
-                if captured.desired == acknowledged {
-                    r.guard_journal.finish(&captured, &acknowledged)?;
-                }
                 Ok(acknowledged)
             })
         }

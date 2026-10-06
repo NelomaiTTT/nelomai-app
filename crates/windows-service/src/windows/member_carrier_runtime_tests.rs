@@ -272,63 +272,35 @@ fn actual_closed_member_rows_remain_closed_during_forward_carrier_retirement() {
     );
 }
 #[test]
-fn joined_sample_caught_reentry_cannot_invoke_even_read_only_callback() {
-    for cleanup in [false, true] {
-        let fence = SourceFence::new(Rc::new(Cell::new(false)));
-        let read_called = Cell::new(false);
-        let outer_read = |expected: &u8| {
-            assert!(fence
-                .joined_read(
-                    cleanup,
-                    expected,
-                    || {
-                        assert!(fence
-                            .joined_read(cleanup, expected, || Ok(7), || Ok::<_, ()>(()), || ())
-                            .is_err());
-                        Ok(7)
-                    },
-                    || {
-                        read_called.set(true);
-                        Ok(())
-                    },
-                    || (),
-                )
-                .is_err());
-            Ok(())
-        };
-        let result = if cleanup {
-            fence.inspect_cleanup(|| Ok(7), outer_read, || ())
-        } else {
-            fence.inspect(|| Ok(7), outer_read, || ())
-        };
-        assert!(result.is_err());
-        assert!(!read_called.get());
-        assert!(fence.revoked.get());
-    }
-}
-#[test]
 fn original_read_window_joins_actual_outer_sample_without_reentrant_owner_entry() {
     let fence = SourceFence::new(Rc::new(Cell::new(false)));
     let count = Cell::new(0);
+    let samples = Cell::new(0);
+    let sample = || {
+        samples.set(samples.get() + 1);
+        Ok::<_, ()>(7)
+    };
     fence
         .inspect(
-            || Ok::<_, ()>(7),
-            |expected| {
-                fence.joined_read(
-                    false,
-                    expected,
-                    || Ok(7),
-                    || {
-                        count.set(1);
-                        Ok(())
-                    },
-                    || (),
-                )
+            sample,
+            |_| {
+                for _ in 0..3 {
+                    fence.joined_read(
+                        false,
+                        || {
+                            count.set(count.get() + 1);
+                            Ok(())
+                        },
+                        || (),
+                    )?;
+                }
+                Ok(())
             },
             || (),
         )
         .unwrap();
-    assert_eq!(count.get(), 1);
+    assert_eq!(count.get(), 3);
+    assert_eq!(samples.get(), 2);
     assert!(!fence.revoked.get());
 }
 #[test]
@@ -338,19 +310,19 @@ fn joined_read_refuses_outside_lease_wrong_lifecycle_drift_error_and_swallowed_r
             let fence = SourceFence::new(Rc::new(Cell::new(false)));
             let sample = Cell::new(7);
             let calls = Cell::new(0);
-            let read = |expected: &u8| {
+            let effect_called = Cell::new(false);
+            let outer_sample = || {
+                calls.set(calls.get() + 1);
+                if fault == 1 && calls.get() == 2 {
+                    Err(())
+                } else {
+                    Ok(sample.get())
+                }
+            };
+            let read = |_: &u8| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     fence.joined_read(
                         if fault == 0 { !cleanup } else { cleanup },
-                        expected,
-                        || {
-                            calls.set(calls.get() + 1);
-                            if fault == 1 {
-                                Err(())
-                            } else {
-                                Ok(sample.get())
-                            }
-                        },
                         || {
                             match fault {
                                 2 => {
@@ -360,9 +332,7 @@ fn joined_read_refuses_outside_lease_wrong_lifecycle_drift_error_and_swallowed_r
                                     return Err(());
                                 }
                                 4 => {
-                                    assert!(fence
-                                        .joined_read(cleanup, expected, || Ok(7), || Ok(()), || ())
-                                        .is_err());
+                                    assert!(fence.joined_read(cleanup, || Ok(()), || ()).is_err());
                                 }
                                 5 => {
                                     panic!("joined callback unwind");
@@ -376,6 +346,8 @@ fn joined_read_refuses_outside_lease_wrong_lifecycle_drift_error_and_swallowed_r
                 }));
                 if fault == 5 {
                     assert!(result.is_err());
+                } else if matches!(fault, 1 | 2) {
+                    assert!(result.unwrap().is_ok()); // Outer postflight rejects drift/read failure.
                 } else {
                     assert!(result.unwrap().is_err());
                 }
@@ -383,18 +355,20 @@ fn joined_read_refuses_outside_lease_wrong_lifecycle_drift_error_and_swallowed_r
                 Ok(()) // Ignored inner error cannot make outer callback succeed.
             };
             let outer = if cleanup {
-                fence.inspect_cleanup(|| Ok(7), read, || ())
+                fence.inspect_cleanup(outer_sample, read, || ())
             } else {
-                fence.inspect(|| Ok(7), read, || ())
+                fence.inspect(outer_sample, read, || ())
             };
+            let outer = outer.map(|()| effect_called.set(true));
             assert!(outer.is_err(), "{cleanup}/{fault}");
+            assert!(!effect_called.get());
             assert!(fence.revoked.get());
             assert!(!fence.busy.get());
             assert!(!fence.joined_busy.get());
             fence
                 .inspect_cleanup(
                     || Ok::<_, ()>(7),
-                    |expected| fence.joined_read(true, expected, || Ok(7), || Ok(()), || ()),
+                    |_| fence.joined_read(true, || Ok(()), || ()),
                     || (),
                 )
                 .unwrap();
@@ -402,9 +376,7 @@ fn joined_read_refuses_outside_lease_wrong_lifecycle_drift_error_and_swallowed_r
         }
     }
     let fence = SourceFence::new(Rc::new(Cell::new(false)));
-    assert!(fence
-        .joined_read(false, &7, || Ok(7), || Ok::<_, ()>(()), || ())
-        .is_err());
+    assert!(fence.joined_read(false, || Ok::<_, ()>(()), || ()).is_err());
     assert!(fence.revoked.get());
 }
 use crate::member_carrier::{Intent, Provenance};

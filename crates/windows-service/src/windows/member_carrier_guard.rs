@@ -736,14 +736,30 @@ pub(crate) struct ColdGuardPolicies {
 }
 impl ColdGuardPolicies {
     #[cfg(windows)]
-    pub(crate) fn from_authenticated_record(
-        record: &crate::windows::member_session::CarrierGuardRecord,
+    pub(crate) fn from_authenticated_facts(
+        facts: &crate::windows::member_carrier_recovery::RecoveryFacts,
     ) -> Result<Self> {
-        // Encoding invokes the real record's context/model/plan validation.
-        let protected_record = record.encode().map_err(|_| GuardError::Conflict)?;
+        let (current, pending, protected_record) = if let Some(record) = &facts.guard {
+            // Encoding invokes the legacy record's context/model/plan validation.
+            let protected_record = record.encode().map_err(|_| GuardError::Conflict)?;
+            (
+                record.current.clone(),
+                record.pending.clone(),
+                protected_record,
+            )
+        } else {
+            let pair = facts.pair.as_ref().ok_or(GuardError::Conflict)?;
+            pair.validate().map_err(|_| GuardError::Conflict)?;
+            let protected_record = pair.encode().map_err(|_| GuardError::Conflict)?;
+            (
+                pair.guard.clone(),
+                pair.pending_guard.clone(),
+                protected_record,
+            )
+        };
         Ok(Self {
-            current: record.current.clone(),
-            pending: record.pending.clone(),
+            current,
+            pending,
             protected_record,
         })
     }

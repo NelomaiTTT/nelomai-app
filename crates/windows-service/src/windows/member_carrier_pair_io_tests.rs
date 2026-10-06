@@ -2994,24 +2994,6 @@ fn generation_projection_keeps_other_active_allows_but_requires_exact_full_guard
 }
 
 #[test]
-fn guard_plan_priority_comes_from_original_exchange_ack_before_journal_postflight() {
-    let (plan, ack) = guard_creation();
-    let captured = guard_ack_plan(&plan, &plan.expected, &ack).unwrap();
-    assert_eq!(captured.captured_sublayer_weight, Some(65401));
-    assert_eq!(captured.base, ack);
-    assert_eq!(captured.desired, ack);
-    assert_eq!(captured.expected, plan.expected);
-    captured.validate().unwrap();
-}
-
-#[test]
-fn guard_plan_does_not_learn_unrelated_equal_priority_snapshot() {
-    let (plan, mut ack) = guard_creation();
-    ack.expected.carrier.as_mut().unwrap().identity.proof.luid += 1;
-    assert!(guard_ack_plan(&plan, &plan.expected, &ack).is_err());
-}
-
-#[test]
 fn network_exchange_switch_uses_target_not_still_published_old_active() {
     use crate::member_carrier_pair::Operation;
     use nelomai_client_tunnel::redundancy::Slot;

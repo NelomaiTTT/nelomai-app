@@ -50,7 +50,7 @@ fn conflict() -> io::Error {
 fn require_non_wfp_recovery(facts: &RecoveryFacts) -> io::Result<()> {
     if facts.layout != RecoveryLayout::NativeCarrier
         || facts.context.is_none()
-        || facts.guard.is_none()
+        || (facts.guard.is_none() && facts.pair.is_none())
         || (!facts.changed_boot && facts.creator.is_none())
     {
         return Err(io::Error::other(
