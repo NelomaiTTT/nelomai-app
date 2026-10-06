@@ -573,31 +573,30 @@ impl RuntimeRead {
         context: &Context,
         source: &super::member_carrier_payload::native::MemberSource,
     ) -> Result<()> {
-        crate::member_fresh_read::read(
-            || {
-                self.runtime.verify_original_context(&self.lease, context)?;
-                // MemberSource retains every original library pin and joins it
-                // to its original carrier around one complete installed read.
-                source.verify_runtime_binding(
-                    &self.runtime.owner,
-                    &self.runtime.identity,
-                    &self.runtime.installation.root,
-                    &self.runtime.directory,
-                    &self.runtime.executable,
-                )?;
-                self.runtime.verify_original_context(&self.lease, context)
-            },
-            || {
-                self.runtime
-                    .files
-                    .try_borrow_mut()
-                    .map_err(|_| Error::Conflict)?
-                    .native_carrier_access(&context.intent.scope)
-                    .map_err(|_| Error::Journal)?
-                    .require_native_context(context)
-                    .map_err(|_| Error::Conflict)
-            },
-        )
+        // The two actual protected-context reads fence one complete bound
+        // MemberSource check. Original context rejection precedes the first
+        // read; owner/root/lease/boot postflight follows the second.
+        self.runtime.verify_original_context(&self.lease, context)?;
+        let read_context = || {
+            self.runtime
+                .files
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?
+                .native_carrier_access(&context.intent.scope)
+                .map_err(|_| Error::Journal)?
+                .require_native_context(context)
+                .map_err(|_| Error::Conflict)
+        };
+        read_context()?;
+        source.verify_runtime_binding(
+            &self.runtime.owner,
+            &self.runtime.identity,
+            &self.runtime.installation.root,
+            &self.runtime.directory,
+            &self.runtime.executable,
+        )?;
+        read_context()?;
+        self.runtime.verify_original_context(&self.lease, context)
     }
     /// Current SAME runtime/source and the actual retained member intent, not
     /// a service name or caller path. This is factual comparison, never Start.

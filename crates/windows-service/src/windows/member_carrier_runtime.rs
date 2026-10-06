@@ -1552,7 +1552,8 @@ pub(crate) mod native {
         fence: Rc<super::SourceFence>,
     }
     type SourceRevision = (Vec<u8>, Vec<u8>);
-    #[derive(PartialEq, Eq)]
+    #[derive(Eq)]
+    #[cfg_attr(not(test), derive(PartialEq))]
     struct SourceSample {
         revision: SourceRevision,
         rows: rows::Snapshot,
@@ -1560,6 +1561,33 @@ pub(crate) mod native {
         carrier: crate::member_carrier_guard::Carrier,
         members: Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
         history: Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
+    }
+    // Preserve full equality, including readonly rows, while locating the
+    // actual native mismatch. This diagnostic does not widen source acceptance.
+    #[cfg(test)]
+    impl PartialEq for SourceSample {
+        fn eq(&self, other: &Self) -> bool {
+            let equal = self.revision == other.revision
+                && self.rows == other.rows
+                && self.original == other.original
+                && self.carrier == other.carrier
+                && self.members == other.members
+                && self.history == other.history;
+            #[cfg(test)]
+            if !equal {
+                trace_observe(&format!(
+                    "C Source sample equality failed revision_equal={} rows_equal={} original_equal={} carrier_equal={} members_equal={} history_equal={} rows_owned_equal={} interface_observed_before={:?} interface_observed_after={:?} address_observed_before={:?} address_observed_after={:?}",
+                    self.revision == other.revision, self.rows == other.rows,
+                    self.original == other.original, self.carrier == other.carrier,
+                    self.members == other.members, self.history == other.history,
+                    rows::same_owned(&self.rows, &other.rows),
+                    self.rows.interface.observed, other.rows.interface.observed,
+                    self.rows.address.as_ref().map(|row| &row.observed),
+                    other.rows.address.as_ref().map(|row| &row.observed),
+                ));
+            }
+            equal
+        }
     }
     /// Borrowed comparison window, minted only INSIDE the actual original
     /// Source/Closing callback. It joins read-only BFE checks without reentering
@@ -3694,21 +3722,53 @@ pub(crate) mod native {
         }
         fn revision(&self) -> Result<SourceRevision> {
             if self.fence.revoked.get() {
+                #[cfg(test)]
+                trace_observe("C Source revision fence revoked: Retired");
                 return Err(Error::Retired);
             }
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.runtime.verify(&self.scope.context).map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
-            if !self.runtime.fresh(&self.scope.context).map_err(denied)? {
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source revision entry deadline error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
+            self.runtime.verify(&self.scope.context).map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source revision runtime error={_error:?}"));
+                denied(_error)
+            })?;
+            self.image.verify_runtime(&self.runtime).map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source revision image error={_error:?}"));
+                denied(_error)
+            })?;
+            if !self.runtime.fresh(&self.scope.context).map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source revision freshness error={_error:?}"));
+                denied(_error)
+            })? {
+                #[cfg(test)]
+                trace_observe("C Source revision not fresh: Retired");
                 return Err(Error::Retired);
             }
             let native = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                .map_err(denied)?;
-            let record = receipts::Record::decode(&native).map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source revision native receipt error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
+            let record = receipts::Record::decode(&native).map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source revision native decode error={_error:?}"));
+                denied(_error)
+            })?;
             validate_stage(
                 &record,
                 &self.scope.context,
@@ -3717,15 +3777,31 @@ pub(crate) mod native {
                 true,
                 Use::Live,
             )
-            .map_err(denied)?;
+            .map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!(
+                    "C Source revision stage validation error={_error:?}"
+                ));
+                denied(_error)
+            })?;
             let rows = self
                 .runtime
                 .record(&self.scope.context, RecordKind::CarrierRows)
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source revision rows receipt error={_error:?}"));
+                    denied(_error)
+                })?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source revision post deadline error={_error:?}"));
+                    denied(_error)
+                })?;
             if self.fence.revoked.get() {
+                #[cfg(test)]
+                trace_observe("C Source revision fence revoked: Retired");
                 return Err(Error::Retired);
             }
             Ok((native, rows))
@@ -3760,7 +3836,11 @@ pub(crate) mod native {
                     &[c],
                     |live, history| Ok((live.to_vec(), history.to_vec())),
                 )
-                .map_err(denied)
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source member/history read error={_error:?}"));
+                    denied(_error)
+                })
         }
         fn sample_for_row(
             &self,
@@ -3769,26 +3849,60 @@ pub(crate) mod native {
             let before = self.revision()?;
             self.members
                 .matches_original_runtime_image(&self.runtime, &self.image)
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source original runtime/image join error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
             let captured = self
                 .address
                 .read(
                     &self.scope.context.intent.scope,
                     self.scope.context.provenance.network_epoch,
                 )
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source captured address read error={_error:?}"));
+                    denied(_error)
+                })?;
             let all = self
                 .originals
                 .observe_all(&self.scope.context)
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source original inventory first error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
+                #[cfg(test)]
+                trace_observe(&format!(
+                    "C Source original inventory comparison: Conflict count={} scope_equal={}",
+                    all.originals.len(),
+                    all.originals
+                        .first()
+                        .is_some_and(|original| original.scope == self.scope)
+                ));
                 return Err(Error::Conflict);
             }
             let (members, history) = self.members_with_history(&all.originals[0].identity)?;
-            let record = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
-            let snapshot = source_sdk_snapshot(captured.binding)?;
+            let record =
+                crate::member_carrier_rows::Record::decode(&before.1).map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source rows decode error={_error:?}"));
+                    denied(_error)
+                })?;
+            let snapshot = source_sdk_snapshot(captured.binding).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source SDK snapshot first error={_error:?}"));
+            })?;
             let source = if let Some((binding, target)) = effect {
                 if captured.binding != binding {
+                    #[cfg(test)]
+                    trace_observe("C Source row effect binding comparison: Conflict");
                     return Err(Error::Conflict);
                 }
                 super::row_effect_source_comparison(
@@ -3810,26 +3924,91 @@ pub(crate) mod native {
                     &snapshot,
                 )
             }
-            .map_err(denied)?;
+            .map_err(|_error| {
+                #[cfg(test)]
+                trace_observe(&format!("C Source ready/row comparison error={_error:?}"));
+                denied(_error)
+            })?;
             let after = self
                 .originals
                 .observe_all(&self.scope.context)
-                .map_err(denied)?;
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source original inventory second error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
             let captured_after = self
                 .address
                 .read(
                     &self.scope.context.intent.scope,
                     self.scope.context.provenance.network_epoch,
                 )
-                .map_err(denied)?;
-            if all != after
-                || captured.binding != captured_after.binding
-                || captured.captured != captured_after.captured
-                || (members.clone(), history.clone())
-                    != self.members_with_history(&all.originals[0].identity)?
-                || snapshot != source_sdk_snapshot(captured.binding)?
-                || before != self.revision()?
-            {
+                .map_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!(
+                        "C Source captured address second read error={_error:?}"
+                    ));
+                    denied(_error)
+                })?;
+            if {
+                let changed = all != after;
+                #[cfg(test)]
+                if changed {
+                    trace_observe("C Source post comparison original inventory changed");
+                }
+                changed
+            } || {
+                let changed = captured.binding != captured_after.binding;
+                #[cfg(test)]
+                if changed {
+                    trace_observe("C Source post comparison captured binding changed");
+                }
+                changed
+            } || {
+                let changed = captured.captured != captured_after.captured;
+                #[cfg(test)]
+                if changed {
+                    trace_observe("C Source post comparison captured rows changed");
+                }
+                changed
+            } || {
+                let changed = (members.clone(), history.clone())
+                    != self.members_with_history(&all.originals[0].identity)?;
+                #[cfg(test)]
+                if changed {
+                    trace_observe("C Source post comparison member/history changed");
+                }
+                changed
+            } || {
+                let after = source_sdk_snapshot(captured.binding).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_observe(&format!("C Source SDK snapshot second error={_error:?}"));
+                })?;
+                let changed = snapshot != after;
+                #[cfg(test)]
+                if changed {
+                    trace_observe(&format!(
+                            "C Source post comparison SDK rows changed owned_equal={} interface_key_equal={} interface_policy_equal={} address_presence_equal={} interface_observed_before={:?} interface_observed_after={:?} address_observed_before={:?} address_observed_after={:?}",
+                            rows::same_owned(&snapshot, &after),
+                            snapshot.interface.key == after.interface.key,
+                            snapshot.interface.policy == after.interface.policy,
+                            snapshot.address.is_some() == after.address.is_some(),
+                            snapshot.interface.observed, after.interface.observed,
+                            snapshot.address.as_ref().map(|row| &row.observed),
+                            after.address.as_ref().map(|row| &row.observed),
+                        ));
+                }
+                changed
+            } || {
+                let changed = before != self.revision()?;
+                #[cfg(test)]
+                if changed {
+                    trace_observe("C Source post comparison protected revision changed");
+                }
+                changed
+            } {
                 return Err(Error::Conflict);
             }
             Ok(SourceSample {

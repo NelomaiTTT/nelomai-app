@@ -5660,32 +5660,68 @@ pub(crate) mod native {
             expected: &pair::Record,
             effect: pair::Effect,
         ) -> Result<()> {
+            #[cfg(test)]
+            trace_step("bootstrap attest entered");
             if effect != pair::Effect::CarrierReady {
                 return Err(Error::Conflict);
             }
             let supervisor = self.supervisor.clone();
             let context = self.context.clone();
             supervisor.run_intent(&context, original, expected, effect, || {
-                self.continuity(original, expected)?;
+                self.continuity(original, expected).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("bootstrap attest entry continuity error={_error:?}"));
+                })?;
+                #[cfg(test)]
+                trace_step("bootstrap attest entry continuity accepted");
                 if expected.phase != pair::Phase::Starting || expected.carrier.is_some() {
+                    #[cfg(test)]
+                    trace_step("bootstrap attest expected Starting/unpublished comparison: Conflict");
                     return Err(Error::Conflict);
                 }
                 if let Some(proof) = self.proof {
+                    #[cfg(test)]
+                    trace_step("bootstrap attest entering source read");
                     self.pins
                         .as_ref()
-                        .ok_or(Error::Pending)?
+                        .ok_or(Error::Pending)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            trace_step("bootstrap attest missing source pins: Pending");
+                        })?
                         .source
                         .inspect_bindings(|bindings| {
                             if bindings.carrier.as_ref().map(|c| c.identity.proof) != Some(proof) {
+                                #[cfg(test)]
+                                trace_step(&format!("bootstrap attest proof comparison: Conflict carrier_present={}", bindings.carrier.is_some()));
                                 return Err(crate::windows::member_carrier_wintun::Error::Conflict);
                             }
+                            #[cfg(test)]
+                            trace_step("bootstrap attest proof comparison accepted");
                             Ok(())
                         })
-                        .map_err(|_| Error::Conflict)?;
+                        .map_err(|_error| {
+                            #[cfg(test)]
+                            trace_step(&format!("bootstrap attest source read error={_error:?}"));
+                            Error::Conflict
+                        })?;
+                    #[cfg(test)]
+                    trace_step("bootstrap attest source read accepted");
                 } else if self.create_attempted {
+                    #[cfg(test)]
+                    trace_step("bootstrap attest missing created proof: Retired");
                     return Err(Error::Retired);
                 }
-                self.continuity(original, expected)
+                self.continuity(original, expected).inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!("bootstrap attest post continuity error={_error:?}"));
+                })?;
+                #[cfg(test)]
+                trace_step("bootstrap attest post continuity accepted");
+                Ok(())
+            }).inspect_err(|_error| {
+                #[cfg(test)]
+                trace_step(&format!("bootstrap attest run_intent error={_error:?}"));
             })
         }
         fn cleanup_pregraph_carrier(
