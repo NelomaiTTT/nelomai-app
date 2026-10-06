@@ -920,8 +920,9 @@ mod native {
     }
     /// Original read-only OS handles, not authenticated metadata or authority.
     /// Caller MUST fully authenticate the whole inventory after acquisition
-    /// while retaining this object. Each use checks actual original/path IDs,
-    /// length, links, reparse facts and security inside one ancestor bracket.
+    /// while retaining this object. Explicit verification checks original/path
+    /// IDs, length, links, reparse facts and security in one ancestor bracket;
+    /// retaining the handles excludes byte mutation until this object drops.
     pub(crate) struct PinnedInstalledFiles {
         directories: PinnedDirectory,
         files: Vec<InstalledFile>,

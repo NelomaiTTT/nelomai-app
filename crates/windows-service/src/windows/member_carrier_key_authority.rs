@@ -263,9 +263,9 @@ impl Runtime {
     }
     fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         self.verify_original_context(pin, context)?;
-        // Full signed byte proof survives only with SAME deny-write/delete OS
-        // handles. Recheck every original/path/security inside ancestor fences;
-        // mutable runtime/context/lease/boot still have independent postflight.
+        // Full signed immutable-byte proof survives only with SAME retained
+        // deny-write/delete OS handles. Original owner/root/executable checks
+        // remain current; context/lease/boot have independent postflight.
         self.installed.verify()?;
         let live = self.installed.layout();
         if live.identity != self.identity

@@ -123,12 +123,16 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             .lines()
             .filter(|line| line.contains("source begin installed payload authentication"))
             .count();
-        let pin_rechecks = stderr
+        let lifetime_rechecks = stderr
             .lines()
-            .filter(|line| line.contains("installation original pin recheck"))
+            .filter(|line| line.contains("installation lifetime recheck"))
+            .count();
+        let final_inventory_rechecks = stderr
+            .lines()
+            .filter(|line| line.contains("installation final inventory recheck"))
             .count();
         println!(
-            "actual native factory cost case={case} runtime_full_auth_attempts={runtime_auth} source_full_auth_attempts={source_auth} installed_pin_recheck_attempts={pin_rechecks} elapsed_ms={}",
+            "actual native factory cost case={case} runtime_full_auth_attempts={runtime_auth} source_full_auth_attempts={source_auth} installed_lifetime_recheck_attempts={lifetime_rechecks} installed_final_inventory_recheck_attempts={final_inventory_rechecks} elapsed_ms={}",
             elapsed.as_millis()
         );
         assert!(
@@ -151,7 +155,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 && !line.contains("runtime end installed payload authentication")
                 && !line.contains("source begin installed payload authentication")
                 && !line.contains("source end installed payload authentication")
-                && !line.contains("installation original pin recheck")
+                && !line.contains("installation lifetime recheck")
         }) {
             println!("{line}");
         }

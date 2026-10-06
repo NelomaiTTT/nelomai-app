@@ -92,8 +92,10 @@ pub(crate) mod native {
     }
 
     /// Complete installed byte proof coupled to SAME original deny-write/delete
-    /// handles. Only construction authenticates signatures/hashes; every later
-    /// use rechecks actual originals, paths/security, owner and private root.
+    /// handles. Construction authenticates signatures/hashes and rechecks the
+    /// complete inventory while every original handle is held. Those handles
+    /// exclude byte mutation for this object's lifetime; later uses recheck
+    /// the original owner/private root and executable binding.
     /// This grants no module mapping, mutable-context or effect authority.
     pub(in crate::windows) struct PinnedInstalledRuntime {
         layout: VerifiedLayout,
@@ -253,6 +255,12 @@ pub(crate) mod native {
                 root,
                 files,
             };
+            // Check all original/path/security/ancestor facts AFTER the final
+            // authentication. Retaining these same read-only handles keeps its
+            // immutable-byte proof alive; no later inventory rescan is needed.
+            #[cfg(test)]
+            trace_step("installation final inventory recheck");
+            pinned.files.verify().map_err(|_| Error::Conflict)?;
             pinned.verify()?;
             Ok(pinned)
         }
@@ -262,13 +270,12 @@ pub(crate) mod native {
         pub(in crate::windows) fn verify(&self) -> Result<()> {
             #[cfg(test)]
             super::super::member_carrier_factory_test_os::trace_step(
-                "installation original pin recheck",
+                "installation lifetime recheck",
             );
             self.owner
                 .verify_at(&self.root_path.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
             self.root.verify().map_err(|_| Error::Conflict)?;
-            self.files.verify().map_err(|_| Error::Conflict)?;
             if std::fs::canonicalize(self.layout.engine_path()).map_err(|_| Error::Native)?
                 != self.executable
             {
@@ -790,13 +797,24 @@ pub(crate) mod native {
                 expected
             );
             for path in &expected {
+                pinned
+                    .verify()
+                    .expect("ongoing verifier retains the same immutable proof");
                 assert!(std::fs::OpenOptions::new().write(true).open(path).is_err());
                 assert!(std::fs::rename(path, path.with_extension("renamed")).is_err());
                 assert!(std::fs::remove_file(path).is_err());
+                pinned
+                    .verify()
+                    .expect("failed mutations must preserve the pinned proof");
             }
             let pointer = root.join(d::POINTER_NAME);
             drop(pinned);
             let bytes = std::fs::read(&pointer).unwrap();
+            std::fs::write(&pointer, &bytes).unwrap();
+            let renamed = pointer.with_extension("renamed");
+            std::fs::rename(&pointer, &renamed).unwrap();
+            std::fs::rename(&renamed, &pointer).unwrap();
+            std::fs::remove_file(&pointer).unwrap();
             std::fs::write(pointer, bytes).unwrap();
         }
 
