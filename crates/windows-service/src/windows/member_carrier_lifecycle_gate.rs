@@ -9,18 +9,9 @@ use crate::{
 };
 use std::{cell::Cell, io};
 
-#[track_caller]
 fn conflict() -> io::Error {
-    #[cfg(all(test, windows))]
-    if crate::windows::member_carrier_factory_test_os::state().is_some() {
-        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-            "lifecycle conflict caller={}",
-            std::panic::Location::caller()
-        ));
-    }
     io::Error::other("carrier_lifecycle_gate_conflict")
 }
-#[track_caller]
 fn denied<E>(_: E) -> io::Error {
     conflict()
 }
@@ -139,9 +130,7 @@ fn compare_row_stage(
             || (role == rows::Role::Carrier
                 && target == &rows::Target::Delete
                 && record.network.is_none()
-                && record.guard
-                    == policy::Model::empty(record.scope.clone())
-                        .map_err(|error| denied(error))?))
+                && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?))
     {
         return Err(conflict());
     }
@@ -267,8 +256,8 @@ fn compare_full_empty_row(
     Ok(())
 }
 fn compare_guard_blocks(record: &pair::Record, observed: &policy::Snapshot) -> io::Result<()> {
-    record.guard.validate().map_err(|error| denied(error))?;
-    let empty = policy::Model::empty(record.scope.clone()).map_err(|error| denied(error))?;
+    record.guard.validate().map_err(denied)?;
+    let empty = policy::Model::empty(record.scope.clone()).map_err(denied)?;
     if record.guard == empty
         && observed == &empty.expected
         && record.pending_guard.is_none()
@@ -315,7 +304,7 @@ fn compare_guard_blocks(record: &pair::Record, observed: &policy::Snapshot) -> i
                 .owner
                 .proof
                 .or(member.owner.retired_proof)
-                .ok_or_else(|| conflict())?;
+                .ok_or_else(conflict)?;
             if record.guard.members[i]
                 .as_ref()
                 .is_none_or(|m| m.identity.proof != proof.interface)
@@ -333,19 +322,16 @@ fn compare_row_binding(
 ) -> io::Result<()> {
     let i = role_index(binding.role);
     let proof = if i == 0 {
-        record.carrier.ok_or_else(|| conflict())?
+        record.carrier.ok_or_else(conflict)?
     } else {
-        let owner = &record.members[i - 1]
-            .as_ref()
-            .ok_or_else(|| conflict())?
-            .owner;
+        let owner = &record.members[i - 1].as_ref().ok_or_else(conflict)?.owner;
         owner
             .proof
             .or(owner.retired_proof)
-            .ok_or_else(|| conflict())?
+            .ok_or_else(conflict)?
             .interface
     };
-    let network = record.addresses.first().ok_or_else(|| conflict())?;
+    let network = record.addresses.first().ok_or_else(conflict)?;
     if record.addresses.len() != 1 || network.prefix_len() != 32 {
         return Err(conflict());
     }
@@ -390,9 +376,9 @@ fn compare_row_effect(
 ) -> io::Result<()> {
     compare_row_stage(context, record, binding.role, target)?;
     compare_row_binding(context, record, binding)?;
-    ack.validate().map_err(|error| denied(error))?;
-    protected.validate().map_err(|error| denied(error))?;
-    let pending = ack.pending.as_ref().ok_or_else(|| conflict())?;
+    ack.validate().map_err(denied)?;
+    protected.validate().map_err(denied)?;
+    let pending = ack.pending.as_ref().ok_or_else(conflict)?;
     if ack != protected
         || &ack.binding != binding
         || &pending.target != target
@@ -424,7 +410,7 @@ fn compare_row_effect(
     } else {
         // Original RowOwner's non-importable ACK mirror is mandatory. JSON or a
         // matching SDK address with no successful own Create ACK cannot delete.
-        let created = ack.creation.as_ref().ok_or_else(|| conflict())?;
+        let created = ack.creation.as_ref().ok_or_else(conflict)?;
         if ack.baseline.address.is_some()
             || ack
                 .current
@@ -531,15 +517,12 @@ fn compare_closing_row_observation(
     compare_context(facts.context, facts.pair)?;
     let original = facts.original;
     compare_row_binding(facts.context, facts.pair, &original.binding)?;
-    original.binding.validate().map_err(|error| denied(error))?;
+    original.binding.validate().map_err(denied)?;
     original
         .baseline
         .validate(&original.binding)
-        .map_err(|error| denied(error))?;
-    facts
-        .actual
-        .validate(&original.binding)
-        .map_err(|error| denied(error))?;
+        .map_err(denied)?;
+    facts.actual.validate(&original.binding).map_err(denied)?;
     if facts.pair.phase != pair::Phase::Closing
         || facts.pair.active.is_some()
         || facts.pair.operation.is_some()
@@ -559,7 +542,7 @@ fn compare_closing_row_observation(
         return Err(conflict());
     }
     let check = |record: &rows::Record| -> io::Result<()> {
-        record.validate().map_err(|error| denied(error))?;
+        record.validate().map_err(denied)?;
         if record.binding != original.binding || record.baseline != original.baseline
             || record.current.interface.key != original.baseline.interface.key
             // Creation provenance is ONLY the actual last ACK. Attempts cannot
@@ -573,7 +556,7 @@ fn compare_closing_row_observation(
             match &pending.target {
                 rows::Target::Interface(policy) => {
                     rows::validate_interface_delta(&record.baseline.interface.policy, policy)
-                        .map_err(|error| denied(error))?;
+                        .map_err(denied)?;
                 }
                 rows::Target::Delete
                     if facts.pair.stop_stage == 6
@@ -592,7 +575,7 @@ fn compare_closing_row_observation(
     let state = if facts.acknowledged == facts.protected {
         ClosingRowWriteState::Acknowledged
     } else {
-        let (before, desired) = facts.attempt.ok_or_else(|| conflict())?;
+        let (before, desired) = facts.attempt.ok_or_else(conflict)?;
         check(before)?;
         check(desired)?;
         if before.revision < facts.acknowledged.revision
@@ -920,15 +903,7 @@ pub(crate) mod native {
         },
     };
 
-    #[track_caller]
     fn native_denied<E>(_: E) -> wintun::Error {
-        #[cfg(test)]
-        if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                "lifecycle native_denied caller={}",
-                std::panic::Location::caller()
-            ));
-        }
         wintun::Error::Conflict
     }
     // No strong owner here: Source owns member authorities which own G. The
@@ -1821,7 +1796,7 @@ pub(crate) mod native {
     }
     impl<A: WindowBindingAttestor> Shared<A> {
         fn verify_capture_origin(&self, selected: &MemberCapture) -> io::Result<()> {
-            let pair = selected.pair.upgrade().ok_or_else(|| conflict())?;
+            let pair = selected.pair.upgrade().ok_or_else(conflict)?;
             let replacement = match &selected.origin {
                 CaptureOrigin::Replacement {
                     token,
@@ -1830,30 +1805,30 @@ pub(crate) mod native {
                 } => {
                     token
                         .upgrade()
-                        .ok_or_else(|| conflict())?
+                        .ok_or_else(conflict)?
                         .verify_lifecycle_origin(
                             &self.rows.read()?,
-                            &old_pin.upgrade().ok_or_else(|| conflict())?,
-                            &old_seal.upgrade().ok_or_else(|| conflict())?,
+                            &old_pin.upgrade().ok_or_else(conflict)?,
+                            &old_seal.upgrade().ok_or_else(conflict)?,
                             &pair,
                             &selected.record,
                             &selected.binding,
                         )
-                        .map_err(|error| denied(error))?;
+                        .map_err(denied)?;
                     true
                 }
                 CaptureOrigin::Initial { started, never } => {
-                    let started = started.upgrade().ok_or_else(|| conflict())?;
+                    let started = started.upgrade().ok_or_else(conflict)?;
                     started
                         .verify_initial_original(
-                            &never.upgrade().ok_or_else(|| conflict())?,
+                            &never.upgrade().ok_or_else(conflict)?,
                             &self.runtime,
                             &self.context,
                         )
-                        .map_err(|error| denied(error))?;
+                        .map_err(denied)?;
                     started
                         .verify_source(&self.source.read()?)
-                        .map_err(|error| denied(error))?;
+                        .map_err(denied)?;
                     let i = role_index(selected.binding.role);
                     if i == 0
                         || started.slot()
@@ -1865,7 +1840,7 @@ pub(crate) mod native {
                         || selected.record.members[i - 1]
                             .as_ref()
                             .and_then(|m| m.owner.proof)
-                            != Some(started.proof().map_err(|error| denied(error))?)
+                            != Some(started.proof().map_err(denied)?)
                     {
                         return Err(conflict());
                     }
@@ -1888,9 +1863,9 @@ pub(crate) mod native {
             match &selected.origin {
                 CaptureOrigin::Replacement { token, .. } => token
                     .upgrade()
-                    .ok_or_else(|| conflict())?
+                    .ok_or_else(conflict)?
                     .verify_lifecycle_pin(&self.rows.read()?, pin)
-                    .map_err(|error| denied(error)),
+                    .map_err(denied),
                 CaptureOrigin::Initial { .. } => {
                     self.verify_capture_origin(selected)?;
                     if !self
@@ -1953,9 +1928,9 @@ pub(crate) mod native {
             let guard = self.guard.read()?;
             let snapshot = guard
                 .try_borrow_mut()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .snapshot_in_window(window)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             if snapshot != selected.record.guard.expected
                 || snapshot
                     .filters
@@ -1971,7 +1946,7 @@ pub(crate) mod native {
             let selected = self
                 .member_captures
                 .try_borrow()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .iter()
                 .rev()
                 .find(|s| !s.complete.get())
@@ -1993,9 +1968,7 @@ pub(crate) mod native {
                     .as_ref()
                     .is_some_and(|m| m.owner.phase == crate::member_owner::Phase::Running)
                 {
-                    let row = self
-                        .captured_row(slot + 1, false)?
-                        .ok_or_else(|| conflict())?;
+                    let row = self.captured_row(slot + 1, false)?.ok_or_else(conflict)?;
                     compare_row_binding(&self.context, record, &row.binding)?;
                 }
             }
@@ -2009,7 +1982,7 @@ pub(crate) mod native {
             if !self.row_generations[i]
                 .generations
                 .try_borrow()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .is_empty()
             {
                 return self.row_generations[i].read(cleanup);
@@ -2018,38 +1991,32 @@ pub(crate) mod native {
                 self.row_pins[i].read()?,
                 self.captured[i]
                     .try_borrow()
-                    .map_err(|error| denied(error))?
+                    .map_err(denied)?
                     .as_ref()
                     .cloned()
-                    .ok_or_else(|| conflict())?,
+                    .ok_or_else(conflict)?,
             ))
         }
         fn captured_row(&self, i: usize, cleanup: bool) -> io::Result<Option<CapturedRow>> {
             if !self.row_generations[i]
                 .generations
                 .try_borrow()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .is_empty()
             {
                 return self.row_generations[i]
                     .read(cleanup)
                     .map(|(_, row)| Some(row));
             }
-            Ok(self.captured[i]
-                .try_borrow()
-                .map_err(|error| denied(error))?
-                .clone())
+            Ok(self.captured[i].try_borrow().map_err(denied)?.clone())
         }
         fn continuity(&self, cleanup: bool) -> io::Result<()> {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             if !cleanup
                 && (self.cancelled.load(Ordering::Acquire)
-                    || !self
-                        .runtime
-                        .fresh(&self.context)
-                        .map_err(|error| denied(error))?
+                    || !self.runtime.fresh(&self.context).map_err(denied)?
                     || self.closing.attempted.get()
                     || self.retired.attempted.get())
             {
@@ -2058,10 +2025,10 @@ pub(crate) mod native {
             Ok(())
         }
         fn selected(&self) -> io::Result<(Rc<NativePairIntentRead>, pair::Record)> {
-            let selected = self.selected.try_borrow().map_err(|error| denied(error))?;
-            let selected = selected.as_ref().ok_or_else(|| conflict())?;
+            let selected = self.selected.try_borrow().map_err(denied)?;
+            let selected = selected.as_ref().ok_or_else(conflict)?;
             Ok((
-                selected.pin.upgrade().ok_or_else(|| conflict())?,
+                selected.pin.upgrade().ok_or_else(conflict)?,
                 selected.record.clone(),
             ))
         }
@@ -2101,10 +2068,7 @@ pub(crate) mod native {
             if !pin.matches_runtime(&self.runtime) {
                 return Err(conflict());
             }
-            let mut selected = self
-                .selected
-                .try_borrow_mut()
-                .map_err(|error| denied(error))?;
+            let mut selected = self.selected.try_borrow_mut().map_err(denied)?;
             if selected.as_ref().is_some_and(|old| {
                 record.revision < old.record.revision
                     || (record.revision == old.record.revision
@@ -2139,17 +2103,17 @@ pub(crate) mod native {
             self.image
                 .read()?
                 .verify_runtime(&self.runtime)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             self.members
                 .read()?
                 .matches_original_runtime_image(&self.runtime, self.image.read()?.as_ref())
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             let bytes = self
                 .runtime
                 .record(&self.context, RecordKind::NativeCarrierReceipts)
-                .map_err(|error| denied(error))?;
-            let native = crate::member_carrier_native_ownership::Record::decode(&bytes)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
+            let native =
+                crate::member_carrier_native_ownership::Record::decode(&bytes).map_err(denied)?;
             if native.context != self.context
                 || native.generation < scope.generation
                 || scope.generation == 0
@@ -2271,15 +2235,14 @@ pub(crate) mod native {
                             let bytes = self
                                 .runtime
                                 .record(&self.context, kind)
-                                .map_err(|error| native_denied(error))?;
-                            let protected = rows::Record::decode(&bytes)
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
+                            let protected = rows::Record::decode(&bytes).map_err(native_denied)?;
                             if let Some(history) = closed {
                                 // Typed Stop history/full absence ONLY. Never use an
                                 // attempt as Stopped ACK and never query its old NIC.
                                 let provider = history
                                     .comparison_provider(&self.context)
-                                    .map_err(|error| native_denied(error))?;
+                                    .map_err(native_denied)?;
                                 if provider.identity.guid != baseline.binding.guid
                                     || provider.identity.index != baseline.binding.key.index
                                     || provider.identity.luid != baseline.binding.key.luid
@@ -2293,10 +2256,10 @@ pub(crate) mod native {
                                     &baseline.baseline,
                                     ack.acknowledged,
                                 )
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
                             } else {
                                 let actual = read_original_snapshot(&baseline.binding)
-                                    .map_err(|error| native_denied(error))?;
+                                    .map_err(native_denied)?;
                                 if ack.acknowledged == &protected {
                                     compare_closing_row_observation(ClosingRowObservation {
                                         context: &self.context,
@@ -2307,7 +2270,7 @@ pub(crate) mod native {
                                         actual: &actual,
                                         attempt: None,
                                     })
-                                    .map_err(|error| native_denied(error))?;
+                                    .map_err(native_denied)?;
                                 } else {
                                     pin.with_cleanup_write_attempt(
                                         &record.scope,
@@ -2348,10 +2311,10 @@ pub(crate) mod native {
                                             Ok(())
                                         },
                                     )
-                                    .map_err(|error| native_denied(error))?;
+                                    .map_err(native_denied)?;
                                 }
                                 if read_original_snapshot(&baseline.binding)
-                                    .map_err(|error| native_denied(error))?
+                                    .map_err(native_denied)?
                                     != actual
                                 {
                                     return Err(wintun::Error::Conflict);
@@ -2360,7 +2323,7 @@ pub(crate) mod native {
                             if self
                                 .runtime
                                 .record(&self.context, kind)
-                                .map_err(|error| native_denied(error))?
+                                .map_err(native_denied)?
                                 != bytes
                             {
                                 return Err(wintun::Error::Conflict);
@@ -2369,7 +2332,7 @@ pub(crate) mod native {
                         })
                         .map_err(|_| rows::Error::Conflict)
                 })
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             }
             self.current(record)
         }
@@ -2402,23 +2365,20 @@ pub(crate) mod native {
                         let before = self
                             .runtime
                             .record(&self.context, kind)
-                            .map_err(|error| native_denied(error))?;
-                        let protected =
-                            rows::Record::decode(&before).map_err(|error| native_denied(error))?;
-                        let observed = read_original_snapshot(facts.binding)
-                            .map_err(|error| native_denied(error))?;
+                            .map_err(native_denied)?;
+                        let protected = rows::Record::decode(&before).map_err(native_denied)?;
+                        let observed =
+                            read_original_snapshot(facts.binding).map_err(native_denied)?;
                         if &protected != facts.acknowledged || protected.binding != *facts.binding {
                             return Err(wintun::Error::Conflict);
                         }
-                        let result = callback(facts.acknowledged, &observed)
-                            .map_err(|error| native_denied(error));
+                        let result = callback(facts.acknowledged, &observed).map_err(native_denied);
                         if self
                             .runtime
                             .record(&self.context, kind)
-                            .map_err(|error| native_denied(error))?
+                            .map_err(native_denied)?
                             != before
-                            || read_original_snapshot(facts.binding)
-                                .map_err(|error| native_denied(error))?
+                            || read_original_snapshot(facts.binding).map_err(native_denied)?
                                 != observed
                         {
                             return Err(wintun::Error::Conflict);
@@ -2440,7 +2400,7 @@ pub(crate) mod native {
                     call,
                 )
             }
-            .map_err(|error| denied(error))
+            .map_err(denied)
         }
         fn blocks(
             &self,
@@ -2451,9 +2411,9 @@ pub(crate) mod native {
             let guard = self.guard.read()?;
             let snapshot = guard
                 .try_borrow_mut()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .snapshot_in_window(window)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             compare_guard_blocks(record, &snapshot)?;
             self.current(record)?;
             Ok(snapshot)
@@ -2503,9 +2463,7 @@ pub(crate) mod native {
                     continue;
                 };
                 if let Some(history) = closed {
-                    let provider = history
-                        .comparison_provider(&self.context)
-                        .map_err(|error| denied(error))?;
+                    let provider = history.comparison_provider(&self.context).map_err(denied)?;
                     if provider.identity.guid != captured.binding.guid
                         || provider.identity.index != captured.binding.key.index
                         || provider.identity.luid != captured.binding.key.luid
@@ -2517,7 +2475,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 let compare = |ack: &rows::Record| {
-                    ack.validate().map_err(|error| denied(error))?;
+                    ack.validate().map_err(denied)?;
                     if ack.binding != captured.binding
                         || ack.baseline != captured.baseline
                         || ack.pending.is_some()
@@ -2585,7 +2543,7 @@ pub(crate) mod native {
                             Ok(())
                         },
                     )
-                    .map_err(|error| denied(error))?;
+                    .map_err(denied)?;
                 } else {
                     self.row_ack(window, role, cleanup, |ack, actual| {
                         compare(ack)?;
@@ -2638,21 +2596,18 @@ pub(crate) mod native {
             self.current(record)
         }
         fn probes_retired_origin(&self, require_retired: bool) -> io::Result<()> {
-            let weak = self
-                .probe_inventory
-                .try_borrow()
-                .map_err(|error| denied(error))?;
+            let weak = self.probe_inventory.try_borrow().map_err(denied)?;
             let actual = weak
                 .as_ref()
-                .ok_or_else(|| conflict())?
+                .ok_or_else(conflict)?
                 .upgrade()
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             let state = self.probes.read()?;
             actual
                 .matches_caps(&self.source.read()?, &self.guard.read()?, &state.gate())
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             if require_retired {
-                actual.inspect_retired().map_err(|error| denied(error))?;
+                actual.inspect_retired().map_err(denied)?;
             }
             Ok(())
         }
@@ -2663,7 +2618,7 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             let actual = originals
                 .observe_all_for_cleanup(&self.context)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             if actual.originals.len() != 1 || actual.originals[0].scope != *scope {
                 return Err(conflict());
             }
@@ -2712,7 +2667,7 @@ pub(crate) mod native {
                         Ok(())
                     },
                 )
-                .map_err(|error| denied(error))
+                .map_err(denied)
         }
     }
     impl<A: WindowBindingAttestor> FullNativeLifecycleGate<A> {
@@ -2734,21 +2689,19 @@ pub(crate) mod native {
             originals: &creators::Observer<OriginalWintun>,
         ) -> wintun::Result<()> {
             let shared = &self.shared;
-            let (_, record) = shared.selected().map_err(|error| native_denied(error))?;
+            let (_, record) = shared.selected().map_err(native_denied)?;
             let cleanup = record.phase == pair::Phase::Closing;
             shared
                 .fence
                 .run(cleanup, || {
                     compare_row_stage(&shared.context, &record, binding.role, target)?;
                     if !cleanup {
-                        self.session.live().map_err(|error| denied(error))?;
+                        self.session.live().map_err(denied)?;
                     }
                     shared.current(&record)?;
                     let registry = shared.registry(scope, originals, cleanup)?;
                     let verify = |window: &NativeBindingsWindow<'_>| {
-                        shared
-                            .window(&record, window)
-                            .map_err(|error| native_denied(error))?;
+                        shared.window(&record, window).map_err(native_denied)?;
                         let member_slot = match binding.role {
                             rows::Role::Carrier => None,
                             rows::Role::MemberA => {
@@ -2761,29 +2714,27 @@ pub(crate) mod native {
                         if member_slot.is_some_and(|slot| window.closed_member(slot).is_some()) {
                             return Err(wintun::Error::Conflict);
                         }
-                        let before = shared
-                            .blocks(&record, window)
-                            .map_err(|error| native_denied(error))?;
+                        let before = shared.blocks(&record, window).map_err(native_denied)?;
                         if cleanup {
                             shared
                                 .resources_restored(&record, window)
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
                         }
                         if target == &rows::Target::Delete {
                             shared
                                 .members_closed(scope, originals)
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
                         }
                         if cleanup {
                             // Factual unresolved sibling observations must not
                             // become effect ACKs for the selected target below.
                             shared
                                 .closing_rows_observe(&record, window)
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
                         } else {
                             shared
                                 .sibling_rows(&record, window, binding.role)
-                                .map_err(|error| native_denied(error))?;
+                                .map_err(native_denied)?;
                         }
                         shared
                             .row_ack(window, binding.role, cleanup, |ack, actual| {
@@ -2797,17 +2748,11 @@ pub(crate) mod native {
                                     actual,
                                 )
                             })
-                            .map_err(|error| native_denied(error))?;
-                        if shared
-                            .blocks(&record, window)
-                            .map_err(|error| native_denied(error))?
-                            != before
-                        {
+                            .map_err(native_denied)?;
+                        if shared.blocks(&record, window).map_err(native_denied)? != before {
                             return Err(wintun::Error::Conflict);
                         }
-                        shared
-                            .window(&record, window)
-                            .map_err(|error| native_denied(error))
+                        shared.window(&record, window).map_err(native_denied)
                     };
                     if cleanup {
                         shared.closing.read()?.inspect_window(verify)
@@ -2819,17 +2764,17 @@ pub(crate) mod native {
                     } else {
                         shared.source.read()?.inspect_window(verify)
                     }
-                    .map_err(|error| denied(error))?;
+                    .map_err(denied)?;
                     if registry != shared.registry(scope, originals, cleanup)? {
                         return Err(conflict());
                     }
                     shared.current(&record)?;
                     if !cleanup {
-                        self.session.live().map_err(|error| denied(error))?;
+                        self.session.live().map_err(denied)?;
                     }
                     Ok(())
                 })
-                .map_err(|error| native_denied(error))
+                .map_err(native_denied)
         }
         fn authorize_stage(
             &mut self,
@@ -3009,17 +2954,15 @@ pub(crate) mod native {
             let guard = self.guard.read()?;
             let before = guard
                 .try_borrow_mut()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .snapshot_in_retired_bracket(&original, record, retired, bindings)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             compare_guard_blocks(record, &before)?;
             self.rows
                 .read()?
                 .inspect_retired_in_bracket(retired, bindings, |facts| {
                     for i in 0..3 {
-                        let captured = self
-                            .captured_row(i, true)
-                            .map_err(|error| native_denied(error))?;
+                        let captured = self.captured_row(i, true).map_err(native_denied)?;
                         match (captured.as_ref(), facts.rows[i].as_ref()) {
                             (None, None) => (),
                             (Some(original), Some(actual))
@@ -3036,7 +2979,7 @@ pub(crate) mod native {
                     }
                     Ok(())
                 })
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             self.probes_retired_origin(true)?;
             let initial = self.baseline.read()?;
             if !initial.matches_source_origin(self.source.read()?.as_ref())
@@ -3049,9 +2992,9 @@ pub(crate) mod native {
                 .verify_lifecycle_retired_in_bracket(record, retired, bindings, &initial)?;
             let after = guard
                 .try_borrow_mut()
-                .map_err(|error| denied(error))?
+                .map_err(denied)?
                 .snapshot_in_retired_bracket(&original, record, retired, bindings)
-                .map_err(|error| denied(error))?;
+                .map_err(denied)?;
             if before != after {
                 return Err(conflict());
             }

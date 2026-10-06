@@ -1452,7 +1452,14 @@ pub(crate) mod native {
                 completed: false,
             };
             let root = &mut attempt.root;
-            let mut authority = root.rows_authority_in_call(current.clone(), expected)?;
+            let mut authority = root
+                .rows_authority_in_call(current.clone(), expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready change rows_authority error={_error:?}"
+                    ));
+                })?;
             let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
             current
                 .inspect_effect(
@@ -1462,14 +1469,32 @@ pub(crate) mod native {
                     expected.pending.ok_or(CarrierError::Pending)?,
                     |_| Ok(()),
                 )
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready change pair preflight error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             authority
                 .select_pair_intent(current.clone(), expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready change select_pair error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             root.rows
                 .as_mut()
                 .ok_or(CarrierError::Pending)?
                 .change_interface(policy)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready change RowOwner error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
             current
@@ -1480,6 +1505,12 @@ pub(crate) mod native {
                     expected.pending.ok_or(CarrierError::Pending)?,
                     |_| Ok(()),
                 )
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready change pair postflight error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             attempt.completed = true;
             Ok(())
@@ -1509,6 +1540,12 @@ pub(crate) mod native {
                     expected.stop_stage,
                     |_| Ok(()),
                 )
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore pair preflight error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             // Cold C may exist before Source/full-G publication. Select its
             // SAME original cleanup scope and freshly authenticate its live
@@ -1523,8 +1560,22 @@ pub(crate) mod native {
                 .ok_or(CarrierError::Pending)?;
             authority
                 .select_pair_intent(current.clone(), expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore select_pair original error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
-            let binding = authority.binding().map_err(denied)?;
+            let binding = authority
+                .binding()
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore binding error={_error:?}"
+                    ));
+                })
+                .map_err(denied)?;
             root.proof = Some(InterfaceProof {
                 guid: binding.guid,
                 index: binding.key.index,
@@ -1537,7 +1588,13 @@ pub(crate) mod native {
             {
                 return Err(CarrierError::Conflict);
             }
-            root.enter_rows_storage_cleanup_in_call(&current, expected)?;
+            root.enter_rows_storage_cleanup_in_call(&current, expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore storage error={_error:?}"
+                    ));
+                })?;
             let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
             let construction = root.construction.as_mut().ok_or(CarrierError::Pending)?;
             construction.revoke_forward();
@@ -1548,6 +1605,12 @@ pub(crate) mod native {
                 .ok_or(CarrierError::Pending)?;
             authority
                 .select_pair_intent(current.clone(), expected)
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore select_pair retained error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             let row_original = root.original_rows.as_ref().ok_or(CarrierError::Pending)?;
             with_retained_or_partial(
@@ -1555,10 +1618,29 @@ pub(crate) mod native {
                 &mut root.row_capture,
                 |capture| capture.owner_mut().map_err(denied),
                 |owner| {
-                    verify_row_owner_original(owner, row_original)?;
-                    owner.restore_interface_for_cleanup().map_err(denied)
+                    verify_row_owner_original(owner, row_original).inspect_err(|_error| {
+                        #[cfg(test)]
+                        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                            "ready restore original owner error={_error:?}"
+                        ));
+                    })?;
+                    owner
+                        .restore_interface_for_cleanup()
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                "ready restore RowOwner error={_error:?}"
+                            ));
+                        })
+                        .map_err(denied)
                 },
-            )?;
+            )
+            .inspect_err(|_error| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                    "ready restore retained row slot error={_error:?}"
+                ));
+            })?;
             current
                 .inspect_cleanup_effect(
                     &meta.runtime,
@@ -1567,6 +1649,12 @@ pub(crate) mod native {
                     expected.stop_stage,
                     |_| Ok(()),
                 )
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "ready restore pair postflight error={_error:?}"
+                    ));
+                })
                 .map_err(denied)?;
             attempt.completed = true;
             Ok(())

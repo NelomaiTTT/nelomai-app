@@ -1411,37 +1411,88 @@ fn read<C: OriginalCreator, K: Kernel>(
     kernel: &mut K,
     binding: &Binding,
 ) -> Result<Snapshot> {
-    let before_challenge = challenge()?;
-    let live = creator.query(&binding.scope, binding.role, before_challenge)?;
+    let before_challenge = challenge().inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read challenge error={_error:?}"));
+    })?;
+    let live = creator
+        .query(&binding.scope, binding.role, before_challenge)
+        .inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows read creator before error={_error:?}"));
+        })?;
     if live.binding != *binding || live.challenge != before_challenge {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read creator before mismatch expected={binding:?} actual={:?} challenge expected={before_challenge} actual={}", live.binding, live.challenge));
         return Err(Error::Conflict);
     }
-    let id = kernel.identity(binding.key)?;
+    let id = kernel.identity(binding.key).inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read identity error={_error:?}"));
+    })?;
     if id.key != binding.key
         || id.guid != binding.guid
         || id.name != binding.name
         || id.hardware
         || id.if_type != 53
     {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!(
+            "rows read identity mismatch binding={binding:?} actual={id:?}"
+        ));
         return Err(Error::Conflict);
     }
     let snapshot = Snapshot {
-        interface: decode_interface(&kernel.interface(binding.key)?)?,
+        interface: decode_interface(&kernel.interface(binding.key).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows read interface SDK error={_error:?}"));
+        })?)
+        .inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows read decode interface error={_error:?}"));
+        })?,
         address: kernel
-            .address(binding.key, binding.address)?
+            .address(binding.key, binding.address)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows read address SDK error={_error:?}"));
+            })?
             .as_ref()
             .map(decode_address)
-            .transpose()?,
+            .transpose()
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows read decode address error={_error:?}"));
+            })?,
     };
-    snapshot.validate(binding)?;
+    snapshot.validate(binding).inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read snapshot validation error={_error:?}"));
+    })?;
     // The lock serializes our owners, not PnP or the OS. Requery after native
     // reads so stale pre-row context/identity cannot authorize their result.
-    let after_challenge = challenge()?;
-    let after = creator.query(&binding.scope, binding.role, after_challenge)?;
-    if after.binding != *binding
-        || after.challenge != after_challenge
-        || kernel.identity(binding.key)? != id
-    {
+    let after_challenge = challenge().inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read challenge error={_error:?}"));
+    })?;
+    let after = creator
+        .query(&binding.scope, binding.role, after_challenge)
+        .inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows read creator after error={_error:?}"));
+        })?;
+    if after.binding != *binding || after.challenge != after_challenge {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read creator after mismatch expected={binding:?} actual={:?} challenge expected={after_challenge} actual={}", after.binding, after.challenge));
+        return Err(Error::Conflict);
+    }
+    let after_id = kernel.identity(binding.key).inspect_err(|_error| {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read identity after error={_error:?}"));
+    })?;
+    if after_id != id {
+        #[cfg(all(test, windows))]
+        trace_observe(&format!("rows read identity after mismatch binding={binding:?} before={id:?} after={after_id:?}"));
         return Err(Error::Conflict);
     }
     Ok(snapshot)
@@ -1930,10 +1981,19 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
     }
     pub(crate) fn change_interface(&mut self, desired: InterfacePolicy) -> Result<()> {
         if self.state.failed || self.state.record.phase != Phase::Captured {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows change unavailable failed={} phase={:?}",
+                self.state.failed, self.state.record.phase
+            ));
             return Err(Error::Retired);
         }
         self.run(|state, creator| {
-            validate_interface_delta(&state.record.current.interface.policy, &desired)?;
+            validate_interface_delta(&state.record.current.interface.policy, &desired)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows change interface delta error={_error:?}"));
+                })?;
             state.mutate(creator, Target::Interface(desired))
         })
     }
@@ -1959,12 +2019,28 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
         self.state.read_pin_revoked.set(true);
         self.state.record_receipt.revoked.set(true);
         self.run(|state, creator| {
-            state.require_cleanup_durable(creator)?;
+            state
+                .require_cleanup_durable(creator)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows restore cleanup durable error={_error:?}"));
+                })?;
             if state.record.pending.is_some() {
-                state.resolve(creator)?;
+                state.resolve(creator).inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows restore resolve pending error={_error:?}"));
+                })?;
             }
-            let live = read(creator, &mut state.kernel, &state.binding)?;
+            let live = read(creator, &mut state.kernel, &state.binding).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows restore read error={_error:?}"));
+            })?;
             if !same_owned(&live, &state.record.current) {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!(
+                    "rows restore before mismatch actual={live:?} current={:?}",
+                    state.record.current
+                ));
                 return Err(Error::Conflict);
             }
             if state.record.phase == Phase::Stopped {
@@ -1973,7 +2049,10 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
             if state.record.phase != Phase::Closing {
                 let mut closing = state.record.clone();
                 closing.phase = Phase::Closing;
-                state.persist(closing)?;
+                state.persist(closing).inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows restore persist Closing error={_error:?}"));
+                })?;
             }
             if state.record.current.interface.policy != state.record.baseline.interface.policy {
                 state.mutate(
@@ -1981,14 +2060,27 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
                     Target::Interface(state.record.baseline.interface.policy.clone()),
                 )?;
             }
-            let after = read(creator, &mut state.kernel, &state.binding)?;
+            let after = read(creator, &mut state.kernel, &state.binding).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows restore read error={_error:?}"));
+            })?;
             if !same_owned(&after, &state.record.current)
                 || after.interface.policy != state.record.baseline.interface.policy
                 || state.record.pending.is_some()
             {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!(
+                    "rows restore postflight mismatch actual={after:?} current={:?} baseline={:?} pending={:?}",
+                    state.record.current,
+                    state.record.baseline.interface.policy,
+                    state.record.pending
+                ));
                 return Err(Error::Conflict);
             }
-            state.require_durable()?;
+            state.require_durable().inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows restore final durable error={_error:?}"));
+            })?;
             Ok(())
         })
     }
@@ -2234,8 +2326,14 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
     }
     fn persist(&mut self, mut desired: Record) -> Result<()> {
         desired.revision = self.record.revision.checked_add(1).ok_or(Error::Retired)?;
-        desired.validate()?;
-        self.require_durable()?;
+        desired.validate().inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows persist desired validation error={_error:?}"));
+        })?;
+        self.require_durable().inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows persist original durable error={_error:?}"));
+        })?;
         let attempt = {
             let mut retained = self
                 .record_receipt
@@ -2259,12 +2357,27 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
         };
         let ack = self
             .journal
-            .compare_exchange(&self.binding, Some(&self.record), &desired);
+            .compare_exchange(&self.binding, Some(&self.record), &desired)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows persist CAS error={_error:?}"));
+            });
         if ack.is_err() {
             self.read_pin_revoked.set(true);
             self.record_receipt.revoked.set(true);
         }
-        if self.journal.load(&self.binding)?.as_ref() != Some(&desired) {
+        if self
+            .journal
+            .load(&self.binding)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows persist readback error={_error:?}"));
+            })?
+            .as_ref()
+            != Some(&desired)
+        {
+            #[cfg(all(test, windows))]
+            trace_observe("rows persist readback mismatch");
             return Err(Error::Journal);
         }
         if ack.is_ok() {
@@ -2328,11 +2441,22 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
         if desired.creation.is_none() {
             desired.creation = self.creation.as_ref().map(|receipt| receipt.row.clone());
         }
-        self.persist(desired)?;
+        self.persist(desired).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows confirm persist error={_error:?}"));
+        })?;
         // Durable confirmation itself is not native proof. Reattest/reconstruct
         // again after its exact reread before any caller receives success.
-        let after = read(creator, &mut self.kernel, &self.binding)?;
+        let after = read(creator, &mut self.kernel, &self.binding).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows confirm postread error={_error:?}"));
+        })?;
         if !same_owned(&after, &self.record.current) {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows confirm mismatch actual={after:?} current={:?}",
+                self.record.current
+            ));
             return Err(Error::Conflict);
         }
         Ok(())
@@ -2353,22 +2477,47 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
         Ok(())
     }
     fn mutate<C: OriginalCreator>(&mut self, creator: &mut C, target: Target) -> Result<()> {
-        self.require_durable()?;
+        self.require_durable().inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate pre-pending durable error={_error:?}"));
+        })?;
         if self.record.pending.is_some() {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows mutate pre-pending already pending target={target:?}"
+            ));
             return Err(Error::Pending);
         }
         // Reserve BOTH intent and confirmation before any native mutation.
         self.record.revision.checked_add(2).ok_or(Error::Retired)?;
-        let before = read(creator, &mut self.kernel, &self.binding)?;
+        let before = read(creator, &mut self.kernel, &self.binding).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate before error={_error:?}"));
+        })?;
         if !same_owned(&before, &self.record.current) {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows mutate before mismatch actual={before:?} current={:?}",
+                self.record.current
+            ));
             return Err(Error::Conflict);
         }
         match &target {
             Target::Interface(p) => {
-                validate_interface_delta(&before.interface.policy, p)?;
+                validate_interface_delta(&before.interface.policy, p).inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows mutate interface delta error={_error:?}"));
+                })?;
                 // Capability checked even before durable intent: ignored/unsupported fields
                 // cannot be normalized by the Initialize/Set path.
-                interface_input(MIB_IPINTERFACE_ROW::default(), self.binding.key, p)?;
+                interface_input(MIB_IPINTERFACE_ROW::default(), self.binding.key, p).inspect_err(
+                    |_error| {
+                        #[cfg(all(test, windows))]
+                        trace_observe(&format!(
+                            "rows mutate interface input pre-pending error={_error:?}"
+                        ));
+                    },
+                )?;
             }
             Target::Create(p) => {
                 p.validate_creation()?;
@@ -2394,29 +2543,60 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
             before,
             target: target.clone(),
         });
-        self.persist(desired)?;
-        creator.authorize(&self.binding, &target)?;
-        let exact = read(creator, &mut self.kernel, &self.binding)?;
+        self.persist(desired).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate persist pending error={_error:?}"));
+        })?;
+        creator
+            .authorize(&self.binding, &target)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                trace_observe(&format!("rows mutate authorize G error={_error:?}"));
+            })?;
+        let exact = read(creator, &mut self.kernel, &self.binding).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate pending-before error={_error:?}"));
+        })?;
         let pending = self.record.pending.clone().ok_or(Error::Pending)?;
         if !same_owned(&exact, &pending.before) {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows mutate pending-before mismatch actual={exact:?} before={:?}",
+                pending.before
+            ));
             return Err(Error::Conflict);
         }
         // Native/provider reads can be slow and can expose outside changes.
         // The exact protected pending revision must still be ours AFTER them,
         // not merely before authorization. A drift cannot reach the OS effect.
-        self.require_durable()?;
+        self.require_durable().inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate pre-SDK durable error={_error:?}"));
+        })?;
         let ack = match &target {
             Target::Interface(p) => {
                 let initialized = self.kernel.initialize_interface();
-                let mut row = interface_input(initialized, self.binding.key, p)?;
-                self.require_durable()?;
+                let mut row =
+                    interface_input(initialized, self.binding.key, p).inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        trace_observe(&format!("rows mutate interface input SDK error={_error:?}"));
+                    })?;
+                self.require_durable().inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!(
+                        "rows mutate interface SDK durable error={_error:?}"
+                    ));
+                })?;
                 self.record_receipt.native_effects_started.set(true);
                 self.kernel.set_interface(&mut row)
             }
             Target::Create(p) => {
                 let initialized = self.kernel.initialize_address();
                 let row = address_input(initialized, self.binding.key, p)?;
-                self.require_durable()?;
+                self.require_durable().inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows mutate create SDK durable error={_error:?}"));
+                })?;
                 self.record_receipt.native_effects_started.set(true);
                 self.kernel.create_address(&row)
             }
@@ -2425,11 +2605,20 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
                 let current = exact.address.as_ref().ok_or(Error::Conflict)?;
                 let initialized = self.kernel.initialize_address();
                 let row = address_input(initialized, self.binding.key, &current.policy)?;
-                self.require_durable()?;
+                self.require_durable().inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    trace_observe(&format!("rows mutate delete SDK durable error={_error:?}"));
+                })?;
                 self.record_receipt.native_effects_started.set(true);
                 self.kernel.delete_address(&row)
             }
-        };
+        }
+        .inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows mutate SDK target={target:?} error={_error:?}"
+            ));
+        });
         if ack.is_err() {
             self.read_pin_revoked.set(true);
             self.record_receipt.revoked.set(true);
@@ -2438,7 +2627,10 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
         if matches!(target, Target::Create(_)) && ack.is_err() {
             return Err(Error::Pending);
         }
-        let after = read(creator, &mut self.kernel, &self.binding)?;
+        let after = read(creator, &mut self.kernel, &self.binding).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows mutate postread error={_error:?}"));
+        })?;
         if let Target::Create(p) = &target {
             let row = after.address.as_ref().ok_or(Error::Pending)?;
             if row.policy != *p
@@ -2455,6 +2647,10 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
             }));
         }
         if !self.target_matches(&after, &pending) {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows mutate target mismatch actual={after:?} pending={pending:?}"
+            ));
             return Err(Error::Pending);
         }
         self.confirm(creator, after, false)
@@ -2469,8 +2665,15 @@ impl<K: Kernel, J: Journal> OwnedRows<K, J> {
         if matches!(pending.target, Target::Delete) {
             self.require_receipt()?;
         }
-        let live = read(creator, &mut self.kernel, &self.binding)?;
+        let live = read(creator, &mut self.kernel, &self.binding).inspect_err(|_error| {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!("rows resolve read error={_error:?}"));
+        })?;
         if !self.target_matches(&live, &pending) && !same_owned(&live, &pending.before) {
+            #[cfg(all(test, windows))]
+            trace_observe(&format!(
+                "rows resolve mismatch actual={live:?} pending={pending:?}"
+            ));
             return Err(Error::Conflict);
         }
         self.confirm(creator, live, true)
