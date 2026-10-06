@@ -8,7 +8,7 @@ use super::member_carrier_creator::CreatorRecord;
 use super::member_carrier_pair_store as carrier_pair_store;
 #[cfg(windows)]
 use super::member_files::{previous_config_valid, PrivateFile, PrivateRecords, SessionFileIo};
-use crate::member_carrier::{self as carrier, CarrierJournal, CarrierKey, Record as CarrierRecord};
+use crate::member_carrier::{self as carrier, Record as CarrierRecord};
 #[cfg(not(windows))]
 use crate::member_carrier_creator::CreatorRecord;
 use crate::member_carrier_guard as carrier_guard;
@@ -2970,142 +2970,6 @@ pub(crate) type WindowsSessionStore<F> = ProtectedStore<F, SessionSnapshot>;
 pub(crate) type WindowsPairStore<F> = ProtectedStore<F, PairRecord>;
 pub(crate) type WindowsNetworkStore<F> = ProtectedStore<F, NetworkJournal>;
 
-#[allow(dead_code)] // Unwired until native/factory gates are closed.
-pub(crate) struct WindowsCarrierStore<F> {
-    files: F,
-    scope: SessionScope,
-    key: CarrierKey,
-    cleanup_only: bool,
-    revoked: bool,
-}
-#[allow(dead_code)]
-impl<F: SessionFiles> WindowsCarrierStore<F> {
-    pub(crate) fn open(
-        mut files: F,
-        scope: SessionScope,
-    ) -> io::Result<(Self, Option<CarrierRecord>)> {
-        let key = carrier::carrier_key(&scope).map_err(|_| failed())?;
-        let (access, _, current) = carrier_snapshot(&mut files, &scope)?;
-        let cleanup_only = current.is_some() || !access.fresh;
-        Ok((
-            Self {
-                files,
-                scope,
-                key,
-                cleanup_only,
-                revoked: false,
-            },
-            current,
-        ))
-    }
-    fn require_key(&self, key: &CarrierKey) -> carrier::Result<()> {
-        if *key != self.key {
-            return Err(carrier::CarrierError::Conflict);
-        }
-        if self.revoked {
-            return Err(carrier::CarrierError::Journal);
-        }
-        Ok(())
-    }
-}
-impl<F: SessionFiles> CarrierJournal for WindowsCarrierStore<F> {
-    fn load(&mut self, key: &CarrierKey) -> carrier::Result<Option<CarrierRecord>> {
-        self.require_key(key)?;
-        let (access, _, current) = carrier_snapshot(&mut self.files, &self.scope)
-            .map_err(|_| carrier::CarrierError::Journal)?;
-        if !self.cleanup_only && !access.fresh {
-            return Err(carrier::CarrierError::Journal);
-        }
-        Ok(current)
-    }
-    fn compare_exchange(
-        &mut self,
-        key: &CarrierKey,
-        expected: Option<&CarrierRecord>,
-        desired: &CarrierRecord,
-    ) -> carrier::Result<()> {
-        self.require_key(key)?;
-        carrier::validate_record_shape(desired)?;
-        if desired.intent.scope != self.scope {
-            return Err(carrier::CarrierError::Conflict);
-        }
-        let (access, raw, current) = carrier_snapshot(&mut self.files, &self.scope)
-            .map_err(|_| carrier::CarrierError::Journal)?;
-        if !self.cleanup_only && !access.fresh {
-            return Err(carrier::CarrierError::Journal);
-        }
-        if current.as_ref() != expected {
-            return Err(carrier::CarrierError::Conflict);
-        }
-        authenticate_carrier(
-            desired,
-            &SessionIdentity {
-                boot_id: access.provenance.boot_id,
-                runtime: access.provenance.runtime.clone(),
-                scope: self.scope.clone(),
-            },
-            desired.provenance.network_epoch,
-        )
-        .map_err(|_| carrier::CarrierError::Conflict)?;
-        if desired.provenance.network_epoch > access.provenance.network_epoch
-            || (!self.cleanup_only
-                && !matches!(
-                    desired.phase,
-                    carrier::Phase::Closing | carrier::Phase::Stopped
-                )
-                && desired.provenance.network_epoch != access.provenance.network_epoch)
-        {
-            return Err(carrier::CarrierError::Conflict);
-        }
-        validate_carrier_transition(
-            current.as_ref(),
-            desired,
-            !self.cleanup_only && access.fresh,
-        )
-        .map_err(|_| carrier::CarrierError::Conflict)?;
-        let bytes = serde_json::to_vec(&Envelope {
-            version: 1,
-            scope: self.scope.clone(),
-            payload: desired,
-        })
-        .map_err(|_| carrier::CarrierError::Journal)?;
-        if bytes.len() > PrivateFile::Carrier.limit() {
-            return Err(carrier::CarrierError::Invalid);
-        }
-        let result =
-            self.files
-                .compare_exchange(&self.scope, RecordKind::Carrier, raw.as_deref(), &bytes);
-        // A failed or unconfirmed fresh write revokes this live instance.
-        // Reopen as cleanup before reading authority again: exact-desired reread
-        // must not turn a lost fresh ACK into permission for another effect.
-        if result.is_err() && !self.cleanup_only {
-            self.revoked = true;
-        }
-        let (_, _, actual) = match carrier_snapshot(&mut self.files, &self.scope) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                if !self.cleanup_only {
-                    self.revoked = true;
-                }
-                return Err(carrier::CarrierError::Journal);
-            }
-        };
-        if actual.as_ref() == Some(desired) {
-            if self.revoked {
-                return Err(carrier::CarrierError::Journal);
-            }
-            return Ok(());
-        }
-        if !self.cleanup_only {
-            self.revoked = true;
-        }
-        if actual.as_ref() != expected {
-            return Err(carrier::CarrierError::Conflict);
-        }
-        Err(carrier::CarrierError::Journal)
-    }
-}
-
 fn carrier_payload(scope: &SessionScope, bytes: &[u8]) -> io::Result<CarrierRecord> {
     if bytes.len() > PrivateFile::Carrier.limit() {
         return Err(failed());
@@ -3138,36 +3002,6 @@ fn require_stopped_carrier(saved: &SavedRecord) -> io::Result<()> {
         return Err(failed());
     }
     Ok(())
-}
-type CarrierSnapshot = (CarrierAccess, Option<Vec<u8>>, Option<CarrierRecord>);
-fn carrier_snapshot<F: SessionFiles>(
-    files: &mut F,
-    scope: &SessionScope,
-) -> io::Result<CarrierSnapshot> {
-    let access = files.carrier_access(scope)?;
-    if access.scope != *scope {
-        return Err(failed());
-    }
-    let raw = files.read(scope, RecordKind::Carrier)?;
-    let current = raw
-        .as_ref()
-        .map(|b| carrier_payload(scope, b))
-        .transpose()?;
-    if let Some(record) = &current {
-        authenticate_carrier(
-            record,
-            &SessionIdentity {
-                boot_id: access.provenance.boot_id,
-                runtime: access.provenance.runtime.clone(),
-                scope: scope.clone(),
-            },
-            record.provenance.network_epoch,
-        )?;
-        if record.provenance.network_epoch > access.provenance.network_epoch {
-            return Err(failed());
-        }
-    }
-    Ok((access, raw, current))
 }
 /// Storage-only progression. The native owner must still prove each readback
 /// and eventual absence. Neither this guard nor a Stopped JSON grants native

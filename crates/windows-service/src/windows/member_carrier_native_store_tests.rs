@@ -1753,16 +1753,26 @@ fn all_ten_fixed_record_owners_survive_retirement_and_partial_overwrite_without_
                 rows: None,
             };
             record.intent.scope = own.clone();
-            let key = carrier::carrier_key(&own).unwrap();
-            let mut store = WindowsCarrierStore::open(f.clone(), own.clone()).unwrap().0;
-            store.compare_exchange(&key, None, &record).unwrap();
+            let mut expected = serde_json::to_vec(&Envelope {
+                version: 1,
+                scope: own.clone(),
+                payload: &record,
+            })
+            .unwrap();
+            f.compare_exchange(&own, kind, None, &expected).unwrap();
             for phase in [carrier::Phase::Closing, carrier::Phase::Stopped] {
                 let mut desired = record.clone();
                 desired.generation += 1;
                 desired.phase = phase;
-                store
-                    .compare_exchange(&key, Some(&record), &desired)
+                let bytes = serde_json::to_vec(&Envelope {
+                    version: 1,
+                    scope: own.clone(),
+                    payload: &desired,
+                })
+                .unwrap();
+                f.compare_exchange(&own, kind, Some(&expected), &bytes)
                     .unwrap();
+                expected = bytes;
                 record = desired;
             }
         }

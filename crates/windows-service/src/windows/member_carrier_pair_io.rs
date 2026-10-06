@@ -57,7 +57,15 @@ fn verify_terminal_member_row_original<
     })
 }
 
+#[track_caller]
 fn conflict() -> io::Error {
+    #[cfg(all(test, windows))]
+    if crate::windows::member_carrier_factory_test_os::state().is_some() {
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "pair_io conflict caller={}",
+            std::panic::Location::caller()
+        ));
+    }
     io::Error::other("carrier_actor_original_or_pending")
 }
 fn clone_original_capture_pair<A, B>(
@@ -7897,16 +7905,16 @@ pub(crate) mod native {
                                         Ok(desired)
                                     },
                                 )
-                                .map_err(denied)?;
+                                .map_err(|error| denied(error))?;
                             this.roots_mut()?
                                 .carrier
                                 .change_interface_in_call(pin.clone(), record, policy)
-                                .map_err(denied)
+                                .map_err(|error| denied(error))
                         }
                         WeakRowsBoundary::Member(slot) => {
                             let policy = this.row_pins[idx(slot)]
                                 .as_ref()
-                                .ok_or_else(conflict)?
+                                .ok_or_else(|| conflict())?
                                 .with_record(
                                     &record.scope,
                                     record.provenance.network_epoch,
@@ -7918,14 +7926,14 @@ pub(crate) mod native {
                                         Ok(desired)
                                     },
                                 )
-                                .map_err(denied)?;
+                                .map_err(|error| denied(error))?;
                             this.row_owners[idx(slot)]
                                 .as_mut()
-                                .ok_or_else(conflict)?
+                                .ok_or_else(|| conflict())?
                                 .owner_mut()
-                                .map_err(denied)?
+                                .map_err(|error| denied(error))?
                                 .change_interface(policy)
-                                .map_err(denied)
+                                .map_err(|error| denied(error))
                         }
                     },
                 )
@@ -8039,7 +8047,7 @@ pub(crate) mod native {
                 this.roots_mut()?
                     .carrier
                     .restore_interface_in_call(pin.clone(), record)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 for slot in [Slot::A, Slot::B] {
                     let i = idx(slot);
                     if this.row_owners[i].is_none() {
@@ -8047,18 +8055,18 @@ pub(crate) mod native {
                     }
                     this.row_authorities[i]
                         .as_mut()
-                        .ok_or_else(conflict)?
+                        .ok_or_else(|| conflict())?
                         .select_pair_intent(pin.clone(), record)
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     // Addressless member owners may reach Stopped now. C must
                     // NOT: its SAME VIP is retained for later stage6 deletion.
                     this.row_owners[i]
                         .as_mut()
-                        .ok_or_else(conflict)?
+                        .ok_or_else(|| conflict())?
                         .owner_mut()
-                        .map_err(denied)?
+                        .map_err(|error| denied(error))?
                         .stop()
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                 }
                 Ok(())
             })

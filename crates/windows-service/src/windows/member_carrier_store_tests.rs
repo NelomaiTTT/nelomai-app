@@ -1,7 +1,5 @@
 use super::*;
-use crate::member_carrier::{
-    self as carrier, CarrierJournal, Phase, Record, RowState, RowValue, WeakHostRow,
-};
+use crate::member_carrier::{self as carrier, Phase, Record, RowState, RowValue, WeakHostRow};
 use crate::member_owner::InterfaceProof;
 use nelomai_client_tunnel::redundancy::{
     session::{SessionPhase, SessionState},
@@ -19,8 +17,6 @@ struct DiskState {
     fail: Option<PrivateFile>,
     lose_ack: Option<PrivateFile>,
     fail_read: Option<PrivateFile>,
-    fail_read_after_write: bool,
-    false_ack: bool,
     replace_before_cas: Option<Vec<u8>>,
 }
 impl PrivateRecords for Disk {
@@ -51,16 +47,8 @@ impl PrivateRecords for Disk {
         {
             return Err(io::Error::other("SECRET CAS failure"));
         }
-        if file == PrivateFile::Carrier && s.false_ack {
-            s.false_ack = false;
-            return Ok(());
-        }
         s.bytes.insert(file, desired.to_vec());
         s.writes += 1;
-        if file == PrivateFile::Carrier && s.fail_read_after_write {
-            s.fail_read_after_write = false;
-            s.fail_read = Some(file);
-        }
         if s.lose_ack == Some(file) {
             s.lose_ack = None;
             return Err(io::Error::other("SECRET lost acknowledgement"));
@@ -208,15 +196,20 @@ fn fixture() -> (Disk, ProtectedSessionFiles<Disk>) {
     f.claim(&scope()).unwrap();
     (d, f)
 }
-type Store = WindowsCarrierStore<ProtectedSessionFiles<Disk>>;
+type Store = ProtectedSessionFiles<Disk>;
 fn open(f: &ProtectedSessionFiles<Disk>) -> Store {
-    WindowsCarrierStore::open(f.clone(), scope()).unwrap().0
-}
-fn key() -> carrier::CarrierKey {
-    carrier::carrier_key(&scope()).unwrap()
+    f.clone()
 }
 fn save(store: &mut Store, old: Option<&Record>, next: &Record) {
-    store.compare_exchange(&key(), old, next).unwrap();
+    let expected = old.map(payload);
+    store
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            expected.as_deref(),
+            &payload(next),
+        )
+        .unwrap();
 }
 fn configure(store: &mut Store) -> Record {
     let p = prepared();
@@ -292,16 +285,19 @@ fn four_fixed_record_owners_remain_exactly_marked_bounded_and_retained() {
             store.save(&NetworkJournal::default()).unwrap();
         }
         if kind == RecordKind::Carrier {
-            let (mut store, _) = WindowsCarrierStore::open(f.clone(), s.clone()).unwrap();
-            let k = carrier::carrier_key(&s).unwrap();
             let mut p = prepared();
             p.intent.scope = s.clone();
-            store.compare_exchange(&k, None, &p).unwrap();
+            f.compare_exchange(&s, kind, None, &payload(&p)).unwrap();
             let closing = advance(&p, Phase::Closing);
-            store.compare_exchange(&k, Some(&p), &closing).unwrap();
-            store
-                .compare_exchange(&k, Some(&closing), &advance(&closing, Phase::Stopped))
+            f.compare_exchange(&s, kind, Some(&payload(&p)), &payload(&closing))
                 .unwrap();
+            f.compare_exchange(
+                &s,
+                kind,
+                Some(&payload(&closing)),
+                &payload(&advance(&closing, Phase::Stopped)),
+            )
+            .unwrap();
         }
         f.complete(&s).unwrap();
         let id = SessionIdentity {
@@ -369,40 +365,21 @@ fn concurrent_changed_private_record_is_never_overwritten_or_treated_as_ack() {
     inject(&d, &p);
     d.0.borrow_mut().replace_before_cas = Some(changed_bytes.clone());
     assert!(store
-        .compare_exchange(&key(), Some(&p), &created(&p))
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&p)),
+            &payload(&created(&p))
+        )
         .is_err());
-    assert!(store.load(&key()).is_err());
+    assert!(!store.carrier_access(&scope()).unwrap().fresh);
     assert_eq!(d.0.borrow().bytes[&PrivateFile::Carrier], changed_bytes);
-    let (mut recovery, saved) = WindowsCarrierStore::open(files(&d), scope()).unwrap();
-    assert_eq!(saved, Some(changed.clone()));
+    let mut recovery = files(&d);
+    assert_eq!(
+        recovery.read(&scope(), RecordKind::Carrier).unwrap(),
+        Some(payload(&changed))
+    );
     assert_eq!(cleanup(&mut recovery, &changed).phase, Phase::Stopped);
-}
-#[test]
-fn uncertain_post_cas_confirmation_revokes_live_store_until_cleanup_reopen() {
-    for unreadable in [false, true] {
-        let (d, f) = fixture();
-        let mut store = open(&f);
-        if unreadable {
-            d.0.borrow_mut().fail_read_after_write = true;
-        } else {
-            d.0.borrow_mut().false_ack = true;
-        }
-        let p = prepared();
-        assert!(store.compare_exchange(&key(), None, &p).is_err());
-        d.0.borrow_mut().fail_read = None;
-        assert!(
-            store.load(&key()).is_err(),
-            "uncertain CAS must not restore fresh authority"
-        );
-        assert!(store.compare_exchange(&key(), None, &p).is_err());
-        let (mut reopened, record) = WindowsCarrierStore::open(files(&d), scope()).unwrap();
-        assert_eq!(record, unreadable.then_some(p.clone()));
-        if let Some(record) = record {
-            assert_eq!(cleanup(&mut reopened, &record).phase, Phase::Stopped);
-        } else {
-            assert!(reopened.compare_exchange(&key(), None, &p).is_err());
-        }
-    }
 }
 #[test]
 fn lost_ack_at_each_carrier_commit_keeps_exact_obligation_and_blocks_live_instance() {
@@ -447,11 +424,21 @@ fn lost_ack_at_each_carrier_commit_keeps_exact_obligation_and_blocks_live_instan
                     } else {
                         d.0.borrow_mut().fail = Some(PrivateFile::Carrier);
                     }
-                    assert!(store.compare_exchange(&key(), old, next).is_err());
-                    assert!(store.load(&key()).is_err());
+                    assert!(store
+                        .compare_exchange(
+                            &scope(),
+                            RecordKind::Carrier,
+                            old.map(payload).as_deref(),
+                            &payload(next)
+                        )
+                        .is_err());
+                    assert!(!store.carrier_access(&scope()).unwrap().fresh);
                     d.0.borrow_mut().fail = None;
-                    let (mut reopened, saved) =
-                        WindowsCarrierStore::open(files(&d), scope()).unwrap();
+                    let mut reopened = files(&d);
+                    let saved = reopened
+                        .read(&scope(), RecordKind::Carrier)
+                        .unwrap()
+                        .map(|bytes| decode::<Record>(&scope(), &bytes).unwrap());
                     assert_eq!(
                         saved.as_ref(),
                         if committed { Some(next) } else { old },
@@ -461,7 +448,12 @@ fn lost_ack_at_each_carrier_commit_keeps_exact_obligation_and_blocks_live_instan
                         assert_eq!(cleanup(&mut reopened, &saved).phase, Phase::Stopped);
                     } else {
                         assert!(reopened
-                            .compare_exchange(&key(), None, &prepared())
+                            .compare_exchange(
+                                &scope(),
+                                RecordKind::Carrier,
+                                None,
+                                &payload(&prepared())
+                            )
                             .is_err());
                     }
                     break;
@@ -479,18 +471,40 @@ fn cleanup_lost_ack_is_reread_exactly_without_resuming_or_losing_pending_rows() 
     let mut recovered = open(&files(&d));
     let closing = advance(&ready, Phase::Closing);
     d.0.borrow_mut().lose_ack = Some(PrivateFile::Carrier);
-    save(&mut recovered, Some(&ready), &closing);
+    assert!(recovered
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&ready)),
+            &payload(&closing)
+        )
+        .is_err());
+    assert_eq!(
+        recovered.read(&scope(), RecordKind::Carrier).unwrap(),
+        Some(payload(&closing))
+    );
     let mut pending = advance(&closing, Phase::Closing);
     let row = &mut pending.rows.as_mut().unwrap()[0];
     row.pending = Some(row.baseline.clone());
     d.0.borrow_mut().lose_ack = Some(PrivateFile::Carrier);
-    save(&mut recovered, Some(&closing), &pending);
-    assert_eq!(recovered.load(&key()).unwrap(), Some(pending.clone()));
     assert!(recovered
         .compare_exchange(
-            &key(),
-            Some(&pending),
-            &advance(&pending, Phase::Configured)
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&closing)),
+            &payload(&pending)
+        )
+        .is_err());
+    assert_eq!(
+        recovered.read(&scope(), RecordKind::Carrier).unwrap(),
+        Some(payload(&pending))
+    );
+    assert!(recovered
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&pending)),
+            &payload(&advance(&pending, Phase::Configured))
         )
         .is_err());
     assert_eq!(cleanup(&mut recovered, &pending).phase, Phase::Stopped);
@@ -533,10 +547,14 @@ fn epoch_advancement_cannot_migrate_live_carrier_but_cleanup_preserves_retained_
     state.network_epoch = 2;
     session.save(&state).unwrap();
     let before = d.0.borrow().bytes[&PrivateFile::Carrier].clone();
-    assert_eq!(
-        live.compare_exchange(&key(), Some(&ready), &ready),
-        Err(carrier::CarrierError::Conflict)
-    );
+    assert!(live
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&ready)),
+            &payload(&ready)
+        )
+        .is_err());
     assert_eq!(d.0.borrow().bytes[&PrivateFile::Carrier], before);
     let mut recovery = open(&files(&d));
     let stopped = cleanup(&mut recovery, &ready);
@@ -547,7 +565,7 @@ fn epoch_advancement_cannot_migrate_live_carrier_but_cleanup_preserves_retained_
 }
 #[test]
 fn normal_stale_boot_runtime_scope_views_are_denied_and_explicit_view_is_cleanup_only() {
-    let (d, f) = fixture();
+    let (d, mut f) = fixture();
     let mut live = open(&f);
     let ready = configure(&mut live);
     let before = d.0.borrow().bytes.clone();
@@ -556,18 +574,25 @@ fn normal_stale_boot_runtime_scope_views_are_denied_and_explicit_view_is_cleanup
     for boot in [[7; 16], [8; 16]] {
         let mut changed =
             ProtectedSessionFiles::new(d.clone(), changed_runtime.clone(), boot).unwrap();
-        assert!(WindowsCarrierStore::open(changed.clone(), scope()).is_err());
-        let (view, reboot) = changed.recovery_view(RuntimeSlot::Stable).unwrap().unwrap();
+        assert!(changed.read(&scope(), RecordKind::Carrier).is_err());
+        let (mut view, reboot) = changed.recovery_view(RuntimeSlot::Stable).unwrap().unwrap();
         assert_eq!(reboot, boot != [7; 16]);
-        let (mut store, record) = WindowsCarrierStore::open(view, scope()).unwrap();
-        assert_eq!(record, Some(ready.clone()));
-        assert!(store
-            .compare_exchange(&key(), Some(&ready), &advance(&ready, Phase::Configured))
+        assert_eq!(
+            view.read(&scope(), RecordKind::Carrier).unwrap(),
+            Some(payload(&ready))
+        );
+        assert!(view
+            .compare_exchange(
+                &scope(),
+                RecordKind::Carrier,
+                Some(&payload(&ready)),
+                &payload(&advance(&ready, Phase::Configured))
+            )
             .is_err());
     }
     let mut foreign = scope();
     foreign.connection_generation += 1;
-    assert!(WindowsCarrierStore::open(f.clone(), foreign).is_err());
+    assert!(f.read(&foreign, RecordKind::Carrier).is_err());
     assert_eq!(d.0.borrow().bytes, before);
 }
 #[test]
@@ -586,34 +611,7 @@ fn carrier_envelope_bound_and_private_read_errors_never_clear_claim_or_records()
     d.0.borrow_mut().fail_read = Some(PrivateFile::Carrier);
     let error = f.read(&scope(), RecordKind::Carrier).unwrap_err();
     assert!(!error.to_string().contains("SECRET"));
-    assert!(WindowsCarrierStore::open(f.clone(), scope()).is_err());
     assert!(f.complete(&scope()).is_err());
-}
-#[test]
-fn carrier_storage_never_trusts_bare_json_without_authenticated_session_access() {
-    #[derive(Clone)]
-    struct BareJson;
-    impl SessionFiles for BareJson {
-        fn scopes(&mut self, _: RuntimeSlot) -> io::Result<Vec<SessionScope>> {
-            Ok(vec![scope()])
-        }
-        fn claim(&mut self, _: &SessionScope) -> io::Result<()> {
-            Ok(())
-        }
-        fn read(&mut self, _: &SessionScope, _: RecordKind) -> io::Result<Option<Vec<u8>>> {
-            panic!("unauthenticated JSON must not be read")
-        }
-        fn compare_exchange(
-            &mut self,
-            _: &SessionScope,
-            _: RecordKind,
-            _: Option<&[u8]>,
-            _: &[u8],
-        ) -> io::Result<()> {
-            panic!("unauthenticated mutation")
-        }
-    }
-    assert!(WindowsCarrierStore::open(BareJson, scope()).is_err());
 }
 #[test]
 fn completed_marker_does_not_authorize_live_carrier_retirement_or_overwrite() {
@@ -643,7 +641,10 @@ fn carrier_store_fresh_lifecycle_and_exact_completion_include_carrier() {
     let (d, mut f) = fixture();
     let mut store = open(&f);
     let ready = configure(&mut store);
-    assert_eq!(store.load(&key()).unwrap(), Some(ready.clone()));
+    assert_eq!(
+        store.read(&scope(), RecordKind::Carrier).unwrap(),
+        Some(payload(&ready))
+    );
     let raw: SavedRecord =
         serde_json::from_slice(&d.0.borrow().bytes[&PrivateFile::Carrier]).unwrap();
     assert_eq!(raw.identity.boot_id, [7; 16]);
@@ -764,17 +765,24 @@ fn carrier_payload_provenance_is_authenticated_by_protected_envelope() {
 #[test]
 fn carrier_fresh_creation_requires_claim_and_cannot_be_replayed_from_recovery() {
     let d = Disk::default();
-    assert!(WindowsCarrierStore::open(files(&d), scope()).is_err());
+    assert!(files(&d)
+        .compare_exchange(&scope(), RecordKind::Carrier, None, &payload(&prepared()))
+        .is_err());
     let (d, f) = fixture();
     let mut reopened = open(&files(&d));
     assert!(reopened
-        .compare_exchange(&key(), None, &prepared())
+        .compare_exchange(&scope(), RecordKind::Carrier, None, &payload(&prepared()))
         .is_err());
     let mut original = open(&f);
     save(&mut original, None, &prepared());
-    let mut recovered = open(&f);
+    let mut recovered = open(&files(&d));
     assert!(recovered
-        .compare_exchange(&key(), Some(&prepared()), &created(&prepared()))
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&prepared())),
+            &payload(&created(&prepared()))
+        )
         .is_err());
 }
 #[test]
@@ -817,39 +825,27 @@ fn carrier_unknown_fields_versions_scope_and_saved_epoch_reject_read_and_complet
             f.read(&scope(), RecordKind::Carrier).is_err(),
             "read {kind}"
         );
-        assert!(WindowsCarrierStore::open(f.clone(), scope()).is_err());
         assert!(f.complete(&scope()).is_err());
         assert_eq!(d.0.borrow().bytes, before);
     }
 }
 #[test]
-fn foreign_key_and_stale_exact_cas_never_replace_current_record() {
+fn stale_exact_cas_never_replaces_current_record() {
     let (d, f) = fixture();
     let mut store = open(&f);
     let p = prepared();
     save(&mut store, None, &p);
-    for kind in 0..3 {
-        let mut foreign = key();
-        match kind {
-            0 => foreign.name.push('x'),
-            1 => foreign.guid[0] ^= 1,
-            _ => {
-                let mut s = scope();
-                s.connection_generation += 1;
-                foreign = carrier::carrier_key(&s).unwrap();
-            }
-        }
-        let before = d.0.borrow().bytes.clone();
-        assert!(store.load(&foreign).is_err());
-        assert!(store
-            .compare_exchange(&foreign, Some(&p), &created(&p))
-            .is_err());
-        assert_eq!(d.0.borrow().bytes, before);
-    }
     let c = created(&p);
     save(&mut store, Some(&p), &c);
     let before = d.0.borrow().bytes.clone();
-    assert!(store.compare_exchange(&key(), Some(&p), &c).is_err());
+    assert!(store
+        .compare_exchange(
+            &scope(),
+            RecordKind::Carrier,
+            Some(&payload(&p)),
+            &payload(&c)
+        )
+        .is_err());
     assert_eq!(d.0.borrow().bytes, before);
 }
 #[test]
@@ -883,7 +879,12 @@ fn recovery_store_independently_rejects_resume_proof_baseline_and_intent_changes
         let before = d.0.borrow().bytes.clone();
         assert!(
             recovered
-                .compare_exchange(&key(), Some(&ready), &next)
+                .compare_exchange(
+                    &scope(),
+                    RecordKind::Carrier,
+                    Some(&payload(&ready)),
+                    &payload(&next)
+                )
                 .is_err(),
             "case {kind}"
         );
@@ -930,10 +931,24 @@ fn carrier_lost_ack_preserves_durable_pending_and_allows_only_cleanup_reopen() {
         } else {
             d.0.borrow_mut().fail = Some(PrivateFile::Carrier);
         }
-        assert!(store.compare_exchange(&key(), Some(&c), &pending).is_err());
+        assert!(store
+            .compare_exchange(
+                &scope(),
+                RecordKind::Carrier,
+                Some(&payload(&c)),
+                &payload(&pending)
+            )
+            .is_err());
         d.0.borrow_mut().fail = None;
-        let (mut recovered, saved) = WindowsCarrierStore::open(files(&d), scope()).unwrap();
-        let saved = saved.unwrap();
+        let mut recovered = files(&d);
+        let saved: Record = decode(
+            &scope(),
+            &recovered
+                .read(&scope(), RecordKind::Carrier)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             saved,
             if committed {
@@ -943,7 +958,12 @@ fn carrier_lost_ack_preserves_durable_pending_and_allows_only_cleanup_reopen() {
             }
         );
         assert!(recovered
-            .compare_exchange(&key(), Some(&saved), &advance(&saved, Phase::Created))
+            .compare_exchange(
+                &scope(),
+                RecordKind::Carrier,
+                Some(&payload(&saved)),
+                &payload(&advance(&saved, Phase::Created))
+            )
             .is_err());
         let closing = advance(&saved, Phase::Closing);
         save(&mut recovered, Some(&saved), &closing);

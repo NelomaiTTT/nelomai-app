@@ -1691,7 +1691,7 @@ pub(crate) mod native {
             }
             self.seal
                 .inspect_original(&self.pin, |_| Ok(()))
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
     }
     impl NativeRowGenerationCapture {
@@ -1718,8 +1718,10 @@ pub(crate) mod native {
                     &rows.runtime,
                     &rows.context,
                 )
-                .map_err(denied)?;
-            self.started.verify_source(&rows.source).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.started
+                .verify_source(&rows.source)
+                .map_err(|error| denied(error))?;
             Ok(rows)
         }
         /// PURE historical original facts; never a live initial capture grant.
@@ -1771,7 +1773,7 @@ pub(crate) mod native {
                     )
                     .map_err(|_| crate::member_carrier::CarrierError::Conflict)
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(root)
         }
         pub(crate) fn stopped_payload(&self) -> Vec<u8> {
@@ -1856,7 +1858,7 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            let old_record = rows::Record::decode(old).map_err(denied)?;
+            let old_record = rows::Record::decode(old).map_err(|error| denied(error))?;
             self.retired
                 .seal
                 .inspect_original(&self.retired.pin, |actual| {
@@ -1865,15 +1867,15 @@ pub(crate) mod native {
                     }
                     Ok(())
                 })
-                .map_err(denied)?;
-            let new_record = rows::Record::decode(new).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            let new_record = rows::Record::decode(new).map_err(|error| denied(error))?;
             compare_member_generation_storage(
                 &rows.context,
                 &old_record,
                 &new_record,
                 &self.binding,
             )
-            .map_err(denied)
+            .map_err(|error| denied(error))
         }
     }
     // Safety: private construction below retains the actual original retired
@@ -2019,16 +2021,19 @@ pub(crate) mod native {
             input
                 .started
                 .verify_original(input.ticket, input.never, &self.runtime, &self.context)
-                .map_err(denied)?;
-            input.started.verify_source(&self.source).map_err(denied)?;
-            let proof = input.started.proof().map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            input
+                .started
+                .verify_source(&self.source)
+                .map_err(|error| denied(error))?;
+            let proof = input.started.proof().map_err(|error| denied(error))?;
             compare_member_capture_binding(
                 &self.context,
                 input.binding,
                 [rows::Role::MemberA, rows::Role::MemberB][index],
                 proof.interface,
             )
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             input
                 .pair
                 .inspect_effect(
@@ -2064,16 +2069,16 @@ pub(crate) mod native {
                         Ok(())
                     },
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let payload = self
                 .runtime
                 .record(&self.context, RecordKind::Pair)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if crate::windows::member_carrier_pair_store::carrier_payload(
                 &self.context.intent.scope,
                 &payload,
             )
-            .map_err(denied)?
+            .map_err(|error| denied(error))?
             .as_ref()
                 != Some(input.record)
             {
@@ -2089,7 +2094,7 @@ pub(crate) mod native {
             input: NativeMemberCaptureInputs<'_>,
         ) -> Result<Rc<NativeRowGenerationCapture>> {
             let mut flight = GenerationProjection::begin(&self.revoked, &self.generation_busy)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             retired.verify_origin(self)?;
             if !retired.acknowledged.get()
                 || retired.capture_attempted.replace(true)
@@ -2114,7 +2119,7 @@ pub(crate) mod native {
                 backend: self
                     .runtime
                     .native_birth_files(&self.context)
-                    .map_err(denied)?
+                    .map_err(|error| denied(error))?
                     .read_identity(),
                 selection: GenerationWriteSelection::new(),
                 acknowledged: Cell::new(false),
@@ -2135,7 +2140,7 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            flight.complete().map_err(denied)?;
+            flight.complete().map_err(|error| denied(error))?;
             capture.acknowledged.set(true);
             Ok(capture)
         }
@@ -2178,7 +2183,7 @@ pub(crate) mod native {
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?
                     .snapshot_in_window(window)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if guard != input.record.guard.expected {
                     return Err(Error::Conflict);
                 }
@@ -2192,17 +2197,24 @@ pub(crate) mod native {
                             RecordKind::MemberBRows,
                         ][capture.retired.index],
                     )
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if !registered && stored != capture.retired.protected {
                     return Err(Error::Conflict);
                 }
                 if registered {
-                    capture.selection.verify(&stored).map_err(denied)?;
+                    capture
+                        .selection
+                        .verify(&stored)
+                        .map_err(|error| denied(error))?;
                     let actual = rows.rows[capture.retired.index]
                         .as_ref()
                         .ok_or(Error::Conflict)?;
                     if actual.binding != capture.binding
-                        || actual.acknowledged.encode().map_err(denied)? != stored
+                        || actual
+                            .acknowledged
+                            .encode()
+                            .map_err(|error| denied(error))?
+                            != stored
                         || actual.acknowledged.phase != rows::Phase::Captured
                         || actual.acknowledged.pending.is_some()
                         || actual.acknowledged.current != actual.acknowledged.baseline
@@ -2222,7 +2234,7 @@ pub(crate) mod native {
             original: Rc<rows::RowRecordReadPin>,
         ) -> Result<()> {
             let mut flight = GenerationProjection::begin(&self.revoked, &self.generation_busy)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let same = capture.rows()?;
             if !Rc::ptr_eq(self, &same) || capture.completed.get() {
                 return Err(Error::Conflict);
@@ -2253,7 +2265,7 @@ pub(crate) mod native {
                             .map_err(|_| rows::Error::Conflict)
                     },
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let mut originals = self
                 .originals
                 .try_borrow_mut()
@@ -2267,7 +2279,7 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             originals[capture.retired.index] = Some(original);
-            flight.complete().map_err(denied)
+            flight.complete().map_err(|error| denied(error))
         }
         pub(crate) fn complete_member_capture(
             self: &Rc<Self>,
@@ -2275,7 +2287,7 @@ pub(crate) mod native {
             input: NativeMemberCaptureInputs<'_>,
         ) -> Result<()> {
             let mut flight = GenerationProjection::begin(&self.revoked, &self.generation_busy)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let same = capture.rows()?;
             if !Rc::ptr_eq(self, &same)
                 || capture.completed.get()
@@ -2303,7 +2315,7 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            flight.complete().map_err(denied)?;
+            flight.complete().map_err(|error| denied(error))?;
             capture.completed.set(true);
             Ok(())
         }
@@ -2316,7 +2328,7 @@ pub(crate) mod native {
             input: NativeRowGenerationInputs<'_>,
         ) -> Result<Rc<NativeRowGenerationReceipt>> {
             let mut flight = GenerationProjection::begin(&self.revoked, &self.generation_busy)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let result = (|| {
                 if self.revoked.get()
                     || self.closing_attempted.get()
@@ -2325,11 +2337,14 @@ pub(crate) mod native {
                 {
                     return Err(Error::Conflict);
                 }
-                input.ticket.verify_source(&self.source).map_err(denied)?;
+                input
+                    .ticket
+                    .verify_source(&self.source)
+                    .map_err(|error| denied(error))?;
                 input
                     .ticket
                     .verify_original(input.never, &self.runtime, &self.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 let index = match input.ticket.slot() {
                     nelomai_contracts::dispatcher::TunnelSlot::A => 1,
                     nelomai_contracts::dispatcher::TunnelSlot::B => 2,
@@ -2359,7 +2374,7 @@ pub(crate) mod native {
                             )
                             .map_err(|_| std::io::Error::other("carrier_row_generation_conflict"))
                         })
-                        .map_err(denied)
+                        .map_err(|error| denied(error))
                 };
                 verify_pair()?;
                 let before = self.source.inspect_window(|window| {
@@ -2398,7 +2413,7 @@ pub(crate) mod native {
                             }
                             Ok(())
                         })
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     let protected = self
                         .runtime
                         .record(
@@ -2409,7 +2424,7 @@ pub(crate) mod native {
                                 RecordKind::MemberBRows,
                             ][index],
                         )
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     Ok((
                         protected,
                         window.bindings().carrier.clone(),
@@ -2466,7 +2481,7 @@ pub(crate) mod native {
                                     RecordKind::MemberBRows,
                                 ][index],
                             )
-                            .map_err(denied)?
+                            .map_err(|error| denied(error))?
                             != before.0
                     {
                         return Err(Error::Conflict);
@@ -2474,19 +2489,22 @@ pub(crate) mod native {
                     input
                         .seal
                         .inspect_original(input.pin, |_| Ok(()))
-                        .map_err(denied)
+                        .map_err(|error| denied(error))
                 })?;
                 verify_pair()?;
-                input.ticket.verify_source(&self.source).map_err(denied)?;
+                input
+                    .ticket
+                    .verify_source(&self.source)
+                    .map_err(|error| denied(error))?;
                 input
                     .ticket
                     .verify_original(input.never, &self.runtime, &self.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 receipt.verify_origin(self)?;
                 Ok(receipt)
             })();
             let receipt = result?;
-            flight.complete().map_err(denied)?;
+            flight.complete().map_err(|error| denied(error))?;
             Ok(receipt)
         }
         /// Finish only AFTER actual MemberInventory retirement. No pending
@@ -2497,7 +2515,7 @@ pub(crate) mod native {
             input: NativeRowGenerationInputs<'_>,
         ) -> Result<()> {
             let mut flight = GenerationProjection::begin(&self.revoked, &self.generation_busy)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let result = (|| {
                 receipt.verify_origin(self)?;
                 if self.revoked.get()
@@ -2511,11 +2529,14 @@ pub(crate) mod native {
                 {
                     return Err(Error::Conflict);
                 }
-                input.ticket.verify_source(&self.source).map_err(denied)?;
+                input
+                    .ticket
+                    .verify_source(&self.source)
+                    .map_err(|error| denied(error))?;
                 input
                     .ticket
                     .verify_original(input.never, &self.runtime, &self.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 input
                     .pair
                     .inspect(&self.runtime, input.supervisor, |actual| {
@@ -2530,7 +2551,7 @@ pub(crate) mod native {
                         )
                         .map_err(|_| std::io::Error::other("carrier_row_generation_conflict"))
                     })
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 self.source.inspect_window(|window| {
                     if window.closed_member(input.ticket.slot()).is_some()
                         || window.bindings().egress[receipt.index - 1].is_some()
@@ -2549,7 +2570,7 @@ pub(crate) mod native {
                                     RecordKind::MemberBRows,
                                 ][receipt.index],
                             )
-                            .map_err(denied)?
+                            .map_err(|error| denied(error))?
                             != receipt.protected
                         || self.sample(window, false, None)? != before
                     {
@@ -2560,7 +2581,7 @@ pub(crate) mod native {
                 input
                     .ticket
                     .verify_original(input.never, &self.runtime, &self.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 input
                     .pair
                     .inspect(&self.runtime, input.supervisor, |actual| {
@@ -2575,11 +2596,11 @@ pub(crate) mod native {
                         )
                         .map_err(|_| std::io::Error::other("carrier_row_generation_conflict"))
                     })
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 Ok(())
             })();
             result?;
-            flight.complete().map_err(denied)?;
+            flight.complete().map_err(|error| denied(error))?;
             receipt.acknowledged.set(true);
             self.generation_pending.set(false);
             Ok(())
@@ -2629,7 +2650,9 @@ pub(crate) mod native {
             &self,
             bindings: &crate::windows::member_carrier_guard::Bindings,
         ) -> Result<NativeResourceRowsFacts> {
-            self.runtime.verify(&self.context).map_err(denied)?;
+            self.runtime
+                .verify(&self.context)
+                .map_err(|error| denied(error))?;
             let originals = self
                 .originals
                 .try_borrow()
@@ -2700,10 +2723,12 @@ pub(crate) mod native {
                                 })
                             },
                         )
-                        .map_err(denied)?,
+                        .map_err(|error| denied(error))?,
                 );
             }
-            self.runtime.verify(&self.context).map_err(denied)?;
+            self.runtime
+                .verify(&self.context)
+                .map_err(|error| denied(error))?;
             Ok(facts)
         }
         /// Caller roots the whole returned reader BEFORE any validation. Only
@@ -2862,19 +2887,21 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             let current = || -> Result<Vec<u8>> {
-                self.runtime.verify(&self.context).map_err(denied)?;
+                self.runtime
+                    .verify(&self.context)
+                    .map_err(|error| denied(error))?;
                 let bytes = self
                     .runtime
                     .record(&self.context, RecordKind::NativeCarrierReceipts)
-                    .map_err(denied)?;
-                let native = receipts::Record::decode(&bytes).map_err(denied)?;
+                    .map_err(|error| denied(error))?;
+                let native = receipts::Record::decode(&bytes).map_err(|error| denied(error))?;
                 carrier_members::retirement_registration(
                     &self.context,
                     native.phase,
                     record,
                     target,
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
                 pair.inspect_effect(
                     &self.runtime,
                     supervisor,
@@ -2892,7 +2919,7 @@ pub(crate) mod native {
                         }
                     },
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
                 Ok(bytes)
             };
             let result = (|| {
@@ -2932,7 +2959,9 @@ pub(crate) mod native {
             retiring: Option<usize>,
             preparing: Option<usize>,
         ) -> Result<NativeResourceRowsFacts> {
-            self.runtime.verify(&self.context).map_err(denied)?;
+            self.runtime
+                .verify(&self.context)
+                .map_err(|error| denied(error))?;
             let originals = self
                 .originals
                 .try_borrow()
@@ -3065,10 +3094,12 @@ pub(crate) mod native {
                             read,
                         )
                     }
-                    .map_err(denied)?,
+                    .map_err(|error| denied(error))?,
                 );
             }
-            self.runtime.verify(&self.context).map_err(denied)?;
+            self.runtime
+                .verify(&self.context)
+                .map_err(|error| denied(error))?;
             Ok(facts)
         }
     }
@@ -3201,11 +3232,11 @@ pub(crate) mod native {
             original: &rows::InitialRowCaptureCleanupRead<'_>,
         ) -> std::io::Result<()> {
             let result = (|| {
-                self.origin.root.verify().map_err(denied)?;
+                self.origin.root.verify().map_err(|error| denied(error))?;
                 self.origin
                     .calling
                     .verify(&self.origin.supervisor, &self.origin.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if !original.matches_record_original(&self.origin.original)
                     || original.initial_record() != &self.initial
                 {
@@ -3274,12 +3305,12 @@ pub(crate) mod native {
                 }
                 original
                     .verify_payloads(expected, desired)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 let expected = expected
                     .map(rows::Record::decode)
                     .transpose()
-                    .map_err(denied)?;
-                let desired = rows::Record::decode(desired).map_err(denied)?;
+                    .map_err(|error| denied(error))?;
+                let desired = rows::Record::decode(desired).map_err(|error| denied(error))?;
                 super::compare_initial_capture_cleanup_storage(
                     &self.origin.context,
                     &self.origin.pair_record,
@@ -3288,7 +3319,7 @@ pub(crate) mod native {
                     expected.as_ref(),
                     &desired,
                 )
-                .map_err(denied)
+                .map_err(|error| denied(error))
             })();
             if result.is_err() {
                 self.origin.root.fail();
@@ -3306,10 +3337,10 @@ pub(crate) mod native {
             original: &rows::CreatedAddressCleanupRead<'_>,
         ) -> std::io::Result<()> {
             let result = (|| {
-                self.root.verify().map_err(denied)?;
+                self.root.verify().map_err(|error| denied(error))?;
                 self.calling
                     .verify(&self.supervisor, &self.context)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if !original.matches_record_original(&self.original) {
                     return Err(Error::Conflict);
                 }
@@ -3376,11 +3407,11 @@ pub(crate) mod native {
                 if scope != &self.context.intent.scope || kind != RecordKind::CarrierRows {
                     return Err(Error::Conflict);
                 }
-                let expected = rows::Record::decode(expected).map_err(denied)?;
-                let desired = rows::Record::decode(desired).map_err(denied)?;
+                let expected = rows::Record::decode(expected).map_err(|error| denied(error))?;
+                let desired = rows::Record::decode(desired).map_err(|error| denied(error))?;
                 original
                     .verify_exchange(original.binding(), &expected, &desired)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 super::compare_created_cleanup_storage(
                     &self.context,
                     &self.pair_record,
@@ -3388,7 +3419,7 @@ pub(crate) mod native {
                     &expected,
                     &desired,
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
                 Ok(())
             })();
             if result.is_err() {
@@ -3412,7 +3443,7 @@ pub(crate) mod native {
             }
         }
         fn borrow(&self) -> Result<RefMut<'_, NativeCarrierAuthority<G>>> {
-            let mut owner = self.original.borrow().map_err(denied)?;
+            let mut owner = self.original.borrow().map_err(|error| denied(error))?;
             if self.original.revoked.get() {
                 owner.failed = true;
             }
@@ -3431,21 +3462,25 @@ pub(crate) mod native {
             let before = owner.current(Use::Live)?;
             let source = NativeSourceRead {
                 address,
-                runtime: owner.runtime.read_pin().map_err(denied)?,
-                image: owner.image.read_pin().map_err(denied)?,
+                runtime: owner.runtime.read_pin().map_err(|error| denied(error))?,
+                image: owner.image.read_pin().map_err(|error| denied(error))?,
                 originals: owner.producer.observer(),
                 members: owner
                     .producer
                     .original_universe()
                     .member_read_pin()
-                    .map_err(denied)?,
+                    .map_err(|error| denied(error))?,
                 scope: owner.scope.clone(),
                 supervisor: owner.gate.supervisor().clone(),
-                deadline: owner.gate.supervisor().read_pin().map_err(denied)?,
+                deadline: owner
+                    .gate
+                    .supervisor()
+                    .read_pin()
+                    .map_err(|error| denied(error))?,
                 fence: owner.source_fence.clone(),
             };
             source.inspect(|_| Ok(()))?;
-            same_record(&before, owner.current(Use::Live)?).map_err(denied)?;
+            same_record(&before, owner.current(Use::Live)?).map_err(|error| denied(error))?;
             owner.verify_supervised()?;
             call.succeeded = true;
             Ok(source)
@@ -3465,17 +3500,21 @@ pub(crate) mod native {
                 original.clone()
             } else {
                 let read = Rc::new(NativeClosingRead {
-                    runtime: owner.runtime.read_pin().map_err(denied)?,
-                    image: owner.image.read_pin().map_err(denied)?,
+                    runtime: owner.runtime.read_pin().map_err(|error| denied(error))?,
+                    image: owner.image.read_pin().map_err(|error| denied(error))?,
                     originals: owner.producer.observer(),
                     members: owner
                         .producer
                         .original_universe()
                         .member_read_pin()
-                        .map_err(denied)?,
+                        .map_err(|error| denied(error))?,
                     scope: owner.scope.clone(),
                     supervisor: owner.gate.supervisor().clone(),
-                    deadline: owner.gate.supervisor().read_pin().map_err(denied)?,
+                    deadline: owner
+                        .gate
+                        .supervisor()
+                        .read_pin()
+                        .map_err(|error| denied(error))?,
                     fence: owner.source_fence.clone(),
                 });
                 crate::windows::member_carrier_original_read::retain_first_before(
@@ -3489,7 +3528,7 @@ pub(crate) mod native {
             // must likewise retain it before validation/independent reads.
             retain(read.clone())?;
             read.inspect_bindings(|_| Ok(()))?;
-            same_record(&before, owner.current(Use::Cleanup)?).map_err(denied)?;
+            same_record(&before, owner.current(Use::Cleanup)?).map_err(|error| denied(error))?;
             owner.verify_supervised()?;
             call.succeeded = true;
             Ok(read)
@@ -3511,7 +3550,7 @@ pub(crate) mod native {
             let read = owner.retain_retired_reader()?;
             retain(read.clone())?;
             read.inspect(|_| Ok(()))?;
-            same_record(&before, owner.current(Use::Cleanup)?).map_err(denied)?;
+            same_record(&before, owner.current(Use::Cleanup)?).map_err(|error| denied(error))?;
             owner.verify_supervised()?;
             call.succeeded = true;
             Ok(read)
@@ -3530,7 +3569,7 @@ pub(crate) mod native {
             let read = owner.retain_unpublished_closed_reader()?;
             retain(read.clone())?; // caller roots BEFORE any SDK/postflight
             read.inspect(|| Ok(()))?;
-            same_record(&before, owner.current(Use::Cleanup)?).map_err(denied)?;
+            same_record(&before, owner.current(Use::Cleanup)?).map_err(|error| denied(error))?;
             owner.verify_supervised()?;
             call.succeeded = true;
             Ok(read)
@@ -3560,7 +3599,7 @@ pub(crate) mod native {
                     let captured = self
                         .address
                         .read(&context.intent.scope, context.provenance.network_epoch)
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     let snapshot = source_sdk_snapshot(captured.binding)?;
                     Ok((
                         revision,
@@ -3596,7 +3635,7 @@ pub(crate) mod native {
                             };
                             inspect(&c).map_err(|_| creators::Error::Conflict)
                         })
-                        .map_err(denied)
+                        .map_err(|error| denied(error))
                 },
                 || Error::Conflict,
             )
@@ -3620,10 +3659,10 @@ pub(crate) mod native {
         pub(in crate::windows) fn protected_network_record(&self) -> Result<Option<Vec<u8>>> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             self.runtime
                 .optional_record(&self.scope.context, RecordKind::Network)
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
         fn revision(&self) -> Result<SourceRevision> {
             if self.fence.revoked.get() {
@@ -3631,20 +3670,22 @@ pub(crate) mod native {
             }
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.image
+                .verify_runtime(&self.runtime)
+                .map_err(|error| denied(error))?;
             let (records, fresh) = self
                 .runtime
                 .record_with_fresh(
                     &self.scope.context,
                     &[RecordKind::NativeCarrierReceipts, RecordKind::CarrierRows],
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if !fresh {
                 return Err(Error::Retired);
             }
             let [native, rows]: [Vec<u8>; 2] = records.try_into().map_err(|_| Error::Conflict)?;
-            let record = receipts::Record::decode(&native).map_err(denied)?;
+            let record = receipts::Record::decode(&native).map_err(|error| denied(error))?;
             validate_stage(
                 &record,
                 &self.scope.context,
@@ -3653,10 +3694,10 @@ pub(crate) mod native {
                 true,
                 Use::Live,
             )
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if self.fence.revoked.get() {
                 return Err(Error::Retired);
             }
@@ -3676,18 +3717,18 @@ pub(crate) mod native {
                     &self.scope.context.intent.scope,
                     self.scope.context.provenance.network_epoch,
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let all = self
                 .originals
                 .observe_all(&self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
                 return Err(Error::Conflict);
             }
             let (members, history) = self
                 .members
                 .read_source_bindings(&self.scope.context, &self.runtime, &self.image)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if all.complete.len() != 1 + members.len()
                 || all.complete[0].0 != carrier_provider::ProviderKind::Wintun
                 || all.complete[0].1 != all.originals[0].provider
@@ -3700,14 +3741,15 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            let record = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
+            let record = crate::member_carrier_rows::Record::decode(&before.1)
+                .map_err(|error| denied(error))?;
             let snapshot = source_sdk_snapshot(captured.binding)?;
             let source = if let Some((binding, target)) = effect {
                 if captured.binding != binding {
                     return Err(Error::Conflict);
                 }
                 super::row_effect_source_comparison(
-                    &receipts::Record::decode(&before.0).map_err(denied)?,
+                    &receipts::Record::decode(&before.0).map_err(|error| denied(error))?,
                     &all.originals[0].identity,
                     captured.binding,
                     captured.captured,
@@ -3725,7 +3767,7 @@ pub(crate) mod native {
                     &snapshot,
                 )
             }
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             if before != self.revision()? {
                 return Err(Error::Conflict);
             }
@@ -3798,14 +3840,14 @@ pub(crate) mod native {
                         .iter()
                         .map(|h| h.comparison_provider(&self.scope.context))
                         .collect::<crate::member_carrier::Result<Vec<_>>>()
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     let projected = super::closing_comparison_bindings(
                         &self.scope.context,
                         &facts.original,
                         &facts.members,
                         &history,
                     )
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                     if projected.carrier.as_ref() != Some(&facts.carrier) {
                         return Err(Error::Conflict);
                     }
@@ -3827,7 +3869,8 @@ pub(crate) mod native {
         // Factual SDK identity/full-row bracket is nested in this source's
         // SAME-original Runtime/Calling/create-ACK/protected revision bracket.
         // Exact absence is not a usable source; preserve the previous denial.
-        let snapshot = rows::native::read_original_snapshot(binding).map_err(denied)?;
+        let snapshot =
+            rows::native::read_original_snapshot(binding).map_err(|error| denied(error))?;
         if snapshot.address.is_none() {
             return Err(Error::Native);
         }
@@ -3844,10 +3887,10 @@ pub(crate) mod native {
         pub(in crate::windows) fn protected_network_record(&self) -> Result<Option<Vec<u8>>> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             self.runtime
                 .optional_record(&self.scope.context, RecordKind::Network)
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
         /// Original provenance only, not Closing/absence/effect permission.
         /// These pins were minted through the SAME retained C authority; equal
@@ -3860,31 +3903,33 @@ pub(crate) mod native {
         fn revision(&self) -> Result<SourceRevision> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.image
+                .verify_runtime(&self.runtime)
+                .map_err(|error| denied(error))?;
             let records = self
                 .runtime
                 .optional_records(
                     &self.scope.context,
                     &[RecordKind::NativeCarrierReceipts, RecordKind::CarrierRows],
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let [native, rows]: [Option<Vec<u8>>; 2] =
                 records.try_into().map_err(|_| Error::Conflict)?;
             let native = native.ok_or(Error::Conflict)?;
             let rows = rows.ok_or(Error::Conflict)?;
             validate_stage(
-                &receipts::Record::decode(&native).map_err(denied)?,
+                &receipts::Record::decode(&native).map_err(|error| denied(error))?,
                 &self.scope.context,
                 &self.scope.binding,
                 self.scope.generation,
                 false,
                 Use::Cleanup,
             )
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok((native, rows))
         }
         fn members(
@@ -3923,7 +3968,7 @@ pub(crate) mod native {
                         partial,
                         |live, history| Ok((live.to_vec(), history.to_vec())),
                     )
-                    .map_err(denied);
+                    .map_err(|error| denied(error));
             }
             self.members
                 .inspect_closing_bindings_full(
@@ -3933,7 +3978,7 @@ pub(crate) mod native {
                     &[c],
                     |live, history| Ok((live.to_vec(), history.to_vec())),
                 )
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
         fn sample(&self) -> Result<ClosingSample> {
             self.sample_inner(None)
@@ -3952,22 +3997,23 @@ pub(crate) mod native {
         ) -> Result<ClosingSample> {
             let before = self.revision()?;
             let partial_observation = partial
-                .map(|original| original.inspect().map_err(denied))
+                .map(|original| original.inspect().map_err(|error| denied(error)))
                 .transpose()?;
             let all = self
                 .originals
                 .observe_all_for_cleanup(&self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
                 return Err(Error::Conflict);
             }
             let (members, history) = self.members(&all.originals[0].identity, partial)?;
             // Matching rows still grant no native ACK. Protected full-row
             // binding must agree with this actual retained original C.
-            let rows = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
+            let rows = crate::member_carrier_rows::Record::decode(&before.1)
+                .map_err(|error| denied(error))?;
             if rows.binding
                 != super::rows_binding(&self.scope.context, &all.originals[0].identity)
-                    .map_err(denied)?
+                    .map_err(|error| denied(error))?
             {
                 return Err(Error::Conflict);
             }
@@ -3998,14 +4044,14 @@ pub(crate) mod native {
                         .iter()
                         .map(|h| h.comparison_provider(&self.scope.context))
                         .collect::<crate::member_carrier::Result<Vec<_>>>()
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     let projected = super::closing_comparison_bindings(
                         &self.scope.context,
                         &facts.original,
                         &facts.members,
                         &history,
                     )
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                     let window = NativeBindingsWindow {
                         origin: WindowOrigin::PartialClosing(self, partial, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
@@ -4040,14 +4086,14 @@ pub(crate) mod native {
                         .iter()
                         .map(|h| h.comparison_provider(&self.scope.context))
                         .collect::<crate::member_carrier::Result<Vec<_>>>()
-                        .map_err(denied)?;
+                        .map_err(|error| denied(error))?;
                     let projected = super::closing_comparison_bindings(
                         &self.scope.context,
                         &facts.original,
                         &facts.members,
                         &history,
                     )
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                     let window = NativeBindingsWindow {
                         origin: WindowOrigin::Closing(self, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
@@ -4075,13 +4121,15 @@ pub(crate) mod native {
         fn revision(&self, terminal: bool) -> Result<Vec<u8>> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.image
+                .verify_runtime(&self.runtime)
+                .map_err(|error| denied(error))?;
             let bytes = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                .map_err(denied)?;
-            let record = receipts::Record::decode(&bytes).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            let record = receipts::Record::decode(&bytes).map_err(|error| denied(error))?;
             if terminal {
                 validate_terminal_stage(
                     &record,
@@ -4099,10 +4147,10 @@ pub(crate) mod native {
                     Use::Cleanup,
                 )
             }
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(bytes)
         }
         fn inspect_for<T>(&self, terminal: bool, inspect: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -4111,7 +4159,8 @@ pub(crate) mod native {
                 succeeded: false,
             };
             let before = self.revision(terminal)?;
-            let mut absence = OriginalUniverse::new(&self.runtime, &self.image).map_err(denied)?;
+            let mut absence =
+                OriginalUniverse::new(&self.runtime, &self.image).map_err(|error| denied(error))?;
             let result = self
                 .original
                 .inspect(&self.scope, &mut absence, || {
@@ -4150,7 +4199,7 @@ pub(crate) mod native {
                     }
                     .map_err(|_| creators::Error::Conflict)
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if self.revision(terminal)? != before {
                 return Err(Error::Conflict);
             }
@@ -4177,7 +4226,7 @@ pub(crate) mod native {
             };
             fence
                 .verify_original_terminal(&self.scope)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let mut retained = self
                 .adapter_reference
                 .try_borrow_mut()
@@ -4200,7 +4249,7 @@ pub(crate) mod native {
                     }
                     fence.verify_original_terminal(&self.scope)
                 })
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
         /// Factual once-release receipt only; no SDK or native effect. The full
         /// outer Retired native bracket and exact Pair/Calling stay mandatory.
@@ -4219,7 +4268,7 @@ pub(crate) mod native {
             };
             fence
                 .verify_original_terminal(&self.scope)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let retained = self
                 .adapter_reference
                 .try_borrow()
@@ -4235,7 +4284,7 @@ pub(crate) mod native {
                     original.verify_closed_reference_in_terminal(&self.scope, closed, ack)?;
                     fence.verify_original_terminal(&self.scope)
                 })
-                .map_err(denied)
+                .map_err(|error| denied(error))
         }
         /// SAME originating C capability only. Native closed ACK/full absence
         /// and precise protected cleanup stage are still verified by inspect.
@@ -4264,7 +4313,8 @@ pub(crate) mod native {
             // to live/Closing inventory. This raw-C query supplies no member
             // authority; the nested terminal reader authenticates their exact
             // originals and queries the FULL mixed provider universe itself.
-            let mut absence = OriginalUniverse::new(&self.runtime, &self.image).map_err(denied)?;
+            let mut absence =
+                OriginalUniverse::new(&self.runtime, &self.image).map_err(|error| denied(error))?;
             let result = self
                 .original
                 .inspect(&mut absence, |carrier| {
@@ -4312,7 +4362,7 @@ pub(crate) mod native {
                         )
                         .map_err(|_| creators::Error::Conflict)
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if self.terminal_revision()? != before {
                 return Err(Error::Conflict);
             }
@@ -4327,7 +4377,7 @@ pub(crate) mod native {
             inspect: impl FnOnce(&[carrier_members::ClosedMemberBinding]) -> Result<T>,
         ) -> Result<T> {
             let before = self.terminal_revision()?;
-            let history = self.history.snapshot().map_err(denied)?;
+            let history = self.history.snapshot().map_err(|error| denied(error))?;
             let result = inspect(&history)?;
             if self.terminal_revision()? != before {
                 return Err(Error::Conflict);
@@ -4337,13 +4387,15 @@ pub(crate) mod native {
         fn terminal_revision(&self) -> Result<Vec<u8>> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.image
+                .verify_runtime(&self.runtime)
+                .map_err(|error| denied(error))?;
             let bytes = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                .map_err(denied)?;
-            let record = receipts::Record::decode(&bytes).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            let record = receipts::Record::decode(&bytes).map_err(|error| denied(error))?;
             validate_retired_read_stage(
                 &record,
                 &self.scope.context,
@@ -4351,10 +4403,10 @@ pub(crate) mod native {
                 self.scope.generation,
                 RetiredReadStage::Terminal,
             )
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(bytes)
         }
         /// Final cleanup comparison bindings from BOTH actual closed histories.
@@ -4403,7 +4455,7 @@ pub(crate) mod native {
                                 .map_err(|_| crate::member_carrier::CarrierError::Conflict)
                         },
                     )
-                    .map_err(denied)
+                    .map_err(|error| denied(error))
             })
         }
         /// Factual original histories ONLY while the caller holds this retired
@@ -4415,7 +4467,7 @@ pub(crate) mod native {
             let before = self.revision()?;
             // This is a lease over the exact outer SDK-bracketed callback, not
             // a nested inventory/Retired read. Facts vanish on Err/unwind.
-            let history = self.history.snapshot().map_err(denied)?;
+            let history = self.history.snapshot().map_err(|error| denied(error))?;
             let value = inspect(&history)?;
             if self.revision()? != before {
                 return Err(Error::Conflict);
@@ -4425,13 +4477,15 @@ pub(crate) mod native {
         fn revision(&self) -> Result<Vec<u8>> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
-            self.image.verify_runtime(&self.runtime).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            self.image
+                .verify_runtime(&self.runtime)
+                .map_err(|error| denied(error))?;
             let bytes = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
-                .map_err(denied)?;
-            let record = receipts::Record::decode(&bytes).map_err(denied)?;
+                .map_err(|error| denied(error))?;
+            let record = receipts::Record::decode(&bytes).map_err(|error| denied(error))?;
             validate_retired_read_stage(
                 &record,
                 &self.scope.context,
@@ -4439,10 +4493,10 @@ pub(crate) mod native {
                 self.scope.generation,
                 RetiredReadStage::Cleanup,
             )
-            .map_err(denied)?;
+            .map_err(|error| denied(error))?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             Ok(bytes)
         }
         /// Bracket the caller's factual WFP read with SAME actual opaque closed
@@ -4462,9 +4516,9 @@ pub(crate) mod native {
             };
             let before = self.revision()?;
             let mut absence = OriginalUniverse::new(&self.runtime, &self.image)
-                .map_err(denied)?
+                .map_err(|error| denied(error))?
                 .with_members(self.members.read_pin())
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let result = self
                 .original
                 .inspect(&mut absence, |facts| {
@@ -4477,7 +4531,7 @@ pub(crate) mod native {
                     }
                     Ok(result)
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             // The factual postflight itself is expensive and must remain inside
             // the SAME watchdog/protected revision, after the callback fence.
             if before != self.revision()? {
@@ -4536,7 +4590,7 @@ pub(crate) mod native {
                     }
                     Ok(())
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let mut owner = self.shared.borrow()?;
             owner.verify_supervised()?;
             let native_before = owner.current(Use::Cleanup)?;
@@ -4550,20 +4604,20 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             pair.verify_cleanup_entry_for(&owner.runtime, &context, expected)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let canonical = owner
                 .runtime
                 .native_files_for_original(&context, files)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let pair_payload = owner
                 .runtime
                 .record(&context, RecordKind::Pair)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if crate::windows::member_carrier_pair_store::carrier_payload(
                 &context.intent.scope,
                 &pair_payload,
             )
-            .map_err(denied)?
+            .map_err(|error| denied(error))?
             .as_ref()
                 != Some(expected)
             {
@@ -4586,12 +4640,12 @@ pub(crate) mod native {
                         Ok(())
                     },
                 )
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let supervisor = owner.gate.supervisor().clone();
             let calling = owner
                 .supervisor
                 .transaction_pin(&supervisor, &context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             owner
                 .created_cleanup_writes
                 .try_reserve(1)
@@ -4610,16 +4664,16 @@ pub(crate) mod native {
             owner.created_cleanup_writes.push(issuer.clone()); // BEFORE every fallible postflight
             let postflight = (|| {
                 pair.verify_cleanup_entry_for(&owner.runtime, &context, expected)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if owner
                     .runtime
                     .record(&context, RecordKind::Pair)
-                    .map_err(denied)?
+                    .map_err(|error| denied(error))?
                     != pair_payload
                     || !owner
                         .runtime
                         .native_files_for_original(&context, files)
-                        .map_err(denied)?
+                        .map_err(|error| denied(error))?
                         .read_identity()
                         .same_original(&issuer.backend)
                     || owner.current(Use::Cleanup)? != native_before
@@ -4630,8 +4684,8 @@ pub(crate) mod native {
                 issuer
                     .calling
                     .verify(&issuer.supervisor, &context)
-                    .map_err(denied)?;
-                issuer.root.admit().map_err(denied)
+                    .map_err(|error| denied(error))?;
+                issuer.root.admit().map_err(|error| denied(error))
             })();
             if postflight.is_err() {
                 issuer.root.fail();
@@ -4675,28 +4729,28 @@ pub(crate) mod native {
                     }
                     Ok(facts.initial_record().clone())
                 })
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let mut owner = self.shared.borrow()?;
             owner.verify_supervised()?;
             let native_before = owner.current(Use::Cleanup)?;
             let context = owner.scope.context.clone();
             super::compare_early_cleanup_storage_context(&context, expected, &initial.binding)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             pair.verify_cleanup_entry_for(&owner.runtime, &context, expected)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let canonical = owner
                 .runtime
                 .native_files_for_original(&context, files)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             let pair_payload = owner
                 .runtime
                 .record(&context, RecordKind::Pair)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             if crate::windows::member_carrier_pair_store::carrier_payload(
                 &context.intent.scope,
                 &pair_payload,
             )
-            .map_err(denied)?
+            .map_err(|error| denied(error))?
             .as_ref()
                 != Some(expected)
             {
@@ -4706,7 +4760,7 @@ pub(crate) mod native {
             let calling = owner
                 .supervisor
                 .transaction_pin(&supervisor, &context)
-                .map_err(denied)?;
+                .map_err(|error| denied(error))?;
             owner
                 .initial_cleanup_writes
                 .try_reserve(1)
@@ -4745,18 +4799,18 @@ pub(crate) mod native {
                         }
                         Ok(())
                     })
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 pair.verify_cleanup_entry_for(&owner.runtime, &context, expected)
-                    .map_err(denied)?;
+                    .map_err(|error| denied(error))?;
                 if owner
                     .runtime
                     .record(&context, RecordKind::Pair)
-                    .map_err(denied)?
+                    .map_err(|error| denied(error))?
                     != pair_payload
                     || !owner
                         .runtime
                         .native_files_for_original(&context, files)
-                        .map_err(denied)?
+                        .map_err(|error| denied(error))?
                         .read_identity()
                         .same_original(&issuer.origin.backend)
                     || owner.current(Use::Cleanup)? != native_before
@@ -4768,8 +4822,8 @@ pub(crate) mod native {
                     .origin
                     .calling
                     .verify(&issuer.origin.supervisor, &context)
-                    .map_err(denied)?;
-                issuer.origin.root.admit().map_err(denied)
+                    .map_err(|error| denied(error))?;
+                issuer.origin.root.admit().map_err(|error| denied(error))
             })();
             if postflight.is_err() {
                 issuer.origin.root.fail();
@@ -4923,8 +4977,14 @@ pub(crate) mod native {
                 original,
                 Error::Conflict,
             )?;
-            owner.runtime.verify(&owner.scope.context).map_err(denied)?;
-            owner.image.verify_runtime(&owner.runtime).map_err(denied)?;
+            owner
+                .runtime
+                .verify(&owner.scope.context)
+                .map_err(|error| denied(error))?;
+            owner
+                .image
+                .verify_runtime(&owner.runtime)
+                .map_err(|error| denied(error))?;
             let revision = || match stage {
                 RetiredReadStage::Cleanup => original.revision(),
                 RetiredReadStage::Terminal => original.terminal_revision(),
@@ -5054,7 +5114,15 @@ pub(crate) mod native {
         // Present ONLY while the SAME original borrow covers the full row call.
         active_row_role: Option<rows::Role>,
     }
+    #[track_caller]
     fn denied<E>(_: E) -> Error {
+        #[cfg(test)]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                "runtime denied caller={}",
+                std::panic::Location::caller()
+            ));
+        }
         Error::Conflict
     }
 

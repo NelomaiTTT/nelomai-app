@@ -92,19 +92,6 @@ pub(crate) enum CarrierError {
     Deadline,
 }
 pub(crate) type Result<T> = std::result::Result<T, CarrierError>;
-pub(crate) trait CarrierJournal {
-    /// Keyed by the full scope-derived carrier identity, under the serialized
-    /// privileged owner. Native storage must authenticate private ancestry,
-    /// runtime, boot and epoch; no IPC path or unprotected storage fallback.
-    fn load(&mut self, key: &CarrierKey) -> Result<Option<Record>>;
-    /// Atomic, durable CAS. An error may mean a committed write with lost ACK.
-    fn compare_exchange(
-        &mut self,
-        key: &CarrierKey,
-        expected: Option<&Record>,
-        desired: &Record,
-    ) -> Result<()>;
-}
 pub(crate) fn carrier_key(scope: &SessionScope) -> Result<CarrierKey> {
     if !scope.validate() {
         return Err(CarrierError::Invalid);
