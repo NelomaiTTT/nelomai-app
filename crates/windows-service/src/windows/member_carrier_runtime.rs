@@ -3768,18 +3768,6 @@ pub(crate) mod native {
         ) -> Result<T> {
             self.inspect_window_for_row(None, inspect)
         }
-        /// Exact pending C weak-row callback ONLY. It exports comparison facts,
-        /// not an ordinary source/WFP allow grant. Protected target + actual
-        /// before-or-applied full SDK row and SAME original ACK bracket callback;
-        /// concrete G separately requires bases/no-permits/network ordering.
-        pub(crate) fn inspect_row_effect<T>(
-            &self,
-            binding: &rows::Binding,
-            target: &rows::Target,
-            inspect: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
-        ) -> Result<T> {
-            self.inspect_bindings_for_row(Some((binding, target)), inspect)
-        }
         /// The EXISTING exact pending C-row observation with its opaque
         /// read-only window, not an ordinary live-source/effect grant.
         pub(crate) fn inspect_row_effect_window<T>(

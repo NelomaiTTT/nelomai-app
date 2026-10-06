@@ -384,7 +384,7 @@ fn compare_row_effect(
         || &pending.target != target
         || &row_target(record, ack) != target
         || pending.before != ack.current
-        || actual != &pending.before
+        || !rows::same_owned(actual, &pending.before)
         || ack.baseline.interface.policy.forwarding
         || ack.baseline.interface.policy.advertising
         || ack.baseline.interface.policy.weak_host_send

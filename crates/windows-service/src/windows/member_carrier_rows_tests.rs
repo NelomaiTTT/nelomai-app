@@ -2802,6 +2802,8 @@ impl Kernel for Fake {
         } else {
             s.ip.SitePrefixLength
         };
+        next.MaxReassemblySize = observed.max_reassembly_size;
+        next.InterfaceIdentifier = observed.interface_identifier;
         next.MinRouterAdvertisementInterval = observed.min_router_advertisement_interval;
         next.MaxRouterAdvertisementInterval = observed.max_router_advertisement_interval;
         next.Connected = observed.connected;
@@ -3156,11 +3158,20 @@ fn readonly_expected() -> Snapshot {
 }
 #[test]
 fn readonly_original_snapshot_returns_complete_decoded_rows_without_owner_or_effects() {
-    let mut sdk = ReadonlySdk::new();
-    let snapshot = read_original_snapshot_with(&mut sdk, &binding());
-    sdk.assert_no_effects();
-    assert_eq!(snapshot, Ok(readonly_expected()));
-    assert_eq!(sdk.reads, ["identity", "interface", "address", "identity"]);
+    for (size, identifier) in [(0, 0), (65535, 123456789), (u32::MAX, u64::MAX)] {
+        let mut sdk = ReadonlySdk::new();
+        let raw = sdk.interface.as_mut().unwrap();
+        raw.MaxReassemblySize = size;
+        raw.InterfaceIdentifier = identifier;
+        let mut expected = readonly_expected();
+        expected.interface.observed.max_reassembly_size = size;
+        expected.interface.observed.interface_identifier = identifier;
+        expected.validate(&binding()).unwrap();
+        let snapshot = read_original_snapshot_with(&mut sdk, &binding());
+        sdk.assert_no_effects();
+        assert_eq!(snapshot, Ok(expected));
+        assert_eq!(sdk.reads, ["identity", "interface", "address", "identity"]);
+    }
 }
 #[test]
 fn readonly_original_snapshot_absence_is_factual_and_still_checks_final_identity() {
@@ -3299,14 +3310,12 @@ fn readonly_original_snapshot_rejects_invalid_binding_before_sdk_reads() {
 }
 #[test]
 fn readonly_original_snapshot_rejects_unsupported_sdk_rows_through_real_decoder() {
-    for case in 0..8 {
+    for case in 0..6 {
         let mut sdk = ReadonlySdk::new();
         match case {
             0 => sdk.interface.as_mut().unwrap().Family = AF_INET6,
-            1 => sdk.interface.as_mut().unwrap().MaxReassemblySize = 1,
-            2 => sdk.interface.as_mut().unwrap().InterfaceIdentifier = 1,
-            3 => sdk.interface.as_mut().unwrap().RouterDiscoveryBehavior = 6500,
-            4 => {
+            1 => sdk.interface.as_mut().unwrap().RouterDiscoveryBehavior = 6500,
+            2 => {
                 sdk.address
                     .as_mut()
                     .unwrap()
@@ -3316,7 +3325,7 @@ fn readonly_original_snapshot_rejects_unsupported_sdk_rows_through_real_decoder(
                     .Ipv4
                     .sin_family = AF_INET6
             }
-            5 => {
+            3 => {
                 sdk.address
                     .as_mut()
                     .unwrap()
@@ -3326,7 +3335,7 @@ fn readonly_original_snapshot_rejects_unsupported_sdk_rows_through_real_decoder(
                     .Ipv4
                     .sin_port = 53
             }
-            6 => sdk.address.as_mut().unwrap().as_mut().unwrap().DadState = 5,
+            4 => sdk.address.as_mut().unwrap().as_mut().unwrap().DadState = 5,
             _ => {
                 sdk.address
                     .as_mut()
@@ -5182,7 +5191,7 @@ fn readiness_full_address_policy_and_stable_row_identity_cannot_drift_between_po
 }
 #[test]
 fn readiness_full_interface_policy_is_reconstructed_not_a_logical_weak_host_projection() {
-    let mutations: [fn(&mut MIB_IPINTERFACE_ROW); 25] = [
+    let mutations: [fn(&mut MIB_IPINTERFACE_ROW); 24] = [
         |r| r.AdvertisingEnabled = !r.AdvertisingEnabled,
         |r| r.ForwardingEnabled = !r.ForwardingEnabled,
         |r| r.WeakHostSend = !r.WeakHostSend,
@@ -5207,7 +5216,6 @@ fn readiness_full_interface_policy_is_reconstructed_not_a_logical_weak_host_proj
         |r| unsafe { r.InterfaceLuid.Value += 1 },
         |r| r.InterfaceIndex += 1,
         |r| r.Family = AF_INET6,
-        |r| r.MaxReassemblySize = 1,
     ];
     for (i, mutate) in mutations.into_iter().enumerate() {
         let fake = Fake::new();
@@ -5251,6 +5259,8 @@ fn readiness_preserves_volatile_native_observations_without_granting_write_permi
         s.ip.ReachableTime += 1;
         s.ip.TransmitOffload._bitfield ^= 1;
         s.ip.ReceiveOffload._bitfield ^= 1;
+        s.ip.MaxReassemblySize = u32::MAX;
+        s.ip.InterfaceIdentifier = u64::MAX;
     });
     assert!(owner
         .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
@@ -5260,6 +5270,8 @@ fn readiness_preserves_volatile_native_observations_without_granting_write_permi
     let row = owner.snapshot().unwrap().interface;
     assert!(!row.observed.connected);
     assert_eq!(row.observed.reachable_time, 32124);
+    assert_eq!(row.observed.max_reassembly_size, u32::MAX);
+    assert_eq!(row.observed.interface_identifier, u64::MAX);
     owner.stop().unwrap();
 }
 #[test]
@@ -5436,6 +5448,11 @@ fn readiness_store_ack_failure_is_not_redeemed_by_exact_bytes_or_created_receipt
 fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
     for site_prefix in [0, 64] {
         let fake = Fake::new();
+        {
+            let mut s = fake.0.borrow_mut();
+            s.ip.MaxReassemblySize = u32::MAX;
+            s.ip.InterfaceIdentifier = u64::MAX;
+        }
         if site_prefix == 64 {
             let mut s = fake.0.borrow_mut();
             s.ip.SitePrefixLength = 64;
@@ -5445,6 +5462,8 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
         let mut owner = fake.owner();
         let baseline = owner.snapshot().unwrap();
         assert_eq!(baseline.interface.observed.transmit_offload, 0xa5);
+        assert_eq!(baseline.interface.observed.max_reassembly_size, u32::MAX);
+        assert_eq!(baseline.interface.observed.interface_identifier, u64::MAX);
         assert!(baseline.address.is_none());
         let mut desired = baseline.interface.policy.clone();
         desired.weak_host_send = true;
@@ -5470,6 +5489,18 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
         assert_eq!(saved.phase, Phase::Stopped);
         assert!(saved.pending.is_none());
         assert_eq!(saved.current.interface.policy, baseline.interface.policy);
+        assert_eq!(
+            saved.baseline.interface.observed,
+            baseline.interface.observed
+        );
+        assert_eq!(
+            saved.current.interface.observed.max_reassembly_size,
+            u32::MAX
+        );
+        assert_eq!(
+            saved.current.interface.observed.interface_identifier,
+            u64::MAX
+        );
         assert_eq!(
             saved.baseline.interface.policy.site_prefix_length,
             site_prefix
@@ -5872,7 +5903,10 @@ fn full_address_codec_preserves_policy_and_separate_observed_dad_timestamp() {
 }
 #[test]
 fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
-    let row = decode_interface(&interface_raw()).unwrap();
+    let mut raw = interface_raw();
+    raw.MaxReassemblySize = u32::MAX;
+    raw.InterfaceIdentifier = u64::MAX;
+    let row = decode_interface(&raw).unwrap();
     assert_eq!(
         row.policy,
         InterfacePolicy {
@@ -5904,8 +5938,8 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
     assert_eq!(
         row.observed,
         InterfaceObserved {
-            max_reassembly_size: 0,
-            interface_identifier: 0,
+            max_reassembly_size: u32::MAX,
+            interface_identifier: u64::MAX,
             min_router_advertisement_interval: 200,
             max_router_advertisement_interval: 600,
             connected: true,
@@ -5981,11 +6015,9 @@ fn address_codec_rejects_unknown_origins_family_and_unsupported_sockaddr_attribu
 }
 #[test]
 fn interface_codec_rejects_sentinels_reserved_unknown_fields_and_v6() {
-    let cases: [fn(&mut MIB_IPINTERFACE_ROW); 6] = [
+    let cases: [fn(&mut MIB_IPINTERFACE_ROW); 4] = [
         |r| r.RouterDiscoveryBehavior = -1,
         |r| r.LinkLocalAddressBehavior = 6500,
-        |r| r.InterfaceIdentifier = 1,
-        |r| r.MaxReassemblySize = 1,
         |r| r.Family = 23,
         |r| r.InterfaceIndex = 0,
     ];
@@ -6008,13 +6040,23 @@ fn writable_inputs_preserve_every_policy_field_but_never_write_dad_or_readonly_o
     assert_eq!(encoded.CreationTimeStamp, 0);
     assert_eq!(unsafe { encoded.ScopeId.Anonymous.Value }, 0);
     assert_eq!(decode_address(&encoded).unwrap().policy, address.policy);
-    let row = decode_interface(&interface_raw()).unwrap();
-    let encoded = interface_input(MIB_IPINTERFACE_ROW::default(), row.key, &row.policy).unwrap();
+    let mut raw = interface_raw();
+    raw.MaxReassemblySize = u32::MAX;
+    raw.InterfaceIdentifier = u64::MAX;
+    let row = decode_interface(&raw).unwrap();
+    let initialized = MIB_IPINTERFACE_ROW {
+        MaxReassemblySize: 65535,
+        InterfaceIdentifier: 123456789,
+        ..Default::default()
+    };
+    let encoded = interface_input(initialized, row.key, &row.policy).unwrap();
     assert_eq!(decode_interface(&encoded).unwrap().policy, row.policy);
     assert!(!encoded.Connected);
     assert_eq!(encoded.ReachableTime, 0);
     assert_eq!(encoded.TransmitOffload._bitfield, 0);
     assert_eq!(encoded.MinRouterAdvertisementInterval, 0);
+    assert_eq!(encoded.MaxReassemblySize, initialized.MaxReassemblySize);
+    assert_eq!(encoded.InterfaceIdentifier, initialized.InterfaceIdentifier);
 }
 #[test]
 fn readonly_and_unsupported_deltas_fail_capability_instead_of_silently_omitting() {

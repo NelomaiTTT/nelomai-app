@@ -3635,7 +3635,8 @@ fn rows_actual_protected_reads_reject_unknown_nullable_schema_and_outer_fields()
                     outer["version"] = 3.into();
                 }
                 _ => {
-                    inner["baseline"]["interface"]["observed"]["interface_identifier"] = 123.into();
+                    inner["baseline"]["interface"]["observed"]["interface_identifier"] =
+                        (-1_i64).into();
                 }
             }
             outer["data"] = serde_json::to_string(&inner).unwrap().into();

@@ -1350,45 +1350,6 @@ pub(crate) mod native {
         result
     }
 
-    // Native test harness only: actual unvalidated observations are diagnostic
-    // facts, never creator or effect authority. Normal consumers use inspect_all.
-    #[cfg(test)]
-    pub(crate) fn diagnostic_snapshot() -> Result<Vec<Device>> {
-        // Private native test harness only; no validation or effect authority.
-        Ok(device_snapshot(&[])?.nodes)
-    }
-    #[cfg(test)]
-    pub(crate) fn diagnostic_devices(identities: &[Identity]) -> Result<Vec<Device>> {
-        let wants = identities
-            .iter()
-            .map(|identity| Expected {
-                guid: identity.guid,
-                luid: identity.luid,
-                index: identity.index,
-                name: identity.name.clone(),
-                description: identity.description.clone(),
-                if_type: identity.if_type,
-                tunnel_type: identity.tunnel_type,
-            })
-            .collect::<Vec<_>>();
-        for want in &wants {
-            validate_expected(want)?;
-        }
-        if wants.is_empty() || wants.len() > 3 {
-            return Err(Error::Invalid("diagnostic universe bound"));
-        }
-        let targets = wants.iter().map(target).collect::<Vec<_>>();
-        device_snapshot(&targets)?
-            .nodes
-            .into_iter()
-            .filter_map(|d| match device_related(&targets, &d) {
-                Ok(true) => Some(Ok(d)),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            })
-            .collect()
-    }
-
     fn last(api: &'static str) -> Error {
         Error::Native(api, unsafe { GetLastError() })
     }

@@ -1502,7 +1502,6 @@ pub(crate) mod native {
             member_carrier_payload::native::{MemberSource, WintunSource},
             member_carrier_preload::native::WintunPreload,
             member_carrier_provider::{self as provider, ExpectedProvider, ProviderKind},
-            member_carrier_ready::native::{NativeCarrierRoot, PrepublicationTerminalRead},
             member_carrier_runtime::native::{
                 NativeBindingsWindow, NativeClosingRead, NativeSourceRead,
             },
@@ -1530,39 +1529,6 @@ pub(crate) mod native {
     pub(crate) type PartialCleanup = PartialMemberCleanup<MemberFiles, NativeMemberIo<MemberFiles>>;
     type Receipt<'a> = PrecreationReceipt<'a, keys::Held<win32::Handle>, KeyLock>;
     type RawOwner = MemberOwner<MemberFiles, NativeMemberIo<MemberFiles>>;
-
-    fn inspect_unstarted_terminal_carrier<T>(
-        carrier: &mut NativeCarrierRoot<'_>,
-        pair: &Rc<NativePairIntentRead>,
-        expected: &PairRecord,
-        envelope: &Closing12Envelope<'_>,
-        inspect: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
-        carrier.verify_member_terminal_original_inputs(
-            envelope.runtime,
-            envelope.context,
-            envelope.carrier,
-            envelope.supervisor,
-        )?;
-        let result = match carrier.pregraph_terminal_read()? {
-            PrepublicationTerminalRead::Published(original) => {
-                if !Rc::ptr_eq(&original, &carrier.retired_pin()?) {
-                    return Err(Error::Conflict);
-                }
-                carrier.inspect_pregraph_terminal_in_call(pair, expected, |_| inspect())?
-            }
-            PrepublicationTerminalRead::Unpublished(_) => {
-                carrier.inspect_unpublished_terminal_in_call(pair, expected, inspect)?
-            }
-        };
-        carrier.verify_member_terminal_original_inputs(
-            envelope.runtime,
-            envelope.context,
-            envelope.carrier,
-            envelope.supervisor,
-        )?;
-        Ok(result)
-    }
 
     struct NeverNativeRegistry(win32::Kernel);
     impl NeverRegistryRead for NeverNativeRegistry {
@@ -1781,23 +1747,6 @@ pub(crate) mod native {
         pub(crate) fn verify_original_read(&self, reader: &NativeMemberRead) -> Result<()> {
             self.verify_original(
                 &self.ticket,
-                &self.origin.never_effects,
-                &self.origin.runtime,
-                &self.origin.context,
-            )?;
-            self.registration
-                .verify_original_read(reader)
-                .map_err(owner_error)
-        }
-        /// Combined exact-ticket + actual new-reader comparison for a raw row
-        /// registration callback. No private/native/Runtime/Source/SDK query.
-        pub(crate) fn verify_replacement_read(
-            &self,
-            ticket: &Rc<NativeMemberPreparationGeneration>,
-            reader: &NativeMemberRead,
-        ) -> Result<()> {
-            self.verify_original(
-                ticket,
                 &self.origin.never_effects,
                 &self.origin.runtime,
                 &self.origin.context,
@@ -3344,29 +3293,7 @@ pub(crate) mod native {
             closing: Option<&NativeClosingRead>,
             lock: &mut KeyLock,
         ) -> Result<()> {
-            self.uncaptured_inner(pair, expected, slot, closing, None, lock)
-                .map_err(pending_unknown)
-        }
-        /// Separate actual Closing12/pending FullEmpty lane for a genuinely
-        /// never-prepared slot. Actual C first-close origin + full SDK remains
-        /// mandatory even if its Pair carrier identity was never published.
-        pub(crate) fn verify_closing12_uncaptured_member_absent(
-            &self,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            slot: TunnelSlot,
-            carrier: &mut NativeCarrierRoot<'_>,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            self.history.uncaptured(slot_index(slot))?;
-            validate_closing12_unstarted(&self.input.context, expected, slot, None)?;
-            if expected.members[slot_index(slot)].is_some() || !self.history.carrier_attempted.get()
-            {
-                return Err(Error::Conflict);
-            }
-            // Keep the ordinary API incapable of supplying terminal C roots.
-            // This exact separate branch is consumed by uncaptured_inner.
-            self.uncaptured_inner(pair, expected, slot, None, Some((pair, carrier)), lock)
+            self.uncaptured_inner(pair, expected, slot, closing, lock)
                 .map_err(pending_unknown)
         }
         fn uncaptured_inner(
@@ -3375,7 +3302,6 @@ pub(crate) mod native {
             expected: &PairRecord,
             slot: TunnelSlot,
             closing: Option<&NativeClosingRead>,
-            terminal: Option<(&Rc<NativePairIntentRead>, &mut NativeCarrierRoot<'_>)>,
             lock: &KeyLock,
         ) -> Result<()> {
             let index = slot_index(slot);
@@ -3383,46 +3309,6 @@ pub(crate) mod native {
             validate_never_member_frame(&self.input.context, expected, slot)?;
             if expected.members[index].is_some() {
                 return Err(Error::Conflict);
-            }
-            if let Some((original_pair, carrier)) = terminal {
-                if closing.is_some() || !std::ptr::eq(pair, Rc::as_ptr(original_pair)) {
-                    return Err(Error::Conflict);
-                }
-                validate_closing12_unstarted(&self.input.context, expected, slot, None)?;
-                if !self.history.carrier_attempted.get() {
-                    return Err(Error::Pending);
-                }
-                let envelope = Closing12Envelope {
-                    context: &self.input.context,
-                    runtime: &self.input.runtime,
-                    source: &self.input.source,
-                    carrier: &self.input.carrier,
-                    supervisor: &self.input.supervisor,
-                };
-                let before = envelope.verify(pair, expected, slot, None, lock)?;
-                inspect_unstarted_terminal_carrier(
-                    carrier,
-                    original_pair,
-                    expected,
-                    &envelope,
-                    || {
-                        for _ in 0..2 {
-                            self.history.uncaptured(index)?;
-                            self.file_absence(slot)?;
-                            self.services_absent(slot)?;
-                            self.key_fact(index + 1)?;
-                            if envelope.verify(pair, expected, slot, None, lock)? != before {
-                                return Err(Error::Conflict);
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
-                self.history.uncaptured(index)?;
-                if envelope.verify(pair, expected, slot, None, lock)? != before {
-                    return Err(Error::Conflict);
-                }
-                return Ok(());
             }
             if expected.stop_stage == 12 && self.history.carrier_attempted.get() {
                 return Err(Error::Pending); // Ordinary live-C sampler is never terminal authority.
@@ -3487,76 +3373,6 @@ pub(crate) mod native {
                 }
             }
             self.history.uncaptured(index)
-        }
-    }
-
-    /// Only readonly current origin/fences. A never-prepared slot supplies no
-    /// fabricated Intent/member record/ACK; actual prepared owners separately
-    /// supply their immutable original intent and private pending capability.
-    struct Closing12Envelope<'a> {
-        context: &'a Context,
-        runtime: &'a RuntimeRead,
-        source: &'a Rc<MemberSource>,
-        carrier: &'a Rc<WintunSource>,
-        supervisor: &'a Rc<NativeDeadline>,
-    }
-    impl Closing12Envelope<'_> {
-        fn verify(
-            &self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            slot: TunnelSlot,
-            original: Option<&Intent>,
-            lock: &KeyLock,
-        ) -> Result<Vec<u8>> {
-            validate_closing12_unstarted(self.context, expected, slot, original)?;
-            let deadline = self.supervisor.read_pin().map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_runtime_call(self.supervisor, self.runtime, self.context)
-                .map_err(|_| Error::Conflict)?;
-            if !self.runtime.matches_lock(lock) || !self.source.matches_carrier(self.carrier) {
-                return Err(Error::Conflict);
-            }
-            self.runtime.verify_source(self.carrier)?;
-            self.runtime
-                .verify_member_source(self.context, self.source)?;
-            if let Some(intent) = original {
-                self.runtime
-                    .verify_member_intent(self.context, self.source, intent)?;
-            }
-            let bytes = self
-                .runtime
-                .record(self.context, RecordKind::NativeCarrierReceipts)?;
-            let native = keys_record::Record::decode(&bytes)?;
-            super::super::member_carrier_runtime::validate_terminal_stage(
-                &native,
-                self.context,
-                &self.context.bindings[0],
-                1,
-            )?; // Shape/fence only; actual C close origin is independently required.
-            for kind in [
-                RecordKind::Network,
-                RecordKind::MemberARows,
-                RecordKind::MemberBRows,
-            ] {
-                if self.runtime.optional_record(self.context, kind)?.is_some() {
-                    return Err(Error::Pending);
-                }
-            }
-            pair.inspect_cleanup_effect(self.runtime, self.supervisor, expected, 12, |_| Ok(()))
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(self.supervisor, self.context)
-                .map_err(|_| Error::Conflict)?;
-            if !self.runtime.matches_lock(lock)
-                || self
-                    .runtime
-                    .record(self.context, RecordKind::NativeCarrierReceipts)?
-                    != bytes
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(bytes)
         }
     }
 
@@ -4122,147 +3938,6 @@ pub(crate) mod native {
         ) -> Result<()> {
             self.verify_unstarted_absent_inner(pair, expected, closing, lock)
                 .map_err(pending_unknown)
-        }
-        /// Disjoint partial-C Closing12/pending FullEmpty channel. SAME actual
-        /// prepared owner/current pending capability and the original retained
-        /// C terminal SDK bracket are mandatory. Not an attached controller,
-        /// imported Prepared record, synthetic Stopped projection or effect.
-        pub(crate) fn verify_closing12_unstarted_absent(
-            &mut self,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            carrier: &mut NativeCarrierRoot<'_>,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            self.verify_closing12_unstarted_absent_inner(pair, expected, carrier, lock)
-                .map_err(pending_unknown)
-        }
-        fn verify_closing12_unstarted_absent_inner(
-            &mut self,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            carrier: &mut NativeCarrierRoot<'_>,
-            lock: &KeyLock,
-        ) -> Result<()> {
-            let origin = &self.origin;
-            let index = slot_index(origin.intent.slot);
-            if self.live_source.is_some()
-                || self.live_preparation.is_some()
-                || origin.generation != 1
-                || origin.replacement.is_some()
-                || !origin.never_effects.matches(
-                    &origin.context,
-                    &origin.runtime,
-                    &origin.source,
-                    &origin.carrier,
-                    &origin.supervisor,
-                )
-                || origin
-                    .never_effects
-                    .history
-                    .started
-                    .iter()
-                    .any(std::cell::Cell::get)
-                || !origin
-                    .never_effects
-                    .retired
-                    .try_borrow()
-                    .map_err(|_| Error::Conflict)?
-                    .is_empty()
-            {
-                return Err(Error::Pending);
-            }
-            origin
-                .never_effects
-                .history
-                .verify_unstarted_preparation(index, origin.generation)?;
-            let envelope = Closing12Envelope {
-                context: &origin.context,
-                runtime: &origin.runtime,
-                source: &origin.source,
-                carrier: &origin.carrier,
-                supervisor: &origin.supervisor,
-            };
-            let native = envelope.verify(
-                pair,
-                expected,
-                origin.intent.slot,
-                Some(&origin.intent),
-                lock,
-            )?;
-            let state = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            if state.retained.is_none() {
-                state.retained = Some(RetainedMember::new(state.raw.take().ok_or(Error::Retired)?));
-            }
-            if state.pending.is_none() {
-                state.pending = Some(
-                    state
-                        .retained
-                        .as_ref()
-                        .ok_or(Error::Retired)?
-                        .pending_read()
-                        .map_err(owner_error)?,
-                );
-            }
-            let member = state.retained.as_ref().ok_or(Error::Retired)?;
-            let pending = state.pending.as_mut().ok_or(Error::Retired)?;
-            member
-                .verify_readonly_native_profile()
-                .map_err(owner_error)?;
-            if member
-                .verify_terminal_unstarted_registration(pending)
-                .map_err(owner_error)?
-                != origin.intent
-            {
-                return Err(Error::Conflict);
-            }
-            inspect_unstarted_terminal_carrier(carrier, pair, expected, &envelope, || {
-                let before = pending.read_unstarted_for_cleanup().map_err(owner_error)?;
-                if before.0 != origin.intent || state.prior.as_ref().is_some_and(|p| p != &before.1)
-                {
-                    return Err(Error::Conflict);
-                }
-                state.prior = Some(before.1.clone()); // SAME original predecessor, not an ACK.
-                origin
-                    .never_effects
-                    .history
-                    .verify_unstarted_preparation(index, origin.generation)?;
-                if member
-                    .verify_terminal_unstarted_registration(pending)
-                    .map_err(owner_error)?
-                    != origin.intent
-                    || pending.read_unstarted_for_cleanup().map_err(owner_error)? != before
-                    || envelope.verify(
-                        pair,
-                        expected,
-                        origin.intent.slot,
-                        Some(&origin.intent),
-                        lock,
-                    )? != native
-                {
-                    return Err(Error::Conflict);
-                }
-                Ok(())
-            })?;
-            origin
-                .never_effects
-                .history
-                .verify_unstarted_preparation(index, origin.generation)?;
-            if member
-                .verify_terminal_unstarted_registration(pending)
-                .map_err(owner_error)?
-                != origin.intent
-                || envelope.verify(
-                    pair,
-                    expected,
-                    origin.intent.slot,
-                    Some(&origin.intent),
-                    lock,
-                )? != native
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(())
         }
         fn verify_unstarted_absent_inner(
             &mut self,
@@ -4934,24 +4609,6 @@ pub(crate) mod native {
             token.verify_pending_reader(&owned.pending)?;
             Ok(token.clone())
         }
-        /// Uses only the predecessor read by THIS readonly prepared owner.
-        /// Caller-supplied/equal predecessor JSON is not required or adopted.
-        pub(crate) fn start_prepared(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            receipt: Receipt<'_>,
-        ) -> Result<MemberRecord> {
-            let prior = self
-                .root
-                .owner
-                .as_ref()
-                .ok_or(Error::Retired)?
-                .prior
-                .clone()
-                .ok_or(Error::Pending)?;
-            self.start(pair, expected, receipt, prior.as_ref())
-        }
         /// Read actual SAME retained service/process/NIC proof, independently
         /// of copied Pair/JSON metadata. No metrics or lifecycle rights issued.
         pub(crate) fn observe_original(
@@ -5454,11 +5111,6 @@ pub(crate) mod native {
             }
             owned.forward_read_envelope(pair, expected, lock)?;
             Ok(receipt.running_record().clone()) // DATA backed by this rooted original ACK, not adoption.
-        }
-        /// Comparison DATA for reconciliation after a lost caller postflight.
-        /// Neither accessor creates an original read/Stop/effect capability.
-        pub(crate) fn retained_running(&self) -> Option<&MemberRecord> {
-            self.root.running.as_ref()
         }
         pub(crate) fn retained_stopped(&self) -> Option<&MemberRecord> {
             self.root.stopped.as_ref()

@@ -2883,56 +2883,6 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)?;
             self.verify_module_only_load_read(original, pair, expected, load)
         }
-        /// Current protected creator DATA must match the SAME actual original
-        /// publication ACK/current kernel capture. Missing/equal foreign JSON
-        /// never supplies origin. Only the bounded reader's outer Pair frame.
-        pub(crate) fn verify_module_only_creator_read(
-            &self,
-            original: &Rc<NativeStartupModuleOnlyCandidate>,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-            observed: &[u8],
-        ) -> Result<()> {
-            self.verify_module_only_candidate(original, pair, expected)?;
-            pair.verify_module_only_read_bracket(
-                &self.runtime,
-                &self.supervisor,
-                &self.context,
-                expected,
-            )
-            .map_err(|_| Error::Conflict)?;
-            let creator = self.creator.as_ref().ok_or(Error::Pending)?;
-            // The store and captured publication are retained from from_claim;
-            // current bytes come from this original Runtime's canonical view.
-            if self.creator_store.is_none()
-                || self
-                    .runtime
-                    .record(&self.context, RecordKind::NativeCreator)?
-                    .as_slice()
-                    != observed
-            {
-                return Err(Error::Conflict);
-            }
-            creator
-                .verify_published_read(&self.runtime, &self.context, observed)
-                .map_err(|_| Error::Conflict)?;
-            pair.verify_module_only_read_bracket(
-                &self.runtime,
-                &self.supervisor,
-                &self.context,
-                expected,
-            )
-            .map_err(|_| Error::Conflict)?;
-            if self
-                .runtime
-                .record(&self.context, RecordKind::NativeCreator)?
-                .as_slice()
-                != observed
-            {
-                return Err(Error::Conflict);
-            }
-            self.verify_module_only_candidate(original, pair, expected)
-        }
         /// One full factual read under SAME finite Calling and outer Pair
         /// bracket, followed by positive watchdog rundown. Caller already roots
         /// Startup, loader read and this reader across every Err/unwind.

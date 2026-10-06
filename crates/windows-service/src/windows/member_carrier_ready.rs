@@ -1116,40 +1116,12 @@ pub(crate) mod native {
                 .cloned()
                 .ok_or(CarrierError::Pending)
         }
-        /// Pure original-envelope comparison for the prepared-member terminal
-        /// reader. No files, Authority, Source, SDK or Calling reentry and no
-        /// absence/effect/destructor permission. The outer caller separately
-        /// authenticates its whole Pair/Calling/keys/full terminal SDK bracket.
-        pub(crate) fn verify_member_terminal_original_inputs(
-            &self,
-            runtime: &RuntimeRead,
-            context: &crate::member_carrier_native_ownership::Context,
-            carrier_source: &Rc<WintunSource>,
-            supervisor: &Rc<NativeDeadline>,
-        ) -> Result<()> {
-            let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
-            if self.terminal_attempted
-                || meta.scope.context != *context
-                || !meta.runtime.same_original_runtime(runtime)
-                || !Rc::ptr_eq(&meta.wintun, carrier_source)
-                || !Rc::ptr_eq(&meta.supervisor, supervisor)
-            {
-                return Err(CarrierError::Conflict);
-            }
-            Ok(())
-        }
         /// SAME original once-close factual reader. G retains only a Weak to
         /// this actor-rooted Rc; no lookup, equal replacement or native effect.
         pub(crate) fn retired_pin(&self) -> Result<Rc<RetiredCarrierRead>> {
             // The SAME actor-rooted slot is filled by the actual gate hook
             // inside native AfterClose, not by a later reader constructor.
             self.lifecycle.retired_pin()
-        }
-        pub(crate) fn prepublication_terminal_read(&self) -> Result<PrepublicationTerminalRead> {
-            if self.terminal_attempted || self.source.is_some() || self.lifecycle.attempted() {
-                return Err(CarrierError::Retired);
-            }
-            self.pregraph_terminal_read()
         }
         /// Actual closed origin for an un-upgraded C, including successful
         /// Ready publication before graph attachment. Source is compared by
@@ -1265,11 +1237,6 @@ pub(crate) mod native {
                 .verify_unpublished_closed_original_in_call(&original)
                 .map_err(denied)?;
             Ok(value)
-        }
-        /// Actual SAME source-origin Closing reader, also retained after an
-        /// unsuccessful capture postflight. Getter facts supply no permission.
-        pub(crate) fn closing_pin(&self) -> Result<Rc<NativeClosingRead>> {
-            self.closing.pin()
         }
         /// Acquire ONE original Closing Rc after the actual journal Closing
         /// transition, inside the caller's actual supervised cleanup Calling.
@@ -1984,23 +1951,6 @@ pub(crate) mod native {
                 .map_err(denied)?;
             attempt.completed = true;
             Ok(())
-        }
-        /// Source-independent FACTUAL final reader for a C whose creator
-        /// identity was actually published, but ready Source was not. Caller
-        /// holds whole Closing12 Calling and authenticates its cold prepared /
-        /// no-graph resource roots in callback. Never a destructor/effect grant.
-        /// Unknown initial row capture/SDK ACK still denies until its original
-        /// typed slot has produced a NEW acknowledged cleanup history.
-        pub(crate) fn inspect_prepublication_terminal_in_call<T>(
-            &mut self,
-            pair: &Rc<NativePairIntentRead>,
-            expected: &PairRecord,
-            inspect: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
-        ) -> Result<T> {
-            if self.source.is_some() {
-                return Err(CarrierError::Retired);
-            }
-            self.inspect_pregraph_terminal_in_call(pair, expected, inspect)
         }
         /// Caller additionally authenticates its private graph-construction
         /// ledger. No full-G fallback is available after upgrade attempted.

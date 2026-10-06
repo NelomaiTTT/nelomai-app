@@ -930,12 +930,6 @@ pub(crate) mod native {
                 },
             )
         }
-        pub(crate) fn bind_retired(&self, original: Rc<RetiredCarrierRead>) -> Result<()> {
-            register_original_channel(&self.originals.retired, &self.fence, original, true, |_| {
-                let selected = self.selected.try_borrow().map_err(denied)?;
-                self.originals.inspect_retired(&selected, |_, _| Ok(()))
-            })
-        }
         /// Actual close hook runs while the native Authority is borrowed. Root
         /// has already retained THIS Rc; publish it here before pure origin
         /// validation only. Never re-enter Pair/SDK/Retired from this hook. Later

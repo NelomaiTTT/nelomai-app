@@ -495,14 +495,26 @@ fn weak_rows_require_exact_intent_captured_bases_and_no_permits() {
     sdk.filters[0].action = policy::Action::Permit;
     assert!(compare_guard_blocks(&r, &sdk).is_err());
 }
-// Break: pending target equality or a partial policy is accepted instead of complete original ACK/protected/native before.
+// Break: pending target equality or a partial policy replaces exact ACK/protected/owned native before.
 #[test]
 fn row_effect_requires_full_pending_before_and_preserves_every_other_field() {
     let (c, r) = fixture();
     let (ack, target) = pending_weak(row_fixture(&c, &r, rows::Role::MemberA));
     assert!(compare_row_effect(&c, &r, &ack.binding, &target, &ack, &ack, &ack.current).is_ok());
+    for timer in [1, u32::MAX] {
+        let mut native = ack.current.clone();
+        native.interface.observed.reachable_time = timer;
+        native.interface.observed.min_router_advertisement_interval = timer;
+        native.interface.observed.max_router_advertisement_interval = timer;
+        native.interface.observed.max_reassembly_size = u32::MAX;
+        native.interface.observed.interface_identifier = u64::MAX;
+        assert!(compare_row_effect(&c, &r, &ack.binding, &target, &ack, &ack, &native).is_ok());
+    }
     let mut native = ack.current.clone();
     native.interface.policy.metric += 1;
+    assert!(compare_row_effect(&c, &r, &ack.binding, &target, &ack, &ack, &native).is_err());
+    native = ack.current.clone();
+    native.interface.key.luid += 1;
     assert!(compare_row_effect(&c, &r, &ack.binding, &target, &ack, &ack, &native).is_err());
     let mut protected = ack.clone();
     protected.revision += 1;
@@ -694,7 +706,7 @@ fn address_delete_denies_unrestored_weak_flags() {
 }
 
 // Break: actual Create ACK requires unchanged DAD progress instead of its exact
-// immutable address identity/timestamp; native-before still must be full exact.
+// immutable address identity/timestamp; owned native fields still remain exact.
 #[test]
 fn address_delete_uses_original_creation_identity_after_dad_progress() {
     let (c, r) = fixture();
@@ -721,6 +733,29 @@ fn address_delete_uses_original_creation_identity_after_dad_progress() {
             &row.current
         )
         .is_ok());
+        let mut native = row.current.clone();
+        native.address.as_mut().unwrap().observed.dad_state = 1;
+        assert!(compare_row_effect(
+            &c,
+            &r,
+            &row.binding,
+            &rows::Target::Delete,
+            &row,
+            &row,
+            &native
+        )
+        .is_ok());
+        native.address.as_mut().unwrap().observed.creation_timestamp += 1;
+        assert!(compare_row_effect(
+            &c,
+            &r,
+            &row.binding,
+            &rows::Target::Delete,
+            &row,
+            &row,
+            &native
+        )
+        .is_err());
         let mut missing = row.clone();
         missing.creation = None;
         assert!(compare_row_effect(

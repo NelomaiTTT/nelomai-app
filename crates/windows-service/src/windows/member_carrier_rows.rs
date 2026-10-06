@@ -170,7 +170,7 @@ pub(crate) fn decode_address(r: &MIB_UNICASTIPADDRESS_ROW) -> Result<AddressRow>
     Ok(row)
 }
 pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> {
-    if r.Family != AF_INET || r.MaxReassemblySize != 0 || r.InterfaceIdentifier != 0 {
+    if r.Family != AF_INET {
         #[cfg(all(test, windows))]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
             trace_observe(&format!("C actual interface Unsupported Family={} MaxReassemblySize={} InterfaceIdentifier={}",
@@ -2619,9 +2619,6 @@ mod ip_helper {
             retain: impl FnOnce(RowRecordReadPin) -> Result<()>,
         ) -> Result<()> {
             Self::capture_with_record_pin_into(slot, retain)
-        }
-        pub(crate) fn capture_native(binding: Binding, authority: A, journal: J) -> Result<Self> {
-            Self::capture(binding, authority, IpHelper { _private: () }, journal)
         }
     }
     impl<A, J> RowCaptureSlot<A, IpHelper, J> {

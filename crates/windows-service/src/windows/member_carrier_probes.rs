@@ -803,11 +803,6 @@ pub(crate) mod native {
         ) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
             self.release_inventory(ReleasePhase::Closing(closing), false)
         }
-        /// Preparing rebind/retirement cleanup before ANY member/weak-row change.
-        /// Requires the real G's protected new-operation ordering separately.
-        pub(crate) fn release_all_preparing(&mut self) -> Result<Vec<RetiredProbeRead<N, A, G>>> {
-            self.release_inventory(ReleasePhase::Preparing, false)
-        }
         fn release_inventory(
             &mut self,
             phase: ReleasePhase<'_>,

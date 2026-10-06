@@ -156,9 +156,21 @@ fn observe_accepts_exact_current_in_all_three_phases_and_readonly_changes() {
         actual.interface.observed.reachable_time = 31415;
         actual.interface.observed.supports_wake_up_patterns = true;
         actual.interface.observed.transmit_offload = 1;
+        actual.interface.observed.max_reassembly_size = u32::MAX;
+        actual.interface.observed.interface_identifier = u64::MAX;
         if let Some(address) = &mut actual.address {
             address.observed.dad_state = 4;
         }
+        accepts(&saved, &actual, Stage::Observe);
+        let mut saved = saved;
+        saved.baseline.interface.observed.max_reassembly_size = u32::MAX;
+        saved.baseline.interface.observed.interface_identifier = u64::MAX;
+        saved.current.interface.observed.max_reassembly_size = u32::MAX;
+        saved.current.interface.observed.interface_identifier = u64::MAX;
+        if let Some(pending) = &mut saved.pending {
+            pending.before = saved.current.clone();
+        }
+        accepts(&saved, &saved.current, Stage::Observe);
         accepts(&saved, &actual, Stage::Observe);
     }
 }
@@ -215,8 +227,6 @@ fn rejects_invalid_saved_records_instead_of_only_checking_policy() {
         |s| s.binding.name.clear(),
         |s| s.binding.scope.runtime_generation = 0,
         |s| s.baseline.interface.key.index = 34,
-        |s| s.baseline.interface.observed.interface_identifier = 1,
-        |s| s.current.interface.observed.max_reassembly_size = 1,
         |s| s.baseline.address = Some(created_address()),
         |s| s.creation.as_mut().unwrap().observed.creation_timestamp = 0,
         |s| s.creation.as_mut().unwrap().policy.on_link_prefix_length = 24,
@@ -248,8 +258,6 @@ fn rejects_invalid_or_foreign_actual_rows() {
     let mutations: &[fn(&mut Snapshot)] = &[
         |a| a.interface.key.index = 34,
         |a| a.interface.key.luid = 3400,
-        |a| a.interface.observed.max_reassembly_size = 1,
-        |a| a.interface.observed.interface_identifier = 1,
         |a| a.interface.policy.router_discovery = 3,
         |a| a.interface.policy.link_local_behavior = 3,
         |a| a.interface.policy.mtu = 67,

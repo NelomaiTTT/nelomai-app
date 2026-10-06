@@ -270,10 +270,7 @@ impl Binding {
 }
 impl Snapshot {
     pub(crate) fn validate(&self, binding: &Binding) -> Result<()> {
-        if self.interface.key != binding.key
-            || self.interface.observed.max_reassembly_size != 0
-            || self.interface.observed.interface_identifier != 0
-        {
+        if self.interface.key != binding.key {
             return Err(Error::Conflict);
         }
         self.interface.policy.validate()?;

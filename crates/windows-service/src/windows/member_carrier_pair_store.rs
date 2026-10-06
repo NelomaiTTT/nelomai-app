@@ -1257,45 +1257,6 @@ pub(crate) mod native_store {
             store.verify()?;
             Ok((store, saved))
         }
-        /// Retained older-epoch records may be opened ONLY through a cleanup
-        /// view. Runtime checks use the independently verified CURRENT context;
-        /// protected record binding keeps the older provenance unchanged.
-        pub(crate) fn recover_from_runtime(
-            runtime: &RuntimeRead,
-            lock: &KeyLock,
-            mut files: NativeSessionFiles,
-            current_context: Context,
-            retained_context: Context,
-        ) -> io::Result<(Self, CleanupRecord)> {
-            if !runtime.matches_lock(lock)
-                || current_context.intent != retained_context.intent
-                || current_context.bindings != retained_context.bindings
-                || current_context.provenance.boot_id != retained_context.provenance.boot_id
-                || current_context.provenance.runtime != retained_context.provenance.runtime
-                || retained_context.provenance.network_epoch
-                    > current_context.provenance.network_epoch
-            {
-                return Err(conflict());
-            }
-            runtime
-                .verify_same_session_files(&current_context, &files)
-                .map_err(|_| conflict())?;
-            let original_files = files.clone();
-            files = files
-                .recovery_view(retained_context.intent.scope.runtime)?
-                .ok_or_else(conflict)?
-                .0;
-            let (inner, saved) = WindowsCarrierPairStore::open(files, retained_context)?;
-            let store = Self {
-                inner,
-                runtime: runtime.read_pin().map_err(|_| conflict())?,
-                lock: lock.pin(),
-                context: current_context,
-                original_files,
-            };
-            store.verify()?;
-            Ok((store, saved.ok_or_else(conflict)?))
-        }
         fn verify(&self) -> io::Result<()> {
             if !self.runtime.matches_pin(&self.lock) {
                 return Err(conflict());

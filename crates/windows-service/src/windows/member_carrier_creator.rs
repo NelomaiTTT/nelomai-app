@@ -390,11 +390,6 @@ pub(crate) mod native {
                 .publication
                 .run(check, || write(&self.original.record))
         }
-        /// Historical outcome only. Completed is NOT permission after a later
-        /// denied read; no observer can mutate/reset the underlying protocol.
-        pub(crate) fn publication_receipt(&self) -> CreatorPublicationReceipt {
-            self.original.publication.receipt()
-        }
         /// Verify PRESENT bytes against THIS original completed publication.
         /// Requires the exact captured RuntimeRead allocation and current kernel
         /// PID/birth before/after; no decode/import, Session write or native grant.

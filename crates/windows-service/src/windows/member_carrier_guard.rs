@@ -2237,20 +2237,6 @@ mod bfe {
         {
             &self.retired
         }
-        pub(crate) fn engine_receipts(&self) -> &std::rc::Rc<GuardEngineClosure> {
-            &self.engines
-        }
-        pub(crate) fn inspect_last_absence<T>(
-            &self,
-            read: impl FnOnce(Option<&Snapshot>) -> Result<T>,
-        ) -> Result<T> {
-            read(
-                self.last_absence
-                    .try_borrow()
-                    .map_err(|_| GuardError::Conflict)?
-                    .as_ref(),
-            )
-        }
         fn observe_absence(&self, bindings: &Bindings) -> Result<Snapshot> {
             if bindings.scope != self.stopped.scope {
                 return Err(GuardError::Conflict);

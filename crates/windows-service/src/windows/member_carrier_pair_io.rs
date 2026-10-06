@@ -1643,24 +1643,6 @@ pub(crate) mod native {
                 Ok(())
             })
         }
-        pub(crate) fn inspect_tickets<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeMemberPreparationGeneration>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            self.inspect(|roots| read(&roots.tickets))
-        }
-        pub(crate) fn inspect_row_receipts<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeRowGenerationReceipt>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            self.inspect(|roots| read(&roots.row_receipts))
-        }
-        pub(crate) fn inspect_rebind_receipts<T>(
-            &self,
-            read: impl FnOnce(&[Rc<NativeMemberRebindReceipt>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            self.inspect(|roots| read(&roots.rebind_receipts))
-        }
     }
 
     /// Actual local originals, not a closed/inert certificate. Caller T owns
@@ -1836,24 +1818,6 @@ pub(crate) mod native {
             // This is deliberately the stringent original actor-no-graph
             // fence. It says nothing about C/key/module absence or release.
             self.require_unconstructed_originals()
-        }
-        pub(crate) fn with_rejected_inputs<T>(
-            &self,
-            read: impl FnOnce(&[Box<NativeActorInputs<'_>>]) -> io::Result<T>,
-        ) -> io::Result<T> {
-            read(&self.rejected_inputs.try_borrow().map_err(denied)?)
-        }
-        pub(crate) fn with_execution_originals<T>(
-            &self,
-            read: impl FnOnce(
-                Option<(&Rc<NativeExecutionRoot>, &[Arc<NativeExecutionLease>])>,
-            ) -> io::Result<T>,
-        ) -> io::Result<T> {
-            read(
-                self.execution
-                    .as_ref()
-                    .map(|s| (&s.root, s.leases.as_slice())),
-            )
         }
     }
     impl<'a> NativeActorTerminalCut<'a> {
@@ -3481,36 +3445,6 @@ pub(crate) mod native {
             witness.verify_original(self, original, expected)?;
             Ok(layout)
         }
-        /// Observe the pending lane BEFORE canonical capture drains Startup.
-        /// A successful read still cannot retire the actor or publish Stopped.
-        pub(crate) fn observe_pending_module_only_terminal(
-            self: &Rc<Self>,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-            witness: &Rc<NativeActorAttemptedTerminalWitness<'a>>,
-        ) -> io::Result<()> {
-            if self.attempted_terminal_layout(original, expected, witness)?
-                != crate::windows::member_carrier_startup::NativeAttemptedTerminalLayout::OtherAttempted
-            {
-                return Err(conflict());
-            }
-            let (startup, serial) = {
-                let actor = self.originals.actor.try_borrow().map_err(denied)?;
-                (
-                    actor.startup.as_ref().ok_or_else(conflict)?.clone(),
-                    actor.serial.clone(),
-                )
-            };
-            serial.run(true, || {
-                witness.verify_original(self, original, expected)?;
-                startup
-                    .try_borrow_mut()
-                    .map_err(denied)?
-                    .observe_attempted_module_only_terminal(original, expected)
-                    .map_err(denied)?;
-                witness.verify_original(self, original, expected)
-            })
-        }
         /// Before any owning cut, consume ONLY the genuine original loader's
         /// once-only native release and mandatory whole postflight. A factual
         /// observation, OtherAttempted discriminator or Stopped is insufficient.
@@ -4222,16 +4156,6 @@ pub(crate) mod native {
         }
     }
     impl<'a> NativeCarrierPairIo<'a> {
-        /// Consumes the SAME actor. Destination retains it before the first
-        /// fallible callback; errors/unwinds leave the original destruction root
-        /// available for factual cleanup, never forward reentry or replacement.
-        pub(crate) fn capture_root_into(
-            self,
-            destination: &mut Option<Rc<NativeActorRootHandoff<'a>>>,
-            handoff: impl FnOnce(&Rc<NativeActorRootHandoff<'a>>) -> io::Result<()>,
-        ) -> io::Result<()> {
-            self.capture_root_with_originals(None, None, destination, handoff)
-        }
         fn capture_root_with_originals(
             self,
             journal: Option<NativePairJournal>,
