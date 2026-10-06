@@ -599,7 +599,16 @@ fn restored_row_uses_full_current_ack_without_freezing_old_readonly_observations
     assert!(compare_closed_carrier_row(&c, &r, &row, &row.current).is_ok());
     let mut changed_sdk = row.current.clone();
     changed_sdk.interface.observed.reachable_time += 1;
-    assert!(compare_closed_carrier_row(&c, &r, &row, &changed_sdk).is_err());
+    assert!(compare_closed_carrier_row(&c, &r, &row, &changed_sdk).is_ok());
+    for key in [false, true] {
+        let mut foreign = changed_sdk.clone();
+        if key {
+            foreign.interface.key.luid += 1;
+        } else {
+            foreign.interface.policy.metric += 1;
+        }
+        assert!(compare_closed_carrier_row(&c, &r, &row, &foreign).is_err());
+    }
 }
 
 // Break: stage-six metadata alone substitutes for actual weak restoration.

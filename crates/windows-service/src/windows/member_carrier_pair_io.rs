@@ -5498,6 +5498,12 @@ pub(crate) mod native {
                 r.lifecycle.retain_rows(&r.rows).map_err(denied)?;
                 r.lifecycle
                     .retain_row(rows::Role::Carrier, &r.pins.carrier_rows)
+                    .inspect_err(|_| {
+                        #[cfg(test)]
+                        super::super::member_carrier_factory_test_os::trace_step(
+                            "register_originals lifecycle retain_row error",
+                        );
+                    })
                     .map_err(denied)?;
                 r.lifecycle.retain_guard(&r.guard).map_err(denied)?;
                 r.lifecycle
@@ -6481,7 +6487,12 @@ pub(crate) mod native {
                     );
                     self.roots().map(|_| ())
                 })?;
-                self.register_originals(record)?;
+                self.register_originals(record).inspect_err(|_| {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "CarrierReady register_originals error",
+                    );
+                })?;
             }
             self.in_call(record, |this, _| {
                 let r = this.roots()?;
@@ -6502,6 +6513,12 @@ pub(crate) mod native {
                         Ok(())
                     })
                     .map_err(denied)
+            })
+            .inspect_err(|_| {
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "CarrierReady final in_call error",
+                );
             })
         }
 

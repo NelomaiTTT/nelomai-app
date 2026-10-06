@@ -4710,6 +4710,17 @@ fn readiness_requires_actual_created_receipt_then_observes_tentative_to_preferre
     let fake = Fake::new();
     let (mut owner, _) = retained_created(&fake);
     let before = fake.0.borrow().private_bytes.clone();
+    let acknowledged = fake.0.borrow().saved.clone().unwrap();
+    assert_eq!(
+        acknowledged
+            .current
+            .address
+            .as_ref()
+            .unwrap()
+            .observed
+            .dad_state,
+        1
+    );
     let queries = fake.0.borrow().queries;
     let mut clock = TestClock::new(&fake);
     clock.after_sleep = Box::new(|fake, sleeps, _| {
@@ -4734,6 +4745,18 @@ fn readiness_requires_actual_created_receipt_then_observes_tentative_to_preferre
         before,
         "DAD is a volatile observation, not a writable journal update"
     );
+    let observed = owner.snapshot().unwrap();
+    assert_eq!(observed.address.as_ref().unwrap().observed.dad_state, 4);
+    assert_ne!(observed, acknowledged.current);
+    assert!(same_owned(&observed, &acknowledged.current));
+    let mut replaced = observed.clone();
+    replaced
+        .address
+        .as_mut()
+        .unwrap()
+        .observed
+        .creation_timestamp += 1;
+    assert!(!same_owned(&replaced, &acknowledged.current));
     owner.change_interface(weak()).unwrap();
     owner.stop().unwrap();
 }

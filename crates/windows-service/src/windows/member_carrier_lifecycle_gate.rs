@@ -443,7 +443,7 @@ fn compare_closed_carrier_row(
         || ack.baseline.address.is_some()
         || ack.current.interface.policy != ack.baseline.interface.policy
         || ack.current.interface.key != ack.baseline.interface.key
-        || actual != &ack.current
+        || !rows::same_owned(actual, &ack.current)
         || actual.address.is_some()
         || actual.interface.policy.weak_host_send
         || actual.interface.policy.weak_host_receive
@@ -1392,7 +1392,7 @@ pub(crate) mod native {
                                     &baseline,
                                     |ack, actual| {
                                         compare_member_capture_baseline(&selected.binding, ack)?;
-                                        if actual != &ack.current {
+                                        if !rows::same_owned(actual, &ack.current) {
                                             return Err(conflict());
                                         }
                                         Ok(())
@@ -1596,7 +1596,7 @@ pub(crate) mod native {
                                                     &selected.binding,
                                                     ack,
                                                 )?;
-                                                if actual != &ack.current {
+                                                if !rows::same_owned(actual, &ack.current) {
                                                     return Err(conflict());
                                                 }
                                                 Ok(())
@@ -1783,7 +1783,15 @@ pub(crate) mod native {
                                 .inspect_window(|window| {
                                     self.shared
                                         .row_ack(window, role, false, |ack, actual| {
-                                            if ack != facts.acknowledged || actual != &ack.current {
+                                            if ack != facts.acknowledged || !rows::same_owned(actual, &ack.current) {
+                                                #[cfg(test)]
+                                                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                                    "lifecycle retain_row SDK/ACK comparison error owned_equal={} full_equal={} dad_old={:?} dad_new={:?}",
+                                                    rows::same_owned(actual, &ack.current),
+                                                    actual == &ack.current,
+                                                    ack.current.address.as_ref().map(|a| a.observed.dad_state),
+                                                    actual.address.as_ref().map(|a| a.observed.dad_state),
+                                                ));
                                                 return Err(conflict());
                                             }
                                             Ok(())
@@ -2562,7 +2570,7 @@ pub(crate) mod native {
                 } else {
                     self.row_ack(window, role, cleanup, |ack, actual| {
                         compare(ack)?;
-                        if actual != &ack.current {
+                        if !rows::same_owned(actual, &ack.current) {
                             return Err(conflict());
                         }
                         Ok(())
