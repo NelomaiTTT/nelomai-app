@@ -1560,7 +1560,60 @@ fn stable_alternate_stack_is_valid_but_a_changed_stack_is_not_stable_evidence() 
     assert_eq!(inspect_all_queries(&[], &mut q), Ok(vec![]));
 }
 #[test]
-fn foreign_crossbinding_requires_complete_metadata_matching_ids_and_live_state() {
+fn foreign_crossbinding_requires_metadata_and_exact_rows_but_live_state_only_for_type53() {
+    // Break: an unrelated non-tunnel PnP problem or absent MIB row blocks
+    // the empty, target-absence, or live owned provider census.
+    for missing_row in [false, true] {
+        for census in 0..3 {
+            let mut q = foreign_query(false);
+            for phase in 0..2 {
+                let d = &mut q.nodes[phase][0];
+                d.if_type = 6;
+                d.status = 2;
+                d.problem = 31;
+                if missing_row {
+                    q.tables[phase].remove(0);
+                } else {
+                    q.tables[phase][0].identity.if_type = 6;
+                    q.tables[phase][0].identity.luid =
+                        (6 << 48) | (u64::from(d.net_luid_index) << 24);
+                }
+            }
+            match census {
+                0 => assert_eq!(inspect_all_queries(&[], &mut q), Ok(vec![])),
+                1 => assert_eq!(inspect_absent_queries(&absence_target(), &mut q), Ok(())),
+                _ => {
+                    for phase in 0..2 {
+                        q.tables[phase].extend(observed().interfaces);
+                        q.nodes[phase].extend(observed().devices);
+                    }
+                    let got = inspect_queries(&expected(), &mut FullQueries { source: q }).unwrap();
+                    assert_eq!(got.instance.name, "Nelomai VIP");
+                }
+            }
+        }
+    }
+    // Missing MIB never excuses malformed metadata, provider signals, or
+    // a target GUID collision on the unrelated non-tunnel branch.
+    for field in 0..3 {
+        let mut q = foreign_query(false);
+        for phase in 0..2 {
+            q.tables[phase].remove(0);
+            let d = &mut q.nodes[phase][0];
+            d.if_type = 6;
+            d.status = 2;
+            d.problem = 31;
+            match field {
+                0 => d.driver.version.clear(),
+                1 => d.hardware_ids.push("Wintun".into()),
+                _ => d.netcfg_instance_id = GUID_TEXT.into(),
+            }
+        }
+        assert!(
+            inspect_absent_queries(&absence_target(), &mut q).is_err(),
+            "missing MIB field {field}"
+        );
+    }
     for phase in 0..2 {
         for field in 0..24 {
             let mut q = foreign_query(false);

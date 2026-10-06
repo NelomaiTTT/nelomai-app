@@ -780,6 +780,17 @@ fn validate_snapshot(
             }
             continue;
         }
+        let is_related = device_related(targets, d)?;
+        if !is_related && d.if_type != 53 {
+            // Unrelated non-tunnel PnP nodes need no live provider row.
+            // Any row that is present must still crossbind exactly.
+            if let Some(row) = matching_row {
+                validate_foreign_row(d, row)?;
+            } else {
+                validate_foreign_metadata(d)?;
+            }
+            continue;
+        }
         let Some(row) = matching_row else {
             #[cfg(all(windows, test))]
             eprintln!(
@@ -795,7 +806,7 @@ fn validate_snapshot(
             );
             return Err(Error::Conflict("PnP without exact MIB row"));
         };
-        if device_related(targets, d)? {
+        if is_related {
             related.push(d.clone());
         } else {
             validate_foreign(d, row)?;

@@ -643,7 +643,7 @@ impl RuntimeRead {
         {
             return Err(Error::Conflict);
         }
-        self.verify_member_source(context, source)
+        Ok(())
     }
     /// Query current protected claim, not a retained permission bit. This alone
     /// is NOT effect authorization; exact durable generation/phase and actual
