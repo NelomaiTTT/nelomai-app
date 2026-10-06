@@ -2200,21 +2200,6 @@ pub(crate) mod native {
         }
     }
 
-    /// Non-Clone/non-serializable read-only observation owning retained installed
-    /// file pins and borrowing the independently authenticated DLL source pin.
-    /// No implementation of ModuleRuntimeAuthority, no load/create permission.
-    pub(crate) struct CheckedExistingPackage<'a> {
-        checked: Checked<Native<'a>>,
-        // Borrowed source/runtime guard continuity must remain on the serialized
-        // caller thread. This observation cannot be moved to a detached worker.
-        not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-    }
-    impl CheckedExistingPackage<'_> {
-        pub(crate) fn reattest(&mut self) -> Result<()> {
-            self.checked.reattest()
-        }
-    }
-
     /// Owns the SAME original signed source Rc and all five cold package pins.
     /// No source File clone/reopen, borrowed-source lifetime, metadata adoption,
     /// module/effect authority, Clone or detached-thread transfer is available.
@@ -2289,38 +2274,12 @@ pub(crate) mod native {
             valid: true,
         })
     }
-    /// Required main interface: borrow its authenticated retained read-only File
-    /// (`WintunSource::file()`), bracket this call and each reattestation with
-    /// `WintunSource::verify()`, retain the ORIGINAL source object and runtime lock.
-    /// Main already verifies its signed manifest hash; this module additionally
-    /// requires the independent audited 0.14.1 DLL hash. No source pathname accepted.
-    ///
-    /// # Safety
-    /// Caller MUST retain independently authenticated Installation/current-exe,
-    /// runtime MutationGuard continuity, signed full payload verification, the
-    /// source's FILE_SHARE_READ-only/no-reparse/single-link ancestor pins, and
-    /// serialize with its actual runtime/mutation lock before AND after this call
-    /// and every reattestation. `File`/hash alone do not authenticate that context.
-    /// This contract is a deliberately OPEN composition seam, not a safe path-only
-    /// trust fallback or an assertion that later upstream maintenance is impossible.
-    pub(crate) unsafe fn from_authenticated_source(
-        source: &File,
-    ) -> Result<CheckedExistingPackage<'_>> {
-        check(Native {
-            source: NativeSource::Borrowed(source),
-        })
-        .map(|checked| CheckedExistingPackage {
-            checked,
-            not_send: std::marker::PhantomData,
-        })
-    }
-
     #[cfg(test)]
     mod installed_data_tests {
         use super::*;
 
         /// Explicit diagnostic: raw native query/parser/trust coverage ONLY.
-        /// Does not construct CheckedExistingPackage/ModuleRuntimeAuthority and
+        /// Does not construct ModuleRuntimeAuthority and
         /// does NOT authenticate this test process as the installed runtime.
         /// No Wintun executable loading, exports or package/device writes.
         #[test]

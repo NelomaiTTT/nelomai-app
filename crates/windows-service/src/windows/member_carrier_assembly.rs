@@ -1581,19 +1581,6 @@ pub(crate) mod native {
             }
             original.verify_origin(&original.runtime, &original.context)
         }
-        /// Borrow the SAME canonical key owner without moving it into Result.
-        /// Caller must hold the original terminal Pair/Calling/full SDK lease;
-        /// NativeOwnership and each native close fence authenticate that lease.
-        /// This access itself grants neither native close nor owner destruction.
-        pub(crate) fn with_original_terminal_key_owner<T>(
-            &mut self,
-            call: impl FnOnce(&mut KeyOwner) -> Result<T>,
-        ) -> Result<T> {
-            if self.terminal_attempted {
-                return Err(Error::Retired);
-            }
-            self.root.with_original_terminal_owner(call)
-        }
         /// No key/native/module permission: proves this wrapper, and ONLY this
         /// wrapper, transferred every owning slot into SAME retained raw.
         pub(crate) fn verify_terminal_drained_into(
