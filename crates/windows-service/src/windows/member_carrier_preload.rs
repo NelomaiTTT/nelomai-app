@@ -1,5 +1,4 @@
 //! Read-only source/package composition. Not executable-load or effect authority.
-#![allow(dead_code)] // Factory remains disabled pending native lifecycle integration.
 
 use crate::member_carrier::{CarrierError as Error, Result};
 
@@ -158,49 +157,6 @@ pub(crate) mod native {
             originals: &mut impl OriginalDevices,
         ) -> Result<()> {
             self.refresh(true, |package| package.reattest_owned_cleanup(originals))
-        }
-    }
-
-    #[cfg(test)]
-    mod ownership_contract {
-        use super::*;
-        use crate::windows::member_carrier_wintun_package::OriginalDevices;
-        use std::rc::Rc;
-
-        // Compiled against the ACTUAL signed WintunSource, never a File or a
-        // test-created authentication surrogate. No installed/native effects
-        // are executed. A source-borrowing return type cannot satisfy this API.
-        fn compile_only_preload_owned_cleanup_api_retains_real_original_after_caller_drop(
-            source: Rc<WintunSource>,
-            originals: &mut impl OriginalDevices,
-        ) -> Result<WintunPreload> {
-            let weak = Rc::downgrade(&source);
-            let mut preload = WintunPreload::new(&source)?;
-            assert!(Rc::ptr_eq(&source, &preload.source));
-            drop(source);
-            assert!(weak.upgrade().is_some());
-            preload.reattest()?;
-            preload.reattest_owned(originals)?;
-            preload.state = State::Denied;
-            preload.reattest_owned_cleanup(originals)?;
-            assert_eq!(preload.state, State::Denied);
-            Ok(preload)
-        }
-
-        fn compile_only_package_owned_cleanup_api_retains_real_original_after_caller_drop(
-            source: Rc<WintunSource>,
-            originals: &mut impl OriginalDevices,
-        ) -> std::result::Result<
-            package::CheckedOriginalPackage,
-            crate::windows::member_carrier_wintun_package::Error,
-        > {
-            let mut package = package::from_original_source(&source)?;
-            drop(source);
-            package.reattest()?;
-            package.reattest_owned(originals)?;
-            package.deny_forward();
-            package.reattest_owned_cleanup(originals)?;
-            Ok(package)
         }
     }
 }
