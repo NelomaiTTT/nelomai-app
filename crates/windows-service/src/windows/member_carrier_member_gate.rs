@@ -743,7 +743,6 @@ pub(crate) mod native {
         supervisor: Rc<NativeDeadline>,
         cancelled: Arc<AtomicBool>,
         selected: Option<Selected>,
-        attempted_pairs: Vec<Rc<NativePairIntentRead>>,
         closing: Registration<NativeClosingRead>,
         closing_network: Registration<NativeClosingNetworkRead>,
         network_ack: Option<NetworkRegistration<N>>,
@@ -790,7 +789,6 @@ pub(crate) mod native {
                     supervisor: input.supervisor,
                     cancelled: input.cancelled,
                     selected: None,
-                    attempted_pairs: vec![],
                     closing: Registration::default(),
                     closing_network: Registration::default(),
                     network_ack: None,
@@ -799,16 +797,12 @@ pub(crate) mod native {
             }
         }
         /// Current exact opaque publication, not imported/equal Pair JSON.
-        /// Each attempted original remains rooted before fallible verification.
+        /// The canonical actor cache retains each original before verification.
         /// Bind Closing before selecting the cleanup publication; never revive
         /// a failed forward G with a fresh selection.
         pub(crate) fn select_pair(&mut self, original: Rc<NativePairIntentRead>) -> Result<()> {
             let state = self.state.get_mut()?;
             self.fence.run(state.closing.first.is_some(), || {
-                if state.attempted_pairs.len() >= 4096 {
-                    return Err(Error::Pending);
-                }
-                state.attempted_pairs.push(original.clone());
                 state.continuity(state.closing.first.is_some())?;
                 if !original.matches_runtime(&state.runtime) {
                     return Err(Error::Conflict);
