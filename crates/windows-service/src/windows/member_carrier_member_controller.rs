@@ -5509,13 +5509,22 @@ pub(crate) mod native {
             self.root.start(
                 |owned| {
                     owned.start_preflight(pair_read, expected, receipt)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start preflight complete");
                     owned.never_effects.history.start(slot_index(owned.intent.slot), owned.generation)?;
                     // Real service/process path, never a successful stub.
-                    owned.member.start_with_prior(prior).map_err(owner_error)
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start native begin");
+                    let result = owned.member.start_with_prior(prior).map_err(owner_error);
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start native returned");
+                    result
                 },
                 |owned| {
                     let reader = owned.member.original_read().map_err(owner_error)?;
                     owned.root_started_generation(&reader)?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start generation rooted");
                     Ok(reader)
                 },
                 |owned, rooted_reader| {
@@ -5524,7 +5533,12 @@ pub(crate) mod native {
                     // Retain FIRST original reader before acquiring/transferring
                     // a second SAME-owner read to fallible inventory registration.
                     let inventory_reader = owned.member.original_read().map_err(owner_error)?;
-                    inventory.register(owned.source.clone(), inventory_reader)
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start inventory register begin");
+                    let result = inventory.register(owned.source.clone(), inventory_reader);
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step("member start inventory register returned");
+                    result
                 },
                 |running, rooted_reader| {
                     if running.phase != MemberPhase::Running || running.proof.is_none()
@@ -5534,12 +5548,17 @@ pub(crate) mod native {
                     runtime.verify_member_intent(&context, &source, &running.intent)?;
                     pair_read.inspect_effect(&runtime, &supervisor, expected,
                         pair::Effect::MemberStart(shared_slot(running.intent.slot)), |_| {
-                            original_source.inspect_window(|window| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_step("member start source postflight begin");
+                            let result = original_source.inspect_window(|window| {
                                 if !window.matches_source(&original_source) || !window.matches_runtime(&runtime) {
                                     return Err(super::super::member_carrier_wintun::Error::Conflict);
                                 }
                                 Ok(())
-                            }).map_err(io_error)
+                            }).map_err(io_error);
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_step("member start source postflight returned");
+                            result
                         }).map_err(|_| Error::Conflict)
                 },
             ).map_err(root_error)?;
