@@ -6698,13 +6698,7 @@ pub(crate) mod native {
             slot: Slot,
         ) -> io::Result<()> {
             self.in_call(record, |this, pin| {
-                let r = this.roots_mut()?;
                 let i = idx(slot);
-                r.controllers[i]
-                    .as_mut()
-                    .ok_or_else(conflict)?
-                    .verify(pin, record, &mut r.lock)
-                    .map_err(denied)?;
                 // First committed Start/Attach captures the addressless baseline
                 // before static base or WeakRows can enter ordinary Observe G.
                 // Replacement generations keep their later typed capture path.
@@ -6717,22 +6711,32 @@ pub(crate) mod native {
                     && matches!((record.phase, record.operation),
                         (pair::Phase::Starting, Some(pair::Operation::Start(s)))
                         | (pair::Phase::Running, Some(pair::Operation::Attach(s))) if s == slot);
+                if !initial_frame || this.row_owners[i].is_some() {
+                    let r = this.roots_mut()?;
+                    r.controllers[i]
+                        .as_mut()
+                        .ok_or_else(conflict)?
+                        .verify(pin, record, &mut r.lock)
+                        .inspect_err(|_error| {
+                            #[cfg(test)]
+                            super::super::member_carrier_factory_test_os::trace_native(
+                                "verify_member controller.verify",
+                                _error,
+                            );
+                        })
+                        .map_err(denied)?;
+                }
                 if initial_frame {
                     if this.row_owners[i].is_none() {
-                        this.capture_member_rows(pin, record, slot)?;
+                        this.capture_member_rows(pin, record, slot)
+                            .inspect_err(|_error| {
+                                #[cfg(test)]
+                                super::super::member_carrier_factory_test_os::trace_step(&format!(
+                                    "verify_member capture_member_rows error={_error:?}"
+                                ));
+                            })?;
                     } else {
                         this.select_guard(pin, record)?;
-                    }
-                    if record.phase == pair::Phase::Starting {
-                        // Initial primary postflight reads the committed Running
-                        // member and its SAME completed original row baseline.
-                        let r = this.roots()?;
-                        r.pins
-                            .source
-                            .inspect_window(|window| {
-                                Self::attest_window(r, window).map_err(native_denied)
-                            })
-                            .map_err(denied)?;
                     }
                 }
                 Ok(())
@@ -8712,14 +8716,13 @@ pub(crate) mod native {
             // factual aliases do not authorize cleanup or revive Source.
         }
     }
-    fn denied(_: impl std::fmt::Debug) -> io::Error {
+    #[track_caller]
+    fn denied(_error: impl std::fmt::Debug) -> io::Error {
         #[cfg(test)]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            // Scoped fixture diagnostics only: call frames, never configurations,
-            // arbitrary native error text or a replacement cleanup decision.
             eprintln!(
-                "actual actor boundary denied: {}",
-                std::backtrace::Backtrace::force_capture()
+                "actual actor boundary denied error={_error:?} caller={}",
+                std::panic::Location::caller()
             );
         }
         conflict()

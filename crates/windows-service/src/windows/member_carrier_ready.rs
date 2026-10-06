@@ -1454,15 +1454,13 @@ pub(crate) mod native {
                 .require_forward_registration()
                 .map_err(denied)?;
             let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
-            let effect = expected.pending.ok_or(CarrierError::Pending)?;
             current
-                .inspect_effect(
-                    &meta.runtime,
-                    &meta.supervisor,
-                    expected,
-                    effect,
-                    |_| Ok(()),
-                )
+                .inspect(&meta.runtime, &meta.supervisor, |actual| {
+                    if actual != expected {
+                        return Err(std::io::Error::other("carrier_rows_foreign_pair"));
+                    }
+                    Ok(())
+                })
                 .map_err(denied)?;
             let construction = root.construction.as_mut().ok_or(CarrierError::Pending)?;
             let (_, authority) = construction
@@ -1470,19 +1468,7 @@ pub(crate) mod native {
                 .components
                 .as_mut()
                 .ok_or(CarrierError::Pending)?;
-            authority
-                .select_pair_intent(current.clone(), expected)
-                .map_err(denied)?;
             let read = authority.read_pin();
-            current
-                .inspect_effect(
-                    &meta.runtime,
-                    &meta.supervisor,
-                    expected,
-                    effect,
-                    |_| Ok(()),
-                )
-                .map_err(denied)?;
             attempt.completed = true;
             Ok(read)
         }
@@ -1499,7 +1485,20 @@ pub(crate) mod native {
                 completed: false,
             };
             let root = &mut attempt.root;
-            root.rows_authority_in_call(current.clone(), expected)?;
+            let mut authority = root.rows_authority_in_call(current.clone(), expected)?;
+            let meta = root.meta.as_ref().ok_or(CarrierError::Pending)?;
+            current
+                .inspect_effect(
+                    &meta.runtime,
+                    &meta.supervisor,
+                    expected,
+                    expected.pending.ok_or(CarrierError::Pending)?,
+                    |_| Ok(()),
+                )
+                .map_err(denied)?;
+            authority
+                .select_pair_intent(current.clone(), expected)
+                .map_err(denied)?;
             root.rows
                 .as_mut()
                 .ok_or(CarrierError::Pending)?
