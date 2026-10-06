@@ -3031,7 +3031,12 @@ pub(crate) mod native {
                         }
                     }
                     let old = self.selected.try_borrow().map_err(denied)?;
-                    if let Some(original) = &old.record.members[i] {
+                    let original = if lifecycle {
+                        r.members[i].as_ref()
+                    } else {
+                        old.record.members[i].as_ref()
+                    };
+                    if let Some(original) = original {
                         if (!lifecycle && old.record.operation != r.operation)
                             || original.owner.intent != history.intent
                             || original.owner.proof != Some(history.proof)

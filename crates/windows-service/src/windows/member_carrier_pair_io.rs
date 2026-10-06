@@ -7108,7 +7108,10 @@ pub(crate) mod native {
                     ));
                 })?;
             let ack = r.network_ack.acknowledgements()?;
-            let leases = r.network_ack.physical_leases()?;
+            let leases = match usage {
+                NetworkPlanUse::BeforeMutation => r.network_ack.physical_obligations()?,
+                NetworkPlanUse::ReadOnly => r.network_ack.physical_leases()?,
+            };
             for lease in &leases {
                 before
                     .verify(&PhysicalRoute {
@@ -7282,7 +7285,10 @@ pub(crate) mod native {
             if before.rows() != after.rows()
                 || before.proofs() != after.proofs()
                 || r.network_ack.acknowledgements()? != ack
-                || r.network_ack.physical_leases()? != leases
+                || match usage {
+                    NetworkPlanUse::BeforeMutation => r.network_ack.physical_obligations()?,
+                    NetworkPlanUse::ReadOnly => r.network_ack.physical_leases()?,
+                } != leases
                 || r.rows
                     .inspect_in_window(window, |f| Ok(f.clone()))
                     .inspect_err(|_error| {
