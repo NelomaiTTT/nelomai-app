@@ -2329,10 +2329,16 @@ pub(crate) mod native {
             self.probe_read = Some(Rc::new(
                 self.probes.as_ref().ok_or(Error::Pending)?.read_pin(),
             ));
+            // Network remains in the SAME original common journal. Typed
+            // birth/cleanup facets deliberately deny that unrelated record.
+            let network_files = graph_result!(
+                input.runtime.original_network_journal_files(&input.context),
+                "Network journal origin"
+            )?;
             self.network_gate = Some(NativeNetworkGate::new_pre_network(
                 input.context.clone(),
                 graph_result!(input.runtime.read_pin(), "network gate runtime pin")?,
-                input.files.clone(),
+                network_files.clone(),
                 pins.source.clone(),
                 original.clone(),
                 expected.clone(),
@@ -2349,7 +2355,7 @@ pub(crate) mod native {
                 NativeCarrierNetworkOwner::fresh_uncaptured(
                     pins.source.clone(),
                     network_gate.clone(),
-                    input.files.clone(),
+                    network_files,
                 )
                 .map_err(|_error| {
                     #[cfg(test)]

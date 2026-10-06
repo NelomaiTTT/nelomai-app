@@ -337,7 +337,6 @@ pub(crate) mod native {
             {
                 return Err(GuardError::Conflict);
             }
-            self.runtime.verify(&self.context).map_err(denied)?;
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;

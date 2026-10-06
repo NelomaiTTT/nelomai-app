@@ -723,8 +723,52 @@ fn native_birth_selection_is_retained_before_failed_postflight_and_never_refresh
 
 #[test]
 fn native_birth_view_does_not_write_session_network_legacy_or_follow_dead_root() {
-    let (_, f, _, execution, lease, s) = bound_start();
+    let (_, mut f, _, execution, lease, s) = bound_start();
     let mut view = f.native_birth_view(&execution).unwrap();
+    assert!(view.read(&scope(), RecordKind::Network).is_err());
+    assert!(
+        super::super::ProtectedStore::<_, super::super::NativeNetworkRecord>::open(
+            view.clone(),
+            scope(),
+            RecordKind::Network,
+        )
+        .is_err()
+    );
+    assert!(f.read(&scope(), RecordKind::Network).unwrap().is_none());
+    let (mut common, saved) =
+        super::super::ProtectedStore::open(f.clone(), scope(), RecordKind::Network).unwrap();
+    assert!(saved.is_none());
+    common
+        .save_value(&super::super::NativeNetworkRecord::default())
+        .unwrap();
+    let saved = f.read(&scope(), RecordKind::Network).unwrap().unwrap();
+    assert_eq!(common.expected.as_ref(), Some(&saved));
+    super::super::NativeNetworkRecord::read_comparison(&scope(), &saved).unwrap();
+    execution.verify_current(&lease).unwrap();
+    assert!(view.read(&scope(), RecordKind::Network).is_err());
+    let mut cleanup = execution.native_cleanup_view(&f).unwrap().into_files();
+    assert!(cleanup.read(&scope(), RecordKind::Network).is_err());
+
+    // A durable lost ACK through the common view does not advance this store's
+    // expected bytes or become a successful publication under the retained birth.
+    let (disk, mut original, _, loss_execution, loss_lease, _) = bound_start();
+    let (mut lost, existing) =
+        super::super::ProtectedStore::open(original.clone(), scope(), RecordKind::Network).unwrap();
+    assert!(existing.is_none());
+    disk.0.borrow_mut().lost_file = Some(PrivateFile::Network);
+    assert!(lost
+        .save_value(&super::super::NativeNetworkRecord::default())
+        .is_err());
+    assert!(original
+        .read(&scope(), RecordKind::Network)
+        .unwrap()
+        .is_some());
+    assert!(lost.expected.is_none());
+    assert!(lost
+        .save_value(&super::super::NativeNetworkRecord::default())
+        .is_err());
+    assert!(lost.expected.is_none());
+    assert!(loss_execution.verify_current(&loss_lease).is_err());
     assert!(view.claim(&scope()).is_err());
     assert!(view.complete(&scope()).is_err());
     assert!(write(&mut view, Some(&s), &s).is_err());
@@ -737,6 +781,10 @@ fn native_birth_view_does_not_write_session_network_legacy_or_follow_dead_root()
     assert!(view
         .compare_exchange(&scope(), RecordKind::Network, None, &network)
         .is_err());
+    assert!(cleanup
+        .compare_exchange(&scope(), RecordKind::Network, Some(&saved), &network)
+        .is_err());
+    assert_eq!(f.read(&scope(), RecordKind::Network).unwrap(), Some(saved));
     let legacy = crate::member_pair::PairRecord {
         scope: scope(),
         members: [None, None],

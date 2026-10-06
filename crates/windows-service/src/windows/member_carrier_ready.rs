@@ -1257,16 +1257,22 @@ pub(crate) mod native {
                     .map_err(denied)?;
                 pair.verify_cleanup_entry_for(&meta.runtime, context, expected)
                     .map_err(denied)?;
-                for kind in [
-                    RecordKind::CarrierRows,
-                    RecordKind::MemberARows,
-                    RecordKind::MemberBRows,
-                    RecordKind::CarrierGuard,
-                    RecordKind::Network,
-                ] {
-                    if meta.runtime.optional_record(context, kind)?.is_some() {
-                        return Err(CarrierError::Conflict);
-                    }
+                if meta
+                    .runtime
+                    .optional_records(
+                        context,
+                        &[
+                            RecordKind::CarrierRows,
+                            RecordKind::MemberARows,
+                            RecordKind::MemberBRows,
+                            RecordKind::CarrierGuard,
+                            RecordKind::Network,
+                        ],
+                    )?
+                    .iter()
+                    .any(Option::is_some)
+                {
+                    return Err(CarrierError::Conflict);
                 }
                 meta.runtime.record(context, RecordKind::Pair)
             };
@@ -2266,15 +2272,20 @@ pub(crate) mod native {
                         return Err(wintun::Error::Conflict);
                     }
                     let read_rows = || -> Result<(Vec<u8>, rows::Snapshot)> {
-                        for kind in [
-                            RecordKind::Network,
-                            RecordKind::CarrierGuard,
-                            RecordKind::MemberARows,
-                            RecordKind::MemberBRows,
-                        ] {
-                            if runtime.optional_record(&context, kind)?.is_some() {
-                                return Err(CarrierError::Conflict);
-                            }
+                        if runtime
+                            .optional_records(
+                                &context,
+                                &[
+                                    RecordKind::Network,
+                                    RecordKind::CarrierGuard,
+                                    RecordKind::MemberARows,
+                                    RecordKind::MemberBRows,
+                                ],
+                            )?
+                            .iter()
+                            .any(Option::is_some)
+                        {
+                            return Err(CarrierError::Conflict);
                         }
                         row.with_cleanup_record(
                             &expected.scope,
@@ -2445,15 +2456,20 @@ pub(crate) mod native {
                 {
                     return Err(CarrierError::Conflict);
                 }
-                for kind in [
-                    RecordKind::Network,
-                    RecordKind::CarrierGuard,
-                    RecordKind::MemberARows,
-                    RecordKind::MemberBRows,
-                ] {
-                    if runtime.optional_record(&context, kind)?.is_some() {
-                        return Err(CarrierError::Conflict);
-                    }
+                if runtime
+                    .optional_records(
+                        &context,
+                        &[
+                            RecordKind::Network,
+                            RecordKind::CarrierGuard,
+                            RecordKind::MemberARows,
+                            RecordKind::MemberBRows,
+                        ],
+                    )?
+                    .iter()
+                    .any(Option::is_some)
+                {
+                    return Err(CarrierError::Conflict);
                 }
                 row_pin
                     .with_cleanup_record(

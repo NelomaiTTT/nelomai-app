@@ -49,6 +49,54 @@ fn compare_context(context: &Context, record: &pair::Record) -> io::Result<()> {
     }
     Ok(())
 }
+fn compare_member_bindings(
+    record: &pair::Record,
+    egress: &[Option<policy::Identity>; 2],
+) -> io::Result<()> {
+    use nelomai_client_tunnel::redundancy::Slot;
+
+    // Read-only initial primary metadata before MemberStart invokes the SDK.
+    // Neither slot has an actual interface yet; all effect gates stay separate.
+    if let (Some(pair::Operation::Start(slot)), Some(pair::Effect::MemberStart(target))) =
+        (record.operation, record.pending)
+    {
+        let i = usize::from(slot == Slot::B);
+        if slot == target
+            && record.phase == pair::Phase::Starting
+            && record.stop_stage == 0
+            && record.active.is_none()
+            && record.network.is_none()
+            && record.pending_guard.is_none()
+            && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?
+            && record.members[i].as_ref().is_some_and(|member| {
+                member.owner.phase == crate::member_owner::Phase::Prepared
+                    && member.owner.proof.is_none()
+                    && member.owner.retired_proof.is_none()
+            })
+            && record.members[1 - i].is_none()
+            && egress.iter().all(Option::is_none)
+        {
+            return Ok(());
+        }
+    }
+    for (i, member) in record.members.iter().enumerate() {
+        if let Some(member) = member {
+            let proof = member
+                .owner
+                .proof
+                .or(member.owner.retired_proof)
+                .ok_or_else(conflict)?
+                .interface;
+            if egress[i]
+                .as_ref()
+                .is_none_or(|identity| identity.proof != proof)
+            {
+                return Err(conflict());
+            }
+        }
+    }
+    Ok(())
+}
 fn compare_lifecycle_stage(
     context: &Context,
     record: &pair::Record,
@@ -1989,7 +2037,6 @@ pub(crate) mod native {
             Ok(self.captured[i].try_borrow().map_err(denied)?.clone())
         }
         fn continuity(&self, cleanup: bool) -> io::Result<()> {
-            self.runtime.verify(&self.context).map_err(denied)?;
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
@@ -2133,22 +2180,7 @@ pub(crate) mod native {
             {
                 return Err(conflict());
             }
-            for (i, member) in record.members.iter().enumerate() {
-                if let Some(member) = member {
-                    let proof = member
-                        .owner
-                        .proof
-                        .or(member.owner.retired_proof)
-                        .ok_or_else(conflict)?
-                        .interface;
-                    if bindings.egress[i]
-                        .as_ref()
-                        .is_none_or(|identity| identity.proof != proof)
-                    {
-                        return Err(conflict());
-                    }
-                }
-            }
+            compare_member_bindings(record, &bindings.egress)?;
             self.current(record)
         }
         fn row_ack<T>(

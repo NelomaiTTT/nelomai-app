@@ -886,20 +886,22 @@ pub(crate) mod native {
             .map_err(|_| conflict())?;
         // Private no-graph lineage above is mandatory; these protected absence
         // observations are factual additional checks, never Option permission.
-        for kind in [
-            crate::windows::member_session::RecordKind::CarrierGuard,
-            crate::windows::member_session::RecordKind::Network,
-            crate::windows::member_session::RecordKind::MemberARows,
-            crate::windows::member_session::RecordKind::MemberBRows,
-        ] {
-            if startup
-                .runtime
-                .optional_record(context, kind)
-                .map_err(|_| conflict())?
-                .is_some()
-            {
-                return Err(conflict());
-            }
+        if startup
+            .runtime
+            .optional_records(
+                context,
+                &[
+                    crate::windows::member_session::RecordKind::CarrierGuard,
+                    crate::windows::member_session::RecordKind::Network,
+                    crate::windows::member_session::RecordKind::MemberARows,
+                    crate::windows::member_session::RecordKind::MemberBRows,
+                ],
+            )
+            .map_err(|_| conflict())?
+            .iter()
+            .any(Option::is_some)
+        {
+            return Err(conflict());
         }
         if c.components.len() != 1 {
             return Err(conflict());

@@ -408,6 +408,16 @@ impl RuntimeRead {
             .map_err(|_| Error::Conflict)?;
         Ok(canonical)
     }
+    /// SAME retained common Network journal, not a typed native birth facet.
+    /// The canonical native context/backend/execution bracket stays mandatory;
+    /// cloning this original storage view supplies no Network or native ACK.
+    pub(super) fn original_network_journal_files(
+        &self,
+        context: &Context,
+    ) -> Result<NativeSessionFiles> {
+        self.native_files_for_original(context, &self.runtime.original_files)?;
+        Ok(self.runtime.original_files.clone())
+    }
     /// Explicit authenticated Stop entry: only SAME original private storage.
     /// No Closing ACK is required to write the first Closing record; native
     /// actions STILL require that actual returned ACK in independent gates.

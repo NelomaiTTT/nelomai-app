@@ -1266,3 +1266,86 @@ fn row_lineage_cannot_reenroll_old_original_as_new_baseline() {
     assert!(lineage.complete(next).is_err());
     assert!(Rc::ptr_eq(&lineage.original(first).unwrap().0, &pin));
 }
+
+// The first MemberStart Observe sees Prepared metadata before any SDK member ACK.
+#[test]
+fn initial_member_start_window_allows_only_exact_unstarted_primary_bindings() {
+    let (context, running) = fixture();
+    let identity = policy::Identity {
+        scope: running.scope.clone(),
+        proof: running.members[0]
+            .as_ref()
+            .unwrap()
+            .owner
+            .proof
+            .unwrap()
+            .interface,
+    };
+    assert!(compare_member_bindings(&running, &[Some(identity.clone()), None]).is_ok());
+    let mut wrong_identity = identity.clone();
+    wrong_identity.proof.luid += 1;
+    assert!(compare_member_bindings(&running, &[Some(wrong_identity), None]).is_err());
+
+    let mut prepared = running.clone();
+    let owner = &mut prepared.members[0].as_mut().unwrap().owner;
+    owner.phase = owner::Phase::Prepared;
+    owner.proof = None;
+    prepared.pending = Some(pair::Effect::MemberStart(Slot::A));
+    prepared.guard = policy::Model::empty(prepared.scope.clone()).unwrap();
+    prepared.validate().unwrap();
+    compare_lifecycle_stage(&context, &prepared, LifecycleStage::Observe).unwrap();
+    assert!(compare_member_bindings(&prepared, &[None, None]).is_ok());
+    for fault in 0..14 {
+        let mut record = prepared.clone();
+        match fault {
+            0 => record.pending = Some(pair::Effect::MemberStart(Slot::B)),
+            1 => record.operation = Some(pair::Operation::Start(Slot::B)),
+            2 => record.phase = pair::Phase::Closing,
+            3 => record.stop_stage = 1,
+            4 => record.active = Some(Slot::A),
+            5 => {
+                record.network = Some(pair::NetworkState {
+                    baseline: pair::NetworkSnapshot {
+                        routes: vec![],
+                        dns: None,
+                    },
+                    current: pair::NetworkSnapshot {
+                        routes: vec![],
+                        dns: None,
+                    },
+                    pending: None,
+                })
+            }
+            6 => {
+                record.pending_guard =
+                    Some(policy::ExchangePlan::new(&record.guard, &record.guard).unwrap())
+            }
+            7 => record.guard = running.guard.clone(),
+            8 => record.members[0].as_mut().unwrap().owner.phase = owner::Phase::Running,
+            9 => {
+                let mut other = record.members[0].as_ref().unwrap().clone();
+                other.owner.intent.slot = TunnelSlot::B;
+                record.members[1] = Some(other);
+            }
+            10 => record.pending = None,
+            11 => record.operation = Some(pair::Operation::Attach(Slot::A)),
+            12 => {
+                record.members[0].as_mut().unwrap().owner.retired_proof =
+                    running.members[0].as_ref().unwrap().owner.proof
+            }
+            _ => {
+                record.members[0].as_mut().unwrap().owner.proof =
+                    running.members[0].as_ref().unwrap().owner.proof
+            }
+        }
+        assert!(
+            compare_member_bindings(&record, &[None, None]).is_err(),
+            "fault {fault}"
+        );
+    }
+    for slot in 0..2 {
+        let mut egress = [None, None];
+        egress[slot] = Some(identity.clone());
+        assert!(compare_member_bindings(&prepared, &egress).is_err());
+    }
+}
