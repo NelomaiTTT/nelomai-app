@@ -4785,7 +4785,7 @@ pub(crate) mod native {
             self.origin.verify(lock)
         }
         /// Publish SAME owner in the persistent controller slot BEFORE any
-        /// fallible pending enrollment, Source/G or original Pair postflight.
+        /// fallible pending enrollment or original Pair postflight.
         pub(crate) fn attach<G: NativeMemberLifecycle>(
             &mut self,
             slot: &mut Option<NativeMemberController<G>>,
@@ -4889,41 +4889,6 @@ pub(crate) mod native {
                             .as_ref()
                             .ok_or(Error::Conflict)?
                             .verify(lock)?;
-                        pair.inspect_effect(
-                            &owned.runtime,
-                            &owned.supervisor,
-                            expected,
-                            pair::Effect::MemberStart(shared_slot(owned.intent.slot)),
-                            |_| Ok(()),
-                        )
-                        .map_err(|_| Error::Conflict)?;
-                        owned
-                            .original_source
-                            .inspect_window(|window| {
-                                if !window.matches_source(&owned.original_source)
-                                    || !window.matches_runtime(&owned.runtime)
-                                {
-                                    return Err(
-                                        super::super::member_carrier_wintun::Error::Conflict,
-                                    );
-                                }
-                                owned
-                                    .gate
-                                    .try_borrow_mut()
-                                    .map_err(|_| {
-                                        super::super::member_carrier_wintun::Error::Conflict
-                                    })?
-                                    .authorize_start(
-                                        &owned.context,
-                                        expected,
-                                        &owned.intent,
-                                        window,
-                                    )
-                                    .map_err(|_| {
-                                        super::super::member_carrier_wintun::Error::Conflict
-                                    })
-                            })
-                            .map_err(|_| Error::Conflict)?;
                         pair.inspect_effect(
                             &owned.runtime,
                             &owned.supervisor,

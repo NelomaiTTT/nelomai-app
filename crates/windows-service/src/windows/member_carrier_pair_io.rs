@@ -6019,13 +6019,6 @@ pub(crate) mod native {
             for slot in [Slot::A, Slot::B] {
                 let i = idx(slot);
                 if let Some(member) = &record.members[i] {
-                    r.member_gates[i]
-                        .as_ref()
-                        .ok_or_else(conflict)?
-                        .try_borrow_mut()
-                        .map_err(denied)?
-                        .select_pair(pin.clone())
-                        .map_err(denied)?;
                     let original = r.controllers[i]
                         .as_mut()
                         .ok_or_else(conflict)?
@@ -6185,8 +6178,6 @@ pub(crate) mod native {
                             ExecutionProbeRead::Uncaptured => {}
                         }
                     }
-                    // Same actual window spans these independent complete samples.
-                    Self::attest_window(r, window).map_err(native_denied)?;
                     if r.guard
                         .try_borrow_mut()
                         .map_err(native_denied)?
