@@ -1,7 +1,13 @@
-//! Original-pin carrier network effect owner. Not factory selected.
+//! Original-pin carrier network effect owner.
 use crate::{member_dns as dns, member_pair::DnsRecord};
 use std::{cell::Cell, io, net::IpAddr};
+#[cfg_attr(all(windows, test), track_caller)]
 fn conflict() -> io::Error {
+    #[cfg(all(windows, test))]
+    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+        "network owner conflict at {}",
+        std::panic::Location::caller()
+    ));
     io::Error::other("carrier_network_effect_conflict")
 }
 // Original-owner comparison state. This ledger never authorizes SDK effects;
@@ -1075,6 +1081,46 @@ pub(crate) mod native {
                 }
                 *retained = Some(closing);
                 drop(retained);
+                // current starts None; retain is its sole writer and never resets it.
+                // Original G/Closing/attempt checks remain; no stopping journal is emitted.
+                if self
+                    .pins
+                    .physical
+                    .try_borrow()
+                    .map_err(|_| conflict())?
+                    .current
+                    .is_none()
+                {
+                    if s.routes.has_resources()
+                        || s.routes.active().is_some()
+                        || s.dns.record.is_some()
+                        || !self
+                            .pins
+                            .route_attempts
+                            .try_borrow()
+                            .map_err(|_| conflict())?
+                            .is_empty()
+                        || self.pins.dns_effects_started.get() != 0
+                        || !self
+                            .pins
+                            .dns_attempts
+                            .try_borrow()
+                            .map_err(|_| conflict())?
+                            .is_empty()
+                    {
+                        return Err(conflict());
+                    }
+                    return self.pins.inspect(&Effect::Read, |_| {
+                        let mut files = self.pins.files.clone();
+                        let native =
+                            files.read(self.pins.source.network_scope(), RecordKind::Network)?;
+                        let protected = self.pins.gate.network_record(true)?;
+                        if native.is_some() || protected.is_some() {
+                            return Err(conflict());
+                        }
+                        Ok(())
+                    });
+                }
                 s.dns.cleanup()?;
                 s.routes.cleanup()
             })

@@ -73,7 +73,13 @@ fn physical_plan_leases(paths: &[PhysicalRoute]) -> io::Result<Vec<PhysicalLease
     Ok(leases.into_values().collect())
 }
 
+#[cfg_attr(all(windows, test), track_caller)]
 fn conflict() -> io::Error {
+    #[cfg(all(windows, test))]
+    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+        "network gate conflict at {}",
+        std::panic::Location::caller()
+    ));
     io::Error::other("carrier_network_gate_conflict")
 }
 fn denied<E>(_: E) -> io::Error {
@@ -1347,6 +1353,11 @@ fn compare_route_reads(
                 || row.route.gateway.is_some()
                 || row.flags[0] != 1)
         {
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                "network gate carrier route denied row={row:?} carrier={c:?} vip={}",
+                record.addresses[0]
+            ));
             return Err(conflict());
         }
     }
