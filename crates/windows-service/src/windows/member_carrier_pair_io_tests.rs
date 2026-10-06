@@ -371,7 +371,7 @@ fn original_generation_cut_has_no_unknown_retaining_wrapper_in_proven_raw_payloa
     destination.transfer_original_into(&mut owning).unwrap();
     drop(owning);
     assert_eq!(drops.get(), 1);
-    assert!(transfer.read_cut().is_err()); // a lost cut is NOT empty history
+    assert!(transfer.original().is_err()); // a lost cut is NOT empty history
     drop(transfer); // weak origin, no hidden owning alias or retaining Drop
 }
 
@@ -2436,19 +2436,19 @@ fn no_carrier_terminal_guard_requires_independent_full_empty_snapshot_not_missin
     record.stop_stage = 12;
     record.pending = None;
     record.validate().unwrap();
-    compare_uncaptured_terminal_guard(&record, &record.guard.expected).unwrap();
+    compare_full_empty_snapshot(&record, &record.guard.expected).unwrap();
     let (_, former) = guard_creation();
-    assert!(compare_uncaptured_terminal_guard(&record, &former.expected).is_err());
+    assert!(compare_full_empty_snapshot(&record, &former.expected).is_err());
     let mut wrong = record.guard.expected.clone();
     wrong.version = 1;
-    assert!(compare_uncaptured_terminal_guard(&record, &wrong).is_err());
+    assert!(compare_full_empty_snapshot(&record, &wrong).is_err());
     let mut wrong = record.guard.expected.clone();
     wrong.scope.connection_generation += 1;
-    assert!(compare_uncaptured_terminal_guard(&record, &wrong).is_err());
+    assert!(compare_full_empty_snapshot(&record, &wrong).is_err());
     record.phase = Phase::Closing;
     record.pending = Some(crate::member_carrier_pair::Effect::FullEmpty);
     record.validate().unwrap();
-    assert!(compare_uncaptured_terminal_guard(&record, &record.guard.expected).is_err());
+    assert!(require_terminal_record(&record).is_err());
 }
 
 #[test]
@@ -2461,26 +2461,33 @@ fn uncaptured_terminal_read_is_mandatory_and_cannot_rearm_forward_calls() {
     record.validate().unwrap();
     let serial = ActorSerial::default();
     let entered = Cell::new(false);
-    uncaptured_terminal_call(&serial, &record, || {
-        assert!(serial.busy.get());
-        assert!(serial.revoked.get());
-        entered.set(true);
-        Ok(())
-    })
-    .unwrap();
+    serial
+        .run(true, || {
+            require_terminal_record(&record)?;
+            assert!(serial.busy.get());
+            assert!(serial.revoked.get());
+            entered.set(true);
+            Ok(())
+        })
+        .unwrap();
     assert!(entered.get());
     assert!(!serial.busy.get());
     assert!(serial.run(false, || Ok(())).is_err());
-    let error = uncaptured_terminal_call(&serial, &record, || {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "original_ledger_denied",
-        ))
-    })
-    .unwrap_err();
+    let error = serial
+        .run(true, || -> io::Result<()> {
+            require_terminal_record(&record)?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original_ledger_denied",
+            ))
+        })
+        .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert!(catch_unwind(AssertUnwindSafe(|| {
-        let _ = uncaptured_terminal_call(&serial, &record, || panic!("terminal read unwind"));
+        let _ = serial.run(true, || -> io::Result<()> {
+            require_terminal_record(&record)?;
+            panic!("terminal read unwind");
+        });
     }))
     .is_err());
     assert!(!serial.busy.get());
@@ -2488,10 +2495,12 @@ fn uncaptured_terminal_read_is_mandatory_and_cannot_rearm_forward_calls() {
     record.phase = Phase::Closing;
     record.pending = Some(crate::member_carrier_pair::Effect::FullEmpty);
     record.validate().unwrap();
-    assert!(uncaptured_terminal_call(&serial, &record, || panic!(
-        "Closing must not enter terminal read"
-    ))
-    .is_err());
+    assert!(serial
+        .run(true, || -> io::Result<()> {
+            require_terminal_record(&record)?;
+            panic!("Closing must not enter terminal read");
+        })
+        .is_err());
 }
 
 #[test]
@@ -2510,10 +2519,12 @@ fn zero_effect_terminal_dispatch_accepts_fresh_stop_and_published_options_but_no
     for actual in [fresh, after_preflight] {
         let serial = ActorSerial::default();
         let proof = ZeroEffectDisposition::<u32>::default();
-        assert!(uncaptured_terminal_call(&serial, &actual, || {
-            proof.capture(|_| Err(io::Error::other("original Never/Stopped SDK issuer denied")))
-        })
-        .is_err());
+        assert!(serial
+            .run(true, || {
+                require_terminal_record(&actual)?;
+                proof.capture(|_| Err(io::Error::other("original Never/Stopped SDK issuer denied")))
+            })
+            .is_err());
         assert!(proof.sealed_proof().is_err());
         assert!(serial
             .run(false, || -> io::Result<()> { panic!("no forward rearm") })

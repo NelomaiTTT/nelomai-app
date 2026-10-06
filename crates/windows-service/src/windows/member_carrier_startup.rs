@@ -4944,29 +4944,6 @@ pub(crate) mod native {
             }
             outcome.verify_supervisor_terminal_drop(&self.supervisor)
         }
-        fn observe_attempted_module_only_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> Result<()> {
-            let (candidate, load) = self.module_only_read_origins(original, expected)?;
-            self.retain_and_read_module_only_terminal(
-                &candidate,
-                &load,
-                original,
-                expected,
-                &mut *self
-                    .module_only_native_read
-                    .try_borrow_mut()
-                    .map_err(|_| Error::Conflict)?,
-                |facts| {
-                    if !facts.same_original(&candidate, &load, original) {
-                        return Err(Error::Conflict);
-                    }
-                    Ok(())
-                },
-            )
-        }
         fn select_terminal_branch(
             &mut self,
             original: &Rc<NativePairIntentRead>,
@@ -5304,13 +5281,6 @@ pub(crate) mod native {
         ) -> Result<()> {
             let actual = self.verify_uncaptured_terminal_root(original, expected)?;
             compare_uncaptured_terminal_snapshot(&expected.scope, &actual)
-        }
-        fn read_uncaptured_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> Result<crate::member_carrier_guard::Snapshot> {
-            self.verify_uncaptured_terminal_root(original, expected)
         }
         fn preflight_fresh(
             &mut self,

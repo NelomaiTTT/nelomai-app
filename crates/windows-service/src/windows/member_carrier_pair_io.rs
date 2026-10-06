@@ -1,6 +1,5 @@
-//! Serialized original-owner carrier actor. Not selected by any product factory.
+//! Serialized original-owner carrier actor.
 //! Registration and copied comparison data never grant a native effect.
-#![allow(dead_code)]
 
 use std::{cell::Cell, io};
 
@@ -131,13 +130,6 @@ impl<T> OriginalGenerationTransfer<T> {
     }
     fn original(&self) -> io::Result<std::rc::Rc<OriginalGenerationCut<T>>> {
         self.original.upgrade().ok_or_else(conflict)
-    }
-    fn read_cut(&self) -> io::Result<Option<std::rc::Rc<OriginalGenerationCut<T>>>> {
-        if self.attempted {
-            self.original().map(Some)
-        } else {
-            Ok(None)
-        }
     }
     fn same_original(&self, original: &std::rc::Rc<OriginalGenerationCut<T>>) -> bool {
         self.attempted
@@ -645,9 +637,11 @@ impl<P: ?Sized> ZeroEffectDisposition<P> {
         }
         self.retained_proof()
     }
+    #[cfg(windows)]
     fn invalidate_disposal(&self) {
         self.disposal.set(3);
     }
+    #[cfg(windows)]
     fn verify_disposing(&self) -> io::Result<()> {
         if self.capture.get() == 2 && self.disposal.get() == 1 {
             Ok(())
@@ -1165,34 +1159,6 @@ fn compare_member_generation_guard(
     Ok(())
 }
 
-/// Dispatch only. The mandatory startup read must authenticate its original
-/// Never ledger, terminal Pair publication and actual cleanup Calling itself.
-#[cfg(any(windows, test))]
-fn uncaptured_terminal_call(
-    serial: &ActorSerial,
-    record: &crate::member_carrier_pair::Record,
-    read: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    serial.run(true, || {
-        require_terminal_record(record)?;
-        read()
-    })
-}
-
-/// Compare independently observed facts only. Never mint an empty observation
-/// from Pair JSON; the native startup reader proves its own ledger and SDK/BFE.
-#[cfg(any(windows, test))]
-fn compare_uncaptured_terminal_guard(
-    record: &crate::member_carrier_pair::Record,
-    observed: &crate::member_carrier_guard::Snapshot,
-) -> io::Result<()> {
-    require_terminal_record(record)?;
-    if observed != &record.guard.expected {
-        return Err(conflict());
-    }
-    Ok(())
-}
-
 /// Comparison/dispatch ONLY. Actual terminal Pair ACK, native original keys
 /// receipt and cleanup Calling must be independently authenticated afterwards.
 #[cfg(any(windows, test))]
@@ -1607,7 +1573,7 @@ pub(crate) mod native {
     type MemberRowCapture = rows::NativeRowCaptureSlot<RowAuthority, MemberRowJournal>;
     struct HistoricalMemberRows {
         pin: Rc<RowRecordReadPin>,
-        authority: RowAuthority,
+        _authority: RowAuthority,
         seal: Rc<rows::StoppedRowGeneration>,
     }
     struct MemberGenerationOriginal {
@@ -1619,38 +1585,15 @@ pub(crate) mod native {
     /// Actual historical aliases, including partial projection/rebind roots.
     /// No controller/owner destructor ACK is invented by this raw field cut.
     pub(crate) struct NativeMemberGenerationRoots {
-        tickets: Vec<Rc<NativeMemberPreparationGeneration>>,
-        row_receipts: Vec<Rc<NativeRowGenerationReceipt>>,
-        originals: Vec<Rc<MemberGenerationOriginal>>,
-        rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
+        _tickets: Vec<Rc<NativeMemberPreparationGeneration>>,
+        _row_receipts: Vec<Rc<NativeRowGenerationReceipt>>,
+        _originals: Vec<Rc<MemberGenerationOriginal>>,
+        _rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
     }
     pub(crate) type NativeMemberGenerationTerminalResources =
         GenerationTerminalResources<NativeMemberGenerationRoots>;
     pub(crate) type NativeMemberGenerationTerminalCut =
         OriginalGenerationCut<NativeMemberGenerationRoots>;
-    impl OriginalGenerationCut<NativeMemberGenerationRoots> {
-        /// All SAME issued ticket/Never roots, not just the successful receipts.
-        /// Missing row receipt remains an unresolved partial projection, never
-        /// an absence/disarm ACK. Caller supplies independently actual terminal
-        /// owner/history/destructor verification under its original bracket.
-        pub(crate) fn inspect_originals(
-            &self,
-            mut read: impl FnMut(
-                &Rc<NativeMemberPreparationGeneration>,
-                &Rc<NativeNeverMemberEffects>,
-                Option<&Rc<NativeRowGenerationReceipt>>,
-            ) -> io::Result<()>,
-        ) -> io::Result<()> {
-            self.inspect(|roots| {
-                for original in &roots.originals {
-                    let receipt = original.receipt.try_borrow().map_err(denied)?;
-                    read(&original.ticket, &original.never, receipt.as_ref())?;
-                }
-                Ok(())
-            })
-        }
-    }
-
     /// Actual local originals, not a closed/inert certificate. Caller T owns
     /// this same Rc; mandatory terminal G verifies the exact original ACKs and
     /// full independent resource/SDK universe before any final destruction.
@@ -2019,10 +1962,10 @@ pub(crate) mod native {
                 transfer.capture(destination, |raw| {
                     let mut parts = self.parts.try_borrow_mut()?;
                     *raw = Some(NativeMemberGenerationRoots {
-                        tickets: std::mem::take(&mut parts.member_generation_tickets),
-                        row_receipts: std::mem::take(&mut parts.row_generation_receipts),
-                        originals: std::mem::take(&mut parts.member_generation_originals),
-                        rebind_receipts: std::mem::take(&mut parts.member_rebind_receipts),
+                        _tickets: std::mem::take(&mut parts.member_generation_tickets),
+                        _row_receipts: std::mem::take(&mut parts.row_generation_receipts),
+                        _originals: std::mem::take(&mut parts.member_generation_originals),
+                        _rebind_receipts: std::mem::take(&mut parts.member_rebind_receipts),
                     });
                     Ok(())
                 })?;
@@ -2388,14 +2331,6 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<()>;
-        /// Retain/read SAME loader-only originals under the concrete bounded
-        /// Calling/Pair reader. Observations are DATA: no release or completion
-        /// permission. Unknown layouts deny while keeping Startup intact.
-        fn observe_attempted_module_only_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> crate::member_carrier::Result<()>;
         /// Sole object-safe branch selection. Authenticate SAME Stopped pin,
         /// Runtime/serial/private invocation ledger before/after selection.
         /// No-attempt: issue the actual whole sealed Never/SDK/BFE proof using
@@ -2593,14 +2528,6 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> crate::member_carrier::Result<()>;
-        /// Same independently authenticated terminal Calling channel, plus
-        /// two actual full scoped BFE reads under the original Never ledger.
-        /// Return observed SDK facts, not an empty model derived from expected.
-        fn read_uncaptured_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> crate::member_carrier::Result<policy::Snapshot>;
         /// Closing12/FullEmpty only, not an acknowledged Stopped read. Own
         /// the SAME bounded cleanup Calling; authenticate the original Never
         /// ledger/partial bootstrap owners, key restoration and full native
@@ -3308,12 +3235,7 @@ pub(crate) mod native {
                 &provisional,
                 |proof| {
                     let mut cut = None;
-                    self.capture_zero_effect_original(
-                        original,
-                        expected,
-                        &mut cut,
-                        Some(proof.clone()),
-                    )?;
+                    self.capture_zero_effect_original(original, expected, &mut cut, proof.clone())?;
                     Ok(NativeActorTerminalBranch::ZeroEffect(
                         cut.ok_or_else(conflict)?,
                     ))
@@ -3588,24 +3510,12 @@ pub(crate) mod native {
                 self.finish_terminal_selection()
             })
         }
-        /// Call while SAME Startup is still in the original actor, before
-        /// canonical capture. Caller and actor root retain the outcome FIRST.
-        /// Provider decides eligibility from its private OriginalNever ledger;
-        /// none of the defensive actor checks below can issue that proof.
-        pub(crate) fn capture_zero_effect_terminal(
-            self: &Rc<Self>,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-            destination: &mut Option<Rc<NativeActorZeroEffectTerminalCut<'a>>>,
-        ) -> io::Result<()> {
-            self.capture_zero_effect_original(original, expected, destination, None)
-        }
         fn capture_zero_effect_original(
             self: &Rc<Self>,
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
             destination: &mut Option<Rc<NativeActorZeroEffectTerminalCut<'a>>>,
-            supplied: Option<Rc<dyn NativeZeroEffectTerminalProof + 'a>>,
+            supplied: Rc<dyn NativeZeroEffectTerminalProof + 'a>,
         ) -> io::Result<()> {
             if self.zero_effect_capture.replace(1) != 0 {
                 self.zero_effect_capture.set(3);
@@ -3656,15 +3566,8 @@ pub(crate) mod native {
                             }
                         }
                         cut.proof.capture(|retain| {
-                            if let Some(same) = supplied.as_ref() {
-                                retain(same.clone())?;
-                                same.verify_original(original, expected).map_err(denied)?;
-                            } else {
-                                startup.try_borrow_mut().map_err(denied)?
-                                    .capture_zero_effect_terminal(original, expected, &mut |proof| {
-                                        retain(proof).map_err(|_| CarrierError::Conflict)
-                                    }).map_err(denied)?;
-                            }
+                            retain(supplied.clone())?;
+                            supplied.verify_original(original, expected).map_err(denied)?;
                             // Actual J remains rooted and is checked AFTER the
                             // provider's whole SDK/Calling postflight as well.
                             let (pin, actual) = self.readback_terminal(&expected.scope)?;
@@ -7865,7 +7768,7 @@ pub(crate) mod native {
                 .map_err(denied)?;
             let old = HistoricalMemberRows {
                 pin: old_pin,
-                authority: self.row_authorities[i]
+                _authority: self.row_authorities[i]
                     .as_ref()
                     .ok_or_else(conflict)?
                     .read_pin(),
