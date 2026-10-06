@@ -1039,3 +1039,217 @@ fn initial_guard_base_requires_current_start_exact_members_and_no_permits_or_net
         );
     }
 }
+
+// Complete factual Sample, using the existing hand-derived row policy fixture.
+fn ready_gate_sample() -> Sample {
+    use crate::member_carrier_rows::*;
+    let record = native_record();
+    let original = original(&record);
+    let mut snapshot = Snapshot {
+        interface: InterfaceRow {
+            key: RowKey {
+                luid: 3300,
+                index: 33,
+            },
+            policy: InterfacePolicy {
+                advertising: false,
+                forwarding: false,
+                weak_host_send: false,
+                weak_host_receive: false,
+                automatic_metric: false,
+                neighbor_unreachability: true,
+                managed_address_configuration: false,
+                other_stateful_configuration: false,
+                advertise_default_route: false,
+                router_discovery: 0,
+                dad_transmits: 1,
+                base_reachable_time: 30000,
+                retransmit_time: 1000,
+                path_mtu_discovery_timeout: 600000,
+                link_local_behavior: 0,
+                link_local_timeout: 0,
+                zone_indices: [0; 16],
+                site_prefix_length: 0,
+                metric: 42,
+                mtu: 1420,
+                disable_default_routes: true,
+            },
+            observed: InterfaceObserved {
+                max_reassembly_size: 0,
+                interface_identifier: 0,
+                min_router_advertisement_interval: 200,
+                max_router_advertisement_interval: 600,
+                connected: true,
+                supports_wake_up_patterns: false,
+                supports_neighbor_discovery: true,
+                supports_router_discovery: true,
+                reachable_time: 27000,
+                transmit_offload: 0,
+                receive_offload: 0,
+            },
+        },
+        address: None,
+    };
+
+    snapshot.address = Some(AddressRow {
+        key: snapshot.interface.key,
+        policy: AddressPolicy {
+            address: [10, 77, 0, 2],
+            prefix_origin: 1,
+            suffix_origin: 1,
+            valid_lifetime: u32::MAX,
+            preferred_lifetime: u32::MAX,
+            on_link_prefix_length: 32,
+            skip_as_source: false,
+        },
+        observed: AddressObserved {
+            dad_state: 4,
+            scope_id: 0,
+            creation_timestamp: 100,
+        },
+    });
+    let provider = provider::Observation {
+        interface: provider::Expected {
+            guid: original.identity.guid,
+            luid: original.identity.luid,
+            index: original.identity.index,
+            name: original.identity.name.clone(),
+            description: original.identity.description.clone(),
+            if_type: 53,
+            tunnel_type: 0,
+        },
+        instance: provider::Device {
+            instance: "ROOT\\WINTUN\\0000".into(),
+            devinst: 1,
+            presence: provider::Presence::Present,
+            class_guid: [1; 16],
+            status: 0,
+            problem: 0,
+            hardware_ids: vec!["Wintun".into()],
+            compatible_ids: vec![],
+            service: "Wintun".into(),
+            description: original.identity.description.clone(),
+            name: original.identity.name.clone(),
+            wireguard_name: None,
+            standard_name: None,
+            netcfg_instance_id: "original-C".into(),
+            net_luid_index: 1,
+            if_type: 53,
+            driver: provider::DriverMetadata {
+                provider: "WireGuard LLC".into(),
+                version: "0.14.1.0".into(),
+                date_filetime: 1,
+                inf: "oem1.inf".into(),
+                matching_device_id: "Wintun".into(),
+                driver_key: "0000".into(),
+            },
+        },
+    };
+    Sample {
+        native: record.encode().unwrap(),
+        rows: Some(b"protected rows".to_vec()),
+        originals: creators::UniverseObservation {
+            context: record.context,
+            originals: vec![creators::Observation {
+                scope: original.scope,
+                identity: original.identity,
+                provider: provider.clone(),
+            }],
+            complete: vec![(provider::ProviderKind::Wintun, provider)],
+        },
+        snapshot: Some(snapshot),
+    }
+}
+
+#[test]
+fn ready_gate_sample_accepts_readonly_row_drift() {
+    let before = ready_gate_sample();
+    let mut after = before.clone();
+    let snapshot = after.snapshot.as_mut().unwrap();
+    snapshot.interface.observed.connected = false;
+    snapshot.interface.observed.reachable_time += 1000;
+    snapshot.interface.observed.supports_wake_up_patterns = true;
+    snapshot
+        .interface
+        .observed
+        .min_router_advertisement_interval += 1;
+    snapshot
+        .interface
+        .observed
+        .max_router_advertisement_interval += 1;
+    snapshot.interface.observed.transmit_offload = 1;
+    snapshot.interface.observed.receive_offload = 2;
+    snapshot.address.as_mut().unwrap().observed.dad_state = 2;
+    assert_ne!(
+        before.snapshot, after.snapshot,
+        "readonly facts remain observable"
+    );
+    assert_eq!(before, after, "readonly facts are not owned CAS fields");
+}
+
+#[test]
+fn ready_gate_sample_rejects_owned_rows_protected_bytes_and_full_provider_drift() {
+    for mutate in [
+        (|s: &mut Sample| s.snapshot.as_mut().unwrap().interface.key.index += 1) as fn(&mut Sample),
+        |s| s.snapshot.as_mut().unwrap().interface.policy.metric += 1,
+        |s| {
+            s.snapshot
+                .as_mut()
+                .unwrap()
+                .address
+                .as_mut()
+                .unwrap()
+                .key
+                .index += 1
+        },
+        |s| {
+            s.snapshot
+                .as_mut()
+                .unwrap()
+                .address
+                .as_mut()
+                .unwrap()
+                .policy
+                .address[3] += 1
+        },
+        |s| {
+            s.snapshot
+                .as_mut()
+                .unwrap()
+                .address
+                .as_mut()
+                .unwrap()
+                .observed
+                .scope_id += 1
+        },
+        |s| {
+            s.snapshot
+                .as_mut()
+                .unwrap()
+                .address
+                .as_mut()
+                .unwrap()
+                .observed
+                .creation_timestamp += 1
+        },
+        |s| s.snapshot.as_mut().unwrap().address = None,
+        |s| s.snapshot = None,
+        |s| s.native.push(0),
+        |s| s.rows.as_mut().unwrap().push(0),
+        |s| s.rows = None,
+        |s| s.originals.context.provenance.boot_id[0] ^= 1,
+        |s| s.originals.originals[0].scope.generation += 1,
+        |s| s.originals.originals[0].identity.index += 1,
+        |s| s.originals.originals[0].provider.instance.problem = 22,
+        |s| s.originals.complete[0].1.instance.problem = 22,
+        |s| s.originals.complete.clear(),
+    ] {
+        let before = ready_gate_sample();
+        let mut after = before.clone();
+        mutate(&mut after);
+        assert_ne!(before, after);
+    }
+    let mut absent = ready_gate_sample();
+    absent.snapshot = None;
+    assert_eq!(absent, absent.clone());
+}

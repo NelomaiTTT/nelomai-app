@@ -8,6 +8,67 @@ use crate::member_carrier::{CarrierError as Error, Result};
 use crate::member_carrier_creators as creators;
 use crate::member_carrier_native_ownership::{self as receipts, KeyPhase, Phase, Record, Value};
 
+#[cfg(windows)]
+use super::member_carrier_provider as provider;
+#[cfg(not(windows))]
+use crate::member_carrier_provider as provider;
+
+#[derive(Clone, Debug, Eq)]
+struct Sample {
+    native: Vec<u8>,
+    rows: Option<Vec<u8>>,
+    originals: creators::UniverseObservation<provider::Observation>,
+    snapshot: Option<crate::member_carrier_rows::Snapshot>,
+}
+
+// Both samples retain complete observations. Only readonly row metadata is
+// excluded from owned CAS equality, using the existing row ownership contract.
+impl PartialEq for Sample {
+    fn eq(&self, other: &Self) -> bool {
+        let same_snapshot = match (&self.snapshot, &other.snapshot) {
+            (Some(before), Some(after)) => crate::member_carrier_rows::same_owned(before, after),
+            (None, None) => true,
+            _ => false,
+        };
+        let equal = self.native == other.native
+            && self.rows == other.rows
+            && self.originals == other.originals
+            && same_snapshot;
+        #[cfg(all(test, windows))]
+        if !equal || self.snapshot != other.snapshot {
+            use crate::windows::member_carrier_factory_test_os::trace_step;
+            trace_step(&format!(
+                "C G sample comparison equal={equal} native_equal={} rows_equal={} original_context_equal={} originals_equal={} census_equal={} snapshot_owned_equal={same_snapshot}",
+                self.native == other.native, self.rows == other.rows,
+                self.originals.context == other.originals.context,
+                self.originals.originals == other.originals.originals,
+                self.originals.complete == other.originals.complete,
+            ));
+            if let (Some(before), Some(after)) = (&self.snapshot, &other.snapshot) {
+                let address_fences = match (&before.address, &after.address) {
+                    (Some(before), Some(after)) => Some((
+                        before.key == after.key,
+                        before.policy == after.policy,
+                        before.observed.scope_id == after.observed.scope_id,
+                        before.observed.creation_timestamp == after.observed.creation_timestamp,
+                    )),
+                    _ => None,
+                };
+                trace_step(&format!(
+                    "C G row comparison interface_key_equal={} interface_policy_equal={} address_presence_equal={} address_key_policy_scope_creation_equal={address_fences:?} interface_observed_before={:?} interface_observed_after={:?} address_observed_before={:?} address_observed_after={:?}",
+                    before.interface.key == after.interface.key,
+                    before.interface.policy == after.interface.policy,
+                    before.address.is_some() == after.address.is_some(),
+                    before.interface.observed, after.interface.observed,
+                    before.address.as_ref().map(|row| &row.observed),
+                    after.address.as_ref().map(|row| &row.observed),
+                ));
+            }
+        }
+        equal
+    }
+}
+
 /// Actual constructor/close-ACK callback retention, not resource permission.
 /// Native callers supply opaque readers; equal data cannot construct a receipt.
 pub(crate) struct OriginalReadCapture<T> {
@@ -1261,14 +1322,6 @@ pub(crate) mod native {
         failed: bool,
         upgrade: Rc<CarrierGateUpgrade>,
     }
-    #[derive(PartialEq, Eq)]
-    struct Sample {
-        native: Vec<u8>,
-        rows: Option<Vec<u8>>,
-        originals:
-            creators::UniverseObservation<crate::windows::member_carrier_provider::Observation>,
-        snapshot: Option<rows::Snapshot>,
-    }
     fn denied<E>(_: E) -> wintun::Error {
         wintun::Error::Conflict
     }
@@ -1527,12 +1580,12 @@ pub(crate) mod native {
             }
             result
         }
+        /// Observation body: called only inside the startup Pair continuity bracket.
         fn sample(&self, stage: StartupStage) -> wintun::Result<Sample> {
             #[cfg(test)]
             if stage == StartupStage::Observe {
                 trace_observe("C Observe G sample entered");
             }
-            self.continuity()?;
             let context = &self.scope.context;
             let [native, network, member_a, member_b, guard, rows]: [Option<Vec<u8>>; 6] = self
                 .runtime
@@ -1689,12 +1742,6 @@ pub(crate) mod native {
                 }
                 None
             };
-            self.continuity().inspect_err(|_error| {
-                #[cfg(test)]
-                if stage == StartupStage::Observe {
-                    trace_observe(&format!("C Observe G sample continuity error={_error:?}"));
-                }
-            })?;
             Ok(Sample {
                 native,
                 rows,
@@ -1738,6 +1785,7 @@ pub(crate) mod native {
                     if stage == StartupStage::Observe {
                         trace_observe("C Observe G Pair callback entered");
                     }
+                    self.continuity().map_err(io_denied)?;
                     let before = self.sample(stage).map_err(io_denied)?;
                     #[cfg(test)]
                     if stage == StartupStage::Observe {
@@ -1847,8 +1895,8 @@ pub(crate) mod native {
             self.failed = false;
             Ok(())
         }
+        /// Observation body: called only inside the closing Pair continuity bracket.
         fn sample_closing(&self, stage: ClosingStage) -> wintun::Result<Sample> {
-            self.continuity_cleanup()?;
             let context = &self.scope.context;
             let [native, network, member_a, member_b, guard, rows]: [Option<Vec<u8>>; 6] = self
                 .runtime
@@ -1954,7 +2002,6 @@ pub(crate) mod native {
                 }
                 None
             };
-            self.continuity_cleanup()?;
             Ok(Sample {
                 native,
                 rows,
@@ -1992,6 +2039,7 @@ pub(crate) mod native {
                 &self.expected,
                 self.expected.stop_stage,
                 |_| {
+                    self.continuity_cleanup().map_err(io_denied)?;
                     self.verify_closing_session(stage).map_err(io_denied)?;
                     let before = self.sample_closing(stage).map_err(io_denied)?;
                     if let Some((binding, target)) = row {
