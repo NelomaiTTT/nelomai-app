@@ -1,7 +1,6 @@
 //! Staged original startup: readonly member preparation precedes C creation.
 //! Selected by the retained production factory; native effect gates and
 //! hardware acceptance remain mandatory and separate from software coverage.
-#![allow(dead_code)]
 
 #[cfg(windows)]
 use super::member_carrier_terminal_release::TerminalCallState;
@@ -446,14 +445,6 @@ enum BootstrapOrigin {
     OriginalNever,
     CreatedRetired,
 }
-fn inspect_bootstrap_empty(
-    context: &Context,
-    expected: &crate::member_carrier_pair::Record,
-    origin: BootstrapOrigin,
-    mut read: impl FnMut() -> Result<crate::member_carrier_guard::Snapshot>,
-) -> Result<()> {
-    read_bootstrap_empty(context, expected, origin, &mut read).map(|_| ())
-}
 fn read_bootstrap_empty(
     context: &Context,
     expected: &crate::member_carrier_pair::Record,
@@ -871,7 +862,6 @@ pub(crate) mod native {
         module_only_selection: Rc<TerminalCallState>,
         module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 14],
         module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
-        module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
         module_only_cleanup_native_reads: RefCell<[Vec<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>; 14]>,
         module_only_release: Option<Rc<NativeNoConstructorReleaseRoot>>,
         module_only_outcome: Option<Rc<NativeModuleOnlyOutcome>>,
@@ -1887,13 +1877,12 @@ pub(crate) mod native {
         creator_store: Option<WindowsNativeCreatorStore<NativeSessionFiles>>,
         initial_noc: Option<Rc<NativeInitialAssemblyNoCRead>>,
         initial_data_retirement: Option<Rc<NativeNoCInitialDataRetirement>>,
-        pub(crate) files: NativeSessionFiles,
+        _files: NativeSessionFiles,
         pub(crate) store: Rc<RefCell<NativeCarrierPairStore>>,
         pub(crate) source: Rc<WintunSource>,
         pub(crate) member_source: Rc<MemberSource>,
         pub(crate) supervisor: Rc<NativeDeadline>,
-        pub(crate) cancelled: Arc<AtomicBool>,
-        pub(crate) engine: PathBuf,
+        _cancelled: Arc<AtomicBool>,
         pub(crate) logical: Zeroizing<String>,
     }
     impl<'a> TerminalResources<TerminalStartupRaw<'a>> {
@@ -3066,13 +3055,12 @@ pub(crate) mod native {
                     creator_store: None,
                     initial_noc: None,
                     initial_data_retirement: None,
-                    files: self.files.clone(),
+                    _files: self.files.clone(),
                     store: self.store.clone(),
                     source: self.source.clone(),
                     member_source: self.member_source.clone(),
                     supervisor: self.supervisor.clone(),
-                    cancelled: self.cancelled.clone(),
-                    engine: self.engine.clone(),
+                    _cancelled: self.cancelled.clone(),
                     logical: Zeroizing::new(String::new()),
                 },
                 |pins| {
@@ -3227,7 +3215,6 @@ pub(crate) mod native {
                 module_only_selection: Rc::new(TerminalCallState::new()),
                 module_only_cleanup_read_calls: std::array::from_fn(|_| RefCell::new(Vec::new())),
                 module_only_load_read: RefCell::new(None),
-                module_only_native_read: RefCell::new(None),
                 module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| Vec::new())),
                 module_only_release: None,
                 module_only_outcome: None,
@@ -3311,9 +3298,6 @@ pub(crate) mod native {
                     )?;
                 Ok(())
             })
-        }
-        pub(crate) fn store(&self) -> Rc<RefCell<NativeCarrierPairStore>> {
-            self.store.clone()
         }
         /// Retain in the factory/session caller before closing or transfer to Pair.
         /// This original handle cannot grant native IO or DATA retirement
@@ -3528,9 +3512,6 @@ pub(crate) mod native {
                 .ok_or(Error::Pending)?
                 .bind_pre_pair_completed(outcome.clone())?;
             self.supervisor.allow_pre_pair_terminal_drop(&outcome)
-        }
-        pub(crate) fn context(&self) -> &Context {
-            &self.context
         }
         /// Transfer the real coordinator and serialized actor using THIS SAME
         /// protected store. Caller's four original slots must outlive this

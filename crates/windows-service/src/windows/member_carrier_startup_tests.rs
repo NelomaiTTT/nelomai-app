@@ -1576,7 +1576,7 @@ fn bootstrap_empty_join_requires_exact_frame_and_two_full_matching_reads() {
         filters: vec![],
     };
     let mut reads = 0;
-    inspect_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || {
+    read_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || {
         reads += 1;
         Ok(empty.clone())
     })
@@ -1584,7 +1584,7 @@ fn bootstrap_empty_join_requires_exact_frame_and_two_full_matching_reads() {
     assert_eq!(reads, 2);
     reads = 0;
     assert!(
-        inspect_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || {
+        read_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || {
             reads += 1;
             let mut actual = empty.clone();
             if reads == 2 {
@@ -1602,7 +1602,7 @@ fn bootstrap_empty_join_requires_exact_frame_and_two_full_matching_reads() {
             2 => wrong.phase = crate::member_carrier_pair::Phase::Stopped,
             _ => wrong.provenance.network_epoch += 1,
         }
-        assert!(inspect_bootstrap_empty(
+        assert!(read_bootstrap_empty(
             &context,
             &wrong,
             BootstrapOrigin::CreatedRetired,
@@ -1613,12 +1613,12 @@ fn bootstrap_empty_join_requires_exact_frame_and_two_full_matching_reads() {
     let mut removal = record.clone();
     removal.stop_stage = 10;
     removal.pending = Some(crate::member_carrier_pair::Effect::Guard);
-    inspect_bootstrap_empty(&context, &removal, BootstrapOrigin::CreatedRetired, || {
+    read_bootstrap_empty(&context, &removal, BootstrapOrigin::CreatedRetired, || {
         Ok(empty.clone())
     })
     .unwrap();
     assert!(
-        inspect_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || Err(
+        read_bootstrap_empty(&context, &record, BootstrapOrigin::CreatedRetired, || Err(
             Error::Pending
         ))
         .is_err()
@@ -1647,13 +1647,13 @@ fn fresh_abort_bootstrap_accepts_absent_vip_only_with_original_never_channel() {
         };
         assert!(closing.addresses.is_empty());
         let mut reads = 0;
-        inspect_bootstrap_empty(&context, &closing, BootstrapOrigin::OriginalNever, || {
+        read_bootstrap_empty(&context, &closing, BootstrapOrigin::OriginalNever, || {
             reads += 1;
             Ok(observed.clone())
         })
         .unwrap();
         assert_eq!(reads, 2);
-        assert!(inspect_bootstrap_empty(
+        assert!(read_bootstrap_empty(
             &context,
             &closing,
             BootstrapOrigin::CreatedRetired,
@@ -1674,7 +1674,7 @@ fn fresh_abort_bootstrap_accepts_absent_vip_only_with_original_never_channel() {
                     })
                 }
             }
-            assert!(inspect_bootstrap_empty(
+            assert!(read_bootstrap_empty(
                 &context,
                 &wrong,
                 BootstrapOrigin::OriginalNever,
@@ -1688,7 +1688,7 @@ fn fresh_abort_bootstrap_accepts_absent_vip_only_with_original_never_channel() {
         BootstrapOrigin::OriginalNever,
         BootstrapOrigin::CreatedRetired,
     ] {
-        inspect_bootstrap_empty(&context, &original_vip, channel, || Ok(observed.clone())).unwrap();
+        read_bootstrap_empty(&context, &original_vip, channel, || Ok(observed.clone())).unwrap();
     }
 }
 
