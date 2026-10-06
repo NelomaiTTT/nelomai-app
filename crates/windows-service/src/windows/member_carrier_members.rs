@@ -2177,10 +2177,13 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             image: &OriginalImage,
         ) -> Result<MixedClosingSample> {
-            if context != &self.context {
+            if context != &self.context
+                || !self.runtime.same_original_runtime(runtime)
+                || !image.matches_source(&self.carrier)
+            {
                 return Err(Error::Conflict);
             }
-            self.matches_original_runtime_image(runtime, image)?;
+            image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
             let before = self.revision()?;
             if Record::decode(&before)?.phase != Phase::Preparing {
                 return Err(Error::Conflict);
@@ -2199,7 +2202,7 @@ pub(crate) mod native {
                     }
                 },
             )?;
-            self.matches_original_runtime_image(runtime, image)?;
+            image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
             if self.revision()? != before {
                 return Err(Error::Conflict);
             }
