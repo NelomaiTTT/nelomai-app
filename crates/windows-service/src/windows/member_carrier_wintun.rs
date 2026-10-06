@@ -1646,32 +1646,16 @@ impl<K: Kernel> Carrier<K> {
         SessionEndRead(self.session_end.clone())
     }
     /// Ends only the original session. Adapter, module and captured identity
-    /// remain retained for a separately authorized close operation. Scheduling
-    /// bounds cannot interrupt the synchronous native call; G supplies that.
-    pub(crate) fn end_session_bounded(
-        &mut self,
-        cancel: &AtomicBool,
-        milliseconds: u32,
-    ) -> Result<()> {
+    /// remain retained for a separately authorized close operation. The caller's
+    /// integrating supervisor supplies the hard synchronous native-call deadline.
+    pub(crate) fn end_session(&mut self, cancel: &AtomicBool) -> Result<()> {
         with_call_resources(self, |owner| {
-            if !(1..=1000).contains(&milliseconds) {
-                return Err(Error::Invalid);
-            }
             owner.poisoned = true;
-            let mut last = owner.kernel.now_ms();
-            let deadline = last
-                .checked_add(u64::from(milliseconds))
-                .ok_or(Error::Invalid)?;
-            owner.cleanup_checkpoint(cancel, &mut last, deadline)?;
-            owner.end_session_inner(cancel, &mut last, deadline)
+            owner.cleanup_checkpoint(cancel)?;
+            owner.end_session_inner(cancel)
         })
     }
-    fn end_session_inner(
-        &mut self,
-        cancel: &AtomicBool,
-        last: &mut u64,
-        deadline: u64,
-    ) -> Result<()> {
+    fn end_session_inner(&mut self, cancel: &AtomicBool) -> Result<()> {
         match self.session_end.state.get() {
             SessionEndState::Acknowledged => {
                 // The retained VOID return is a historical fact only. An
@@ -1679,7 +1663,7 @@ impl<K: Kernel> Carrier<K> {
                 // authority and SAME original adapter observation.
                 self.kernel.verify(&self.binding, Stage::BeforeEnd)?;
                 self.capture_for(Stage::CleanupObserve)?;
-                return self.cleanup_checkpoint(cancel, last, deadline);
+                return self.cleanup_checkpoint(cancel);
             }
             SessionEndState::Live => {}
             // No ACK can be inferred from phase or Option<Session>. Unknown
@@ -1688,41 +1672,32 @@ impl<K: Kernel> Carrier<K> {
         }
         self.kernel.verify(&self.binding, Stage::BeforeEnd)?;
         self.capture_for(Stage::CleanupObserve)?;
-        self.cleanup_checkpoint(cancel, last, deadline)?;
+        self.cleanup_checkpoint(cancel)?;
         self.phase = Phase::Closing;
         self.session_end.state.set(SessionEndState::EndPending);
         self.kernel.end(self.session.take().ok_or(Error::Pending)?);
         // Native EndSession is VOID. Record its actual return before ANY
-        // fallible deadline/cancellation/provider postflight can obscure it.
+        // fallible cancellation/provider postflight can obscure it.
         self.session_end.state.set(SessionEndState::Acknowledged);
-        self.cleanup_checkpoint(cancel, last, deadline)?;
+        self.cleanup_checkpoint(cancel)?;
         self.capture_for(Stage::CleanupObserve)?;
-        self.cleanup_checkpoint(cancel, last, deadline)
+        self.cleanup_checkpoint(cancel)
     }
-    /// Bounds scheduling/waits BETWEEN audited synchronous calls; cannot
-    /// interrupt WintunEndSession/CloseAdapter or a blocking attestor call.
-    /// The integrating supervisor must supply the hard native-call deadline.
-    pub(crate) fn close_bounded(&mut self, cancel: &AtomicBool, milliseconds: u32) -> Result<()> {
-        with_call_resources(self, |owner| owner.close_inner(cancel, milliseconds))
+    /// Closes the exact original under the caller's hard native-call supervisor.
+    pub(crate) fn close_original(&mut self, cancel: &AtomicBool) -> Result<()> {
+        with_call_resources(self, |owner| owner.close_inner(cancel))
     }
-    fn close_inner(&mut self, cancel: &AtomicBool, milliseconds: u32) -> Result<()> {
+    fn close_inner(&mut self, cancel: &AtomicBool) -> Result<()> {
         if self.phase == Phase::Closed {
             return Ok(());
         }
-        if !(1..=1000).contains(&milliseconds) {
-            return Err(Error::Invalid);
-        }
         self.poisoned = true; // Teardown never resumes packet/session progression.
-        let mut last = self.kernel.now_ms();
-        let deadline = last
-            .checked_add(u64::from(milliseconds))
-            .ok_or(Error::Invalid)?;
-        self.cleanup_checkpoint(cancel, &mut last, deadline)?;
+        self.cleanup_checkpoint(cancel)?;
         if self.phase == Phase::Empty {
             self.kernel.verify(&self.binding, Stage::AfterClose)?;
             self.kernel.absent(&self.binding)?;
             self.phase = Phase::ClosePending;
-            self.cleanup_checkpoint(cancel, &mut last, deadline)?;
+            self.cleanup_checkpoint(cancel)?;
             self.kernel.release_module()?;
             self.phase = Phase::Closed;
             return Ok(());
@@ -1741,36 +1716,28 @@ impl<K: Kernel> Carrier<K> {
                 // A separately acknowledged End is already complete. Close
                 // must use its own pending operation, never authorize End from
                 // a CarrierClose record or repeat the consumed native call.
-                self.end_session_inner(cancel, &mut last, deadline)?;
+                self.end_session_inner(cancel)?;
             }
             self.kernel.verify(&self.binding, Stage::BeforeClose)?;
             self.capture_for(Stage::CleanupObserve)?;
-            self.cleanup_checkpoint(cancel, &mut last, deadline)?;
+            self.cleanup_checkpoint(cancel)?;
             // Native close is VOID. The original handle is consumed exactly once;
             // failure of later absence checks must NEVER retry a freed handle.
             self.kernel
                 .close(self.adapter.take().ok_or(Error::Pending)?);
             self.phase = Phase::ClosePending;
-            self.cleanup_checkpoint(cancel, &mut last, deadline)?;
+            self.cleanup_checkpoint(cancel)?;
         }
         self.kernel.verify(&self.binding, Stage::AfterClose)?;
         self.kernel.absent(&self.binding)?;
-        self.cleanup_checkpoint(cancel, &mut last, deadline)?;
+        self.cleanup_checkpoint(cancel)?;
         self.kernel.release_module()?;
         self.phase = Phase::Closed;
         Ok(())
     }
-    fn cleanup_checkpoint(&self, cancel: &AtomicBool, last: &mut u64, deadline: u64) -> Result<()> {
+    fn cleanup_checkpoint(&self, cancel: &AtomicBool) -> Result<()> {
         if cancel.load(Ordering::Acquire) {
-            return Err(Error::Cancelled);
-        }
-        let now = self.kernel.now_ms();
-        if now < *last {
-            return Err(Error::Conflict);
-        }
-        *last = now;
-        if now >= deadline {
-            Err(Error::Deadline)
+            Err(Error::Cancelled)
         } else {
             Ok(())
         }

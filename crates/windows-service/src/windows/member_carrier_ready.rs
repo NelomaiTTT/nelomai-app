@@ -2495,11 +2495,11 @@ pub(crate) mod native {
                             .verify_never_started()
                             .map_err(denied)
                     } else {
-                        carrier.end_session_bounded(cancelled, 1000).map_err(denied)
+                        carrier.end_session(cancelled).map_err(denied)
                     }
                 }
                 StopStep::Handle => {
-                    carrier.close_bounded(cancelled, 1000).map_err(denied)?;
+                    carrier.close_original(cancelled).map_err(denied)?;
                     let lifecycle = self.lifecycle.clone();
                     // AfterClose roots exactly one ACTUAL provider channel.
                     // A published read failure can never switch to unpublished.

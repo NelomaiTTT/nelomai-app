@@ -343,7 +343,7 @@ mod tests {
     }
     impl Cleanup for Carrier<Native> {
         fn close(&mut self) -> Result<()> {
-            self.close_bounded(&AtomicBool::new(false), 1000)
+            self.close_original(&AtomicBool::new(false))
         }
     }
 
@@ -355,17 +355,14 @@ mod tests {
             c.create(TestPrerequisite).unwrap();
             c.start().unwrap();
             let pin = c.session_end_read();
-            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.end_session(&AtomicBool::new(false)).unwrap();
             let ack = pin.acknowledged().unwrap();
             if authority_denied {
                 n.0.borrow_mut().fail_stage = Some(Stage::BeforeEnd);
             } else {
                 n.0.borrow_mut().drift = true;
             }
-            assert_eq!(
-                c.end_session_bounded(&AtomicBool::new(false), 100),
-                Err(Error::Conflict)
-            );
+            assert_eq!(c.end_session(&AtomicBool::new(false)), Err(Error::Conflict));
             pin.verify_acknowledged(&ack).unwrap(); // retained fact, not fresh permission
             assert_eq!(n.0.borrow().ended, 1);
             assert_eq!(n.0.borrow().closed, 0);
@@ -386,7 +383,7 @@ mod tests {
         assert_eq!(pin.verify_never_started(), Err(Error::Pending));
         assert_eq!(alias.verify_no_live_session(), Err(Error::Pending));
         pin.verify_endable().unwrap();
-        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        c.end_session(&AtomicBool::new(false)).unwrap();
         alias.verify_no_live_session().unwrap();
         pin.verify_endable().unwrap();
         assert_eq!(pin.verify_never_started(), Err(Error::Pending));
@@ -413,14 +410,12 @@ mod tests {
         assert_eq!(read.no_live_session(), Err(Error::Pending));
         foreign.create(TestPrerequisite).unwrap();
         foreign.start().unwrap();
-        foreign
-            .end_session_bounded(&AtomicBool::new(false), 100)
-            .unwrap();
+        foreign.end_session(&AtomicBool::new(false)).unwrap();
         // A foreign equal identity with a real end ACK cannot replace ours.
         read.retain(foreign.session_end_read());
         assert_eq!(read.no_live_session(), Err(Error::Pending));
         assert_eq!(read.endable(), Err(Error::Pending));
-        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        c.end_session(&AtomicBool::new(false)).unwrap();
         assert_eq!(read.no_live_session(), Err(Error::Pending)); // sticky invalid
     }
     #[test]
@@ -433,9 +428,7 @@ mod tests {
         gate.retain_handoff(original.read_pin());
         gate.live().unwrap();
         assert_eq!(gate.no_live_session(), Err(Error::Pending));
-        carrier
-            .end_session_bounded(&AtomicBool::new(false), 100)
-            .unwrap();
+        carrier.end_session(&AtomicBool::new(false)).unwrap();
         gate.endable().unwrap();
         gate.no_live_session().unwrap();
         assert_eq!(gate.live(), Err(Error::Pending));
@@ -462,7 +455,7 @@ mod tests {
             }
             c.create(TestPrerequisite).unwrap();
             c.start().unwrap();
-            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.end_session(&AtomicBool::new(false)).unwrap();
             if late {
                 read.retain(c.session_end_read());
                 assert_eq!(read.no_live_session(), Err(Error::Pending));
@@ -490,7 +483,7 @@ mod tests {
                 c.start().unwrap();
                 n.0.borrow_mut().panic_end = true;
                 assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                    || c.end_session_bounded(&AtomicBool::new(false), 100)
+                    || c.end_session(&AtomicBool::new(false))
                 ))
                 .is_err());
             }
@@ -527,7 +520,7 @@ mod tests {
         n.0.borrow_mut().end_pin = Some(alias.read_pin());
         n.0.borrow_mut().calls.clear();
         n.0.borrow_mut().observed_stages.clear();
-        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        c.end_session(&AtomicBool::new(false)).unwrap();
         let ack = pin.acknowledged().unwrap();
         alias.verify_acknowledged(&ack).unwrap();
         assert_eq!(c.phase(), Phase::Closing);
@@ -544,7 +537,7 @@ mod tests {
         assert_eq!(c.captured().unwrap().identity, row().identity);
         assert!(!n.0.borrow().call_resources_held);
         let observations = n.0.borrow().observed_stages.len();
-        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        c.end_session(&AtomicBool::new(false)).unwrap();
         assert_eq!(n.0.borrow().observed_stages.len(), observations + 1);
         assert_eq!(n.0.borrow().ended, 1);
         assert_eq!(n.0.borrow().closed, 0);
@@ -569,17 +562,14 @@ mod tests {
     }
 
     #[test]
-    fn separate_end_deadline_after_void_return_preserves_ack_and_original_adapter() {
-        // Break: a post-return timeout hides actual native completion or closes.
+    fn separate_slow_end_preserves_ack_and_original_adapter() {
+        // Break: a local timer rejects a supervised native return or obscures its ACK.
         let (n, mut c) = setup();
         c.create(TestPrerequisite).unwrap();
         c.start().unwrap();
         let pin = c.session_end_read();
-        n.0.borrow_mut().end_duration = 100;
-        assert_eq!(
-            c.end_session_bounded(&AtomicBool::new(false), 100),
-            Err(Error::Deadline)
-        );
+        n.0.borrow_mut().end_duration = 1500;
+        c.end_session(&AtomicBool::new(false)).unwrap();
         let ack = pin.acknowledged().unwrap();
         pin.verify_acknowledged(&ack).unwrap();
         assert_eq!(n.0.borrow().ended, 1);
@@ -606,7 +596,7 @@ mod tests {
                 n.0.borrow_mut().cancel_after_end = Some(cancel.clone());
             }
             assert_eq!(
-                c.end_session_bounded(&cancel, 100),
+                c.end_session(&cancel),
                 Err(if postflight_error {
                     Error::Native
                 } else {
@@ -618,7 +608,7 @@ mod tests {
             assert_eq!(n.0.borrow().closed, 0);
             assert!(!n.0.borrow().call_resources_held);
             n.0.borrow_mut().fail = None;
-            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.end_session(&AtomicBool::new(false)).unwrap();
             c.close().unwrap();
             assert_eq!(n.0.borrow().ended, 1);
             assert_eq!(n.0.borrow().closed, 1);
@@ -647,7 +637,7 @@ mod tests {
             if mode == 3 {
                 n.0.borrow_mut().cancel_at_stage = Some((Stage::BeforeEnd, cancel.clone()));
             }
-            assert_eq!(c.end_session_bounded(&cancel, 100), Err(expected));
+            assert_eq!(c.end_session(&cancel), Err(expected));
             assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
             assert_eq!(n.0.borrow().ended, 0);
             assert_eq!(n.0.borrow().closed, 0);
@@ -655,7 +645,7 @@ mod tests {
             assert!(!n.0.borrow().calls.iter().any(|s| s == "unpin_module"));
             n.0.borrow_mut().fail_stage = None;
             n.0.borrow_mut().cancel_at_stage = None;
-            c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+            c.end_session(&AtomicBool::new(false)).unwrap();
             c.close().unwrap();
             assert_eq!(n.0.borrow().ended, 1);
         }
@@ -673,7 +663,7 @@ mod tests {
             n.0.borrow_mut().end_pin = Some(pin.read_pin());
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if separate {
-                    c.end_session_bounded(&AtomicBool::new(false), 100)
+                    c.end_session(&AtomicBool::new(false))
                 } else {
                     c.close()
                 }
@@ -682,10 +672,7 @@ mod tests {
             assert!(!n.0.borrow().call_resources_held);
             assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
             n.0.borrow_mut().panic_end = false;
-            assert_eq!(
-                c.end_session_bounded(&AtomicBool::new(false), 100),
-                Err(Error::Pending)
-            );
+            assert_eq!(c.end_session(&AtomicBool::new(false)), Err(Error::Pending));
             assert_eq!(c.close(), Err(Error::Pending));
             assert_eq!(n.0.borrow().ended, 1);
             assert_eq!(n.0.borrow().closed, 0);
@@ -709,9 +696,7 @@ mod tests {
         let pin = c.session_end_read();
         let alias = pin.read_pin();
         let foreign_pin = foreign.session_end_read();
-        foreign
-            .end_session_bounded(&AtomicBool::new(false), 100)
-            .unwrap();
+        foreign.end_session(&AtomicBool::new(false)).unwrap();
         let foreign_ack = foreign_pin.acknowledged().unwrap();
         assert_eq!(pin.verify_acknowledged(&foreign_ack), Err(Error::Conflict));
         assert_eq!(
@@ -721,7 +706,7 @@ mod tests {
         assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
         assert!(matches!(alias.acknowledged(), Err(Error::Pending)));
         assert_eq!(n.0.borrow().ended, 0);
-        c.end_session_bounded(&AtomicBool::new(false), 100).unwrap();
+        c.end_session(&AtomicBool::new(false)).unwrap();
         let ack = alias.acknowledged().unwrap();
         assert_eq!(foreign_pin.verify_acknowledged(&ack), Err(Error::Conflict));
         pin.verify_acknowledged(&ack).unwrap();
@@ -735,10 +720,7 @@ mod tests {
             if created {
                 c.create(TestPrerequisite).unwrap();
             }
-            assert_eq!(
-                c.end_session_bounded(&AtomicBool::new(false), 100),
-                Err(Error::Pending)
-            );
+            assert_eq!(c.end_session(&AtomicBool::new(false)), Err(Error::Pending));
             assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
             c.close().unwrap();
             assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
@@ -778,21 +760,6 @@ mod tests {
         assert_eq!(n.0.borrow().ended, 0);
         assert_eq!(n.0.borrow().closed, 1);
         assert!(matches!(pin.acknowledged(), Err(Error::Pending)));
-    }
-
-    #[test]
-    fn separate_end_invalid_bounds_never_reach_effects() {
-        let (n, mut c) = setup();
-        c.create(TestPrerequisite).unwrap();
-        c.start().unwrap();
-        let calls = n.0.borrow().calls.clone();
-        for ms in [0, 1001] {
-            assert_eq!(
-                c.end_session_bounded(&AtomicBool::new(false), ms),
-                Err(Error::Invalid)
-            );
-            assert_eq!(n.0.borrow().calls, calls);
-        }
     }
 
     #[test]
@@ -1254,7 +1221,7 @@ mod tests {
         let (n, mut c) = setup();
         c.create(TestPrerequisite).unwrap();
         c.start().unwrap();
-        assert!(c.close_bounded(&AtomicBool::new(true), 100).is_err());
+        assert!(c.close_original(&AtomicBool::new(true)).is_err());
         assert_eq!(n.0.borrow().ended, 0);
         assert_eq!(n.0.borrow().closed, 0);
         c.close().unwrap();
@@ -1389,40 +1356,28 @@ mod tests {
         }
     }
     #[test]
-    fn exceeded_native_end_or_close_budget_preserves_remaining_obligations_without_reusing_handles()
-    {
+    fn slow_native_end_or_close_preserves_completion_without_reusing_handles() {
         for after_end in [true, false] {
             let (n, mut c) = setup();
             c.create(TestPrerequisite).unwrap();
             c.start().unwrap();
             if after_end {
-                n.0.borrow_mut().end_duration = 150;
+                n.0.borrow_mut().end_duration = 1500;
             } else {
-                n.0.borrow_mut().close_duration = 150;
+                n.0.borrow_mut().close_duration = 1500;
             }
-            assert_eq!(
-                c.close_bounded(&AtomicBool::new(false), 100),
-                Err(Error::Deadline)
-            );
+            c.close_original(&AtomicBool::new(false)).unwrap();
+            assert_eq!(c.phase(), Phase::Closed);
             assert_eq!(n.0.borrow().ended, 1);
-            assert_eq!(n.0.borrow().closed, u32::from(!after_end));
-            assert!(!n.0.borrow().calls.iter().any(|c| c == "unpin_module"));
+            assert_eq!(n.0.borrow().closed, 1);
             c.close().unwrap();
             assert_eq!(n.0.borrow().ended, 1);
             assert_eq!(n.0.borrow().closed, 1);
         }
     }
     #[test]
-    fn unused_module_cleanup_is_bounded_and_never_creates_or_closes_a_nic() {
+    fn unused_module_cleanup_never_creates_or_closes_a_nic() {
         let (n, mut c) = setup();
-        assert_eq!(
-            c.close_bounded(&AtomicBool::new(false), 0),
-            Err(Error::Invalid)
-        );
-        assert_eq!(
-            c.close_bounded(&AtomicBool::new(false), 1001),
-            Err(Error::Invalid)
-        );
         n.0.borrow_mut().fail = Some("unpin_module");
         assert!(c.close().is_err());
         assert_eq!(c.phase(), Phase::ClosePending);
