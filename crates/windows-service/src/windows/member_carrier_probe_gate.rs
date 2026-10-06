@@ -33,7 +33,8 @@ fn idx(slot: Slot) -> usize {
 fn denied<E>(_: E) -> GuardError {
     GuardError::Conflict
 }
-fn compare_identity(context: &Context, r: &pair::Record) -> Result<()> {
+// Protected metadata origin only; Prepared members confer no effect permission.
+fn compare_origin(context: &Context, r: &pair::Record) -> Result<()> {
     r.validate().map_err(denied)?;
     if r.scope != context.intent.scope
         || r.provenance != context.provenance
@@ -43,6 +44,21 @@ fn compare_identity(context: &Context, r: &pair::Record) -> Result<()> {
     {
         return Err(GuardError::Conflict);
     }
+    for (i, m) in r.members.iter().enumerate() {
+        if let Some(m) = m {
+            if [m.owner.proof, m.owner.retired_proof]
+                .into_iter()
+                .flatten()
+                .any(|p| p.interface.guid != context.bindings[i + 1].guid)
+            {
+                return Err(GuardError::Conflict);
+            }
+        }
+    }
+    Ok(())
+}
+fn compare_identity(context: &Context, r: &pair::Record) -> Result<()> {
+    compare_origin(context, r)?;
     for (i, m) in r.members.iter().enumerate() {
         if let Some(m) = m {
             if m.owner.phase != crate::member_owner::Phase::Running
@@ -1261,7 +1277,7 @@ pub(crate) mod native {
             })
         }
         fn continuity(&self, selected: &Selected) -> Result<()> {
-            compare_identity(&self.context, &selected.record)?;
+            compare_origin(&self.context, &selected.record)?;
             if !selected.pin.matches_runtime(&self.runtime) {
                 return Err(GuardError::Conflict);
             }
@@ -1475,7 +1491,7 @@ pub(crate) mod native {
             };
             self.fence.inspect(purpose, || {
                 let mut selected = self.selected.try_borrow_mut().map_err(denied)?;
-                compare_identity(&self.context, &record)?;
+                compare_origin(&self.context, &record)?;
                 if record.revision < selected.record.revision
                     || (record.revision == selected.record.revision
                         && (record != selected.record || !Rc::ptr_eq(&pin, &selected.pin)))

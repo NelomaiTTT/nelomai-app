@@ -1165,3 +1165,75 @@ fn weak_registration_retains_exact_first_origin_and_expiry_denies_without_a_stro
     drop(actor);
     assert!(slot.value.borrow().as_ref().unwrap().upgrade().is_none());
 }
+
+// Prepared ownership metadata after C publication is not probe/Guard authority.
+#[test]
+fn starting_prepared_origin_retains_metadata_without_granting_any_probe_effect() {
+    let (context, mut record) = fixture();
+    let proof = record.members[0].as_ref().unwrap().owner.proof.unwrap();
+    record.members[0].as_mut().unwrap().owner.phase = owner::Phase::Prepared;
+    record.members[0].as_mut().unwrap().owner.proof = None;
+    record.guard = policy::Model::empty(record.scope.clone()).unwrap();
+    record.network = None;
+    record.pending = None;
+    record.validate().unwrap();
+    assert_eq!(compare_origin(&context, &record), Ok(()));
+    assert!(compare_identity(&context, &record).is_err());
+    for purpose in [
+        Purpose::Open(Slot::A),
+        Purpose::Open(Slot::B),
+        Purpose::Use(Slot::A),
+        Purpose::Use(Slot::B),
+        Purpose::Preparing,
+        Purpose::Closing,
+        Purpose::Guard,
+    ] {
+        assert!(
+            compare_stage(&context, &record, purpose).is_err(),
+            "{purpose:?}"
+        );
+    }
+    assert!(compare_guard_target(&context, &record, &record.guard).is_err());
+    let mut foreign = context.clone();
+    foreign.provenance.boot_id[0] ^= 1;
+    assert!(compare_origin(&foreign, &record).is_err());
+    foreign = context.clone();
+    foreign.intent.scope.connection_generation += 1;
+    assert!(compare_origin(&foreign, &record).is_err());
+    foreign = context.clone();
+    foreign.bindings[0].guid[0] ^= 1;
+    assert!(compare_origin(&foreign, &record).is_err());
+
+    let mut live = record.clone();
+    live.members[0].as_mut().unwrap().owner.phase = owner::Phase::Running;
+    live.members[0].as_mut().unwrap().owner.proof = Some(proof);
+    assert_eq!(compare_origin(&context, &live), Ok(()));
+    live.members[0]
+        .as_mut()
+        .unwrap()
+        .owner
+        .proof
+        .as_mut()
+        .unwrap()
+        .interface
+        .guid[0] ^= 1;
+    live.validate().unwrap();
+    assert!(compare_origin(&context, &live).is_err());
+
+    let mut retired = record.clone();
+    retired.members[0].as_mut().unwrap().owner.retired_proof = Some(proof);
+    retired.validate().unwrap();
+    assert_eq!(compare_origin(&context, &retired), Ok(()));
+    assert!(compare_identity(&context, &retired).is_err());
+    retired.members[0]
+        .as_mut()
+        .unwrap()
+        .owner
+        .retired_proof
+        .as_mut()
+        .unwrap()
+        .interface
+        .guid[0] ^= 1;
+    retired.validate().unwrap();
+    assert!(compare_origin(&context, &retired).is_err());
+}

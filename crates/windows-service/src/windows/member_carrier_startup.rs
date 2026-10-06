@@ -2283,8 +2283,13 @@ pub(crate) mod native {
             ));
             let state = self.probe_state.as_ref().ok_or(Error::Pending)?.clone();
             self.probes = Some(
-                ProbeInventory::new(pins.source.clone(), guard.clone(), state.gate())
-                    .map_err(|_| Error::Conflict)?,
+                ProbeInventory::new(pins.source.clone(), guard.clone(), state.gate()).map_err(
+                    |_error| {
+                        #[cfg(test)]
+                        trace_step(&format!("startup graph ProbeInventory error={_error:?}"));
+                        Error::Conflict
+                    },
+                )?,
             );
             self.probe_read = Some(Rc::new(
                 self.probes.as_ref().ok_or(Error::Pending)?.read_pin(),

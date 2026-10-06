@@ -1573,10 +1573,15 @@ pub(crate) mod native {
                     .inventory
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                if Record::decode(&inventory.revision()?)?.phase != Phase::Preparing {
+                let before = inventory.revision()?;
+                if Record::decode(&before)?.phase != Phase::Preparing {
                     return Err(Error::Conflict);
                 }
-                inventory.read_all_inner()
+                let members = inventory.read_all_in_revision(&before)?;
+                if inventory.revision()? != before {
+                    return Err(Error::Conflict);
+                }
+                Ok(members)
             })
         }
         pub(crate) fn inspect_full<T>(
@@ -2189,7 +2194,7 @@ pub(crate) mod native {
             if Record::decode(&before)?.phase != Phase::Preparing {
                 return Err(Error::Conflict);
             }
-            let live = self.read_all_inner()?;
+            let live = self.read_all_in_revision(&before)?;
             let history = read_mixed_closed_bindings(
                 &self.context,
                 &mut self.entries,

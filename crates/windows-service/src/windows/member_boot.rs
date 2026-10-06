@@ -67,7 +67,7 @@ fn query_boot(query: impl FnOnce(u32, &mut [u8], &mut u32) -> i32) -> io::Result
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
-    use std::{ffi::c_void, ptr};
+    use std::{ffi::c_void, ptr, sync::OnceLock};
     use windows_sys::Win32::{
         Foundation::{FreeLibrary, HMODULE},
         System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
@@ -82,23 +82,51 @@ pub(crate) fn boot_id() -> io::Result<[u8; 16]> {
         }
     }
 
-    let name: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
-    // System-directory-only search: never the working directory, application
-    // directory, PATH, or a caller-provided DLL path. No mandatory ntdll import.
-    let module =
-        unsafe { LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
-    if module.is_null() {
-        return Err(unsupported());
+    struct SystemBootQuery {
+        _library: Library,
+        query: NtQuery,
     }
-    let library = Library(module);
-    let procedure =
-        unsafe { GetProcAddress(library.0, c"NtQuerySystemInformation".as_ptr().cast()) }
-            .ok_or_else(unsupported)?;
-    // SAFETY: exact exported NTAPI signature from the cited declarations; the
-    // module reference stays alive through the call. Only the supported little-
-    // endian x64/ARM64 ABI reaches here. Buffer is initialized, aligned to 8,
-    // writable for exactly 32 bytes, and return-length points to a live u32.
-    let query: NtQuery = unsafe { std::mem::transmute(procedure) };
+    // SAFETY: this owns an OS loader reference, not a thread-affine resource.
+    // The immutable export remains live while that reference is held, and each
+    // invocation supplies its own buffer and return-length storage.
+    unsafe impl Send for SystemBootQuery {}
+    unsafe impl Sync for SystemBootQuery {}
+    impl SystemBootQuery {
+        fn load() -> io::Result<Self> {
+            let name: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
+            // System-directory-only search: never the working directory,
+            // application directory, PATH, or a caller-provided DLL path.
+            let module = unsafe {
+                LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)
+            };
+            if module.is_null() {
+                return Err(unsupported());
+            }
+            let library = Library(module);
+            let procedure =
+                unsafe { GetProcAddress(library.0, c"NtQuerySystemInformation".as_ptr().cast()) }
+                    .ok_or_else(unsupported)?;
+            // SAFETY: exact exported NTAPI signature from the cited declarations;
+            // the owned module reference remains live with the function pointer.
+            let query: NtQuery = unsafe { std::mem::transmute(procedure) };
+            Ok(Self {
+                _library: library,
+                query,
+            })
+        }
+    }
+    static QUERY: OnceLock<SystemBootQuery> = OnceLock::new();
+    if QUERY.get().is_none() {
+        // Do not retain initialization errors. A concurrent successful loser
+        // drops only its own extra loader reference through Library::drop.
+        let _ = QUERY.set(SystemBootQuery::load()?);
+    }
+    let query = QUERY.get().ok_or_else(unsupported)?.query;
+    // Only code resolution is retained. Every call freshly queries boot data.
+    // SAFETY: the process-lifetime module reference protects the exact export.
+    // Only the supported little-endian x64/ARM64 ABI reaches here. Buffer is
+    // initialized, aligned to 8, writable for exactly 32 bytes; return-length
+    // points to a live u32.
     query_boot(|class, buffer, returned| unsafe {
         query(
             class,
