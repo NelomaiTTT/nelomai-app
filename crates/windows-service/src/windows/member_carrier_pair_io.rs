@@ -1552,10 +1552,13 @@ pub(crate) mod native {
         }
         fn verify_retired_bracket(
             &mut self,
+            pair: &Rc<NativePairIntentRead>,
+            record: &pair::Record,
             original: &RetiredCarrierRead,
             bindings: &Bindings,
         ) -> policy::Result<()> {
-            self.inner.verify_retired_bracket(original, bindings)
+            self.inner
+                .verify_retired_bracket(pair, record, original, bindings)
         }
     }
     impl TerminalBindingAttestor for OriginalGuardAttestor {
@@ -5594,7 +5597,7 @@ pub(crate) mod native {
                 };
                 if let Some(retired) = retired {
                     if matches!(record.stop_stage, 9 | 10) {
-                        return Self::native_empty_graph_in_call(r, record);
+                        return Self::native_empty_graph_in_call(r, pin, record);
                     }
                     if record.stop_stage == 11 {
                         require_effect(record, pair::Effect::RestoreKeys)?;
@@ -5629,7 +5632,7 @@ pub(crate) mod native {
                                 .guard
                                 .try_borrow_mut()
                                 .map_err(native_denied)?
-                                .snapshot_in_retired_bracket(&retired, bindings)
+                                .snapshot_in_retired_bracket(pin, record, &retired, bindings)
                                 .map_err(native_denied)?;
                             r.rows
                                 .inspect_retired_in_bracket(&retired, bindings, |_| Ok(()))?;
@@ -5639,7 +5642,7 @@ pub(crate) mod native {
                             if r.guard
                                 .try_borrow_mut()
                                 .map_err(native_denied)?
-                                .snapshot_in_retired_bracket(&retired, bindings)
+                                .snapshot_in_retired_bracket(pin, record, &retired, bindings)
                                 .map_err(native_denied)?
                                 != before
                             {
@@ -5691,7 +5694,7 @@ pub(crate) mod native {
                 r.probe_state
                     .select(pin.clone(), record.clone())
                     .map_err(denied)?;
-                Self::native_empty_graph_in_call(r, record)
+                Self::native_empty_graph_in_call(r, pin, record)
             })
         }
         /// Existing actual Pair/Calling, SAME Retired full mixed SDK/history
@@ -5699,6 +5702,7 @@ pub(crate) mod native {
         /// Source/Authority reentry or successful cleanup inferred from JSON.
         fn native_empty_graph_in_call(
             r: &NativeActorInputs<'_>,
+            pin: &Rc<NativePairIntentRead>,
             record: &pair::Record,
         ) -> io::Result<()> {
             require_native_empty_frame(record)?;
@@ -5718,7 +5722,7 @@ pub(crate) mod native {
                             .guard
                             .try_borrow_mut()
                             .map_err(native_denied)?
-                            .snapshot_in_retired_bracket(&original, bindings)
+                            .snapshot_in_retired_bracket(pin, record, &original, bindings)
                             .map_err(native_denied)?;
                         if guard != record.guard.expected
                             || guard.scope != record.scope
@@ -5795,11 +5799,15 @@ pub(crate) mod native {
                 });
             }
             self.in_call(record, |this, pin| {
-                this.select_guard(pin, record)?;
+                if record.phase != pair::Phase::Stopped {
+                    this.select_guard(pin, record)?;
+                }
                 let r = this.roots()?;
-                r.probe_state
-                    .select(pin.clone(), record.clone())
-                    .map_err(denied)?;
+                if record.phase != pair::Phase::Stopped {
+                    r.probe_state
+                        .select(pin.clone(), record.clone())
+                        .map_err(denied)?;
+                }
                 let original = r.carrier.retired_pin().map_err(denied)?;
                 if !original.matches_source_origin(&r.pins.source)
                     || !r
@@ -5855,7 +5863,7 @@ pub(crate) mod native {
                                 .guard
                                 .try_borrow_mut()
                                 .map_err(native_denied)?
-                                .snapshot_in_retired_bracket(&original, bindings)
+                                .snapshot_in_retired_bracket(pin, record, &original, bindings)
                                 .map_err(native_denied)?;
                             compare_full_empty_snapshot(record, &guard).map_err(native_denied)?;
                             let facts = r.rows.inspect_retired_in_bracket(
@@ -6407,7 +6415,9 @@ pub(crate) mod native {
                 });
             }
             self.in_call(&record, |this, pin| {
-                this.select_guard(pin, &record)?;
+                if record.phase != pair::Phase::Stopped {
+                    this.select_guard(pin, &record)?;
+                }
                 let r = this.roots()?;
                 if (record.phase == pair::Phase::Closing && record.stop_stage == 12)
                     || record.phase == pair::Phase::Stopped
@@ -6420,7 +6430,7 @@ pub(crate) mod native {
                                 .guard
                                 .try_borrow_mut()
                                 .map_err(native_denied)?
-                                .snapshot_in_retired_bracket(&original, bindings)
+                                .snapshot_in_retired_bracket(pin, &record, &original, bindings)
                                 .map_err(native_denied)?;
                             compare_full_empty_snapshot(&record, &actual).map_err(native_denied)?;
                             Ok(actual)
@@ -6429,15 +6439,36 @@ pub(crate) mod native {
                 }
                 if record.phase == pair::Phase::Closing && record.stop_stage >= 8 {
                     let original = r.carrier.retired_pin().map_err(denied)?;
-                    return original
-                        .inspect_bindings(|bindings| {
-                            r.guard
-                                .try_borrow_mut()
-                                .map_err(native_denied)?
-                                .snapshot_in_retired_bracket(&original, bindings)
-                                .map_err(native_denied)
-                        })
-                        .map_err(denied);
+                    let sample = |bindings: &Bindings| {
+                        r.guard
+                            .try_borrow_mut()
+                            .map_err(native_denied)?
+                            .snapshot_in_retired_bracket(pin, &record, &original, bindings)
+                            .map_err(native_denied)
+                    };
+                    if record.stop_stage == 11 {
+                        let raw = r
+                            .runtime
+                            .record(
+                                &r.context,
+                                crate::windows::member_session::RecordKind::NativeCarrierReceipts,
+                            )
+                            .map_err(denied)?;
+                        let native = crate::member_carrier_native_ownership::Record::decode(&raw)
+                            .map_err(denied)?;
+                        if crate::windows::member_carrier_ready::key_restore_read_is_terminal(
+                            &r.context, &record, &native,
+                        )
+                        .map_err(denied)?
+                        {
+                            return original
+                                .inspect_terminal_bindings_and_history(|bindings, _| {
+                                    sample(bindings)
+                                })
+                                .map_err(denied);
+                        }
+                    }
+                    return original.inspect_bindings(sample).map_err(denied);
                 }
                 r.guard
                     .try_borrow_mut()
@@ -7724,12 +7755,9 @@ pub(crate) mod native {
                 .carrier
                 .rows_authority_in_call(pin.clone(), record)
                 .map_err(|error| denied(error))?;
-            let mut authority = authority
+            let authority = authority
                 .for_member(binding.role)
                 .map_err(|error| denied(error))?;
-            if authority.binding().map_err(|error| denied(error))? != binding {
-                return Err(conflict());
-            }
             self.row_authorities[i] = Some(authority.read_pin()); // SAME owner alias before baseline capture
             let (journal, saved) = WindowsCarrierRowsStore::open(r.files.clone(), binding.clone())?;
             if saved.is_some() {
@@ -7912,10 +7940,7 @@ pub(crate) mod native {
                         .carrier
                         .rows_authority_in_call(pin.clone(), record)
                         .map_err(denied)?;
-                    let mut authority = authority.for_member(binding.role).map_err(denied)?;
-                    if authority.binding().map_err(denied)? != binding {
-                        return Err(conflict());
-                    }
+                    let authority = authority.for_member(binding.role).map_err(denied)?;
                     *authority_pin = Some(authority.read_pin());
                     *destination = Some(MemberRowCapture::new_native(
                         binding.clone(),

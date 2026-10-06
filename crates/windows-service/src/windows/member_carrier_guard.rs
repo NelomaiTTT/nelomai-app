@@ -491,6 +491,10 @@ pub(crate) trait WindowBindingAttestor: BindingAttestor {
     /// Retired/Source again. This method grants NO mutation/removal rights.
     fn verify_retired_bracket(
         &mut self,
+        pair: &std::rc::Rc<
+            crate::windows::member_carrier_pair_store::native_store::NativePairIntentRead,
+        >,
+        record: &crate::member_carrier_pair::Record,
         retired: &crate::windows::member_carrier_runtime::native::RetiredCarrierRead,
         bindings: &Bindings,
     ) -> Result<()>;
@@ -2503,6 +2507,10 @@ mod bfe {
         /// original full Retired/SDK absence bracket. No nested Retired read.
         pub(crate) fn snapshot_in_retired_bracket(
             &mut self,
+            pair: &std::rc::Rc<
+                crate::windows::member_carrier_pair_store::native_store::NativePairIntentRead,
+            >,
+            record: &crate::member_carrier_pair::Record,
             retired: &crate::windows::member_carrier_runtime::native::RetiredCarrierRead,
             bindings: &Bindings,
         ) -> Result<Snapshot> {
@@ -2512,7 +2520,8 @@ mod bfe {
             let was_failed = self.failed;
             self.failed = true;
             let result = (|| {
-                self.attestor.verify_retired_bracket(retired, bindings)?;
+                self.attestor
+                    .verify_retired_bracket(pair, record, retired, bindings)?;
                 let before = transaction(&mut self.io, SessionKind::StaticBase, true, |io| {
                     read_native_snapshot(
                         io,
@@ -2522,7 +2531,8 @@ mod bfe {
                         &self.owned_ids,
                     )
                 })?;
-                self.attestor.verify_retired_bracket(retired, bindings)?;
+                self.attestor
+                    .verify_retired_bracket(pair, record, retired, bindings)?;
                 let after = transaction(&mut self.io, SessionKind::StaticBase, true, |io| {
                     read_native_snapshot(
                         io,
@@ -2536,7 +2546,8 @@ mod bfe {
                     return Err(GuardError::Conflict);
                 }
                 self.compare_snapshot(&before, was_failed)?;
-                self.attestor.verify_retired_bracket(retired, bindings)?;
+                self.attestor
+                    .verify_retired_bracket(pair, record, retired, bindings)?;
                 Ok(before)
             })();
             match result {

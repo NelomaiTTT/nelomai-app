@@ -3895,7 +3895,9 @@ pub(crate) mod native {
                                         .ok_or(Error::Pending)?
                                         .try_borrow_mut()
                                         .map_err(|_| Error::Conflict)?
-                                        .snapshot_in_retired_bracket(&retired, bindings)
+                                        .snapshot_in_retired_bracket(
+                                            original, expected, &retired, bindings,
+                                        )
                                         .map_err(|_| Error::Conflict)
                                 },
                             )
@@ -4239,7 +4241,7 @@ pub(crate) mod native {
                                 BootstrapOrigin::CreatedRetired,
                                 || {
                                     Self::bootstrap_retired_resources(
-                                        graph, expected, &retired, bindings, &source,
+                                        graph, original, expected, &retired, bindings, &source,
                                     )
                                 },
                             )
@@ -4256,6 +4258,7 @@ pub(crate) mod native {
         /// enter live Source or query historical DNS/NICs from here.
         fn bootstrap_retired_resources(
             graph: &GraphSlot,
+            original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
             retired: &crate::windows::member_carrier_runtime::native::RetiredCarrierRead,
             bindings: &crate::windows::member_carrier_guard::Bindings,
@@ -4281,7 +4284,7 @@ pub(crate) mod native {
             let before = guard
                 .try_borrow_mut()
                 .map_err(|_| Error::Conflict)?
-                .snapshot_in_retired_bracket(retired, bindings)
+                .snapshot_in_retired_bracket(original, expected, retired, bindings)
                 .map_err(|_| Error::Conflict)?;
             graph
                 .rows
@@ -4311,7 +4314,7 @@ pub(crate) mod native {
             if guard
                 .try_borrow_mut()
                 .map_err(|_| Error::Conflict)?
-                .snapshot_in_retired_bracket(retired, bindings)
+                .snapshot_in_retired_bracket(original, expected, retired, bindings)
                 .map_err(|_| Error::Conflict)?
                 != before
             {

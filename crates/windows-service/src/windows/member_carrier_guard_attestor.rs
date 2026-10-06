@@ -97,7 +97,9 @@ fn compare_retired_read(context: &Context, record: &pair::Record) -> Result<()> 
         (8, Some(pair::Effect::CarrierClose)) if record.pending_guard.is_none() => Ok(()),
         (9, Some(pair::Effect::NativeEmpty)) if record.pending_guard.is_none() => Ok(()),
         (10, Some(pair::Effect::Guard)) => {
-            let plan = record.pending_guard.as_ref().ok_or(GuardError::Conflict)?;
+            let Some(plan) = record.pending_guard.as_ref() else {
+                return Ok(());
+            };
             plan.validate()?;
             let empty = Model::empty(record.scope.clone())?;
             if plan.desired != empty || plan.expected.permits {
@@ -117,6 +119,12 @@ fn compare_retired_read(context: &Context, record: &pair::Record) -> Result<()> 
             if !known {
                 return Err(GuardError::Conflict);
             }
+            Ok(())
+        }
+        (11, Some(pair::Effect::RestoreKeys)) | (12, Some(pair::Effect::FullEmpty))
+            if record.pending_guard.is_none()
+                && record.guard == Model::empty(record.scope.clone())? =>
+        {
             Ok(())
         }
         _ => Err(GuardError::Conflict),
@@ -1115,13 +1123,40 @@ pub(crate) mod native {
     impl<G: NativeGuardGate> WindowBindingAttestor for NativeGuardAttestor<G> {
         fn verify_retired_bracket(
             &mut self,
+            pair: &Rc<NativePairIntentRead>,
+            record: &pair::Record,
             retired: &RetiredCarrierRead,
             bindings: &Bindings,
         ) -> Result<()> {
+            if record.phase == pair::Phase::Stopped {
+                let original = self
+                    .originals
+                    .retired
+                    .value
+                    .try_borrow()
+                    .map_err(denied)?
+                    .clone()
+                    .ok_or(GuardError::Conflict)?;
+                if !std::ptr::eq(original.as_ref(), retired) {
+                    return Err(GuardError::Conflict);
+                }
+                return self.verify_terminal_bracket(pair, record, &original, bindings);
+            }
             let fence = self.fence.clone();
             fence.inspect_cleanup(|| {
-                let selected = self.selected.try_borrow().map_err(denied)?;
-                compare_retired_read(&self.originals.context, &selected.record)?;
+                compare_retired_read(&self.originals.context, record)?;
+                let previous = self.selected.try_borrow().map_err(denied)?;
+                compare_selection(&self.originals.context, &previous.record, record)?;
+                if !pair.same_store_origin(&previous.pair)
+                    || (record.revision == previous.record.revision
+                        && !Rc::ptr_eq(pair, &previous.pair))
+                {
+                    return Err(GuardError::Conflict);
+                }
+                let selected = Selected {
+                    pair: pair.clone(),
+                    record: record.clone(),
+                };
                 let slot = self.originals.retired.value.try_borrow().map_err(denied)?;
                 let original = slot.as_ref().ok_or(GuardError::Conflict)?;
                 let source = self.originals.source.as_ref().ok_or(GuardError::Conflict)?;
@@ -1131,17 +1166,42 @@ pub(crate) mod native {
                     return Err(GuardError::Conflict);
                 }
                 self.originals.inspect_pair(&selected, false, |_| {
-                    retired
-                        .inspect_history_in_bracket(|history| {
-                            compare_bindings_with_history(
-                                &self.originals.context,
-                                &selected.record,
-                                &facts(bindings),
-                                history_by_slot(history),
-                            )
-                            .map_err(native_denied)
-                        })
-                        .map_err(io_denied)
+                    let bytes = self
+                        .originals
+                        .runtime
+                        .record(
+                            &self.originals.context,
+                            crate::windows::member_session::RecordKind::NativeCarrierReceipts,
+                        )
+                        .map_err(io_denied)?;
+                    let native = crate::member_carrier_native_ownership::Record::decode(&bytes)
+                        .map_err(io_denied)?;
+                    if native.context != self.originals.context {
+                        return Err(io_denied(()));
+                    }
+                    let compare = |history: &[original_members::ClosedMemberBinding]| {
+                        compare_bindings_with_history(
+                            &self.originals.context,
+                            record,
+                            &facts(bindings),
+                            history_by_slot(history),
+                        )
+                        .map_err(native_denied)
+                    };
+                    match native.phase {
+                        crate::member_carrier_native_ownership::Phase::Closing
+                            if record.stop_stage <= 11 =>
+                        {
+                            retired.inspect_history_in_bracket(compare)
+                        }
+                        crate::member_carrier_native_ownership::Phase::Stopped
+                            if matches!(record.stop_stage, 11 | 12) =>
+                        {
+                            retired.inspect_terminal_history_in_bracket(compare)
+                        }
+                        _ => return Err(io_denied(())),
+                    }
+                    .map_err(io_denied)
                 })
             })
         }

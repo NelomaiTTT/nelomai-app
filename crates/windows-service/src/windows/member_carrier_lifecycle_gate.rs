@@ -1160,7 +1160,7 @@ pub(crate) mod native {
                     let before = guard
                         .try_borrow_mut()
                         .map_err(denied)?
-                        .snapshot_in_retired_bracket(retired, bindings)
+                        .snapshot_in_retired_bracket(original, record, retired, bindings)
                         .map_err(denied)?;
                     compare(&shared.context, record, &before)?;
                     let rows_root = shared.rows.read()?;
@@ -1224,7 +1224,7 @@ pub(crate) mod native {
                     let after = guard
                         .try_borrow_mut()
                         .map_err(denied)?
-                        .snapshot_in_retired_bracket(retired, bindings)
+                        .snapshot_in_retired_bracket(original, record, retired, bindings)
                         .map_err(denied)?;
                     compare(&shared.context, record, &after)?;
                     if before != after
@@ -1305,15 +1305,6 @@ pub(crate) mod native {
                     selected
                         .generation
                         .set(Some(self.shared.row_generations[i].begin(None)?));
-                    self.shared
-                        .source
-                        .read()?
-                        .inspect_window(|window| {
-                            self.shared
-                                .capture_window(&selected, window)
-                                .map_err(native_denied)
-                        })
-                        .map_err(denied)?;
                     self.shared.current(input.record)
                 })
                 .map_err(native_denied)
@@ -1349,33 +1340,8 @@ pub(crate) mod native {
                     self.shared.verify_capture_origin(&selected)?;
                     let i = role_index(selected.binding.role);
                     let index = selected.generation.get().ok_or_else(conflict)?;
-                    let (pin, baseline) = self.shared.row_generations[i].original(index)?;
+                    let (pin, _) = self.shared.row_generations[i].original(index)?;
                     self.shared.verify_capture_pin(&selected, &pin)?;
-                    self.shared
-                        .source
-                        .read()?
-                        .inspect_window(|window| {
-                            self.shared
-                                .capture_window(&selected, window)
-                                .map_err(native_denied)?;
-                            self.shared
-                                .row_ack_original(
-                                    window,
-                                    selected.binding.role,
-                                    false,
-                                    &pin,
-                                    &baseline,
-                                    |ack, actual| {
-                                        compare_member_capture_baseline(&selected.binding, ack)?;
-                                        if !rows::same_owned(actual, &ack.current) {
-                                            return Err(conflict());
-                                        }
-                                        Ok(())
-                                    },
-                                )
-                                .map_err(native_denied)
-                        })
-                        .map_err(denied)?;
                     self.shared.current(&selected.record)?;
                     self.shared.row_generations[i].complete(index)?;
                     selected.complete.set(true);
@@ -2954,6 +2920,7 @@ pub(crate) mod native {
             bindings: &Bindings,
         ) -> io::Result<()> {
             self.continuity(true)?;
+            let (original, _) = self.selected()?;
             if bindings.scope != record.scope
                 || !retired.matches_source_origin(self.source.read()?.as_ref())
             {
@@ -2963,7 +2930,7 @@ pub(crate) mod native {
             let before = guard
                 .try_borrow_mut()
                 .map_err(denied)?
-                .snapshot_in_retired_bracket(retired, bindings)
+                .snapshot_in_retired_bracket(&original, record, retired, bindings)
                 .map_err(denied)?;
             compare_guard_blocks(record, &before)?;
             self.rows
@@ -3001,7 +2968,7 @@ pub(crate) mod native {
             let after = guard
                 .try_borrow_mut()
                 .map_err(denied)?
-                .snapshot_in_retired_bracket(retired, bindings)
+                .snapshot_in_retired_bracket(&original, record, retired, bindings)
                 .map_err(denied)?;
             if before != after {
                 return Err(conflict());

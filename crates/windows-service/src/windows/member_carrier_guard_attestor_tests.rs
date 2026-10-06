@@ -794,6 +794,47 @@ fn retired_stage9_is_factual_only_and_exact_stage10_has_a_distinct_removal_gate(
         ),
         Ok(ExchangeEdge::RemoveBase)
     );
+    let mut unplanned_read = record.clone();
+    unplanned_read.pending_guard = None;
+    compare_retired_read(&context, &unplanned_read).unwrap();
+    assert!(compare_retired_removal(
+        &context,
+        &unplanned_read,
+        SessionKind::StaticBase,
+        &base,
+        &Model::empty(record.scope.clone()).unwrap(),
+    )
+    .is_err());
+    for (stage, effect) in [
+        (11, pair::Effect::RestoreKeys),
+        (12, pair::Effect::FullEmpty),
+    ] {
+        let mut final_read = record.clone();
+        final_read.stop_stage = stage;
+        final_read.pending = Some(effect);
+        final_read.pending_guard = None;
+        final_read.guard = Model::empty(final_read.scope.clone()).unwrap();
+        compare_retired_read(&context, &final_read).unwrap();
+        assert!(compare_retired_removal(
+            &context,
+            &final_read,
+            SessionKind::StaticBase,
+            &base,
+            &final_read.guard,
+        )
+        .is_err());
+        for fault in 0..5 {
+            let mut wrong = final_read.clone();
+            match fault {
+                0 => wrong.pending = None,
+                1 => wrong.pending = Some(pair::Effect::NativeEmpty),
+                2 => wrong.guard = base.clone(),
+                3 => wrong.pending_guard = record.pending_guard.clone(),
+                _ => wrong.operation = Some(pair::Operation::Retire(Slot::B)),
+            }
+            assert!(compare_retired_read(&context, &wrong).is_err());
+        }
+    }
 }
 #[test]
 fn after_close_stage8_can_read_registered_retired_facts_but_not_remove_bases() {
