@@ -302,7 +302,22 @@ impl CarrierPairIo for Io {
                 record.phase, record.stop_stage, record.pending, effect
             ))
         })?;
-        if self.0.borrow().foreign {
+        let state = self.0.borrow();
+        // Actual first member SDK success cannot match the OLD durable
+        // Prepared/no-proof Source binding during post-effect attestation.
+        let initial_member_mismatch = match effect {
+            Effect::MemberStart(slot)
+                if record.phase == Phase::Starting
+                    && record.operation == Some(Operation::Start(slot))
+                    && record.members[1 - idx(slot)].is_none() =>
+            {
+                state.members[idx(slot)].as_ref().is_some_and(|actual| {
+                    record.members[idx(slot)].as_ref().map(|m| &m.owner) != Some(actual)
+                })
+            }
+            _ => false,
+        };
+        if state.foreign || initial_member_mismatch {
             Err(failed())
         } else {
             Ok(())
@@ -376,6 +391,17 @@ impl CarrierPairIo for Io {
         Ok(owner)
     }
     fn verify_member(&mut self, r: &Record, slot: Slot) -> io::Result<()> {
+        self.effect(&format!("verify-member-{slot:?}"), |_| {})?;
+        let interrupted = self
+            .0
+            .borrow()
+            .fail
+            .as_ref()
+            .is_some_and(|(name, _)| name == "verify-member-unwind");
+        if interrupted {
+            self.0.borrow_mut().fail = None;
+            panic!("initial member postcondition interrupted");
+        }
         if self.0.borrow().members[idx(slot)].as_ref()
             != r.members[idx(slot)].as_ref().map(|m| &m.owner)
         {
@@ -710,11 +736,18 @@ fn fresh_state_for(scope: SessionScope) -> Shared {
 }
 fn pair() -> (CarrierNativePair<Io, Disk>, Shared) {
     let s = fresh_state();
-    (
-        CarrierNativePair::new(scope(), provenance(), Io(s.clone(), None), Disk(s.clone()))
-            .unwrap(),
-        s,
+    let mut native = Some(Io(s.clone(), None));
+    let mut journal = Some(Disk(s.clone()));
+    let mut retained = None;
+    CarrierNativePair::new_retained_into(
+        &mut retained,
+        scope(),
+        provenance(),
+        &mut native,
+        &mut journal,
     )
+    .unwrap();
+    (retained.unwrap(), s)
 }
 
 #[test]
@@ -1323,6 +1356,12 @@ fn start_readies_c_once_before_addressless_a_and_blocks_before_network_and_ports
     let events = &s.borrow().events;
     let position = |name: &str| events.iter().position(|e| e == name).unwrap();
     assert!(position("carrier-ready") < position("start-A"));
+    let started = position("start-A");
+    let verified = position("verify-member-A");
+    assert!(events[started + 1..verified]
+        .iter()
+        .any(|event| event == "save:Starting:None"));
+    assert!(verified < position("bases"));
     assert!(position("bases") < position("weak"));
     assert!(position("weak") < position("network"));
     assert!(position("network") < position("hold-A"));
@@ -2477,16 +2516,37 @@ fn sibling_network_mismatch_and_stale_fences_have_no_effects() {
 }
 #[test]
 fn partial_start_never_cleanup_and_resume_and_stop_retries_exact_obligation() {
-    for name in ["start-A", "weak", "network", "hold-A", "allows", "data"] {
+    for name in [
+        "start-A",
+        "verify-member-A",
+        "verify-member-unwind",
+        "weak",
+        "network",
+        "hold-A",
+        "allows",
+        "data",
+    ] {
         for lost in [false, true] {
             let (mut p, s) = pair();
             s.borrow_mut().fail = Some((name.into(), lost));
-            assert!(
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 p.start(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
-                    .is_err(),
-                "{name} {lost}"
-            );
+            }));
+            assert!(result.is_err() || result.unwrap().is_err(), "{name} {lost}");
             assert_ne!(p.snapshot().phase, Phase::Running);
+            if matches!(name, "verify-member-A" | "verify-member-unwind") {
+                assert!(p.faulted.get());
+                assert!(p.receipts.members[0].is_some());
+                assert!(p.cleanup_pending());
+                assert!(p.snapshot().pending.is_none());
+                assert_eq!(
+                    p.snapshot().members[0].as_ref().unwrap().owner.phase,
+                    OwnerPhase::Running
+                );
+                for later in ["bases", "weak", "network", "hold-A", "allows", "data"] {
+                    assert!(!s.borrow().counts.contains_key(later));
+                }
+            }
             let events = s.borrow().events.len();
             assert!(p
                 .start(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
@@ -2549,6 +2609,18 @@ fn stopping_before_start_retires_claim_without_creating_native_resources() {
 fn all_start_protected_cas_failures_remain_cleanup_only_and_can_retire_acknowledged_effects() {
     let (p, s) = running();
     let saves = s.borrow().saves;
+    let member_save = {
+        let state = s.borrow();
+        let verified = state
+            .events
+            .iter()
+            .position(|e| e == "verify-member-A")
+            .unwrap();
+        state.events[..verified]
+            .iter()
+            .filter(|e| e.starts_with("save:"))
+            .count()
+    };
     drop(p);
     for save in 2..=saves {
         for lost in [false, true] {
@@ -2560,6 +2632,23 @@ fn all_start_protected_cas_failures_remain_cleanup_only_and_can_retire_acknowled
                 "save {save} lost={lost}"
             );
             assert!(p.cleanup_pending());
+            if save == member_save {
+                assert!(p.receipts.members[0].is_some());
+                for later in [
+                    "verify-member-A",
+                    "bases",
+                    "weak",
+                    "network",
+                    "hold-A",
+                    "allows",
+                    "data",
+                ] {
+                    assert!(
+                        !s.borrow().counts.contains_key(later),
+                        "save ACK failed: {later}"
+                    );
+                }
+            }
             let count = s.borrow().events.len();
             assert!(p
                 .start(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())

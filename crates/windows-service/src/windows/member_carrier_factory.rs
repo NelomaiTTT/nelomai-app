@@ -46,6 +46,7 @@ pub(crate) struct NativeCarrierPreparation {
     scope: SessionScope,
     logical: Zeroizing<String>,
     cancelled: Arc<AtomicBool>,
+    executor: Rc<tokio::runtime::Runtime>,
     // These slots outlive every from_claim/transfer Err and unwind.
     startup: Option<NativeStartupRoot>,
     io: Option<NativeCarrierPairIo<'static>>,
@@ -93,6 +94,7 @@ impl CarrierPairPreparation<NativeCarrierPairIo<'static>, NativePairJournal>
             &mut self.io,
             &mut self.journal,
             destination,
+            self.executor.clone(),
         )
     }
     fn begin_cleanup_before_pair(&mut self, scope: &SessionScope) -> io::Result<()> {
@@ -226,6 +228,7 @@ pub(crate) fn select_carrier(
     scope: SessionScope,
     logical: &str,
     cancelled: Arc<AtomicBool>,
+    executor: Rc<tokio::runtime::Runtime>,
 ) -> io::Result<(NativeFactoryControl, NativeCarrierSessionStore)> {
     let (store, old) =
         WindowsSessionStore::open(files.clone(), scope.clone(), RecordKind::Session)?;
@@ -244,6 +247,7 @@ pub(crate) fn select_carrier(
             scope: scope.clone(),
             logical: Zeroizing::new(logical.to_owned()),
             cancelled,
+            executor,
             startup: None,
             io: None,
             journal: None,

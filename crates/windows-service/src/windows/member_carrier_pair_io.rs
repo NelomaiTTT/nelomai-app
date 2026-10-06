@@ -3225,6 +3225,8 @@ pub(crate) mod native {
     /// This root has no Drop-native effects. Until explicit final release is
     /// proven, abandonment retains ALL original owners (including partial ACKs).
     pub(crate) struct NativeCarrierPairIo<'a> {
+        // Ordinary shared IO executor, outside the native authority graph.
+        executor: Rc<tokio::runtime::Runtime>,
         serial: Rc<ActorSerial>,
         // The native graph is retained as one owner; moving actor/control slots
         // must not copy its 78KiB aggregate through every factory frame.
@@ -4974,7 +4976,10 @@ pub(crate) mod native {
                 Ok(())
             })
         }
-        pub(crate) fn original(input: NativeActorInputs<'a>) -> Self {
+        pub(crate) fn original(
+            input: NativeActorInputs<'a>,
+            executor: Rc<tokio::runtime::Runtime>,
+        ) -> Self {
             let selected = Selected {
                 pin: input.pair.clone(),
                 record: input.expected.clone(),
@@ -4999,6 +5004,7 @@ pub(crate) mod native {
                 issued: RefCell::new(Vec::new()),
             });
             Self {
+                executor,
                 serial,
                 roots: Some(Box::new(input)),
                 pair,
@@ -5035,13 +5041,17 @@ pub(crate) mod native {
         }
         /// Caller-rooted BEFORE cold preflight/C construction. Pair cache is
         /// created ONCE here and stays the same across actual full graph capture.
-        pub(crate) fn cold(input: NativeColdActorInputs<'a>) -> Self {
+        pub(crate) fn cold(
+            input: NativeColdActorInputs<'a>,
+            executor: Rc<tokio::runtime::Runtime>,
+        ) -> Self {
             let pair = Rc::new(OriginalPairCache {
                 store: input.store,
                 selected: RefCell::new(None),
                 attempted: RefCell::new(Vec::new()),
             });
             Self {
+                executor,
                 serial: Rc::new(ActorSerial::default()),
                 roots: None,
                 pair,
@@ -6855,8 +6865,7 @@ pub(crate) mod native {
                 // First committed Start/Attach captures the addressless baseline
                 // before static base or WeakRows can enter ordinary Observe G.
                 // Replacement generations keep their later typed capture path.
-                if this.row_owners[i].is_none()
-                    && this.stopped_row_generations[i].is_none()
+                let initial_frame = this.stopped_row_generations[i].is_none()
                     && !this
                         .member_generation_originals
                         .iter()
@@ -6864,9 +6873,24 @@ pub(crate) mod native {
                     && record.pending.is_none()
                     && matches!((record.phase, record.operation),
                         (pair::Phase::Starting, Some(pair::Operation::Start(s)))
-                        | (pair::Phase::Running, Some(pair::Operation::Attach(s))) if s == slot)
-                {
-                    this.capture_member_rows(pin, record, slot)?;
+                        | (pair::Phase::Running, Some(pair::Operation::Attach(s))) if s == slot);
+                if initial_frame {
+                    if this.row_owners[i].is_none() {
+                        this.capture_member_rows(pin, record, slot)?;
+                    } else {
+                        this.select_guard(pin, record)?;
+                    }
+                    if record.phase == pair::Phase::Starting {
+                        // Initial primary postflight reads the committed Running
+                        // member and its SAME completed original row baseline.
+                        let r = this.roots()?;
+                        r.pins
+                            .source
+                            .inspect_window(|window| {
+                                Self::attest_window(r, window).map_err(native_denied)
+                            })
+                            .map_err(denied)?;
+                    }
                 }
                 Ok(())
             })
@@ -8406,6 +8430,7 @@ pub(crate) mod native {
                 if tokio::runtime::Handle::try_current().is_ok() {
                     return Err(conflict());
                 }
+                let executor = this.executor.clone();
                 let r = this.roots_mut()?;
                 let member = record.members[idx(slot)].as_ref().ok_or_else(conflict)?;
                 let gate = r.member_gates[idx(slot)].as_ref().ok_or_else(conflict)?;
@@ -8434,10 +8459,6 @@ pub(crate) mod native {
                     member.peer,
                     process_birth_ms(before.1.process.creation_time)?,
                 )?;
-                let executor = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()?;
                 let sampled = executor.block_on(metrics.read())?;
                 if r.controllers[idx(slot)]
                     .as_mut()

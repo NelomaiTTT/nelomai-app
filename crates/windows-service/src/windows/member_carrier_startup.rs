@@ -3481,7 +3481,7 @@ pub(crate) mod native {
         pub(crate) fn store(&self) -> Rc<RefCell<NativeCarrierPairStore>> {
             self.store.clone()
         }
-        /// Retain in the factory/session caller BEFORE closing/into_pair.
+        /// Retain in the factory/session caller before closing or transfer to Pair.
         /// This original handle cannot grant native IO or DATA retirement
         /// until the same Startup has bound its completed whole NoC outcome.
         pub(crate) fn initial_data_retirement_root(
@@ -3698,35 +3698,13 @@ pub(crate) mod native {
         pub(crate) fn context(&self) -> &Context {
             &self.context
         }
-        /// Compose the real coordinator and serialized actor using THIS SAME
-        /// protected store. Coordinator::new alone publishes Fresh; the actor
-        /// mints its first original ACK afterwards, never a speculative pin.
-        /// This is not service selection or recovery/capability acceptance.
-        pub(crate) fn into_pair(
-            self,
-        ) -> std::io::Result<
-            pair::CarrierNativePair<actor::NativeCarrierPairIo<'static>, actor::NativePairJournal>,
-        > {
-            let scope = self.context.intent.scope.clone();
-            let provenance = self.context.provenance.clone();
-            let store = self.store.clone();
-            let io = actor::NativeCarrierPairIo::cold(actor::NativeColdActorInputs {
-                store: store.clone(),
-                startup: Box::new(self),
-            });
-            pair::CarrierNativePair::new(
-                scope,
-                provenance,
-                io,
-                actor::NativePairJournal::original(store),
-            )
-        }
-        /// Retained counterpart to `into_pair`. Caller's four original slots
-        /// must outlive this fallible/unwinding frame. No owning resource is
-        /// returned through Result, and only Pair's retained constructor does
-        /// the protected Fresh load/CAS/readback. Actual native gates are
-        /// unchanged; failed initial publication cannot grant Stop/Start from
-        /// absence, equal effect DATA or a new scope.
+        /// Transfer the real coordinator and serialized actor using THIS SAME
+        /// protected store. Caller's four original slots must outlive this
+        /// fallible/unwinding frame. No owning resource is returned through
+        /// Result, and only Pair's retained constructor does the protected
+        /// Fresh load/CAS/readback. Actual native gates are unchanged; failed
+        /// initial publication cannot grant Stop/Start from absence, equal
+        /// effect DATA or a new scope.
         pub(crate) fn into_pair_retained_into(
             startup: &mut Option<Self>,
             io: &mut Option<actor::NativeCarrierPairIo<'static>>,
@@ -3737,6 +3715,7 @@ pub(crate) mod native {
                     actor::NativePairJournal,
                 >,
             >,
+            executor: Rc<tokio::runtime::Runtime>,
         ) -> std::io::Result<()> {
             transfer_startup_retained_into(
                 startup,
@@ -3752,10 +3731,13 @@ pub(crate) mod native {
                 |original| {
                     let store = original.store.clone();
                     let journal = actor::NativePairJournal::original(store.clone());
-                    let io = actor::NativeCarrierPairIo::cold(actor::NativeColdActorInputs {
-                        store,
-                        startup: Box::new(original),
-                    });
+                    let io = actor::NativeCarrierPairIo::cold(
+                        actor::NativeColdActorInputs {
+                            store,
+                            startup: Box::new(original),
+                        },
+                        executor,
+                    );
                     (io, journal)
                 },
             )

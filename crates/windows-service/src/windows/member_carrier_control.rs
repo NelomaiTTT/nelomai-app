@@ -367,10 +367,7 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             return Err(conflict());
         }
         let actor = self.actor.as_ref().ok_or_else(conflict)?.clone();
-        if crate::member_carrier_control::continue_pregraph_terminal(
-            self.attempted_layout == Some(NativeAttemptedTerminalLayout::PublishedCarrierPregraph),
-            self.actor_released,
-        ) {
+        if self.attempted_layout == Some(NativeAttemptedTerminalLayout::PublishedCarrierPregraph) {
             return self.finish_pregraph(&actor, scope);
         }
         if !self.actor_released {
@@ -395,47 +392,26 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                 Some(NativeActorTerminalBranch::NativeAttempted(witness)) => Some(witness.clone()),
                 _ => None,
             };
-            crate::member_carrier_control::capture_terminal_originals_for_layout(
-                self.attempted_layout == Some(NativeAttemptedTerminalLayout::OtherAttempted),
-                || {
-                    actor.release_module_only_terminal(
-                        &stopped,
-                        &record,
-                        attempted.as_ref().ok_or_else(conflict)?,
-                    )
-                },
-                || {
-                    if !self.locals_captured {
-                        if self.attempted_layout
-                            == Some(NativeAttemptedTerminalLayout::OtherAttempted)
-                        {
-                            actor.capture_module_only_locals(
-                                &stopped,
-                                &record,
-                                &mut self.locals,
-                            )?;
-                        } else {
-                            actor.capture_locals(
-                                &stopped,
-                                &record,
-                                &mut self.locals,
-                                |_| Ok(()),
-                            )?;
-                        }
-                        self.locals_captured = true;
-                    }
-                    if !self.canonical_captured {
-                        actor.capture_canonical_inputs(
-                            &stopped,
-                            &record,
-                            &mut self.canonical,
-                            |_| Ok(()),
-                        )?;
-                        self.canonical_captured = true;
-                    }
-                    Ok(())
-                },
-            )?;
+            if self.attempted_layout == Some(NativeAttemptedTerminalLayout::OtherAttempted) {
+                actor.release_module_only_terminal(
+                    &stopped,
+                    &record,
+                    attempted.as_ref().ok_or_else(conflict)?,
+                )?;
+            }
+            if !self.locals_captured {
+                if self.attempted_layout == Some(NativeAttemptedTerminalLayout::OtherAttempted) {
+                    actor.capture_module_only_locals(&stopped, &record, &mut self.locals)?;
+                } else {
+                    actor.capture_locals(&stopped, &record, &mut self.locals, |_| Ok(()))?;
+                }
+                self.locals_captured = true;
+            }
+            if !self.canonical_captured {
+                actor
+                    .capture_canonical_inputs(&stopped, &record, &mut self.canonical, |_| Ok(()))?;
+                self.canonical_captured = true;
+            }
             if let Some(NativeActorTerminalBranch::ZeroEffect(outcome)) = self.branch.as_ref() {
                 // Actual private Never/whole native inventory proof, NOT empty
                 // actor fields or failed attempted cleanup. No synthetic C,

@@ -215,8 +215,10 @@ pub(crate) trait CarrierPairIo {
     fn select_running_execution(&mut self, record: &Record) -> io::Result<u64>;
     fn preflight_fresh(&mut self, record: &Record) -> io::Result<()>;
     /// Actual provider/source/native/runtime/creator authority BEFORE and AFTER
-    /// every boundary. No serialized boolean, JSON identity or default G proof.
-    /// Cleanup checks allow exact original absence, never foreign adoption.
+    /// every boundary. First primary MemberStart's AFTER read instead uses
+    /// verify_member on its acknowledged Starting record and captured originals.
+    /// No serialized boolean, JSON identity or default G proof. Cleanup checks
+    /// allow exact original absence, never foreign adoption.
     fn attest_effect(&mut self, record: &Record, effect: Effect) -> io::Result<()>;
     /// Native key/row journals and original ACK/retained C handle REQUIRED.
     /// Publish ONLY address rows and retained-session DAD readiness here.
@@ -239,6 +241,9 @@ pub(crate) trait CarrierPairIo {
         slot: Slot,
         native: &str,
     ) -> io::Result<OwnerRecord>;
+    /// First primary post-publication verification includes the SAME controller
+    /// ACK, original initial row capture and full Source/WFP/rows/network/ACK
+    /// postconditions before any base, weak-row or traffic effect may follow.
     fn verify_member(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
     fn stop_member(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
     fn verify_member_absent(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
@@ -682,63 +687,6 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         *destination = Some(root.clone());
         handoff(&root)
     }
-    pub(crate) fn new(
-        scope: SessionScope,
-        provenance: Provenance,
-        io: I,
-        mut journal: J,
-    ) -> io::Result<Self> {
-        if !scope.validate()
-            || provenance.network_epoch == 0
-            || provenance.boot_id == [0; 16]
-            || provenance.runtime.slot != scope.runtime
-        {
-            return Err(failed());
-        }
-        let record = Record {
-            version: 2,
-            guard: guard::Model::empty(scope.clone()).map_err(|_| failed())?,
-            scope,
-            provenance,
-            revision: 1,
-            phase: Phase::Fresh,
-            addresses: vec![],
-            dns: vec![],
-            carrier: None,
-            members: [None, None],
-            active: None,
-            options: None,
-            pending_guard: None,
-            pending: None,
-            network: None,
-            stop_stage: 0,
-            operation: None,
-        };
-        if journal.load(&record.scope)?.is_some() {
-            return Err(failed());
-        }
-        validate_transition(None, &record)?;
-        journal.compare_exchange(None, &record)?;
-        if journal.load(&record.scope)?.as_ref() != Some(&record) {
-            return Err(failed());
-        }
-        Ok(Self {
-            io: PairOriginal::new(io),
-            journal: PairOriginal::new(journal),
-            execution_epoch: Cell::new(record.provenance.network_epoch),
-            execution_completion_pending: false,
-            startup_completion_attempted: false,
-            initial_publication_acknowledged: true,
-            record,
-            sockets: [None, None],
-            tuples: [None, None],
-            cleanup_only: false,
-            faulted: Rc::new(Cell::new(false)),
-            uncertain_write: None,
-            receipts: EffectReceipts::default(),
-            terminal_ack_pending: false,
-        })
-    }
     pub(crate) fn snapshot(&self) -> &Record {
         &self.record
     }
@@ -1026,10 +974,38 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             .as_mut()
             .ok_or_else(failed)?
             .owner = started;
-        self.finish(Effect::MemberStart(member.slot), next)?;
-        self.io
-            .borrow_mut()
-            .verify_member(&self.record, member.slot)
+        let initial_primary = self.record.phase == Phase::Starting
+            && self.record.operation == Some(Operation::Start(member.slot))
+            && self.record.pending == Some(Effect::MemberStart(member.slot))
+            && self.record.stop_stage == 0
+            && self.record.members[1 - idx(member.slot)].is_none()
+            && self.record.active.is_none()
+            && self.record.network.is_none()
+            && self.record.pending_guard.is_none()
+            && self.record.guard
+                == guard::Model::empty(self.record.scope.clone()).map_err(|_| failed())?;
+        if initial_primary {
+            // The actual native Running ACK is already retained. Publish it in
+            // Starting before reading live bindings and capturing initial rows;
+            // the old Prepared frame cannot describe that live member. Full
+            // postconditions still precede every base/row/traffic effect.
+            let mut flight = ReadFlight {
+                faulted: self.faulted.clone(),
+                finished: false,
+            };
+            next.pending = None;
+            self.save(next)?;
+            self.io
+                .borrow_mut()
+                .verify_member(&self.record, member.slot)?;
+            flight.finished = true;
+            Ok(())
+        } else {
+            self.finish(Effect::MemberStart(member.slot), next)?;
+            self.io
+                .borrow_mut()
+                .verify_member(&self.record, member.slot)
+        }
     }
     fn model(&self, active: Option<Slot>, permits: bool) -> io::Result<guard::Model> {
         self.model_excluding(active, permits, None)

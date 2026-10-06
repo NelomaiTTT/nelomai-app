@@ -1389,6 +1389,7 @@ impl NativePairFactory<NativeSessionFiles> {
             scope.clone(),
             primary.configuration.expose(),
             self.cancelled.clone(),
+            self.executor.clone(),
         )
     }
     /// Cleanup-only installer: source is derived from the validated installed

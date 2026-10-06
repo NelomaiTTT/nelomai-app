@@ -1856,16 +1856,21 @@ fn fresh_coordinator_abort(context: &Context, halt: u8) -> crate::member_carrier
         }
     }
     let disk = Rc::new(RefCell::new(None));
-    let mut coordinator = pair::CarrierNativePair::new(
+    let mut native = Some(EmptyIo {
+        scope: context.intent.scope.clone(),
+        halt,
+    });
+    let mut journal = Some(Disk(disk.clone()));
+    let mut retained = None;
+    pair::CarrierNativePair::new_retained_into(
+        &mut retained,
         context.intent.scope.clone(),
         context.provenance.clone(),
-        EmptyIo {
-            scope: context.intent.scope.clone(),
-            halt,
-        },
-        Disk(disk.clone()),
+        &mut native,
+        &mut journal,
     )
     .unwrap();
+    let coordinator = retained.as_mut().unwrap();
     assert_eq!(coordinator.snapshot().phase, pair::Phase::Fresh);
     assert!(coordinator.snapshot().addresses.is_empty());
     assert!(coordinator.stop(&context.intent.scope).is_err());
