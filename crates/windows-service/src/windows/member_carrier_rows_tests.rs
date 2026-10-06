@@ -1097,11 +1097,14 @@ fn cleanup_reconciles_own_interface_write_after_cas_readback_error_or_unwind() {
                     row_pin_record(&pin, &b, true)
                         .baseline
                         .interface
-                        .policy
+                        .observed
                         .site_prefix_length,
                     site_prefix
                 );
-                assert_eq!(fake.0.borrow().ip.SitePrefixLength, site_prefix);
+                assert_eq!(
+                    fake.0.borrow().ip.SitePrefixLength,
+                    if revision == 3 { 0 } else { site_prefix }
+                );
                 assert_eq!(fake.0.borrow().effects, if revision == 3 { 2 } else { 0 });
                 assert!(
                     !decode_interface(&fake.0.borrow().ip)
@@ -2111,7 +2114,7 @@ use std::{cell::RefCell, rc::Rc};
 
 #[test]
 fn every_writable_field_is_preserved_and_foreign_native_cas_drift_is_never_overwritten() {
-    let cases: [fn(&mut MIB_IPINTERFACE_ROW); 21] = [
+    let cases: [fn(&mut MIB_IPINTERFACE_ROW); 20] = [
         |r| r.AdvertisingEnabled = !r.AdvertisingEnabled,
         |r| r.ForwardingEnabled = !r.ForwardingEnabled,
         |r| r.WeakHostSend = !r.WeakHostSend,
@@ -2129,7 +2132,6 @@ fn every_writable_field_is_preserved_and_foreign_native_cas_drift_is_never_overw
         |r| r.LinkLocalAddressBehavior = 1,
         |r| r.LinkLocalAddressTimeout += 1,
         |r| r.ZoneIndices[15] += 1,
-        |r| r.SitePrefixLength = 1,
         |r| r.Metric += 1,
         |r| r.NlMtu += 1,
         |r| r.DisableDefaultRoutes = !r.DisableDefaultRoutes,
@@ -2138,97 +2140,94 @@ fn every_writable_field_is_preserved_and_foreign_native_cas_drift_is_never_overw
         let mut raw = interface_raw();
         mutate(&mut raw);
         let p = decode_interface(&raw).unwrap().policy;
-        if p.site_prefix_length == 0 {
-            let encoded = interface_input(
-                MIB_IPINTERFACE_ROW::default(),
-                RowKey {
-                    luid: 3300,
-                    index: 33,
-                },
-                &p,
-            )
-            .unwrap();
-            assert_eq!(
-                encoded.AdvertisingEnabled, raw.AdvertisingEnabled,
-                "input AdvertisingEnabled, case {i}"
-            );
-            assert_eq!(
-                encoded.ForwardingEnabled, raw.ForwardingEnabled,
-                "input ForwardingEnabled, case {i}"
-            );
-            assert_eq!(
-                encoded.WeakHostSend, raw.WeakHostSend,
-                "input WeakHostSend, case {i}"
-            );
-            assert_eq!(
-                encoded.WeakHostReceive, raw.WeakHostReceive,
-                "input WeakHostReceive, case {i}"
-            );
-            assert_eq!(
-                encoded.UseAutomaticMetric, raw.UseAutomaticMetric,
-                "input UseAutomaticMetric, case {i}"
-            );
-            assert_eq!(
-                encoded.UseNeighborUnreachabilityDetection, raw.UseNeighborUnreachabilityDetection,
-                "input UseNeighborUnreachabilityDetection, case {i}"
-            );
-            assert_eq!(
-                encoded.ManagedAddressConfigurationSupported,
-                raw.ManagedAddressConfigurationSupported,
-                "input ManagedAddressConfigurationSupported, case {i}"
-            );
-            assert_eq!(
-                encoded.OtherStatefulConfigurationSupported,
-                raw.OtherStatefulConfigurationSupported,
-                "input OtherStatefulConfigurationSupported, case {i}"
-            );
-            assert_eq!(
-                encoded.AdvertiseDefaultRoute, raw.AdvertiseDefaultRoute,
-                "input AdvertiseDefaultRoute, case {i}"
-            );
-            assert_eq!(
-                encoded.RouterDiscoveryBehavior, raw.RouterDiscoveryBehavior,
-                "input RouterDiscoveryBehavior, case {i}"
-            );
-            assert_eq!(
-                encoded.DadTransmits, raw.DadTransmits,
-                "input DadTransmits, case {i}"
-            );
-            assert_eq!(
-                encoded.BaseReachableTime, raw.BaseReachableTime,
-                "input BaseReachableTime, case {i}"
-            );
-            assert_eq!(
-                encoded.RetransmitTime, raw.RetransmitTime,
-                "input RetransmitTime, case {i}"
-            );
-            assert_eq!(
-                encoded.PathMtuDiscoveryTimeout, raw.PathMtuDiscoveryTimeout,
-                "input PathMtuDiscoveryTimeout, case {i}"
-            );
-            assert_eq!(
-                encoded.LinkLocalAddressBehavior, raw.LinkLocalAddressBehavior,
-                "input LinkLocalAddressBehavior, case {i}"
-            );
-            assert_eq!(
-                encoded.LinkLocalAddressTimeout, raw.LinkLocalAddressTimeout,
-                "input LinkLocalAddressTimeout, case {i}"
-            );
-            assert_eq!(
-                encoded.ZoneIndices, raw.ZoneIndices,
-                "input ZoneIndices, case {i}"
-            );
-            assert_eq!(
-                encoded.SitePrefixLength, raw.SitePrefixLength,
-                "input SitePrefixLength, case {i}"
-            );
-            assert_eq!(encoded.Metric, raw.Metric, "input Metric, case {i}");
-            assert_eq!(encoded.NlMtu, raw.NlMtu, "input NlMtu, case {i}");
-            assert_eq!(
-                encoded.DisableDefaultRoutes, raw.DisableDefaultRoutes,
-                "input DisableDefaultRoutes, case {i}"
-            );
-        }
+        let encoded = interface_input(
+            MIB_IPINTERFACE_ROW::default(),
+            RowKey {
+                luid: 3300,
+                index: 33,
+            },
+            &p,
+        )
+        .unwrap();
+        assert_eq!(
+            encoded.AdvertisingEnabled, raw.AdvertisingEnabled,
+            "input AdvertisingEnabled, case {i}"
+        );
+        assert_eq!(
+            encoded.ForwardingEnabled, raw.ForwardingEnabled,
+            "input ForwardingEnabled, case {i}"
+        );
+        assert_eq!(
+            encoded.WeakHostSend, raw.WeakHostSend,
+            "input WeakHostSend, case {i}"
+        );
+        assert_eq!(
+            encoded.WeakHostReceive, raw.WeakHostReceive,
+            "input WeakHostReceive, case {i}"
+        );
+        assert_eq!(
+            encoded.UseAutomaticMetric, raw.UseAutomaticMetric,
+            "input UseAutomaticMetric, case {i}"
+        );
+        assert_eq!(
+            encoded.UseNeighborUnreachabilityDetection, raw.UseNeighborUnreachabilityDetection,
+            "input UseNeighborUnreachabilityDetection, case {i}"
+        );
+        assert_eq!(
+            encoded.ManagedAddressConfigurationSupported, raw.ManagedAddressConfigurationSupported,
+            "input ManagedAddressConfigurationSupported, case {i}"
+        );
+        assert_eq!(
+            encoded.OtherStatefulConfigurationSupported, raw.OtherStatefulConfigurationSupported,
+            "input OtherStatefulConfigurationSupported, case {i}"
+        );
+        assert_eq!(
+            encoded.AdvertiseDefaultRoute, raw.AdvertiseDefaultRoute,
+            "input AdvertiseDefaultRoute, case {i}"
+        );
+        assert_eq!(
+            encoded.RouterDiscoveryBehavior, raw.RouterDiscoveryBehavior,
+            "input RouterDiscoveryBehavior, case {i}"
+        );
+        assert_eq!(
+            encoded.DadTransmits, raw.DadTransmits,
+            "input DadTransmits, case {i}"
+        );
+        assert_eq!(
+            encoded.BaseReachableTime, raw.BaseReachableTime,
+            "input BaseReachableTime, case {i}"
+        );
+        assert_eq!(
+            encoded.RetransmitTime, raw.RetransmitTime,
+            "input RetransmitTime, case {i}"
+        );
+        assert_eq!(
+            encoded.PathMtuDiscoveryTimeout, raw.PathMtuDiscoveryTimeout,
+            "input PathMtuDiscoveryTimeout, case {i}"
+        );
+        assert_eq!(
+            encoded.LinkLocalAddressBehavior, raw.LinkLocalAddressBehavior,
+            "input LinkLocalAddressBehavior, case {i}"
+        );
+        assert_eq!(
+            encoded.LinkLocalAddressTimeout, raw.LinkLocalAddressTimeout,
+            "input LinkLocalAddressTimeout, case {i}"
+        );
+        assert_eq!(
+            encoded.ZoneIndices, raw.ZoneIndices,
+            "input ZoneIndices, case {i}"
+        );
+        assert_eq!(
+            encoded.SitePrefixLength, 0,
+            "SDK input SitePrefixLength, case {i}"
+        );
+        assert_eq!(encoded.Metric, raw.Metric, "input Metric, case {i}");
+        assert_eq!(encoded.NlMtu, raw.NlMtu, "input NlMtu, case {i}");
+        assert_eq!(
+            encoded.DisableDefaultRoutes, raw.DisableDefaultRoutes,
+            "input DisableDefaultRoutes, case {i}"
+        );
+
         let fake = Fake::new();
         let mut owner = fake.owner();
         mutate(&mut fake.0.borrow_mut().ip);
@@ -2321,28 +2320,6 @@ fn stage3_interface_cleanup_keeps_original_carrier_address_until_stage6_stop() {
     assert_eq!(stopped.phase, Phase::Stopped);
     assert_eq!(stopped.creation, before.creation);
     assert!(stopped.current.address.is_none());
-}
-#[test]
-fn unsupported_ipv4_site_prefix_baseline_is_not_silently_zeroed_on_set() {
-    let fake = Fake::new();
-    fake.0.borrow_mut().ip.SitePrefixLength = 255;
-    let mut owner = fake.owner();
-    let mut desired = owner.snapshot().unwrap().interface.policy;
-    desired.weak_host_send = true;
-    assert!(owner.change_interface(desired).is_err());
-    assert_eq!(fake.0.borrow().effects, 0);
-    assert_eq!(
-        fake.0
-            .borrow()
-            .saved
-            .as_ref()
-            .unwrap()
-            .baseline
-            .interface
-            .policy
-            .site_prefix_length,
-        255
-    );
 }
 #[test]
 fn each_address_policy_and_stable_observed_change_rejects_cleanup_without_delete() {
@@ -2565,7 +2542,6 @@ enum Fault {
     Unapplied,
     FalseAck,
     Partial,
-    SitePrefixChanged,
 }
 struct State {
     binding: Binding,
@@ -2795,13 +2771,8 @@ impl Kernel for Fake {
             row.SitePrefixLength, 0,
             "IPv4 Set requires SDK sentinel input"
         );
-        // This IPv4 field cannot be modified by Set. Get retains its original
-        // value, except for the explicit post-Set OS drift regression.
-        next.SitePrefixLength = if matches!(fault, Fault::SitePrefixChanged) {
-            0
-        } else {
-            s.ip.SitePrefixLength
-        };
+        // Actual IPv4 Set readback can replace the previous 64 with SDK input 0.
+        next.SitePrefixLength = row.SitePrefixLength;
         next.MaxReassemblySize = observed.max_reassembly_size;
         next.InterfaceIdentifier = observed.interface_identifier;
         next.MinRouterAdvertisementInterval = observed.min_router_advertisement_interval;
@@ -3115,12 +3086,12 @@ fn readonly_expected() -> Snapshot {
                 zone_indices: [
                     100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
                 ],
-                site_prefix_length: 0,
                 metric: 25,
                 mtu: 1420,
                 disable_default_routes: true,
             },
             observed: InterfaceObserved {
+                site_prefix_length: 0,
                 max_reassembly_size: 0,
                 interface_identifier: 0,
                 min_router_advertisement_interval: 200,
@@ -5191,7 +5162,7 @@ fn readiness_full_address_policy_and_stable_row_identity_cannot_drift_between_po
 }
 #[test]
 fn readiness_full_interface_policy_is_reconstructed_not_a_logical_weak_host_projection() {
-    let mutations: [fn(&mut MIB_IPINTERFACE_ROW); 24] = [
+    let mutations: [fn(&mut MIB_IPINTERFACE_ROW); 23] = [
         |r| r.AdvertisingEnabled = !r.AdvertisingEnabled,
         |r| r.ForwardingEnabled = !r.ForwardingEnabled,
         |r| r.WeakHostSend = !r.WeakHostSend,
@@ -5209,7 +5180,6 @@ fn readiness_full_interface_policy_is_reconstructed_not_a_logical_weak_host_proj
         |r| r.LinkLocalAddressBehavior = 1,
         |r| r.LinkLocalAddressTimeout += 1,
         |r| r.ZoneIndices[15] += 1,
-        |r| r.SitePrefixLength = 1,
         |r| r.Metric += 1,
         |r| r.NlMtu += 1,
         |r| r.DisableDefaultRoutes = !r.DisableDefaultRoutes,
@@ -5468,6 +5438,9 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
         let mut desired = baseline.interface.policy.clone();
         desired.weak_host_send = true;
         desired.weak_host_receive = true;
+        owner.create_address(address_policy()).unwrap();
+        let created = owner.snapshot().unwrap();
+        assert_eq!(created.address.as_ref().unwrap().observed.dad_state, 1);
         owner.change_interface(desired).unwrap();
         assert_eq!(
             fake.0
@@ -5477,13 +5450,12 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
                 .unwrap()
                 .current
                 .interface
-                .policy
+                .observed
                 .site_prefix_length,
-            site_prefix
+            0
         );
-        owner.create_address(address_policy()).unwrap();
-        let created = owner.snapshot().unwrap();
-        assert_eq!(created.address.unwrap().observed.dad_state, 1);
+        owner.restore_interface_for_cleanup().unwrap();
+        assert_eq!(owner.snapshot().unwrap().address, created.address);
         owner.stop().unwrap();
         let saved = fake.0.borrow().saved.clone().unwrap();
         assert_eq!(saved.phase, Phase::Stopped);
@@ -5502,10 +5474,11 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
             u64::MAX
         );
         assert_eq!(
-            saved.baseline.interface.policy.site_prefix_length,
+            saved.baseline.interface.observed.site_prefix_length,
             site_prefix
         );
-        assert_eq!(fake.0.borrow().ip.SitePrefixLength, site_prefix);
+        assert_eq!(saved.current.interface.observed.site_prefix_length, 0);
+        assert_eq!(fake.0.borrow().ip.SitePrefixLength, 0);
         assert!(saved.current.address.is_none());
         assert!(fake.0.borrow().address.is_none());
         assert_eq!(fake.0.borrow().effects, 4);
@@ -5514,6 +5487,7 @@ fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {
 #[test]
 fn exact_readback_resolves_lost_set_and_delete_ack_without_blind_retry() {
     let fake = Fake::new();
+    fake.0.borrow_mut().ip.SitePrefixLength = 64;
     let mut owner = fake.owner();
     fake.0.borrow_mut().kernel_fault = Fault::LostAck;
     owner.change_interface(weak()).unwrap();
@@ -5524,16 +5498,8 @@ fn exact_readback_resolves_lost_set_and_delete_ack_without_blind_retry() {
 }
 #[test]
 fn partial_or_false_set_ack_keeps_durable_pending_and_no_active_resume() {
-    for fault in [
-        Fault::Unapplied,
-        Fault::FalseAck,
-        Fault::Partial,
-        Fault::SitePrefixChanged,
-    ] {
+    for fault in [Fault::Unapplied, Fault::FalseAck, Fault::Partial] {
         let fake = Fake::new();
-        if matches!(fault, Fault::SitePrefixChanged) {
-            fake.0.borrow_mut().ip.SitePrefixLength = 64;
-        }
         let mut owner = fake.owner();
         let mut desired = owner.snapshot().unwrap().interface.policy;
         desired.weak_host_send = true;
@@ -5542,7 +5508,7 @@ fn partial_or_false_set_ack_keeps_durable_pending_and_no_active_resume() {
         assert!(owner.change_interface(desired).is_err());
         assert!(fake.0.borrow().saved.as_ref().unwrap().pending.is_some());
         assert!(owner.create_address(address_policy()).is_err());
-        if matches!(fault, Fault::Partial | Fault::SitePrefixChanged) {
+        if matches!(fault, Fault::Partial) {
             let effects = fake.0.borrow().effects;
             assert!(owner.stop().is_err());
             assert_eq!(
@@ -5550,25 +5516,6 @@ fn partial_or_false_set_ack_keeps_durable_pending_and_no_active_resume() {
                 effects,
                 "no retry/rollback over foreign drift"
             );
-            if matches!(fault, Fault::SitePrefixChanged) {
-                let s = fake.0.borrow();
-                let saved = s.saved.as_ref().unwrap();
-                assert_eq!(effects, 1);
-                assert_eq!(s.ip.SitePrefixLength, 0);
-                assert_eq!(saved.baseline.interface.policy.site_prefix_length, 64);
-                assert_eq!(saved.current.interface.policy.site_prefix_length, 64);
-                assert_eq!(
-                    saved
-                        .pending
-                        .as_ref()
-                        .unwrap()
-                        .before
-                        .interface
-                        .policy
-                        .site_prefix_length,
-                    64
-                );
-            }
         } else {
             owner.stop().unwrap();
         }
@@ -5929,7 +5876,6 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
             zone_indices: [
                 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115
             ],
-            site_prefix_length: 0,
             metric: 25,
             mtu: 1420,
             disable_default_routes: true,
@@ -5938,6 +5884,7 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
     assert_eq!(
         row.observed,
         InterfaceObserved {
+            site_prefix_length: 0,
             max_reassembly_size: u32::MAX,
             interface_identifier: u64::MAX,
             min_router_advertisement_interval: 200,
@@ -5969,7 +5916,7 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
     assert_eq!(row.observed.transmit_offload, 0xa5);
     assert_eq!(row.observed.receive_offload, 0x5a);
     // Actual native Wintun tuple rejected in CI: retain Get's nonmodifiable
-    // IPv4 value in the model while Set encodes the documented zero input.
+    // IPv4 value in observations while Set encodes the documented zero input.
     let mut raw = interface_raw();
     raw.RouterDiscoveryBehavior = 2;
     raw.LinkLocalAddressBehavior = 0;
@@ -5977,20 +5924,16 @@ fn full_interface_codec_preserves_all_writable_and_kernel_managed_fields() {
     raw.NlMtu = 65535;
     raw.SitePrefixLength = 64;
     let captured = decode_interface(&raw).unwrap();
-    assert_eq!(captured.policy.site_prefix_length, 64);
+    assert_eq!(captured.observed.site_prefix_length, 64);
     let mut desired = captured.policy.clone();
     desired.weak_host_send = true;
     desired.weak_host_receive = true;
     validate_interface_delta(&captured.policy, &desired).unwrap();
     let encoded = interface_input(MIB_IPINTERFACE_ROW::default(), captured.key, &desired).unwrap();
     assert_eq!(encoded.SitePrefixLength, 0);
-    assert_eq!(
-        desired.site_prefix_length, 64,
-        "SDK sentinel must not rewrite protected policy"
-    );
-    let mut input_policy = desired;
-    input_policy.site_prefix_length = 0;
-    assert_eq!(decode_interface(&encoded).unwrap().policy, input_policy);
+    let actual = decode_interface(&encoded).unwrap();
+    assert_eq!(actual.observed.site_prefix_length, 0);
+    assert_eq!(actual.policy, desired);
 }
 #[test]
 fn address_codec_rejects_unknown_origins_family_and_unsupported_sockaddr_attributes() {
@@ -6060,17 +6003,6 @@ fn writable_inputs_preserve_every_policy_field_but_never_write_dad_or_readonly_o
 }
 #[test]
 fn readonly_and_unsupported_deltas_fail_capability_instead_of_silently_omitting() {
-    let mut p = decode_interface(&interface_raw()).unwrap().policy;
-    p.site_prefix_length = 255;
-    assert!(interface_input(
-        MIB_IPINTERFACE_ROW::default(),
-        RowKey {
-            luid: 3300,
-            index: 33
-        },
-        &p
-    )
-    .is_err());
     let before = decode_interface(&interface_raw()).unwrap().policy;
     let mut next = before.clone();
     next.forwarding = true;
@@ -6079,20 +6011,20 @@ fn readonly_and_unsupported_deltas_fail_capability_instead_of_silently_omitting(
     next.weak_host_send = true;
     next.weak_host_receive = true;
     assert!(validate_interface_delta(&before, &next).is_ok());
-    for site_prefix in [0, 64] {
-        let mut before = before.clone();
-        before.site_prefix_length = site_prefix;
-        for changed in [0, 1, 32, 64, 255] {
-            if changed == site_prefix {
-                continue;
-            }
-            let mut next = before.clone();
-            next.weak_host_send = true;
-            next.site_prefix_length = changed;
-            assert!(
-                validate_interface_delta(&before, &next).is_err(),
-                "foreign site prefix {site_prefix}->{changed}"
-            );
+    for site_prefix in [0, 1, 32, 64, 255] {
+        let mut raw = interface_raw();
+        raw.SitePrefixLength = site_prefix;
+        let row = decode_interface(&raw).unwrap();
+        assert_eq!(row.observed.site_prefix_length, site_prefix);
+        Snapshot {
+            interface: row.clone(),
+            address: None,
         }
+        .validate(&binding())
+        .unwrap();
+        let encoded =
+            interface_input(MIB_IPINTERFACE_ROW::default(), row.key, &row.policy).unwrap();
+        assert_eq!(encoded.SitePrefixLength, 0);
+        assert_eq!(decode_interface(&encoded).unwrap().policy, row.policy);
     }
 }

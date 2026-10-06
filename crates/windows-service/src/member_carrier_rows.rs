@@ -54,9 +54,6 @@ pub(crate) struct InterfacePolicy {
     pub link_local_behavior: i32,
     pub link_local_timeout: u32,
     pub zone_indices: [u32; 16],
-    // Exact IPv4 Get value retained in snapshots/CAS. Set requires zero input
-    // for this nonmodifiable field; its sentinel never replaces this value.
-    pub site_prefix_length: u32,
     pub metric: u32,
     pub mtu: u32,
     pub disable_default_routes: bool,
@@ -64,6 +61,8 @@ pub(crate) struct InterfacePolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InterfaceObserved {
+    // Actual nonmodifiable IPv4 Get value; Set always supplies SDK input zero.
+    pub site_prefix_length: u32,
     pub max_reassembly_size: u32,
     pub interface_identifier: u64,
     pub min_router_advertisement_interval: u32,
@@ -146,9 +145,6 @@ impl InterfacePolicy {
             || !(0..=2).contains(&self.link_local_behavior)
             || self.metric > 0x7fffffff
             || self.mtu < 68
-            || (self.site_prefix_length > 32
-                && self.site_prefix_length != 64
-                && self.site_prefix_length != 255)
         {
             return Err(Error::Unsupported);
         }
@@ -161,14 +157,14 @@ pub(crate) fn validate_interface_delta(
 ) -> Result<()> {
     before.validate()?;
     after.validate()?;
-    // This sidecar owns weak-host only; all other policy metadata participates
-    // in exact CAS and is preserved, including nonmodifiable SitePrefixLength.
+    // This sidecar owns weak-host only; all other writable policy metadata
+    // participates in exact CAS and is preserved.
     // Forwarding/DHCP/metric/MTU/zone edits need a
     // separate future owner contract, not silently widened permissions.
     let mut permitted = before.clone();
     permitted.weak_host_send = after.weak_host_send;
     permitted.weak_host_receive = after.weak_host_receive;
-    if permitted != *after || !matches!(after.site_prefix_length, 0 | 64) {
+    if permitted != *after {
         return Err(Error::Unsupported);
     }
     Ok(())

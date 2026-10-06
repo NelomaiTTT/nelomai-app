@@ -273,12 +273,12 @@ fn row(context: &Context, role: usize) -> rows::Record {
                 link_local_behavior: 0,
                 link_local_timeout: 0,
                 zone_indices: [0; 16],
-                site_prefix_length: 0,
                 metric: 5,
                 mtu: 1420,
                 disable_default_routes: true,
             },
             observed: rows::InterfaceObserved {
+                site_prefix_length: 0,
                 max_reassembly_size: 0,
                 interface_identifier: 0,
                 min_router_advertisement_interval: 200,

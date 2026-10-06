@@ -173,8 +173,8 @@ pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> 
     if r.Family != AF_INET {
         #[cfg(all(test, windows))]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            trace_observe(&format!("C actual interface Unsupported Family={} MaxReassemblySize={} InterfaceIdentifier={}",
-                r.Family, r.MaxReassemblySize, r.InterfaceIdentifier));
+            trace_observe(&format!("C actual interface Unsupported Family={} MaxReassemblySize={} InterfaceIdentifier={} SitePrefixLength={}",
+                r.Family, r.MaxReassemblySize, r.InterfaceIdentifier, r.SitePrefixLength));
         }
         return Err(Error::Unsupported);
     }
@@ -201,12 +201,12 @@ pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> 
             link_local_behavior: r.LinkLocalAddressBehavior,
             link_local_timeout: r.LinkLocalAddressTimeout,
             zone_indices: r.ZoneIndices,
-            site_prefix_length: r.SitePrefixLength,
             metric: r.Metric,
             mtu: r.NlMtu,
             disable_default_routes: r.DisableDefaultRoutes,
         },
         observed: InterfaceObserved {
+            site_prefix_length: r.SitePrefixLength,
             max_reassembly_size: r.MaxReassemblySize,
             interface_identifier: r.InterfaceIdentifier,
             min_router_advertisement_interval: r.MinRouterAdvertisementInterval,
@@ -226,8 +226,8 @@ pub(crate) fn decode_interface(r: &MIB_IPINTERFACE_ROW) -> Result<InterfaceRow> 
         if *_error == Error::Unsupported
             && crate::windows::member_carrier_factory_test_os::state().is_some()
         {
-            trace_observe(&format!("C actual interface policy Unsupported RouterDiscoveryBehavior={} LinkLocalAddressBehavior={} Metric={} NlMtu={} SitePrefixLength={}",
-                row.policy.router_discovery, row.policy.link_local_behavior, row.policy.metric, row.policy.mtu, row.policy.site_prefix_length));
+            trace_observe(&format!("C actual interface policy Unsupported RouterDiscoveryBehavior={} LinkLocalAddressBehavior={} Metric={} NlMtu={}",
+                row.policy.router_discovery, row.policy.link_local_behavior, row.policy.metric, row.policy.mtu));
         }
     })?;
     Ok(row)
@@ -274,12 +274,8 @@ pub(crate) fn interface_input(
 ) -> Result<MIB_IPINTERFACE_ROW> {
     k.validate()?;
     p.validate()?;
-    // IPv4 Set requires zero for this nonmodifiable field. Get's exact 0/64
-    // stays in the protected policy and post-Set CAS; 255/other baselines still
-    // fail capability before mutation. Zero is an SDK input, not a Get rewrite.
-    if !matches!(p.site_prefix_length, 0 | 64) {
-        return Err(Error::Unsupported);
-    }
+    // IPv4 Set requires zero for this nonmodifiable field. The actual Get
+    // value remains in observations and is never used as writable policy.
     r.Family = AF_INET;
     r.InterfaceLuid.Value = k.luid;
     r.InterfaceIndex = k.index;

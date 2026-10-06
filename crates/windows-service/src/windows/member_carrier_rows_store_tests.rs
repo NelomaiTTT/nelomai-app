@@ -167,12 +167,12 @@ fn initial(role: Role) -> Record {
         link_local_behavior: 0,
         link_local_timeout: 6500,
         zone_indices: [17; 16],
-        site_prefix_length: 0,
         metric: 19,
         mtu: 1420,
         disable_default_routes: true,
     };
     let observed = InterfaceObserved {
+        site_prefix_length: 0,
         max_reassembly_size: 0,
         interface_identifier: 0,
         min_router_advertisement_interval: 200,
