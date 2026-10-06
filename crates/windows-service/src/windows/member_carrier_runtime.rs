@@ -53,7 +53,6 @@ struct ConstructionRoot<I, A, S, C, E = CarrierError> {
     authority_complete: Cell<bool>,
     components_attempted: Cell<bool>,
     components_complete: Cell<bool>,
-    supervisor_attempted: Cell<bool>,
     error: std::marker::PhantomData<E>,
 }
 struct ConstructionAttempt {
@@ -81,7 +80,6 @@ impl<I, A, S, C, E: From<ConstructionFailure>> ConstructionRoot<I, A, S, C, E> {
             authority_complete: Cell::new(false),
             components_attempted: Cell::new(false),
             components_complete: Cell::new(false),
-            supervisor_attempted: Cell::new(false),
             error: std::marker::PhantomData,
         }
     }
@@ -140,50 +138,6 @@ impl<I, A, S, C, E: From<ConstructionFailure>> ConstructionRoot<I, A, S, C, E> {
     }
     fn retained_parts(&mut self) -> &mut ConstructionParts<I, A, S, C> {
         self.parts.get_mut()
-    }
-    fn supervised(
-        &self,
-        call: impl FnOnce() -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), E> {
-        let attempt = self.begin_supervised()?;
-        call()?;
-        self.finish_supervised(attempt)
-    }
-    fn begin_supervised(&self) -> std::result::Result<ConstructionAttempt, E> {
-        if self.supervisor_attempted.replace(true) || self.revoked.get() {
-            self.revoked.set(true);
-            return Err(ConstructionFailure::Retired.into());
-        }
-        // Owned signal only: this guard does NOT borrow the root. Mutable
-        // component operations can borrow the whole caller's slot underneath it.
-        Ok(ConstructionAttempt {
-            revoked: self.revoked.clone(),
-            succeeded: false,
-        })
-    }
-    fn finish_supervised(&self, mut attempt: ConstructionAttempt) -> std::result::Result<(), E> {
-        // Covers the enclosing supervisor's postflight, after the inner stage
-        // callbacks have already published their original owning outputs.
-        if !Rc::ptr_eq(&self.revoked, &attempt.revoked) {
-            self.revoked.set(true);
-            return Err(ConstructionFailure::Conflict.into());
-        }
-        if self.revoked.get() {
-            return Err(ConstructionFailure::Retired.into());
-        }
-        if !self.components_complete.get() {
-            return Err(ConstructionFailure::Pending.into());
-        }
-        attempt.succeeded = true;
-        Ok(())
-    }
-    fn supervised_mut(
-        &mut self,
-        call: impl FnOnce(&mut Self) -> std::result::Result<(), E>,
-    ) -> std::result::Result<(), E> {
-        let attempt = self.begin_supervised()?;
-        call(self)?;
-        self.finish_supervised(attempt)
     }
 }
 
@@ -5305,27 +5259,6 @@ pub(crate) mod native {
                     same_record(&before, owner.current(Use::Create)?).map_err(denied)?;
                     Ok(())
                 })
-        }
-        /// Wrap the caller's actual supervisor.run/run_intent around BOTH
-        /// construction stages. The root exists before this call and survives
-        /// its Err/unwind; the wrapper supplies retention/revocation ONLY.
-        /// Actual G and Calling checks still gate every native stage inside it.
-        pub(crate) fn in_supervised_call(
-            &self,
-            call: impl FnOnce(&Self) -> Result<()>,
-        ) -> Result<()> {
-            self.root.supervised(|| call(self))
-        }
-        /// SAME guard/signal as the read wrapper, held outside all mutable
-        /// borrows. Main's actual supervisor covers construct, resolve and
-        /// mutable Carrier/RowOwner work through its whole Calling window.
-        pub(crate) fn in_supervised_call_mut(
-            &mut self,
-            call: impl FnOnce(&mut Self) -> Result<()>,
-        ) -> Result<()> {
-            let attempt = self.root.begin_supervised()?;
-            call(self)?;
-            self.root.finish_supervised(attempt)
         }
         /// Use after an external supervisor postflight failure (or in its unwind
         /// guard). Irreversible, shared by every actual native authority alias.
