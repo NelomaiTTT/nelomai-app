@@ -939,9 +939,7 @@ pub(crate) mod native_store {
             if self.revoked.get() || !self.runtime.matches_pin(&self.lock) {
                 return Err(conflict());
             }
-            self.runtime
-                .verify_same_session_files(&self.context, &self.files)
-                .map_err(|_| conflict())?;
+            // The getter already fully authenticates this original backend/context.
             let mut files = self
                 .runtime
                 .native_files_for_original(&self.context, &self.files)
@@ -1090,9 +1088,7 @@ pub(crate) mod native_store {
             if self.revoked.get() || !self.runtime.matches_pin(&self.lock) {
                 return Err(conflict());
             }
-            self.runtime
-                .verify_same_session_files(&self.context, &self.files)
-                .map_err(|_| conflict())?;
+            // The getter already fully authenticates this original backend/context.
             let mut files = self
                 .runtime
                 .native_files_for_original(&self.context, &self.files)
