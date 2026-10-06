@@ -903,10 +903,7 @@ pub(crate) mod native {
             }
             let deadline = self.supervisor.read_pin().map_err(denied)?;
             deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_member_intent(&self.context, &self.member_source, &self.intent)?;

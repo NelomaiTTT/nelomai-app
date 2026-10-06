@@ -1409,13 +1409,7 @@ pub(crate) mod native {
                     }
                     let deadline = meta.supervisor.read_pin().map_err(native_denied)?;
                     deadline
-                        .verify_runtime(&meta.supervisor, &meta.runtime, &meta.scope.context)
-                        .map_err(native_denied)?;
-                    deadline
-                        .verify_call(&meta.supervisor, &meta.scope.context)
-                        .map_err(native_denied)?;
-                    meta.runtime
-                        .verify(&meta.scope.context)
+                        .verify_runtime_call(&meta.supervisor, &meta.runtime, &meta.scope.context)
                         .map_err(native_denied)?;
                     meta.runtime
                         .verify_source(&meta.wintun)

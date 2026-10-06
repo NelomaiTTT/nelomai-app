@@ -5086,7 +5086,7 @@ pub(crate) mod native {
             call.owner
                 .verify_supervised()
                 .map_err(|_| rows::Error::Conflict)?;
-            let use_ = call.owner.row_use().map_err(|_| rows::Error::Conflict)?;
+            let (use_, _) = call.owner.row_state().map_err(|_| rows::Error::Conflict)?;
             if call.owner.failed && use_ != Use::Cleanup {
                 return Err(rows::Error::Retired);
             }
@@ -5527,7 +5527,8 @@ pub(crate) mod native {
             authority.current(Use::Create)?;
             Ok(authority)
         }
-        fn row_use(&self) -> Result<Use> {
+        // Return the final factual receipt already compared with the first read.
+        fn row_state(&self) -> Result<(Use, receipts::Record)> {
             let bytes = self
                 .runtime
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
@@ -5538,16 +5539,15 @@ pub(crate) mod native {
                 receipts::Phase::Closing => Use::Cleanup,
                 _ => return Err(Error::Retired),
             };
-            same_record(&record, self.current(use_)?).map_err(denied)?;
-            Ok(use_)
+            let current = same_record(&record, self.current(use_)?).map_err(denied)?;
+            Ok((use_, current))
         }
         fn row_binding(&mut self) -> rows::Result<rows::Binding> {
             let role = self.active_row_role.ok_or(rows::Error::Retired)?;
             if role != rows::Role::Carrier {
                 return self.member_row_binding(role);
             }
-            let use_ = self.row_use().map_err(|_| rows::Error::Conflict)?;
-            let before = self.current(use_).map_err(|_| rows::Error::Conflict)?;
+            let (use_, before) = self.row_state().map_err(|_| rows::Error::Conflict)?;
             let held = self.effect.as_mut().ok_or(rows::Error::Retired)?;
             if use_ == Use::Cleanup {
                 held.verify_for_cleanup(&self.cancelled)
@@ -5585,8 +5585,7 @@ pub(crate) mod native {
         fn member_row_binding(&mut self, role: rows::Role) -> rows::Result<rows::Binding> {
             self.verify_supervised()
                 .map_err(|_| rows::Error::Conflict)?;
-            let use_ = self.row_use().map_err(|_| rows::Error::Conflict)?;
-            let before = self.current(use_).map_err(|_| rows::Error::Conflict)?;
+            let (use_, before) = self.row_state().map_err(|_| rows::Error::Conflict)?;
             if self.active_row_role != Some(role) || (self.failed && use_ != Use::Cleanup) {
                 return Err(rows::Error::Retired);
             }
@@ -5928,8 +5927,7 @@ pub(crate) mod native {
             if self.row_binding()? != *binding {
                 return Err(rows::Error::Conflict);
             }
-            let use_ = self.row_use().map_err(|_| rows::Error::Conflict)?;
-            let native = self.current(use_).map_err(|_| rows::Error::Conflict)?;
+            let (use_, native) = self.row_state().map_err(|_| rows::Error::Conflict)?;
             let kind = match binding.role {
                 rows::Role::Carrier => RecordKind::CarrierRows,
                 rows::Role::MemberA => RecordKind::MemberARows,

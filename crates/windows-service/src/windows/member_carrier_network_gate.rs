@@ -2019,10 +2019,7 @@ pub(crate) mod native {
                 }
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
@@ -2220,10 +2217,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
@@ -2283,10 +2277,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
@@ -2749,10 +2740,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
@@ -2858,10 +2846,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)

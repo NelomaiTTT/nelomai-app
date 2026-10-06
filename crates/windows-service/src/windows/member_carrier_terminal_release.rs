@@ -340,10 +340,7 @@ pub(crate) mod native {
             // Construction and final ownership disposal require no read pin.
             let deadline = p.supervisor.read_pin().map_err(io::Error::other)?;
             deadline
-                .verify_runtime(&p.supervisor, &p.runtime, &p.context)
-                .map_err(io::Error::other)?;
-            deadline
-                .verify_call(&p.supervisor, &p.context)
+                .verify_runtime_call(&p.supervisor, &p.runtime, &p.context)
                 .map_err(io::Error::other)
         }
         fn current(&self) -> io::Result<()> {

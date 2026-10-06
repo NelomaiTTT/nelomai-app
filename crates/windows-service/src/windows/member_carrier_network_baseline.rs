@@ -315,12 +315,8 @@ pub(crate) mod native {
     impl<A: WindowBindingAttestor> Origin<A> {
         fn continuity(&self) -> io::Result<()> {
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(io::Error::other)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
-                .map_err(io::Error::other)?;
-            self.runtime.verify(&self.context).map_err(io::Error::other)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
+                .map_err(io::Error::other)
         }
         fn capture_window(&self, window: &NativeBindingsWindow<'_>) -> io::Result<()> {
             self.continuity()?;

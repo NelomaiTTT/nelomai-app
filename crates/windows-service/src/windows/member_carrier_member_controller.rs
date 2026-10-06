@@ -3548,10 +3548,7 @@ pub(crate) mod native {
             validate_closing12_unstarted(self.context, expected, slot, original)?;
             let deadline = self.supervisor.read_pin().map_err(|_| Error::Conflict)?;
             deadline
-                .verify_runtime(self.supervisor, self.runtime, self.context)
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(self.supervisor, self.context)
+                .verify_runtime_call(self.supervisor, self.runtime, self.context)
                 .map_err(|_| Error::Conflict)?;
             if !self.runtime.matches_lock(lock) || !self.source.matches_carrier(self.carrier) {
                 return Err(Error::Conflict);
@@ -3622,10 +3619,7 @@ pub(crate) mod native {
             )?;
             let deadline = self.supervisor.read_pin().map_err(|_| Error::Conflict)?;
             deadline
-                .verify_runtime(self.supervisor, self.runtime, self.context)
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(self.supervisor, self.context)
+                .verify_runtime_call(self.supervisor, self.runtime, self.context)
                 .map_err(|_| Error::Conflict)?;
             if !self.runtime.matches_lock(lock) || !self.source.matches_carrier(self.carrier) {
                 return Err(Error::Conflict);
@@ -3733,10 +3727,7 @@ pub(crate) mod native {
             }
             let deadline = self.supervisor.read_pin().map_err(|_| Error::Conflict)?;
             deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(|_| Error::Conflict)?;
             if !self.runtime.matches_lock(lock)
                 || !self.runtime.fresh(&self.context)?
@@ -6197,10 +6188,7 @@ pub(crate) mod native {
             self.verify_sources()?;
             let deadline = self.supervisor.read_pin().map_err(|_| Error::Conflict)?;
             deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
-                .map_err(|_| Error::Conflict)?;
-            deadline
-                .verify_call(&self.supervisor, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(|_| Error::Conflict)?;
             let bytes = self
                 .runtime

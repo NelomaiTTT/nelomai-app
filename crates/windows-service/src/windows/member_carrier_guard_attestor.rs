@@ -711,12 +711,8 @@ pub(crate) mod native {
                 return Err(GuardError::Conflict);
             }
             self.deadline
-                .verify_runtime(&self.supervisor, &self.runtime, &self.context)
+                .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
-            self.deadline
-                .verify_call(&self.supervisor, &self.context)
-                .map_err(denied)?;
-            self.runtime.verify(&self.context).map_err(denied)?;
             if selected.record.phase != pair::Phase::Closing
                 && !self.runtime.fresh(&self.context).map_err(denied)?
             {
@@ -1211,15 +1207,11 @@ pub(crate) mod native {
                 let verify = || {
                     self.originals
                         .deadline
-                        .verify_runtime(
+                        .verify_runtime_call(
                             &self.originals.supervisor,
                             &self.originals.runtime,
                             &self.originals.context,
                         )
-                        .map_err(denied)?;
-                    self.originals
-                        .deadline
-                        .verify_call(&self.originals.supervisor, &self.originals.context)
                         .map_err(denied)?;
                     // Canonical G may already be inside Pair.inspect. The
                     // actual store method authenticates current original ACK,
