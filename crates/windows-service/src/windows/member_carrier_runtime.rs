@@ -3686,35 +3686,6 @@ pub(crate) mod native {
         fn sample(&self) -> Result<SourceSample> {
             self.sample_for_row(None)
         }
-        fn members_with_history(
-            &self,
-            carrier: &creators::Identity,
-        ) -> Result<(
-            Vec<carrier_provider::ExpectedProvider>,
-            Vec<carrier_members::ClosedMemberBinding>,
-        )> {
-            let c = carrier_provider::ExpectedProvider {
-                kind: carrier_provider::ProviderKind::Wintun,
-                identity: carrier_provider::Expected {
-                    guid: carrier.guid,
-                    luid: carrier.luid,
-                    index: carrier.index,
-                    name: carrier.name.clone(),
-                    description: carrier.description.clone(),
-                    if_type: carrier.if_type,
-                    tunnel_type: carrier.tunnel_type,
-                },
-            };
-            self.members
-                .inspect_source_bindings_full(
-                    &self.scope.context,
-                    &self.runtime,
-                    &self.image,
-                    &[c],
-                    |live, history| Ok((live.to_vec(), history.to_vec())),
-                )
-                .map_err(denied)
-        }
         fn sample_for_row(
             &self,
             effect: Option<(&rows::Binding, &rows::Target)>,
@@ -3737,7 +3708,22 @@ pub(crate) mod native {
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
                 return Err(Error::Conflict);
             }
-            let (members, history) = self.members_with_history(&all.originals[0].identity)?;
+            let (members, history) = self
+                .members
+                .read_source_bindings(&self.scope.context, &self.runtime, &self.image)
+                .map_err(denied)?;
+            if all.complete.len() != 1 + members.len()
+                || all.complete[0].0 != carrier_provider::ProviderKind::Wintun
+                || all.complete[0].1 != all.originals[0].provider
+                || all.complete[1..]
+                    .iter()
+                    .zip(&members)
+                    .any(|((kind, actual), member)| {
+                        *kind != member.kind || actual.interface != member.identity
+                    })
+            {
+                return Err(Error::Conflict);
+            }
             let record = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
             let snapshot = source_sdk_snapshot(captured.binding)?;
             let source = if let Some((binding, target)) = effect {

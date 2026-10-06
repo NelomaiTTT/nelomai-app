@@ -1691,34 +1691,25 @@ pub(crate) mod native {
             })
         }
 
-        /// Live C with zero or more SAME-original retired member histories.
-        /// History never enters SDK inputs and cannot revive a closed member.
-        pub(crate) fn inspect_source_bindings_full<T>(
+        /// Original live members and closed history under the SAME protected
+        /// revision. The enclosing Source read joins these identities to its
+        /// complete native provider census; history never enters live SDK inputs.
+        pub(crate) fn read_source_bindings(
             &self,
             context: &Context,
             runtime: &RuntimeRead,
             image: &OriginalImage,
-            carrier: &[ExpectedProvider],
-            inspect: impl FnOnce(&[ExpectedProvider], &[ClosedMemberBinding]) -> Result<T>,
-        ) -> Result<T> {
+        ) -> Result<(Vec<ExpectedProvider>, Vec<ClosedMemberBinding>)> {
             self.health.forward(|| {
                 let mut inventory = self
                     .inventory
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                if carrier.len() != 1 {
+                let before = inventory.source_bindings_revision(context, runtime, image)?;
+                if inventory.source_bindings_revision(context, runtime, image)? != before {
                     return Err(Error::Conflict);
                 }
-                inspect_mixed_closing_with(
-                    || inventory.source_bindings_revision(context, runtime, image),
-                    |live| {
-                        let wants = complete_provider_inputs(context, carrier, live)?;
-                        super::super::member_carrier_provider::native::inspect_mixed(&wants)
-                            .map(|_| ())
-                            .map_err(|_| Error::Pending)
-                    },
-                    inspect,
-                )
+                Ok((before.1, before.2))
             })
         }
 
