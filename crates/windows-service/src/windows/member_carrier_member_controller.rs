@@ -6212,14 +6212,12 @@ pub(crate) mod native {
                 receipt.binding,
                 self.intent.slot,
             )?;
-            // Copy facts while inventory is borrowed, then release that borrow
-            // BEFORE Source/G joined reads can sample this SAME inventory.
-            let members = self.inventory.inspect_full(
-                &self.context,
-                &self.runtime,
-                &self.image,
-                |members| Ok(members.to_vec()),
-            )?;
+            // Read the SAME original live tuple, releasing its inventory borrow
+            // BEFORE Source/G. That Source bracket independently joins the full
+            // native census; exact target absence is still checked below.
+            let (members, _) =
+                self.inventory
+                    .read_source_bindings(&self.context, &self.runtime, &self.image)?;
             pair_read
                 .inspect_effect(
                     &self.runtime,
