@@ -635,6 +635,24 @@ fn native_empty_network_read_stage_ten_retry_is_not_a_stage_nine_removal_grant()
     nine.stop_stage = 9;
     nine.pending = Some(pair::Effect::NativeEmpty);
     assert!(compare_native_empty_resource_stage(&context, &nine, &baseline).is_err());
+    record.guard = empty.clone();
+    record.validate().unwrap();
+    assert!(compare_native_empty_resource_stage(&context, &record, &baseline).is_ok());
+    for fault in 0..4 {
+        let mut changed = record.clone();
+        let plan = changed.pending_guard.as_mut().unwrap();
+        match fault {
+            0 => plan.desired = plan.expected.clone(),
+            1 => plan.expected.scope.connection_generation += 1,
+            2 => plan.withdrawn.permits = true,
+            _ => plan.base.expected.scope.connection_generation += 1,
+        }
+        assert!(compare_native_empty_resource_stage(&context, &changed, &baseline).is_err());
+    }
+    nine = record.clone();
+    nine.stop_stage = 9;
+    nine.pending = Some(pair::Effect::NativeEmpty);
+    assert!(compare_native_empty_resource_stage(&context, &nine, &baseline).is_err());
     record.pending_guard = None;
     record.guard = empty;
     record.validate().unwrap();

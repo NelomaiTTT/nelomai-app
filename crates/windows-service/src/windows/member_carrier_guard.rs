@@ -57,7 +57,7 @@ struct Backing {
 }
 impl EncodedFilter {
     pub(crate) fn new(filter: &Filter) -> Result<Self> {
-        validate_action(filter.layer, filter.action, filter.flags, filter.weight)?;
+        validate_action(filter.action, filter.flags, filter.weight)?;
         let mut backing = Backing::default();
         let mut conditions = filter
             .conditions
@@ -145,7 +145,7 @@ pub(crate) unsafe fn decode_filter(
     if unsafe { read_weight(&raw.effectiveWeight) }? != weight {
         return Err(GuardError::Conflict);
     }
-    validate_action(layer, action, raw.flags, weight)?;
+    validate_action(action, raw.flags, weight)?;
     let conditions = unsafe {
         std::slice::from_raw_parts(raw.filterCondition, raw.numFilterConditions as usize)
     };
@@ -166,7 +166,7 @@ pub(crate) unsafe fn decode_filter(
             sublayer,
             layer,
             weight,
-            flags: raw.flags,
+            flags: raw.flags & !FWPM_FILTER_FLAG_INDEXED,
             action,
             conditions: decoded,
         },
@@ -190,13 +190,8 @@ pub(crate) unsafe fn decode_sublayer(raw: &FWPM_SUBLAYER0, expected_key: Key) ->
         flags: raw.flags,
     })
 }
-fn validate_action(layer: Layer, action: Action, flags: u32, weight: u64) -> Result<()> {
-    let indexed = action == Action::Permit
-        && matches!(
-            layer,
-            Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
-        );
-    if flags != if indexed { FWPM_FILTER_FLAG_INDEXED } else { 0 }
+fn validate_action(action: Action, flags: u32, weight: u64) -> Result<()> {
+    if flags & !FWPM_FILTER_FLAG_INDEXED != 0
         || weight != if action == Action::Block { 1 } else { 2 }
     {
         return Err(GuardError::Conflict);
@@ -1223,7 +1218,7 @@ fn cold_read_checked<N: ColdStaticNativeApi>(
                     && own.policy.key == f.key
                     && own.policy.layer == f.layer
                     && f.sublayer_weight == sub.weight
-                    && f.flags == 0
+                    && f.flags & !FWPM_FILTER_FLAG_INDEXED == 0
                     && f.action == FWP_ACTION_BLOCK
             }) {
                 return Err(GuardError::Conflict);
@@ -1369,7 +1364,7 @@ pub(crate) fn validate_arbitration(
             if ids.get(&f.key) != Some(&f.id)
                 || f.sublayer_weight != sub.weight
                 || exact.layer != f.layer
-                || exact.flags != f.flags
+                || exact.flags != f.flags & !FWPM_FILTER_FLAG_INDEXED
                 || action != f.action
             {
                 return Err(GuardError::Conflict);

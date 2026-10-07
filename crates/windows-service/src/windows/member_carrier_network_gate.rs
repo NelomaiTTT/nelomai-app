@@ -497,10 +497,25 @@ fn compare_native_empty_resource_stage(
         10 => pair::Effect::Guard,
         _ => return Err(conflict()),
     };
+    let empty = policy::Model::empty(record.scope.clone()).map_err(denied)?;
+    if let Some(plan) = &record.pending_guard {
+        // Stage10 can read the retained base or its ACKed empty state before
+        // Pair publication. This exact recovery classification grants no effect.
+        if record.stop_stage != 10
+            || !plan.expected.installed
+            || plan.expected.assigned_sublayer_weight.is_none()
+            || plan.expected.permits
+            || plan.resolve(&record.guard.expected).map_err(denied)? != record.guard
+            || plan.desired != empty
+            || plan.withdrawn.permits
+            || plan.base.permits
+        {
+            return Err(conflict());
+        }
+    }
     let retained_base = record.guard.installed && record.guard.assigned_sublayer_weight.is_some();
-    let empty_guard = (record.stop_stage == 10 || record.network.is_none())
-        && record.pending_guard.is_none()
-        && record.guard == policy::Model::empty(record.scope.clone()).map_err(denied)?;
+    let empty_guard =
+        (record.stop_stage == 10 || record.network.is_none()) && record.guard == empty;
     baseline.with_servers(&record.dns).map_err(denied)?;
     if record.scope != context.intent.scope
         || record.provenance != context.provenance
@@ -519,18 +534,6 @@ fn compare_native_empty_resource_stage(
         || baseline.interface.luid != c.luid
     {
         return Err(conflict());
-    }
-    if let Some(plan) = &record.pending_guard {
-        // Stage9 precedes removal; stage10 may already have journaled the
-        // exact DENY-only-to-empty exchange. This read never grants that effect.
-        if record.stop_stage != 10
-            || plan.expected != record.guard
-            || plan.desired != policy::Model::empty(record.scope.clone()).map_err(denied)?
-            || plan.withdrawn.permits
-            || plan.base.permits
-        {
-            return Err(conflict());
-        }
     }
     if let Some(network) = &record.network {
         if network.pending.is_some()

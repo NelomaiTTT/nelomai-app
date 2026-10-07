@@ -93,10 +93,15 @@ fn native_codec_roundtrips_real_full_four_layer_models_and_preserves_ids() {
     for active in [None, Some(Slot::A), Some(Slot::B)] {
         let model = pair(active);
         for filter in &model.expected.filters {
-            let encoded = returned(filter);
-            let got = unsafe { decode_filter(&encoded.raw, filter.key, filter.sublayer) }.unwrap();
-            assert_eq!(got.policy, *filter);
-            assert_eq!(got.id, 9001);
+            assert_eq!(filter.flags, 0);
+            for flags in [0, FWPM_FILTER_FLAG_INDEXED] {
+                let mut encoded = returned(filter);
+                encoded.raw.flags = flags;
+                let got =
+                    unsafe { decode_filter(&encoded.raw, filter.key, filter.sublayer) }.unwrap();
+                assert_eq!(got.policy, *filter);
+                assert_eq!(got.id, 9001);
+            }
             if filter.action == Action::Permit
                 && matches!(filter.layer, Layer::ForwardV4 | Layer::ForwardV6)
             {
@@ -173,17 +178,7 @@ fn native_codec_uses_literal_wfp_layer_fields_types_flags_and_eight_ale_conditio
         let encoded = returned(&filter);
         assert_eq!(key(encoded.raw.layerKey), Key(layer_id.to_be_bytes()));
         assert_eq!(encoded.raw.numFilterConditions, count);
-        assert_eq!(
-            encoded.raw.flags,
-            if matches!(
-                layer,
-                Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
-            ) {
-                64
-            } else {
-                0
-            }
-        );
+        assert_eq!(encoded.raw.flags, 0);
         let conditions =
             unsafe { std::slice::from_raw_parts(encoded.raw.filterCondition, count as usize) };
         let local = conditions
@@ -915,6 +910,7 @@ struct World {
     binding_fault: u8,
     binding_after_scan: Option<u8>,
     arbitration_fault: bool,
+    indexed_arbitration: bool,
     arbitration_extra: Vec<ArbitrationFilter>,
     denied: bool,
     closed: [bool; 2],
@@ -1110,6 +1106,13 @@ fn cold_static_cleanup_removes_exact_captured_partial_blocks_only() {
         .events
         .iter()
         .any(|e| e.contains("DynamicPermits") || e.starts_with("add:")));
+
+    let (root, world, _) = cold_fixture(3);
+    world.borrow_mut().indexed_arbitration = true;
+    root.capture().unwrap();
+    root.cleanup().unwrap();
+    assert!(world.borrow().objects.filters.is_empty());
+    assert_eq!(root.disposition(), (true, true, false));
 }
 
 #[test]
@@ -1808,6 +1811,7 @@ impl NativeApi for Api {
         if w.arbitration_fault {
             return Err(GuardError::Native(61));
         }
+        let indexed = w.indexed_arbitration;
         let state = w.staged.as_ref().unwrap();
         let mut filters: Vec<_> = state
             .filters
@@ -1819,7 +1823,7 @@ impl NativeApi for Api {
                 layer: f.policy.layer,
                 sublayer: f.policy.sublayer,
                 sublayer_weight: state.sublayer.as_ref().unwrap().weight,
-                flags: f.policy.flags,
+                flags: f.policy.flags | if indexed { FWPM_FILTER_FLAG_INDEXED } else { 0 },
                 action: if f.policy.action == Action::Block {
                     FWP_ACTION_BLOCK
                 } else {
@@ -2193,8 +2197,12 @@ fn priority_inventory_requires_complete_original_ids_layers_flags_and_assigned_p
     let model = base(&mut guard);
     let mut io = Api(w.clone());
     io.begin(SessionKind::DynamicPermits, false).unwrap();
-    let filters = io.arbitration(SessionKind::DynamicPermits).unwrap();
+    let mut filters = io.arbitration(SessionKind::DynamicPermits).unwrap();
     let ids: BTreeMap<_, _> = filters.iter().map(|f| (f.key, f.id)).collect();
+    assert!(validate_arbitration(&scope(), &model.expected, &ids, &filters, &[]).is_ok());
+    for filter in &mut filters {
+        filter.flags |= FWPM_FILTER_FLAG_INDEXED;
+    }
     assert!(validate_arbitration(&scope(), &model.expected, &ids, &filters, &[]).is_ok());
     let domain = crate::member_owner::ServiceDomain {
         app_id: "\\device\\volume\\wireguard.exe\0".encode_utf16().collect(),
@@ -2977,7 +2985,7 @@ fn native_conditions_reject_duplicate_fields_wrong_family_types_match_masks_and_
                 1 => conditions[0].matchType = FWP_MATCH_NOT_EQUAL,
                 2 => conditions[0].conditionValue.r#type = FWP_RANGE_TYPE,
                 3 => conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID,
-                4 => encoded.raw.flags ^= 64,
+                4 => encoded.raw.flags |= FWPM_FILTER_FLAG_DISABLED,
                 5 => encoded.raw.filterKey = GUID::from_u128(7),
                 _ => {
                     let address = conditions

@@ -5631,8 +5631,24 @@ pub(crate) mod native {
                             .map_err(native_denied)?
                             .snapshot_in_retired_bracket(pin, record, &original, bindings)
                             .map_err(native_denied)?;
-                        if guard != record.guard.expected
-                            || guard.scope != record.scope
+                        if guard != record.guard.expected {
+                            let plan = record
+                                .pending_guard
+                                .as_ref()
+                                .ok_or_else(|| native_denied(()))?;
+                            let empty = policy::Model::empty(record.scope.clone())
+                                .map_err(native_denied)?;
+                            // The actual NativeGuard retired read already attests this
+                            // plan and current ownership. Its ACKed empty snapshot can
+                            // precede publication of the empty Pair model.
+                            if record.stop_stage != 10
+                                || plan.desired != empty
+                                || plan.resolve(&guard).map_err(native_denied)? != empty
+                            {
+                                return Err(native_denied(()));
+                            }
+                        }
+                        if guard.scope != record.scope
                             || guard
                                 .filters
                                 .iter()

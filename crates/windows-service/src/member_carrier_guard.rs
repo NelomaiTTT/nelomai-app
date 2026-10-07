@@ -17,7 +17,6 @@ const VERSION: u32 = 2;
 const REQUESTED_PRIORITY: u16 = 65534;
 const RAW_ENDPOINT: u32 = 0x10;
 const OUTBOUND_PASS_THRU: u32 = 0x40000;
-const INDEXED: u32 = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -548,15 +547,7 @@ fn filter(
         sublayer: keys.sublayer,
         layer,
         weight: if action == Action::Block { 1 } else { 2 },
-        flags: if action == Action::Permit
-            && matches!(
-                layer,
-                Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
-            ) {
-            INDEXED
-        } else {
-            0
-        },
+        flags: 0,
         action,
         conditions,
     }

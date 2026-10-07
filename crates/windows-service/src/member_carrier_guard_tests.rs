@@ -133,7 +133,7 @@ fn standby_requires_exact_carrier_and_egress_at_all_four_layers_both_families() 
         for (i, layer) in layers.into_iter().enumerate() {
             let filter = permit(&model, layer, &source.to_string(), 22);
             assert_eq!(filter.conditions, want[i]);
-            assert_eq!(filter.flags, if i >= 2 { 64 } else { 0 });
+            assert_eq!(filter.flags, 0);
             assert_eq!(filter.weight, 2);
         }
     }
