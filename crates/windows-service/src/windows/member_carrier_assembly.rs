@@ -599,14 +599,6 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         }
         call(self.owner.as_mut().ok_or(Error::Pending)?)
     }
-    fn with_member_precreation(
-        &mut self,
-        role: receipt::Role,
-        lock: &mut I::MutationLock,
-        call: impl FnOnce(Receipt<'_, I>) -> Result<()>,
-    ) -> Result<()> {
-        self.with_member_precreation_in(role, lock, &mut |call| call(), call)
-    }
     fn with_member_precreation_in(
         &mut self,
         role: receipt::Role,
@@ -742,9 +734,6 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         self.attached = true;
         Ok(())
     }
-    fn prepare_carrier(&mut self, lock: &mut I::MutationLock) -> Result<()> {
-        self.prepare_carrier_in(lock, |call| call())
-    }
     fn prepare_carrier_in(
         &mut self,
         lock: &mut I::MutationLock,
@@ -770,13 +759,6 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         )?;
         self.prepared = true;
         Ok(())
-    }
-    fn with_precreation(
-        &mut self,
-        lock: &mut I::MutationLock,
-        call: impl FnOnce(&mut Option<A>, Receipt<'_, I>, u64) -> Result<()>,
-    ) -> Result<()> {
-        self.with_precreation_in(lock, &mut |call| call(), call)
     }
     fn with_precreation_in(
         &mut self,

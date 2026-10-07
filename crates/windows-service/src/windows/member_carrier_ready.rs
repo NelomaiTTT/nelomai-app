@@ -210,9 +210,6 @@ impl ReadyRun {
             revoked: Rc::new(Cell::new(false)),
         }
     }
-    fn execute(&self, effect: impl FnMut(ReadyStep) -> Result<()>) -> Result<()> {
-        self.execute_in(&mut |call| call(), effect)
-    }
     fn execute_in(
         &self,
         run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
@@ -807,17 +804,6 @@ pub(crate) mod native {
                 meta: None,
                 proof: None,
             }
-        }
-        pub(crate) fn with_original_loaded_module_for_terminal(
-            &self,
-            call: impl FnOnce(
-                &mut crate::windows::member_carrier_module::native::LoadedWintun,
-            ) -> std::io::Result<()>,
-        ) -> std::io::Result<()> {
-            self.construction
-                .as_ref()
-                .ok_or_else(|| std::io::Error::other("carrier_terminal_construction_missing"))?
-                .with_original_loaded_module_for_terminal(call)
         }
         /// Pure SAME stopped-capture transfer in the actual Retired/protected
         /// rows callback. No Source/Authority/journal/old-NIC query or permission
@@ -2869,9 +2855,6 @@ pub(crate) mod native {
     }
     fn native_denied<E>(_: E) -> wintun::Error {
         wintun::Error::Conflict
-    }
-    fn io_denied<E>(_: E) -> std::io::Error {
-        std::io::Error::other("native_carrier_ready")
     }
 }
 

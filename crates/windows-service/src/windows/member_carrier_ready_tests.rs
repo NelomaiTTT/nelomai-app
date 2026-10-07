@@ -1168,10 +1168,12 @@ fn original_pins_are_not_published_before_whole_call_ack_or_after_revocation() {
     assert_eq!(calls, STEPS.len());
     assert!(run.published(false).is_err());
     run.published(true).unwrap();
-    assert!(run.execute(|_| Ok(())).is_err());
+    assert!(run.execute_in(&mut |call| call(), |_| Ok(())).is_err());
     assert!(run.published(true).is_err());
     let failed = ReadyRun::new();
-    assert!(failed.execute(|_| Err(CarrierError::Native)).is_err());
+    assert!(failed
+        .execute_in(&mut |call| call(), |_| Err(CarrierError::Native))
+        .is_err());
     assert!(failed.published(true).is_err());
 }
 
@@ -1298,7 +1300,7 @@ fn source_publication_is_last_after_all_native_creation_and_ready_boundaries() {
     assert!(!run.revoked.get());
     let mut repeated = false;
     assert!(run
-        .execute(|_| {
+        .execute_in(&mut |call| call(), |_| {
             repeated = true;
             Ok(())
         })
@@ -1426,14 +1428,16 @@ fn every_failed_native_boundary_prevents_later_effects_and_new_attempt() {
             assert_eq!(seen, STEPS[..failed]);
             assert!(run.revoked.get());
             assert!(run.published(true).is_err());
-            assert!(run.execute(|_| panic!("C retry after postflight")).is_err());
+            assert!(run
+                .execute_in(&mut |call| call(), |_| panic!("C retry after postflight"))
+                .is_err());
         }
     }
     for failed in 0..STEPS.len() {
         let run = ReadyRun::new();
         let mut seen = vec![];
         assert!(run
-            .execute(|step| {
+            .execute_in(&mut |call| call(), |step| {
                 seen.push(step);
                 if step == STEPS[failed] {
                     Err(CarrierError::Native)
@@ -1446,7 +1450,7 @@ fn every_failed_native_boundary_prevents_later_effects_and_new_attempt() {
         assert!(run.revoked.get());
         let mut repeated = false;
         assert!(run
-            .execute(|_| {
+            .execute_in(&mut |call| call(), |_| {
                 repeated = true;
                 Ok(())
             })
@@ -1460,10 +1464,10 @@ fn caught_reentry_cannot_publish_a_source_from_the_outer_attempt() {
     let run = ReadyRun::new();
     let seen = RefCell::new(vec![]);
     assert!(run
-        .execute(|step| {
+        .execute_in(&mut |call| call(), |step| {
             seen.borrow_mut().push(step);
             if step == ReadyStep::Create {
-                assert!(run.execute(|_| Ok(())).is_err());
+                assert!(run.execute_in(&mut |call| call(), |_| Ok(())).is_err());
             }
             Ok(())
         })
@@ -1476,15 +1480,18 @@ fn caught_reentry_cannot_publish_a_source_from_the_outer_attempt() {
 fn unwind_retains_the_callers_partial_objects_and_irreversibly_retires_run() {
     let run = ReadyRun::new();
     let retained = RefCell::new(vec![]);
-    assert!(catch_unwind(AssertUnwindSafe(|| run.execute(|step| {
-        retained.borrow_mut().push(step);
-        if step == ReadyStep::Address {
-            panic!("native postflight");
+    assert!(catch_unwind(AssertUnwindSafe(|| run.execute_in(
+        &mut |call| call(),
+        |step| {
+            retained.borrow_mut().push(step);
+            if step == ReadyStep::Address {
+                panic!("native postflight");
+            }
+            Ok(())
         }
-        Ok(())
-    })))
+    )))
     .is_err());
     assert_eq!(*retained.borrow(), STEPS[..=5]);
     assert!(run.revoked.get());
-    assert!(run.execute(|_| Ok(())).is_err());
+    assert!(run.execute_in(&mut |call| call(), |_| Ok(())).is_err());
 }

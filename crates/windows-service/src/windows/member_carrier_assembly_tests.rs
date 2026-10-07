@@ -789,7 +789,7 @@ fn module_only_assembly_source_is_original_initial_and_revokes_before_key_access
                 let _ = root.attach_keys(&mut lock.clone());
             }
             1 => {
-                let _ = root.prepare_carrier(&mut lock.clone());
+                let _ = root.prepare_carrier_in(&mut lock.clone(), |call| call());
             }
             _ => {
                 root.module_only_allowed.set(false);
@@ -1242,12 +1242,12 @@ fn retain_io(root: &mut Root, s: &Shared, drops: &Rc<Cell<u32>>) {
 #[test]
 fn same_assembly_member_recreation_uses_acknowledged_original_restored_key() {
     let (mut root, state, mut lock, _) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     root.assets.take();
-    root.with_member_precreation(Role::MemberB, &mut lock, |_| Ok(()))
+    root.with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| Ok(()))
         .unwrap();
     root.restore_member_key(Role::MemberB, &mut lock).unwrap();
-    root.with_member_precreation(Role::MemberB, &mut lock, |receipt| {
+    root.with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |receipt| {
         assert_eq!(receipt.binding, &context().bindings[2]);
         assert_eq!(receipt.record.phase, receipt::Phase::Preparing);
         assert_eq!(receipt.record.keys[0].phase, KeyPhase::Disabled);
@@ -1259,11 +1259,11 @@ fn same_assembly_member_recreation_uses_acknowledged_original_restored_key() {
     // A later SAME original member retirement can renew this slot once again;
     // consumed receipts do not permanently disable the slot or recreate keys.
     root.restore_member_key(Role::MemberB, &mut lock).unwrap();
-    root.with_member_precreation(Role::MemberB, &mut lock, |_| Ok(()))
+    root.with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| Ok(()))
         .unwrap();
     assert_eq!(state.borrow().creates, 2);
     assert!(root
-        .with_member_precreation(Role::MemberB, &mut lock, |_| panic!(
+        .with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| panic!(
             "duplicate must not create"
         ))
         .is_err());
@@ -1273,9 +1273,9 @@ fn same_assembly_member_recreation_uses_acknowledged_original_restored_key() {
 fn member_restore_lost_ack_or_unwind_retains_keys_and_forbids_recreation() {
     for fault in [Fault::MemberRestoreLost, Fault::MemberRestorePanic] {
         let (mut root, state, mut lock, drops) = attached(Fault::None);
-        root.prepare_carrier(&mut lock).unwrap();
+        root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
         root.assets.take();
-        root.with_member_precreation(Role::MemberB, &mut lock, |_| Ok(()))
+        root.with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| Ok(()))
             .unwrap();
         state.borrow_mut().fault = fault;
         let writes = state.borrow().writes;
@@ -1285,7 +1285,9 @@ fn member_restore_lost_ack_or_unwind_retains_keys_and_forbids_recreation() {
         assert!(result.is_err() || result.unwrap().is_err());
         assert_eq!(state.borrow().writes, writes);
         assert!(root
-            .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("lost ACK"))
+            .with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| panic!(
+                "lost ACK"
+            ))
             .is_err());
         drop(root);
         assert_eq!(state.borrow().key_drops.get(), 0);
@@ -1330,7 +1332,7 @@ fn terminal_owner_borrow_keeps_same_keys_and_never_rearms_preparation() {
             (creates, writes)
         );
         assert!(root
-            .with_member_precreation(Role::MemberA, &mut lock, |_| panic!(
+            .with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| panic!(
                 "rearmed member effect"
             ))
             .is_err());
@@ -1342,7 +1344,9 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     // Break: prepare a replacement owner, predict generation, or replace ACK.
     let (mut rejected, state, mut rejected_lock, drops) = attached(Fault::None);
     state.borrow_mut().nic_after_create = true;
-    assert!(rejected.prepare_carrier(&mut rejected_lock).is_err());
+    assert!(rejected
+        .prepare_carrier_in(&mut rejected_lock, |call| call())
+        .is_err());
     let record = state.borrow().record.clone().unwrap();
     assert_eq!(record.keys[0].phase, KeyPhase::Captured);
     assert!(
@@ -1351,7 +1355,7 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     );
     assert_eq!((state.borrow().creates, state.borrow().writes), (1, 0));
     assert!(rejected
-        .with_precreation(&mut rejected_lock, |_, _, _| panic!(
+        .with_precreation_in(&mut rejected_lock, &mut |call| call(), |_, _, _| panic!(
             "NIC conflict allowed create"
         ))
         .is_err());
@@ -1360,13 +1364,15 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     assert_eq!(state.borrow().key_drops.get(), 0);
     let (mut rejected, state, mut rejected_lock, drops) = attached(Fault::None);
     state.borrow_mut().nic_after_write = true;
-    assert!(rejected.prepare_carrier(&mut rejected_lock).is_err());
+    assert!(rejected
+        .prepare_carrier_in(&mut rejected_lock, |call| call())
+        .is_err());
     let record = state.borrow().record.clone().unwrap();
     assert_eq!(record.keys[0].phase, KeyPhase::DisablePending);
     assert!(record.keys[0].new_key_ack);
     assert_eq!((state.borrow().creates, state.borrow().writes), (1, 1));
     assert!(rejected
-        .with_precreation(&mut rejected_lock, |_, _, _| panic!(
+        .with_precreation_in(&mut rejected_lock, &mut |call| call(), |_, _, _| panic!(
             "NIC conflict after value mutation allowed create"
         ))
         .is_err());
@@ -1374,7 +1380,7 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
     assert_eq!(drops.get(), 0);
     assert_eq!(state.borrow().key_drops.get(), 0);
     let (mut root, s, mut lock, drops) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     assert_eq!((s.borrow().creates, s.borrow().writes), (1, 1));
     assert_eq!(root.disabled.as_ref().unwrap().generation, 5);
     let mut calls = 0;
@@ -1405,10 +1411,13 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
         calls, 1,
         "precreation check is separate from C construction steps"
     );
-    assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Retired));
+    assert_eq!(
+        root.prepare_carrier_in(&mut lock, |call| call()),
+        Err(Error::Retired)
+    );
     assert_eq!(root.attach_keys(&mut lock), Err(Error::Retired));
     assert_eq!(
-        root.with_precreation(&mut lock, |_, _, _| panic!("repeat")),
+        root.with_precreation_in(&mut lock, &mut |call| call(), |_, _, _| panic!("repeat")),
         Err(Error::Retired)
     );
 }
@@ -1416,7 +1425,7 @@ fn actual_attachment_and_preparation_keep_same_owner_and_current_generation() {
 #[test]
 fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_per_role() {
     let (mut root, s, mut lock, drops) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     let original_assets = root.assets.take().unwrap();
     assert!(Rc::ptr_eq(&original_assets.0, &drops));
     for (role, index) in [(Role::MemberA, 1), (Role::MemberB, 2)] {
@@ -1455,14 +1464,21 @@ fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_pe
         .unwrap();
         assert_eq!(calls.get(), 10);
         assert_eq!(
-            root.with_member_precreation(role, &mut lock, |_| panic!("repeat")),
+            root.with_member_precreation_in(role, &mut lock, &mut |call| call(), |_| panic!(
+                "repeat"
+            )),
             Err(Error::Retired)
         );
     }
     assert_eq!((s.borrow().creates, s.borrow().writes), (3, 3));
     assert!(root.assets.is_none());
     assert_eq!(
-        root.with_member_precreation(Role::RoleCarrier, &mut lock, |_| panic!("not member")),
+        root.with_member_precreation_in(
+            Role::RoleCarrier,
+            &mut lock,
+            &mut |call| call(),
+            |_| panic!("not member")
+        ),
         Err(Error::Retired)
     );
 }
@@ -1471,17 +1487,26 @@ fn member_prerequisite_uses_original_owner_after_carrier_assets_transfer_once_pe
 fn member_prerequisite_before_c_preparation_and_after_wrong_lock_fail_without_effects() {
     let (mut root, s, mut lock, _) = attached(Fault::None);
     assert!(root
-        .with_member_precreation(Role::MemberA, &mut lock, |_| panic!("not ready"))
+        .with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| panic!(
+            "not ready"
+        ))
         .is_err());
     assert_eq!(s.borrow().creates, 0);
     let (mut root, s, mut lock, _) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     assert!(root
-        .with_member_precreation(Role::MemberA, &mut Rc::new(()), |_| panic!("wrong lock"))
+        .with_member_precreation_in(
+            Role::MemberA,
+            &mut Rc::new(()),
+            &mut |call| call(),
+            |_| panic!("wrong lock")
+        )
         .is_err());
     assert_eq!(s.borrow().creates, 1);
     assert!(root
-        .with_member_precreation(Role::MemberA, &mut lock, |_| panic!("replay"))
+        .with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| panic!(
+            "replay"
+        ))
         .is_err());
 }
 
@@ -1491,7 +1516,7 @@ fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_origi
     for failed_step in 1..=10 {
         for unwind in [false, true] {
             let (mut root, s, mut lock, drops) = attached(Fault::None);
-            root.prepare_carrier(&mut lock).unwrap();
+            root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
             let calls = std::cell::Cell::new(0);
             let callback = std::cell::Cell::new(false);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1520,7 +1545,12 @@ fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_origi
             assert_eq!(callback.get(), failed_step == 10);
             assert_eq!(s.borrow().creates, if failed_step >= 4 { 2 } else { 1 });
             assert!(root
-                .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("sibling effect"))
+                .with_member_precreation_in(
+                    Role::MemberB,
+                    &mut lock,
+                    &mut |call| call(),
+                    |_| panic!("sibling effect")
+                )
                 .is_err());
             drop(root);
             assert_eq!(drops.get(), 0);
@@ -1533,9 +1563,9 @@ fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_origi
     }
     for unwind in [false, true] {
         let (mut root, s, mut lock, drops) = attached(Fault::None);
-        root.prepare_carrier(&mut lock).unwrap();
+        root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            root.with_member_precreation(Role::MemberA, &mut lock, |_| {
+            root.with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| {
                 if unwind {
                     panic!("member callback after effect");
                 }
@@ -1544,7 +1574,9 @@ fn member_callback_error_or_unwind_retires_sibling_precreation_and_retains_origi
         }));
         assert!(result.is_err() || result.unwrap().is_err());
         assert!(root
-            .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("sibling effect"))
+            .with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| panic!(
+                "sibling effect"
+            ))
             .is_err());
         assert_eq!(s.borrow().creates, 2);
         drop(root);
@@ -1558,9 +1590,9 @@ fn retained_owner_enters_closing_before_native_cleanup_without_restoring_live_ke
     // Break: rebuild the native owner from JSON, use cached C generation, or
     // restore keys before the actual member/C cleanup ACKs have been verified.
     let (mut root, s, mut lock, _) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     root.assets.take();
-    root.with_member_precreation(Role::MemberA, &mut lock, |_| Ok(()))
+    root.with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| Ok(()))
         .unwrap();
     root.owner
         .as_mut()
@@ -1582,13 +1614,15 @@ fn retained_owner_enters_closing_before_native_cleanup_without_restoring_live_ke
     assert_eq!(record.keys[1].phase, KeyPhase::Disabled);
     assert_eq!((s.borrow().creates, s.borrow().writes), (2, 2));
     assert!(root
-        .with_member_precreation(Role::MemberB, &mut lock, |_| panic!("closing"))
+        .with_member_precreation_in(Role::MemberB, &mut lock, &mut |call| call(), |_| panic!(
+            "closing"
+        ))
         .is_err());
     root.begin_cleanup(&mut lock).unwrap();
     assert_eq!(s.borrow().record.as_ref().unwrap().generation, 10);
     for fault in 0..3 {
         let (mut root, state, mut lock, _) = attached(Fault::None);
-        root.prepare_carrier(&mut lock).unwrap();
+        root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
         root.assets.take();
         let acknowledged = state.borrow().record.clone().unwrap();
         let mut foreign_lock = Rc::new(());
@@ -1629,7 +1663,7 @@ fn terminal_key_owner_borrow_retains_original_keys_on_error_and_unwind() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
     for unwind in [false, true] {
         let (mut root, state, mut lock, _) = attached(Fault::None);
-        root.prepare_carrier(&mut lock).unwrap();
+        root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
         let mut retained = TerminalResources::new(None);
         root.drain_terminal_into(retained.retained_mut(), |_| Ok(()))
             .unwrap();
@@ -1667,7 +1701,7 @@ fn terminal_key_owner_borrow_retains_original_keys_on_error_and_unwind() {
 #[test]
 fn terminal_key_owner_accessor_requires_actual_cut_origin() {
     let (mut root, _, mut lock, _) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     let mut retained = TerminalResources::new(None);
     root.drain_terminal_into(retained.retained_mut(), |_| Ok(()))
         .unwrap();
@@ -1953,7 +1987,7 @@ fn live_member_key_restore_requires_original_closed_target_and_completed_retire_
 fn root_drop_retains_all_unknown_resources() {
     // Break: implicit Drop of the original key, bootstrap or remaining assets.
     let (mut root, s, mut lock, drops) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     drop(root);
     assert_eq!(drops.get(), 0);
     assert_eq!(s.borrow().key_drops.get(), 0);
@@ -2036,7 +2070,7 @@ fn internal_capture_or_disable_err_and_unwind_keep_exact_key_and_assets() {
     ] {
         let (mut root, s, mut lock, drops) = attached(fault);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            root.prepare_carrier(&mut lock)
+            root.prepare_carrier_in(&mut lock, |call| call())
         }));
         assert!(result.is_err() || result.unwrap().is_err());
         assert!(root.owner.is_some());
@@ -2044,9 +2078,14 @@ fn internal_capture_or_disable_err_and_unwind_keep_exact_key_and_assets() {
         assert_eq!(s.borrow().creates, 1);
         assert_eq!(s.borrow().key_drops.get(), 0);
         s.borrow_mut().fault = Fault::None;
-        assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Retired));
+        assert_eq!(
+            root.prepare_carrier_in(&mut lock, |call| call()),
+            Err(Error::Retired)
+        );
         assert!(root
-            .with_precreation(&mut lock, |_, _, _| panic!("failed preparation"))
+            .with_precreation_in(&mut lock, &mut |call| call(), |_, _, _| panic!(
+                "failed preparation"
+            ))
             .is_err());
         drop(root);
         assert_eq!(drops.get(), 0);
@@ -2058,21 +2097,25 @@ fn internal_capture_or_disable_err_and_unwind_keep_exact_key_and_assets() {
 fn callback_internal_err_or_unwind_retains_originals_and_fences_precreation() {
     for unwind in [false, true] {
         let (mut root, s, mut lock, drops) = attached(Fault::None);
-        root.prepare_carrier(&mut lock).unwrap();
+        root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            root.with_precreation(&mut lock, |assets, receipt, generation| {
-                assert_eq!(generation, 5);
-                assert_eq!(receipt.record.generation, 5);
-                assert!(Rc::ptr_eq(&assets.as_ref().unwrap().0, &drops));
-                if unwind {
-                    panic!("main construction boundary");
-                }
-                Err(Error::Native)
-            })
+            root.with_precreation_in(
+                &mut lock,
+                &mut |call| call(),
+                |assets, receipt, generation| {
+                    assert_eq!(generation, 5);
+                    assert_eq!(receipt.record.generation, 5);
+                    assert!(Rc::ptr_eq(&assets.as_ref().unwrap().0, &drops));
+                    if unwind {
+                        panic!("main construction boundary");
+                    }
+                    Err(Error::Native)
+                },
+            )
         }));
         assert!(result.is_err() || result.unwrap() == Err(Error::Native));
         assert_eq!(
-            root.with_precreation(&mut lock, |_, _, _| panic!("retry")),
+            root.with_precreation_in(&mut lock, &mut |call| call(), |_, _, _| panic!("retry")),
             Err(Error::Retired)
         );
         assert_eq!(s.borrow().key_drops.get(), 0);
@@ -2086,14 +2129,14 @@ fn actual_current_receipt_after_member_preparation_overrides_cached_carrier_gene
     // Break: constructing Scope from cached C preparation rather than its
     // actual CURRENT borrowed receipt after a legitimate later key revision.
     let (mut root, s, mut lock, _) = attached(Fault::None);
-    root.prepare_carrier(&mut lock).unwrap();
+    root.prepare_carrier_in(&mut lock, |call| call()).unwrap();
     root.owner
         .as_mut()
         .unwrap()
         .prepare_role(Role::MemberA, &mut lock)
         .unwrap();
     assert_eq!(root.disabled.as_ref().unwrap().generation, 5);
-    root.with_precreation(&mut lock, |_, receipt, generation| {
+    root.with_precreation_in(&mut lock, &mut |call| call(), |_, receipt, generation| {
         assert_eq!(generation, 9);
         assert_eq!(receipt.record.generation, 9);
         keys::reattest_disabled_original_key(
@@ -2130,11 +2173,17 @@ fn attachment_internal_err_or_unwind_keeps_both_original_slots_and_assets() {
 #[test]
 fn preparation_attempt_before_attachment_cannot_be_rearmed_by_later_attachment() {
     let (mut root, s, mut lock, drops) = setup(Fault::None);
-    assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Pending));
+    assert_eq!(
+        root.prepare_carrier_in(&mut lock, |call| call()),
+        Err(Error::Pending)
+    );
     root.initialize().unwrap();
     retain_io(&mut root, &s, &drops);
     root.attach_keys(&mut lock).unwrap();
-    assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Retired));
+    assert_eq!(
+        root.prepare_carrier_in(&mut lock, |call| call()),
+        Err(Error::Retired)
+    );
     assert_eq!(s.borrow().creates, 0);
 }
 
@@ -2159,15 +2208,20 @@ fn occupied_owner_is_never_overwritten_and_attachment_cannot_retry() {
 fn internal_create_retention(fault: Fault) {
     let (mut root, s, mut lock, drops) = attached(fault);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        root.prepare_carrier(&mut lock)
+        root.prepare_carrier_in(&mut lock, |call| call())
     }));
     assert!(result.is_err() || result.unwrap().is_err());
     assert!(root.owner.is_some());
     assert!(root.assets.is_some());
     assert_eq!(s.borrow().creates, 1);
-    assert_eq!(root.prepare_carrier(&mut lock), Err(Error::Retired));
+    assert_eq!(
+        root.prepare_carrier_in(&mut lock, |call| call()),
+        Err(Error::Retired)
+    );
     assert!(root
-        .with_precreation(&mut lock, |_, _, _| panic!("unacknowledged create"))
+        .with_precreation_in(&mut lock, &mut |call| call(), |_, _, _| panic!(
+            "unacknowledged create"
+        ))
         .is_err());
     drop(root);
     assert_eq!(drops.get(), 0);
