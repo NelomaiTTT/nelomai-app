@@ -5,6 +5,71 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RedundantStopAcknowledgementTest {
+    @Test fun currentUserStopRetainsLastPrimaryButTargetedCancellationDoesNot() {
+        for (action in listOf(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT,
+            NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT, null)) {
+            var bytes: ByteArray? = null
+            val store = AndroidRecoveryStore(object : EncryptedRecordBackend {
+                override fun read() = bytes?.copyOf()
+                override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+            }, BootIdentityProvider { 7L })
+            val active = transaction.copy(warmStopSupported = true, localActiveLeaseId = "lease-b")
+            assertTrue(store.beginRedundant(active) is RecoveryStoreResult.Success)
+            val cancelled = (store.cancelCurrentIntent() as RecoveryStoreResult.Success)
+                .value.redundantTransaction!!
+            routeCancelledRedundantIntentStop(action, cancelled) { operationId, retain ->
+                assertTrue(store.cancelRedundantIntentAndDeferStop("user-stop", operationId,
+                    retainActivePeer = retain) is RecoveryStoreResult.Success)
+            }
+            val stopped = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertEquals(action == NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT,
+                stopped.retainActivePeerOnStop)
+            assertEquals("lease-b", stopped.localActiveLeaseId)
+            assertEquals("user-stop", stopped.stopOperationId)
+            assertFalse(stopped.desiredActive)
+            // A later UI Stop cannot upgrade a cold cancellation to WARM.
+            routeCancelledRedundantIntentStop(
+                NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT, stopped,
+            ) { operationId, retain ->
+                assertTrue(store.cancelRedundantIntentAndDeferStop("retry-stop", operationId,
+                    retainActivePeer = retain) is RecoveryStoreResult.Success)
+            }
+            val retry = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertEquals(stopped.retainActivePeerOnStop, retry.retainActivePeerOnStop)
+            assertEquals("user-stop", retry.stopOperationId)
+        }
+    }
+
+    @Test fun currentUserStopCannotRetainUnsupportedOrUnsettledPrimary() {
+        for (supported in listOf(false, true)) {
+            var bytes: ByteArray? = null
+            val store = AndroidRecoveryStore(object : EncryptedRecordBackend {
+                override fun read() = bytes?.copyOf()
+                override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+            }, BootIdentityProvider { 7L })
+            val active = transaction.copy(warmStopSupported = supported,
+                retry = if (supported) AndroidRedundantRetryState(
+                    pendingNativeSourceLeaseId = "lease-a",
+                    pendingNativeActiveLeaseId = "lease-b",
+                    pendingNativeActiveSlot = RedundantSlot.B,
+                    pendingNativeMembershipGeneration = 0,
+                    pendingNativeSwitchReason = "primary_unhealthy",
+                ) else AndroidRedundantRetryState())
+            assertTrue(store.beginRedundant(active) is RecoveryStoreResult.Success)
+            val cancelled = (store.cancelCurrentIntent() as RecoveryStoreResult.Success)
+                .value.redundantTransaction!!
+            routeCancelledRedundantIntentStop(
+                NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT, cancelled,
+            ) { operationId, retain ->
+                assertTrue(store.cancelRedundantIntentAndDeferStop("user-stop", operationId,
+                    retainActivePeer = retain) is RecoveryStoreResult.Success)
+            }
+            val stopped = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertFalse(stopped.retainActivePeerOnStop)
+            assertNull(stopped.retry.pendingNativeActiveLeaseId)
+        }
+    }
+
     @Test fun retentionDecisionAndLastPrimaryAreFrozenAcrossStopRetries() {
         for (supported in listOf(false, true)) {
             var bytes: ByteArray? = null

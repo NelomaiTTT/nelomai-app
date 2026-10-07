@@ -4,9 +4,10 @@ use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::{AuthDevice, BackgroundTokenResponse, TokenResponse};
 use nelomai_client_core::{
     classify_recovery, stall_recovery_plan, ConnectOptions, ConnectionIntentCoordinator, CoreApi,
-    CoreApiError, CoreError, CoreLogEvent, CoreLogger, Phase, RecoveryDecision,
-    RecoveryPolicyContext, RecoveryTransport, RetryPolicy, RetrySchedule, StallRecoveryPlan,
-    StallTrigger, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome, StartDisposition,
+    CoreApiError, CoreError, CoreLogEvent, CoreLogger, NativeConnectionIntent, Phase,
+    RecoveryDecision, RecoveryPolicyContext, RecoveryTransport, RetryPolicy, RetrySchedule,
+    StallRecoveryPlan, StallTrigger, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    StartDisposition,
 };
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
@@ -576,6 +577,7 @@ struct MockApi {
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
     bootstrap_binding_without_connection: AtomicBool,
+    bootstrap_reply: Mutex<Option<Bootstrap>>,
     pin_calls: AtomicUsize,
     hold_pin: AtomicBool,
     pin_entered: Notify,
@@ -630,6 +632,7 @@ impl MockApi {
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
             bootstrap_binding_without_connection: AtomicBool::new(false),
+            bootstrap_reply: Mutex::new(None),
             pin_calls: AtomicUsize::new(0),
             hold_pin: AtomicBool::new(false),
             pin_entered: Notify::new(),
@@ -682,7 +685,12 @@ impl CoreApi for MockApi {
                 egress_mode: EgressMode::Ipv4,
             });
         }
-        Ok(response)
+        Ok(self
+            .bootstrap_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(response))
     }
 
     async fn background_token(
@@ -4442,6 +4450,397 @@ async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operati
 
     assert_eq!(started.phase, Phase::Connected);
     assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_ready_without_connection_adopts_native_running_without_network() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    api.hold_bootstrap.store(true, Ordering::SeqCst);
+    api.hold_restore.store(true, Ordering::SeqCst);
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+
+    let state = tokio::time::timeout(
+        Duration::from_millis(100),
+        core.reconcile_external_tunnel_state(),
+    )
+    .await
+    .expect("local snapshot must not await panel");
+    assert_eq!(state.phase, Phase::Connected);
+    assert_eq!(state.connection, None);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_connected_poll_cannot_publish_running_after_logout() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    let poll = {
+        let core = core.clone();
+        tokio::spawn(async move { core.state().await })
+    };
+    tunnel.status_entered.notified().await;
+    core.sign_out().await.unwrap();
+    tunnel.status_release.notify_one();
+    assert_eq!(poll.await.unwrap().phase, Phase::SignedOut);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_expected_stop_clears_only_the_owned_runtime_warning() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    let policy_warning = core.split_tunnel_warning().await;
+    assert_eq!(
+        policy_warning.as_deref(),
+        Some("split_tunnel_policy_unavailable")
+    );
+    core.signal_start_cancellation();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    // Another reader may see physical Stop before the native intent arrives.
+    core.state().await;
+    assert_eq!(
+        core.split_tunnel_warning().await.as_deref(),
+        Some("tunnel_runtime_stopped")
+    );
+    let observation = core.begin_foreground_observation().await;
+    let stopped = core
+        .foreground_state(
+            observation,
+            Some(NativeConnectionIntent {
+                generation: 2,
+                desired_active: false,
+            }),
+        )
+        .await;
+    assert_eq!(stopped.phase, Phase::Ready);
+    assert_eq!(core.split_tunnel_warning().await, policy_warning);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_unexpected_stop_and_failure_keep_runtime_warning() {
+    for (status, intent) in [
+        (TunnelStatus::Stopped, Some(true)),
+        (TunnelStatus::Stopped, None),
+        (TunnelStatus::Failed, Some(false)),
+    ] {
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            Arc::new(MockApi::new(0)),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.start(options(), 1_700_000_000).await.unwrap();
+        *tunnel.status.lock().unwrap() = status;
+        let observation = core.begin_foreground_observation().await;
+        let state = core
+            .foreground_state(
+                observation,
+                intent.map(|desired_active| NativeConnectionIntent {
+                    generation: 1,
+                    desired_active,
+                }),
+            )
+            .await;
+        assert_ne!(state.phase, Phase::Connected);
+        assert_eq!(
+            core.split_tunnel_warning().await.as_deref(),
+            Some("tunnel_runtime_stopped")
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_snapshot_finishes_while_configuration_restore_is_stalled() {
+    let api = Arc::new(MockApi::new(0));
+    *api.bootstrap_connection.lock().unwrap() = Some(connection("native-lease"));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    api.hold_restore.store(true, Ordering::SeqCst);
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let observation = core.begin_foreground_observation().await;
+    let state = tokio::time::timeout(
+        Duration::from_millis(100),
+        core.foreground_state(
+            observation,
+            Some(NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            }),
+        ),
+    )
+    .await
+    .expect("foreground state must not restore configuration over the network");
+    assert_eq!(state.phase, Phase::Connected);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_rejects_reordered_intent_and_old_generation() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    let old = core.begin_foreground_observation().await;
+    let new = core.begin_foreground_observation().await;
+    core.foreground_state(
+        new,
+        Some(NativeConnectionIntent {
+            generation: 3,
+            desired_active: false,
+        }),
+    )
+    .await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    assert_eq!(
+        core.foreground_state(
+            old,
+            Some(NativeConnectionIntent {
+                generation: 2,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        Phase::Ready
+    );
+    let late = core.begin_foreground_observation().await;
+    assert_eq!(
+        core.foreground_state(
+            late,
+            Some(NativeConnectionIntent {
+                generation: 2,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        Phase::Ready
+    );
+    let current = core.begin_foreground_observation().await;
+    assert_eq!(
+        core.foreground_state(
+            current,
+            Some(NativeConnectionIntent {
+                generation: 4,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        Phase::Connected
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_cancel_epoch_rejects_a_late_native_stop() {
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    let warning = core.split_tunnel_warning().await;
+    let observation = core.begin_foreground_observation().await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    let poll = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.foreground_state(
+                observation,
+                Some(NativeConnectionIntent {
+                    generation: 1,
+                    desired_active: true,
+                }),
+            )
+            .await
+        })
+    };
+    tunnel.status_entered.notified().await;
+    core.signal_start_cancellation();
+    tunnel.status_release.notify_one();
+    assert_eq!(poll.await.unwrap().phase, Phase::Connected);
+    assert_eq!(core.split_tunnel_warning().await, warning);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_new_running_observation_fences_an_older_plain_state_poll() {
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    let warning = core.split_tunnel_warning().await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    let old = {
+        let core = core.clone();
+        tokio::spawn(async move { core.state().await })
+    };
+    tunnel.status_entered.notified().await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let new = core.begin_foreground_observation().await;
+    core.foreground_state(
+        new,
+        Some(NativeConnectionIntent {
+            generation: 2,
+            desired_active: true,
+        }),
+    )
+    .await;
+    tunnel.status_release.notify_one();
+    assert_eq!(old.await.unwrap().phase, Phase::Connected);
+    assert_eq!(core.split_tunnel_warning().await, warning);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_native_running_preserves_admission_update_and_signed_out_states() {
+    for (access, can_connect, required_update, expected) in [
+        (AccessState::Active, false, false, Phase::AccessExpired),
+        (AccessState::Expired, false, false, Phase::AccessExpired),
+        (AccessState::Active, true, true, Phase::UpdateRequired),
+        (AccessState::Active, true, false, Phase::NeedsPeerBinding),
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        let mut response = bootstrap();
+        response.access.state = access;
+        response.access.can_connect = can_connect;
+        response.update.required = required_update;
+        *api.bootstrap_reply.lock().unwrap() = Some(response);
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        let observation = core.begin_foreground_observation().await;
+        assert_eq!(
+            core.foreground_state(
+                observation,
+                Some(NativeConnectionIntent {
+                    generation: 1,
+                    desired_active: true,
+                })
+            )
+            .await
+            .phase,
+            expected
+        );
+        assert_eq!(core.reconcile_external_tunnel_state().await.phase, expected);
+        core.sign_out().await.unwrap();
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        let observation = core.begin_foreground_observation().await;
+        assert_eq!(
+            core.foreground_state(
+                observation,
+                Some(NativeConnectionIntent {
+                    generation: 2,
+                    desired_active: true,
+                })
+            )
+            .await
+            .phase,
+            Phase::SignedOut
+        );
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_intent_alone_never_implies_running_and_new_start_fences_old_read() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    let observation = core.begin_foreground_observation().await;
+    assert_eq!(
+        core.foreground_state(
+            observation,
+            Some(NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        Phase::Ready
+    );
+    let old = core.begin_foreground_observation().await;
+    core.begin_start_attempt();
+    core.finish_start_attempt();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    assert_eq!(
+        core.foreground_state(
+            old,
+            Some(NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        Phase::Ready
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

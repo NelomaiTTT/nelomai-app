@@ -17,6 +17,7 @@
 - Новый продукт0.3.3, не0.3.3d и не замена выпущенного0.3.2. Сохранить trusted stable0.2.20 и его проверяемое происхождение.
 - Включить NLM013/040(Android delta)/044/048/049/062/063/064. NLM045/065 — отдельная оценка, в обязательный состав этого плана не включены.
 - Не переносить wholesale `b2eb2bc`, `a556d3a`, `6b8aa90`, `6f9d112` или ветку0.4.0. Не менять чужие recovery/vendor, production, Windows/Mac установки на этапе разработки.
+- Сохранить CI push-trigger ветки `Future/windows-hot-standby-0.4.0`: пользователь сообщил отдельную правку `af4929d189ca881adc9908174ebeb6f819dfac19` (только branches в checks.yml). При версии/интеграцииmain перенести эту строку без кода0.4.0; workflow_dispatch остаётся Linux-only, не считать его полным CI.
 - Не сбрасывать auth/journals/data, не ослаблять ownership/admission/IPC/WFP guards, не читать и не печатать секреты.
 - Для каждого переноса: исходный SHA, новый SHA, NLM-ID, точная regression и её RED/GREEN. Исторические тесты не заменяют свежую проверку0.3.3.
 - Release workflow допускает только `mode=sign_candidate`, exact source_sha, `version=0.3.3`, `critical=false`, `minimum_supported=false`, `panel_notification_ready=false` до завершения аппаратной приёмки. Публичная публикация — отдельное действие.
@@ -56,11 +57,11 @@
 **Files:** `NelomaiVpnService.kt`, `RedundantStopAcknowledgementTest.kt`; `crates/client-core/src/lib.rs`, `crates/client-application/src/lib.rs`, их тесты; `src-tauri/src/commands.rs`; `src/lib/{connection-action,foreground-state}.test.ts`, `src/lib/connection-action.ts`, `src/routes/+page.svelte`.
 **Interfaces:** явный current-user Stop сохраняет WARM; targeted cancel/failedStart остаютсяcold. Foreground snapshot ограждён наблюдаемыми epoch/generation/order; никаких новых desktop pair интерфейсов. Источникb2eb2bc, UI follow-up a556d3a только если применим к перенесённой foreground логике.
 
-- [ ] Добавить RED для user button Stop→retainActivePeer=true, targetedcancel→false и повторного Stop с неизменным первым решением.
-- [ ] Добавить RED для nativeStopped после user intent: не выдавать tunnel_runtime_stopped как системный сбой; genuineunexpectedstop должен сохранять предупреждение.
-- [ ] Перенести связанный Core/application/commands/UI срез без новых desktop factory/capability/contract веток. Не блокировать native foreground чтение сетевым bootstrap.
-- [ ] Покрыть late replies после новогоStart/logout, offline bootstrap, настоящую nativefailure, single-flight, foreground wake; periodic observation не должна мигать/блокировать Start, Stop доступен.
-- [ ] Запустить `cargo test -p nelomai-client-core -p nelomai-client-application -p nelomai-app`, Android Stop tests, `npm test`; review/commit сNLM040/049 иsourceSHA.
+- [x] RED user button Stop→retainActivePeer=true подтверждён; targetedcancel→false, capability/pending-role guards и неизменность первого cold-решения покрыты.
+- [x] RED UI voluntaryStop, поздний Connected после logout и nativeRunning при CoreReady подтверждены; genuineunexpectedstop сохраняет предупреждение.
+- [x] Core/application/commands/UI перенесены без desktop pair API; foreground не ждёт network bootstrap. Stable desktop three-field intent projection сохранена.
+- [x] Late Start/Stop/logout, admission, offline bootstrap, nativefailure, single-flight, foreground wake покрыты. Дополнительный RED periodic polling подтвердил применимость UI-only a556d3a: passive poll не блокирует Start, foreground barrier не блокирует Stop.
+- [x] Rust533PASS/15suites; Android976PASS; npm143PASS/check/build; host strictClippy трёх пакетов/alltargets и actualAndroid Rust check PASS (existing warnings +3 unused Android helpers, не strictAndroidClippy). Inline review без открытых замечаний; аппаратная проверка впереди.
 
 ## Task 4: NLM-062/064: обычный Stop и смена протокола
 

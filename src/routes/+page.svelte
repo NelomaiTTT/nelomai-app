@@ -22,6 +22,8 @@
     initialConnectionActionState,
     isCurrentConnectionAction,
     prepareConnectionStartForPlatform,
+    beginRuntimeStateSync,
+    initialRuntimeStateSync,
   } from "$lib/connection-action";
   import {
     historyStateForOverlay,
@@ -137,7 +139,7 @@
   let startupPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
-  let runtimeStateBusy = false;
+  let runtimeStateSync = $state(initialRuntimeStateSync());
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
   let splitTunnelOpen = $state(false);
@@ -274,7 +276,7 @@
       else connectionIntentNotificationUnlisten = unlisten;
     });
     stateTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void synchronizeRuntimeState();
+      if (document.visibilityState === "visible") void synchronizeRuntimeState(false);
     }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
@@ -479,20 +481,24 @@
     }
   }
 
-  async function synchronizeRuntimeState() {
+  async function synchronizeRuntimeState(foreground = true) {
     if (
       busy ||
-      runtimeStateBusy ||
       !bootstrap?.binding ||
       !["ready", "connecting", "connected", "stopping"].includes(phase)
     ) {
       return;
     }
-    runtimeStateBusy = true;
+    const sync = beginRuntimeStateSync(runtimeStateSync, foreground);
+    runtimeStateSync = sync.state;
+    if (!sync.started) return;
     try {
       const previous = phase;
+      const observedBootstrap = bootstrap;
+      const actionEpoch = connectionActionState.epoch;
       const current = await nativeClient.state().catch(() => null);
-      if (!current) return;
+      if (!current || busy || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
@@ -519,6 +525,7 @@
       }
       if (
         (previous === "connected" || previous === "connecting") &&
+        current.warning === "tunnel_runtime_stopped" &&
         current.connectionIntentStatus === "none" &&
         current.phase !== "connected" &&
         current.phase !== "connecting" &&
@@ -528,7 +535,7 @@
         await loadSplitTunnel(false);
       }
     } finally {
-      runtimeStateBusy = false;
+      runtimeStateSync = initialRuntimeStateSync();
     }
   }
 
@@ -703,7 +710,7 @@
     }
     const stopping =
       forceStop || connectionAction === "stop" || connectionActionState.startBusy;
-    if (!canBeginConnectionAction(connectionActionState, busy, stopping)) return;
+    if (!canBeginConnectionAction(connectionActionState, busy, stopping, runtimeStateSync.blocking)) return;
     const startDeviceId = bootstrap?.device.id;
     const startPlatform = bootstrap?.device.platform;
     if (!stopping && !startDeviceId) return;
@@ -760,6 +767,7 @@
       }
       view = "connection";
       const current = await nativeClient.state();
+      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       phase = current.phase;
       runtimeWarning = current.warning;
@@ -778,6 +786,7 @@
         );
       }
       const current = await nativeClient.state().catch(() => null);
+      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
@@ -1533,6 +1542,7 @@
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
+              runtimeStateSync.blocking,
             ) ||
               (connectionAction === "start" &&
                 (!splitTunnelLoaded || splitTunnelBlocksStart)) ||
@@ -1541,6 +1551,7 @@
             <span>
               {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
                 ? "Стоп"
+                : runtimeStateSync.blocking ? "Проверяем состояние"
                 : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}
