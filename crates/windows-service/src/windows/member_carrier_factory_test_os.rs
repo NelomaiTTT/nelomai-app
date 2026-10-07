@@ -134,7 +134,7 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                         }
                 }
                 (NativePublication::Running, member_files::PrivateFile::Session) => {
-                    payload["session"]["phase"] == "Running"
+                    payload["phase"] == "Running"
                 }
                 _ => false,
             };

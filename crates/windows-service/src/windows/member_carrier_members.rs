@@ -1468,7 +1468,20 @@ pub(crate) mod native {
             image: &OriginalImage,
         ) -> Result<()> {
             self.health.observe(
-                || self.closing(),
+                || {
+                    let inventory = self.inventory.try_borrow().map_err(|_| Error::Conflict)?;
+                    inventory.runtime.verify_source(&inventory.carrier)?;
+                    let bytes = inventory
+                        .runtime
+                        .record(&inventory.context, RecordKind::NativeCarrierReceipts)?;
+                    let record = Record::decode(&bytes)?;
+                    if record.context != inventory.context {
+                        return Err(Error::Conflict);
+                    }
+                    // Classification only; the action still authenticates the
+                    // original terminal revision before accepting Stopped.
+                    Ok(matches!(record.phase, Phase::Closing | Phase::Stopped))
+                },
                 |_| {
                     self.inventory
                         .try_borrow()
@@ -1905,7 +1918,24 @@ pub(crate) mod native {
             // callback or native effect. The final revision independently
             // authenticates and rereads the current full native receipt.
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
-            self.revision()?;
+            self.runtime.verify_source(&self.carrier)?;
+            let bytes = self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?;
+            let native = Record::decode(&bytes)?;
+            if native.context != self.context {
+                return Err(Error::Conflict);
+            }
+            if native.phase == Phase::Stopped {
+                // Origin-only factual lane. Callers retain their independent
+                // Pair/Calling, full terminal SDK/history and effect gates.
+                super::super::member_carrier_runtime::validate_terminal_stage(
+                    &native,
+                    &self.context,
+                    &self.context.bindings[0],
+                    1,
+                )?;
+            }
             Ok(())
         }
 

@@ -1064,6 +1064,10 @@ fn pregraph_key_restore_read_uses_actual_stage11_not_projected_full_empty() {
 // Terminal-only selection rejects the pre-effect Disabled original keys.
 #[test]
 fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
+    #[cfg(not(windows))]
+    use crate::member_carrier_pair_store as store;
+    #[cfg(windows)]
+    use crate::windows::member_carrier_pair_store as store;
     use crate::{member_carrier_native_ownership as n, member_carrier_pair as p};
     let (context, mut record, _) = full_cleanup_fixture();
     record.stop_stage = 11;
@@ -1084,7 +1088,39 @@ fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
             pending: None,
         }),
     };
+    let envelope = store::encode_carrier_payload(&record).unwrap();
+    assert!(p::Record::decode(&envelope).is_err());
+    let actual = store::carrier_payload(&record.scope, &envelope)
+        .unwrap()
+        .unwrap();
+    assert!(actual == record);
+    for fault in 0..4 {
+        let mut wrong: serde_json::Value = serde_json::from_slice(&envelope).unwrap();
+        match fault {
+            0 => wrong["version"] = 2.into(),
+            1 => {
+                wrong["scope"]["connection_generation"] =
+                    (record.scope.connection_generation + 1).into()
+            }
+            2 => wrong["payload"]["version"] = 3.into(),
+            _ => wrong["payload"]["unexpected"] = true.into(),
+        }
+        let raw = serde_json::to_vec(&wrong).unwrap();
+        assert!(store::carrier_payload(&record.scope, &raw).is_err());
+    }
+    assert!(!key_restore_read_is_terminal(&context, &actual, &native).unwrap());
+    native.keys[0].phase = n::KeyPhase::RestorePending;
+    native.keys[0].pending = Some(n::Value::Absent);
     assert!(!key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    native.keys[0].phase = n::KeyPhase::Clean;
+    native.keys[0].current = n::Value::Absent;
+    native.keys[0].pending = None;
+    assert!(!key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    for stage in [8, 9, 10, 12] {
+        let mut wrong = record.clone();
+        wrong.stop_stage = stage;
+        assert!(key_restore_read_is_terminal(&context, &wrong, &native).is_err());
+    }
     native.phase = n::Phase::Stopped;
     for key in &mut native.keys {
         key.phase = n::KeyPhase::Clean;
@@ -1104,10 +1140,7 @@ fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
             6 => observed.phase = n::Phase::Preparing,
             7 => observed.keys[1].phase = n::KeyPhase::Captured,
             8 => observed.generation = 0,
-            _ => {
-                observed.phase = n::Phase::Closing;
-                observed.keys[0].phase = n::KeyPhase::Clean;
-            }
+            _ => observed.keys[0].new_key_ack = false,
         }
         assert!(
             key_restore_read_is_terminal(&context, &wrong, &observed).is_err(),

@@ -1820,6 +1820,72 @@ fn pregraph_native_empty_original_revision_keeps_cleanup_keys_until_later_stage(
         RetiredReadStage::Terminal
     )
     .is_err());
+    for phase in [KeyPhase::RestorePending, KeyPhase::Clean] {
+        let mut partial = closing.clone();
+        partial.keys[0].phase = phase;
+        partial.keys[0].current = if phase == KeyPhase::Clean {
+            Value::Absent
+        } else {
+            Value::DwordZero
+        };
+        partial.keys[0].pending = if phase == KeyPhase::RestorePending {
+            Some(Value::Absent)
+        } else {
+            None
+        };
+        validate_retired_read_stage(
+            &partial,
+            &partial.context,
+            &partial.context.bindings[0],
+            10,
+            RetiredReadStage::KeyRestore,
+        )
+        .unwrap();
+        for stage in [RetiredReadStage::Cleanup, RetiredReadStage::Terminal] {
+            assert!(validate_retired_read_stage(
+                &partial,
+                &partial.context,
+                &partial.context.bindings[0],
+                10,
+                stage
+            )
+            .is_err());
+        }
+        assert!(validate_stage(
+            &partial,
+            &partial.context,
+            &partial.context.bindings[0],
+            10,
+            false,
+            Use::Cleanup
+        )
+        .is_err());
+        for fault in 0..6 {
+            let mut wrong = partial.clone();
+            let mut context = partial.context.clone();
+            let mut binding = partial.context.bindings[0].clone();
+            let mut generation = 10;
+            match fault {
+                0 => wrong.keys[0].new_key_ack = false,
+                1 => context.provenance.network_epoch += 1,
+                2 => binding = context.bindings[1].clone(),
+                3 => generation = 0,
+                4 => generation = wrong.generation + 1,
+                _ => wrong.phase = Phase::Preparing,
+            }
+            assert!(
+                validate_retired_read_stage(
+                    &wrong,
+                    &context,
+                    &binding,
+                    generation,
+                    RetiredReadStage::KeyRestore
+                )
+                .is_err(),
+                "partial {phase:?} fault {fault}"
+            );
+        }
+    }
     let mut restored = closing.clone();
     restored.phase = Phase::Stopped;
     for key in &mut restored.keys {

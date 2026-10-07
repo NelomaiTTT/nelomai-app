@@ -461,8 +461,16 @@ pub(crate) fn key_restore_read_is_terminal(
         return Err(CarrierError::Conflict);
     }
     match native.phase {
-        n::Phase::Closing if native.keys[0].phase == n::KeyPhase::Disabled => Ok(false),
-        n::Phase::Stopped => Ok(true), // validate_record requires ALL keys Clean
+        n::Phase::Closing
+            if native.keys[0].new_key_ack
+                && matches!(
+                    native.keys[0].phase,
+                    n::KeyPhase::Disabled | n::KeyPhase::RestorePending | n::KeyPhase::Clean
+                ) =>
+        {
+            Ok(false)
+        }
+        n::Phase::Stopped if native.keys[0].new_key_ack => Ok(true), // ALL keys Clean
         _ => Err(CarrierError::Conflict),
     }
 }

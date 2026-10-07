@@ -1021,6 +1021,42 @@ fn partial_restore_retains_exact_pending_and_can_finish_after_fresh_attestation(
         recovery.cleanup(&partial, &mut lock).unwrap().phase,
         Phase::Stopped
     );
+
+    let (mut owner, shared, mut lock) = setup();
+    let saved = prepare_all(&mut owner, &mut lock);
+    assert!(owner
+        .cleanup_in(&saved, &mut lock, |call| {
+            call()?;
+            if read_record(&shared.borrow())?.is_some_and(|r| {
+                r.phase == Phase::Closing
+                    && r.keys[0].phase == KeyPhase::Clean
+                    && r.keys[1].phase == KeyPhase::Disabled
+            }) {
+                return Err(Error::Pending);
+            }
+            Ok(())
+        })
+        .is_err());
+    let partial = owner.snapshot().unwrap().unwrap();
+    assert_eq!(partial.phase, Phase::Closing);
+    assert_eq!(partial.keys[0].phase, KeyPhase::Clean);
+    assert_eq!(partial.keys[1].phase, KeyPhase::Disabled);
+    assert!(owner
+        .before_adapter_create(Role::RoleCarrier, &mut lock)
+        .is_err());
+    assert_eq!(
+        owner.cleanup(&partial, &mut lock).unwrap().phase,
+        Phase::Stopped
+    );
+    assert_eq!(
+        shared
+            .borrow()
+            .events
+            .iter()
+            .filter(|e| e.ends_with(":Absent"))
+            .count(),
+        3
+    );
 }
 #[test]
 fn stale_native_proof_scope_binding_generation_and_challenge_fail_closed() {

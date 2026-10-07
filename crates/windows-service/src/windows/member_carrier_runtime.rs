@@ -1332,6 +1332,7 @@ fn validate_stage(
 #[derive(Clone, Copy)]
 enum RetiredReadStage {
     Cleanup,
+    KeyRestore,
     Terminal,
 }
 fn validate_retired_read_stage(
@@ -1344,6 +1345,23 @@ fn validate_retired_read_stage(
     match stage {
         RetiredReadStage::Cleanup => {
             validate_stage(record, context, binding, generation, false, Use::Cleanup)
+        }
+        RetiredReadStage::KeyRestore => {
+            receipts::validate_record(record)?;
+            if record.context != *context
+                || binding != &context.bindings[0]
+                || generation == 0
+                || record.generation < generation
+                || record.phase != Phase::Closing
+                || !record.keys[0].new_key_ack
+                || !matches!(
+                    record.keys[0].phase,
+                    KeyPhase::RestorePending | KeyPhase::Clean
+                )
+            {
+                return Err(CarrierError::Conflict);
+            }
+            Ok(())
         }
         RetiredReadStage::Terminal => validate_terminal_stage(record, context, binding, generation),
     }
@@ -4443,7 +4461,7 @@ pub(crate) mod native {
             }
             Ok(value)
         }
-        fn revision(&self) -> Result<Vec<u8>> {
+        fn revision(&self) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
@@ -4453,18 +4471,50 @@ pub(crate) mod native {
                 .record(&self.scope.context, RecordKind::NativeCarrierReceipts)
                 .map_err(denied)?;
             let record = receipts::Record::decode(&bytes).map_err(denied)?;
+            let (stage, pair_bytes) = if record.phase == receipts::Phase::Closing
+                && matches!(
+                    record.keys[0].phase,
+                    receipts::KeyPhase::RestorePending | receipts::KeyPhase::Clean
+                ) {
+                // Read-only partial original restoration under the actual
+                // Closing11 Pair and SAME Calling; never effect permission.
+                let pair_bytes = self
+                    .runtime
+                    .record(&self.scope.context, RecordKind::Pair)
+                    .map_err(denied)?;
+                let pair = crate::windows::member_carrier_pair_store::carrier_payload(
+                    &self.scope.context.intent.scope,
+                    &pair_bytes,
+                )
+                .map_err(denied)?
+                .ok_or(Error::Conflict)?;
+                if crate::windows::member_carrier_ready::key_restore_read_is_terminal(
+                    &self.scope.context,
+                    &pair,
+                    &record,
+                )
+                .map_err(denied)?
+                {
+                    return Err(Error::Conflict);
+                }
+                // Keep the exact Pair publication in the existing pre/post
+                // revision comparison alongside the native key receipt.
+                (RetiredReadStage::KeyRestore, Some(pair_bytes))
+            } else {
+                (RetiredReadStage::Cleanup, None)
+            };
             validate_retired_read_stage(
                 &record,
                 &self.scope.context,
                 &self.scope.binding,
                 self.scope.generation,
-                RetiredReadStage::Cleanup,
+                stage,
             )
             .map_err(denied)?;
             self.deadline
                 .verify_call(&self.supervisor, &self.scope.context)
                 .map_err(denied)?;
-            Ok(bytes)
+            Ok((bytes, pair_bytes))
         }
         /// Bracket the caller's factual WFP read with SAME actual opaque closed
         /// C receipt and FULL C+A+B native absence. Historical identity never
@@ -4947,8 +4997,10 @@ pub(crate) mod native {
             owner.runtime.verify(&owner.scope.context).map_err(denied)?;
             owner.image.verify_runtime(&owner.runtime).map_err(denied)?;
             let revision = || match stage {
-                RetiredReadStage::Cleanup => original.revision(),
-                RetiredReadStage::Terminal => original.terminal_revision(),
+                RetiredReadStage::Cleanup | RetiredReadStage::KeyRestore => original.revision(),
+                RetiredReadStage::Terminal => {
+                    original.terminal_revision().map(|bytes| (bytes, None))
+                }
             };
             let before = revision()?;
             // No callback or SDK lookup is hidden in this identity check. An

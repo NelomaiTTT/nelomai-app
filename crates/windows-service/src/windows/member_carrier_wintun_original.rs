@@ -409,7 +409,27 @@ impl OriginalKeyInventory {
                     .verify_live_runtime(&self.runtime)
                     .map_err(original_error)?;
             }
-            receipt::Phase::Stopped => return Err(creators::Error::Conflict),
+            receipt::Phase::Stopped => {
+                // Factual clean verification also serves terminal key release.
+                // Actual value/handle effects retain their independent gates.
+                let record = receipt::Record::decode(&before).map_err(original_error)?;
+                crate::windows::member_carrier_runtime::validate_terminal_stage(
+                    &record,
+                    context,
+                    &context.bindings[0],
+                    1,
+                )
+                .map_err(original_error)?;
+                self.observer.assert_no_creator_for_key_cleanup(context, binding)?;
+                let universe = self.observer.observe_all_for_cleanup(context)?;
+                if universe.context != *context
+                    || !universe.originals.is_empty()
+                    || !universe.complete.is_empty()
+                {
+                    return Err(creators::Error::Conflict);
+                }
+                self.observer.assert_no_creator_for_key_cleanup(context, binding)?;
+            },
         }
         self.image
             .verify_runtime(&self.runtime)
