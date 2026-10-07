@@ -126,7 +126,7 @@ if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.
 throw 'Audited factory WireGuard DLL hash mismatch'
 }
 "NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append""",
-        """$build = @(& cargo test --locked -p nelomai-windows-service --lib --no-run --message-format=json)
+        """$build = @(& cargo test --release --locked -p nelomai-windows-service --lib --no-run --message-format=json)
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
 $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_service' -and $_.profile.test -and $_.executable

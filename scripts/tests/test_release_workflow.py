@@ -111,8 +111,13 @@ class ReleaseWorkflowTest(unittest.TestCase):
         checker = module("release-workflow-check")
         workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+        artifact = next(step for step in workflow["jobs"]["windows-build"]["steps"]
+                        if step.get("name") == "Assemble exact factory test artifact")
+        self.assertIn("cargo test --release --locked", artifact["run"])
         checker.assert_windows_factory_jobs(workflow, factory)
         mutations = (
+            lambda jobs: jobs["windows-build"]["steps"][-2].update(
+                run=jobs["windows-build"]["steps"][-2]["run"].replace("--release ", "")),
             lambda jobs: jobs["windows"]["needs"].remove("windows-build"),
             lambda jobs: jobs["windows"]["steps"][0].update(run='test "$NATIVE_RESULT" = success'),
             lambda jobs: jobs["windows-native"].update(needs=[]),
