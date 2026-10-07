@@ -38,11 +38,9 @@ const MEMBER_INTERFACES: &str = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parame
 pub(crate) enum GuidError {
     UnsupportedPath,
     UnsupportedRevision,
-    UnsupportedName,
     InvalidConfigurationPath,
     ServiceNameMismatch,
 }
-pub(crate) type MemberSlot = TunnelSlot;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderPath {
     AmneziaSignedDll,
@@ -126,59 +124,9 @@ fn slot_native_name(
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ValidatedMember {
-    path: ProviderPath,
-    slot: MemberSlot,
-    name: &'static str,
-}
-impl ValidatedMember {
-    /// `revision` is a comparison input, NOT proof of a verified payload.
-    /// No filesystem path, SCM name parsing, case folding or legacy fallback.
-    pub(crate) fn new(
-        path: ProviderPath,
-        revision: &str,
-        slot: MemberSlot,
-        name: &str,
-    ) -> Result<Self, GuidError> {
-        let transport = validated_transport(path, revision)?;
-        let expected_name = slot_native_name(slot, transport)?;
-        if name != expected_name {
-            return Err(GuidError::UnsupportedName);
-        }
-        Ok(Self {
-            path,
-            slot,
-            name: expected_name,
-        })
-    }
-    pub(crate) fn guid(self) -> NativeGuid {
-        fixed_name_guid(self.name)
-    }
-    pub(crate) fn path(self) -> ProviderPath {
-        self.path
-    }
-    pub(crate) fn slot(self) -> MemberSlot {
-        self.slot
-    }
-    pub(crate) fn native_name(self) -> &'static str {
-        self.name
-    }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WindowsGuidFields {
-    pub data1: u32,
-    pub data2: u16,
-    pub data3: u16,
-    pub data4: [u8; 8],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeGuid([u8; 16]);
 
 impl NativeGuid {
-    pub(crate) fn windows_memory_bytes(self) -> [u8; 16] {
-        self.0
-    }
     /// Canonical textual/network order, e.g. member ownership Binding.guid.
     /// This is NOT the memory supplied to Windows requested-GUID functions.
     pub(crate) fn canonical_bytes(self) -> [u8; 16] {
@@ -187,16 +135,6 @@ impl NativeGuid {
             b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9], b[10], b[11], b[12], b[13],
             b[14], b[15],
         ]
-    }
-    /// Field values for Windows GUID { Data1, Data2, Data3, Data4 }.
-    pub(crate) fn windows_fields(self) -> WindowsGuidFields {
-        let b = self.0;
-        WindowsGuidFields {
-            data1: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            data2: u16::from_le_bytes([b[4], b[5]]),
-            data3: u16::from_le_bytes([b[6], b[7]]),
-            data4: [b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]],
-        }
     }
     /// Braced GUID component only; never a caller-selected registry root/path.
     pub(crate) fn registry_component(self) -> String {

@@ -77,7 +77,7 @@ impl ValidatedWireGuardInput {
         self.interface_public_key
     }
     /// Matches the audited upstream EXE algorithm, not a shipped EXE identity.
-    /// Deliberately separate from ValidatedMember: must not precreate registry
+    /// Deliberately separate from member_binding: must not precreate registry
     /// keys for an unpinned executable based on this reference result.
     fn reference_executable_guid(&self) -> NativeGuid {
         let mut hash = Blake2s256::new();
@@ -467,7 +467,7 @@ fn signed_awg_observed_guid_is_raw_windows_memory_order() {
     let guid = fixed_name_guid("NelomaiAmneziaWg3");
     assert_eq!(guid.to_string(), "093889e9-0638-2af7-e890-8f81b9e9c695");
     assert_eq!(
-        guid.windows_memory_bytes(),
+        guid.0,
         [
             0xe9, 0x89, 0x38, 0x09, 0x38, 0x06, 0xf7, 0x2a, 0xe8, 0x90, 0x8f, 0x81, 0xb9, 0xe9,
             0xc6, 0x95
@@ -504,47 +504,6 @@ fn wg_input(name: &str, ips: &[&str]) -> ValidatedWireGuardInput {
     .unwrap()
 }
 
-// Break caught: changing labels, names, LE length prefixes or digest byte order.
-#[test]
-fn pinned_dll_member_vectors_match_independent_blake2s() {
-    for (path, revision, slot, name, expected) in [
-        (
-            ProviderPath::AmneziaSignedDll,
-            AWG_SOURCE_REVISION,
-            MemberSlot::A,
-            "NelomaiAmneziaWg3A",
-            "5e421b19-3234-5def-d557-e8c3d50a2247",
-        ),
-        (
-            ProviderPath::AmneziaSignedDll,
-            AWG_SOURCE_REVISION,
-            MemberSlot::B,
-            "NelomaiAmneziaWg3B",
-            "adf8d250-6db6-d0a8-bed5-b6f47b94f340",
-        ),
-        (
-            ProviderPath::WireGuardSignedDll,
-            WG_SOURCE_REVISION,
-            MemberSlot::A,
-            "nelomai-a",
-            "b75141b9-108e-4bf9-5a47-7af4a3ddcd39",
-        ),
-        (
-            ProviderPath::WireGuardSignedDll,
-            WG_SOURCE_REVISION,
-            MemberSlot::B,
-            "nelomai-b",
-            "2bb16406-8cb1-40d2-3fa0-c71e3be8ca2d",
-        ),
-    ] {
-        let input = ValidatedMember::new(path, revision, slot, name).unwrap();
-        assert_eq!(input.guid().to_string(), expected);
-        assert_eq!(input.path(), path);
-        assert_eq!(input.slot(), slot);
-        assert_eq!(input.native_name(), name);
-    }
-}
-
 // Recorded Panel research: WINDOWS-SHARED-VIP-RESEARCH-2026-09-29.md,
 // "Real addressless AWG under triple policy, 12:20UTC". No new native probe.
 #[test]
@@ -557,115 +516,16 @@ fn recorded_own_probe_guid_matches_the_fixed_algorithm() {
 
 // Break caught: feeding Windows memory bytes into a canonical-byte consumer.
 #[test]
-fn canonical_bytes_native_fields_and_registry_component_agree() {
+fn canonical_bytes_and_registry_component_agree() {
     let guid = fixed_name_guid("NelomaiAmneziaWg3");
     assert_eq!(
         guid.canonical_bytes(),
         bytes("093889e906382af7e8908f81b9e9c695")
     );
     assert_eq!(
-        guid.windows_fields(),
-        WindowsGuidFields {
-            data1: 0x093889e9,
-            data2: 0x0638,
-            data3: 0x2af7,
-            data4: bytes("e8908f81b9e9c695"),
-        }
-    );
-    assert_eq!(
         guid.registry_component(),
         "{093889e9-0638-2af7-e890-8f81b9e9c695}"
     );
-}
-
-// Break caught: accepting an unaudited provider/revision as the AWG default.
-#[test]
-fn executable_and_unknown_paths_fail_even_with_a_known_revision() {
-    for path in [
-        ProviderPath::WireGuardExeInstallTunnelService,
-        ProviderPath::Unsupported,
-    ] {
-        assert_eq!(
-            ValidatedMember::new(path, WG_SOURCE_REVISION, MemberSlot::A, "nelomai-a"),
-            Err(GuidError::UnsupportedPath)
-        );
-    }
-}
-
-#[test]
-fn dll_revisions_are_independent_and_exact() {
-    for (path, name, wrong) in [
-        (
-            ProviderPath::AmneziaSignedDll,
-            "NelomaiAmneziaWg3A",
-            WG_SOURCE_REVISION,
-        ),
-        (
-            ProviderPath::WireGuardSignedDll,
-            "nelomai-a",
-            AWG_SOURCE_REVISION,
-        ),
-    ] {
-        for revision in [
-            wrong,
-            "",
-            "latest",
-            "575626d8",
-            " 575626d8f8aa5b64114cf378a08e54bf852d909b",
-        ] {
-            assert_eq!(
-                ValidatedMember::new(path, revision, MemberSlot::A, name),
-                Err(GuidError::UnsupportedRevision)
-            );
-        }
-    }
-}
-
-// Break caught: case folding, Unicode NFC guessing, service-name hashing,
-// basename guessing, legacy-slot adoption or accepting an alias for slot A.
-#[test]
-fn only_exact_existing_slot_names_can_be_member_bindings() {
-    for name in [
-        "",
-        "nelomai-b",
-        "Nelomai-a",
-        "NELОMAI-a",
-        "nelomai-a\0",
-        " nelomai-a",
-        "nelomai-a ",
-        "nelomai-a.conf",
-        "WireGuardTunnel$nelomai-a",
-        "../nelomai-a",
-        "nelomai-a\\x",
-        "Nelomai",
-        "NelomaiAmneziaWg3A",
-    ] {
-        assert_eq!(
-            ValidatedMember::new(
-                ProviderPath::WireGuardSignedDll,
-                WG_SOURCE_REVISION,
-                MemberSlot::A,
-                name
-            ),
-            Err(GuidError::UnsupportedName)
-        );
-    }
-    for name in [
-        "NelomaiAmneziaWg3",
-        "NelomaiAmneziaWg3B",
-        "nelomaiamneziawg3a",
-        "nelomai-a",
-    ] {
-        assert_eq!(
-            ValidatedMember::new(
-                ProviderPath::AmneziaSignedDll,
-                AWG_SOURCE_REVISION,
-                MemberSlot::A,
-                name
-            ),
-            Err(GuidError::UnsupportedName)
-        );
-    }
 }
 
 // Break caught: hashing the private key directly or deriving a wrong public key.
