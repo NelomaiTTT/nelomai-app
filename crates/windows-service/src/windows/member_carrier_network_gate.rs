@@ -1999,10 +1999,9 @@ pub(crate) mod native {
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            if kind == GuardResourceKind::Retired {
-                self.runtime.verify(&self.context).map_err(denied)?;
-            } else if self.cancelled.load(Ordering::Acquire)
-                || !self.runtime.fresh(&self.context).map_err(denied)?
+            if kind != GuardResourceKind::Retired
+                && (self.cancelled.load(Ordering::Acquire)
+                    || !self.runtime.fresh(&self.context).map_err(denied)?)
             {
                 return Err(conflict());
             }

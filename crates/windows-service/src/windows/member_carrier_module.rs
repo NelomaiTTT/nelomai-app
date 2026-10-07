@@ -1240,9 +1240,6 @@ pub(crate) mod native {
                     runtime
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
                     let mut lease = Lease::take(cancelled, 5000).map_err(|_| Error::Conflict)?;
                     let _read_lease = module.2.retain_read()?;
                     runtime
@@ -1253,9 +1250,6 @@ pub(crate) mod native {
                     // mapping/bounds/exports and independently joins repeat sources.
                     require_process_anchor(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
                     runtime
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
@@ -1289,9 +1283,6 @@ pub(crate) mod native {
                     runtime
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
                     let mut lease = Lease::take(cancelled, 5000).map_err(|_| Error::Conflict)?;
                     // Count the actual held cooperative lease, not reader Rc
                     // aliases. Existing terminal unload refuses any holder.
@@ -1302,9 +1293,6 @@ pub(crate) mod native {
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
                     require_process_anchor(&self.source, module)?;
                     lease.verify(cancelled).map_err(|_| Error::Conflict)?;
-                    self.lock
-                        .verify_source(&self.source)
-                        .map_err(|_| Error::Conflict)?;
                     runtime
                         .verify_source(&self.source)
                         .map_err(|_| Error::Conflict)?;
@@ -1476,12 +1464,6 @@ pub(crate) mod native {
             if !self.matches_runtime(runtime) {
                 return Err(Error::Conflict);
             }
-            runtime
-                .verify_source(&self.source)
-                .map_err(|_| Error::Conflict)?;
-            self.lock
-                .verify_source(&self.source)
-                .map_err(|_| Error::Conflict)?;
             runtime
                 .verify_source(&self.source)
                 .map_err(|_| Error::Conflict)
