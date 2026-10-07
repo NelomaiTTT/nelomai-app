@@ -8,6 +8,86 @@ import org.junit.rules.TemporaryFolder
 class PersistentLogcatTest {
     @get:Rule val temporary = TemporaryFolder()
 
+    private fun record(priority: String, text: String) = "10-08 12:00:00.000  1234  5678 $priority Nelomai: $text"
+
+    @Test fun automaticSnapshotExcludesDetailedRecordsButKeepsThemForManualExport() {
+        val noBackup = temporary.newFolder()
+        val root = java.io.File(noBackup, "diagnostics/logcat")
+        val journal = LogcatJournal(root)
+        journal.append(record("I", "normal-info"))
+        journal.append(record("D", "manual-only-detail"))
+        journal.append("manual-only-unframed")
+        val automatic = PersistentLogcat.snapshot(noBackup.absolutePath)
+        assertTrue(automatic.contains("normal-info"))
+        assertFalse(automatic.contains("manual-only"))
+        assertTrue(LogcatJournal.snapshot(root).contains("manual-only-detail"))
+        assertTrue(PersistentLogcat::class.java.getMethod("manualSnapshot", String::class.java)
+            .invoke(null, noBackup.absolutePath).toString().contains("manual-only-detail"))
+    }
+
+    @Test fun defaultCapturePersistsInfoWarningsErrorsButNotVerboseDebugOrUnknownRecords() {
+        val root = temporary.newFolder()
+        val capture = LogcatCapture(LogcatJournal(root)) { 100L }
+        for (level in listOf("V", "D", "I", "W", "E", "F")) capture.append(record(level, "message-$level"))
+        capture.append("unframed debug continuation")
+        val text = LogcatJournal.snapshot(root)
+        for (level in listOf("I", "W", "E", "F")) assertTrue(text.contains("message-$level"))
+        for (level in listOf("V", "D")) assertFalse(text.contains("message-$level"))
+        assertFalse(text.contains("unframed"))
+    }
+
+    @Test fun verboseExpiresAtFifteenMinutesWithoutUiAndRepeatedStartCannotExtendIt() {
+        val root = temporary.newFolder()
+        var now = 10L
+        val capture = LogcatCapture(LogcatJournal(root)) { now }
+        assertTrue(capture.enableVerbose())
+        capture.append(record("V", "inside-window"))
+        now += 899_999
+        assertFalse(capture.enableVerbose())
+        assertEquals(1L, capture.status().remainingMillis)
+        capture.append(record("D", "last-millisecond"))
+        now++
+        capture.append(record("D", "after-expiry"))
+        capture.append(record("E", "ordinary-error"))
+        assertFalse(capture.status().active)
+        val text = LogcatJournal.snapshot(root)
+        assertTrue(text.contains("inside-window")); assertTrue(text.contains("last-millisecond"))
+        assertFalse(text.contains("after-expiry")); assertTrue(text.contains("ordinary-error"))
+    }
+
+    @Test fun byteBudgetCountsSanitizedUtf8AndCannotWrapAroundWithRotation() {
+        val root = temporary.newFolder()
+        val capture = LogcatCapture(LogcatJournal(root)) { 100L }
+        assertTrue(capture.enableVerbose())
+        val line = record("D", "я ".repeat(1000))
+        val bytes = (sanitizeLogcatLine(line) + "\n").toByteArray(Charsets.UTF_8).size
+        val count = (2 * 1024 * 1024) / bytes
+        repeat(count) { capture.append(line) }
+        assertEquals(count.toLong() * bytes, capture.status().recordedBytes)
+        capture.append(line)
+        assertFalse(capture.status().active)
+        assertTrue(capture.status().recordedBytes <= 2 * 1024 * 1024)
+        capture.append(record("D", "over-budget"))
+        assertFalse(LogcatJournal.snapshot(root).contains("over-budget"))
+    }
+
+    @Test fun manualStopAndNewCollectorDisableVerboseWithoutRemovingSanitizedEvidence() {
+        val root = temporary.newFolder()
+        val capture = LogcatCapture(LogcatJournal(root)) { 100L }
+        assertTrue(capture.enableVerbose())
+        capture.append(record("D", "password=never-persist"))
+        capture.append(record("D", "retained-evidence"))
+        capture.stopVerbose()
+        capture.append(record("D", "after-stop"))
+        assertTrue(capture.enableVerbose())
+        val restarted = LogcatCapture(LogcatJournal(root)) { 101L }
+        assertFalse(restarted.status().active)
+        restarted.append(record("D", "after-restart"))
+        val text = LogcatJournal.snapshot(root)
+        assertTrue(text.contains("retained-evidence"))
+        for (value in listOf("never-persist", "after-stop", "after-restart")) assertFalse(text.contains(value))
+    }
+
     @Test fun onlyBrokerCollectsWhileRuntimeAndVpnRemainFreeToFreeze() {
         val root = temporary.newFolder()
         for (process in listOf("ru.nelomai.client:runtime", "ru.nelomai.client:vpn", null, "")) {

@@ -41,7 +41,7 @@ pub fn logcat_snapshot() -> Option<String> {
         let snapshot = env
             .call_static_method(
                 JClass::from(class),
-                "snapshot",
+                "manualSnapshot",
                 "(Ljava/lang/String;)Ljava/lang/String;",
                 &[JValue::Object(&path)],
             )?

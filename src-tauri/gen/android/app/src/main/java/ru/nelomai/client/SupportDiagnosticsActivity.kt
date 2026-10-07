@@ -18,6 +18,7 @@ import androidx.core.content.FileProvider
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import ru.nelomai.runtime.v1.PersistentLogcat
 
 /** Container-owned pre-login UI, deliberately independent of the runtime/owner. */
 class SupportDiagnosticsActivity : Activity() {
@@ -25,6 +26,15 @@ class SupportDiagnosticsActivity : Activity() {
     private lateinit var status: TextView
     private val actions = mutableListOf<Button>()
     private lateinit var cancel: Button
+    private lateinit var verboseStatus: TextView
+    private lateinit var verboseStart: Button
+    private lateinit var verboseStop: Button
+    private val verboseTick = object : Runnable {
+        override fun run() {
+            refreshVerboseStatus()
+            handler.postDelayed(this, 1_000)
+        }
+    }
     private val handler = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { task -> Thread(task, "support-diagnostics").apply { isDaemon = true } }
     @Volatile private var report: SupportDiagnosticReport? = null
@@ -47,6 +57,26 @@ class SupportDiagnosticsActivity : Activity() {
         text("Диагностика Nelomai").textSize = 24f
         text("Вход в аккаунт не нужен. Собираются только ограниченные журналы Nelomai с удалением секретов. " +
             "Код поддержки разрешает только отправку отчёта; его срок и лимит проверяет сервер. Можно сохранить или поделиться отчётом без кода.")
+        text("Обычно сохраняются информационные сообщения, предупреждения и ошибки. " +
+            "Подробная запись выключится через 15 минут, при достижении 2 МиБ или после перезапуска процесса приложения. " +
+            "Закрытие этого экрана запись не останавливает. После воспроизведения ошибки нажмите «Собрать новый отчёт». " +
+            "Подробные сообщения отправляются только вручную.")
+        verboseStatus = text("").apply { id = VERBOSE_STATUS }
+        verboseStart = Button(this).apply {
+            id = VERBOSE_START; text = "Подробная запись на 15 минут"
+            setOnClickListener {
+                if (PersistentLogcat.enableVerbose()) refreshVerboseStatus()
+                else if (PersistentLogcat.verboseStatus().active) refreshVerboseStatus()
+                else verboseStatus.text = "Сборщик недоступен. Повторите позже; обычное сохранение отчёта доступно."
+            }
+            layout.addView(this)
+        }
+        verboseStop = Button(this).apply {
+            id = VERBOSE_STOP; text = "Остановить подробную запись"
+            setOnClickListener { PersistentLogcat.stopVerbose(); refreshVerboseStatus() }
+            layout.addView(this)
+        }
+        refreshVerboseStatus()
         text("Код поддержки")
         code = EditText(this).apply {
             id = CODE_FIELD
@@ -78,6 +108,27 @@ class SupportDiagnosticsActivity : Activity() {
 
     private class RetainedReport(val report: SupportDiagnosticReport?, val pendingSave: SupportDiagnosticReport?)
     override fun onRetainNonConfigurationInstance(): Any = RetainedReport(report, pendingSave)
+
+    private fun refreshVerboseStatus() {
+        val capture = PersistentLogcat.verboseStatus()
+        verboseStart.isEnabled = !capture.active
+        verboseStop.isEnabled = capture.active
+        val seconds = (capture.remainingMillis + 999) / 1_000
+        verboseStatus.text = if (capture.active) {
+            "Подробная запись: ещё ${seconds / 60} мин ${seconds % 60} сек; ${capture.recordedBytes / 1024} из 2048 КиБ."
+        } else "Подробная запись выключена. Ранее собранные журналы сохранены в пределах лимита."
+    }
+
+    override fun onResume() {
+        super.onResume()
+        handler.removeCallbacks(verboseTick)
+        verboseTick.run()
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(verboseTick)
+        super.onPause()
+    }
 
     private fun collect(enteredCode: String, current: Int): SupportDiagnosticReport = report ?: SupportDiagnosticCollector(
         filesDir, noBackupFilesDir, "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
@@ -209,6 +260,9 @@ class SupportDiagnosticsActivity : Activity() {
         const val SEND_BUTTON = 0x00d10003
         const val SAVE_BUTTON = 0x00d10004
         const val SHARE_BUTTON = 0x00d10005
+        const val VERBOSE_START = 0x00d10006
+        const val VERBOSE_STOP = 0x00d10007
+        const val VERBOSE_STATUS = 0x00d10008
         private const val SAVE_REQUEST = 10
     }
 }

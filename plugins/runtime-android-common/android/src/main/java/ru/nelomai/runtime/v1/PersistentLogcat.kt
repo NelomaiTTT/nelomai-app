@@ -11,6 +11,9 @@ private val logcatAuthorization = Regex("(?i)\\b(?:bearer|basic)\\s+\\S+")
 private val logcatUrl = Regex("(?i)https?://[^\\s\"'<>]+")
 private val logcatJwt = Regex("\\beyJ[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){1,2}")
 private val logcatKeyMaterial = Regex("(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}(?![A-Za-z0-9+/_=-])")
+private val logcatPriority = Regex("""^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+\s+\d+\s+\d+\s+([VDIWEFA])\s""")
+private fun ordinaryLogcatLine(line: String): Boolean =
+    logcatPriority.find(line)?.groupValues?.get(1) in listOf("I", "W", "E", "F", "A")
 
 /** Deliberately redact before persistence, not only before upload. */
 fun sanitizeLogcatLine(line: String): String {
@@ -77,11 +80,59 @@ class LogcatJournal(private val root: File, private val segmentBytes: Int = 1024
     }
 }
 
+/** Per-process capture policy; no preference or token survives an owner restart. */
+class LogcatCapture(private val journal: LogcatJournal, private val nowMs: () -> Long) {
+    data class Status(val active: Boolean, val remainingMillis: Long, val recordedBytes: Long)
+    private var startedAt: Long? = null
+    private var recordedBytes = 0L
+
+    @Synchronized fun status(): Status {
+        val elapsed = startedAt?.let { nowMs() - it }
+        if (elapsed != null && (elapsed < 0 || elapsed >= 15 * 60 * 1000L)) startedAt = null
+        return Status(startedAt != null, if (startedAt != null) 900_000L - (elapsed ?: 0) else 0, recordedBytes)
+    }
+    @Synchronized fun enableVerbose(): Boolean {
+        if (status().active) return false
+        startedAt = nowMs()
+        recordedBytes = 0
+        return true
+    }
+    @Synchronized fun stopVerbose() { startedAt = null }
+    @Synchronized fun append(line: String) {
+        val safe = sanitizeLogcatLine(line)
+        if (safe.isBlank()) return
+        val ordinary = ordinaryLogcatLine(safe)
+        val bytes = safe.toByteArray(Charsets.UTF_8).size.toLong() + 1
+        var verbose = status().active
+        if (verbose && bytes > 2 * 1024 * 1024L - recordedBytes) {
+            stopVerbose()
+            verbose = false
+        }
+        if (!verbose && !ordinary) return
+        // Redact before persistence; rotation never resets the session budget.
+        journal.append(safe)
+        if (verbose) {
+            recordedBytes += bytes
+            if (recordedBytes >= 2 * 1024 * 1024L) stopVerbose()
+        }
+    }
+}
+
 object PersistentLogcat {
     private val started = AtomicBoolean(false)
+    @Volatile private var capture: LogcatCapture? = null
     private fun directory(files: File) = File(files, "diagnostics/logcat")
 
+    fun verboseStatus(): LogcatCapture.Status = capture?.status() ?: LogcatCapture.Status(false, 0, 0)
+    fun enableVerbose(): Boolean = capture?.enableVerbose() ?: false
+    fun stopVerbose() { capture?.stopVerbose() }
+
+    // Existing automatic-upload callers (including the immutable stable runtime)
+    // get ordinary records only. Detailed capture requires explicit manual export.
     @JvmStatic fun snapshot(noBackupPath: String): String =
+        manualSnapshot(noBackupPath).lineSequence().filter(::ordinaryLogcatLine).joinToString("\n")
+
+    @JvmStatic fun manualSnapshot(noBackupPath: String): String =
         runCatching { LogcatJournal.snapshot(directory(File(noBackupPath))) }.getOrDefault("")
 
     internal fun command(sdk: Int, uid: Int): List<String> = buildList {
@@ -126,7 +177,8 @@ object PersistentLogcat {
                     val process = ProcessBuilder(command(android.os.Build.VERSION.SDK_INT, android.os.Process.myUid()))
                         .redirectErrorStream(true).start()
                     try {
-                        val journal = LogcatJournal(root)
+                        val writer = LogcatCapture(LogcatJournal(root), android.os.SystemClock::elapsedRealtime)
+                        capture = writer
                         process.inputStream.bufferedReader().use { input ->
                             // Android bounds individual log records. Also cap
                             // our line accumulator rather than using readLine().
@@ -136,13 +188,13 @@ object PersistentLogcat {
                                 val character = input.read()
                                 if (character < 0) break
                                 if (character == '\n'.code) {
-                                    journal.append(if (truncated) "[oversized logcat record omitted]" else line.toString())
+                                    writer.append(if (truncated) "[oversized logcat record omitted]" else line.toString())
                                     line.setLength(0); truncated = false
                                 } else if (line.length < 16 * 1024) line.append(character.toChar())
                                 else truncated = true
                             }
                         }
-                    } finally { process.destroy() }
+                    } finally { capture?.stopVerbose(); capture = null; process.destroy() }
                 }
             } catch (_: Exception) {
                 // Diagnostics must never prevent startup, login, or tunnel stop.

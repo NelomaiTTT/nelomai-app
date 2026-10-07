@@ -19,6 +19,62 @@ import javax.xml.parsers.DocumentBuilderFactory
 @RunWith(org.robolectric.RobolectricTestRunner::class)
 @Config(sdk = [28])
 class SupportDiagnosticsActivityTest {
+    @Test fun verboseButtonsControlRealCollectorWithoutLoginUploadOrExtendingOnRecreation() {
+        val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+        val activity = controller.get()
+        val root = File(activity.cacheDir, "timed-logcat").apply { mkdirs() }
+        var now = 100L
+        val capture = ru.nelomai.runtime.v1.LogcatCapture(ru.nelomai.runtime.v1.LogcatJournal(root)) { now }
+        val field = ru.nelomai.runtime.v1.PersistentLogcat::class.java.getDeclaredField("capture").apply { isAccessible = true }
+        val old = field.get(null)
+        field.set(null, capture)
+        try {
+            val start = activity.findViewById<Button>(0x00d10006)
+            val stop = activity.findViewById<Button>(0x00d10007)
+            assertNotNull("pre-login screen needs verbose start", start)
+            assertNotNull("pre-login screen needs verbose stop", stop)
+            start.performClick()
+            assertTrue(capture.status().active)
+            assertFalse(start.isEnabled); assertTrue(stop.isEnabled)
+            assertNull(shadowOf(activity.application).nextStartedService)
+            assertEquals("", activity.findViewById<EditText>(SupportDiagnosticsActivity.CODE_FIELD).text.toString())
+            assertTrue(activity.findViewById<android.widget.TextView>(SupportDiagnosticsActivity.STATUS_VIEW).text.contains("не собран"))
+            now += 60_000
+            controller.pause().stop().destroy()
+            val reopened = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+            assertEquals(840_000L, capture.status().remainingMillis)
+            assertFalse(reopened.get().findViewById<Button>(0x00d10006).isEnabled)
+            reopened.get().findViewById<Button>(0x00d10007).performClick()
+            assertFalse(capture.status().active)
+            assertTrue(reopened.get().findViewById<Button>(0x00d10006).isEnabled)
+            reopened.pause().stop().destroy()
+        } finally { field.set(null, old) }
+    }
+
+    @Test fun verboseScreenShowsExpiryAndDoesNotPretendAnAbsentCollectorStarted() {
+        val field = ru.nelomai.runtime.v1.PersistentLogcat::class.java.getDeclaredField("capture").apply { isAccessible = true }
+        val old = field.get(null)
+        field.set(null, null)
+        val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            val start = activity.findViewById<Button>(0x00d10006)
+            assertNotNull(start)
+            start.performClick()
+            assertFalse(ru.nelomai.runtime.v1.PersistentLogcat.verboseStatus().active)
+            assertFalse(activity.findViewById<Button>(0x00d10007).isEnabled)
+            assertTrue(activity.findViewById<android.widget.TextView>(0x00d10008).text.contains("недоступен"))
+            var now = 0L
+            val capture = ru.nelomai.runtime.v1.LogcatCapture(ru.nelomai.runtime.v1.LogcatJournal(File(activity.cacheDir, "expiry-logcat"))) { now }
+            field.set(null, capture)
+            start.performClick()
+            now = 900_000
+            shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(1))
+            assertFalse(activity.findViewById<Button>(0x00d10007).isEnabled)
+            assertTrue(start.isEnabled)
+        } finally { controller.pause().stop().destroy(); field.set(null, old) }
+    }
+
     @Test fun screenNeedsNoRuntimeAndDoesNotRestoreSupportCode() {
         val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
         val activity = controller.get()
