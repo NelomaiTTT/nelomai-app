@@ -1236,6 +1236,10 @@ where
         self.core.local_stop_pending_cleanup().await
     }
 
+    pub fn has_pending_stop_cleanup(&self) -> Result<bool, ApplicationError> {
+        self.core.has_pending_stop_cleanup().map_err(Into::into)
+    }
+
     pub fn signal_start_cancellation(&self) -> bool {
         self.core.signal_start_cancellation()
     }

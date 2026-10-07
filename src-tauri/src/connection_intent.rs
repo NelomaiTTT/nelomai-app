@@ -241,14 +241,26 @@ impl DesktopConnectionIntent {
         now_unix: i64,
         initial_preflight: Option<InitialDesktopPreflight>,
     ) -> Result<StartCommandResponse, CommandError> {
+        let observed = {
+            let state = self.state.lock().await;
+            state
+                .coordinator
+                .completed_connection()
+                .map(|connection| (state.coordinator.generation(), connection.clone()))
+        };
         let core_state = self.application.state().await;
         let action = {
             let mut state = self.state.lock().await;
             let previous_generation = state.coordinator.generation();
-            let disposition = state
-                .coordinator
-                .start_or_resume(options.clone(), now_unix)
-                .map_err(|error| CommandError::new("connection_busy", error.to_string()))?;
+            let disposition = start_after_core_observation(
+                &mut state,
+                observed.as_ref(),
+                &core_state,
+                self.application.has_pending_stop_cleanup().unwrap_or(true),
+                options.clone(),
+                now_unix,
+            )
+            .map_err(|error| CommandError::new("connection_busy", error.to_string()))?;
             match disposition {
                 StartDisposition::Connected(connection) => {
                     if connection_matches_core_state(&core_state, &connection) {
@@ -1212,6 +1224,43 @@ fn connection_matches_core_state(state: &CoreState, connection: &Connection) -> 
             .is_some_and(|current| current.lease_id == connection.lease_id)
 }
 
+fn start_after_core_observation(
+    state: &mut RuntimeState,
+    observed: Option<&(IntentGeneration, Connection)>,
+    core: &CoreState,
+    cleanup_pending: bool,
+    options: ConnectOptions,
+    now: i64,
+) -> Result<StartDisposition, nelomai_client_core::ConnectionIntentError> {
+    // Only retire the same completed intent observed before the await. Core
+    // retains the panel's Stop record, whose retired session may be omitted.
+    // Neither a newer generation nor pending cleanup authorizes retirement.
+    if core.phase == Phase::Ready
+        && !cleanup_pending
+        && observed.is_some_and(|(generation, connection)| {
+            *generation == state.coordinator.generation()
+                && state.coordinator.completed_connection() == Some(connection)
+                && core.connection.as_ref().is_none_or(|stopped| {
+                    stopped.lease_id == connection.lease_id
+                        && (stopped.session_id.is_none()
+                            || stopped.session_id == connection.session_id)
+                        && matches!(
+                            stopped.status,
+                            LeaseStatus::Released | LeaseStatus::Failed | LeaseStatus::Warm
+                        )
+                })
+        })
+    {
+        let generation = state.coordinator.generation();
+        if state.coordinator.cancel_intent(generation) {
+            state.armed = false;
+            state.owned_lease_id = None;
+            state.attempt_kind = AttemptKind::Start;
+        }
+    }
+    state.coordinator.start_or_resume(options, now)
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn can_begin_stall_recovery(status: ConnectionIntentStatus, armed: bool) -> bool {
     armed && status == ConnectionIntentStatus::None
@@ -1604,6 +1653,237 @@ mod tests {
             },
             &cached,
         ));
+    }
+
+    fn completed_ordinary_intent() -> (super::RuntimeState, Connection) {
+        let mut state = super::RuntimeState::default();
+        let options = ConnectOptions {
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probes: Vec::new(),
+            allow_alternate: true,
+        };
+        let StartDisposition::Recovering { generation, .. } = state
+            .coordinator
+            .start_or_resume(options.clone(), 10)
+            .unwrap()
+        else {
+            panic!("initial attempt")
+        };
+        assert!(state.coordinator.begin_attempt(generation));
+        let current = connection("completed-ordinary-lease");
+        assert_eq!(
+            state
+                .coordinator
+                .mark_connected(generation, current.clone()),
+            RecoveryDecision::Accept
+        );
+        state.options = Some(options);
+        state.armed = true;
+        state.owned_lease_id = Some(current.lease_id.clone());
+        state.attempt_kind = AttemptKind::StallReplacement;
+        (state, current)
+    }
+
+    #[test]
+    fn completed_ordinary_stop_allows_protocol_switch_with_retained_or_absent_record() {
+        for status in [
+            None,
+            Some(LeaseStatus::Released),
+            Some(LeaseStatus::Failed),
+            Some(LeaseStatus::Warm),
+        ] {
+            let (mut state, current) = completed_ordinary_intent();
+            let generation = state.coordinator.generation();
+            let observed = (generation, current.clone());
+            let retained = status.map(|status| Connection { status, ..current });
+            let mut options = state.options.clone().unwrap();
+            options.layer = Layer::Tic;
+            let result = super::start_after_core_observation(
+                &mut state,
+                Some(&observed),
+                &CoreState {
+                    phase: Phase::Ready,
+                    connection: retained,
+                },
+                false,
+                options,
+                20,
+            )
+            .expect("confirmed ordinary Stop must allow switching protocol");
+            assert!(
+                matches!(result, StartDisposition::Recovering { generation: next, .. } if next.value() > generation.value())
+            );
+            assert!(!state.armed);
+            assert!(state.owned_lease_id.is_none());
+            assert_eq!(state.attempt_kind, AttemptKind::Start);
+        }
+    }
+
+    #[test]
+    fn completed_intent_retirement_accepts_only_absent_or_matching_retired_session() {
+        for session in [None, Some("owned-session")] {
+            let (mut state, mut current) = completed_ordinary_intent();
+            let generation = state.coordinator.generation();
+            current.session_id = Some("owned-session".into());
+            assert!(state.coordinator.begin_attempt(generation));
+            assert_eq!(
+                state
+                    .coordinator
+                    .mark_connected(generation, current.clone()),
+                RecoveryDecision::Accept
+            );
+            let observed = (generation, current.clone());
+            let mut stopped = current;
+            stopped.status = LeaseStatus::Released;
+            stopped.session_id = session.map(str::to_owned);
+            let mut options = state.options.clone().unwrap();
+            options.layer = Layer::Tic;
+            assert!(matches!(
+                super::start_after_core_observation(
+                    &mut state,
+                    Some(&observed),
+                    &CoreState {
+                        phase: Phase::Ready,
+                        connection: Some(stopped)
+                    },
+                    false,
+                    options,
+                    20,
+                ),
+                Ok(StartDisposition::Recovering { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn retired_record_cannot_release_foreign_live_or_pending_ordinary_intent() {
+        for case in [
+            "foreign_lease",
+            "foreign_session",
+            "connected",
+            "issued",
+            "allocating",
+            "stopping",
+            "connecting",
+            "pending_cleanup",
+        ] {
+            let (mut state, current) = completed_ordinary_intent();
+            let generation = state.coordinator.generation();
+            let observed = (generation, current.clone());
+            let mut stopped = current.clone();
+            stopped.status = LeaseStatus::Released;
+            let mut phase = Phase::Ready;
+            match case {
+                "foreign_lease" => stopped.lease_id = "foreign".into(),
+                "foreign_session" => stopped.session_id = Some("foreign".into()),
+                "connected" => stopped.status = LeaseStatus::Connected,
+                "issued" => stopped.status = LeaseStatus::Issued,
+                "allocating" => stopped.status = LeaseStatus::Allocating,
+                "stopping" => phase = Phase::Stopping,
+                "connecting" => phase = Phase::Connecting,
+                _ => {}
+            }
+            let mut options = state.options.clone().unwrap();
+            options.layer = Layer::Tic;
+            assert_eq!(
+                super::start_after_core_observation(
+                    &mut state,
+                    Some(&observed),
+                    &CoreState {
+                        phase,
+                        connection: Some(stopped)
+                    },
+                    case == "pending_cleanup",
+                    options,
+                    20,
+                ),
+                Err(nelomai_client_core::ConnectionIntentError::DifferentIntentActive),
+                "{case}"
+            );
+            assert_eq!(state.coordinator.generation(), generation, "{case}");
+            assert!(state.armed, "{case}");
+            assert_eq!(
+                state.owned_lease_id.as_deref(),
+                Some(current.lease_id.as_str()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_core_observation_never_retires_new_or_inflight_ordinary_intent() {
+        for case in [
+            "no_observation",
+            "old_generation",
+            "wrong_identity",
+            "attempt",
+            "retry",
+            "new_generation",
+        ] {
+            let (mut state, current) = completed_ordinary_intent();
+            let generation = state.coordinator.generation();
+            let mut observed = Some((generation, current.clone()));
+            match case {
+                "no_observation" => observed = None,
+                "old_generation" => {
+                    observed.as_mut().unwrap().0 =
+                        ConnectionIntentCoordinator::default().generation()
+                }
+                "wrong_identity" => observed.as_mut().unwrap().1 = connection("foreign"),
+                "attempt" => assert!(state.coordinator.begin_attempt(generation)),
+                "retry" => assert!(state.coordinator.schedule_retry(generation, 20).is_some()),
+                "new_generation" => {
+                    assert!(state.coordinator.cancel_intent(generation));
+                    let StartDisposition::Recovering {
+                        generation: next, ..
+                    } = state
+                        .coordinator
+                        .start_or_resume(state.options.clone().unwrap(), 20)
+                        .unwrap()
+                    else {
+                        panic!("new attempt")
+                    };
+                    assert!(state.coordinator.begin_attempt(next));
+                    assert_eq!(
+                        state.coordinator.mark_connected(next, current.clone()),
+                        RecoveryDecision::Accept
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let expected_generation = state.coordinator.generation();
+            let mut options = state.options.clone().unwrap();
+            options.layer = Layer::Tic;
+            assert_eq!(
+                super::start_after_core_observation(
+                    &mut state,
+                    observed.as_ref(),
+                    &CoreState {
+                        phase: Phase::Ready,
+                        connection: None
+                    },
+                    false,
+                    options,
+                    21,
+                ),
+                Err(nelomai_client_core::ConnectionIntentError::DifferentIntentActive),
+                "{case}"
+            );
+            assert_eq!(
+                state.coordinator.generation(),
+                expected_generation,
+                "{case}"
+            );
+            assert!(state.armed, "{case}");
+            assert_eq!(
+                state.owned_lease_id.as_deref(),
+                Some(current.lease_id.as_str()),
+                "{case}"
+            );
+        }
     }
 
     #[test]

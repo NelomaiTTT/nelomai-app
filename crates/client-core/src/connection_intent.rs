@@ -398,6 +398,13 @@ impl ConnectionIntentCoordinator {
         self.status
     }
 
+    /// A completed intent, never an in-flight attempt or scheduled recovery.
+    pub fn completed_connection(&self) -> Option<&Connection> {
+        (self.status == ConnectionIntentStatus::None && self.attempt_generation.is_none())
+            .then_some(self.connected.as_ref())
+            .flatten()
+    }
+
     pub fn start_or_resume(
         &mut self,
         options: ConnectOptions,

@@ -68,11 +68,11 @@
 **Files:** `crates/client-core/src/lib.rs`, `crates/client-core/tests/runtime.rs`, `crates/client-core/src/connection_intent.rs`, `src-tauri/src/connection_intent.rs`.
 **Interfaces:** существующий durableStopworker и desktop coordinator. Исходникиb0d796a,d2e33ca,409cc34; не переносить desktop_runtime pairfix257a28b или новые поля pairarchitecture ради компиляции теста.
 
-- [ ] Сначала RED `ordinary_local_stop_preserves_auth_for_exact_cleanup_replay` и `unavailable_panel_does_not_delay_local_close_or_lose_control_replay` на стабильной Core.stop_locally, fresh+WARM случаи.
-- [ ] Удалить гонку speculativeauth/panel против nativeclose; сохранить exactoperation journal до nativeclose и существующие worker retries.
-- [ ] Добавить регрессию ordinaryStop→Ready с retained retired connection→сменаTic/Stray. Проверить отказ foreign/live lease, новую generation, runningattempt/retry, чужую session и незавершённую очистку.
-- [ ] Перенести completedidentity+generation snapshot/revalidation и обработку retainedStopResponse; d2e33ca без409cc34 недостаточен. Использовать реальные поля базы0.3.2.
-- [ ] `cargo test -p nelomai-client-core --test runtime`, `cargo test -p nelomai-app --lib connection_intent`, strictClippy двух пакетов; review/commit каждого независимого исправления.
+- [x] RED fresh/WARM: StartCancelled вместо повторяемой ошибки панели; unavailable panel/localclose и durable-replay assertions воспроизведены.
+- [x] Speculativeauth/nativeclose race удалена, exactoperation journal/worker сохранены. NLM062 commit409003bc0e5c9b97a390e3b30a14074c5f643303, Core280PASS + strictClippy.
+- [x] RED completed ordinary intent→сменаTic/Stray DifferentIntentActive подтверждён; retainedStopResponse actualCore проверен; foreign/live/session/pendingStop, новое поколение/inflight/retry guards покрыты.
+- [x] d2e33ca+409cc34 смысл перенесён на stable coordinator: snapshot/revalidation + retiredlease/session, без pairarchitecture. Вместо отсутствующего pending_redundant_recovery проверяется существующий pendingStop journal; ошибки чтения запрещают retirement.
+- [x] Весь Rust workspace1101PASS/0fail/1ignored/87suites, strictClippy core/application/app alltargets PASS, fmt/diff clean. Inline review исправил misplaced cfg у нового all-desktop helper; без открытых замечаний. Native Windows/hardware остаётся отдельным gate.
 
 ## Task 5: NLM-044: согласованная цепочка update recovery
 
