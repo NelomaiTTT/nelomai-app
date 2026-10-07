@@ -39,6 +39,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     let cases = [
         "primary",
+        "network-route-postflight",
         "module-load-read-error",
         "module-load-read-unwind",
         "resolver-reference-error",
@@ -203,6 +204,7 @@ fn carrier_factory_actual_cold_child() {
         "module-load-read-error" | "module-load-read-unwind"
     );
     let full_primary = case == "primary";
+    let route_partial = case == "network-route-postflight";
     let resolver_partial = matches!(
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
@@ -224,6 +226,7 @@ fn carrier_factory_actual_cold_child() {
         || resolver_partial
         || adapter_partial
         || full_primary
+        || route_partial
         || native_partial.is_some()
     {
         Fixture::new_native_modules()
@@ -413,6 +416,28 @@ fn carrier_factory_actual_cold_child() {
             );
         }
     }
+    if route_partial {
+        fixture.lose_route_postflight();
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
+        assert!(
+            original.start_primary(primary, options).is_err(),
+            "post-create table fault accepted"
+        );
+        fixture.require_route_postflight_fault();
+        let snapshot = original.snapshot();
+        assert!(matches!(
+            snapshot.session.phase,
+            SessionPhase::Stopping | SessionPhase::Stopped
+        ));
+        if !snapshot.cleanup_pending {
+            assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
+        }
+    }
     if full_primary {
         let Command::Start {
             primary, options, ..
@@ -495,7 +520,11 @@ fn carrier_factory_actual_cold_child() {
         std::mem::forget(factory);
         return;
     }
-    if matches!(case.as_str(), "cold" | "primary-data-denial") || module_partial || full_primary {
+    if matches!(case.as_str(), "cold" | "primary-data-denial")
+        || module_partial
+        || full_primary
+        || route_partial
+    {
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);

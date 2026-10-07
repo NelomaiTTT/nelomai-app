@@ -1351,13 +1351,14 @@ use crate::windows::member_carrier_network_owner::RouteAttempt;
 /// actual ACK histories inside the independently original SDK/Calling bracket.
 #[cfg(any(windows, test))]
 fn compare_network_ack(
-    expected: &crate::member_carrier_pair::NetworkSnapshot,
+    expected: (&crate::member_carrier_pair::NetworkSnapshot, bool),
     sampled: &[crate::member_routes::Row],
     dns: &crate::member_dns::Snapshot,
     baseline: &crate::member_dns::Snapshot,
     attempts: &[RouteAttempt],
     dns_history: &(usize, Vec<crate::member_dns::Snapshot>),
 ) -> io::Result<()> {
+    let (expected, cleanup) = expected;
     if sampled.len() != expected.routes.len()
         || sampled.len() > crate::member_routes::MAX_TABLE_ROWS
         || attempts.len() > 32768
@@ -1366,7 +1367,7 @@ fn compare_network_ack(
         || dns_history.0 != dns_history.1.len()
         || dns_history.0 > 32768
         || (dns_history.0 == 0 && dns != baseline)
-        || (dns_history.0 > 0 && dns_history.1.last() != Some(dns))
+        || (dns_history.0 > 0 && !(cleanup && dns == baseline) && dns_history.1.last() != Some(dns))
     {
         return Err(conflict());
     }
@@ -1384,6 +1385,19 @@ fn compare_network_ack(
         if last.deleting || last.row != *row {
             return Err(conflict());
         }
+    }
+    let mut latest = std::collections::BTreeMap::new();
+    for attempt in attempts {
+        latest.insert(
+            (attempt.row.route.destination, attempt.row.route.interface),
+            attempt,
+        );
+    }
+    if latest
+        .into_iter()
+        .any(|(key, attempt)| keys.contains(&key) == attempt.deleting)
+    {
+        return Err(conflict());
     }
     Ok(())
 }
@@ -5943,7 +5957,7 @@ pub(crate) mod native {
                                 .map(|r| r.actual.clone().ok_or_else(conflict))
                                 .collect::<io::Result<Vec<_>>>()?;
                             compare_network_ack(
-                                &network.current,
+                                (&network.current, false),
                                 &sampled,
                                 &facts.dns,
                                 r.baseline.snapshot(),
@@ -6746,7 +6760,57 @@ pub(crate) mod native {
                         .as_ref()
                         .ok_or_else(conflict)?
                         .inspect_window(|window| {
-                            n.inspect_in_window(window, sample).map_err(native_denied)
+                            let ack = r.network_ack.acknowledgements().map_err(native_denied)?;
+                            let dns_history = r
+                                .network_ack
+                                .dns_exchange_history()
+                                .map_err(native_denied)?;
+                            let observed = n
+                                .inspect_in_window(window, |facts| {
+                                    let mut rows = std::collections::BTreeMap::new();
+                                    for fact in facts
+                                        .routes
+                                        .current
+                                        .iter()
+                                        .chain(facts.routes.pending.iter().flatten())
+                                    {
+                                        let key =
+                                            (fact.expected.destination, fact.expected.interface);
+                                        if rows
+                                            .insert(key, fact.actual.clone())
+                                            .is_some_and(|previous| previous != fact.actual)
+                                        {
+                                            return Err(conflict());
+                                        }
+                                    }
+                                    let sampled = rows.into_values().flatten().collect::<Vec<_>>();
+                                    let observed = pair::NetworkSnapshot {
+                                        routes: sampled
+                                            .iter()
+                                            .map(|row| row.route.clone())
+                                            .collect(),
+                                        dns: Some(facts.dns.clone()),
+                                    };
+                                    compare_network_ack(
+                                        (&observed, true),
+                                        &sampled,
+                                        &facts.dns,
+                                        r.baseline.snapshot(),
+                                        &ack.0,
+                                        &dns_history,
+                                    )?;
+                                    Ok(observed)
+                                })
+                                .map_err(native_denied)?;
+                            if r.network_ack.acknowledgements().map_err(native_denied)? != ack
+                                || r.network_ack
+                                    .dns_exchange_history()
+                                    .map_err(native_denied)?
+                                    != dns_history
+                            {
+                                return Err(native_denied(()));
+                            }
+                            Ok(observed)
                         })
                         .map_err(denied)
                 } else {
@@ -6951,7 +7015,7 @@ pub(crate) mod native {
                                     .map(|r| r.actual.clone().ok_or_else(conflict))
                                     .collect::<io::Result<Vec<_>>>()?;
                                 compare_network_ack(
-                                    expected,
+                                    (expected, false),
                                     &sampled,
                                     &facts.dns,
                                     r.baseline.snapshot(),

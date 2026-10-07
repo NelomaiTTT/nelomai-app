@@ -109,7 +109,10 @@ impl RowIo for NativeRowIo {
     }
     fn create(&mut self, row: &Row) -> io::Result<()> {
         let row = encode_row(row)?;
-        status(unsafe { CreateIpForwardEntry2(&row) })
+        status(unsafe { CreateIpForwardEntry2(&row) })?;
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::route_created();
+        Ok(())
     }
     fn delete(&mut self, row: &Row) -> io::Result<()> {
         let row = encode_row(row)?;

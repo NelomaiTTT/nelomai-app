@@ -1133,6 +1133,12 @@ fn compare_dns_read(
         .ok_or_else(conflict)?;
     // A post-effect target is covered only by the SDK ACK retained before the
     // owner returned to Source. Pending/native equality supplies no receipt.
+    if record.phase == pair::Phase::Closing {
+        if n.baseline.dns.as_ref() == Some(actual) || attempts.last() == Some(actual) {
+            return Ok(());
+        }
+        return Err(conflict());
+    }
     if actual == before || (actual == after && attempts.last() == Some(actual)) {
         Ok(())
     } else {
@@ -1198,6 +1204,7 @@ fn compare_journal(
     record: &pair::Record,
     journal: &NetworkJournal,
     cleanup: bool,
+    prior: Option<(&NetworkJournal, &[Row])>,
 ) -> io::Result<()> {
     let n = record.network.as_ref().ok_or_else(conflict)?;
     let target = n.pending.as_ref().ok_or_else(conflict)?;
@@ -1207,16 +1214,55 @@ fn compare_journal(
     let actual = routes_by_key(&current)?;
     let view = journal.read_view()?;
     if cleanup {
-        if !n.baseline.routes.is_empty() {
+        if !n.baseline.routes.is_empty() || target != &n.baseline {
             return Err(conflict());
         }
-        if current
-            .iter()
-            .any(|r| before.get(&key(r)).is_none_or(|known| *known != r))
-            || pending.as_ref().is_some_and(|r| !r.is_empty())
-            || (view.stopping() && view.pending_active().is_some())
-        {
-            return Err(conflict());
+        if let Some((old, rows)) = prior {
+            let (old_current, old_pending) = journal_routes(old)?;
+            let old_view = old.read_view()?;
+            let same_stopping = view.stopping()
+                && current == old_current
+                && pending == old_pending
+                && view.recorded_active() == old_view.recorded_active()
+                && view.pending_active() == old_view.pending_active();
+            let old_current_by_key = routes_by_key(&old_current)?;
+            let old_pending_by_key = routes_by_key(old_pending.as_deref().unwrap_or(&[]))?;
+            let observed = rows
+                .iter()
+                .filter(|row| {
+                    old_current_by_key.contains_key(&key(&row.route))
+                        || old_pending_by_key.contains_key(&key(&row.route))
+                })
+                .map(|row| row.route.clone())
+                .collect::<Vec<_>>();
+            let normalized = old_view.stopping()
+                && old_pending.is_some()
+                && view.stopping()
+                && pending.is_none()
+                && view.recorded_active().is_none()
+                && actual == routes_by_key(&observed)?
+                && observed.iter().all(|route| {
+                    old_current_by_key.get(&key(route)).copied() == Some(route)
+                        || old_pending_by_key.get(&key(route)).copied() == Some(route)
+                });
+            let empty_pending = old_view.stopping()
+                && old_pending.is_none()
+                && view.stopping()
+                && current == old_current
+                && view.recorded_active() == old_view.recorded_active()
+                && pending.as_ref().is_some_and(Vec::is_empty)
+                && view.pending_active().is_none();
+            let empty_commit = old_view.stopping()
+                && old_pending.as_ref().is_some_and(Vec::is_empty)
+                && old_view.pending_active().is_none()
+                && view.stopping()
+                && current.is_empty()
+                && pending.is_none()
+                && view.recorded_active().is_none()
+                && observed.is_empty();
+            if !(same_stopping || normalized || empty_pending || empty_commit) {
+                return Err(conflict());
+            }
         }
     } else if view.stopping()
         || (actual != before && actual != after)
@@ -1252,6 +1298,16 @@ fn compare_route_effect(
     }
     let (current, pending) = journal_routes(journal)?;
     let pending = pending.ok_or_else(conflict)?;
+    if record.phase == pair::Phase::Closing {
+        let view = journal.read_view()?;
+        if !matches!(kind, RouteEffect::Delete)
+            || !view.stopping()
+            || !pending.is_empty()
+            || view.pending_active().is_some()
+        {
+            return Err(conflict());
+        }
+    }
     let before = current.iter().find(|r| key(r) == key(&row.route));
     let after = pending.iter().find(|r| key(r) == key(&row.route));
     let values = actual
@@ -1348,17 +1404,38 @@ fn compare_route_reads(
         if members.contains(&row.route.interface) {
             compare_route_ack(attempts, row)?;
         }
-        if row.route.interface == c.index
-            && (row.route.destination != record.addresses[0]
-                || row.route.gateway.is_some()
-                || row.flags[0] != 1)
-        {
-            #[cfg(all(windows, test))]
-            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                "network gate carrier route denied row={row:?} carrier={c:?} vip={}",
-                record.addresses[0]
-            ));
-            return Err(conflict());
+        if row.route.interface == c.index || row.luid == c.luid {
+            let same_carrier = row.route.interface == c.index
+                && row.luid == c.luid
+                && row.route.scope == RouteScope::WindowsInterface(c.index);
+            let vip = row.route.destination == record.addresses[0]
+                && row.route.gateway.is_none()
+                && row.flags[0] == 1;
+            let control = (row.route.destination
+                == "224.0.0.0/4".parse::<ipnet::IpNet>().map_err(denied)?
+                || row.route.destination
+                    == "255.255.255.255/32"
+                        .parse::<ipnet::IpNet>()
+                        .map_err(denied)?)
+                && row.route.gateway.is_none()
+                && row.protocol == 2
+                && row.origin == 1
+                && row.flags == [0, 1, 0, 0]
+                && row.site_prefix_length == 0
+                && row.valid_lifetime == u32::MAX
+                && row.preferred_lifetime == u32::MAX;
+            if !same_carrier || !(vip || control) {
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                    "network gate carrier routes denied rows={:?} carrier={c:?} vip={}",
+                    actual
+                        .iter()
+                        .filter(|row| row.route.interface == c.index || row.luid == c.luid)
+                        .collect::<Vec<_>>(),
+                    record.addresses[0]
+                ));
+                return Err(conflict());
+            }
         }
     }
     Ok(())
@@ -3397,7 +3474,7 @@ pub(crate) mod native {
             // require a protected child pending plan, so it grants no writes.
             let empty = NetworkJournal::default();
             let journal = saved.as_ref().map(|r| &r.journal).unwrap_or(&empty);
-            compare_journal(&selected.record, journal, cleanup)?;
+            compare_journal(&selected.record, journal, cleanup, None)?;
             compare_route_reads(&selected.record, journal, &attempts, physical.rows())?;
             compare_dns_read(&selected.record, &network.dns, &dns_acks)?;
             for lease in &obligations {
@@ -3482,7 +3559,12 @@ pub(crate) mod native {
                     )?;
                 }
                 Effect::PublishNetwork(next) => {
-                    compare_journal(&selected.record, next, cleanup)?;
+                    compare_journal(
+                        &selected.record,
+                        next,
+                        cleanup,
+                        Some((journal, physical.rows())),
+                    )?;
                     compare_route_reads(&selected.record, next, &attempts, physical.rows())?;
                     let (current, pending) = journal_routes(next)?;
                     if pending.is_none() {

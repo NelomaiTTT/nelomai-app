@@ -1610,7 +1610,18 @@ fn dns_before_or_after_coverage_never_converts_target_equality_to_ack() {
     let mut foreign = after.clone();
     foreign.settings.search_list = Some("foreign.example".into());
     assert!(compare_dns_read(&r, &foreign, std::slice::from_ref(after)).is_err());
+    let mut closing = r.clone();
+    closing.phase = pair::Phase::Closing;
+    closing.operation = None;
+    closing.stop_stage = 2;
+    closing.pending = Some(pair::Effect::RestoreNetwork);
+    closing.network.as_mut().unwrap().current = n.baseline.clone();
+    closing.network.as_mut().unwrap().pending = Some(n.baseline.clone());
+    assert!(compare_dns_read(&closing, after, std::slice::from_ref(after)).is_ok());
+    assert!(compare_dns_read(&closing, after, &[]).is_err());
+    assert!(compare_dns_read(&closing, before, std::slice::from_ref(after)).is_ok());
 }
+
 // Break: reentry/unwind/caught nested errors restore forward authorization or erase an outstanding cleanup obligation.
 #[test]
 fn gate_fence_is_sticky_on_nested_denial_and_unwind() {
@@ -1788,14 +1799,126 @@ fn route_delete_needs_same_owner_sdk_ack_even_when_native_equals_journal() {
         NativeProof { index: 8, luid: 91 }
     )
     .is_err());
+    assert!(compare_route_effect(
+        &r,
+        &pending,
+        &ack,
+        &actual,
+        &row,
+        RouteEffect::Set,
+        NativeProof { index: 8, luid: 91 }
+    )
+    .is_err());
 }
 // Break: truncating a pending journal, selecting wrong active slot or importing a preexisting original route.
 #[test]
 fn child_journal_covers_whole_plan_without_adoption() {
     let (_, r) = fixture();
     let target = &r.network.as_ref().unwrap().pending.as_ref().unwrap().routes;
-    assert!(compare_journal(&r, &journal(&[], Some(target), false), false).is_ok());
-    assert!(compare_journal(&r, &journal(&[], Some(&target[..3]), false), false).is_err());
+    assert!(compare_journal(&r, &journal(&[], Some(target), false), false, None).is_ok());
+    assert!(compare_journal(&r, &journal(&[], Some(&target[..3]), false), false, None).is_err());
+    let mut closing = r.clone();
+    closing.phase = pair::Phase::Closing;
+    closing.operation = None;
+    closing.stop_stage = 2;
+    closing.pending = Some(pair::Effect::RestoreNetwork);
+    let baseline = closing.network.as_ref().unwrap().baseline.clone();
+    closing.network.as_mut().unwrap().current.routes = target[..1].to_vec();
+    closing.network.as_mut().unwrap().pending = Some(baseline);
+    assert!(
+        compare_journal(&closing, &journal(&[], Some(target), true), true, None).is_ok(),
+        "Stopping must retain the unapplied part of the authentic child WAL"
+    );
+    let interrupted = journal(&[], Some(target), false);
+    let stopping = journal(&[], Some(target), true);
+    let row = Row::static_route(target[2].clone(), NativeProof { index: 8, luid: 91 });
+    let actual = std::slice::from_ref(&row);
+    closing.network.as_mut().unwrap().current.routes = vec![row.route.clone()];
+    let mut ack = vec![RouteAttempt {
+        row: row.clone(),
+        deleting: false,
+        acknowledged: true,
+    }];
+    assert!(compare_route_reads(&closing, &interrupted, &ack, actual).is_ok());
+    assert!(compare_journal(&closing, &stopping, true, Some((&interrupted, actual))).is_ok());
+    let normalized = journal(std::slice::from_ref(&row.route), None, true);
+    assert!(compare_journal(&closing, &normalized, true, Some((&stopping, actual))).is_ok());
+    assert!(compare_route_reads(&closing, &normalized, &ack, actual).is_ok());
+    assert!(
+        compare_journal(
+            &closing,
+            &journal(&[], None, true),
+            true,
+            Some((&stopping, actual))
+        )
+        .is_err(),
+        "normalization cannot omit a still-present acknowledged key"
+    );
+    assert!(
+        compare_journal(
+            &closing,
+            &journal(target, None, true),
+            true,
+            Some((&stopping, actual))
+        )
+        .is_err(),
+        "unapplied child targets do not become current owned rows"
+    );
+    let mut unknown = ack.clone();
+    unknown[0].acknowledged = false;
+    assert!(compare_route_reads(&closing, &stopping, &unknown, actual).is_err());
+    let mut foreign = row.clone();
+    foreign.protocol += 1;
+    assert!(compare_route_reads(&closing, &stopping, &ack, &[foreign]).is_err());
+    let mut empty_target =
+        serde_json::to_value(journal(std::slice::from_ref(&row.route), Some(&[]), true)).unwrap();
+    empty_target["pending"]["active"] = serde_json::Value::Null;
+    let empty_target: NetworkJournal = serde_json::from_value(empty_target).unwrap();
+    assert!(compare_journal(&closing, &empty_target, true, Some((&normalized, actual))).is_ok());
+    assert!(compare_route_effect(
+        &closing,
+        &empty_target,
+        &ack,
+        actual,
+        &row,
+        RouteEffect::Delete,
+        NativeProof { index: 8, luid: 91 }
+    )
+    .is_ok());
+    assert!(
+        compare_journal(
+            &closing,
+            &journal(&[], None, true),
+            true,
+            Some((&empty_target, actual))
+        )
+        .is_err(),
+        "empty commit requires actual route absence"
+    );
+    ack.push(RouteAttempt {
+        row: row.clone(),
+        deleting: true,
+        acknowledged: true,
+    });
+    assert!(compare_route_reads(&closing, &empty_target, &ack, &[]).is_ok());
+    let committed = journal(&[], None, true);
+    assert!(compare_journal(&closing, &committed, true, Some((&empty_target, &[]))).is_ok());
+    assert!(compare_route_reads(&closing, &committed, &ack, &[]).is_ok());
+    for fault in 0..5 {
+        let mut value = serde_json::to_value(&normalized).unwrap();
+        match fault {
+            0 => value["stopping"] = serde_json::json!(false),
+            1 => value["active"] = serde_json::json!("A"),
+            2 => value["pending"] = serde_json::to_value(&stopping).unwrap()["pending"].clone(),
+            3 => value["owned"][0]["original"] = value["owned"][0]["current"].clone(),
+            _ => value["owned"][0]["current"]["Route"]["metric"] = serde_json::json!(999),
+        }
+        let bad: NetworkJournal = serde_json::from_value(value).unwrap();
+        assert!(
+            compare_journal(&closing, &bad, true, Some((&stopping, actual))).is_err(),
+            "cleanup role fault {fault}"
+        );
+    }
     let base = serde_json::to_value(journal(&[], Some(target), false)).unwrap();
     for fault in 0..4 {
         let mut value = base.clone();
@@ -1809,7 +1932,7 @@ fn child_journal_covers_whole_plan_without_adoption() {
             _ => value["pending"]["target"][0]["current"] = serde_json::json!({"LinkDnsRoute":8}),
         }
         let bad = serde_json::from_value(value).unwrap();
-        assert!(compare_journal(&r, &bad, false).is_err());
+        assert!(compare_journal(&r, &bad, false, None).is_err());
     }
 }
 // Break: treating protected before/after routes as proof that native effects succeeded.
@@ -1830,6 +1953,59 @@ fn route_reads_require_every_present_key_ack_and_reject_extra_member_rows() {
     assert!(compare_route_reads(&r, &pending, &ack, &rows).is_err());
     rows[1].route.destination = "203.0.113.7/32".parse().unwrap();
     assert!(compare_route_reads(&r, &pending, &ack, &rows).is_err());
+    let c = r.carrier.unwrap();
+    let mut multicast = Row::static_route(
+        RouteValue {
+            destination: "224.0.0.0/4".parse().unwrap(),
+            scope: RouteScope::WindowsInterface(c.index),
+            interface: c.index,
+            gateway: None,
+            metric: 256,
+        },
+        NativeProof {
+            index: c.index,
+            luid: c.luid,
+        },
+    );
+    multicast.protocol = 2;
+    multicast.origin = 1;
+    multicast.flags = [0, 1, 0, 0];
+    assert!(
+        compare_route_reads(&r, &pending, &ack, &[row.clone(), multicast.clone()]).is_ok(),
+        "an allowed C control-route observation supplies no route ownership"
+    );
+    let mut broadcast = multicast.clone();
+    broadcast.route.destination = "255.255.255.255/32".parse().unwrap();
+    assert!(compare_route_reads(&r, &pending, &ack, &[row.clone(), broadcast]).is_ok());
+    let mut varied_metric = multicast.clone();
+    varied_metric.route.metric += 1;
+    assert!(compare_route_reads(&r, &pending, &ack, &[row.clone(), varied_metric]).is_ok());
+    for fault in 0..17 {
+        let mut foreign = multicast.clone();
+        match fault {
+            0 => foreign.luid += 1,
+            1 => foreign.route.interface += 1,
+            2 => foreign.route.scope = RouteScope::Global,
+            3 => foreign.route.gateway = Some("192.0.2.1".parse().unwrap()),
+            4 => foreign.route.destination = "0.0.0.0/0".parse().unwrap(),
+            5 => foreign.route.destination = "1.1.1.1/32".parse().unwrap(),
+            6 => foreign.route.destination = "10.7.0.0/24".parse().unwrap(),
+            7 => foreign.route.destination = "10.7.0.255/32".parse().unwrap(),
+            8 => foreign.route.destination = "ff00::/8".parse().unwrap(),
+            9 => foreign.protocol = 3,
+            10 => foreign.origin = 0,
+            11 => foreign.flags[0] = 1,
+            12 => foreign.site_prefix_length = 1,
+            13 => foreign.valid_lifetime -= 1,
+            14 => foreign.preferred_lifetime -= 1,
+            15 => foreign.flags[1] = 0,
+            _ => foreign.flags[2] = 1,
+        }
+        assert!(
+            compare_route_reads(&r, &pending, &ack, &[row.clone(), foreign]).is_err(),
+            "C control row fault {fault}"
+        );
+    }
 }
 
 fn resource_records(c: &Context, r: &pair::Record) -> [Option<rows::Record>; 3] {

@@ -2748,7 +2748,7 @@ fn network_ack_unknown_dns_attempt_is_not_never_exchanged_or_restored() {
         acknowledged: true,
     }];
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone()],
         &dns,
         &dns,
@@ -2757,7 +2757,7 @@ fn network_ack_unknown_dns_attempt_is_not_never_exchanged_or_restored() {
     )
     .is_ok());
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone()],
         &dns,
         &dns,
@@ -2766,7 +2766,7 @@ fn network_ack_unknown_dns_attempt_is_not_never_exchanged_or_restored() {
     )
     .is_err());
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone()],
         &dns,
         &dns,
@@ -2774,10 +2774,38 @@ fn network_ack_unknown_dns_attempt_is_not_never_exchanged_or_restored() {
         &(1, vec![dns.clone()])
     )
     .is_ok());
+    let prior = dns.with_servers(&["8.8.8.8".parse().unwrap()]).unwrap();
+    assert!(compare_network_ack(
+        (&expected, true),
+        &[row.clone()],
+        &dns,
+        &dns,
+        &attempts,
+        &(1, vec![prior.clone()])
+    )
+    .is_ok());
+    assert!(compare_network_ack(
+        (&expected, false),
+        &[row.clone()],
+        &dns,
+        &dns,
+        &attempts,
+        &(1, vec![prior])
+    )
+    .is_err());
+    assert!(compare_network_ack(
+        (&expected, true),
+        &[row.clone()],
+        &dns,
+        &dns,
+        &attempts,
+        &(1, vec![])
+    )
+    .is_err());
     let mut changed = dns.clone();
     changed.settings.domain = Some("foreign".into());
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row],
         &changed,
         &dns,
@@ -2803,7 +2831,7 @@ fn network_ack_requires_exact_full_original_sdk_row_not_equal_route_value() {
             _ => foreign.valid_lifetime -= 1,
         }
         assert!(compare_network_ack(
-            &expected,
+            (&expected, false),
             &[foreign],
             &dns,
             &dns,
@@ -2815,7 +2843,7 @@ fn network_ack_requires_exact_full_original_sdk_row_not_equal_route_value() {
     let mut unknown = ack.clone();
     unknown.acknowledged = false;
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone()],
         &dns,
         &dns,
@@ -2823,10 +2851,24 @@ fn network_ack_requires_exact_full_original_sdk_row_not_equal_route_value() {
         &(0, vec![])
     )
     .is_err());
+    let mut empty = expected.clone();
+    empty.routes.clear();
+    assert!(
+        compare_network_ack(
+            (&empty, false),
+            &[],
+            &dns,
+            &dns,
+            std::slice::from_ref(&ack),
+            &(0, vec![])
+        )
+        .is_err(),
+        "a retained latest creation cannot disappear from Closing observation"
+    );
     let mut deleted = ack;
     deleted.deleting = true;
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone()],
         &dns,
         &dns,
@@ -2835,7 +2877,7 @@ fn network_ack_requires_exact_full_original_sdk_row_not_equal_route_value() {
     )
     .is_err());
     assert!(compare_network_ack(
-        &expected,
+        (&expected, false),
         &[row.clone(), row],
         &dns,
         &dns,

@@ -104,6 +104,8 @@ fn read_family(family: Family) -> io::Result<Vec<Row>> {
         return Ok(Vec::new());
     }
     status(code)?;
+    #[cfg(test)]
+    super::member_carrier_factory_test_os::route_table_read()?;
     // Allocation belongs to IPHelper and remains live until decoding completes.
     unsafe { decode_table(memory.0, family) }
 }

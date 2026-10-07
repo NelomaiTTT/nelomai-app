@@ -43,6 +43,8 @@ struct Inputs {
     adapter_reference_releases: usize,
     adapter_reference_original: Option<Weak<NativeKernelReferenceRead>>,
     adapter_create_attempts: usize,
+    route_postflight_fault: Option<bool>,
+    route_postflight_fault_reached: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativePublication {
@@ -156,6 +158,31 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                 panic!("fixture filesystem publication ACK unwind");
             }
             return Err(io::Error::other("fixture filesystem publication ACK lost"));
+        }
+        Ok(())
+    })
+}
+// Only external SDK/table boundaries. The successful native create returns
+// unchanged so its real owner retains the ACK before a later table-read fault.
+pub(crate) fn route_created() {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            if inputs.route_postflight_fault == Some(false) {
+                inputs.route_postflight_fault = Some(true);
+            }
+        }
+    });
+}
+pub(crate) fn route_table_read() -> io::Result<()> {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            if inputs.route_postflight_fault == Some(true) {
+                inputs.route_postflight_fault = None;
+                inputs.route_postflight_fault_reached = true;
+                return Err(io::Error::other(
+                    "fixture route table read after native create ACK",
+                ));
+            }
         }
         Ok(())
     })
@@ -489,6 +516,8 @@ impl Fixture {
                 adapter_reference_releases: 0,
                 adapter_reference_original: None,
                 adapter_create_attempts: 0,
+                route_postflight_fault: None,
+                route_postflight_fault_reached: false,
             })
         });
         // Real private-directory/ancestor/lock/CAS implementation creates state.
@@ -607,6 +636,26 @@ impl Fixture {
     pub(crate) fn lose_ack(&self, target: member_files::PrivateFile, unwind: bool) {
         INPUTS.with(|inputs| {
             inputs.borrow_mut().as_mut().expect("fixture inputs").fault = Some((target, unwind))
+        });
+    }
+    pub(crate) fn lose_route_postflight(&self) {
+        INPUTS.with(|inputs| {
+            inputs
+                .borrow_mut()
+                .as_mut()
+                .expect("fixture inputs")
+                .route_postflight_fault = Some(false);
+        });
+    }
+    pub(crate) fn require_route_postflight_fault(&self) {
+        INPUTS.with(|inputs| {
+            let inputs = inputs.borrow();
+            let inputs = inputs.as_ref().expect("fixture inputs");
+            assert!(
+                inputs.route_postflight_fault_reached,
+                "actual successful route create/table fault not reached"
+            );
+            assert!(inputs.route_postflight_fault.is_none());
         });
     }
     pub(crate) fn lose_native_publication_ack(&self, target: NativePublication, unwind: bool) {

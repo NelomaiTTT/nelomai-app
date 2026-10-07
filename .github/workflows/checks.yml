@@ -290,6 +290,7 @@ jobs:
       matrix:
         case:
           - primary
+          - network-route-postflight
           - module-load-read-error
           - module-load-read-unwind
           - resolver-reference-error

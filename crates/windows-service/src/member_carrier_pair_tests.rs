@@ -2701,6 +2701,33 @@ fn switch_partial_or_lost_ack_never_publishes_target_or_resumes() {
             p.stop(&scope()).unwrap();
         }
     }
+    for foreign in [false, true] {
+        let (mut p, s) = running();
+        let current = p.record.network.as_ref().unwrap().current.clone();
+        let mut target = current.clone();
+        target.routes[0].metric += 1;
+        let mut additional = target.routes[0].clone();
+        additional.destination = "203.0.113.7/32".parse().unwrap();
+        target.routes.push(additional.clone());
+        p.record.network.as_mut().unwrap().pending = Some(target);
+        let mut observed = current;
+        observed.routes.push(additional);
+        if foreign {
+            observed.routes[1].metric += 1;
+        }
+        s.borrow_mut().network = observed;
+        s.borrow_mut().disk = Some(p.record.clone());
+        let result = p.stop(&scope());
+        if foreign {
+            assert!(result.is_err());
+            assert!(!s.borrow().counts.contains_key("restore-network"));
+            assert_eq!(p.snapshot().stop_stage, 2);
+        } else {
+            result.expect("per-key interrupted Network projection must restore baseline");
+            assert_eq!(p.snapshot().phase, Phase::Stopped);
+            assert!(s.borrow().network.routes.is_empty());
+        }
+    }
 }
 #[test]
 fn unacknowledged_native_c_creation_is_never_adopted_or_blindly_deleted() {

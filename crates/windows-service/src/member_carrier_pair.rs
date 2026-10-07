@@ -1410,9 +1410,37 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             return Ok(());
         };
         let observed = self.io.borrow_mut().read_network(&self.record)?;
-        if observed != state.current
-            && Some(&observed) != state.pending.as_ref()
-            && observed != state.baseline
+        validate_network(&self.record, &observed, false)?;
+        let snapshots = [
+            &state.baseline,
+            &state.current,
+            state.pending.as_ref().unwrap_or(&state.baseline),
+        ];
+        let known_routes = snapshots.map(|snapshot| {
+            snapshot
+                .routes
+                .iter()
+                .map(|route| ((route.destination, route.interface), route))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        });
+        let observed_routes = observed
+            .routes
+            .iter()
+            .map(|route| ((route.destination, route.interface), route))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let keys = known_routes
+            .iter()
+            .flat_map(|routes| routes.keys())
+            .chain(observed_routes.keys())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !snapshots
+            .iter()
+            .any(|snapshot| snapshot.dns == observed.dns)
+            || keys.into_iter().any(|key| {
+                !known_routes
+                    .iter()
+                    .any(|routes| routes.get(key) == observed_routes.get(key))
+            })
         {
             return Err(failed());
         }
