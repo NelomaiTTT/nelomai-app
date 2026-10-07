@@ -2157,7 +2157,31 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
             })?;
         authorize(&stopping, &after).inspect_err(|_error| {
             #[cfg(all(windows, test))]
-            eprintln!("actual native owner stop postStop identity slot={slot:?}: {_error:?}");
+            eprintln!(
+                "actual native owner stop postStop identity slot={slot:?}: {_error:?}; alternative_service_present={} config={} service_absent={} service_spec_matches={} process={} interface={} retained_interfaces={} retained_interfaces_mismatch={}",
+                after.alternative_service_present,
+                match after.config_sha256 {
+                    None => "absent",
+                    Some(hash) if hash == stopping.intent.config_sha256 => "match",
+                    Some(_) => "mismatch",
+                },
+                after.service.is_none(),
+                after.service.as_ref().is_some_and(|service| service.exact_spec),
+                match after.service.as_ref().and_then(|service| service.process) {
+                    None => "absent",
+                    Some(process) if stopping.proof.is_some_and(|proof| process == proof.process) => "match",
+                    Some(_) => "mismatch",
+                },
+                match after.interface {
+                    None => "absent",
+                    Some(interface) if stopping.proof.is_some_and(|proof| interface == proof.interface) => "match",
+                    Some(_) => "mismatch",
+                },
+                after.retained_interfaces.len(),
+                after.retained_interfaces.iter().any(|interface| {
+                    stopping.proof.is_none_or(|proof| *interface != proof.interface)
+                }),
+            );
         })?;
         if after.service.is_some()
             || after.interface.is_some()
