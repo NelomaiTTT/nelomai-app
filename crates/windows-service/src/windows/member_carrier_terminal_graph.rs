@@ -554,13 +554,9 @@ pub(crate) mod native {
                     // is reconstructed from empty fields or module ordinals.
                     unsafe {
                         canonical.with_originals_mut(|original| {
+                            let mut modules = modules.try_borrow_mut().map_err(|_| conflict())?;
                             let shell = original.startup.take().ok_or_else(conflict)?;
-                            modules
-                                .try_borrow_mut()
-                                .map_err(|_| conflict())?
-                                .retained_mut()
-                                .startup_shells
-                                .push(shell);
+                            modules.retained_mut().startup_shells.push(shell);
                             Ok(())
                         })?;
                     }
@@ -1314,6 +1310,17 @@ pub(crate) mod native {
                         .as_mut()
                         .ok_or_else(conflict)?;
                     let mut modules = self.modules.try_borrow_mut().map_err(|_| conflict())?;
+                    // Keep the SAME drained Startup wrapper outside T through
+                    // actual module ACK and whole root release, as in pregraph.
+                    // SAFETY: the destination is borrowed BEFORE taking the
+                    // original; no fallible call separates take from retention.
+                    unsafe {
+                        canonical.with_originals_mut(|originals| {
+                            let shell = originals.startup.take().ok_or_else(conflict)?;
+                            modules.retained_mut().startup_shells.push(shell);
+                            Ok(())
+                        })?;
+                    }
                     separate_modules(
                         raw.carrier.as_mut(),
                         raw.assembly.as_mut(),
