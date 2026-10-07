@@ -614,7 +614,17 @@ pub(crate) mod native {
                     .map_err(|_| Error::Conflict)
             };
             pins()?;
-            self.carrier.verify_owner(owner)?;
+            let carrier = &self.carrier.0;
+            let layout = carrier.installed.layout();
+            if layout.identity != carrier.identity
+                || layout.directory != carrier.directory
+                || std::fs::canonicalize(layout.engine_path()).map_err(|_| Error::Native)?
+                    != carrier.executable
+                || layout.engine_path().with_file_name(carrier.kind.path())
+                    != carrier.payload.path()
+            {
+                return Err(Error::Conflict);
+            }
             pins()
         }
         pub(in crate::windows) fn verify_runtime_binding(
