@@ -748,7 +748,11 @@ pub(crate) mod native {
             effect: bool,
             call: impl FnOnce(&pair::Record) -> io::Result<T>,
         ) -> Result<T> {
-            self.continuity(selected)?;
+            compare_pair(&self.context, &selected.record)?;
+            cancellation(&selected.record, self.cancelled.load(Ordering::Acquire))?;
+            if !selected.pair.matches_runtime(&self.runtime) {
+                return Err(GuardError::Conflict);
+            }
             let check = |actual: &pair::Record| {
                 if actual != &selected.record {
                     return Err(io_denied(()));

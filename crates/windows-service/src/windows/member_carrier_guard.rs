@@ -1384,6 +1384,8 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
         desired: &Model,
         cleanup: bool,
     ) -> Result<Model> {
+        #[cfg(all(windows, test))]
+        use crate::windows::member_carrier_factory_test_os::trace_step;
         let validation = crate::member_carrier_guard::validate_session_exchange(
             &self.scope,
             expected,
@@ -1416,7 +1418,10 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
         let pending = &mut self.pending;
         let attestor = &mut self.attestor;
         let staged = transaction(&mut self.io, kind, false, |io| {
-            let actual = read_locked(io, attestor, scope, kind, ids)?;
+            let actual = read_locked(io, attestor, scope, kind, ids).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard exchange expected read: {_error:?}"));
+            })?;
             if actual != expected.expected {
                 return Err(GuardError::Conflict);
             }
@@ -1430,9 +1435,17 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                     failed_read: false,
                     _serialized: std::marker::PhantomData,
                 };
-                attestor.authorize(kind, expected, desired, &mut locked)?;
+                attestor
+                    .authorize(kind, expected, desired, &mut locked)
+                    .inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        trace_step(&format!("guard exchange authorize: {_error:?}"));
+                    })?;
                 if desired.permits {
-                    locked.priority_barrier()?;
+                    locked.priority_barrier().inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        trace_step(&format!("guard exchange priority barrier: {_error:?}"));
+                    })?;
                 }
                 if locked.failed_read {
                     return Err(GuardError::Conflict);
@@ -1486,7 +1499,10 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                     ids.insert(new.key, id); // Retained even on ambiguous commit; NO adoption.
                 }
             }
-            let actual = read_locked(io, attestor, scope, kind, ids)?;
+            let actual = read_locked(io, attestor, scope, kind, ids).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard exchange post-effect read: {_error:?}"));
+            })?;
             // Creation captures FULL assigned priority in this creating write
             // transaction. No later recovery read is allowed to learn it.
             let captured = desired.readback_after(expected, &actual)?;
@@ -1495,7 +1511,11 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
         });
         let captured = match staged {
             Ok(m) => m,
-            Err(e) => return self.fail(e),
+            Err(e) => {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard exchange staged transaction: {e:?}"));
+                return self.fail(e);
+            }
         };
         let readback = self.read_snapshot(); // serialized independent committed read.
         match readback {
@@ -1508,7 +1528,11 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                 Ok(captured)
             }
             Ok(_) => self.fail(GuardError::Conflict),
-            Err(e) => self.fail(e),
+            Err(e) => {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard exchange committed readback: {e:?}"));
+                self.fail(e)
+            }
         }
     }
     fn compare_snapshot(&self, actual: &Snapshot, was_failed: bool) -> Result<()> {

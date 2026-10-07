@@ -300,6 +300,30 @@ pub(crate) mod native {
     };
     include!("member_carrier_wintun_original.rs");
 
+    #[cfg(all(windows, test))]
+    unsafe extern "system" fn native_error_logger(level: i32, timestamp: u64, message: *const u16) {
+        let _ = std::panic::catch_unwind(|| {
+            if level != 2 || message.is_null() {
+                return;
+            }
+            let mut text = Vec::new();
+            for offset in 0..2048 {
+                // Vendor callback supplies a live null-terminated LPCWSTR.
+                let unit = unsafe { message.add(offset).read() };
+                if unit == 0 {
+                    break;
+                }
+                text.push(unit);
+            }
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "actual Wintun SDK error timestamp={timestamp}: {}",
+                String::from_utf16_lossy(&text)
+            );
+        });
+    }
+
     /// Independent privileged capability contract, NOT a record-derived fact.
     /// No production implementation is supplied; factory stays disconnected.
     ///
@@ -884,6 +908,21 @@ pub(crate) mod native {
                 prerequisite.new_key_ack,
                 prerequisite.mutation_lock,
             )?;
+            #[cfg(all(windows, test))]
+            if crate::windows::member_carrier_factory_test_os::state().is_some() {
+                if let Some(raw) = unsafe {
+                    GetProcAddress(
+                        self.module.module.as_ptr(),
+                        c"WintunSetLogger".as_ptr().cast(),
+                    )
+                } {
+                    // SAME authenticated resident adapter-reference pin; not the test resolver.
+                    let set_logger: unsafe extern "system" fn(
+                        Option<unsafe extern "system" fn(i32, u64, *const u16)>,
+                    ) = unsafe { std::mem::transmute(raw) };
+                    unsafe { set_logger(Some(native_error_logger)) };
+                }
+            }
             let name: Vec<u16> = binding.name.encode_utf16().chain(Some(0)).collect();
             let kind: Vec<u16> = binding.tunnel_type.encode_utf16().chain(Some(0)).collect();
             let guid = Guid::new(binding.guid);
