@@ -221,68 +221,6 @@ fn capture_record_is_exact_original_starting_before_every_network_child() {
         );
     }
 }
-// Break: refusing truthful untouched baseline after C retirement, or treating
-// historic Pair network metadata as an SDK restoration ACK.
-#[test]
-fn retired_record_allows_no_exchange_history_or_exact_restored_network_only_at_stage_ten() {
-    let (c, mut r, carrier, b) = before_network();
-    r.phase = pair::Phase::Closing;
-    r.operation = None;
-    r.active = None;
-    r.stop_stage = 10;
-    r.pending = Some(pair::Effect::Guard);
-    r.pending_guard = Some(
-        policy::ExchangePlan::new(&r.guard, &policy::Model::empty(r.scope.clone()).unwrap())
-            .unwrap(),
-    );
-    assert!(compare_retired_record(&c, &r, &carrier, &b).is_ok());
-    let restored = pair::NetworkSnapshot {
-        routes: vec![],
-        dns: Some(b.clone()),
-    };
-    r.network = Some(pair::NetworkState {
-        baseline: restored.clone(),
-        current: restored,
-        pending: None,
-    });
-    assert!(compare_retired_record(&c, &r, &carrier, &b).is_ok());
-    for fault in 0..6 {
-        let mut x = r.clone();
-        match fault {
-            0 => x.stop_stage = 9,
-            1 => x.stop_stage = 1,
-            2 => x.pending = None,
-            3 => {
-                x.network.as_mut().unwrap().pending = Some(pair::NetworkSnapshot {
-                    routes: vec![],
-                    dns: Some(b.clone()),
-                })
-            }
-            4 => {
-                x.network
-                    .as_mut()
-                    .unwrap()
-                    .current
-                    .dns
-                    .as_mut()
-                    .unwrap()
-                    .settings
-                    .enable_llmnr = 1
-            }
-            _ => x
-                .network
-                .as_mut()
-                .unwrap()
-                .current
-                .routes
-                .push(route("1.1.1.1/32", 8, 1, None)),
-        }
-        assert!(
-            compare_retired_record(&c, &x, &carrier, &b).is_err(),
-            "fault {fault}"
-        );
-    }
-}
 // Break: a weak registration retaining the SDK root forever or replacing equal
 // baseline data with a different original capability.
 #[test]
@@ -437,44 +375,6 @@ fn initial_dns_baseline_requires_full_original_interface_and_supported_empty_set
             compare_initial(&carrier(), &facts(), &d, None).is_err(),
             "fault {fault}"
         );
-    }
-}
-// Break: inventing an exchange ACK from a zero-length ACK list after an unacknowledged SDK attempt.
-#[test]
-fn untouched_and_restored_are_distinct_and_unknown_attempts_never_become_untouched() {
-    let b = baseline();
-    let mut selected = b.clone();
-    selected.settings.name_server = Some("1.1.1.1".into());
-    assert_eq!(
-        classify_dns(&b, 0, &[]).unwrap(),
-        DnsBaselineDisposition::NeverExchanged
-    );
-    assert!(classify_dns(&b, 1, &[]).is_err());
-    assert_eq!(
-        classify_dns(&b, 2, &[selected.clone(), b.clone()]).unwrap(),
-        DnsBaselineDisposition::RestoredByLastAck
-    );
-    assert!(classify_dns(&b, 2, &[selected.clone()]).is_err());
-    assert!(classify_dns(&b, 1, &[selected]).is_err());
-    assert!(classify_dns(&b, 0, &[b.clone()]).is_err());
-}
-// Break: comparing only server text or accepting a prior baseline ACK instead of the LAST actual ACK.
-#[test]
-fn last_restore_ack_compares_every_dns_field_and_exact_original_history() {
-    let b = baseline();
-    let mut active = b.clone();
-    active.settings.name_server = Some("1.1.1.1".into());
-    assert!(classify_dns(&b, 2, &[b.clone(), active]).is_err());
-    for fault in 0..5 {
-        let mut foreign = b.clone();
-        match fault {
-            0 => foreign.interface.guid = [9; 16],
-            1 => foreign.interface.scope.runtime_generation += 1,
-            2 => foreign.settings.search_list = Some("foreign.example".into()),
-            3 => foreign.settings.flags = 2,
-            _ => foreign.settings.enable_llmnr = 1,
-        }
-        assert!(classify_dns(&b, 1, &[foreign]).is_err(), "fault {fault}");
     }
 }
 // Break: dropping first SDK capture on Err/unwind or requiring successful outer postflight to read retained facts.

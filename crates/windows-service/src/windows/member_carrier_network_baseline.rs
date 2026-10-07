@@ -1,6 +1,5 @@
-//! Original SDK DNS baseline facts for partial carrier cleanup. Factory OFF.
+//! Original SDK DNS baseline facts for partial carrier cleanup.
 //! These comparisons/read pins are never resource, DNS-write or readiness grants.
-#![allow(dead_code)]
 use super::member_carrier_network::NetworkFacts;
 #[cfg(all(test, windows))]
 use crate::windows::member_carrier_factory_test_os::trace_step;
@@ -12,11 +11,6 @@ use std::{
 };
 fn conflict() -> io::Error {
     io::Error::other("carrier_network_baseline_conflict")
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DnsBaselineDisposition {
-    NeverExchanged,
-    RestoredByLastAck,
 }
 fn validate_dns(snapshot: &dns::Snapshot) -> io::Result<()> {
     // Existing complete validator, not a decoder/default success substitute.
@@ -69,31 +63,6 @@ fn compare_initial(
     }
     Ok(())
 }
-fn classify_dns(
-    baseline: &dns::Snapshot,
-    attempts: usize,
-    acks: &[dns::Snapshot],
-) -> io::Result<DnsBaselineDisposition> {
-    validate_dns(baseline)?;
-    if attempts > 32768 || attempts != acks.len() {
-        return Err(conflict());
-    }
-    if attempts == 0 {
-        return Ok(DnsBaselineDisposition::NeverExchanged);
-    }
-    for ack in acks {
-        validate_dns(ack)?;
-        let mut nameserver_only = baseline.clone();
-        nameserver_only.settings.name_server = ack.settings.name_server.clone();
-        if ack != &nameserver_only {
-            return Err(conflict());
-        }
-    }
-    if acks.last() != Some(baseline) {
-        return Err(conflict());
-    }
-    Ok(DnsBaselineDisposition::RestoredByLastAck)
-}
 fn compare_record_origin(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
@@ -137,46 +106,6 @@ fn compare_capture_record(
         )
     {
         return Err(conflict());
-    }
-    Ok(())
-}
-fn compare_retired_record(
-    context: &crate::member_carrier_native_ownership::Context,
-    record: &crate::member_carrier_pair::Record,
-    carrier: &Carrier,
-    baseline: &dns::Snapshot,
-) -> io::Result<()> {
-    use crate::member_carrier_pair::{Effect, Phase};
-    compare_record_origin(context, record, carrier)?;
-    validate_dns(baseline)?;
-    let empty = crate::member_carrier_guard::Model::empty(record.scope.clone())
-        .map_err(io::Error::other)?;
-    if record.phase != Phase::Closing
-        || record.stop_stage != 10
-        || record.pending != Some(Effect::Guard)
-        || record.active.is_some()
-        || record.operation.is_some()
-        || !record.guard.installed
-        || record.guard.assigned_sublayer_weight.is_none()
-        || record
-            .pending_guard
-            .as_ref()
-            .is_none_or(|p| p.desired != empty)
-        || baseline.interface.scope != carrier.identity.scope
-        || baseline.interface.guid != carrier.identity.proof.guid
-        || baseline.interface.luid != carrier.identity.proof.luid
-        || baseline.interface.index != carrier.identity.proof.index
-    {
-        return Err(conflict());
-    }
-    if let Some(network) = &record.network {
-        if network.pending.is_some()
-            || network.current != network.baseline
-            || !network.baseline.routes.is_empty()
-            || network.baseline.dns.as_ref() != Some(baseline)
-        {
-            return Err(conflict());
-        }
     }
     Ok(())
 }
@@ -261,24 +190,17 @@ impl<T> Drop for CaptureFlight<'_, T> {
 pub(crate) mod native {
     use super::*;
     use crate::windows::{
-        member_carrier_guard::{Bindings, NativeGuard, Wfp, WindowBindingAttestor},
+        member_carrier_guard::{NativeGuard, Wfp, WindowBindingAttestor},
         member_carrier_key_authority::RuntimeRead,
         member_carrier_network::native::NativeNetworkRead,
-        member_carrier_network_gate::native::NativeNetworkGate,
-        member_carrier_network_owner::native::NativeNetworkAckRead,
         member_carrier_pair_store::native_store::NativePairIntentRead,
-        member_carrier_runtime::native::{
-            NativeBindingsWindow, NativeSourceRead, RetiredCarrierRead,
-        },
+        member_carrier_runtime::native::{NativeBindingsWindow, NativeSourceRead},
         member_native_deadline::{NativeDeadline, NativeDeadlineReadPin},
     };
     use crate::{member_carrier_native_ownership::Context, member_carrier_pair as pair};
-    use std::{
-        rc::Weak,
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
     };
     struct Origin<A: WindowBindingAttestor> {
         context: Context,
@@ -300,13 +222,7 @@ pub(crate) mod native {
     /// NativeNetworkRead callback. NOT a DNS exchange ACK or effect/readiness G.
     pub(crate) struct NativeNetworkBaselineRead<A: WindowBindingAttestor> {
         origin: Rc<Origin<A>>,
-        carrier: Carrier,
         snapshot: dns::Snapshot,
-    }
-    /// Concrete weak read. G stores ONLY this; actor independently retains root
-    /// or strong read. Expiry denies, not empty history or a successful default.
-    pub(crate) struct NativeNetworkBaselineWeakRead<A: WindowBindingAttestor> {
-        original: Weak<NativeNetworkBaselineRead<A>>,
     }
     impl<A: WindowBindingAttestor> Origin<A> {
         fn continuity(&self) -> io::Result<()> {
@@ -452,7 +368,6 @@ pub(crate) mod native {
                     // No caller-supplied snapshot or public data constructor.
                     sink.retain(Rc::new(NativeNetworkBaselineRead {
                         origin: origin.clone(),
-                        carrier: carrier.clone(),
                         snapshot: facts.dns.clone(),
                     }))
                 }).inspect_err(|_| {
@@ -480,9 +395,6 @@ pub(crate) mod native {
         }
     }
     impl<A: WindowBindingAttestor> NativeNetworkBaselineRead<A> {
-        pub(crate) fn same_original(&self, other: &Self) -> bool {
-            std::ptr::eq(self, other)
-        }
         pub(crate) fn matches_source_origin(&self, source: &NativeSourceRead) -> bool {
             std::ptr::eq(self.origin.source.as_ref(), source)
         }
@@ -492,55 +404,6 @@ pub(crate) mod native {
         /// Snapshot DATA only, never a DNS exchange or restoration ACK.
         pub(crate) fn snapshot(&self) -> &dns::Snapshot {
             &self.snapshot
-        }
-        pub(crate) fn downgrade(self: &Rc<Self>) -> NativeNetworkBaselineWeakRead<A> {
-            NativeNetworkBaselineWeakRead {
-                original: Rc::downgrade(self),
-            }
-        }
-        /// Supplied inside Main's SAME original retired/full-absence + locked
-        /// Wfp/current Pair bracket. No reentry or historical C DNS/index query.
-        /// Main authenticates canonical Owner ACK pin and no remaining DNS
-        /// child/routes/row obligations independently; this is factual ONLY.
-        pub(crate) fn inspect_retired_in_bracket<T>(
-            &self,
-            record: &pair::Record,
-            retired: &RetiredCarrierRead,
-            bindings: &Bindings,
-            owner: &NativeNetworkAckRead<NativeNetworkGate<A>>,
-            gate: &Rc<NativeNetworkGate<A>>,
-            inspect: impl FnOnce(&dns::Snapshot, DnsBaselineDisposition) -> io::Result<T>,
-        ) -> io::Result<T> {
-            self.origin.continuity()?;
-            compare_retired_record(&self.origin.context, record, &self.carrier, &self.snapshot)?;
-            if !retired.matches_source_origin(&self.origin.source)
-                || bindings.scope != record.scope
-                || bindings.carrier.as_ref() != Some(&self.carrier)
-                || !owner.matches_origin(&self.origin.source, gate)
-            {
-                return Err(conflict());
-            }
-            // REQUIRED Main seam: count EVERY actual SDK exchange attempt,
-            // including failure/unwind, not just successful readback ACKs.
-            let (attempts, acks): (usize, Vec<dns::Snapshot>) = owner.dns_exchange_history()?;
-            let disposition = classify_dns(&self.snapshot, attempts, &acks)?;
-            if record.network.is_none() && disposition != DnsBaselineDisposition::NeverExchanged {
-                return Err(conflict());
-            }
-            let result = inspect(&self.snapshot, disposition);
-            if owner.dns_exchange_history()? != (attempts, acks) {
-                return Err(conflict());
-            }
-            self.origin.continuity()?;
-            result
-        }
-    }
-    impl<A: WindowBindingAttestor> NativeNetworkBaselineWeakRead<A> {
-        pub(crate) fn upgrade(&self) -> io::Result<Rc<NativeNetworkBaselineRead<A>>> {
-            self.original.upgrade().ok_or_else(conflict)
-        }
-        pub(crate) fn same_original(&self, other: &Self) -> bool {
-            Weak::ptr_eq(&self.original, &other.original)
         }
     }
 }
