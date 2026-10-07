@@ -534,9 +534,20 @@ fn validate_universe_table(wants: &[Expected], rows: &[Interface], foreign: &[u3
                 .filter(|want| collides(want, row))
                 .collect::<Vec<_>>();
             if matches.len() != 1 {
+                #[cfg(all(test, windows))]
+                eprintln!(
+                    "actual native provider denied MIB identity={:?} wanted={wants:?}",
+                    row.identity
+                );
                 return Err(Error::Conflict("extra/unknown MIB provider row"));
             }
-            validate_row(matches[0], row)?;
+            validate_row(matches[0], row).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!(
+                    "actual native provider denied MIB identity={:?} wanted={:?}: {_error:?}",
+                    row.identity, matches[0]
+                );
+            })?;
         }
     }
     Ok(())

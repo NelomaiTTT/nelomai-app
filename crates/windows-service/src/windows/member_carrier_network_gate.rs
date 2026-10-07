@@ -3559,7 +3559,7 @@ pub(crate) mod native {
                 }
             }
             match effect {
-                Effect::Read | Effect::VerifyDnsIntent => (),
+                Effect::Read => (),
                 Effect::Plan {
                     slot,
                     values,

@@ -370,7 +370,6 @@ pub(crate) mod native {
             desired: &'a dns::Snapshot,
         },
         PublishNetwork(&'a NetworkJournal),
-        VerifyDnsIntent,
         Plan {
             slot: Slot,
             values: &'a [NetworkValue],
@@ -904,13 +903,40 @@ pub(crate) mod native {
     }
     impl<G: NativeNetworkEffectGate> DnsJournal for DnsStore<G> {
         fn save(&mut self, value: Option<&DnsRecord>) -> io::Result<()> {
-            self.pins.inspect(&Effect::VerifyDnsIntent, |_| {
-                self.pins.gate.verify_dns_intent(
-                    self.pins.cleanup.get(),
-                    self.expected.as_ref(),
-                    value,
-                )
-            })?;
+            let cleanup = self.pins.cleanup.get();
+            self.pins.fence.require(cleanup)?;
+            let call = |window: &NativeBindingsWindow<'_>| -> io::Result<()> {
+                self.pins.fence.require(cleanup)?;
+                // The child callback checks actual Pair/ACK coverage; no SDK
+                // effect precedes it, and final G reattests the complete state.
+                self.pins
+                    .gate
+                    .verify_dns_intent(cleanup, self.expected.as_ref(), value)?;
+                self.pins.fence.require(cleanup)?;
+                self.pins.gate.authorize(cleanup, window, &Effect::Read)?;
+                Ok(())
+            };
+            let run = |window: &NativeBindingsWindow<'_>| {
+                call(window).map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+            };
+            let result = if cleanup {
+                let closing = self
+                    .pins
+                    .closing
+                    .try_borrow()
+                    .map_err(|_| conflict())?
+                    .clone()
+                    .ok_or_else(conflict)?;
+                closing.inspect_window(run)
+            } else {
+                self.pins.source.inspect_window(run)
+            }
+            .map_err(|_| conflict());
+            if result.is_err() {
+                self.pins.fence.revoked.set(true);
+                self.pins.fence.tainted.set(true);
+            }
+            result?;
             self.expected = value.cloned();
             Ok(())
         }

@@ -621,14 +621,10 @@ fn compare_live_rows(
             return Err(GuardError::Conflict);
         }
         let mut desired = ack.baseline.interface.policy.clone();
-        if i != 0 {
-            desired.weak_host_send = true;
-            desired.weak_host_receive = true;
-        }
+        desired.weak_host_send = true;
+        desired.weak_host_receive = true;
         if actual.interface.policy != desired
-            && !(mode == RowMode::Bases
-                && i != 0
-                && actual.interface.policy == ack.baseline.interface.policy)
+            && !(mode == RowMode::Bases && actual.interface.policy == ack.baseline.interface.policy)
         {
             return Err(GuardError::Conflict);
         }
@@ -1270,14 +1266,22 @@ pub(crate) mod native {
             Ok(())
         }
         fn current(&self, selected: &Selected, purpose: Option<Purpose>) -> Result<()> {
-            self.continuity(selected)?;
+            self.continuity(selected).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe current continuity: {_error:?}");
+            })?;
             if let Some(purpose) = purpose {
-                compare_stage(&self.context, &selected.record, purpose)?;
+                compare_stage(&self.context, &selected.record, purpose).inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe current stage: {_error:?}");
+                })?;
             }
             let check = |actual: &pair::Record| {
                 if actual == &selected.record {
                     Ok(())
                 } else {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe current selected record differs");
                     Err(io_denied(()))
                 }
             };
@@ -1302,8 +1306,15 @@ pub(crate) mod native {
                 }
                 _ => selected.pin.inspect(&self.runtime, &self.supervisor, check),
             }
-            .map_err(denied)?;
-            self.continuity(selected)
+            .map_err(denied)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe current original Pair read: {_error:?}");
+            })?;
+            self.continuity(selected).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe current final continuity: {_error:?}");
+            })
         }
         fn caps(
             &self,
@@ -1385,16 +1396,37 @@ pub(crate) mod native {
             purpose: Purpose,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
-            self.original_window(window, purpose)?;
-            self.current(selected, Some(purpose))?;
+            self.original_window(window, purpose)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample original window: {_error:?}");
+                })?;
+            self.current(selected, Some(purpose))
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample current before: {_error:?}");
+                })?;
             // Each snapshot uses the original Wfp/IDs/priority inside its own
             // read-only transaction. No Guard/Pair lease spans a sibling read.
             let before = self
                 .guard
                 .try_borrow_mut()
-                .map_err(denied)?
-                .snapshot_in_window(window)?;
-            compare_guard(&selected.record, purpose, &before)?;
+                .map_err(denied)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample guard borrow: {_error:?}");
+                })?
+                .snapshot_in_window(window)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample guard snapshot: {_error:?}");
+                })?;
+            compare_guard(&selected.record, purpose, &before).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe sample compare guard before: {_error:?}");
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe guard values expected={} permits={} actualPermits={} assigned={:?} actualWeight={:?}", before == selected.record.guard.expected, selected.record.guard.permits, before.filters.iter().any(|f| f.action == policy::Action::Permit), selected.record.guard.assigned_sublayer_weight, before.sublayer.as_ref().map(|s| s.weight));
+            })?;
             let metrics = self
                 .rows
                 .inspect_in_window(window, |facts| {
@@ -1405,12 +1437,40 @@ pub(crate) mod native {
                                 .map(|actual| (&r.binding, &r.acknowledged, actual))
                         })
                     });
-                    compare_rows(&self.context, &selected.record, borrowed).map_err(native_denied)
+                    compare_rows(&self.context, &selected.record, borrowed)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!("actual native probe sample compare rows: {_error:?}");
+                            #[cfg(all(test, windows))]
+                            for (i, fact) in borrowed.iter().enumerate() {
+                                if let Some((binding, ack, actual)) = fact {
+                                    eprintln!("actual native probe row i={i} role={:?} phase={:?} pending={} owned={}", binding.role, ack.phase, ack.pending.is_some(), rows::same_owned(&ack.current, actual));
+                                    if i == 0 {
+                                        eprintln!("actual native probe C row dad={:?} created={:?} creationMatch={}", actual.address.as_ref().map(|a| a.observed.dad_state), actual.address.as_ref().map(|a| a.observed.creation_timestamp), actual.address.as_ref().zip(ack.creation.as_ref()).is_some_and(|(a, c)| rows::same_address(a, c)));
+                                    } else {
+                                        eprintln!("actual native probe member row policy={:?} baseline={:?}", actual.interface.policy, ack.baseline.interface.policy);
+                                    }
+                                } else {
+                                    eprintln!("actual native probe row i={i} absent");
+                                }
+                            }
+                        })
+                        .map_err(native_denied)
                 })
-                .map_err(denied)?;
+                .map_err(denied)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample rows original read: {_error:?}");
+                })?;
             let network_read =
                 |facts: &crate::windows::member_carrier_network::native::NativeNetworkFacts| {
-                    let physical = self.physical(window, &facts.routes).map_err(io_denied)?;
+                    let physical = self
+                        .physical(window, &facts.routes)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!("actual native probe sample physical: {_error:?}");
+                        })
+                        .map_err(io_denied)?;
                     compare_network(
                         &selected.record,
                         &facts.routes,
@@ -1419,9 +1479,28 @@ pub(crate) mod native {
                         &physical,
                         &metrics,
                     )
+                    .inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe sample compare network: {_error:?}");
+                        #[cfg(all(test, windows))]
+                        {
+                            eprintln!("actual native probe network routes={:?} active={:?} pending={} pendingActive={:?} stopping={} metrics={metrics:?}", selected.record.network.as_ref().map(|n| &n.current.routes), facts.routes.active, facts.routes.pending.is_some(), facts.routes.pending_active, facts.routes.stopping);
+                            for fact in &facts.routes.current {
+                                eprintln!("actual native probe route key=({},{}) actual={:?}", fact.expected.destination, fact.expected.interface, fact.actual.as_ref().map(|r| (r.luid, r.protocol)));
+                            }
+                        }
+                    })
                     .map_err(io_denied)?;
-                    let after = self.physical(window, &facts.routes).map_err(io_denied)?;
+                    let after = self
+                        .physical(window, &facts.routes)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!("actual native probe sample physical: {_error:?}");
+                        })
+                        .map_err(io_denied)?;
                     if physical.rows() != after.rows() || physical.proofs() != after.proofs() {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe sample physical changed");
                         return Err(io_denied(()));
                     }
                     Ok(())
@@ -1435,22 +1514,48 @@ pub(crate) mod native {
                     .ok_or(GuardError::Conflict)?
                     .network
                     .inspect_in_window(window, network_read)
-                    .map_err(denied)?;
+                    .map_err(denied)
+                    .inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe sample network original read: {_error:?}");
+                    })?;
             } else {
                 self.network
                     .inspect_in_window(window, network_read)
-                    .map_err(denied)?;
+                    .map_err(denied)
+                    .inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe sample network original read: {_error:?}");
+                    })?;
             }
             let after = self
                 .guard
                 .try_borrow_mut()
-                .map_err(denied)?
-                .snapshot_in_window(window)?;
-            compare_guard(&selected.record, purpose, &after)?;
+                .map_err(denied)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample guard borrow: {_error:?}");
+                })?
+                .snapshot_in_window(window)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe sample guard snapshot: {_error:?}");
+                })?;
+            compare_guard(&selected.record, purpose, &after).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe sample compare guard after: {_error:?}");
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe guard values expected={} permits={} actualPermits={} assigned={:?} actualWeight={:?}", after == selected.record.guard.expected, selected.record.guard.permits, after.filters.iter().any(|f| f.action == policy::Action::Permit), selected.record.guard.assigned_sublayer_weight, after.sublayer.as_ref().map(|s| s.weight));
+            })?;
             if before != after {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe sample guard changed");
                 return Err(GuardError::Conflict);
             }
-            self.current(selected, Some(purpose))
+            self.current(selected, Some(purpose)).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe sample current after: {_error:?}");
+            })
         }
         pub(crate) fn select(
             &self,
@@ -1615,18 +1720,42 @@ pub(crate) mod native {
             slot: Slot,
             target: Ipv4Addr,
         ) -> Result<()> {
-            let root = self.root()?;
-            root.fence.inspect(Purpose::Open(slot), || {
-                self.verify_inventory(inventory)?;
-                let selected = root.selected.try_borrow().map_err(denied)?;
-                if selected.record.members[idx(slot)]
-                    .as_ref()
-                    .is_none_or(|m| m.probe.target_ipv4 != target)
-                {
-                    return Err(GuardError::Conflict);
-                }
-                root.sample(&selected, Purpose::Open(slot), window)
-            })
+            let root = self.root().inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe authorize open root: {_error:?}");
+            })?;
+            root.fence
+                .inspect(Purpose::Open(slot), || {
+                    self.verify_inventory(inventory).inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe authorize open inventory: {_error:?}");
+                    })?;
+                    let selected =
+                        root.selected
+                            .try_borrow()
+                            .map_err(denied)
+                            .inspect_err(|_error| {
+                                #[cfg(all(test, windows))]
+                                eprintln!(
+                                    "actual native probe authorize open selected: {_error:?}"
+                                );
+                            })?;
+                    if selected.record.members[idx(slot)]
+                        .as_ref()
+                        .is_none_or(|m| m.probe.target_ipv4 != target)
+                    {
+                        #[cfg(all(test, windows))]
+                        eprintln!(
+                            "actual native probe authorize open target differs slot={slot:?}"
+                        );
+                        return Err(GuardError::Conflict);
+                    }
+                    root.sample(&selected, Purpose::Open(slot), window)
+                })
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe authorize open fence: {_error:?}");
+                })
         }
         fn authorize_use(&self, original: &Held<A>, tuple: &ProbeTuple) -> Result<()> {
             let root = self.root()?;

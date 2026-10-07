@@ -1687,15 +1687,24 @@ impl<K: Kernel> Carrier<K> {
             }
             self.kernel.verify(&self.binding, Stage::BeforeClose)?;
             self.capture_for(Stage::CleanupObserve)?;
+            #[cfg(all(test, windows))]
+            eprintln!("actual native CarrierClose final capture accepted");
             self.cleanup_checkpoint(cancel)?;
             // Native close is VOID. The original handle is consumed exactly once;
             // failure of later absence checks must NEVER retry a freed handle.
             self.kernel
                 .close(self.adapter.take().ok_or(Error::Pending)?);
+            #[cfg(all(test, windows))]
+            eprintln!("actual native CarrierClose native close returned");
             self.phase = Phase::ClosePending;
             self.cleanup_checkpoint(cancel)?;
         }
-        self.kernel.verify(&self.binding, Stage::AfterClose)?;
+        self.kernel
+            .verify(&self.binding, Stage::AfterClose)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native CarrierClose AfterClose verify: {_error:?}");
+            })?;
         self.kernel.absent(&self.binding)?;
         self.cleanup_checkpoint(cancel)?;
         self.kernel.release_module()?;

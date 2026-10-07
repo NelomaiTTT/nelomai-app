@@ -933,6 +933,10 @@ unsafe impl creators::NativeAbsence for OriginalUniverse {
             return Err(creators::Error::Conflict);
         }
         member_carrier_provider::native::inspect_absent(scope.binding.guid, &scope.binding.name)
+            .inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native CarrierClose original absence: {_error:?}");
+            })
             .map_err(original_error)?;
         self.verify(&scope.context)?;
         Ok(creators::AbsenceFacts {

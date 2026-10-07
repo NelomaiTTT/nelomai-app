@@ -316,10 +316,9 @@ fn row(context: &Context, role: usize) -> rows::Record {
         };
         current.address = Some(a.clone());
         creation = Some(a);
-    } else {
-        current.interface.policy.weak_host_send = true;
-        current.interface.policy.weak_host_receive = true;
     }
+    current.interface.policy.weak_host_send = true;
+    current.interface.policy.weak_host_receive = true;
     let r = rows::Record {
         version: 1,
         domain: rows::DOMAIN.into(),
@@ -786,6 +785,10 @@ fn full_rows_require_carrier_created_ready_and_exact_owned_weak_member_policy() 
     let metrics = compare_rows(&c, &r, resources(&carrier, &member)).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!((metrics[0].interface, metrics[0].metric), (8, 5));
+    let mut preweak = carrier.clone();
+    preweak.current.interface.policy = preweak.baseline.interface.policy.clone();
+    assert!(compare_rows(&c, &r, resources(&preweak, &member)).is_err());
+    assert!(compare_rows_for(&c, &r, resources(&preweak, &member), RowMode::Bases).is_ok());
     for fault in 0..9 {
         let mut a = member.clone();
         let mut carrier = carrier.clone();
@@ -797,7 +800,7 @@ fn full_rows_require_carrier_created_ready_and_exact_owned_weak_member_policy() 
             4 => a.phase = rows::Phase::Closing,
             5 => carrier.creation = None,
             6 => carrier.current.address.as_mut().unwrap().observed.dad_state = 1,
-            7 => carrier.current.interface.policy.weak_host_send = true,
+            7 => carrier.current.interface.policy.weak_host_send = false,
             _ => a.current.address = carrier.current.address.clone(),
         }
         assert!(
@@ -984,11 +987,15 @@ fn first_blocking_guard_target_and_baseline_rows_are_not_port_permission() {
     r.pending = Some(pair::Effect::Guard);
     r.pending_guard = Some(policy::ExchangePlan::new(&r.guard, &base).unwrap());
     assert_eq!(compare_guard_target(&c, &r, &base), Ok(()));
-    let carrier = row(&c, 0);
+    let mut carrier = row(&c, 0);
     let mut member = row(&c, 1);
+    carrier.current.interface.policy = carrier.baseline.interface.policy.clone();
     member.current = member.baseline.clone();
     assert!(compare_rows_for(&c, &r, resources(&carrier, &member), RowMode::Bases).is_ok());
     assert!(compare_rows(&c, &r, resources(&carrier, &member)).is_err());
+    carrier.current.interface.policy.weak_host_send = true;
+    assert!(compare_rows_for(&c, &r, resources(&carrier, &member), RowMode::Bases).is_err());
+    carrier.current.interface.policy = carrier.baseline.interface.policy.clone();
     member.current.interface.policy.weak_host_send = true;
     assert!(compare_rows_for(&c, &r, resources(&carrier, &member), RowMode::Bases).is_err());
 }
