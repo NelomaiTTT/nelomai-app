@@ -2910,6 +2910,52 @@ mod bfe {
                                 sub.weight
                             }
                         };
+                        #[cfg(all(test, windows))]
+                        if crate::windows::member_carrier_factory_test_os::state().is_some()
+                            && weight == u16::MAX
+                            && f.flags & FWPM_FILTER_FLAG_DISABLED == 0
+                            && f.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT != 0
+                            && f.action.r#type == FWP_ACTION_PERMIT
+                            && crate::member_carrier_guard::resource_keys(&self.scope)
+                                .is_ok_and(|keys| keys.sublayer != subkey)
+                        {
+                            crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                "foreign hard permit id={} layer={layer:?} conditions={} null={}",
+                                f.filterId,
+                                f.numFilterConditions,
+                                f.filterCondition.is_null()
+                            ));
+                            if !f.filterCondition.is_null() {
+                                // SDK page owns this typed array until Memory drops.
+                                let conditions = unsafe {
+                                    std::slice::from_raw_parts(
+                                        f.filterCondition,
+                                        f.numFilterConditions.min(8) as usize,
+                                    )
+                                };
+                                for condition in conditions {
+                                    let value = unsafe {
+                                        match condition.conditionValue.r#type {
+                                            FWP_UINT8 => Some(u64::from(
+                                                condition.conditionValue.Anonymous.uint8,
+                                            )),
+                                            FWP_UINT16 => Some(u64::from(
+                                                condition.conditionValue.Anonymous.uint16,
+                                            )),
+                                            FWP_UINT32 => Some(u64::from(
+                                                condition.conditionValue.Anonymous.uint32,
+                                            )),
+                                            _ => None,
+                                        }
+                                    };
+                                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                        "foreign hard permit id={} field={:?} match={} type={} scalar={value:?} decoded={:?}",
+                                        f.filterId, key(condition.fieldKey), condition.matchType, condition.conditionValue.r#type,
+                                        unsafe { decode_condition(condition, layer) }
+                                    ));
+                                }
+                            }
+                        }
                         result.push(ArbitrationFilter {
                             key: key(f.filterKey),
                             id: f.filterId,

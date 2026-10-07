@@ -5133,10 +5133,14 @@ pub(crate) mod native {
                 .map_err(|error| denied(error))?;
             let closing = &mut self.closing;
             let network = &mut self.closing_network;
+            #[cfg(all(test, windows))]
+            let closing_stage = std::cell::Cell::new("Ready capture");
             r.carrier
                 .capture_closing_in_call(pin.clone(), record, |original| {
                     // Root callback strong slot FIRST, then reader/callback checks.
                     *closing = Some(original.clone());
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("network read");
                     *network = Some(Rc::new(
                         r.network_read
                             .closing_read(original.clone())
@@ -5145,28 +5149,53 @@ pub(crate) mod native {
                     let n = network
                         .as_ref()
                         .ok_or(crate::windows::member_carrier_wintun::Error::Conflict)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("network gate");
                     r.network_gate
                         .retain_closing_origin(original)
                         .map_err(native_denied)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("rows");
                     r.rows.bind_closing(original.clone())?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("lifecycle");
                     r.lifecycle.retain_closing(original)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("lifecycle network");
                     r.lifecycle.retain_closing_network(n)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("Guard resources");
                     r.guard_resources
                         .retain_closing(original)
                         .map_err(native_denied)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("attestor");
                     r.attestor
                         .bind_closing(original.clone())
                         .map_err(native_denied)?;
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("probes");
                     r.probe_state
                         .bind_closing(original.clone(), n.clone())
                         .map_err(native_denied)?;
                     for g in r.member_gates.iter().flatten() {
+                        #[cfg(all(test, windows))]
+                        closing_stage.set("member gate");
                         g.try_borrow_mut()
                             .map_err(native_denied)?
                             .bind_closing(original, n)
                             .map_err(native_denied)?;
                     }
+                    #[cfg(all(test, windows))]
+                    closing_stage.set("Ready post-registration");
                     Ok(())
+                })
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "closing capture {}: {_error:?}",
+                        closing_stage.get()
+                    ));
                 })
                 .map_err(|error| denied(error))?;
             Ok(())

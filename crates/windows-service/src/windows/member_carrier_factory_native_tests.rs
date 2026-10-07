@@ -491,13 +491,15 @@ fn carrier_factory_actual_cold_child() {
         }
     }
     eprintln!("actual factory {case}: original Stop");
-    let stopped = original.execute(
+    let stop_started = std::time::Instant::now();
+    let mut stopped = original.execute(
         Command::Stop {
             scope: scope.clone(),
         },
         8,
     );
-    if stopped.is_err() {
+    if let Err(error) = &stopped {
+        eprintln!("actual factory {case}: Stop error {error:?}");
         fixture.trace_pair_stage();
     }
     if case == "module-load-read-unwind" {
@@ -516,6 +518,30 @@ fn carrier_factory_actual_cold_child() {
         || full_primary
         || route_partial
     {
+        let retry_started = std::time::Instant::now();
+        while stopped.is_err() && original.snapshot().cleanup_pending {
+            assert_eq!(original.snapshot().session.phase, SessionPhase::Stopping);
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            let now = 8 + stop_started.elapsed().as_millis() as u64;
+            match original.tick(now) {
+                Ok(_) => {
+                    let snapshot = original.snapshot();
+                    if !snapshot.cleanup_pending {
+                        stopped = Ok(snapshot);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("actual factory {case}: Stop tick error {error:?}");
+                    assert!(original.snapshot().cleanup_pending);
+                    fixture.trace_pair_stage();
+                    stopped = Err(error);
+                }
+            }
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            if original.snapshot().cleanup_pending {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
@@ -569,14 +595,42 @@ fn carrier_factory_actual_cold_child() {
             assert!(!running.cleanup_pending);
         }
         eprintln!("actual factory {case}: repeat Stop");
-        let stopped = second
-            .execute(
-                Command::Stop {
-                    scope: next.clone(),
-                },
-                10,
-            )
-            .expect("actual repeat native Stop");
+        let stop_started = std::time::Instant::now();
+        let mut stopped = second.execute(
+            Command::Stop {
+                scope: next.clone(),
+            },
+            10,
+        );
+        if let Err(error) = &stopped {
+            eprintln!("actual factory {case}: repeat Stop error {error:?}");
+            fixture.trace_pair_stage();
+        }
+        let retry_started = std::time::Instant::now();
+        while stopped.is_err() && second.snapshot().cleanup_pending {
+            assert_eq!(second.snapshot().session.phase, SessionPhase::Stopping);
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            let now = 10 + stop_started.elapsed().as_millis() as u64;
+            match second.tick(now) {
+                Ok(_) => {
+                    let snapshot = second.snapshot();
+                    if !snapshot.cleanup_pending {
+                        stopped = Ok(snapshot);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("actual factory {case}: repeat Stop tick error {error:?}");
+                    assert!(second.snapshot().cleanup_pending);
+                    fixture.trace_pair_stage();
+                    stopped = Err(error);
+                }
+            }
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            if second.snapshot().cleanup_pending {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let stopped = stopped.expect("actual repeat native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
         if full_primary {

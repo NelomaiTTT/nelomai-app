@@ -1587,16 +1587,37 @@ fn prepare_stop_never_started_has_no_warm_and_blocks_start_install_and_role_ack(
 
 #[test]
 fn prepare_stop_deadline_cleanup_failure_retries_on_next_tick() {
-    let (mut owner, world) = running();
-    owner.execute(prepare_stop(scope()), 100).unwrap();
-    world.borrow_mut().fail_close = true;
-    assert!(owner.tick(1100).is_err());
-    assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopping);
-    assert!(owner.snapshot().cleanup_pending);
-    world.borrow_mut().fail_close = false;
-    owner.tick(1200).unwrap();
-    assert_eq!(world.borrow().closed_scopes, [scope(), scope()]);
-    assert_eq!(world.borrow().native, [false, false]);
+    for deferred in [true, false] {
+        let (mut owner, world) = running();
+        if deferred {
+            owner.execute(prepare_stop(scope()), 100).unwrap();
+        }
+        world.borrow_mut().fail_close = true;
+        let first = if deferred {
+            owner.tick(1100).map(|_| ())
+        } else {
+            owner
+                .execute(Command::Stop { scope: scope() }, 100)
+                .map(|_| ())
+        };
+        assert!(first.is_err());
+        let pending = owner.snapshot();
+        assert_eq!(pending.session.scope, scope());
+        assert_eq!(pending.session.phase, SessionPhase::Stopping);
+        assert!(pending.cleanup_pending);
+        assert!(!pending.primary_ready && !pending.standby_ready);
+        assert_eq!(world.borrow().closed_scopes, [scope()]);
+        assert_eq!(world.borrow().native, [true, false]);
+        world.borrow_mut().fail_close = false;
+        let tick = owner.tick(1200).unwrap();
+        assert!(!tick.primary_ready && !tick.standby_ready);
+        let stopped = owner.snapshot();
+        assert_eq!(stopped.session.scope, scope());
+        assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+        assert!(!stopped.cleanup_pending);
+        assert_eq!(world.borrow().closed_scopes, [scope(), scope()]);
+        assert_eq!(world.borrow().native, [false, false]);
+    }
 }
 
 #[test]

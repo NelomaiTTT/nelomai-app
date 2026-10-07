@@ -558,7 +558,9 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
             return Err(fenced());
         }
         self.last_tick = now;
-        if self.stop_deadline.is_some_and(|deadline| now >= deadline) {
+        if (snapshot.phase == SessionPhase::Stopping && self.stop_deadline.is_none())
+            || self.stop_deadline.is_some_and(|deadline| now >= deadline)
+        {
             self.stop(&snapshot.scope)?;
             return Ok(TickResult::default());
         }
