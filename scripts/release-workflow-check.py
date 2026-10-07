@@ -91,7 +91,7 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     selected = strategy.get("matrix", {}).get("case", [])
     require(set(strategy) == {"fail-fast", "matrix"} and strategy["fail-fast"] is False
             and set(strategy["matrix"]) == {"case"}, "Native matrix cannot suppress remaining cases")
-    require(len(cases) == len(set(cases)) == len(selected) == len(set(selected)) == 18
+    require(len(cases) == len(set(cases)) == len(selected) == len(set(selected)) == 19
             and set(selected) == set(cases), "Native matrix must cover every actual factory case exactly once")
     checkout = {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "submodules": "recursive"}}
     require(build["steps"][0] == native["steps"][0] == checkout, "Producer and consumer checkouts must use exact current SHA")
