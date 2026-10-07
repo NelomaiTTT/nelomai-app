@@ -33,6 +33,46 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+// Models the authenticated IPC boundary: dropping an in-flight access request
+// closes its channel (client-container::ipc::transport::RequestLifetime).
+// Keep that fail-closed property; local Stop must not cancel access issuance.
+struct DropSensitiveAuth {
+    inner: Arc<dyn nelomai_client_core::RuntimeAuthProvider>,
+    blocked: AtomicBool,
+    closed: AtomicBool,
+}
+struct CancelAccessOnDrop<'a>(&'a AtomicBool);
+impl Drop for CancelAccessOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl nelomai_client_core::RuntimeAuthProvider for DropSensitiveAuth {
+    async fn state(&self) -> Result<nelomai_client_api::RuntimeAuthState, CoreError> {
+        self.inner.state().await
+    }
+    async fn login(
+        &self,
+        request: nelomai_client_api::RuntimeLogin,
+    ) -> Result<AccessSnapshot, CoreError> {
+        self.inner.login(request).await
+    }
+    async fn logout(&self) -> Result<(), CoreError> {
+        self.inner.logout().await
+    }
+    async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::StartCancelled);
+        }
+        if self.blocked.load(Ordering::SeqCst) {
+            let _request = CancelAccessOnDrop(&self.closed);
+            std::future::pending::<()>().await;
+        }
+        self.inner.access(stale).await
+    }
+}
+
 struct MemoryStore(Mutex<Option<StoredAuth>>);
 
 impl MemoryStore {
@@ -2484,16 +2524,91 @@ async fn warm_start_local_stop_keeps_server_cleanup_until_acknowledged() {
     assert!(!core.has_pending_stop_cleanup().unwrap());
     assert_eq!(
         api.stop_operation_ids.lock().unwrap().as_slice(),
-        &[
-            pending.operation_id.clone(),
-            pending.operation_id.clone(),
-            pending.operation_id
-        ]
+        &[pending.operation_id.clone(), pending.operation_id]
     );
     let calls = api.stop_calls.load(Ordering::SeqCst);
     core.stop_locally().await.unwrap();
     assert!(!core.has_pending_stop_cleanup().unwrap());
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), calls);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn ordinary_local_stop_preserves_auth_for_exact_cleanup_replay() {
+    // Dropping the speculative access future poisons the real private IPC
+    // channel. Exercise ordinary fresh and reused-WARM leases, not pair Stop.
+    for warm_start in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        api.warm_start.store(warm_start, Ordering::SeqCst);
+        let store = Arc::new(MemoryStore::new(auth()));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(DropSensitiveAuth {
+            inner: Arc::new(support::TestOwner::new(
+                api.clone(),
+                store.clone(),
+                local.clone(),
+            )),
+            blocked: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            Arc::new(support::LegacyRuntime::new(store.clone())),
+            owner.clone(),
+            local,
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(Vec::new()));
+        let connected = core.start(options(), 1_700_000_000).await.unwrap();
+        owner.blocked.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), core.stop_locally())
+            .await
+            .expect("local Stop must not wait for auth")
+            .unwrap();
+        assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+        let pending = store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pending_compensation_stop
+            .unwrap();
+        assert_eq!(pending.lease_id, connected.lease_id);
+        assert!(pending.accept_warm);
+        assert!(pending.redundant_session_id.is_none());
+        owner.blocked.store(false, Ordering::SeqCst);
+        *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+        let retry = core.stop().await;
+        assert!(
+            matches!(retry, Err(CoreError::Api(CoreApiError::Retryable))),
+            "cleanup did not reach the retryable panel: {retry:?}"
+        );
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .pending_compensation_stop
+                .as_ref(),
+            Some(&pending)
+        );
+        *api.stop_error.lock().unwrap() = None;
+        let stopped = core
+            .stop()
+            .await
+            .expect("auth must survive local Stop for durable replay");
+        assert_eq!(stopped.lease_id, connected.lease_id);
+        assert_eq!(stopped.status, LeaseStatus::Warm);
+        let ready = core.state().await;
+        assert_eq!(ready.phase, Phase::Ready);
+        assert_eq!(ready.connection.as_ref(), Some(&stopped));
+        assert!(stopped.session_id.is_none());
+        assert!(!core.has_pending_stop_cleanup().unwrap());
+        assert_eq!(
+            api.stop_operation_ids.lock().unwrap().as_slice(),
+            &[pending.operation_id.clone(), pending.operation_id]
+        );
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -2566,13 +2681,13 @@ async fn warm_start_pending_stop_survives_core_reconstruction() {
     assert!(!restored.has_pending_stop_cleanup().unwrap());
     assert_eq!(
         api.stop_operation_ids.lock().unwrap().as_slice(),
-        &[pending.operation_id.clone(), pending.operation_id]
+        &[pending.operation_id]
     );
 }
 
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
-async fn hanging_initial_stop_does_not_delay_local_close_or_lose_control_replay() {
+async fn unavailable_panel_does_not_delay_local_close_or_lose_control_replay() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());
     let store = Arc::new(MemoryStore::new(auth()));
@@ -2589,13 +2704,12 @@ async fn hanging_initial_stop_does_not_delay_local_close_or_lose_control_replay(
         .unwrap()
         .unwrap();
     assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
     assert!(core.local_stop_pending_cleanup().await);
     api.hold_stop.store(false, Ordering::SeqCst);
     core.stop().await.unwrap();
     let ids = api.stop_operation_ids.lock().unwrap();
-    assert_eq!(ids.len(), 2);
-    assert_eq!(ids[0], ids[1]);
+    assert_eq!(ids.len(), 1);
 }
 
 #[cfg(not(target_os = "android"))]
@@ -2621,11 +2735,8 @@ async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
     assert_eq!(core.state().await.phase, Phase::Stopping);
     assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
     assert!(core.local_stop_pending_cleanup().await);
-    assert_eq!(
-        events.lock().unwrap().as_slice(),
-        &["panel_stop", "local_stop"]
-    );
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(events.lock().unwrap().as_slice(), &["local_stop"]);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
     let pending = store
         .load()
         .unwrap()
@@ -2665,7 +2776,6 @@ async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
         &[
             pending.operation_id.clone(),
             pending.operation_id.clone(),
-            pending.operation_id.clone(),
             pending.operation_id
         ]
     );
@@ -2699,7 +2809,7 @@ async fn explicit_local_stop_failure_retains_cleanup_without_claiming_local_disc
         .unwrap()
         .pending_compensation_stop
         .is_some());
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
     core.stop_locally().await.unwrap();
     assert!(core.local_stop_pending_cleanup().await);
     assert!(core.start_saved_stray_offline(1_700_000_001).await.is_err());
@@ -2751,7 +2861,7 @@ async fn explicit_local_stop_cleanup_fences_new_starts_and_conflicting_leases() 
             .as_ref(),
         Some(&pending)
     );
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(not(target_os = "android"))]
