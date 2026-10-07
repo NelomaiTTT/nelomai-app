@@ -163,7 +163,6 @@ impl RuntimeRead {
         Rc::ptr_eq(&self.runtime, &other.runtime) && self.lease.0.matches(&other.lease.0)
     }
     pub(super) fn read_pin(&self) -> Result<Self> {
-        self.verify(&self.runtime.context)?;
         Ok(Self {
             runtime: self.runtime.clone(),
             lease: self.lease.read_pin(),
