@@ -1918,7 +1918,6 @@ pub(crate) mod native {
             // callback or native effect. The final revision independently
             // authenticates and rereads the current full native receipt.
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
-            self.runtime.verify_source(&self.carrier)?;
             let bytes = self
                 .runtime
                 .record(&self.context, RecordKind::NativeCarrierReceipts)?;

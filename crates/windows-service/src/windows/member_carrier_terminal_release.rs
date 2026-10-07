@@ -5,7 +5,15 @@ use std::{
     cell::{Cell, RefCell},
     io,
 };
+#[cfg_attr(all(windows, test), track_caller)]
 fn conflict() -> io::Error {
+    #[cfg(all(windows, test))]
+    if crate::windows::member_carrier_factory_test_os::state().is_some() {
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "terminal_release conflict caller={}",
+            std::panic::Location::caller()
+        ));
+    }
     io::Error::other("carrier_terminal_release_conflict")
 }
 pub(crate) fn compare_terminal(context: &Context, record: &pair::Record) -> io::Result<()> {
@@ -432,12 +440,22 @@ pub(crate) mod native {
                 let p = &self.pins;
                 p.supervisor
                     .run_terminal_cleanup(&p.context, &p.stopped, &p.expected, || {
-                        let permit = self
-                            .prepare()
-                            .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+                        let permit = self.prepare().map_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            crate::windows::member_carrier_factory_test_os::trace_step(
+                                "terminal release prepare failed",
+                            );
+                            crate::member_carrier::CarrierError::Conflict
+                        })?;
                         module
                             .release_terminal_into(permit, retained_ack)
-                            .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+                            .map_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                crate::windows::member_carrier_factory_test_os::trace_step(
+                                    &format!("terminal release module boundary: {_error:?}"),
+                                );
+                                crate::member_carrier::CarrierError::Conflict
+                            })?;
                         Ok(())
                     })
                     .map_err(|_| conflict())

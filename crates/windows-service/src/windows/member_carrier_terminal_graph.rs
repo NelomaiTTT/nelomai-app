@@ -10,7 +10,15 @@ use crate::{
     member_carrier_assembly::TerminalResources, member_carrier_terminal_release::TerminalCallState,
 };
 use std::io;
+#[cfg_attr(all(windows, test), track_caller)]
 fn conflict() -> io::Error {
+    #[cfg(all(windows, test))]
+    if crate::windows::member_carrier_factory_test_os::state().is_some() {
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "terminal_graph conflict caller={}",
+            std::panic::Location::caller()
+        ));
+    }
     io::Error::other("canonical_terminal_graph_conflict")
 }
 /// Unknown Drop retains inputs AND any constructed root. No owning input is
