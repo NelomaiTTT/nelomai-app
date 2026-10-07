@@ -878,59 +878,7 @@ impl AuthBroker {
                     return Self::api_receipt(receipt);
                 }
             } else {
-                Self::active(&auth)?;
-                Self::ensure_transition_issuance_allowed(
-                    &auth,
-                    Some(&frozen.request.operation_id),
-                )?;
-                if meta.pending_request.is_some()
-                    || meta.pending_recovery.is_some()
-                    || meta.pending_logout.is_some()
-                    || meta.transition_authorities.len() >= MAX_TRANSITION_AUTHORITIES
-                {
-                    return Err(BrokerError::RecoveryRequired);
-                }
-                let source = Self::transition_source_from_auth(&auth)?;
-                if frozen.request.source_identity != source.identity
-                    || frozen.request.expected_session_generation
-                        != source.expected_session_generation
-                    || frozen.source_device_id != source.device_id
-                    || frozen.source_scope_fingerprint != source.scope_fingerprint
-                {
-                    return Err(BrokerError::IdentityMismatch);
-                }
-                let authority = TransitionAuthorityV1 {
-                    schema_version: 1,
-                    reconcile_operation_id: frozen.request.operation_id.clone(),
-                    request_fingerprint: frozen.request_fingerprint.clone(),
-                    source_auth_epoch: auth.auth_epoch,
-                    source_family: meta.family.clone(),
-                    source_identity: auth.confirmed_identity.clone(),
-                    source_device_id: source.device_id,
-                    source_scope_fingerprint: source.scope_fingerprint,
-                    expected_session_generation: auth.session_generation,
-                    target_identity: frozen.request.target_identity.identity(None)?,
-                    cleanup_contract_version: frozen.request.cleanup_contract_version,
-                    cleanup_access_proof: auth
-                        .access_token
-                        .clone()
-                        .ok_or(BrokerError::RecoveryRequired)?,
-                    resume_refresh_proof: auth
-                        .refresh_token
-                        .clone()
-                        .ok_or(BrokerError::RecoveryRequired)?,
-                    legacy_refresh_completed: false,
-                    superseded_by: None,
-                    dispatch_state: TransitionDispatchStateV1::Captured,
-                    reconcile_receipt: None,
-                    resume_ticket: None,
-                    resume_evidence: None,
-                };
-                auth.broker
-                    .as_mut()
-                    .ok_or(BrokerError::RecoveryRequired)?
-                    .transition_authorities
-                    .push(authority);
+                Self::capture_transition_authority(&mut auth, &frozen)?;
                 self.save_transition_write(&auth)?;
             }
         }
@@ -1169,6 +1117,191 @@ impl AuthBroker {
             }
         }
         Err(BrokerError::RecoveryRequired)
+    }
+
+    /// Prepare a new reconcile after a completed apply without dispatching it.
+    /// The protected authority is durable before the coordinator changes its
+    /// active operation. A crash between those saves reuses the captured request.
+    pub(crate) async fn prepare_completed_apply_reconcile(
+        &self,
+        predecessor: FrozenReconcileRequest,
+        resume_operation_id: &str,
+        target: RuntimeTarget,
+        legacy_supersede: Option<(&str, &RuntimeTarget)>,
+    ) -> Result<FrozenReconcileRequest, BrokerError> {
+        let _issuance = self.issuance.lock().await;
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let current = Self::transition_source_from_auth(&auth)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        let authority = meta
+            .transition_authorities
+            .iter()
+            .find(|entry| entry.reconcile_operation_id == predecessor.request.operation_id)
+            .ok_or(BrokerError::RecoveryRequired)?;
+        Self::match_transition_authority(authority, &predecessor)?;
+        let evidence = authority
+            .resume_evidence
+            .as_ref()
+            .ok_or(BrokerError::RecoveryRequired)?;
+        let done = meta
+            .completed_resume
+            .as_ref()
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if evidence.operation_id != resume_operation_id
+            || evidence.decision != "apply"
+            || authority.resume_ticket.as_ref() != Some(&done.request)
+            || done.identity != evidence.identity
+            || current.identity.as_ref() != Some(&evidence.identity)
+            || current.auth_epoch != authority.source_auth_epoch
+            || current.family != authority.source_family
+            || current.device_id != authority.source_device_id
+            || auth.access_token.as_ref() != Some(&evidence.access_token)
+            || authority.superseded_by.is_some()
+            || meta.pending_request.is_some()
+            || meta.pending_recovery.is_some()
+            || meta.pending_logout.is_some()
+            || auth.pending_resume.is_some()
+            || auth.completed_runtime_logout.is_some()
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        if let Some((operation_id, _)) = legacy_supersede {
+            if operation_id == resume_operation_id
+                || meta
+                    .transition_authorities
+                    .iter()
+                    .any(|entry| entry.reconcile_operation_id == operation_id)
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+        }
+        if let Some(ticket) = &auth.pending_runtime_supersede {
+            let (operation_id, old_target) =
+                legacy_supersede.ok_or(BrokerError::RecoveryRequired)?;
+            // The broken candidate captured this ticket AFTER apply. Exact
+            // current-generation proof means it cannot have succeeded: the
+            // panel requires a blocked clean/cleaning predecessor at its OLD
+            // source generation. A pre-apply/unknown-success ticket, or any
+            // recorded response, must never be discarded by this migration.
+            if ticket.operation_id != operation_id
+                || ticket.superseded_reconcile_operation_id != predecessor.request.operation_id
+                || ticket.target_identity != old_target.identity(None)?
+                || ticket.expected_session_generation != current.expected_session_generation
+                || ticket.source.auth_epoch != current.auth_epoch
+                || ticket.source.family != current.family
+                || ticket.source.identity != current.identity
+                || ticket.source.device_id != current.device_id
+                || ticket.source.scope_fingerprint != current.scope_fingerprint
+                || auth.refresh_token.as_ref() != Some(&ticket.refresh_proof)
+                || ticket.response_state.is_some()
+                || ticket.response_reconcile_operation_id.is_some()
+                || ticket.retry_after_seconds.is_some()
+                || ticket.expected_session_generation <= authority.expected_session_generation
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+        }
+        let mut request = predecessor.request.clone();
+        request.source_identity = current.identity.clone();
+        request.expected_session_generation = current.expected_session_generation;
+        // Only one unresolved authority may own this current scope. Reuse a
+        // pre-network capture if the journal save was interrupted, including
+        // its original target when yet another update was installed meanwhile.
+        let mut captured = meta.transition_authorities.iter().filter(|entry| {
+            entry.source_auth_epoch == current.auth_epoch
+                && entry.source_family == current.family
+                && entry.source_identity == current.identity
+                && entry.source_device_id == current.device_id
+                && entry.resume_evidence.is_none()
+                && entry.superseded_by.is_none()
+        });
+        let existing = captured.next().cloned();
+        if captured.next().is_some() {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        // Remove only the ticket proven impossible above, in the same atomic
+        // protected save as the new capture. No intermediate state is stored.
+        auth.pending_runtime_supersede = None;
+        let frozen = if let Some(entry) = existing {
+            if entry.dispatch_state != TransitionDispatchStateV1::Captured
+                || entry.reconcile_receipt.is_some()
+                || entry.resume_ticket.is_some()
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            request.operation_id = entry.reconcile_operation_id.clone();
+            request.target_identity = RuntimeTarget::from_identity(&entry.target_identity);
+            let frozen = FrozenReconcileRequest::new(request, &current)?;
+            Self::match_transition_authority(&entry, &frozen)?;
+            frozen
+        } else {
+            request.operation_id = Uuid::new_v4().to_string();
+            request.target_identity = target;
+            let frozen = FrozenReconcileRequest::new(request, &current)?;
+            Self::capture_transition_authority(&mut auth, &frozen)?;
+            frozen
+        };
+        self.save_transition_write(&auth)?;
+        Ok(frozen)
+    }
+
+    fn capture_transition_authority(
+        auth: &mut AuthStoreV1,
+        frozen: &FrozenReconcileRequest,
+    ) -> Result<(), BrokerError> {
+        Self::active(auth)?;
+        Self::ensure_transition_issuance_allowed(auth, Some(&frozen.request.operation_id))?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        if meta.pending_request.is_some()
+            || meta.pending_recovery.is_some()
+            || meta.pending_logout.is_some()
+            || auth.pending_runtime_supersede.is_some()
+            || meta.transition_authorities.len() >= MAX_TRANSITION_AUTHORITIES
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        let source = Self::transition_source_from_auth(auth)?;
+        if frozen.request.source_identity != source.identity
+            || frozen.request.expected_session_generation != source.expected_session_generation
+            || frozen.source_device_id != source.device_id
+            || frozen.source_scope_fingerprint != source.scope_fingerprint
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        let authority = TransitionAuthorityV1 {
+            schema_version: 1,
+            reconcile_operation_id: frozen.request.operation_id.clone(),
+            request_fingerprint: frozen.request_fingerprint.clone(),
+            source_auth_epoch: auth.auth_epoch,
+            source_family: meta.family.clone(),
+            source_identity: auth.confirmed_identity.clone(),
+            source_device_id: source.device_id,
+            source_scope_fingerprint: source.scope_fingerprint,
+            expected_session_generation: auth.session_generation,
+            target_identity: frozen.request.target_identity.identity(None)?,
+            cleanup_contract_version: frozen.request.cleanup_contract_version,
+            cleanup_access_proof: auth
+                .access_token
+                .clone()
+                .ok_or(BrokerError::RecoveryRequired)?,
+            resume_refresh_proof: auth
+                .refresh_token
+                .clone()
+                .ok_or(BrokerError::RecoveryRequired)?,
+            legacy_refresh_completed: false,
+            superseded_by: None,
+            dispatch_state: TransitionDispatchStateV1::Captured,
+            reconcile_receipt: None,
+            resume_ticket: None,
+            resume_evidence: None,
+        };
+        auth.broker
+            .as_mut()
+            .ok_or(BrokerError::RecoveryRequired)?
+            .transition_authorities
+            .push(authority);
+        Ok(())
     }
 
     pub async fn supersede_transition(

@@ -137,14 +137,35 @@ impl<S: RuntimeStateStore> ScopeAdmission for RuntimeRecordInventory<S> {
         {
             return Err(PrivateError::Protocol);
         }
-        let mut matching = self.retained.iter().chain([&self.target]).filter(|owner| {
-            owner
-                .cleanup_snapshot()
-                .is_ok_and(|current| current == *snapshot)
+        let mut matches = self.retained.iter().chain([&self.target]).filter(|owner| {
+            owner.paths().slot() == snapshot.slot
+                && owner.paths().runtime_version() == snapshot.runtime_version
         });
-        let source = matching.next().ok_or(PrivateError::RecoveryRequired)?;
-        if matching.next().is_some() {
+        let source = matches.next().ok_or(PrivateError::RecoveryRequired)?;
+        if matches.next().is_some() {
             return Err(PrivateError::RecoveryRequired);
+        }
+        let current = source
+            .cleanup_snapshot()
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        if current != *snapshot {
+            // A lost ACK may leave the source already cleared. A newer installed
+            // container can also have superseded the server transition: bind its
+            // verified empty target with the owner's current scope, never relabel
+            // an existing scope or discard operational state on either side.
+            if Arc::ptr_eq(source, &self.target) {
+                self.target
+                    .check_completed_cleanup(Some(scope))
+                    .map_err(|_| PrivateError::RecoveryRequired)?;
+            } else {
+                source
+                    .check_completed_cleanup(None)
+                    .map_err(|_| PrivateError::RecoveryRequired)?;
+                self.target
+                    .complete_empty_cleanup_and_bind(scope)
+                    .map_err(|_| PrivateError::RecoveryRequired)?;
+            }
+            return Ok(());
         }
         if Arc::ptr_eq(source, &self.target) {
             return ScopeAdmission::complete_cleanup(source.as_ref(), snapshot, scope, writers);

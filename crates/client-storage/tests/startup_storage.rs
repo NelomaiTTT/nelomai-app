@@ -12,8 +12,10 @@ use std::sync::{
 #[derive(Clone, Default)]
 struct Records {
     values: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    reads: Arc<Mutex<HashMap<String, usize>>>,
     writes: Arc<AtomicUsize>,
     fail_at: Arc<AtomicUsize>,
+    corrupt_at: Arc<AtomicUsize>,
     legacy: Legacy,
 }
 #[derive(Clone, Default)]
@@ -36,6 +38,13 @@ struct Record {
 }
 impl ProtectedRecordStore for Record {
     fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        *self
+            .all
+            .reads
+            .lock()
+            .unwrap()
+            .entry(self.key.clone())
+            .or_default() += 1;
         Ok(self.all.values.lock().unwrap().get(&self.key).cloned())
     }
     fn save_record(&self, bytes: &[u8]) -> Result<(), StorageError> {
@@ -45,11 +54,14 @@ impl ProtectedRecordStore for Record {
                 "synthetic interrupted write",
             ));
         }
-        self.all
-            .values
-            .lock()
-            .unwrap()
-            .insert(self.key.clone(), bytes.into());
+        self.all.values.lock().unwrap().insert(
+            self.key.clone(),
+            if self.all.corrupt_at.load(Ordering::SeqCst) == count {
+                b"corrupt persisted record".to_vec()
+            } else {
+                bytes.into()
+            },
+        );
         Ok(())
     }
     fn delete_record(&self) -> Result<(), StorageError> {
@@ -97,6 +109,88 @@ fn manifest_for(version: &str) -> nelomai_contracts::VerifiedContainerManifest {
         arch,
     )
     .unwrap()
+}
+
+#[test]
+fn committed_startup_reads_selected_once_without_skipping_retained_or_pending_records() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    prepare_runtime_storage(&lock, &manifest(), RuntimeSlot::Latest, &records).unwrap();
+    let manifest = manifest_for("0.3.2");
+    prepare_runtime_storage(&lock, &manifest, RuntimeSlot::Latest, &records).unwrap();
+    let before = records.values.lock().unwrap().clone();
+    records.reads.lock().unwrap().clear();
+    let writes = records.writes.load(Ordering::SeqCst);
+    let prepared =
+        prepare_runtime_storage(&lock, &manifest, RuntimeSlot::Latest, &records).unwrap();
+    let reads = records.reads.lock().unwrap().clone();
+    for namespace in [
+        "runtime/latest/state/0.3.2/state-v1.json",
+        "runtime/latest/state/0.2.16/state-v1.json",
+        "runtime/stable/state/0.2.16/state-v1.json",
+    ] {
+        assert_eq!(reads.get(namespace), Some(&1), "{namespace}");
+        assert_eq!(
+            reads.get(&format!("{namespace}:pending-write-v1")),
+            Some(&1)
+        );
+    }
+    assert_eq!(records.writes.load(Ordering::SeqCst), writes);
+    assert_eq!(*records.values.lock().unwrap(), before);
+    // No cache survives initialization: the returned store observes later writes.
+    let mut state = prepared.runtime.load().unwrap().unwrap();
+    state.applied_split_tunnel.working_policy_hash = Some("new-state".into());
+    ProtectedRuntimeStore::new(
+        records.record(prepared.runtime.paths().namespace()),
+        prepared.runtime.paths().clone(),
+    )
+    .save(&state)
+    .unwrap();
+    assert_eq!(prepared.runtime.load().unwrap(), Some(state));
+}
+
+#[test]
+fn fresh_startup_reuses_initial_read_but_reads_back_the_saved_record() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    let prepared =
+        prepare_runtime_storage(&lock, &manifest(), RuntimeSlot::Latest, &records).unwrap();
+    assert_eq!(
+        records
+            .reads
+            .lock()
+            .unwrap()
+            .get(prepared.runtime.paths().namespace()),
+        Some(&2)
+    );
+    assert!(prepared.auth.load().unwrap().is_some());
+    assert!(prepared.runtime.load().unwrap().is_some());
+}
+
+#[test]
+fn startup_read_reuse_never_hides_corrupt_post_write_data() {
+    for corrupt_at in [2, 3] {
+        let root = tempfile::tempdir().unwrap();
+        let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+        let records = Records::default();
+        records.corrupt_at.store(corrupt_at, Ordering::SeqCst);
+        assert!(
+            prepare_runtime_storage(&lock, &manifest(), RuntimeSlot::Latest, &records).is_err()
+        );
+        let marker: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("common/runtime-inventory-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["payload"]["committed"], false);
+        assert!(records
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.ends_with(":pending-write-v1")));
+    }
 }
 
 #[test]

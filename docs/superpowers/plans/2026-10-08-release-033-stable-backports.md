@@ -79,10 +79,10 @@
 **Files:** `crates/client-storage/src/{runtime_state,startup}.rs`, `crates/client-storage/tests/startup_storage.rs`; `crates/client-container/src/ipc/child_admission.rs`, `src/{switch,update,auth_broker}.rs` внутри client-container; `tests/{cleanup_replay,update,transition_auth}.rs`, `tests/support/runtime_switch_contract.rs`, `tests/test_completed_apply_panel_contract.py`.
 **Interfaces:** прежние protectedroot/successorauthority/scope, RuntimeRecordOwner и runtime-switch API. Источники6b8aa90→b2eb2bc→a556d3a, только container/storage.
 
-- [ ] Перенести failing regressions для ACKlost after cleanup, historicaltarget отсутствующего в новом manifest, completedapply predecessor (не отправлять forbidden supersede).
-- [ ] Перенести цепочку последовательно, прогоняя каждый набор доGREEN. Новая work/liveowner/несогласованныеpublicjournals/foreignscope/epochrotation должны оставаться отказом.
-- [ ] Запустить `cargo test -p nelomai-client-storage -p nelomai-client-container`; выполнить Python actualpanelcontract fixture по инструкциям самого теста с существующим panel окружением, без сетиproduction.
-- [ ] Inline review всей цепочки и тестов, commitNLM044. Не включать Macsigning/installer и Windowscoldstart части исходныхкоммитов автоматически.
+- [x] RED: ACKlost cleanup6, startupreads2, historicaltarget/provenance6, forbidden supersede/phase11; последовательно GREEN. Ambiguous/foreign/newwork/epoch/protectedauthority guards сохранены.
+- [x] Цепочка перенесена только в storage/container; source/current generation, capture-before-journal, response-loss replay и exact pending-ticket migration покрыты.
+- [x] Storage+container309PASS/1existingignored; actualpanelcontract2PASS в изолированной SQLite без production; полный Rustworkspace1126PASS/0fail/1existingignored/88suites, strictClippy storage/container alltargets и fmt/diff PASS.
+- [x] Inline review цепочки без открытых замечаний. Macsigning/installer/Windowscoldstart не перенесены; аппаратное закрытие NLM044 остаётся release gate.
 
 ## Task 6: NLM-063 и согласование сборки0.3.3
 

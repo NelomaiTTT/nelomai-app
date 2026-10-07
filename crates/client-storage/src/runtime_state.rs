@@ -329,6 +329,9 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
             owner: self.clone(),
         }
     }
+    pub fn paths(&self) -> &RuntimePaths {
+        self.backend.paths()
+    }
     pub fn split(self: &Arc<Self>) -> RuntimeSplitTunnelStore<S> {
         RuntimeSplitTunnelStore {
             owner: self.clone(),
@@ -354,6 +357,32 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
             .lock()
             .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
         Ok(cleanup_snapshot(&self.load_required()?))
+    }
+    /// Read-only completion check under the caller's runtime writer quiescence.
+    /// A replay may acknowledge existing state, but must not clear new work or
+    /// relabel another auth scope. The compact cleanup snapshot omits payload
+    /// such as split policy, so checking only empty lease/operation IDs is unsafe.
+    pub fn check_completed_cleanup(
+        &self,
+        scope: Option<&RuntimeAuthScope>,
+    ) -> Result<(), StorageError> {
+        if let Some(scope) = scope {
+            scope.validate()?;
+        }
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let current = self.load_required()?;
+        if current.cleanup_only
+            || !current.operationally_empty()
+            || current.auth_scope.as_ref() != scope
+        {
+            return Err(StorageError::RecoveryRequired(
+                "runtime cleanup completion differs",
+            ));
+        }
+        Ok(())
     }
     /// Container control only. The caller must hold runtime writer quiescence
     /// and present matching local/server receipts before invoking this method.
