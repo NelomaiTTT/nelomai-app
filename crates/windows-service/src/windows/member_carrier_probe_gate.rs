@@ -1266,10 +1266,13 @@ pub(crate) mod native {
             Ok(())
         }
         fn current(&self, selected: &Selected, purpose: Option<Purpose>) -> Result<()> {
-            self.continuity(selected).inspect_err(|_error| {
-                #[cfg(all(test, windows))]
-                eprintln!("actual native probe current continuity: {_error:?}");
-            })?;
+            compare_origin(&self.context, &selected.record)?;
+            if !selected.pin.matches_runtime(&self.runtime)
+                || (selected.record.phase != pair::Phase::Closing
+                    && self.cancelled.load(Ordering::Acquire))
+            {
+                return Err(GuardError::Conflict);
+            }
             if let Some(purpose) = purpose {
                 compare_stage(&self.context, &selected.record, purpose).inspect_err(|_error| {
                     #[cfg(all(test, windows))]
