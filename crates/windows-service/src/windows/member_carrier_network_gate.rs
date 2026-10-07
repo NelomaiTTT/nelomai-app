@@ -1,4 +1,4 @@
-//! Original network effect authorization. Deliberately not factory selected.
+//! Original network effect authorization.
 //! Portable comparisons below confer no authority. The native implementation
 //! accepts only actual Runtime/Pair/Network/Row owners and NativeGuard<Wfp,A>.
 #![allow(dead_code)]
@@ -1397,12 +1397,49 @@ fn compare_route_reads(
         .members
         .iter()
         .flatten()
-        .filter_map(|m| m.owner.proof.map(|p| p.interface.index))
+        .filter_map(|m| m.owner.proof.map(|p| p.interface))
         .collect::<Vec<_>>();
     let c = record.carrier.ok_or_else(conflict)?;
+    let multicast = "224.0.0.0/4".parse::<ipnet::IpNet>().map_err(denied)?;
+    let broadcast = "255.255.255.255/32"
+        .parse::<ipnet::IpNet>()
+        .map_err(denied)?;
     for row in actual {
-        if members.contains(&row.route.interface) {
-            compare_route_ack(attempts, row)?;
+        let control = (row.route.destination == multicast || row.route.destination == broadcast)
+            && row.route.gateway.is_none()
+            && row.protocol == 2
+            && row.origin == 1
+            && row.flags == [0, 1, 0, 0]
+            && row.site_prefix_length == 0
+            && row.valid_lifetime == u32::MAX
+            && row.preferred_lifetime == u32::MAX;
+        if let Some(member) = members
+            .iter()
+            .find(|p| row.route.interface == p.index || row.luid == p.luid)
+        {
+            let observed = if row.route.interface != member.index
+                || row.luid != member.luid
+                || row.route.scope != RouteScope::WindowsInterface(member.index)
+            {
+                Err(conflict())
+            } else if control {
+                Ok(())
+            } else {
+                compare_route_ack(attempts, row)
+            };
+            #[cfg(all(windows, test))]
+            let observed = observed.inspect_err(|_| {
+                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "member routes denied rows={:?} member={member:?} last={:?}",
+                        actual
+                            .iter()
+                            .filter(|row| row.route.interface == member.index
+                                || row.luid == member.luid)
+                            .collect::<Vec<_>>(),
+                        last_route(attempts, &row.route)
+                    ));
+            });
+            observed?;
         }
         if row.route.interface == c.index || row.luid == c.luid {
             let same_carrier = row.route.interface == c.index
@@ -1411,19 +1448,6 @@ fn compare_route_reads(
             let vip = row.route.destination == record.addresses[0]
                 && row.route.gateway.is_none()
                 && row.flags[0] == 1;
-            let control = (row.route.destination
-                == "224.0.0.0/4".parse::<ipnet::IpNet>().map_err(denied)?
-                || row.route.destination
-                    == "255.255.255.255/32"
-                        .parse::<ipnet::IpNet>()
-                        .map_err(denied)?)
-                && row.route.gateway.is_none()
-                && row.protocol == 2
-                && row.origin == 1
-                && row.flags == [0, 1, 0, 0]
-                && row.site_prefix_length == 0
-                && row.valid_lifetime == u32::MAX
-                && row.preferred_lifetime == u32::MAX;
             if !same_carrier || !(vip || control) {
                 #[cfg(all(windows, test))]
                 crate::windows::member_carrier_factory_test_os::trace_step(&format!(
@@ -2983,15 +3007,6 @@ pub(crate) mod native {
             )?;
             self.continuity(selected, cleanup)
         }
-        fn verify_window(
-            &self,
-            selected: &Selected,
-            cleanup: bool,
-            window: &NativeBindingsWindow<'_>,
-        ) -> io::Result<()> {
-            self.continuity(selected, cleanup)?;
-            self.verify_bindings(&selected.record, cleanup, window)
-        }
         fn verify_bindings(
             &self,
             r: &pair::Record,
@@ -3430,7 +3445,7 @@ pub(crate) mod native {
             capture: Option<&mut NativePhysicalPlanCapture<'_>>,
         ) -> io::Result<()> {
             let selected = self.selected.try_borrow().map_err(denied)?;
-            self.verify_window(&selected, cleanup, window)?;
+            self.verify_bindings(&selected.record, cleanup, window)?;
             self.verify_pair(&selected, cleanup)?;
             let ack = self.ack_pin()?;
             let (attempts, dns_acks) = ack.acknowledgements()?;
@@ -3619,7 +3634,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.verify_pair(&selected, cleanup)?;
-            self.verify_window(&selected, cleanup, window)
+            self.verify_bindings(&selected.record, cleanup, window)
         }
     }
     // SAFETY: exact Wfp specialization, retained SAME original runtime/files,

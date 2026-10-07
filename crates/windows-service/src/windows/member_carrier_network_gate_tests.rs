@@ -1980,31 +1980,99 @@ fn route_reads_require_every_present_key_ack_and_reject_extra_member_rows() {
     let mut varied_metric = multicast.clone();
     varied_metric.route.metric += 1;
     assert!(compare_route_reads(&r, &pending, &ack, &[row.clone(), varied_metric]).is_ok());
-    for fault in 0..17 {
-        let mut foreign = multicast.clone();
-        match fault {
-            0 => foreign.luid += 1,
-            1 => foreign.route.interface += 1,
-            2 => foreign.route.scope = RouteScope::Global,
-            3 => foreign.route.gateway = Some("192.0.2.1".parse().unwrap()),
-            4 => foreign.route.destination = "0.0.0.0/0".parse().unwrap(),
-            5 => foreign.route.destination = "1.1.1.1/32".parse().unwrap(),
-            6 => foreign.route.destination = "10.7.0.0/24".parse().unwrap(),
-            7 => foreign.route.destination = "10.7.0.255/32".parse().unwrap(),
-            8 => foreign.route.destination = "ff00::/8".parse().unwrap(),
-            9 => foreign.protocol = 3,
-            10 => foreign.origin = 0,
-            11 => foreign.flags[0] = 1,
-            12 => foreign.site_prefix_length = 1,
-            13 => foreign.valid_lifetime -= 1,
-            14 => foreign.preferred_lifetime -= 1,
-            15 => foreign.flags[1] = 0,
-            _ => foreign.flags[2] = 1,
+    let mut both = r.clone();
+    let mut b = both.members[0].as_ref().unwrap().clone();
+    b.owner.intent.slot = TunnelSlot::B;
+    b.owner.proof.as_mut().unwrap().interface = owner::InterfaceProof {
+        index: 9,
+        luid: 92,
+        guid: [3; 16],
+    };
+    b.owner.proof.as_mut().unwrap().process.pid += 1;
+    b.lease_id = "33333333-3333-4333-8333-333333333333".into();
+    both.members[1] = Some(b);
+    both.validate().unwrap();
+    for proof in both
+        .members
+        .iter()
+        .flatten()
+        .map(|m| m.owner.proof.unwrap().interface)
+    {
+        let mut control = multicast.clone();
+        control.route.interface = proof.index;
+        control.route.scope = RouteScope::WindowsInterface(proof.index);
+        control.luid = proof.luid;
+        for destination in ["224.0.0.0/4", "255.255.255.255/32"] {
+            control.route.destination = destination.parse().unwrap();
+            assert!(
+                compare_route_reads(&both, &pending, &[], std::slice::from_ref(&control)).is_ok(),
+                "finite A/B control observation needs no owned route ACK"
+            );
         }
+        let mut owned = both.clone();
+        let routes = &mut owned
+            .network
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .routes;
+        routes.push(control.route.clone());
+        let child = journal(&[], Some(routes), false);
         assert!(
-            compare_route_reads(&r, &pending, &ack, &[row.clone(), foreign]).is_err(),
-            "C control row fault {fault}"
+            compare_route_reads(&owned, &child, &[], std::slice::from_ref(&control)).is_err(),
+            "an owned target key cannot use the control observation exception"
         );
+        let unknown = [RouteAttempt {
+            row: control.clone(),
+            deleting: false,
+            acknowledged: false,
+        }];
+        assert!(
+            compare_route_reads(&owned, &child, &unknown, std::slice::from_ref(&control)).is_err()
+        );
+        let mut vip = control.clone();
+        vip.route.destination = both.addresses[0];
+        vip.flags[0] = 1;
+        assert!(compare_route_reads(&both, &pending, &[], &[vip]).is_err());
+    }
+    for proof in std::iter::once(c).chain(
+        both.members
+            .iter()
+            .flatten()
+            .map(|m| m.owner.proof.unwrap().interface),
+    ) {
+        for fault in 0..17 {
+            let mut foreign = multicast.clone();
+            foreign.route.interface = proof.index;
+            foreign.route.scope = RouteScope::WindowsInterface(proof.index);
+            foreign.luid = proof.luid;
+            match fault {
+                0 => foreign.luid += 1,
+                1 => foreign.route.interface += 1,
+                2 => foreign.route.scope = RouteScope::Global,
+                3 => foreign.route.gateway = Some("192.0.2.1".parse().unwrap()),
+                4 => foreign.route.destination = "0.0.0.0/0".parse().unwrap(),
+                5 => foreign.route.destination = "1.1.1.1/32".parse().unwrap(),
+                6 => foreign.route.destination = "10.7.0.0/24".parse().unwrap(),
+                7 => foreign.route.destination = "10.7.0.255/32".parse().unwrap(),
+                8 => foreign.route.destination = "ff00::/8".parse().unwrap(),
+                9 => foreign.protocol = 3,
+                10 => foreign.origin = 0,
+                11 => foreign.flags[0] = 1,
+                12 => foreign.site_prefix_length = 1,
+                13 => foreign.valid_lifetime -= 1,
+                14 => foreign.preferred_lifetime -= 1,
+                15 => foreign.flags[1] = 0,
+                _ => foreign.flags[2] = 1,
+            }
+            assert!(
+                compare_route_reads(&both, &pending, &ack, &[row.clone(), foreign]).is_err(),
+                "control row fault {fault} on {}",
+                proof.index
+            );
+        }
     }
 }
 
