@@ -2923,7 +2923,12 @@ pub(crate) mod native {
             retiring: Option<usize>,
             preparing: Option<usize>,
         ) -> Result<NativeResourceRowsFacts> {
-            self.runtime.verify(&self.context).map_err(denied)?;
+            self.runtime
+                .require_original_context(&self.context)
+                .map_err(denied)?;
+            if !window.matches_runtime(&self.runtime) {
+                return Err(Error::Conflict);
+            }
             let originals = self
                 .originals
                 .try_borrow()
@@ -3059,7 +3064,6 @@ pub(crate) mod native {
                     .map_err(denied)?,
                 );
             }
-            self.runtime.verify(&self.context).map_err(denied)?;
             Ok(facts)
         }
     }
