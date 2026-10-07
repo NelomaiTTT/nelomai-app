@@ -686,7 +686,10 @@ pub(crate) mod native {
             before: Option<&NetworkValue>,
             after: Option<&NetworkValue>,
         ) -> io::Result<()> {
-            self.0.inspect(&Effect::Read, |window| {
+            let cleanup = self.0.cleanup.get();
+            self.0.fence.require(cleanup)?;
+            let call = |window: &NativeBindingsWindow<'_>| -> io::Result<()> {
+                self.0.fence.require(cleanup)?;
                 let b = window.bindings();
                 MemberRoutes::new(
                     AcknowledgedRows {
@@ -699,8 +702,34 @@ pub(crate) mod native {
                         bindings: b,
                     },
                 )
-                .compare_exchange(key, before, after)
-            })
+                .compare_exchange(key, before, after)?;
+                self.0.fence.require(cleanup)?;
+                // Actual writes authorize their effect before recording the
+                // attempt; every comparison still reattests its final state.
+                self.0.gate.authorize(cleanup, window, &Effect::Read)?;
+                Ok(())
+            };
+            let run = |window: &NativeBindingsWindow<'_>| {
+                call(window).map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+            };
+            let result = if cleanup {
+                let closing = self
+                    .0
+                    .closing
+                    .try_borrow()
+                    .map_err(|_| conflict())?
+                    .clone()
+                    .ok_or_else(conflict)?;
+                closing.inspect_window(run)
+            } else {
+                self.0.source.inspect_window(run)
+            }
+            .map_err(|_| conflict());
+            if result.is_err() {
+                self.0.fence.revoked.set(true);
+                self.0.fence.tainted.set(true);
+            }
+            result
         }
     }
     struct RouteJournal<G> {

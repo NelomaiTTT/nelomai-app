@@ -5287,20 +5287,25 @@ pub(crate) mod native {
             let mut inventory = owned.inventory.read_pin();
             // Reconciliation still reauthenticates current Closing before any
             // registration, including when the SAME native Stop ACK is rooted.
-            if self.root.closed.is_some() {
+            let preflight = if self.root.closed.is_some() {
                 // No new native effect: republish only our rooted SAME Stop ACK.
                 // A Closing full inventory cannot precede this republish: its
                 // old live entry may already be absent after a lost register ACK.
-                owned.cleanup_envelope(pair_read, expected, lock)?;
+                owned.cleanup_envelope(pair_read, expected, lock)
             } else if !self.root.registered
                 || expected.members[index]
                     .as_ref()
                     .is_some_and(|m| m.owner.proof.is_none())
             {
-                owned.partial_stop_preflight(pair_read, expected, lock)?;
+                owned.partial_stop_preflight(pair_read, expected, lock)
             } else {
-                owned.stop_preflight(pair_read, expected, closing, lock)?;
-            }
+                owned.stop_preflight(pair_read, expected, closing, lock)
+            };
+            preflight.inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native Stop preflight slot={index}: {_error:?}");
+            })?;
+
             self.root
                 .stop(
                     |owned| {
@@ -5315,28 +5320,65 @@ pub(crate) mod native {
                         if current.intent != owned.intent {
                             return Err(Error::Conflict);
                         }
-                        if let Some(original) = &owned.partial_cleanup {
+
+                        let result = if let Some(original) = &owned.partial_cleanup {
                             owned
                                 .member
                                 .stop_partial_original(&current, original)
                                 .map_err(owner_error)
                         } else {
                             owned.member.stop(&current).map_err(owner_error)
-                        }
+                        };
+                        result.inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual native Stop owner slot={index}: {_error:?}");
+                        })
                     },
-                    |receipt| inventory.closed(index, receipt),
+                    |receipt| {
+                        inventory.closed(index, receipt).inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual native Stop publish slot={index}: {_error:?}");
+                        })
+                    },
                     |stopped, receipt, (owned, reader)| {
-                        owned.member.verify_closed(receipt).map_err(owner_error)?;
+                        owned
+                            .member
+                            .verify_closed(receipt)
+                            .map_err(owner_error)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!(
+                                    "actual native Stop owner closed slot={index}: {_error:?}"
+                                );
+                            })?;
                         if let Some(reader) = reader {
-                            reader.verify_closed(receipt).map_err(owner_error)?;
+                            reader
+                                .verify_closed(receipt)
+                                .map_err(owner_error)
+                                .inspect_err(|_error| {
+                                    #[cfg(all(windows, test))]
+                                    eprintln!(
+                                        "actual native Stop reader closed slot={index}: {_error:?}"
+                                    );
+                                })?;
                         }
                         if stopped.phase != MemberPhase::Stopped
                             || stopped.intent.scope != context.intent.scope
                         {
                             return Err(Error::Conflict);
                         }
-                        runtime.verify_member_intent(&context, &source, &stopped.intent)?;
-                        owned.cleanup_envelope(pair_read, expected, lock)?;
+                        runtime
+                            .verify_member_intent(&context, &source, &stopped.intent)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!("actual native Stop source slot={index}: {_error:?}");
+                            })?;
+                        owned
+                            .cleanup_envelope(pair_read, expected, lock)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!("actual native Stop cleanup slot={index}: {_error:?}");
+                            })?;
                         closing
                             .inspect_window(|window| {
                                 if !window.matches_closing(closing)
@@ -5351,11 +5393,28 @@ pub(crate) mod native {
                                 // history to SDK or recursively borrow inventory.
                                 Ok(())
                             })
-                            .map_err(|_| Error::Conflict)?;
-                        owned.cleanup_envelope(pair_read, expected, lock)
+                            .map_err(|_| Error::Conflict)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!(
+                                    "actual native Stop Closing window slot={index}: {_error:?}"
+                                );
+                            })?;
+                        owned
+                            .cleanup_envelope(pair_read, expected, lock)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!(
+                                    "actual native Stop cleanup final slot={index}: {_error:?}"
+                                );
+                            })
                     },
                 )
-                .map_err(root_error)?;
+                .map_err(root_error)
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual native Stop root slot={index}: {_error:?}");
+                })?;
             self.root.stopped.clone().ok_or(Error::Pending)
         }
     }

@@ -707,12 +707,30 @@ pub(crate) mod native {
             let snapshot = guard
                 .try_borrow_mut()
                 .map_err(|_| GuardError::Conflict)?
-                .snapshot()?;
+                .snapshot()
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open guard slot={slot:?}: {_error:?}");
+                })?;
             source
                 .inspect_window(|window| {
                     let b = window.bindings();
-                    open_snapshot(&facts(b), &snapshot).map_err(denied)?;
-                    let expected = Expected::from_actual(b, slot, target).map_err(denied)?;
+                    open_snapshot(&facts(b), &snapshot)
+                        .map_err(denied)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!(
+                                "actual native probe open snapshot slot={slot:?}: {_error:?}"
+                            );
+                        })?;
+                    let expected = Expected::from_actual(b, slot, target)
+                        .map_err(denied)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!(
+                                "actual native probe open expected slot={slot:?}: {_error:?}"
+                            );
+                        })?;
                     // Acquire the canonical destination and all caps BEFORE
                     // creating the socket, so no fallible borrow follows ACK.
                     let mut held = original
@@ -729,49 +747,86 @@ pub(crate) mod native {
                     creation.verify().map_err(denied)?;
                     call.verify().map_err(denied)?;
                     gate.authorize_open(&self.read_pin(), window, slot, target)
-                        .map_err(denied)?;
+                        .map_err(denied)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!(
+                                "actual native probe open preSDK gate slot={slot:?}: {_error:?}"
+                            );
+                        })?;
                     let socket = NativeProbeSocket::open(
                         caps.expected.egress.proof.index,
                         caps.expected.source,
                         caps.expected.target,
                     )
+                    .inspect_err(|_error| {
+                        #[cfg(all(test, windows))]
+                        eprintln!("actual native probe open socket slot={slot:?}: {_error:?}");
+                    })
                     .map_err(|_| SourceError::Native)?;
                     // ACK retained canonically BEFORE tuple/readback/postflight.
                     *held = Held::new(NativeSocket(Some(socket)), caps);
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open SDK ACK retained slot={slot:?}");
                     let actual = held
                         .caps
                         .as_ref()
                         .ok_or(SourceError::Conflict)?
                         .expected
                         .tuple(held.socket.as_ref().ok_or(SourceError::Conflict)?)
-                        .map_err(denied)?;
+                        .map_err(denied)
+                        .inspect_err(|_error| {
+                            #[cfg(all(test, windows))]
+                            eprintln!(
+                                "actual native probe open first tuple slot={slot:?}: {_error:?}"
+                            );
+                        })?;
                     let caps = held.caps.as_mut().ok_or(SourceError::Conflict)?;
                     caps.tuple = Some(actual);
                     creation.verify().map_err(denied)?;
                     Ok(())
                 })
-                .map_err(source_error)?;
+                .map_err(source_error)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open source slot={slot:?}: {_error:?}");
+                })?;
             gate.verify_original(source, guard)?;
             let after = guard
                 .try_borrow_mut()
                 .map_err(|_| GuardError::Conflict)?
-                .snapshot()?;
+                .snapshot()
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open postguard slot={slot:?}: {_error:?}");
+                })?;
             source
                 .inspect_window(|window| {
                     open_snapshot(&facts(window.bindings()), &after).map_err(denied)?;
                     gate.authorize_open(&self.read_pin(), window, slot, target)
                         .map_err(denied)
                 })
-                .map_err(source_error)?;
+                .map_err(source_error)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open postgate slot={slot:?}: {_error:?}");
+                })?;
             gate.verify_inventory(&self.read_pin())?;
             creation.finish()?;
-            original.tuple(None)?;
+            original.tuple(None).inspect_err(|_error| {
+                #[cfg(all(test, windows))]
+                eprintln!("actual native probe open final tuple slot={slot:?}: {_error:?}");
+            })?;
             call.verify()?;
             self.inventory
                 .entries
                 .try_borrow_mut()
                 .map_err(|_| GuardError::Conflict)?
-                .publish(slot)?;
+                .publish(slot)
+                .inspect_err(|_error| {
+                    #[cfg(all(test, windows))]
+                    eprintln!("actual native probe open publish slot={slot:?}: {_error:?}");
+                })?;
             call.finish()?;
             Ok(HeldProbeOwner { original })
         }

@@ -1976,10 +1976,15 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         Ok(running)
     }
     pub(crate) fn stop(&mut self, expected: &Record) -> Result<Record> {
+        #[cfg(all(windows, test))]
+        let slot = expected.intent.slot;
         self.original_read_revoked = true;
         self.io.revoke_original();
         self.start_consumed = true;
-        self.require_current(expected)?;
+        self.require_current(expected).inspect_err(|_error| {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop current record slot={slot:?}: {_error:?}");
+        })?;
         if expected.previous_config_sha256.is_some() {
             // No SCM effect is ever permitted while either config digest is
             // acceptable. Retain both exact digests across terminal cleanup.
@@ -2007,28 +2012,79 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         if expected.phase == Phase::Stopped {
             return Ok(expected.clone());
         }
-        let before = self.io.inspect(&self.intent, expected.proof.as_ref())?;
-        authorize(expected, &before)?;
-        self.authorize_cleanup(expected, &before)?;
+        let before = self
+            .io
+            .inspect(&self.intent, expected.proof.as_ref())
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop preflight inspect slot={slot:?}: {_error:?}");
+            })?;
+        authorize(expected, &before).inspect_err(|_error| {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop preflight identity slot={slot:?}: {_error:?}");
+        })?;
+        self.authorize_cleanup(expected, &before)
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop preflight cleanup slot={slot:?}: {_error:?}");
+            })?;
         let mut stopping = expected.clone();
         stopping.phase = Phase::Stopping;
         if &stopping != expected {
             self.journal
-                .compare_exchange(self.intent.slot, Some(expected), &stopping)?;
+                .compare_exchange(self.intent.slot, Some(expected), &stopping)
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual native owner stop Stopping CAS slot={slot:?}: {_error:?}");
+                })?;
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop Stopping CAS complete slot={slot:?}");
         }
-        let current = self.io.inspect(&self.intent, stopping.proof.as_ref())?;
-        authorize(&stopping, &current)?;
-        self.authorize_cleanup(&stopping, &current)?;
+        let current = self
+            .io
+            .inspect(&self.intent, stopping.proof.as_ref())
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop Stopping inspect slot={slot:?}: {_error:?}");
+            })?;
+        authorize(&stopping, &current).inspect_err(|_error| {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop Stopping identity slot={slot:?}: {_error:?}");
+        })?;
+        self.authorize_cleanup(&stopping, &current)
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop Stopping cleanup slot={slot:?}: {_error:?}");
+            })?;
         if current.service.is_some() {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop native stop_slot entered slot={slot:?}");
             self.io
-                .stop_slot(&self.intent, stopping.proof.as_ref(), &current)?;
+                .stop_slot(&self.intent, stopping.proof.as_ref(), &current)
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!(
+                        "actual native owner stop native stop_slot slot={slot:?}: {_error:?}"
+                    );
+                })?;
         }
-        let after = self.io.inspect(&self.intent, stopping.proof.as_ref())?;
-        authorize(&stopping, &after)?;
+        let after = self
+            .io
+            .inspect(&self.intent, stopping.proof.as_ref())
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop postStop inspect slot={slot:?}: {_error:?}");
+            })?;
+        authorize(&stopping, &after).inspect_err(|_error| {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop postStop identity slot={slot:?}: {_error:?}");
+        })?;
         if after.service.is_some()
             || after.interface.is_some()
             || !after.retained_interfaces.is_empty()
         {
+            #[cfg(all(windows, test))]
+            eprintln!("actual native owner stop postStop native obligations remain slot={slot:?}");
             return Err(OwnerError::Pending);
         }
         let stopped = Record {
@@ -2039,7 +2095,12 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
             previous_config_sha256: None,
         };
         self.journal
-            .compare_exchange(self.intent.slot, Some(&stopping), &stopped)?;
+            .compare_exchange(self.intent.slot, Some(&stopping), &stopped)
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual native owner stop Stopped CAS slot={slot:?}: {_error:?}");
+            })?;
+
         Ok(stopped)
     }
     /// Stop is a revocation of already-proven native authority. A failed durable
