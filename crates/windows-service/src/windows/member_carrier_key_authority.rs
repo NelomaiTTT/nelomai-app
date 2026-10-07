@@ -261,10 +261,10 @@ impl Runtime {
     fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         #[cfg(test)]
         super::member_carrier_factory_test_os::trace_step("runtime current check");
-        self.verify_original_context(pin, context)?;
         // SAME retained deny-write/delete handles keep the signed byte proof
-        // alive. The outer original-context checks cover owner/root/context
-        // before/after; duplicating those checks inside installed adds no fact.
+        // alive. Reading this retained layout and canonical executable path
+        // grants no authority; the final original-context check verifies the
+        // actual owner/root/context before any successful return.
         let live = self.installed.layout();
         if live.identity != self.identity
             || live.directory != self.directory

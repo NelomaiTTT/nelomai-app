@@ -346,16 +346,9 @@ pub(crate) mod native {
         fn verify(&self) -> Result<()> {
             #[cfg(test)]
             trace_step("source current check");
-            self.owner
-                .verify_at(&self.installation.root.join("engine-owner.lock"))
-                .map_err(|_| Error::Conflict)?;
-            (self.root)()?;
-            self.payload
-                .verify_original()
-                .map_err(|_| Error::Conflict)?;
             // SAME retained handles keep both slots' signed byte proof alive.
-            // Owner/root and strict DLL originals already bracket this read;
-            // the canonical executable binding remains current here.
+            // This retained layout and canonical path read grants no authority;
+            // the final strict DLL/owner/root checks precede successful return.
             let layout = self.installed.layout();
             if layout.identity != self.identity
                 || layout.directory != self.directory
@@ -573,7 +566,7 @@ pub(crate) mod native {
             }
             // The complete pinned signed proof covers BOTH slots and ALL
             // payloads. Join every original library to that SAME owner, root,
-            // executable and manifest before/after current inventory checks.
+            // executable and manifest after the factual retained-layout read.
             let pins = || {
                 let carrier = &self.carrier.0;
                 if !Arc::ptr_eq(&carrier.owner, owner) {
@@ -613,7 +606,6 @@ pub(crate) mod native {
                     .verify_at(&carrier.installation.root.join("engine-owner.lock"))
                     .map_err(|_| Error::Conflict)
             };
-            pins()?;
             let carrier = &self.carrier.0;
             let layout = carrier.installed.layout();
             if layout.identity != carrier.identity
