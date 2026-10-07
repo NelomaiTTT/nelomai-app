@@ -1155,8 +1155,10 @@ pub(crate) mod native_store {
                     .runtime
                     .native_files_for_original(&self.context, &self.original_files)
                     .map_err(|_| conflict())?;
+                Ok(())
+            } else {
+                self.verify()
             }
-            self.verify()
         }
         /// Same originating store publication only, without minting another
         /// native Rc. Runtime/lock/private bytes remain independently checked;
