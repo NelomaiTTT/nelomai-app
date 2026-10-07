@@ -2,9 +2,10 @@
 use super::*;
 use crate::{
     member_actor::PairFactory,
+    member_owner::Journal,
     windows::{
         member_carrier_factory_test_os::{ChildCurrentCheckReport, Fixture, NativePublication},
-        member_files::PrivateFile,
+        member_files::{MemberFiles, PrivateFile},
         member_pair::NativePairFactory,
     },
 };
@@ -15,7 +16,9 @@ use nelomai_client_tunnel::{
     },
     DesktopTunnelOptions, TunnelConfiguration,
 };
-use nelomai_contracts::{HealthProbeKind, RedundantHealthProbe, RuntimeSlot};
+use nelomai_contracts::{
+    dispatcher::TunnelSlot, HealthProbeKind, RedundantHealthProbe, RuntimeSlot,
+};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -573,6 +576,20 @@ fn carrier_factory_actual_cold_child() {
         next.session_id = session_ids[1].clone();
         next.connection_generation += 1;
         let next = next.clone();
+        let mut retained_members = if !full_primary {
+            let mut files = MemberFiles::new().expect("actual retained member files");
+            let records = [TunnelSlot::A, TunnelSlot::B].map(|slot| {
+                let record = files.load(slot).expect("actual predecessor member journal");
+                if let Some(record) = &record {
+                    assert_eq!(record.phase, crate::member_owner::Phase::Stopped);
+                    assert_ne!(record.intent.scope, next);
+                }
+                record
+            });
+            Some((files, records))
+        } else {
+            None
+        };
         eprintln!("actual factory {case}: repeat prepare");
         let mut second = factory
             .prepare(RuntimeSlot::Latest, &command, 9)
@@ -633,11 +650,20 @@ fn carrier_factory_actual_cold_child() {
         let stopped = stopped.expect("actual repeat native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
-        if full_primary {
-            let repeated = second
-                .execute(Command::Stop { scope: next }, 10)
-                .expect("actual second native primary repeated Stop");
-            assert_eq!(repeated, stopped);
+        let repeated = second
+            .execute(Command::Stop { scope: next }, 10)
+            .expect("actual second repeated Stop");
+        assert_eq!(repeated, stopped);
+        if let Some((files, records)) = &mut retained_members {
+            for (slot, record) in [TunnelSlot::A, TunnelSlot::B].into_iter().zip(records) {
+                assert_eq!(
+                    files
+                        .load(slot)
+                        .expect("actual preserved predecessor journal"),
+                    *record,
+                    "cold repeat Stop changed its predecessor journal"
+                );
+            }
         }
     } else {
         match stopped {

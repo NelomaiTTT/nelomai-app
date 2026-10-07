@@ -2673,6 +2673,7 @@ pub(crate) mod native {
             self.verify_roots(lock)
         }
         fn file_absence(&self, slot: TunnelSlot) -> Result<()> {
+            use crate::member_owner::{Journal, MemberIo};
             use std::{
                 fs::File,
                 os::windows::{ffi::OsStrExt, io::FromRawHandle},
@@ -2689,6 +2690,38 @@ pub(crate) mod native {
             let root = super::super::install::state_directory().map_err(|_| Error::Pending)?;
             let pinned = self.directory.try_borrow().map_err(|_| Error::Conflict)?;
             let pinned = pinned.as_ref().ok_or(Error::Pending)?;
+            pinned.verify().map_err(|_| Error::Pending)?;
+            let mut files = MemberFiles::new().map_err(|_| Error::Pending)?;
+            if let Some(record) = files.load(slot).map_err(|_| Error::Pending)? {
+                // A completed predecessor retains its private journal/config.
+                // Observe its actual old native identities without granting a
+                // new owner, mutation or cleanup effect to this cold slot.
+                crate::member_owner::validate_record_shape(&record).map_err(|_| Error::Conflict)?;
+                if record.intent.slot != slot
+                    || record.phase != MemberPhase::Stopped
+                    || record.intent.scope == self.input.context.intent.scope
+                {
+                    return Err(Error::Conflict);
+                }
+                let private = MemberFiles::new().map_err(|_| Error::Pending)?;
+                let mut native = NativeMemberIo::for_retained_cleanup(&record, private)
+                    .map_err(|_| Error::Pending)?;
+                let observed = native
+                    .inspect(&record.intent, record.retired_proof.as_ref())
+                    .map_err(|_| Error::Pending)?;
+                if observed.config_sha256.is_some_and(|hash| {
+                    hash != record.intent.config_sha256
+                        && Some(hash) != record.previous_config_sha256
+                }) || observed.service.is_some()
+                    || observed.alternative_service_present
+                    || observed.interface.is_some()
+                    || !observed.retained_interfaces.is_empty()
+                    || files.load(slot).map_err(|_| Error::Pending)? != Some(record)
+                {
+                    return Err(Error::Conflict);
+                }
+                return pinned.verify().map_err(|_| Error::Pending);
+            }
             for name in [
                 crate::redundancy::slot_config_filename(slot),
                 match slot {
