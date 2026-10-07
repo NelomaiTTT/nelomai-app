@@ -38,6 +38,7 @@ struct Inputs {
     resolver_reference_releases: usize,
     resolver_reference_original: Option<Weak<NativeKernelReferenceRead>>,
     adapter_reference_fault: Option<bool>,
+    adapter_reference_before_create: bool,
     adapter_reference_fault_reached: bool,
     adapter_reference_acquisitions: usize,
     adapter_reference_releases: usize,
@@ -173,10 +174,50 @@ pub(crate) fn route_created() {
         }
     });
 }
-pub(crate) fn route_table_read() -> io::Result<()> {
+pub(crate) fn native_table_read(before_create: bool) -> io::Result<()> {
     INPUTS.with(|inputs| {
         if let Some(inputs) = inputs.borrow_mut().as_mut() {
-            if inputs.route_postflight_fault == Some(true) {
+            if before_create && inputs.adapter_reference_before_create {
+                if let Some(unwind) = inputs.adapter_reference_fault.take() {
+                    inputs.adapter_reference_fault_reached = true;
+                    assert_eq!(inputs.adapter_reference_acquisitions, 0);
+                    assert_eq!(inputs.adapter_create_attempts, 0);
+                    assert_eq!(inputs.resolver_reference_acquisitions, 1);
+                    assert_eq!(inputs.native_loads, 1);
+                    assert_eq!(inputs.native_originals.len(), 1);
+                    assert_eq!(inputs.native_originals[0].0, "key");
+                    assert!(inputs.module_originals[0].upgrade().is_some());
+                    inputs
+                        .resolver_reference_original
+                        .as_ref()
+                        .expect("actual resolver origin at absence fault")
+                        .upgrade()
+                        .expect("actual resolver owner at absence fault")
+                        .verify_retained_original()
+                        .expect("actual resolver pin at absence fault");
+                    let key = inputs.native_originals[0]
+                        .1
+                        .upgrade()
+                        .expect("actual key owner at absence fault");
+                    let key = key
+                        .downcast_ref::<super::member_carrier_keys::OriginalKeyRootObligation<
+                            super::member_carrier_keys::win32::Handle,
+                        >>()
+                        .expect("actual key obligation at absence fault");
+                    assert_eq!(
+                        key.classification(),
+                        super::member_carrier_keys::KeyRootObligationKind::CreatedKeyRootRetained
+                    );
+                    assert!(key.closed_handle_ack().is_err());
+                    if unwind {
+                        panic!("fixture post-GetIfTable2 absence read unwind");
+                    }
+                    return Err(io::Error::other(
+                        "fixture post-GetIfTable2 absence read lost",
+                    ));
+                }
+            }
+            if !before_create && inputs.route_postflight_fault == Some(true) {
                 inputs.route_postflight_fault = None;
                 inputs.route_postflight_fault_reached = true;
                 return Err(io::Error::other(
@@ -190,6 +231,12 @@ pub(crate) fn route_table_read() -> io::Result<()> {
 pub(crate) fn native_original_retained<T: Any>(kind: &'static str, original: &Rc<T>) {
     INPUTS.with(|inputs| {
         if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            if kind == "key"
+                && (!inputs.adapter_reference_before_create
+                    || inputs.adapter_reference_fault.is_none())
+            {
+                return;
+            }
             let root: Rc<dyn Any> = original.clone();
             inputs.native_originals.push((kind, Rc::downgrade(&root)));
         }
@@ -279,19 +326,21 @@ pub(crate) fn native_adapter_reference_returned(
         };
         inputs.adapter_reference_acquisitions += 1;
         inputs.adapter_reference_original = Some(Rc::downgrade(original));
-        if let Some(unwind) = inputs.adapter_reference_fault.take() {
-            inputs.adapter_reference_fault_reached = true;
-            assert_eq!(inputs.adapter_reference_acquisitions, 1);
-            assert_eq!(inputs.adapter_create_attempts, 0);
-            original
-                .verify_retained_original()
-                .expect("actual adapter reference");
-            if unwind {
-                panic!("fixture post-GetModuleHandleEx adapter reference unwind");
+        if !inputs.adapter_reference_before_create {
+            if let Some(unwind) = inputs.adapter_reference_fault.take() {
+                inputs.adapter_reference_fault_reached = true;
+                assert_eq!(inputs.adapter_reference_acquisitions, 1);
+                assert_eq!(inputs.adapter_create_attempts, 0);
+                original
+                    .verify_retained_original()
+                    .expect("actual adapter reference");
+                if unwind {
+                    panic!("fixture post-GetModuleHandleEx adapter reference unwind");
+                }
+                return Err(io::Error::other(
+                    "fixture adapter reference postflight lost",
+                ));
             }
-            return Err(io::Error::other(
-                "fixture adapter reference postflight lost",
-            ));
         }
         Ok(())
     })
@@ -511,6 +560,7 @@ impl Fixture {
                 resolver_reference_releases: 0,
                 resolver_reference_original: None,
                 adapter_reference_fault: None,
+                adapter_reference_before_create: false,
                 adapter_reference_fault_reached: false,
                 adapter_reference_acquisitions: 0,
                 adapter_reference_releases: 0,
@@ -734,23 +784,23 @@ impl Fixture {
             );
         });
     }
-    pub(crate) fn lose_adapter_reference_postflight(&self, unwind: bool) {
+    pub(crate) fn lose_precreate_postflight(&self, unwind: bool, before_create: bool) {
         INPUTS.with(|inputs| {
-            inputs
-                .borrow_mut()
-                .as_mut()
-                .expect("fixture inputs")
-                .adapter_reference_fault = Some(unwind);
+            let mut inputs = inputs.borrow_mut();
+            let inputs = inputs.as_mut().expect("fixture inputs");
+            inputs.adapter_reference_fault = Some(unwind);
+            inputs.adapter_reference_before_create = before_create;
         });
     }
-    pub(crate) fn require_retained_adapter_reference(&self) {
+    pub(crate) fn require_retained_precreate_originals(&self) {
         INPUTS.with(|inputs| {
             let inputs = inputs.borrow();
             let inputs = inputs.as_ref().expect("fixture inputs");
             assert!(inputs.adapter_reference_fault_reached);
             assert!(inputs.adapter_reference_fault.is_none());
             assert_eq!(
-                inputs.adapter_reference_acquisitions, 1,
+                inputs.adapter_reference_acquisitions,
+                usize::from(!inputs.adapter_reference_before_create),
                 "adapter reference retried"
             );
             assert_eq!(
@@ -762,30 +812,62 @@ impl Fixture {
                 "adapter create reached after fault"
             );
             assert!(
-                inputs.native_originals.is_empty(),
+                inputs
+                    .native_originals
+                    .iter()
+                    .all(|(kind, _)| *kind == "key"),
                 "adapter ACK manufactured"
             );
-            // The fixture owns only Weak; this SAME rooted object must still
-            // own the actual returned original HMODULE after Err/unwind/Stop.
-            let adapter = inputs
-                .adapter_reference_original
-                .as_ref()
-                .expect("actual adapter reference origin")
-                .upgrade()
-                .expect("caller lost the original adapter reference owner");
-            adapter
-                .verify_retained_original()
-                .expect("original adapter pin/return lost");
+            assert_eq!(
+                inputs.native_originals.len(),
+                usize::from(inputs.adapter_reference_before_create),
+                "actual pre-create key/adapter origin count changed"
+            );
+            // The fixture owns only Weak; these SAME rooted objects retain
+            // actual original HKEY/HMODULE owners through Err/unwind/retry.
             let resolver = inputs
                 .resolver_reference_original
                 .as_ref()
                 .expect("actual resolver reference origin")
                 .upgrade()
                 .expect("caller lost the distinct resolver reference owner");
-            assert!(
-                !adapter.same_original(&resolver),
-                "distinct acquisitions merged"
-            );
+            resolver
+                .verify_retained_original()
+                .expect("original resolver pin/return lost");
+            if inputs.adapter_reference_before_create {
+                assert!(inputs.adapter_reference_original.is_none());
+                let key = inputs.native_originals[0]
+                    .1
+                    .upgrade()
+                    .expect("original key owner lost");
+                let key = key
+                    .downcast_ref::<super::member_carrier_keys::OriginalKeyRootObligation<
+                        super::member_carrier_keys::win32::Handle,
+                    >>()
+                    .expect("actual original key obligation");
+                assert_eq!(
+                    key.classification(),
+                    super::member_carrier_keys::KeyRootObligationKind::CreatedKeyRootRetained
+                );
+                assert!(
+                    key.closed_handle_ack().is_err(),
+                    "original key closed without cleanup"
+                );
+            } else {
+                let adapter = inputs
+                    .adapter_reference_original
+                    .as_ref()
+                    .expect("actual adapter reference origin")
+                    .upgrade()
+                    .expect("caller lost the original adapter reference owner");
+                adapter
+                    .verify_retained_original()
+                    .expect("original adapter pin/return lost");
+                assert!(
+                    !adapter.same_original(&resolver),
+                    "distinct acquisitions merged"
+                );
+            }
             assert_eq!(inputs.native_loads, 1);
             assert!(
                 inputs.module_originals[0].upgrade().is_some(),

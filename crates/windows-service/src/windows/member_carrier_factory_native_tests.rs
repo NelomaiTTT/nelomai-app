@@ -27,7 +27,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     // case in its OWN child; process exit is not a synthesized cleanup receipt.
     // libtest names start at the crate's modules; module_path! includes the
     // crate name. Each resolver lane also exercises its distinct adapter
-    // reference in a fresh child; retain the exact count checks below.
+    // reference and pre-create table failure in fresh children. Retain the
+    // exact count checks below.
     let child_module = module_path!()
         .split_once("::")
         .expect("crate-qualified module")
@@ -77,12 +78,16 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         .into_iter()
         .filter(|case| selected.as_deref().is_none_or(|selected| *case == selected))
         .flat_map(|case| {
-            let adapter = match case {
-                "resolver-reference-error" => Some("adapter-reference-error"),
-                "resolver-reference-unwind" => Some("adapter-reference-unwind"),
+            let partials = match case {
+                "resolver-reference-error" => {
+                    Some(["adapter-reference-error", "absence-table-error"])
+                }
+                "resolver-reference-unwind" => {
+                    Some(["adapter-reference-unwind", "absence-table-unwind"])
+                }
                 _ => None,
             };
-            std::iter::once(case).chain(adapter)
+            std::iter::once(case).chain(partials.into_iter().flatten())
         })
     {
         // The case spans preparation, many independently supervised cleanup
@@ -186,9 +191,9 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         completed += 1;
     }
     let expected = match selected.as_deref() {
-        Some("resolver-reference-error" | "resolver-reference-unwind") => 2,
+        Some("resolver-reference-error" | "resolver-reference-unwind") => 3,
         Some(_) => 1,
-        None => cases.len() + 2,
+        None => cases.len() + 4,
     };
     assert_eq!(completed, expected);
     println!(
@@ -212,6 +217,10 @@ fn carrier_factory_actual_cold_child() {
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
     );
+    let absence_partial = matches!(
+        case.as_str(),
+        "absence-table-error" | "absence-table-unwind"
+    );
     let adapter_partial = matches!(
         case.as_str(),
         "adapter-reference-error" | "adapter-reference-unwind"
@@ -228,6 +237,7 @@ fn carrier_factory_actual_cold_child() {
     let native_path = module_partial
         || resolver_partial
         || adapter_partial
+        || absence_partial
         || full_primary
         || route_partial
         || native_partial.is_some();
@@ -345,8 +355,12 @@ fn carrier_factory_actual_cold_child() {
         std::mem::forget(factory);
         return;
     }
-    if adapter_partial {
-        fixture.lose_adapter_reference_postflight(case == "adapter-reference-unwind");
+    if adapter_partial || absence_partial {
+        let unwind = matches!(
+            case.as_str(),
+            "adapter-reference-unwind" | "absence-table-unwind"
+        );
+        fixture.lose_precreate_postflight(unwind, absence_partial);
         let Command::Start {
             primary, options, ..
         } = &command
@@ -356,29 +370,55 @@ fn carrier_factory_actual_cold_child() {
         let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             original.start_primary(primary, options)
         }));
-        assert!(
-            started.is_err() || started.unwrap().is_err(),
-            "adapter reference fault accepted"
-        );
-        assert!(original.snapshot().cleanup_pending);
-        fixture.require_retained_adapter_reference();
-        assert!(
-            original.start_primary(primary, options).is_err(),
-            "uncertain adapter reference retried"
-        );
-        fixture.require_retained_adapter_reference();
+        if unwind {
+            assert!(
+                started.is_err(),
+                "actual pre-create boundary did not unwind"
+            );
+        } else {
+            assert!(
+                matches!(started, Ok(Err(_))),
+                "actual pre-create error accepted"
+            );
+        }
+        if !absence_partial || original.snapshot().cleanup_pending {
+            assert!(original.snapshot().cleanup_pending);
+            fixture.require_retained_precreate_originals();
+            assert!(
+                original.start_primary(primary, options).is_err(),
+                "failed pre-create boundary retried"
+            );
+            fixture.require_retained_precreate_originals();
+        } else {
+            assert_eq!(original.snapshot().session.phase, SessionPhase::Stopped);
+        }
         let stopped = original.execute(
             Command::Stop {
                 scope: scope.clone(),
             },
             8,
         );
+        if stopped.is_err() {
+            assert!(original.snapshot().cleanup_pending);
+            fixture.require_retained_precreate_originals();
+        }
+        if absence_partial {
+            // No adapter/reference attempt: actual original key/module cleanup
+            // must complete; process exit is never a substitute release ACK.
+            let stopped = stopped.expect("actual post-key/pre-C Stop completion");
+            assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+            assert!(!stopped.cleanup_pending);
+            let repeated = original
+                .execute(Command::Stop { scope }, 8)
+                .expect("actual post-key/pre-C repeated Stop");
+            assert_eq!(repeated, stopped);
+            return;
+        }
         assert!(
             stopped.is_err(),
             "no-C adapter reference became completed Stop"
         );
         assert!(original.snapshot().cleanup_pending);
-        fixture.require_retained_adapter_reference();
         // No adapter CloseACK exists, and process exit supplies no release ACK.
         std::mem::forget(original);
         std::mem::forget(factory);

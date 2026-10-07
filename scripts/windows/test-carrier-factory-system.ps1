@@ -106,7 +106,7 @@ try {
     if ($output -notmatch '(?m)^test result: ok\. 1 passed; 0 failed;') {
         throw 'Missing exact factory execution count; no empty-filter PASS'
     }
-    $expectedCompleted = if ($Case -in @('resolver-reference-error', 'resolver-reference-unwind')) { 2 } else { 1 }
+    $expectedCompleted = if ($Case -in @('resolver-reference-error', 'resolver-reference-unwind')) { 3 } else { 1 }
     if ($output -notmatch ('(?m)^actual native factory coverage case=' + [regex]::Escape($Case) + ' completed=' + $expectedCompleted + '\r?$')) {
         throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     }

@@ -2693,6 +2693,19 @@ pub(crate) mod native {
                     root.resolve_components().map_err(denied)
                 }
                 ReadyStep::Create => {
+                    #[cfg(test)]
+                    if let Some(receipt) = prerequisite.as_ref() {
+                        assert_eq!(
+                            receipt.record.keys[0].phase,
+                            crate::member_carrier_native_ownership::KeyPhase::Disabled
+                        );
+                        super::super::member_carrier_factory_test_os::native_original_retained(
+                            "key",
+                            &super::super::member_carrier_keys::terminal_original_key_obligation(
+                                receipt.new_key_ack,
+                            ),
+                        );
+                    }
                     let root = self.construction.as_mut().ok_or(CarrierError::Pending)?;
                     let (carrier, _) = root
                         .retained_parts()

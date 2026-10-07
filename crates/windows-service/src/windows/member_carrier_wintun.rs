@@ -810,6 +810,11 @@ pub(crate) mod native {
                 }
             }
             let table = Table(raw);
+            #[cfg(test)]
+            if status == 0 && !table.0.is_null() {
+                crate::windows::member_carrier_factory_test_os::native_table_read(true)
+                    .map_err(|_| Error::Native)?;
+            }
             if status != 0 || table.0.is_null() {
                 return Err(Error::Native);
             }
