@@ -934,6 +934,12 @@ fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) 
     validate_absence_table(targets, &before).inspect_err(|_error| {
         #[cfg(all(windows, test))]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            eprintln!(
+                "actual native MIB absence denied; matching rows (guid,name,luid,index,type,role_flags)={:?}",
+                before.iter().filter(|r| targets.iter().any(|t| r.identity.guid == t.guid || r.identity.name.eq_ignore_ascii_case(&t.name)))
+                    .take(8).map(|r| (&r.identity.guid, &r.identity.name, r.identity.luid,
+                        r.identity.index, r.identity.if_type, r.role_flags)).collect::<Vec<_>>()
+            );
             match query.device_snapshot(targets) {
                 Ok(snapshot) => eprintln!(
                     "actual native MIB absence denied; PnP (presence,status,problem,guid,name)={:?}",

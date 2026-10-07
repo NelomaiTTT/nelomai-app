@@ -444,12 +444,8 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
             }
             let original = if let Some(entry) = find(&self.journal.owned, &value.key()) {
                 entry.original.clone()
-            } else {
+            } else if matches!(value, NetworkValue::Dns(_)) {
                 let original = self.system.read(&value.key())?;
-                // DNS has a baseline to restore; pre-existing routes aren't ours.
-                if !matches!(value, NetworkValue::Dns(_)) && original.is_some() {
-                    return Err(conflict());
-                }
                 if original
                     .as_ref()
                     .is_some_and(|v| v.key() != value.key() || !v.valid())
@@ -457,6 +453,9 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
                     return Err(conflict());
                 }
                 original
+            } else {
+                // New non-DNS resources require absence in the all-changes preflight.
+                None
             };
             target.push(Entry {
                 original,

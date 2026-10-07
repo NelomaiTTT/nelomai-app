@@ -1054,8 +1054,6 @@ fn failed_rule_creation_rolls_back_its_route_through_the_real_owner() {
     let present = r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","scope":"253","metric":42,"flags":[]}]"#;
     let network = adapter(&[
         "[]",
-        "[]", // originals
-        "[]",
         "[]", // preflight
         "[]",
         "",

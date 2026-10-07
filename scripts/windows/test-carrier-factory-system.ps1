@@ -2,13 +2,23 @@ param(
     [Parameter(Mandatory = $true)][string]$TestExecutable,
     [Parameter(Mandatory = $true)][string]$RuntimeDirectory,
     [Parameter(Mandatory = $true)][string]$OutputDirectory,
-    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Case
+    [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Case,
+    [Guid]$DisposableVmId = [Guid]::Empty
 )
 $ErrorActionPreference = 'Stop'
-# This harness belongs only to the disposable native CI runner, never line H.
+# This harness belongs only to disposable native CI or the explicit disposable VM, never line H.
 # Production's unimpersonated SYSTEM gate and actual namespace/mutex calls stay
 # intact. The ordinary suite runs separately; this executes its SAME factory test.
-if ($env:GITHUB_ACTIONS -ne 'true') { throw 'Factory SYSTEM harness requires GitHub Actions' }
+if ($env:GITHUB_ACTIONS -ne 'true') {
+    if ($DisposableVmId -eq [Guid]::Empty) { throw 'Factory SYSTEM harness requires an explicit disposable VM ID outside GitHub Actions' }
+    $computer = Get-CimInstance -ClassName Win32_ComputerSystem
+    $guest = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters'
+    if ($computer.Name -cne 'NELOMAI033' -or $computer.Manufacturer -cne 'Microsoft Corporation' -or
+        $computer.Model -cne 'Virtual Machine' -or $guest.VirtualMachineName -cne 'Nelomai-033-Native' -or
+        [Guid]$guest.VirtualMachineId -ne $DisposableVmId) {
+        throw 'Factory SYSTEM harness disposable guest identity mismatch'
+    }
+}
 $selectedTest = 'windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair'
 $exe = (Resolve-Path -LiteralPath $TestExecutable).Path
 $selection = @(& $exe --exact $selectedTest --list)

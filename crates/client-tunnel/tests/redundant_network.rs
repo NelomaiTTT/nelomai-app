@@ -6,12 +6,14 @@ use std::{collections::BTreeMap, io};
 struct System {
     values: BTreeMap<String, NetworkValue>,
     writes: usize,
+    reads: Vec<ResourceKey>,
     fail_at: Vec<usize>,
     ignore_at: Vec<usize>,
     reject_interfaces: Vec<u32>,
 }
 impl NetworkSystem for System {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        self.reads.push(key.clone());
         Ok(self.values.get(&format!("{key:?}")).cloned())
     }
     fn compare_exchange(
@@ -353,19 +355,23 @@ fn failed_rollback_keeps_durable_pending_state_and_recovery_restores_original() 
 
 #[test]
 fn existing_foreign_route_is_never_adopted_or_removed() {
-    let mut system = System::default();
-    let foreign = route("0.0.0.0/1", 77);
-    system
-        .values
-        .insert(format!("{:?}", foreign.key()), foreign.clone());
-    let mut owner = NetworkOwner::fresh(system, Journal::default());
-    assert!(owner.select(Slot::A, pair(10)).is_err());
-    assert_eq!(owner.system_mut().writes, 0);
-    owner.cleanup().unwrap();
-    assert_eq!(
-        owner.system_mut().read(&foreign.key()).unwrap(),
-        Some(foreign)
-    );
+    for foreign_index in 0..4 {
+        let mut system = System::default();
+        let foreign = pair(77)[foreign_index].clone();
+        system
+            .values
+            .insert(format!("{:?}", foreign.key()), foreign.clone());
+        let mut owner = NetworkOwner::fresh(system, Journal::default());
+        assert!(owner.select(Slot::A, pair(10)).is_err());
+        assert_eq!(owner.system_mut().writes, 0);
+        assert_eq!(owner.active(), None);
+        assert!(!owner.has_resources());
+        owner.cleanup().unwrap();
+        assert_eq!(
+            owner.system_mut().read(&foreign.key()).unwrap(),
+            Some(foreign)
+        );
+    }
 }
 
 #[test]
@@ -418,9 +424,12 @@ fn cleanup_does_not_overwrite_dns_changed_by_another_owner() {
         servers: vec!["77.88.8.8".parse().unwrap()],
     });
     let mut system = System::default();
-    system.values.insert(format!("{:?}", dns.key()), original);
+    system
+        .values
+        .insert(format!("{:?}", dns.key()), original.clone());
     let mut owner = NetworkOwner::fresh(system, Journal::default());
     owner.select(Slot::A, vec![dns.clone()]).unwrap();
+    assert_eq!(owner.system_mut().reads, vec![dns.key(); 3]);
     owner
         .system_mut()
         .values
@@ -428,6 +437,12 @@ fn cleanup_does_not_overwrite_dns_changed_by_another_owner() {
     assert!(owner.cleanup().is_err());
     assert!(owner.cleanup_pending());
     assert_eq!(owner.system_mut().read(&dns.key()).unwrap(), Some(foreign));
+    let (_, store) = owner.into_parts();
+    let saved = serde_json::to_value(store.saved.unwrap()).unwrap();
+    assert_eq!(
+        saved["owned"][0]["original"],
+        serde_json::to_value(original).unwrap()
+    );
 }
 
 #[test]
@@ -484,10 +499,34 @@ fn physical_bypasses_can_be_prepared_without_publishing_unstarted_primary() {
     let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
     owner.prepare(vec![route("192.0.2.1/32", 5)]).unwrap();
     assert_eq!(owner.active(), None);
+    let bypass = route("192.0.2.1/32", 5);
+    assert_eq!(owner.system_mut().reads, vec![bypass.key(); 2]);
+    owner.system_mut().reads.clear();
     let mut routes = vec![route("192.0.2.1/32", 5)];
     routes.extend(pair(10));
     owner.select(Slot::A, routes).unwrap();
     assert_eq!(owner.active(), Some(Slot::A));
+    // Existing bypass is reconciled; new routes need only preflight + postflight.
+    assert_eq!(
+        owner
+            .system_mut()
+            .reads
+            .iter()
+            .filter(|key| **key == bypass.key())
+            .count(),
+        1
+    );
+    for value in pair(10) {
+        assert_eq!(
+            owner
+                .system_mut()
+                .reads
+                .iter()
+                .filter(|key| **key == value.key())
+                .count(),
+            2
+        );
+    }
     assert!(owner.prepare(vec![]).is_err());
     assert_eq!(owner.active(), Some(Slot::A));
 }

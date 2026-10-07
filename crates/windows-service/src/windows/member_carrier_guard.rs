@@ -1978,14 +1978,38 @@ fn read_locked<N: NativeApi, A: BindingAttestor>(
     kind: SessionKind,
     ids: &BTreeMap<Key, u64>,
 ) -> Result<Snapshot> {
-    let bindings = a.observe(scope)?;
-    let actual = read_native_snapshot(io, &bindings, scope, kind, ids)?;
+    let bindings = a.observe(scope).inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard read_locked first observe kind={kind:?}: {_error:?}"
+        ));
+    })?;
+    let actual = read_native_snapshot(io, &bindings, scope, kind, ids).inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard read_locked native snapshot kind={kind:?}: {_error:?}"
+        ));
+    })?;
     // Include even currently unreferenced owners: a foreign/rebound B or source
     // appearing during an EMPTY/base read may not be hidden by the projection.
     // This remains a sampled continuity fence, not atomicity against OS writers.
-    let after = a.observe(scope)?;
-    validate_bindings(scope, &after)?;
+    let after = a.observe(scope).inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard read_locked second observe kind={kind:?}: {_error:?}"
+        ));
+    })?;
+    validate_bindings(scope, &after).inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard read_locked second bindings validation kind={kind:?}: {_error:?}"
+        ));
+    })?;
     if bindings != after {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard read_locked bindings equality mismatch kind={kind:?}"
+        ));
         return Err(GuardError::Conflict);
     }
     Ok(actual)
@@ -2005,6 +2029,11 @@ fn read_native_snapshot<N: NativeApi>(
     for (i, k) in keys.filters.into_iter().enumerate() {
         if let Some(native) = io.filter(kind, k, keys.sublayer)? {
             if native.policy.key != k || ids.get(&k) != Some(&native.id) {
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                    "guard owned filter identity mismatch kind={kind:?} key={k:?} actual_key={:?} actual_id={} expected_id={:?}",
+                    native.policy.key, native.id, ids.get(&k)
+                ));
                 return Err(GuardError::Conflict);
             }
             referenced[i / 24] = true;
@@ -2943,7 +2972,19 @@ mod bfe {
             }
             status(code)?;
             let raw = unsafe { memory.0.as_ref() }.ok_or(GuardError::Conflict)?;
-            unsafe { decode_filter(raw, k, sub) }.map(Some)
+            unsafe { decode_filter(raw, k, sub) }
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "guard owned filter raw decode kind={kind:?} key={k:?} actual_key={:?} sublayer={:?} id={} layer={:?} flags={} action={} conditions={} weight_type={} weight={:?} effective_type={} effective={:?} provider_present={} provider_bytes={}: {_error:?}",
+                        key(raw.filterKey), key(raw.subLayerKey), raw.filterId, key(raw.layerKey),
+                        raw.flags, raw.action.r#type, raw.numFilterConditions,
+                        raw.weight.r#type, unsafe { read_weight(&raw.weight) },
+                        raw.effectiveWeight.r#type, unsafe { read_weight(&raw.effectiveWeight) },
+                        !raw.providerKey.is_null(), raw.providerData.size
+                    ));
+                })
+                .map(Some)
         }
         fn arbitration(&mut self, kind: SessionKind) -> Result<Vec<ArbitrationFilter>> {
             // The guard already holds THIS engine's write transaction. Do not
