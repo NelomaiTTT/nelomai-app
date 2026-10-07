@@ -302,7 +302,11 @@ impl Drop for NtAdapter {
 
 impl NtAdapter {
     fn open(name: &str, expected_luid: u64) -> io::Result<Self> {
-        let path = std::env::current_exe()?.with_file_name("wireguard.dll");
+        let executable = std::env::current_exe()?;
+        #[cfg(test)]
+        let executable =
+            crate::windows::member_carrier_factory_test_os::executable().unwrap_or(executable);
+        let path = executable.with_file_name("wireguard.dll");
         let library = unsafe {
             LoadLibraryExW(
                 wide(path).as_ptr(),
