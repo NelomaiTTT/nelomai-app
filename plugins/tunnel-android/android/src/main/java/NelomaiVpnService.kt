@@ -733,6 +733,21 @@ internal fun startRedundantVpnSession(
 class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVpnHostV1) :
     GoBackend.VpnService(runtimeHost.service) {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
+    private val statusSelectionDelegate = lazy { ru.nelomai.client.RuntimeSelectionStore(applicationContext) }
+    private val statusEndpoint = TunnelStatusEndpoint(
+        generation = serviceGeneration,
+        isCurrent = { !serviceDestroyed && serviceCallbackGate.isOpen() &&
+            serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get() },
+        verifyRuntime = { complete ->
+            statusSelectionDelegate.value.read { result ->
+                complete(result.getOrNull()?.let {
+                    it.slot == BuildConfig.RUNTIME_SLOT && it.runtimeVersion == BuildConfig.RUNTIME_VERSION &&
+                        !ru.nelomai.client.RuntimeProcessSelection.needsExit(it)
+                } == true)
+            }
+        },
+        observe = ::handleClientStatus,
+    )
     private val restoreHandler = Handler(Looper.getMainLooper())
     private val credentialExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-background-credential").apply { isDaemon = true }
@@ -2513,8 +2528,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun handleClientStatus(intent: Intent) {
+        val receiver = statusEndpoint.replyTo(intent.resultReceiver())
         if (intent.getIntExtra(EXTRA_API_VERSION, 0) != TUNNEL_API_VERSION) {
-            intent.resultReceiver().sendError("unsupported_api_version")
+            receiver.sendError("unsupported_api_version")
             stopIfIdle()
             return
         }
@@ -2532,11 +2548,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 dispatchRedundantResume(recovery)
                 SessionState.STARTING
             }
-            intent.resultReceiver().sendOperation(state, 0)
+            receiver.sendOperation(state, 0)
             return
         }
         if (recovery is RecoveryStoreResult.Failure) {
-            intent.resultReceiver().sendError(recovery.code)
+            receiver.sendError(recovery.code)
             return
         }
         val state = TunnelRuntime.state()
@@ -2545,10 +2561,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             state,
         )) {
             restoreDesiredTunnel("client_status")
-            intent.resultReceiver().sendOperation(SessionState.STARTING, 0)
+            receiver.sendOperation(SessionState.STARTING, 0)
             return
         }
-        intent.resultReceiver().sendOperation(state, 0)
+        receiver.sendOperation(state, 0)
         stopIfIdle()
     }
 
@@ -3408,6 +3424,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     override fun onRevoke() {
+        statusEndpoint.close()
         TunnelLog.warning("service.vpn_revoked")
         idleStopDebouncer.cancel()
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
@@ -3532,6 +3549,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     override fun onDestroy() {
+        statusEndpoint.close()
+        if (statusSelectionDelegate.isInitialized()) statusSelectionDelegate.value.close()
         serviceDestroyed = true
         if (activeService === this) activeService = null
         serviceCallbackGate.close()
@@ -4478,6 +4497,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun abandonServiceForRecovery() {
+        statusEndpoint.close()
         serviceCallbackGate.close()
         if (activeService === this) activeService = null
     }

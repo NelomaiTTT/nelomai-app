@@ -35,8 +35,11 @@ class StableSourceGenerationTest(unittest.TestCase):
         service.write_text(
             "package ru.nelomai.tunnel\n"
             "import ru.nelomai.client.RuntimeDispatchGuard\n"
+            "import ru.nelomai.client.RuntimeProcessSelection\n"
             "val icon = R.drawable.ic_vpn_notification\n"
             "val pending = RuntimeDispatchGuard.hasPending()\n"
+            "val mayObserve = "
+            "!ru.nelomai.client.RuntimeProcessSelection.needsExit(selected)\n"
         )
         for plugin in ("push-android", "updater-android"):
             (self.root / f"plugins/{plugin}/android/src/main/java").mkdir(parents=True)
@@ -73,6 +76,11 @@ class StableSourceGenerationTest(unittest.TestCase):
     def test_resource_import_is_not_hidden_by_a_longer_runtime_import(self):
         self.assertIn("import ru.nelomai.runtime.stable.R\n", self.generated)
         self.assertIn("R.drawable.stable_runtime_ic_vpn_notification", self.generated)
+
+    def test_status_channel_uses_the_shared_process_selection_fence(self):
+        self.assertIn("import ru.nelomai.client.RuntimeProcessSelection\n", self.generated)
+        self.assertIn("!ru.nelomai.client.RuntimeProcessSelection.needsExit(selected)", self.generated)
+        self.assertNotIn("ru.nelomai.runtime.stable.RuntimeProcessSelection", self.generated)
 
 
 if __name__ == "__main__":

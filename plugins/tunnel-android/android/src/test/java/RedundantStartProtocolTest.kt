@@ -86,7 +86,17 @@ class RedundantStartProtocolTest {
     }
 
     @Test fun unresponsiveStatusStillReportsServiceTimeoutNotConnectionTimeout() {
-        val context = RuntimeEnvironment.getApplication()
+        // Model an unavailable optional binding and an RPC with no reply.
+        // Robolectric's default synthetic binding instead delivers a null
+        // component/binder, which is an explicit connection failure, not silence.
+        val context = object : android.content.ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun getApplicationContext(): android.content.Context = this
+            override fun bindService(
+                intent: android.content.Intent,
+                connection: android.content.ServiceConnection,
+                flags: Int,
+            ): Boolean = false
+        }
         val errors = mutableListOf<String>()
         TunnelServiceClient.status(context, TUNNEL_API_VERSION, { _, _ -> }, { errors += it })
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(30))

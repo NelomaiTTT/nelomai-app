@@ -45,11 +45,11 @@
 **Files:** `plugins/tunnel-android/android/src/main/java/{TunnelStatusTransport,TunnelServiceProtocol,NelomaiVpnService}.kt`, соответствующие `TunnelStatusTransportTest`/`RedundantStartProtocolTest`; `scripts/android/generate-stable-sources.py` и `scripts/tests/test_generate_stable_sources.py`.
 **Interfaces:** существующий statusRPC; не изменять Start/Stop/cancellation policy. Источники5540f1f+bd96f57.
 
-- [ ] Перенести actual status channel regression:100idle polls →1service start/1binding/100fresh observations. ПолучитьRED на стабильном коде.
-- [ ] Перенести status-only binding и endpoint guards, затем generator fix сохранения shared `RuntimeProcessSelection`.
-- [ ] Проверить release binding после5s inactivity, request deadline30s, binderdeath/revoke/generation/runtime change, false bind, late reply, wrongUID/opcode/API, Stop при сломанном observer.
-- [ ] Выполнить Android plugin JUnit/Robolectric через его существующий Gradle project; перед вызовом уточнить `./gradlew projects`, не угадывать app task вместо plugin. Выполнить `python3 -m unittest discover -s scripts/tests -p test_generate_stable_sources.py` в уже подготовленном Python окружении.
-- [ ] В Android container выполнить `:stable-runtime-android:compileDebugKotlin`, не выдавать skipped JNI за shippingAPK. Review/commit NLM-013 обоих зависимых срезов.
+- [x] Existing-client-API regression: RED100 service starts → GREEN1start/1binding/100fresh observations; не compilation failure нового API.
+- [x] Перенести status-only binding и endpoint guards, затем generator fix сохранения shared `RuntimeProcessSelection` (отдельный RED→GREEN).
+- [x] Проверить release binding после5s inactivity, request deadline30s, binderdeath/revoke/generation/runtime change, false bind, late reply, wrongUID/opcode/API, Stop при сломанном observer.
+- [x] Standalone Android plugin projects проверен; full JUnit974PASS/0failed/errors/skipped/45suites. Python generator3PASS.
+- [x] `:stable-runtime-android:compileDebugKotlin` PASS; это не shipping APK и не hardware. Inline review без открытых замечаний; commit NLM-013 обоих зависимых срезов. Gradle9/deprecated API warnings сохранены в логах.
 
 ## Task 3: NLM-040/049: смысл Stop и актуальное состояние UI
 
