@@ -712,6 +712,36 @@ fn never_member_terminal_frame_is_separate_exact_and_requires_no_native_history(
     stopped.operation = None;
     stopped.validate().unwrap();
     validate_never_member_terminal_frame(&context, &stopped).unwrap();
+    // Successful Stop retains the original restored network journal for final
+    // G; its presence cannot reject the SAME completed terminal publication.
+    let baseline = pair::NetworkSnapshot {
+        routes: vec![nelomai_client_tunnel::redundancy::network::RouteValue {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            scope: nelomai_client_tunnel::redundancy::network::RouteScope::WindowsInterface(10),
+            interface: 10,
+            gateway: None,
+            metric: 1,
+        }],
+        dns: None,
+    };
+    stopped.network = Some(pair::NetworkState {
+        baseline: baseline.clone(),
+        current: baseline.clone(),
+        pending: None,
+    });
+    stopped.validate().unwrap();
+    validate_never_member_terminal_frame(&context, &stopped).unwrap();
+    for pending in [false, true] {
+        let mut bad = stopped.clone();
+        let network = bad.network.as_mut().unwrap();
+        if pending {
+            network.pending = Some(baseline.clone());
+        } else {
+            network.current.routes[0].metric += 1;
+        }
+        assert!(bad.validate().is_err());
+        assert!(validate_never_member_terminal_frame(&context, &bad).is_err());
+    }
     assert!(validate_never_member_frame(&context, &stopped, TunnelSlot::B).is_err());
     for fault in 0..7 {
         let mut bad = stopped.clone();

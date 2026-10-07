@@ -631,7 +631,6 @@ fn validate_never_member_terminal_frame(
         || current.stop_stage != 12
         || current.carrier.is_some()
         || current.members.iter().any(Option::is_some)
-        || current.network.is_some()
         || current.pending.is_some()
         || current.pending_guard.is_some()
         || current.operation.is_some()
@@ -2508,6 +2507,7 @@ pub(crate) mod native {
             if !std::ptr::eq(owner, Rc::as_ptr(&self.input.supervisor))
                 || context != &self.input.context
                 || !pair.matches_runtime(&self.input.runtime)
+                || expected.network.is_some()
             {
                 return Err(Error::Conflict);
             }
@@ -3228,6 +3228,9 @@ pub(crate) mod native {
             expected: &PairRecord,
             lock: &KeyLock,
         ) -> Result<()> {
+            if expected.network.is_some() {
+                return Err(Error::Conflict);
+            }
             validate_never_member_terminal_frame(&self.input.context, expected)?;
             pair.verify_terminal_entry(&self.input.runtime, &self.input.context, expected)
                 .map_err(|_| Error::Conflict)?;

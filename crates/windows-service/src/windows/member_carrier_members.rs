@@ -2185,8 +2185,11 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             self.matches_original_runtime_image(runtime, image)?;
-            let before = self.revision()?;
-            if Record::decode(&before)?.phase != Phase::Closing {
+            let before = self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?;
+            let record = Record::decode(&before)?;
+            if record.context != self.context || record.phase != Phase::Closing {
                 return Err(Error::Conflict);
             }
             let mut members = read_closing_members_with(
@@ -2208,7 +2211,11 @@ pub(crate) mod native {
             )?;
             members.extend(self.pending_members(true, false)?);
             self.matches_original_runtime_image(runtime, image)?;
-            if self.revision()? != before {
+            if self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?
+                != before
+            {
                 return Err(Error::Conflict);
             }
             Ok((before, members))
@@ -2227,8 +2234,11 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
-            let before = self.revision()?;
-            if Record::decode(&before)?.phase != Phase::Preparing {
+            let before = self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?;
+            let record = Record::decode(&before)?;
+            if record.context != self.context || record.phase != Phase::Preparing {
                 return Err(Error::Conflict);
             }
             let mut service_domains = Vec::new();
@@ -2247,7 +2257,11 @@ pub(crate) mod native {
                 },
             )?;
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;
-            if self.revision()? != before {
+            if self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?
+                != before
+            {
                 return Err(Error::Conflict);
             }
             Ok((
@@ -2302,7 +2316,11 @@ pub(crate) mod native {
                 },
             )?;
             self.matches_original_runtime_image(runtime, image)?;
-            if self.revision()? != revision {
+            if self
+                .runtime
+                .record(&self.context, RecordKind::NativeCarrierReceipts)?
+                != revision
+            {
                 return Err(Error::Conflict);
             }
             Ok((
