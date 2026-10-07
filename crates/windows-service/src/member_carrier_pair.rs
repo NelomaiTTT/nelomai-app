@@ -211,7 +211,9 @@ pub(crate) trait PairJournal {
 pub(crate) trait CarrierPairIo {
     type Socket: PairSocket;
     /// Actual first Running Session ACK joined to the retained original startup
-    /// SDK proof. Returned epoch is comparison facts only, never permission.
+    /// SDK proof. MUST bracket selection with full actual original Running
+    /// guard/C/member rows, network ACK/DNS/endpoints and held-probe reads under
+    /// the same Pair/deadline. Returned epoch is comparison facts only, never permission.
     fn select_running_execution(&mut self, record: &Record) -> io::Result<u64>;
     fn preflight_fresh(&mut self, record: &Record) -> io::Result<()>;
     /// Actual provider/source/native/runtime/creator authority BEFORE and AFTER
@@ -1215,7 +1217,9 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         self.finish(Effect::HoldProbe(slot), self.record.clone())
     }
     fn install_allows(&mut self, slot: Slot) -> io::Result<()> {
-        self.permit_authority(slot)?;
+        if self.record.guard.permits {
+            return Err(failed());
+        }
         self.transition_guard(self.model(Some(slot), true)?)
     }
     pub(crate) fn attach_member(
@@ -1793,7 +1797,8 @@ impl<I: CarrierPairIo, J: PairJournal> NativePair for CarrierNativePair<I, J> {
 impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
     fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
         self.check_scope(scope)?;
-        self.check_live(scope, self.fence())?;
+        let fence = self.fence();
+        self.check_live(scope, fence)?;
         if self.record.phase != Phase::Running
             || self.record.pending.is_some()
             || self.record.pending_guard.is_some()
@@ -1815,7 +1820,8 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
             if epoch != self.execution_epoch.get() {
                 return Err(failed());
             }
-            self.check_integrity()
+            self.check_live(scope, fence)?;
+            self.require_current()
         })();
         let result = self.outcome(result);
         flight.finished = result.is_ok();

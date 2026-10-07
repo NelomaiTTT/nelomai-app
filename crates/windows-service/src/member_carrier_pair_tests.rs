@@ -275,7 +275,44 @@ impl CarrierPairIo for Io {
         {
             panic!("original Running handoff interrupted");
         }
-        self.effect("complete-start", |_| {})?;
+        // This required native handoff itself brackets its modeled actual
+        // originals. Do not substitute a coordinator read_live/no-op proof.
+        for step in 0..2 {
+            let actual = self.0.borrow();
+            if actual.scope != record.scope
+                || actual.disk.as_ref() != Some(record)
+                || actual.guard.expected != record.guard.expected
+                || actual.carrier != record.carrier
+                || actual
+                    .members
+                    .iter()
+                    .zip(&record.members)
+                    .any(|(actual, expected)| {
+                        actual.as_ref() != expected.as_ref().map(|member| &member.owner)
+                    })
+                || record.network.as_ref().is_none_or(|network| {
+                    network.pending.is_some() || network.current != actual.network
+                })
+                || actual.foreign
+                || !actual.weak
+                || actual.held < record.members.iter().flatten().count()
+                || actual.unpublished != 0
+            {
+                return Err(failed());
+            }
+            drop(actual);
+            if step == 0 {
+                self.effect("complete-start", |actual| {
+                    if actual
+                        .fail
+                        .as_ref()
+                        .is_some_and(|(name, _)| name == "complete-start-post-network-drift")
+                    {
+                        actual.network.routes[0].metric += 1;
+                    }
+                })?;
+            }
+        }
         Ok(self.0.borrow().execution_epoch)
     }
     fn preflight_fresh(&mut self, r: &Record) -> io::Result<()> {
@@ -1373,7 +1410,38 @@ fn start_readies_c_once_before_addressless_a_and_blocks_before_network_and_ports
     assert!(position("weak") < position("network"));
     assert!(position("network") < position("hold-A"));
     assert!(position("hold-A") < position("allows"));
+    let hold = position("hold-A");
+    let allows = position("allows");
+    let published = hold
+        + events[hold..allows]
+            .iter()
+            .position(|event| event == "save:Starting:Some(Guard)")
+            .unwrap();
+    // Hold's own ACK check precedes publication; permit authority belongs
+    // only to the published plan immediately before its actual WFP edge.
+    assert_eq!(
+        events[hold..published]
+            .iter()
+            .filter(|event| event.as_str() == "held-proof")
+            .count(),
+        1
+    );
+    for check in ["ready", "verify-member-A", "held-proof", "endpoints"] {
+        assert_eq!(
+            events[published..allows]
+                .iter()
+                .filter(|event| event.as_str() == check)
+                .count(),
+            1,
+            "{check}"
+        );
+    }
     assert!(position("allows") < position("data"));
+    let before = s.borrow().counts.clone();
+    let saves = s.borrow().saves;
+    assert!(p.install_allows(Slot::A).is_err());
+    assert_eq!(s.borrow().counts, before);
+    assert_eq!(s.borrow().saves, saves);
 }
 
 #[test]
@@ -2338,7 +2406,9 @@ fn startup_handoff_selects_running_once_and_rejects_foreign_or_duplicate_calls()
     foreign.connection_generation += 1;
     assert!(pair.complete_start(&foreign).is_err());
     assert!(!shared.borrow().counts.contains_key("complete-start"));
+    let before = shared.borrow().events.len();
     pair.complete_start(&scope()).unwrap();
+    assert_eq!(&shared.borrow().events[before..], &["complete-start"]);
     assert_eq!(shared.borrow().counts.get("complete-start"), Some(&1));
     assert!(pair.complete_start(&scope()).is_err());
     assert_eq!(shared.borrow().counts.get("complete-start"), Some(&1));
@@ -2347,18 +2417,59 @@ fn startup_handoff_selects_running_once_and_rejects_foreign_or_duplicate_calls()
 }
 #[test]
 fn startup_handoff_failure_or_wrong_epoch_cannot_reopen_forward_reads() {
-    for fault in 0..3 {
+    for fault in 0..10 {
         let (mut pair, shared) = running();
         match fault {
             0 => shared.borrow_mut().fail = Some(("complete-start".into(), false)),
             1 => shared.borrow_mut().fail = Some(("complete-start".into(), true)),
-            _ => shared.borrow_mut().execution_epoch += 1,
+            2 => shared.borrow_mut().execution_epoch += 1,
+            3 => shared.borrow_mut().guard = guard::Model::empty(scope()).unwrap(),
+            4 => shared.borrow_mut().carrier = Some(proof(34)),
+            5 => {
+                shared.borrow_mut().members[0]
+                    .as_mut()
+                    .unwrap()
+                    .proof
+                    .as_mut()
+                    .unwrap()
+                    .process
+                    .creation_time += 1
+            }
+            6 => shared.borrow_mut().network.routes[0].metric += 1,
+            7 => shared.borrow_mut().foreign = true,
+            8 => shared.borrow_mut().held = 0,
+            _ => {
+                shared.borrow_mut().fail = Some(("complete-start-post-network-drift".into(), false))
+            }
         }
-        assert!(pair.complete_start(&scope()).is_err());
+        assert!(pair.complete_start(&scope()).is_err(), "fault={fault}");
         assert!(pair.check_integrity().is_err());
         assert!(pair.open_probe(Slot::A).is_err());
         assert!(pair.complete_start(&scope()).is_err());
-        assert_eq!(shared.borrow().counts.get("complete-start"), Some(&1));
+        assert_eq!(
+            shared.borrow().counts.get("complete-start"),
+            if (3..=8).contains(&fault) {
+                None
+            } else {
+                Some(&1)
+            }
+        );
+        // Restore changed external facts for exact cleanup, never forward use.
+        {
+            let mut actual = shared.borrow_mut();
+            actual.guard = pair.record.guard.clone();
+            actual.carrier = pair.record.carrier;
+            actual.members = pair
+                .record
+                .members
+                .each_ref()
+                .map(|member| member.as_ref().map(|m| m.owner.clone()));
+            actual.network = pair.record.network.as_ref().unwrap().current.clone();
+            actual.foreign = false;
+            actual.held = 1;
+            actual.fail = None;
+        }
+        assert!(pair.check_integrity().is_err());
         pair.stop(&scope()).unwrap();
         assert_eq!(pair.snapshot().phase, Phase::Stopped);
     }
