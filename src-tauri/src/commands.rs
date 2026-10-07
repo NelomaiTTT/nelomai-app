@@ -2244,7 +2244,7 @@ async fn android_app_state(
                 current,
                 async {
                     enrichment_application
-                        .bootstrap(now_unix())
+                        .bootstrap_for_foreground(now_unix())
                         .await
                         .map_err(CommandError::from)
                 },

@@ -603,6 +603,7 @@ struct MockApi {
     stop_as_failed: AtomicBool,
     server_observed_handshake: AtomicBool,
     bootstrap_fails: AtomicBool,
+    bootstrap_error: Mutex<Option<CoreApiError>>,
     hold_bootstrap: AtomicBool,
     bootstrap_entered: Notify,
     release_bootstrap: Notify,
@@ -658,6 +659,7 @@ impl MockApi {
             stop_as_failed: AtomicBool::new(false),
             server_observed_handshake: AtomicBool::new(false),
             bootstrap_fails: AtomicBool::new(false),
+            bootstrap_error: Mutex::new(None),
             hold_bootstrap: AtomicBool::new(false),
             bootstrap_entered: Notify::new(),
             release_bootstrap: Notify::new(),
@@ -694,6 +696,9 @@ impl CoreApi for MockApi {
     }
 
     async fn bootstrap(&self, access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
+        if let Some(error) = self.bootstrap_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         if self.hold_bootstrap.load(Ordering::SeqCst) {
             self.bootstrap_entered.notify_one();
             self.release_bootstrap.notified().await;
@@ -4613,6 +4618,87 @@ async fn foreground_connected_poll_cannot_publish_running_after_logout() {
     core.sign_out().await.unwrap();
     tunnel.status_release.notify_one();
     assert_eq!(poll.await.unwrap().phase, Phase::SignedOut);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_bootstrap_outage_preserves_running_and_stopped_local_controls() {
+    for running in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.start(options(), 1_700_000_000).await.unwrap();
+        if !running {
+            core.stop().await.unwrap();
+        }
+        let before = core.state().await;
+        api.bootstrap_fails.store(true, Ordering::SeqCst);
+        assert!(core.bootstrap_for_foreground(1_700_000_001).await.is_err());
+        let observation = core.begin_foreground_observation().await;
+        let displayed = core
+            .foreground_state(
+                observation,
+                Some(NativeConnectionIntent {
+                    generation: 1,
+                    desired_active: running,
+                }),
+            )
+            .await;
+        assert_eq!(
+            displayed, before,
+            "optional panel failure must preserve local controls"
+        );
+        assert_eq!(
+            *tunnel.status.lock().unwrap(),
+            if running {
+                TunnelStatus::Running
+            } else {
+                TunnelStatus::Stopped
+            }
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreground_bootstrap_keeps_authoritative_failures_and_initial_startup_policy() {
+    for (error, expected) in [
+        (CoreApiError::Unauthorized, Phase::SignedOut),
+        (CoreApiError::AccessExpired, Phase::AccessExpired),
+        (
+            CoreApiError::Rejected {
+                code: "invalid_request".into(),
+                message: "invalid request".into(),
+                retry_after_seconds: None,
+            },
+            Phase::Error,
+        ),
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.start(options(), 1_700_000_000).await.unwrap();
+        *api.bootstrap_error.lock().unwrap() = Some(error);
+        assert!(core.bootstrap_for_foreground(1_700_000_001).await.is_err());
+        assert_eq!(core.state().await.phase, expected);
+    }
+    let api = Arc::new(MockApi::new(0));
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    api.bootstrap_fails.store(true, Ordering::SeqCst);
+    assert!(core.bootstrap(1_700_000_000).await.is_err());
+    assert_eq!(core.state().await.phase, Phase::ServerUnavailable);
 }
 
 #[tokio::test(flavor = "current_thread")]

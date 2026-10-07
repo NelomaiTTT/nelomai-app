@@ -1795,7 +1795,20 @@ where
         self.auth.access(Some(stale_access)).await
     }
 
+    pub async fn bootstrap_for_foreground(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
+        self.bootstrap_with_local_presentation(now_unix, true).await
+    }
+
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
+        self.bootstrap_with_local_presentation(now_unix, false)
+            .await
+    }
+
+    async fn bootstrap_with_local_presentation(
+        &self,
+        now_unix: i64,
+        preserve_local_on_outage: bool,
+    ) -> Result<Bootstrap, CoreError> {
         let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
         let access_token = self.access_snapshot().await?;
         let response = self.api.bootstrap(&access_token).await;
@@ -1810,18 +1823,38 @@ where
                 match response {
                     Ok(response) => response,
                     Err(error) => {
-                        self.set_phase(phase_for_api_error(&error)).await;
+                        self.apply_bootstrap_error(&error, preserve_local_on_outage)
+                            .await;
                         return Err(error.into());
                     }
                 }
             }
             Err(error) => {
-                self.set_phase(phase_for_api_error(&error)).await;
+                self.apply_bootstrap_error(&error, preserve_local_on_outage)
+                    .await;
                 return Err(error.into());
             }
         };
         self.complete_bootstrap(response, now_unix, cancel_epoch)
             .await
+    }
+
+    async fn apply_bootstrap_error(&self, error: &CoreApiError, preserve_local: bool) {
+        let phase = phase_for_api_error(error);
+        let mut state = self.state.lock().await;
+        // Optional foreground enrichment is not the local connection owner.
+        // A panel outage must not hide Stop or strand polling on Unavailable.
+        // Initial startup and authoritative auth/access failures keep their policy.
+        if preserve_local
+            && phase == Phase::ServerUnavailable
+            && matches!(
+                state.phase,
+                Phase::Ready | Phase::Connected | Phase::Connecting | Phase::Stopping
+            )
+        {
+            return;
+        }
+        state.phase = phase;
     }
 
     pub async fn bootstrap_without_refresh(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {

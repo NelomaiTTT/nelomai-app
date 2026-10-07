@@ -880,6 +880,17 @@ where
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }
 
+    pub async fn bootstrap_for_foreground(
+        &self,
+        now_unix: i64,
+    ) -> Result<Bootstrap, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .bootstrap_for_foreground(now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn bootstrap_without_refresh(
         &self,
         now_unix: i64,
