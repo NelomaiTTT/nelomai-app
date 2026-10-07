@@ -1243,8 +1243,23 @@ pub(crate) mod native {
                         Ok(())
                     });
                 }
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "network DNS cleanup begin",
+                );
                 s.dns.cleanup()?;
-                s.routes.cleanup()
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step("network DNS cleanup end");
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "network routes cleanup begin",
+                );
+                s.routes.cleanup()?;
+                #[cfg(test)]
+                super::super::member_carrier_factory_test_os::trace_step(
+                    "network routes cleanup end",
+                );
+                Ok(())
             })
         }
     }

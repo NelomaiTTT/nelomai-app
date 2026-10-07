@@ -1136,7 +1136,15 @@ pub(crate) mod native {
                 if !std::ptr::eq(original.as_ref(), retired) {
                     return Err(GuardError::Conflict);
                 }
-                return self.verify_terminal_bracket(pair, record, &original, bindings);
+                let originals = self.originals.clone();
+                // This factual snapshot owns its Pair read; canonical terminal
+                // gates call verify_terminal_bracket inside their existing frame.
+                return pair
+                    .inspect(&originals.runtime, &originals.supervisor, |_| {
+                        self.verify_terminal_bracket(pair, record, &original, bindings)
+                            .map_err(io_denied)
+                    })
+                    .map_err(denied);
             }
             let fence = self.fence.clone();
             fence.inspect_cleanup(|| {

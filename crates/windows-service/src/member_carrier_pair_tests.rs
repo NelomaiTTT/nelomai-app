@@ -2402,12 +2402,18 @@ fn terminal_handoff_abandonment_keeps_untransferred_originals_and_socket_obligat
 #[test]
 fn startup_handoff_selects_running_once_and_rejects_foreign_or_duplicate_calls() {
     let (mut pair, shared) = running();
+    assert!(
+        pair.cleanup_pending(),
+        "Running native ACK is not Start completion"
+    );
     let mut foreign = scope();
     foreign.connection_generation += 1;
     assert!(pair.complete_start(&foreign).is_err());
     assert!(!shared.borrow().counts.contains_key("complete-start"));
+    assert!(pair.cleanup_pending());
     let before = shared.borrow().events.len();
     pair.complete_start(&scope()).unwrap();
+    assert!(!pair.cleanup_pending());
     assert_eq!(&shared.borrow().events[before..], &["complete-start"]);
     assert_eq!(shared.borrow().counts.get("complete-start"), Some(&1));
     assert!(pair.complete_start(&scope()).is_err());
@@ -2443,6 +2449,7 @@ fn startup_handoff_failure_or_wrong_epoch_cannot_reopen_forward_reads() {
             }
         }
         assert!(pair.complete_start(&scope()).is_err(), "fault={fault}");
+        assert!(pair.cleanup_pending(), "fault={fault}");
         assert!(pair.check_integrity().is_err());
         assert!(pair.open_probe(Slot::A).is_err());
         assert!(pair.complete_start(&scope()).is_err());
@@ -2477,16 +2484,22 @@ fn startup_handoff_failure_or_wrong_epoch_cannot_reopen_forward_reads() {
 #[test]
 fn startup_handoff_unwind_keeps_original_resources_cleanup_only() {
     let (mut pair, shared) = running();
+    assert!(pair.cleanup_pending());
+    assert!(!pair.startup_completion_attempted);
     shared.borrow_mut().fail = Some(("complete-start-unwind".into(), false));
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || pair.complete_start(&scope())
     ))
     .is_err());
+    assert!(pair.startup_completion_attempted);
+    assert!(pair.cleanup_pending());
+    assert_eq!(shared.borrow().held, 1);
     assert!(pair.check_integrity().is_err());
     assert!(pair.open_probe(Slot::A).is_err());
     shared.borrow_mut().fail = None;
     pair.stop(&scope()).unwrap();
     assert_eq!(pair.snapshot().phase, Phase::Stopped);
+    assert!(!pair.cleanup_pending());
 }
 #[test]
 fn actual_member_plan_keeps_endpoint_and_lan_physical_bypasses() {

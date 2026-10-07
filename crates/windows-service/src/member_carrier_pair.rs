@@ -2031,7 +2031,8 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
             || self.execution_completion_pending
             || self.uncertain_write.is_some()
             || (self.record.phase != Phase::Stopped
-                && (self.cleanup_only
+                && (!self.startup_completion_attempted
+                    || self.cleanup_only
                     || self.faulted.get()
                     || self.record.phase != Phase::Running
                     || self.record.pending.is_some()
