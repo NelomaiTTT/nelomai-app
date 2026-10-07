@@ -1006,7 +1006,7 @@ fn initial_noc_cut_roots_same_ack_and_bootstrap_before_error_or_unwind() {
         }));
         assert!(result.is_err() || result.unwrap().is_err());
         root.verify_initial_noc_original(&origin, &pin).unwrap();
-        root.verify_initial_terminal_cut(raw.retained().as_ref().unwrap(), &context())
+        root.verify_drained_original(raw.retained().as_ref().unwrap())
             .unwrap();
         assert!(root
             .drain_terminal_into(&mut None, |_| panic!("repeat cut"))
@@ -1077,35 +1077,6 @@ fn initial_noc_source_requires_original_initial_ack_and_no_constructor_entry() {
     assert_eq!(state.borrow().writes, 0);
 }
 
-// Break: initialized DATA is mistaken for SDK/key ownership, foreign equal
-// initial pins are adopted, or a constructor/native attempt enters Never.
-#[test]
-fn initialized_assembly_terminal_cut_requires_same_initial_ack_and_no_sdk_entry() {
-    let (mut root, state, _, _) = setup(Fault::None);
-    root.initialize().unwrap();
-    let mut raw = TerminalResources::new(None);
-    root.drain_terminal_into(raw.retained_mut(), |_| Ok(()))
-        .unwrap();
-    root.verify_initial_terminal_cut(raw.retained().as_ref().unwrap(), &context())
-        .unwrap();
-    assert_eq!(state.borrow().creates, 0);
-    assert_eq!(state.borrow().writes, 0);
-    let (mut other, _, _, _) = setup(Fault::None);
-    other.initialize().unwrap();
-    let actual = raw.retained_mut().as_mut().unwrap();
-    let original = actual.initial.take();
-    actual.initial = other.initial.take();
-    assert!(root
-        .verify_initial_terminal_cut(actual, &context())
-        .is_err());
-    actual.initial = original;
-    root.attach_attempted = true;
-    assert!(root
-        .verify_initial_terminal_cut(actual, &context())
-        .is_err());
-    assert_eq!(state.borrow().creates, 0);
-    assert_eq!(state.borrow().writes, 0);
-}
 // Break: considering an empty shell drained into an equal foreign raw, or
 // ignoring an original field that a future drain forgot to transfer.
 // Break: a genuine loaded-but-unconstructed Assembly is mistaken for Never,
@@ -1126,7 +1097,9 @@ fn module_only_terminal_cut_preserves_loader_history_and_same_initial_owner() {
     root.verify_module_only_terminal_cut(raw, &selected)
         .unwrap();
     assert!(!root.no_sdk.get(), "never reset actual loader history");
-    assert!(root.verify_initial_terminal_cut(raw, &context()).is_err());
+    assert!(root
+        .verify_initial_noc_original(&root.origin, raw.initial.as_ref().unwrap())
+        .is_err());
 
     let (mut foreign, _, _, _) = setup(Fault::None);
     foreign.initialize().unwrap();
@@ -1300,43 +1273,6 @@ fn attached(fault: Fault) -> (Root, Shared, Rc<()>, Rc<Cell<u32>>) {
     retain_io(&mut root, &s, &drops);
     root.attach_keys(&mut lock).unwrap();
     (root, s, lock, drops)
-}
-
-// Break: borrowing the pre-graph terminal owner moves its sole original through
-// Result, or an error/unwind rearms member preparation. No native close grant.
-#[test]
-fn terminal_owner_borrow_keeps_same_keys_and_never_rearms_preparation() {
-    for unwind in [false, true] {
-        let (mut root, state, mut lock, _) = attached(Fault::None);
-        let current = root.owner.as_mut().unwrap().snapshot().unwrap();
-        let creates = state.borrow().creates;
-        let writes = state.borrow().writes;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            root.with_original_terminal_owner(|owner| {
-                assert_eq!(owner.snapshot().unwrap(), current);
-                if unwind {
-                    panic!("native key terminal callback");
-                }
-                Err::<(), _>(Error::Conflict)
-            })
-        }));
-        if unwind {
-            assert!(result.is_err());
-        } else {
-            assert_eq!(result.unwrap(), Err(Error::Conflict));
-        }
-        assert_eq!(root.owner.as_mut().unwrap().snapshot().unwrap(), current);
-        assert_eq!(state.borrow().key_drops.get(), 0);
-        assert_eq!(
-            (state.borrow().creates, state.borrow().writes),
-            (creates, writes)
-        );
-        assert!(root
-            .with_member_precreation_in(Role::MemberA, &mut lock, &mut |call| call(), |_| panic!(
-                "rearmed member effect"
-            ))
-            .is_err());
-    }
 }
 
 #[test]

@@ -511,50 +511,6 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         Ok(())
     }
 
-    /// Factual no-SDK initial-journal cut, not native absence or disposal.
-    /// Requires the exact opaque initial ACK minted by this original Assembly.
-    fn verify_initial_terminal_cut(
-        &self,
-        raw: &AssemblyTerminalParts<J, I, A, B>,
-        context: &Context,
-    ) -> Result<()> {
-        self.verify_drained_original(raw)?;
-        if !self.no_sdk.get()
-            || !self.initialize_attempted
-            || self.attach_attempted
-            || self.prepare_attempted
-            || self.precreation_attempted
-            || self.member_attempted.iter().any(|attempt| *attempt)
-            || raw.pending.is_none()
-            || raw.io.try_borrow().map_err(|_| Error::Conflict)?.is_some()
-            || raw
-                .owner
-                .try_borrow()
-                .map_err(|_| Error::Conflict)?
-                .is_some()
-            || raw
-                .assets
-                .try_borrow()
-                .map_err(|_| Error::Conflict)?
-                .is_some()
-            || raw.disabled.is_some()
-            || raw.closing.is_some()
-            || raw.member_disabled.iter().any(Option::is_some)
-            || raw.member_key_retired.iter().any(Option::is_some)
-        {
-            return Err(Error::Conflict);
-        }
-        let actual = raw.initial.as_ref().ok_or(Error::Pending)?;
-        let original = self
-            .initial_original
-            .as_ref()
-            .and_then(std::rc::Weak::upgrade)
-            .ok_or(Error::Pending)?;
-        if !std::rc::Rc::ptr_eq(actual, &original) {
-            return Err(Error::Conflict);
-        }
-        actual.verify(context).map(|_| ())
-    }
     fn restore_member_key(
         &mut self,
         role: receipt::Role,
@@ -588,16 +544,6 @@ impl<J: NativeJournal, I: NativeKeyAttachment<J>, A, B> Assembly<J, I, A, B> {
         // native address/session/member effect or inferred absence.
         self.closing = Some(owner.begin_cleanup(&current, lock)?);
         Ok(())
-    }
-    fn with_original_terminal_owner<T>(
-        &mut self,
-        call: impl FnOnce(&mut Owner<J, I>) -> Result<T>,
-    ) -> Result<T> {
-        self.member_cleanup_only = true;
-        if self.terminal_attempted {
-            return Err(Error::Retired);
-        }
-        call(self.owner.as_mut().ok_or(Error::Pending)?)
     }
     fn with_member_precreation_in(
         &mut self,
