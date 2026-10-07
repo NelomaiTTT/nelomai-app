@@ -222,13 +222,15 @@ fn carrier_factory_actual_cold_child() {
         "running-unwind" => Some((NativePublication::Running, true)),
         _ => None,
     };
-    let fixture = if module_partial
+    let native_path = module_partial
         || resolver_partial
         || adapter_partial
         || full_primary
         || route_partial
-        || native_partial.is_some()
-    {
+        || native_partial.is_some();
+    let preparation_succeeds =
+        native_path || matches!(case.as_str(), "cold" | "primary-data-denial");
+    let fixture = if native_path {
         Fixture::new_native_modules()
     } else {
         Fixture::new()
@@ -273,12 +275,7 @@ fn carrier_factory_actual_cold_child() {
         options: DesktopTunnelOptions::default(),
     };
     match case.as_str() {
-        "cold" | "primary-data-denial" | "primary" => (),
-        "module-load-read-error" | "module-load-read-unwind" => (),
-        "resolver-reference-error" | "resolver-reference-unwind" => (),
-        "adapter-reference-error" | "adapter-reference-unwind" => (),
-        "carrier-ack" | "carrier-unwind" | "member-ack" | "member-unwind" | "running-ack"
-        | "running-unwind" => (),
+        _ if preparation_succeeds => (),
         "creator-ack" => fixture.lose_ack(PrivateFile::NativeCreator, false),
         "initial-native-ack" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, false),
         "initial-native-unwind" => fixture.lose_ack(PrivateFile::NativeCarrierReceipts, true),
@@ -294,13 +291,7 @@ fn carrier_factory_actual_cold_child() {
     if let Ok(Err(error)) = &result {
         eprintln!("actual factory {case}: preparation error {error:?}");
     }
-    if matches!(case.as_str(), "cold" | "primary-data-denial")
-        || module_partial
-        || resolver_partial
-        || adapter_partial
-        || full_primary
-        || native_partial.is_some()
-    {
+    if preparation_succeeds {
         result
             .expect("actual cold prepare unwound")
             .expect("actual cold factory preparation");
