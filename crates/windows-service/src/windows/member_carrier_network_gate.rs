@@ -3773,7 +3773,16 @@ pub(crate) mod native {
                     self.verify_pre_network_pair(&selected)?;
                     return Ok(None);
                 }
-                self.verify_pair(&selected, cleanup)?;
+                let network = selected.network.as_ref().ok_or_else(conflict)?;
+                compare_stage(&self.context, &selected.record, cleanup)?;
+                if !selected.pair.matches_runtime(&self.runtime)
+                    || !network.matches_runtime(&self.runtime)
+                    || (!cleanup && self.cancelled.load(Ordering::Acquire))
+                {
+                    return Err(conflict());
+                }
+                // The protected read authenticates its original Runtime;
+                // complete Pair/Network continuity still precedes return.
                 let bytes = self
                     .runtime
                     .optional_record(&self.context, RecordKind::Network)
@@ -3790,7 +3799,14 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             self.fence.run(cleanup, || {
                 let selected = self.selected.try_borrow().map_err(denied)?;
-                self.verify_pair(&selected, cleanup)?;
+                let network = selected.network.as_ref().ok_or_else(conflict)?;
+                compare_stage(&self.context, &selected.record, cleanup)?;
+                if !selected.pair.matches_runtime(&self.runtime)
+                    || !network.matches_runtime(&self.runtime)
+                    || (!cleanup && self.cancelled.load(Ordering::Acquire))
+                {
+                    return Err(conflict());
+                }
                 let ack = self.ack_pin()?;
                 let (_, native_dns) = ack.acknowledgements()?;
                 let mut child = self.dns_child.try_borrow_mut().map_err(denied)?;
@@ -3810,11 +3826,9 @@ pub(crate) mod native {
                 {
                     return Err(conflict());
                 }
-                selected
-                    .network
-                    .as_ref()
-                    .ok_or_else(conflict)?
-                    .dns_transition(cleanup, expected, desired, native_dns.last())?;
+                // Original child coverage authenticates its key/backend/Pair
+                // bytes before retention; final complete continuity remains.
+                network.dns_transition(cleanup, expected, desired, native_dns.last())?;
                 // Retain actual child publication coverage before any later
                 // Source postflight can fail. This is not an out-of-band Pair
                 // CAS; the whole current record/revision stays unchanged.
