@@ -791,12 +791,10 @@ pub(crate) mod native_store {
             if !self.matches_runtime(runtime) || &self.context != context {
                 return Err(conflict());
             }
-            self.verify()?;
-            if !runtime.fresh(context).map_err(|_| conflict())? {
+            self.intent.forward_entry(expected, effect)?;
+            if !self.verify()? {
                 return Err(conflict());
             }
-            self.intent.forward_entry(expected, effect)?;
-            self.verify()?;
             call.completed = true;
             Ok(())
         }
@@ -812,7 +810,6 @@ pub(crate) mod native_store {
             if !self.matches_runtime(runtime) || &self.context != context {
                 return Err(conflict());
             }
-            self.verify()?;
             self.intent.cleanup()?;
             self.verify()?;
             call.completed = true;
@@ -844,7 +841,6 @@ pub(crate) mod native_store {
             if !self.matches_runtime(runtime) || &self.context != context {
                 return Err(conflict());
             }
-            self.verify()?;
             self.intent.terminal_entry(expected)?;
             self.verify()?;
             call.completed = true;
@@ -868,7 +864,6 @@ pub(crate) mod native_store {
                     deadline
                         .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())?;
-                    self.verify()?;
                     self.intent.terminal_entry(expected)?;
                     self.verify()?;
                     deadline
@@ -920,7 +915,6 @@ pub(crate) mod native_store {
                     deadline
                         .verify_runtime_call(supervisor, runtime, context)
                         .map_err(|_| conflict())?;
-                    self.verify()?;
                     self.intent.cleanup()?;
                     if self.intent.record != *expected {
                         return Err(conflict());
@@ -935,7 +929,7 @@ pub(crate) mod native_store {
             }
             result
         }
-        fn verify(&self) -> io::Result<()> {
+        fn verify(&self) -> io::Result<bool> {
             if self.revoked.get() || !self.runtime.matches_pin(&self.lock) {
                 return Err(conflict());
             }
@@ -947,7 +941,6 @@ pub(crate) mod native_store {
             self.intent.verify_files(&mut files)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
-                .map(|_| ())
                 .map_err(|_| conflict())
         }
         /// Brackets READ-ONLY independent gate facts under the actual Calling
