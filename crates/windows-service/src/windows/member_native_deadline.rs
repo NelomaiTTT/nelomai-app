@@ -284,7 +284,6 @@ impl NativeDeadline {
                 );
             })
             .map_err(|_| CarrierError::Conflict)?;
-        let authenticated_return = std::cell::Cell::new(false);
         let outcome = self.run(context, || {
             intent
                 .inspect_effect(&self.runtime, self, expected, effect, |_| Ok(()))
@@ -301,11 +300,10 @@ impl NativeDeadline {
             intent
                 .inspect_effect(&self.runtime, self, expected, effect, |_| Ok(()))
                 .map_err(|_| CarrierError::Conflict)?;
-            authenticated_return.set(true);
             value
         });
-        attempt.succeeded =
-            outcome.is_ok() || (authenticated_return.get() && self.deadline.cleanup_eligible());
+        attempt.succeeded = outcome.is_ok()
+            || (self.owner.verify_cleanup().is_ok() && self.deadline.cleanup_eligible());
         outcome
     }
     /// Separate, SAME-supervisor cleanup-only entry. An opaque ORIGINAL Pair
