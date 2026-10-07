@@ -1664,10 +1664,9 @@ pub(crate) mod native {
                     .inventory
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
+                // The complete revision brackets originals and receipts; the
+                // enclosing Source independently brackets its full SDK join.
                 let before = inventory.source_bindings_revision(context, runtime, image)?;
-                if inventory.source_bindings_revision(context, runtime, image)? != before {
-                    return Err(Error::Conflict);
-                }
                 Ok((before.1, before.2))
             })
         }
