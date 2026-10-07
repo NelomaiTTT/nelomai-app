@@ -908,7 +908,6 @@ pub(crate) mod native {
         if c.components.len() != 1 {
             return Err(conflict());
         }
-        c.components[0].verify_released().map_err(|_| conflict())?;
         let mut wfp =
             crate::windows::member_carrier_guard::ScopedGuardAbsence::open(stopped.scope.clone())
                 .map_err(|_| conflict())?;
@@ -1156,6 +1155,7 @@ pub(crate) mod native {
                     adapter.as_ref().ok_or_else(conflict)?,
                 )
                 .map_err(|_| conflict())?;
+            c.components[0].verify_released().map_err(|_| conflict())?;
             for raw in &c.bootstrap_cuts {
                 let raw = raw.try_borrow().map_err(|_| conflict())?;
                 if raw.retained().attempt_facts() != (true, true, true, true)

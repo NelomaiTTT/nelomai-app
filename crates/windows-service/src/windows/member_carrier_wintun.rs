@@ -656,11 +656,6 @@ pub(crate) mod native {
                 || self.adapter.is_some()
                 || self.session.is_some()
                 || self.kernel.reference.verify_released().is_err()
-                || self
-                    .kernel
-                    .adapter_reference
-                    .as_ref()
-                    .is_some_and(|reference| reference.verify_released().is_err())
                 || !matches!(
                     self.session_end.state.get(),
                     SessionEndState::NeverStarted | SessionEndState::Acknowledged
