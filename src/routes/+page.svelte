@@ -6,6 +6,7 @@
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import RuntimeSelector from "$lib/RuntimeSelector.svelte";
+  import SupportDiagnosticsButton from "$lib/SupportDiagnosticsButton.svelte";
   import { ReleaseHistory } from "$lib/release-history";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import {
@@ -1443,6 +1444,7 @@
         <button class="primary-button" type="submit" disabled={busy}>
           {busy ? "Входим…" : "Войти"}
         </button>
+        <SupportDiagnosticsButton />
       </form>
     {:else if view === "peer_selection"}
       <div class="panel peer-panel">

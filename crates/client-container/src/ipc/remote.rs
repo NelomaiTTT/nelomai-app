@@ -1031,6 +1031,16 @@ struct CachedScopeStamp {
     logout_generation: u64,
 }
 
+/// Local diagnostic stages, never added to the private wire protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateLoginStage {
+    State,
+    Request,
+    Admission,
+    Response,
+}
+type LoginFailureObserver = Box<dyn Fn(PrivateLoginStage, PrivateError) + Send + Sync>;
+
 pub struct PrivateRuntimeAuthClient {
     outbox: Arc<Outbox>,
     pending: Arc<Pending<AuthResponseV1>>,
@@ -1038,6 +1048,7 @@ pub struct PrivateRuntimeAuthClient {
     send_gate: Mutex<()>,
     pub(super) pending_login: Mutex<Option<u64>>,
     child: Arc<ChildAdmission>,
+    login_failure_observer: Option<LoginFailureObserver>,
 }
 impl Drop for PrivateRuntimeAuthClient {
     fn drop(&mut self) {
@@ -1046,6 +1057,20 @@ impl Drop for PrivateRuntimeAuthClient {
     }
 }
 impl PrivateRuntimeAuthClient {
+    /// Receives only closed enums, not requests, credentials, or server prose.
+    pub fn with_login_failure_observer(
+        mut self,
+        observer: impl Fn(PrivateLoginStage, PrivateError) + Send + Sync + 'static,
+    ) -> Self {
+        self.login_failure_observer = Some(Box::new(observer));
+        self
+    }
+    fn login_error(&self, stage: PrivateLoginStage, error: PrivateError) -> CoreError {
+        if let Some(observer) = &self.login_failure_observer {
+            observer(stage, error);
+        }
+        core_error(error)
+    }
     pub async fn owner_request(
         &self,
         request: crate::host::HostRequestV1,
@@ -1260,6 +1285,7 @@ impl PrivateRuntimeAuthClient {
             send_gate: Mutex::new(()),
             pending_login: Mutex::new(None),
             child,
+            login_failure_observer: None,
         }
     }
     pub(super) async fn request(
@@ -1410,17 +1436,22 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
     }
     async fn login(&self, request: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
         let deadline = Instant::now() + REQUEST_BUDGET;
-        let stamp = self.stamp(deadline).await.map_err(core_error)?;
+        let stamp = self
+            .stamp(deadline)
+            .await
+            .map_err(|error| self.login_error(PrivateLoginStage::State, error))?;
         match self
             .request(AuthRequestV1::Login { stamp, request }, deadline)
             .await
-            .map_err(core_error)?
+            .map_err(|error| self.login_error(PrivateLoginStage::Request, error))?
         {
             AuthResponseV1::Access { access, .. } => {
-                self.child.check(&scope(&access)).map_err(core_error)?;
+                self.child
+                    .check(&scope(&access))
+                    .map_err(|error| self.login_error(PrivateLoginStage::Admission, error))?;
                 Ok(access)
             }
-            _ => Err(core_error(PrivateError::Protocol)),
+            _ => Err(self.login_error(PrivateLoginStage::Response, PrivateError::Protocol)),
         }
     }
     async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {

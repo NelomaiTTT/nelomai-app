@@ -20,6 +20,8 @@
             android:authorities="${applicationId}.androidx-startup"
             android:exported="false" android:process=":runtime" />
         <service android:name=".RuntimeAuthBrokerService" android:exported="false" />
+        <activity android:name=".SupportDiagnosticsActivity" android:exported="false"
+            android:label="@string/support_diagnostics_label" />
         <activity android:name=".RuntimeApkInstallerActivity" android:exported="false" />
         <service android:name=".RuntimeVpnDispatcherService" android:exported="false"
             android:foregroundServiceType="systemExempted" android:permission="android.permission.BIND_VPN_SERVICE"
@@ -39,6 +41,7 @@
             android:label="@string/main_activity_title"
             android:name=".MainActivity"
             android:exported="true">
+            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

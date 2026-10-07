@@ -1050,6 +1050,86 @@ async fn fresh_install_reports_logged_out() {
 }
 
 #[tokio::test]
+async fn login_diagnostics_preserve_private_failure_before_core_conversion() {
+    // Real private frames and real RuntimeAuthProvider::login, not the diagnostic mapper alone.
+    for (during_state, error, expected_stage) in [
+        (true, PrivateError::Closed, PrivateLoginStage::State),
+        (false, PrivateError::Closed, PrivateLoginStage::Request),
+        (false, PrivateError::Cancelled, PrivateLoginStage::Request),
+    ] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+        let stop = CoreLocalStop::new(Arc::new(Tunnel::default()));
+        let child = Arc::new(ChildAdmission::new(
+            "diagnostic-child".into(),
+            stop.runtime_writer_gates(),
+            Arc::new(RuntimeRecordInventory::new(fixture.record.clone(), vec![])),
+        ));
+        let (mut peer, socket) = private_socketpair().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let client = PrivateRuntimeAuthClient::new(socket, child, stop)
+            .with_login_failure_observer(move |stage, error| {
+                observed.lock().unwrap().push((stage, error))
+            });
+        let login = tokio::spawn(async move {
+            client
+                .login(RuntimeLogin {
+                    login: "must-not-enter-diagnostics".into(),
+                    password: "must-not-enter-diagnostics".into(),
+                    device_name: "must-not-enter-diagnostics".into(),
+                })
+                .await
+        });
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let mut request = read_frame(&mut peer, deadline).await.unwrap();
+        assert!(matches!(
+            request.message,
+            MessageV1::Request(AuthRequestV1::State)
+        ));
+        if !during_state {
+            let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    request.id,
+                    MessageV1::Response(AuthResponseV1::State {
+                        stamp,
+                        state: RuntimeAuthState::LoggedOut,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            request = read_frame(&mut peer, deadline).await.unwrap();
+            assert!(matches!(
+                request.message,
+                MessageV1::Request(AuthRequestV1::Login { .. })
+            ));
+        }
+        if error == PrivateError::Closed {
+            drop(peer); // Actual transport loss, not an owner-supplied Closed response.
+        } else {
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    request.id,
+                    MessageV1::Response(AuthResponseV1::Error { error }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            login.await.unwrap(),
+            Err(nelomai_client_core::CoreError::StartCancelled)
+        ));
+        assert_eq!(*events.lock().unwrap(), vec![(expected_stage, error)]);
+    }
+}
+
+#[tokio::test]
 async fn migrated_credentials_without_confirmed_identity_still_require_recovery() {
     let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
     let mut auth = fixture.auth.load().unwrap().unwrap();

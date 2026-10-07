@@ -33,18 +33,6 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         local.runtime_writer_gates(),
         Arc::new(RuntimeRecordInventory::new(record.clone(), retained)),
     ));
-    let socket = std::os::unix::net::UnixStream::from(descriptor);
-    socket.set_nonblocking(true)?;
-    let port = tauri::async_runtime::block_on(async {
-        tokio::net::UnixStream::from_std(socket).map(|socket| {
-            Arc::new(PrivateRuntimeAuthClient::new(
-                socket,
-                admission,
-                local.clone(),
-            ))
-        })
-    })?;
-    let api = ClientApi::new(PANEL_BASE)?.with_app_version(&bootstrap.target.container_version)?;
     let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
         selected
             .operational_state
@@ -53,6 +41,20 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
             .join("diagnostics"),
         resource_usage::ResourceSnapshot::capture(app.handle()),
     )?);
+    let login_diagnostics = diagnostics.clone();
+    let socket = std::os::unix::net::UnixStream::from(descriptor);
+    socket.set_nonblocking(true)?;
+    let port = tauri::async_runtime::block_on(async {
+        tokio::net::UnixStream::from_std(socket).map(|socket| {
+            Arc::new(
+                PrivateRuntimeAuthClient::new(socket, admission, local.clone())
+                    .with_login_failure_observer(move |stage, error| {
+                        commands::record_private_login_failure(&login_diagnostics, stage, error);
+                    }),
+            )
+        })
+    })?;
+    let api = ClientApi::new(PANEL_BASE)?.with_app_version(&bootstrap.target.container_version)?;
     diagnostics.record_named("startup.rust.private_runtime_ready", None, None, None);
     let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(
         &selected.preferences,

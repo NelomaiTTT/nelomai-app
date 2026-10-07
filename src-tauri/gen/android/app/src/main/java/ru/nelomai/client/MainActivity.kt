@@ -3,13 +3,15 @@ package ru.nelomai.client
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
 
 /** Launcher only: no Tauri, keyring or versioned engine is loaded here. */
 class MainActivity : Activity() {
-    private lateinit var selection: RuntimeSelectionStore
+    private var selection: RuntimeSelectionStore? = null
     private var launchStarted = false
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
+        if (routeDiagnostics(intent)) return
         selection = RuntimeSelectionStore(this)
         setContentView(android.widget.TextView(this).apply {
             text = "Запуск Nelomai…"
@@ -21,16 +23,30 @@ class MainActivity : Activity() {
         // onCreate can still run at background importance on a cold start.
         if (!hasFocus || launchStarted || isFinishing || isDestroyed) return
         launchStarted = true
+        var stage = SupportStartupStage.LAUNCHER_OWNER_START
         runCatching {
             startService(Intent(this, RuntimeAuthBrokerService::class.java))
-            selection.read { result ->
+            stage = SupportStartupStage.LAUNCHER_OWNER_READ
+            selection?.read { result ->
                 if (isFinishing || isDestroyed) return@read
                 result.onSuccess { startActivity(Intent(this, RuntimeBootstrapActivity::class.java)); finish() }
-                    .onFailure { showRuntimeStartupFailure(it) }
+                    .onFailure { SupportDiagnosticsStartup.showFailure(this, SupportStartupStage.LAUNCHER_OWNER_READ, it) }
             }
-        }.onFailure { showRuntimeStartupFailure(it) }
+        }.onFailure { SupportDiagnosticsStartup.showFailure(this, stage, it) }
     }
-    override fun onDestroy() { selection.close(); super.onDestroy() }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        routeDiagnostics(intent)
+    }
+    private fun routeDiagnostics(intent: Intent): Boolean {
+        if (!SupportDiagnosticsEntry.isShortcut(intent)) return false
+        launchStarted = true
+        SupportDiagnosticsEntry.open(this)
+        finish()
+        return true
+    }
+    override fun onDestroy() { selection?.close(); super.onDestroy() }
 }
 
 /** Runs in :runtime so Binder records the actual admitted child PID. */
@@ -42,10 +58,11 @@ class RuntimeBootstrapActivity : Activity() {
         selection.read { result ->
             if (isFinishing || isDestroyed) return@read
             if (result.isFailure) {
-                showRuntimeStartupFailure(requireNotNull(result.exceptionOrNull()))
+                SupportDiagnosticsStartup.showFailure(this, SupportStartupStage.BOOTSTRAP_OWNER_READ, requireNotNull(result.exceptionOrNull()))
                 return@read
             }
             result.onSuccess { selected ->
+                var stage = SupportStartupStage.BOOTSTRAP_PROCESS_CLAIM
                 runCatching {
                     if (RuntimeProcessSelection.needsExit(selected)) {
                         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -53,20 +70,24 @@ class RuntimeBootstrapActivity : Activity() {
                         return@runCatching
                     }
                     if (RuntimeProcessSelection.hasAdmission(selected)) {
+                        stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_START
                         startActivity(Intent().setClassName(packageName, RuntimeAdapters.activity(selected)))
                         return@runCatching
                     }
                     RuntimeProcessSelection.claim(selected)
+                    stage = SupportStartupStage.BOOTSTRAP_OWNER_ATTACH
                     val (fd, bootstrap) = selection.attach(selected)
                     fd.use {
                         val launch = Intent().setClassName(packageName, RuntimeAdapters.activity(selected))
                             .putExtra("runtime_endpoint_v1", fd).putExtra("runtime_bootstrap_v1", bootstrap)
                             .putExtra("runtime_selection_v1", RuntimeSelectionStore.encode(selected))
+                        stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_PREPARE
                         RuntimeAdapters.prepareActivity(selected, launch)
+                        stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_START
                         startActivity(launch)
                     }
                 }.onFailure {
-                    showRuntimeStartupFailure(it)
+                    SupportDiagnosticsStartup.showFailure(this, stage, it)
                     return@read
                 }
             }
@@ -74,15 +95,4 @@ class RuntimeBootstrapActivity : Activity() {
         }
     }
     override fun onDestroy() { selection.close(); super.onDestroy() }
-}
-
-private fun Activity.showRuntimeStartupFailure(error: Throwable) {
-    val cause = (error as? java.lang.reflect.InvocationTargetException)?.targetException ?: error
-    // Do not log bootstrap payloads, tokens or exception messages containing them.
-    android.util.Log.e("NelomaiStartup", "runtime_bootstrap_failed: ${cause.javaClass.name}\n" +
-        cause.stackTrace.take(8).joinToString("\n"))
-    setContentView(android.widget.TextView(this).apply {
-        text = "Не удалось запустить Nelomai. Закройте и откройте приложение. Данные сохранены."
-        setPadding(32, 64, 32, 32)
-    })
 }

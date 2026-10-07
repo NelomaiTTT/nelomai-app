@@ -830,7 +830,15 @@ async fn bootstrap_application_for_startup(
             .map_err(runtime_readiness_error)?;
         let first_error = match application.bootstrap_without_refresh(now_unix).await {
             Ok(response) => return Ok(response),
-            Err(error) => error,
+            Err(error) => {
+                diagnostics.record_named(
+                    "startup.bootstrap_without_refresh.failed",
+                    None,
+                    None,
+                    Some(application_error_diagnostic_code(&error)),
+                );
+                error
+            }
         };
         diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
         // Eligibility comes from the owner and exact runtime admission, not the
@@ -842,8 +850,7 @@ async fn bootstrap_application_for_startup(
         route_android_startup_recovery(
             first_error,
             async {
-                recovery
-                    .await
+                observe_private_auth_result(recovery.await, diagnostics, SupportAuthStage::Recover)
                     .map(|_| ())
                     .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
             },
@@ -986,6 +993,86 @@ fn private_error_code(error: nelomai_client_container::ipc::PrivateError) -> &'s
         PrivateError::AccessUnavailable => "private_access_unavailable",
         PrivateError::Service => "private_service",
     }
+}
+
+// Diagnostic classification is closed: never record API/tunnel error prose or supplied codes.
+fn application_error_diagnostic_code(error: &ApplicationError) -> &'static str {
+    match error {
+        ApplicationError::Core(CoreError::StartCancelled) => "core_start_cancelled",
+        ApplicationError::Core(CoreError::AuthRecoveryRequired) => "core_auth_recovery_required",
+        ApplicationError::Core(CoreError::AuthenticationOutcomeUnknown) => {
+            "core_authentication_outcome_unknown"
+        }
+        ApplicationError::Core(CoreError::SignedOut) => "core_signed_out",
+        ApplicationError::Core(CoreError::AccessExpired) => "core_access_expired",
+        ApplicationError::Core(CoreError::Storage) | ApplicationError::Storage => {
+            "storage_unavailable"
+        }
+        ApplicationError::Api(CoreApiError::Rejected { .. })
+        | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected { .. })) => "api_rejected",
+        ApplicationError::Api(CoreApiError::Retryable)
+        | ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)) => "api_retryable",
+        ApplicationError::Api(CoreApiError::Unauthorized)
+        | ApplicationError::Core(CoreError::Api(CoreApiError::Unauthorized)) => "api_unauthorized",
+        ApplicationError::Api(CoreApiError::AccessExpired)
+        | ApplicationError::Core(CoreError::Api(CoreApiError::AccessExpired)) => {
+            "api_access_expired"
+        }
+        ApplicationError::Clock => "clock_unavailable",
+        ApplicationError::RecoveryDeferred => "recovery_deferred",
+        ApplicationError::Core(_) => "core_failure_unclassified",
+    }
+}
+
+fn diagnose_sign_in_failure(error: ApplicationError, diagnostics: &AppDiagnostics) -> CommandError {
+    diagnostics.record_named(
+        "native.sign_in.login_failed",
+        None,
+        None,
+        Some(application_error_diagnostic_code(&error)),
+    );
+    CommandError::from(error)
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn record_private_login_failure(
+    diagnostics: &AppDiagnostics,
+    stage: nelomai_client_container::ipc::PrivateLoginStage,
+    error: nelomai_client_container::ipc::PrivateError,
+) {
+    use nelomai_client_container::ipc::PrivateLoginStage;
+    let event = match stage {
+        PrivateLoginStage::State => "native.sign_in.private_state_failed",
+        PrivateLoginStage::Request => "native.sign_in.private_request_failed",
+        PrivateLoginStage::Admission => "native.sign_in.private_admission_failed",
+        PrivateLoginStage::Response => "native.sign_in.private_response_failed",
+    };
+    diagnostics.record_named(event, None, None, Some(private_error_code(error)));
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy)]
+enum SupportAuthStage {
+    Recover,
+    Provision,
+    SignInRuntimeReady,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn observe_private_auth_result<T>(
+    result: Result<T, nelomai_client_container::ipc::PrivateError>,
+    diagnostics: &AppDiagnostics,
+    stage: SupportAuthStage,
+) -> Result<T, nelomai_client_container::ipc::PrivateError> {
+    if let Err(error) = &result {
+        let event = match stage {
+            SupportAuthStage::Recover => "startup.auth_recovery.failed",
+            SupportAuthStage::Provision => "background.provision_owner_failed",
+            SupportAuthStage::SignInRuntimeReady => "native.sign_in.runtime_ready_failed",
+        };
+        diagnostics.record_named(event, None, None, Some(private_error_code(*error)));
+    }
+    result // Preserve exact error, fencing, recovery eligibility and retry behavior.
 }
 
 impl From<ApplicationError> for CommandError {
@@ -2395,14 +2482,18 @@ pub async fn app_login(
             now_unix(),
         )
         .await
-        .map_err(CommandError::from)?;
+        .map_err(|error| diagnose_sign_in_failure(error, &diagnostics))?;
     #[cfg(target_os = "android")]
     {
         let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
-            .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
-            .await
-            .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
+        observe_private_auth_result(
+            app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+                .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
+                .await,
+            &diagnostics,
+            SupportAuthStage::SignInRuntimeReady,
+        )
+        .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
     }
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
@@ -2566,15 +2657,19 @@ async fn provision_android_background(
     {
         // The common owner obtains device/capability from its own admitted
         // bootstrap, never from UI-provided install-secret or refresh material.
-        app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
-            .background(nelomai_client_container::ipc::BackgroundAction::Provision)
-            .await
-            .map_err(|error| {
-                CommandError::new(
-                    private_error_code(error),
-                    "Не удалось подготовить фоновое подключение",
-                )
-            })?;
+        observe_private_auth_result(
+            app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+                .background(nelomai_client_container::ipc::BackgroundAction::Provision)
+                .await,
+            &app.state::<Arc<AppDiagnostics>>(),
+            SupportAuthStage::Provision,
+        )
+        .map_err(|error| {
+            CommandError::new(
+                private_error_code(error),
+                "Не удалось подготовить фоновое подключение",
+            )
+        })?;
         prepare_android_quick_plan(app, application, bootstrap).await?;
     }
     #[cfg(not(target_os = "android"))]
@@ -4231,6 +4326,160 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    fn support_records(directory: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(directory.join("application.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn support_sign_in_failure_records_native_start_cancelled_without_changing_presentation() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let error = super::diagnose_sign_in_failure(
+            nelomai_client_application::ApplicationError::Core(
+                nelomai_client_core::CoreError::StartCancelled,
+            ),
+            &diagnostics,
+        );
+        assert_eq!(error.code(), "connection_intent_cancelled");
+        assert_eq!(error.message, "Подключение отменено");
+        let records = support_records(directory.path());
+        let record = records
+            .iter()
+            .find(|record| record["kind"] == "native.sign_in.login_failed")
+            .unwrap();
+        assert_eq!(record["code"], "core_start_cancelled");
+    }
+
+    #[test]
+    fn support_sign_in_failure_never_logs_server_error_codes_or_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let error = super::diagnose_sign_in_failure(
+            nelomai_client_application::ApplicationError::Api(
+                nelomai_client_core::CoreApiError::Rejected {
+                    code: "password_secret".into(),
+                    message: "support-code-secret".into(),
+                    retry_after_seconds: None,
+                },
+            ),
+            &diagnostics,
+        );
+        assert_eq!(error.code(), "password_secret"); // Presentation remains unchanged.
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(!log.contains("password_secret"));
+        assert!(!log.contains("support-code-secret"));
+        assert!(support_records(directory.path())
+            .iter()
+            .any(|record| record["code"] == "api_rejected"));
+    }
+
+    #[test]
+    fn support_private_login_records_distinct_causes_and_stages_in_report_log() {
+        use nelomai_client_container::ipc::{PrivateError, PrivateLoginStage};
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        for (stage, error, event, code) in [
+            (
+                PrivateLoginStage::State,
+                PrivateError::Closed,
+                "native.sign_in.private_state_failed",
+                "private_closed",
+            ),
+            (
+                PrivateLoginStage::Request,
+                PrivateError::Closed,
+                "native.sign_in.private_request_failed",
+                "private_closed",
+            ),
+            (
+                PrivateLoginStage::Request,
+                PrivateError::Cancelled,
+                "native.sign_in.private_request_failed",
+                "private_cancelled",
+            ),
+            (
+                PrivateLoginStage::Admission,
+                PrivateError::Cancelled,
+                "native.sign_in.private_admission_failed",
+                "private_cancelled",
+            ),
+            (
+                PrivateLoginStage::Response,
+                PrivateError::Protocol,
+                "native.sign_in.private_response_failed",
+                "private_protocol",
+            ),
+        ] {
+            super::record_private_login_failure(&diagnostics, stage, error);
+            let records = support_records(directory.path());
+            let last = records.last().unwrap();
+            assert_eq!(last["kind"], event);
+            assert_eq!(last["code"], code);
+        }
+        assert_eq!(support_records(directory.path()).len(), 6); // Startup + five diagnostic failures.
+    }
+
+    #[test]
+    fn support_private_stage_observation_preserves_success_and_exact_error() {
+        use super::{observe_private_auth_result, SupportAuthStage};
+        use nelomai_client_container::ipc::PrivateError;
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        assert_eq!(
+            observe_private_auth_result(Ok(42), &diagnostics, SupportAuthStage::Recover),
+            Ok(42)
+        );
+        for (stage, error, event, code) in [
+            (
+                SupportAuthStage::Recover,
+                PrivateError::RefreshPending,
+                "startup.auth_recovery.failed",
+                "private_refresh_pending",
+            ),
+            (
+                SupportAuthStage::Provision,
+                PrivateError::Cancelled,
+                "background.provision_owner_failed",
+                "private_cancelled",
+            ),
+            (
+                SupportAuthStage::SignInRuntimeReady,
+                PrivateError::RecoveryRequired,
+                "native.sign_in.runtime_ready_failed",
+                "private_recovery_required",
+            ),
+        ] {
+            assert_eq!(
+                observe_private_auth_result::<()>(Err(error), &diagnostics, stage),
+                Err(error)
+            );
+            assert!(support_records(directory.path())
+                .iter()
+                .any(|record| record["kind"] == event && record["code"] == code));
+        }
+        assert_eq!(support_records(directory.path()).len(), 4); // Startup + three actual failures only.
+    }
+
     #[test]
     fn prepared_quick_plan_keeps_legacy_available_without_recovery_capability() {
         let original: nelomai_contracts::Bootstrap = serde_json::from_str(include_str!(

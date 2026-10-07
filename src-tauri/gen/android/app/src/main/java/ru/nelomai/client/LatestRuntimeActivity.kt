@@ -10,6 +10,11 @@ class LatestRuntimeActivity : TauriActivity() {
   private val ownerConnection by lazy { ru.nelomai.client.RuntimeSelectionStore(this) }
   override val handleBackNavigation: Boolean = true
 
+  override fun onWebViewCreate(webView: android.webkit.WebView) {
+    super.onWebViewCreate(webView)
+    ru.nelomai.runtime.v1.SupportDiagnosticsEntry.install(this, webView)
+  }
+
   private val startupHandler = Handler(Looper.getMainLooper())
   private val frontendTimeout = Runnable {
     if (!StartupDiagnostics.frontendReady(applicationContext)) {

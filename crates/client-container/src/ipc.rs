@@ -11,7 +11,8 @@ pub use child_admission::{ChildAdmission, RuntimeRecordInventory, ScopeAdmission
 mod remote;
 mod transport;
 pub use remote::{
-    LaunchBinding, OwnerService, PrivateBackgroundDispatcher, PrivateRuntimeAuthClient, RemoteOwner,
+    LaunchBinding, OwnerService, PrivateBackgroundDispatcher, PrivateLoginStage,
+    PrivateRuntimeAuthClient, RemoteOwner,
 };
 #[cfg(test)]
 mod tests;

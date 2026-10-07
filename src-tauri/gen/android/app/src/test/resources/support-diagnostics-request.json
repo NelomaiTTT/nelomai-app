@@ -1,0 +1,11 @@
+{
+  "report_id": "865f15fc-f9ca-4344-97c0-90d5511f0a20",
+  "trigger": "manual",
+  "generated_at_unix": 1791396000,
+  "app_version": "0.3.2",
+  "platform_version": "Android 13 (API 33)",
+  "architecture": "aarch64",
+  "application_log": "startup.launcher.owner_read_failed\n",
+  "helper_log": "[unavailable: log_missing_or_unsafe]\n",
+  "logcat_log": "owner.open ready=false\n"
+}

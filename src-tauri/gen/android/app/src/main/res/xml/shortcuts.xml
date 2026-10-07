@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:shortcutId="support_diagnostics" android:enabled="true"
+        android:icon="@drawable/ic_quick_tile" android:shortcutShortLabel="@string/support_diagnostics_label">
+        <!-- Launcher callers route through the exported container entry point;
+             the report screen itself stays private and no runtime is attached. -->
+        <intent android:action="android.intent.action.VIEW"
+            android:targetPackage="ru.nelomai.client" android:targetClass="ru.nelomai.client.MainActivity">
+            <extra android:name="nelomai_support_diagnostics" android:value="true" />
+        </intent>
+    </shortcut>
+</shortcuts>
