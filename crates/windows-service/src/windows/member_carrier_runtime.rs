@@ -5470,15 +5470,7 @@ pub(crate) mod native {
                     tunnel_type: identity.tunnel_type,
                 },
             )?;
-            let all_after = if use_ == Use::Cleanup {
-                self.observer.observe_all_for_cleanup(context)
-            } else {
-                self.observer.observe_all(context)
-            }
-            .map_err(|_| rows::Error::Conflict)?;
-            if all_after != all_before
-                || self.current(use_).map_err(|_| rows::Error::Conflict)? != before
-            {
+            if self.current(use_).map_err(|_| rows::Error::Conflict)? != before {
                 return Err(rows::Error::Conflict);
             }
             self.verify_supervised()
