@@ -114,6 +114,20 @@ class ReleaseWorkflowTest(unittest.TestCase):
         artifact = next(step for step in workflow["jobs"]["windows-build"]["steps"]
                         if step.get("name") == "Assemble exact factory test artifact")
         self.assertIn("cargo test --release --locked", artifact["run"])
+        self.assertEqual(workflow["jobs"]["windows-native"]["steps"][-1], {
+            "name": "Retain actual factory diagnostics",
+            "if": "always()",
+            "uses": "actions/upload-artifact@v4",
+            "with": {
+                "name": "windows-native-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.case }}",
+                "path": "${{ runner.temp }}/carrier-factory-system-*/factory.log\n"
+                        "${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout\n"
+                        "${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr\n"
+                        "${{ runner.temp }}/carrier-factory-system-*/result.json\n",
+                "if-no-files-found": "warn",
+                "retention-days": 1,
+            },
+        })
         checker.assert_windows_factory_jobs(workflow, factory)
         mutations = (
             lambda jobs: jobs["windows-build"]["steps"][-2].update(
@@ -126,6 +140,13 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-native"]["env"].update(MANIFEST_SHA256="self-described"),
             lambda jobs: jobs["windows-native"]["steps"][3].update(run="echo verify skipped"),
             lambda jobs: jobs["windows-native"]["steps"][4].update(**{"continue-on-error": True}),
+            lambda jobs: jobs["windows-native"]["steps"][4].update(**{"if": "always()"}),
+            lambda jobs: jobs["windows-native"]["steps"][-1].update(**{"if": "success()"}),
+            lambda jobs: jobs["windows-native"]["steps"][-1]["with"].update(
+                path="${{ runner.temp }}/factory-artifact/"),
+            lambda jobs: jobs["windows-native"]["steps"][-1]["with"].update(
+                name="windows-native-result"),
+            lambda jobs: jobs["windows-native"]["steps"].pop(),
             lambda jobs: jobs["windows-build"]["steps"][3].update(run="cargo check -p nelomai-windows-service"),
             lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),

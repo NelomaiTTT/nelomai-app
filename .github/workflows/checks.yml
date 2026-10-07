@@ -335,6 +335,18 @@ jobs:
           ./scripts/windows/test-carrier-factory-system.ps1 -TestExecutable "$env:RUNNER_TEMP/factory-artifact/factory-tests.exe" `
             -RuntimeDirectory "$env:RUNNER_TEMP/factory-artifact/runtime" `
             -OutputDirectory $env:RUNNER_TEMP -Case ${{ matrix.case }}
+      - name: Retain actual factory diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.case }}
+          path: |
+            ${{ runner.temp }}/carrier-factory-system-*/factory.log
+            ${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout
+            ${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr
+            ${{ runner.temp }}/carrier-factory-system-*/result.json
+          if-no-files-found: warn
+          retention-days: 1
 
   windows:
     if: ${{ always() && github.event_name != 'workflow_dispatch' }}

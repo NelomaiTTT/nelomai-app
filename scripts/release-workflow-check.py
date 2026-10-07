@@ -49,7 +49,10 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
         require(set(job) <= {"if", "name", "runs-on", "env", "steps", "outputs", "needs", "strategy"},
                 f"{name} cannot mask or replace its execution/status gates")
         for step in job["steps"]:
-            require(set(step) <= {"name", "uses", "with", "run", "id", "env", "timeout-minutes"},
+            allowed = {"name", "uses", "with", "run", "id", "env", "timeout-minutes"}
+            if name == "windows-native" and step is job["steps"][-1] and step.get("uses") == "actions/upload-artifact@v4":
+                allowed.add("if")
+            require(set(step) <= allowed,
                     f"{name} steps must execute unconditionally and fail normally")
     for name in ("frontend", "rust", "android-plugin", "windows-build", "windows-native", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
@@ -149,7 +152,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     require(build["steps"][-1] == {"uses": "actions/upload-artifact@v4", "with": {
         "name": "${{ steps.artifact.outputs.artifact_name }}", "path": "${{ runner.temp }}/factory-artifact/",
         "if-no-files-found": "error", "retention-days": 1}}, "Upload only the exact successful build artifact for one day")
-    require(len(native["steps"]) == 5, "Native cases must only download/verify and execute, never rebuild or fall back")
+    require(len(native["steps"]) == 6, "Native cases must only download/verify, execute and retain diagnostics, never rebuild or fall back")
     native_programs = [
         """if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_NAME) -or $env:MANIFEST_SHA256 -notmatch '^[a-f0-9]{64}$') {
 throw 'Missing successful build artifact outputs; no fallback'
@@ -167,7 +170,17 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
         "name": "${{ needs.windows-build.outputs.artifact_name }}", "path": "${{ runner.temp }}/factory-artifact/"}},
         "Native case must download only this successful build, without previous-run or cache fallback")
     require(all("env" not in step for step in native["steps"]), "Native steps cannot override pinned build outputs")
-    require(native["steps"][-1].get("timeout-minutes") == 55, "SYSTEM factory aperture must remain unchanged")
+    require(native["steps"][4].get("timeout-minutes") == 55, "SYSTEM factory aperture must remain unchanged")
+    require(native["steps"][-1] == {
+        "name": "Retain actual factory diagnostics", "if": "always()", "uses": "actions/upload-artifact@v4",
+        "with": {
+            "name": "windows-native-result-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.case }}",
+            "path": "${{ runner.temp }}/carrier-factory-system-*/factory.log\n"
+                    "${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout\n"
+                    "${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr\n"
+                    "${{ runner.temp }}/carrier-factory-system-*/result.json\n",
+            "if-no-files-found": "warn", "retention-days": 1}},
+        "Every native case must retain only actual SYSTEM outputs even on failure, uniquely bound to source/run/attempt/case for one day")
     require(aggregate.get("if") == "${{ always() && github.event_name != 'workflow_dispatch' }}"
             and aggregate.get("needs") == ["windows-build", "windows-native"]
             and aggregate["runs-on"] == "ubuntu-latest" and len(aggregate["steps"]) == 1,
