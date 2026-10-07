@@ -710,7 +710,7 @@ pub(crate) mod native {
                         {
                         let mut held_lock = raw.lock.try_borrow_mut().map_err(|_| native_wintun_conflict())?;
                         let lock = held_lock.as_mut().ok_or_else(native_wintun_conflict)?;
-                        assembly.with_terminal_original_key_owner(|owner| owner.with_terminal_original_keys(lock, |_, keys, _| {
+                        assembly.with_terminal_original_key_owner(|owner| owner.with_terminal_original_key_reads(lock, |_, keys| {
                             for (slot, key) in keys.into_iter().enumerate() {
                                 if let Some(key) = key {
                                     if let Some(ack) = c.key_closes.try_borrow().map_err(|_| crate::member_carrier::CarrierError::Conflict)?[slot].as_ref() {
@@ -1569,7 +1569,7 @@ pub(crate) mod native {
                                     let assembly = input.assembly.as_ref().ok_or(
                                         crate::windows::member_carrier_wintun::Error::Conflict)?;
                                     assembly.with_terminal_original_key_owner(|owner| {
-                                        owner.with_terminal_original_keys(&mut lock, |_, keys, _| {
+                                        owner.with_terminal_original_key_reads(&mut lock, |_, keys| {
                                             for (slot, original) in keys.into_iter().enumerate() {
                                                 if let Some(original) = original {
                                                     crate::windows::member_carrier_keys::close_terminal_original_key(

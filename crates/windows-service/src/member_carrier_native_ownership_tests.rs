@@ -718,44 +718,50 @@ fn cleanup_restores_only_owned_values_after_nic_absence_and_never_deletes_keys()
 }
 
 #[test]
-fn terminal_key_handoff_requires_actual_stopped_originals_and_no_forward_revival() {
-    // Break: selecting HKEYs from clean JSON/another owner or before native
-    // absence lets the terminal caller release foreign or still-live originals.
+fn terminal_key_ack_read_uses_same_originals_without_querying_closed_handles() {
+    // Break: terminal selection/final G queries a released HKEY or reads keys
+    // without the original Stopped journal, retained ledger and current lock.
     let (mut owner, state, mut lock) = setup();
     let record = prepare_all(&mut owner, &mut lock);
     assert!(owner
-        .with_terminal_original_keys(&mut lock, |_, _, _| -> Result<()> {
+        .with_terminal_original_key_reads(&mut lock, |_, _| -> Result<()> {
             panic!("terminal callback before actual cleanup")
         })
         .is_err());
     let stopped = owner.cleanup(&record, &mut lock).unwrap();
+    let reads = state.borrow().inspection_count;
     let effects = state.borrow().events.len();
-    let actual = owner
-        .with_terminal_original_keys(&mut lock, |record, keys, _| {
+    state.borrow_mut().inspect_failure = Some(reads + 1);
+    let originals = owner
+        .with_terminal_original_key_reads(&mut lock, |record, keys| {
             assert_eq!(record.phase, Phase::Stopped);
-            Ok(keys.map(|key| key.map(|original| original.retained_handle().0)))
+            Ok(keys.map(|key| key.map(|key| key.retained_handle().0)))
         })
         .unwrap();
-    assert_eq!(actual, [Some(10), Some(11), Some(12)]);
+    assert_eq!(originals, [Some(10), Some(11), Some(12)]);
+    assert_eq!(state.borrow().inspection_count, reads);
     assert_eq!(state.borrow().events.len(), effects);
     assert!(owner.prepare_role(Role::MemberA, &mut lock).is_err());
     assert_eq!(owner.snapshot().unwrap(), Some(stopped));
-}
-
-#[test]
-fn terminal_key_handoff_does_not_adopt_record_only_keys_or_skip_postflight() {
-    for fault in 0..4 {
+    lock.held = false;
+    assert!(owner
+        .with_terminal_original_key_reads(&mut lock, |_, _| -> Result<()> {
+            panic!("terminal key ACK read ignored original serialized lock")
+        })
+        .is_err());
+    for fault in 0..3 {
         let (mut owner, state, mut lock) = setup();
         let record = prepare_all(&mut owner, &mut lock);
         let stopped = owner.cleanup(&record, &mut lock).unwrap();
         match fault {
             0 => owner.retained.keys[1] = None,
-            1 => state.borrow_mut().keys[1] = Some(99),
-            2 => state.borrow_mut().nic_absent[1] = false,
+            1 => {
+                owner.retained.keys[1].as_mut().unwrap().binding = owner.context.bindings[0].clone()
+            }
             _ => {}
         }
         let entered = Cell::new(false);
-        let result = owner.with_terminal_original_keys(&mut lock, |_, _, _| {
+        let result = owner.with_terminal_original_key_reads(&mut lock, |_, _| {
             entered.set(true);
             let mut changed = stopped.clone();
             changed.generation += 1;
@@ -763,32 +769,8 @@ fn terminal_key_handoff_does_not_adopt_record_only_keys_or_skip_postflight() {
             Ok(())
         });
         assert!(result.is_err(), "fault {fault}");
-        assert_eq!(entered.get(), fault == 3);
+        assert_eq!(entered.get(), fault == 2);
     }
-}
-
-#[test]
-fn terminal_key_ack_read_uses_same_originals_without_querying_closed_handles() {
-    // Break: final G recursively queries a released HKEY, or reads a key list
-    // not authenticated by the original current private journal and lock.
-    let (mut owner, state, mut lock) = setup();
-    let record = prepare_all(&mut owner, &mut lock);
-    owner.cleanup(&record, &mut lock).unwrap();
-    let reads = state.borrow().inspection_count;
-    state.borrow_mut().inspect_failure = Some(reads + 1);
-    let originals = owner
-        .with_terminal_original_key_reads(&mut lock, |_, keys| {
-            Ok(keys.map(|key| key.map(|key| key.retained_handle().0)))
-        })
-        .unwrap();
-    assert_eq!(originals, [Some(10), Some(11), Some(12)]);
-    assert_eq!(state.borrow().inspection_count, reads);
-    lock.held = false;
-    assert!(owner
-        .with_terminal_original_key_reads(&mut lock, |_, _| -> Result<()> {
-            panic!("terminal key ACK read ignored original serialized lock")
-        })
-        .is_err());
 }
 
 #[test]

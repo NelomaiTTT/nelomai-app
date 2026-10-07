@@ -1929,7 +1929,7 @@ fn sdk_deleted_disabled_original_cleanup_preserves_real_owner_cas_and_never_writ
         "no DWORD write/delete to deleted original"
     );
     let original = owner
-        .with_terminal_original_keys(&mut true, |_, keys, _| {
+        .with_terminal_original_key_reads(&mut true, |_, keys| {
             Ok(terminal_original_key_obligation(keys[0].unwrap()))
         })
         .unwrap();

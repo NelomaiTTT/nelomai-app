@@ -1040,44 +1040,8 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         }
         Ok(record)
     }
-    /// Borrow SAME retained NEW-key originals after actual value restoration
-    /// and independent native absence. The caller must supply its concrete
-    /// terminal Calling/G fence for explicit handle closure; this method cannot
-    /// mint a close receipt, reconstruct a handle, or authorize any SDK effect.
-    /// Postflight uses current original journal/lock, NOT a closed HKEY query.
-    pub(crate) fn with_terminal_original_keys<T>(
-        &mut self,
-        lock: &mut I::MutationLock,
-        inspect: impl FnOnce(&Record, [Option<&NewKeyAck<I::Key>>; 3], &mut I) -> Result<T>,
-    ) -> Result<T> {
-        self.cleanup_only = true;
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        let record = self.current.as_ref().ok_or(Error::Pending)?.clone();
-        self.require_current(&record)?;
-        if record.phase != Phase::Stopped {
-            return Err(Error::Conflict);
-        }
-        self.verify_clean(&record, lock)?;
-        for (index, original) in self.retained.keys.iter().enumerate() {
-            if record.keys[index].new_key_ack != original.is_some()
-                || original.as_ref().is_some_and(|key| {
-                    key.context != self.context || key.binding != self.context.bindings[index]
-                })
-            {
-                return Err(Error::Conflict);
-            }
-        }
-        let keys = self
-            .retained
-            .keys
-            .each_ref()
-            .map(|key| key.as_ref().map(|key| &key.ack));
-        let result = inspect(&record, keys, &mut self.io);
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        self.require_current(&record)?;
-        result
-    }
-    /// Factual SAME-original key ACK read for final G AFTER explicit closes.
+    /// Factual SAME-original key ACK selection within the caller's terminal
+    /// bracket, or read for final G AFTER explicit closes.
     /// No HKEY queries, native absence assertions or effect/Drop permission.
     /// G must match every actual native close ACK and independently inspect the
     /// whole terminal universe. Equal Clean JSON cannot create missing keys.
@@ -1666,9 +1630,6 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             record = clean;
         }
         Ok(record)
-    }
-    fn verify_clean(&mut self, record: &Record, lock: &mut I::MutationLock) -> Result<()> {
-        self.verify_clean_in(record, lock, &mut |call| call())
     }
     fn verify_clean_in(
         &mut self,
