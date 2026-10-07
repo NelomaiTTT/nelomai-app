@@ -200,7 +200,8 @@ impl NativeDeadline {
             owner: self,
             succeeded: false,
         };
-        self.runtime.verify(&self.context)?;
+        // Retain the SAME runtime and policy only; every use of this pin must
+        // authenticate its current runtime, lease and policy before authority.
         self.verify_lease()?;
         let pin = NativeDeadlineReadPin {
             owner: self.owner.clone(),

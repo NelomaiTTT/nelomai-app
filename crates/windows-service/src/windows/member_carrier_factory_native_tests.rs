@@ -264,8 +264,8 @@ fn carrier_factory_actual_cold_child() {
         connection_generation: 3,
     };
     let primary = Member { slot: Slot::A, lease_id: "22222222-2222-4222-8222-222222222222".into(),
-        configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.11:51820\nPersistentKeepalive = 25\n".into()),
-        probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "1.1.1.1".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
+        configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 198.51.100.0/24\nEndpoint = 192.0.2.11:51820\nPersistentKeepalive = 25\n".into()),
+        probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "198.51.100.53".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
     let mut command = Command::Start {
         scope: scope.clone(),
         primary,
