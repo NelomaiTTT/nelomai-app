@@ -3018,7 +3018,16 @@ pub(crate) mod native {
                 .map_err(denied)
         }
         fn verify_pair(&self, selected: &Selected, cleanup: bool) -> io::Result<()> {
-            self.continuity(selected, cleanup)?;
+            let network = selected.network.as_ref().ok_or_else(conflict)?;
+            compare_stage(&self.context, &selected.record, cleanup)?;
+            if !selected.pair.matches_runtime(&self.runtime)
+                || !network.matches_runtime(&self.runtime)
+                || (!cleanup && self.cancelled.load(Ordering::Acquire))
+            {
+                return Err(conflict());
+            }
+            // Both original reads authenticate their own Runtime/Calling
+            // brackets; final continuity still precedes every resource join.
             // End this Pair callback BEFORE the row/network/Guard sibling joins.
             // Guard's attestor may inspect this SAME original Pair pin itself.
             let verify = |actual: &pair::Record| {
