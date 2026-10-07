@@ -1,6 +1,5 @@
 //! Actual native terminal composition used by the retained production factory.
 //! Pending original layouts remain owned; observations never grant disposal.
-#![allow(dead_code)]
 
 use crate::{
     member_carrier_control::CarrierPairFinalizer,
@@ -588,23 +587,4 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             .map_err(|_| conflict())?
             .finish(original, scope)
     }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn actual_native_finalizer_consumes_the_same_coordinator_and_terminal_provider(
-    original: crate::member_carrier_pair::CarrierNativePair<
-        crate::windows::member_carrier_pair_io::native::NativeCarrierPairIo<'static>,
-        crate::windows::member_carrier_pair_io::native::NativePairJournal,
-    >,
-    scope: &nelomai_client_tunnel::redundancy::SessionScope,
-) -> std::io::Result<()> {
-    // Compile-only actual Windows type join. No fake provider or SDK receipt;
-    // this is NOT a native-execution or successful terminal acceptance test.
-    use nelomai_client_tunnel::redundancy::driver::NativePair;
-    let mut control = crate::member_carrier_control::CarrierPairControl::new(
-        original,
-        NativeCarrierPairFinalizer::new(),
-    );
-    control.close(scope)
 }

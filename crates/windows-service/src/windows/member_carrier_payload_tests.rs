@@ -141,22 +141,3 @@ fn member_source_selection_cannot_substitute_role_path_or_signed_slot() {
         }
     }
 }
-
-#[cfg(windows)]
-#[allow(dead_code)]
-fn actual_member_sources_require_the_same_original_runtime_and_carrier(
-    root: &std::path::Path,
-    owner: std::sync::Arc<nelomai_contracts::dispatcher::MutationGuard>,
-    carrier: std::rc::Rc<native::WintunSource>,
-    runtime: &super::super::member_carrier_key_authority::RuntimeRead,
-    context: &crate::member_carrier_native_ownership::Context,
-    transport: nelomai_client_tunnel::TunnelTransport,
-) -> Result<()> {
-    // Compile-only actual owner composition, not Windows execution or a fake
-    // source/manifest/mutex permission. Pins remain after the caller's Rc drops.
-    let source = native::MemberSource::new(root, owner, transport, &carrier)?;
-    assert!(source.matches_carrier(&carrier));
-    drop(carrier);
-    runtime.verify_member_source(context, &source)?;
-    source.verify()
-}

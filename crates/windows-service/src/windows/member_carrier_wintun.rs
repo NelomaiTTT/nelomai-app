@@ -300,39 +300,6 @@ pub(crate) mod native {
     };
     include!("member_carrier_wintun_original.rs");
 
-    #[cfg(test)]
-    fn actual_original_ack_composes_with_independent_creator_inventory(
-        adapter: OriginalAdapterRead,
-        runtime: &crate::windows::member_carrier_key_authority::RuntimeRead,
-        image: &crate::windows::member_carrier_module::native::OriginalImage,
-        scope: crate::windows::member_carrier_creators::Scope,
-    ) -> std::result::Result<(), crate::windows::member_carrier_creators::Error> {
-        // Compile-only API contract, NOT an actual native-create/runtime test.
-        let prepared = PreparedOriginal::new(runtime, image, scope)?;
-        // Nothing fallible may precede raw-ACK retention after native return.
-        let original: OriginalWintun = prepared.acknowledge(adapter);
-        let universe = OriginalUniverse::new(runtime, image)?;
-        let context = original.scope.context.clone();
-        let (_producer, _observer) = crate::windows::member_carrier_creators::Producer::<
-            OriginalWintun,
-        >::intent(context, universe)?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn actual_original_registry_supplies_live_package_facts_without_lookup_adoption(
-        observer: creators::Observer<OriginalWintun>,
-        runtime: &RuntimeRead,
-        image: &OriginalImage,
-    ) -> creators::Result<()> {
-        // Compile-only actual API contract: no hardware execution/permission.
-        let mut originals = OriginalPackageInventory::new(observer, runtime, image)?;
-        let _ =
-            crate::windows::member_carrier_wintun_package::OriginalDevices::observe(&mut originals)
-                .map_err(original_error)?;
-        Ok(())
-    }
-
     /// Independent privileged capability contract, NOT a record-derived fact.
     /// No production implementation is supplied; factory stays disconnected.
     ///

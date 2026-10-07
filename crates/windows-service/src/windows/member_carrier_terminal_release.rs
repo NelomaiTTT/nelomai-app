@@ -564,20 +564,6 @@ pub(crate) mod native {
             std::ptr::eq(self.root.as_ref(), root) && self.consumed.get()
         }
     }
-    #[cfg(test)]
-    fn actual_terminal_api_requires_original_root_and_native_module_ack<
-        T,
-        G: NativeTerminalResourceGate<T>,
-    >(
-        root: &Rc<NativeTerminalReleaseRoot<T, G>>,
-        module: &mut crate::windows::member_carrier_module::native::LoadedWintun,
-        retained_ack: &mut Option<NativeModuleReleased<T, G>>,
-    ) -> io::Result<()> {
-        // Type-check the real native path, never executed on the host, no
-        // fabricated NativePair/Retired/Runtime/Calling/G/LoadedWintun inputs.
-        root.unload_in_terminal_call(module, retained_ack)?;
-        root.release_resources(retained_ack.as_ref().ok_or_else(conflict)?)
-    }
 }
 #[cfg(test)]
 #[path = "member_carrier_terminal_release_tests.rs"]
