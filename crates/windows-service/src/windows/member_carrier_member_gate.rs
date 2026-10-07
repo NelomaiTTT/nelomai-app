@@ -625,25 +625,6 @@ impl Drop for Flight<'_> {
         self.fence.busy.set(false);
     }
 }
-/// Keep all actual inputs and attempted registrations on Err/unwind/Drop.
-/// Only the enclosing actor's complete original receipts may release them;
-/// this authorization component has no completion or unchecked cleanup API.
-struct Root<T>(Option<T>);
-impl<T> Root<T> {
-    fn new(value: T) -> Self {
-        Self(Some(value))
-    }
-    fn get_mut(&mut self) -> Result<&mut T> {
-        self.0.as_mut().ok_or(Error::Pending)
-    }
-}
-impl<T> Drop for Root<T> {
-    fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            std::mem::forget(value);
-        }
-    }
-}
 struct Registration<T> {
     first: Option<std::rc::Weak<T>>,
 }
@@ -753,7 +734,9 @@ pub(crate) mod native {
         P: NativeProbeGate<Wfp, A>,
         N: NativeNetworkEffectGate,
     > {
-        state: Root<State<A, P, N>>,
+        // GraphSlot/actor and terminal resource roots retain this SAME payload
+        // across Err/unwind; authenticated outer disposal releases its pins.
+        state: State<A, P, N>,
         fence: GateFence,
     }
     fn upgrade<T>(original: &Weak<T>) -> Result<Rc<T>> {
@@ -775,7 +758,7 @@ pub(crate) mod native {
         /// the returned G in the actual actor/controller before selecting Pair.
         pub(crate) fn new(input: NativeMemberGateInputs<A, P>) -> Self {
             Self {
-                state: Root::new(State {
+                state: State {
                     context: input.context,
                     intent: input.intent,
                     runtime: input.runtime,
@@ -793,7 +776,7 @@ pub(crate) mod native {
                     closing: Registration::default(),
                     closing_network: Registration::default(),
                     network_ack: None,
-                }),
+                },
                 fence: GateFence::default(),
             }
         }
@@ -802,7 +785,7 @@ pub(crate) mod native {
         /// Bind Closing before selecting the cleanup publication; never revive
         /// a failed forward G with a fresh selection.
         pub(crate) fn select_pair(&mut self, original: Rc<NativePairIntentRead>) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(state.closing.first.is_some(), || {
                 state.continuity(state.closing.first.is_some())?;
                 if !original.matches_runtime(&state.runtime) {
@@ -837,7 +820,7 @@ pub(crate) mod native {
             closing: &Rc<NativeClosingRead>,
             network: &Rc<NativeClosingNetworkRead>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(true, || {
                 state.closing.retain(closing)?;
                 state.closing_network.retain(network)?;
@@ -852,7 +835,7 @@ pub(crate) mod native {
             original: &Rc<NativeNetworkAckRead<N>>,
             gate: &Rc<N>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(state.closing.first.is_some(), || {
                 let registration = state
                     .network_ack
@@ -1226,7 +1209,7 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(false, || {
                 let usage = state.check_arguments(context, record, intent, false)?;
                 state.authorize(record, usage, window, None)
@@ -1239,7 +1222,7 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(true, || {
                 let usage = state.check_arguments(context, record, intent, true)?;
                 state.authorize(record, usage, window, None)
@@ -1252,7 +1235,7 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(false, || {
                 if context != &state.context
                     || intent != &state.intent
@@ -1293,7 +1276,7 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(false, || {
                 if context != &state.context
                     || intent != &state.intent
@@ -1313,7 +1296,7 @@ pub(crate) mod native {
             original: &Pending,
             service: Option<&Rc<PartialCleanup>>,
         ) -> Result<()> {
-            let state = self.state.get_mut()?;
+            let state = &mut self.state;
             self.fence.run(true, || {
                 let usage = state.check_arguments(context, record, intent, true)?;
                 state.continuity(true)?;

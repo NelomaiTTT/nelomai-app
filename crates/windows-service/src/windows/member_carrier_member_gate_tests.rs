@@ -1042,26 +1042,6 @@ fn cleanup_fence_rejects_caught_reentry_and_unwind_never_rearms_forward() {
     fence.run(true, || Ok(())).unwrap();
 }
 #[test]
-fn rooted_originals_survive_error_unwind_and_gate_drop() {
-    struct Tracked(std::rc::Rc<Cell<usize>>);
-    impl Drop for Tracked {
-        fn drop(&mut self) {
-            self.0.set(self.0.get() + 1);
-        }
-    }
-    let drops = std::rc::Rc::new(Cell::new(0));
-    let mut root = Root::new(Tracked(drops.clone()));
-    assert!(root.get_mut().is_ok());
-    drop(root);
-    assert_eq!(drops.get(), 0);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _root = Root::new(Tracked(drops.clone()));
-        panic!("postflight")
-    }));
-    assert!(result.is_err());
-    assert_eq!(drops.get(), 0);
-}
-#[test]
 fn weak_registration_keeps_first_identity_without_owning_or_replacing_actor_root() {
     let original = std::rc::Rc::new(7);
     let foreign = std::rc::Rc::new(7);

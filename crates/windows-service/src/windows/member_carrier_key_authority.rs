@@ -193,7 +193,13 @@ impl RuntimeRead {
         files: NativeSessionFiles,
         context: Context,
     ) -> Result<(Self, KeyLock)> {
-        let serialized = KEY_MUTATIONS.try_lock().map_err(|_| Error::Conflict)?;
+        let serialized = KEY_MUTATIONS.try_lock().map_err(|_| {
+            #[cfg(test)]
+            super::member_carrier_factory_test_os::trace_step(
+                "runtime creation denied: KEY_MUTATIONS",
+            );
+            Error::Conflict
+        })?;
         owner
             .verify_at(&root.join("engine-owner.lock"))
             .map_err(|_| Error::Conflict)?;
