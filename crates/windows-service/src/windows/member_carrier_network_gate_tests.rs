@@ -1949,11 +1949,202 @@ fn route_reads_require_every_present_key_ack_and_reject_extra_member_rows() {
         acknowledged: true,
     }];
     assert!(compare_route_reads(&r, &pending, &ack, std::slice::from_ref(&row)).is_ok());
+    // Windows derives this read-only broadcast row from the SAME ACKed on-link
+    // parent. Its presence is never an ACK or deletion right for its own key.
+    let mut subnet_record = r.clone();
+    let subnet = route("198.51.100.0/24", 8, 0, None);
+    subnet_record
+        .network
+        .as_mut()
+        .unwrap()
+        .pending
+        .as_mut()
+        .unwrap()
+        .routes = vec![subnet.clone()];
+    subnet_record.validate().unwrap();
+    let subnet_journal = journal(&[], Some(std::slice::from_ref(&subnet)), false);
+    let parent = Row::static_route(subnet, NativeProof { index: 8, luid: 91 });
+    let parent_ack = RouteAttempt {
+        row: parent.clone(),
+        deleting: false,
+        acknowledged: true,
+    };
+    let mut derived = Row::static_route(
+        route("198.51.100.255/32", 8, 256, None),
+        NativeProof { index: 8, luid: 91 },
+    );
+    derived.protocol = 2;
+    derived.flags = [1, 1, 0, 0];
+    let subnet_rows = [parent.clone(), derived.clone()];
+    assert!(
+        compare_route_reads(
+            &subnet_record,
+            &subnet_journal,
+            std::slice::from_ref(&parent_ack),
+            &subnet_rows,
+        )
+        .is_ok(),
+        "actual ACKed static parent permits only its implicit member broadcast observation"
+    );
+    for fault in 0..7 {
+        let mut attempts = vec![parent_ack.clone()];
+        let mut actual = subnet_rows.to_vec();
+        match fault {
+            0 => attempts.clear(),
+            1 => attempts[0].acknowledged = false,
+            2 => attempts[0].deleting = true,
+            3 => {
+                let mut unknown = parent_ack.clone();
+                unknown.acknowledged = false;
+                attempts.push(unknown);
+            }
+            4 => {
+                let mut superseded = parent_ack.clone();
+                superseded.row.route.metric += 1;
+                attempts.push(superseded);
+            }
+            5 => {
+                let mut deleted = parent_ack.clone();
+                deleted.deleting = true;
+                attempts.push(deleted);
+                actual.remove(0);
+            }
+            _ => {
+                actual.remove(0);
+            }
+        };
+        assert!(
+            compare_route_reads(&subnet_record, &subnet_journal, &attempts, &actual).is_err(),
+            "broadcast needs the latest nondeleted ACK and present exact parent: fault {fault}"
+        );
+    }
+    for fault in 0..15 {
+        let mut foreign = derived.clone();
+        match fault {
+            0 => foreign.route.interface += 1,
+            1 => foreign.luid += 1,
+            2 => foreign.route.scope = RouteScope::Global,
+            3 => foreign.route.gateway = Some("192.0.2.1".parse().unwrap()),
+            4 => foreign.route.metric += 1,
+            5 => foreign.protocol = 3,
+            6 => foreign.origin = 1,
+            7 => foreign.flags[0] = 0,
+            8 => foreign.flags[1] = 0,
+            9 => foreign.flags[2] = 1,
+            10 => foreign.flags[3] = 1,
+            11 => foreign.site_prefix_length = 1,
+            12 => foreign.valid_lifetime -= 1,
+            13 => foreign.preferred_lifetime -= 1,
+            _ => foreign.route.destination = "198.51.100.254/32".parse().unwrap(),
+        }
+        assert!(
+            compare_route_reads(
+                &subnet_record,
+                &subnet_journal,
+                std::slice::from_ref(&parent_ack),
+                &[parent.clone(), foreign],
+            )
+            .is_err(),
+            "broadcast observation must keep exact identity and metadata: fault {fault}"
+        );
+    }
+    for fault in 0..8 {
+        let mut foreign = parent.clone();
+        match fault {
+            0 => foreign.route.gateway = Some("192.0.2.1".parse().unwrap()),
+            1 => foreign.protocol = 2,
+            2 => foreign.origin = 1,
+            3 => foreign.flags[0] = 1,
+            4 => foreign.site_prefix_length = 1,
+            5 => foreign.valid_lifetime -= 1,
+            6 => foreign.preferred_lifetime -= 1,
+            _ => foreign.luid += 1,
+        }
+        let foreign_ack = RouteAttempt {
+            row: foreign.clone(),
+            ..parent_ack.clone()
+        };
+        assert!(
+            compare_route_reads(
+                &subnet_record,
+                &subnet_journal,
+                &[foreign_ack],
+                &[foreign, derived.clone()],
+            )
+            .is_err(),
+            "an ACK does not make a nonstatic or foreign parent valid: fault {fault}"
+        );
+    }
+    for destination in ["198.51.100.254/31", "198.51.100.255/32"] {
+        let mut host_parent = parent.clone();
+        host_parent.route.destination = destination.parse().unwrap();
+        let mut host_record = subnet_record.clone();
+        host_record
+            .network
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap()
+            .routes = vec![host_parent.route.clone()];
+        let host_journal = journal(&[], Some(std::slice::from_ref(&host_parent.route)), false);
+        let host_ack = RouteAttempt {
+            row: host_parent.clone(),
+            ..parent_ack.clone()
+        };
+        assert!(compare_route_reads(
+            &host_record,
+            &host_journal,
+            &[host_ack],
+            &[host_parent, derived.clone()],
+        )
+        .is_err());
+    }
+    let mut owned_broadcast = subnet_record.clone();
+    let owned_routes = &mut owned_broadcast
+        .network
+        .as_mut()
+        .unwrap()
+        .pending
+        .as_mut()
+        .unwrap()
+        .routes;
+    owned_routes.push(derived.route.clone());
+    let owned_journal = journal(&[], Some(owned_routes), false);
+    for unknown in [false, true] {
+        let mut attempts = vec![parent_ack.clone()];
+        if unknown {
+            attempts.push(RouteAttempt {
+                row: derived.clone(),
+                deleting: false,
+                acknowledged: false,
+            });
+        }
+        assert!(
+            compare_route_reads(&owned_broadcast, &owned_journal, &attempts, &subnet_rows,)
+                .is_err(),
+            "an owned broadcast key still needs its own actual ACK"
+        );
+    }
     let mut rows = vec![row.clone(), row.clone()];
     assert!(compare_route_reads(&r, &pending, &ack, &rows).is_err());
     rows[1].route.destination = "203.0.113.7/32".parse().unwrap();
     assert!(compare_route_reads(&r, &pending, &ack, &rows).is_err());
     let c = r.carrier.unwrap();
+    let mut carrier_broadcast = derived.clone();
+    carrier_broadcast.route.interface = c.index;
+    carrier_broadcast.route.scope = RouteScope::WindowsInterface(c.index);
+    carrier_broadcast.luid = c.luid;
+    assert!(
+        compare_route_reads(
+            &subnet_record,
+            &subnet_journal,
+            std::slice::from_ref(&parent_ack),
+            &[parent.clone(), carrier_broadcast],
+        )
+        .is_err(),
+        "the carrier cannot use the member broadcast observation"
+    );
     let mut multicast = Row::static_route(
         RouteValue {
             destination: "224.0.0.0/4".parse().unwrap(),

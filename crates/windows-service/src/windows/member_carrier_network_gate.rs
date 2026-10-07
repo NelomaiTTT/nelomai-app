@@ -1433,7 +1433,40 @@ fn compare_route_reads(
                 || row.route.scope != RouteScope::WindowsInterface(member.index)
             {
                 Err(conflict())
-            } else if control {
+            } else if control
+                // Read-only implicit broadcast of a present exact static
+                // parent whose latest actual ACK was checked above. This
+                // supplies no ACK or deletion authority for the broadcast.
+                || (row.route.gateway.is_none()
+                    && row.route.metric == 256
+                    && row.protocol == 2
+                    && row.origin == 0
+                    && row.flags == [1, 1, 0, 0]
+                    && row.site_prefix_length == 0
+                    && row.valid_lifetime == u32::MAX
+                    && row.preferred_lifetime == u32::MAX
+                    && table.values().any(|parent| {
+                        parent.route.interface == member.index
+                            && parent.luid == member.luid
+                            && parent.route.scope == RouteScope::WindowsInterface(member.index)
+                            && parent.route.gateway.is_none()
+                            && *parent
+                                == &Row::static_route(
+                                    parent.route.clone(),
+                                    NativeProof {
+                                        index: member.index,
+                                        luid: member.luid,
+                                    },
+                                )
+                            && matches!(
+                                (row.route.destination, parent.route.destination),
+                                (ipnet::IpNet::V4(host), ipnet::IpNet::V4(subnet))
+                                    if host.prefix_len() == 32
+                                        && subnet.prefix_len() < 31
+                                        && host.addr() == subnet.broadcast()
+                            )
+                    }))
+            {
                 Ok(())
             } else {
                 compare_route_ack(attempts, row)
