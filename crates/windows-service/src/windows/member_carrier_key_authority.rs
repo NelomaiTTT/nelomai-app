@@ -690,6 +690,22 @@ impl RuntimeRead {
                     .files
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
+                if !kinds.contains(&RecordKind::Network) {
+                    let (access, records) = files
+                        .native_records(context, kinds)
+                        .map_err(|_| Error::Journal)?;
+                    access
+                        .require_native_context(context)
+                        .map_err(|_| Error::Conflict)?;
+                    let records = records
+                        .into_iter()
+                        .map(|record| record.ok_or(Error::Journal))
+                        .collect::<Result<Vec<_>>>()?;
+                    return Ok((
+                        records,
+                        !self.runtime.forward_closed.get() && access.is_fresh(),
+                    ));
+                }
                 let mut records = Vec::with_capacity(kinds.len());
                 for &kind in kinds {
                     files
@@ -766,13 +782,14 @@ impl RuntimeRead {
                     .files
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                // An empty batch still authenticates the protected context.
-                if kinds.is_empty() {
-                    files
-                        .native_carrier_access(&context.intent.scope)
-                        .map_err(|_| Error::Journal)?
+                if !kinds.contains(&RecordKind::Network) {
+                    let (access, records) = files
+                        .native_records(context, kinds)
+                        .map_err(|_| Error::Journal)?;
+                    access
                         .require_native_context(context)
                         .map_err(|_| Error::Conflict)?;
+                    return Ok(records);
                 }
                 let mut records = Vec::with_capacity(kinds.len());
                 for &kind in kinds {

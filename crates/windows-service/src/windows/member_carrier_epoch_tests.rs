@@ -1216,6 +1216,92 @@ fn native_birth_view_identity_requires_original_bound_state_even_after_cleanup_r
 
 #[test]
 fn actual_carrier_access_birth_fact_failed_postflight_fences_all_registered_siblings() {
+    let (_, files, _, execution, _, _) = bound_running();
+    let context = native_context(&files);
+    let mut view = files.native_birth_view(&execution).unwrap();
+    let bytes = native_record(&context).encode().unwrap();
+    view.compare_exchange(&scope(), RecordKind::NativeCarrierReceipts, None, &bytes)
+        .unwrap();
+    let kinds = [
+        RecordKind::Session,
+        RecordKind::NativeCarrierReceipts,
+        RecordKind::MemberARows,
+    ];
+    let expected = kinds
+        .map(|kind| view.read(&scope(), kind).unwrap())
+        .to_vec();
+    assert!(view
+        .native_records(&context, &[RecordKind::Network])
+        .is_err());
+    let (access, records) = view.native_records(&context, &kinds).unwrap();
+    access.require_native_context(&context).unwrap();
+    assert!(access.is_registered_native_birth_view());
+    assert!(access.is_fresh());
+    assert_eq!(records, expected);
+    assert!(view.native_records(&context, &[]).unwrap().1.is_empty());
+    let mut cleanup = execution.native_cleanup_view(&files).unwrap().into_files();
+    let (access, records) = cleanup.native_records(&context, &kinds).unwrap();
+    assert!(access.is_registered_native_birth_view());
+    assert!(!access.is_fresh());
+    assert_eq!(records, expected);
+
+    for fault in 0..5 {
+        let (disk, mut files, root, execution, lease, session) = bound_running();
+        let mut context = native_context(&files);
+        let mut view = files.native_birth_view(&execution).unwrap();
+        let bytes = native_record(&context).encode().unwrap();
+        view.compare_exchange(&scope(), RecordKind::NativeCarrierReceipts, None, &bytes)
+            .unwrap();
+        match fault {
+            0 => context.bindings[0].name.push_str("-foreign"),
+            1 => {
+                let mut next = session.clone();
+                next.network_epoch += 1;
+                write(&mut files, Some(&session), &next).unwrap();
+            }
+            2 => {
+                let wrong = disk.0.borrow().bytes[&PrivateFile::Session].clone();
+                disk.0
+                    .borrow_mut()
+                    .bytes
+                    .insert(PrivateFile::NativeCarrierReceipts, wrong);
+            }
+            3 => disk.0.borrow_mut().fail_after = true,
+            _ => disk.0.borrow_mut().after = Some(Box::new(|| panic!("batch postflight"))),
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            view.native_records(&context, &kinds)
+        }));
+        if fault == 4 {
+            assert!(result.is_err());
+        } else {
+            assert!(result.unwrap().is_err());
+        }
+        assert!(view.native_carrier_access(&scope()).is_err());
+        assert!(execution.verify_current(&lease).is_err());
+        if fault == 1 {
+            // A stale selected lease is denied before a storage flight starts;
+            // the original factual ACK history still records the actual epoch.
+            root.inspect(|facts| {
+                assert_eq!(facts.execution.value(), 2);
+                Ok(())
+            })
+            .unwrap();
+        } else {
+            assert!(root.inspect(|_| Ok(())).is_err());
+        }
+    }
+
+    let (disk, mut files, _, _, _, _) = bound_running();
+    let context = native_context(&files);
+    let changed = disk.clone();
+    disk.0.borrow_mut().after = Some(Box::new(move || {
+        changed.0.borrow_mut().bytes.remove(&PrivateFile::Index);
+    }));
+    assert!(files
+        .native_records(&context, &[RecordKind::Session])
+        .is_err());
+
     for reentry in [false, true] {
         let (disk, mut files, root, execution, lease, _) = bound_running();
         let mut view = files.native_birth_view(&execution).unwrap();

@@ -940,6 +940,102 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
     ) -> io::Result<Option<epoch::ExecutionStorageFlight>> {
         epoch::ExecutionStorageFlight::begin(self, scope)
     }
+    /// Factual selected records under the SAME original storage flight. No
+    /// publication ACK, native effect authority or cached permission is returned.
+    pub(crate) fn native_records(
+        &mut self,
+        context: &native_receipt::Context,
+        kinds: &[RecordKind],
+    ) -> io::Result<(CarrierAccess, Vec<Option<Vec<u8>>>)> {
+        if self.native_execution.is_some() && kinds.contains(&RecordKind::Network) {
+            return Err(failed());
+        }
+        let scope = &context.intent.scope;
+        let identity = self.identity(scope)?;
+        let native = self.native_flight(scope)?;
+        let mut backend = self.backend_guard()?;
+        let (before_index, epoch, records) = backend
+            .io
+            .transaction(|files| {
+                let (before_index, index) = load_index(files)?;
+                require_active(&index, &identity)?;
+                let epoch = if let Some(flight) = &native {
+                    flight.verify(files)?;
+                    if flight.context() != context {
+                        return Err(failed());
+                    }
+                    flight.context().provenance.network_epoch
+                } else {
+                    current_epoch(files, &index, &identity)?
+                };
+                if context.provenance.boot_id != identity.boot_id
+                    || context.provenance.runtime != identity.runtime
+                    || context.provenance.network_epoch != epoch
+                {
+                    return Err(failed());
+                }
+                let mut records = Vec::with_capacity(kinds.len());
+                for &kind in kinds {
+                    let (_, record) = load_record(files, &index, &identity, kind)?;
+                    if let Some(record) = &record {
+                        if kind != RecordKind::Session
+                            && record.network_epoch > current_epoch(files, &index, &identity)?
+                        {
+                            return Err(failed());
+                        }
+                    }
+                    if let Some(flight) = &native {
+                        if let Some(record) = &record {
+                            if kind != RecordKind::Session {
+                                flight.verify_record(kind, record.data.as_bytes())?;
+                            }
+                        }
+                    }
+                    records.push(record.map(|r| r.data.into_bytes()));
+                }
+                if let Some(flight) = &native {
+                    flight.verify(files)?;
+                }
+                Ok((before_index, epoch, records))
+            })
+            .map_err(|_| failed())?;
+        let registered_native_birth_view = if let Some(flight) = native {
+            backend
+                .io
+                .transaction(|files| flight.verify(files))
+                .map_err(|_| failed())?;
+            flight.finish();
+            true
+        } else {
+            backend
+                .io
+                .transaction(|files| {
+                    let (after_index, index) = load_index(files)?;
+                    require_active(&index, &identity)?;
+                    if after_index != before_index
+                        || current_epoch(files, &index, &identity)? != epoch
+                    {
+                        return Err(failed());
+                    }
+                    Ok(())
+                })
+                .map_err(|_| failed())?;
+            false
+        };
+        Ok((
+            CarrierAccess {
+                scope: scope.clone(),
+                provenance: carrier::Provenance {
+                    boot_id: identity.boot_id,
+                    runtime: identity.runtime,
+                    network_epoch: epoch,
+                },
+                fresh: !self.cleanup_only && backend.fresh.as_ref() == Some(scope),
+                registered_native_birth_view,
+            },
+            records,
+        ))
+    }
     /// Comparison of the original backend/context ONLY. This neither grants a
     /// claim nor tests current private-file validity/freshness or native absence.
     #[allow(dead_code)] // Used by actual Windows RuntimeRead composition.

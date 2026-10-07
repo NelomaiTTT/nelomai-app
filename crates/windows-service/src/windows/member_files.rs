@@ -1272,6 +1272,11 @@ mod native {
         }
         fn read(&self, path: &Path, limit: usize, share: u32) -> Result<Option<ReadFile>> {
             self.verify_directories()?;
+            let read = Self::read_file(path, limit, share)?;
+            self.verify_directories()?;
+            Ok(read)
+        }
+        fn read_file(path: &Path, limit: usize, share: u32) -> Result<Option<ReadFile>> {
             let mut file = match open(
                 path,
                 GENERIC_READ | READ_CONTROL,
@@ -1281,10 +1286,7 @@ mod native {
                 None,
             ) {
                 Ok(file) => file,
-                Err(ERROR_FILE_NOT_FOUND) => {
-                    self.verify_directories()?;
-                    return Ok(None);
-                }
+                Err(ERROR_FILE_NOT_FOUND) => return Ok(None),
                 Err(_) => return Err(OwnerError::Native),
             };
             let before = stamp(&file, false, limit)?;
@@ -1300,7 +1302,6 @@ mod native {
                 acl: security,
             };
             read.verify(limit)?;
-            self.verify_directories()?;
             Ok(Some(read))
         }
         fn temporary(&self, slot: TunnelSlot) -> Result<(PathBuf, File)> {
@@ -1533,14 +1534,13 @@ mod native {
     struct SessionRecords<'a>(&'a MemberFiles);
     impl PrivateRecords for SessionRecords<'_> {
         fn read(&mut self, file: PrivateFile) -> std::io::Result<Option<Vec<u8>>> {
-            self.0
-                .read(
-                    &self.0.root.join(file.name()),
-                    file.limit(),
-                    FILE_SHARE_READ,
-                )
-                .map(|value| value.map(|r| r.bytes.to_vec()))
-                .map_err(|_| std::io::Error::other("protected_session_file_failed"))
+            MemberFiles::read_file(
+                &self.0.root.join(file.name()),
+                file.limit(),
+                FILE_SHARE_READ,
+            )
+            .map(|value| value.map(|r| r.bytes.to_vec()))
+            .map_err(|_| std::io::Error::other("protected_session_file_failed"))
         }
         fn compare_exchange(
             &mut self,
