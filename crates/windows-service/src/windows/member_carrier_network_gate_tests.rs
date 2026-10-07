@@ -1338,18 +1338,37 @@ fn retired_resources_require_stage_ten_restored_children_and_actual_baseline_ack
         &record,
         &empty,
         false,
+        1,
         &[baseline.clone()]
     )
     .is_ok());
-    assert!(compare_retired_resource_journals(&context, &record, &empty, false, &[]).is_err());
+    // Route failure before the first DNS exchange retains the actual baseline.
+    assert!(compare_retired_resource_journals(&context, &record, &empty, false, 0, &[]).is_ok());
     assert!(compare_retired_resource_journals(
         &context,
         &record,
         &empty,
         true,
+        1,
         &[baseline.clone()]
     )
     .is_err());
+    for (count, history) in [
+        (1, vec![]), // Started IO without its actual ACK.
+        (0, vec![baseline.clone()]),
+        (2, vec![baseline.clone()]), // A stale ACK cannot hide the latest attempt.
+        (32769, vec![baseline.clone(); 32769]),
+    ] {
+        assert!(compare_retired_resource_journals(
+            &context, &record, &empty, false, count, &history
+        )
+        .is_err());
+    }
+    let mut foreign = baseline.clone();
+    foreign.settings.enable_llmnr = 1;
+    assert!(
+        compare_retired_resource_journals(&context, &record, &empty, false, 1, &[foreign]).is_err()
+    );
     let mut drift = record.clone();
     drift.stop_stage = 9;
     assert!(compare_retired_resource_journals(
@@ -1357,6 +1376,7 @@ fn retired_resources_require_stage_ten_restored_children_and_actual_baseline_ack
         &drift,
         &empty,
         false,
+        1,
         &[baseline.clone()]
     )
     .is_err());
@@ -1376,6 +1396,7 @@ fn retired_resources_require_stage_ten_restored_children_and_actual_baseline_ack
         &drift,
         &empty,
         false,
+        1,
         &[baseline.clone()]
     )
     .is_err());

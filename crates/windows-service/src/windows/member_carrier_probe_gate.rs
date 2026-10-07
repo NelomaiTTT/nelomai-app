@@ -158,7 +158,9 @@ fn compare_stage(context: &Context, r: &pair::Record, purpose: Purpose) -> Resul
             if r.stop_stage == 0 {
                 if let Some(plan) = &r.pending_guard {
                     plan.validate()?;
-                    if plan.resolve(&r.guard.expected)? != r.guard {
+                    if ![&plan.expected, &plan.withdrawn, &plan.base, &plan.desired]
+                        .contains(&&r.guard)
+                    {
                         return Err(GuardError::Conflict);
                     }
                 }
@@ -307,7 +309,7 @@ fn compare_closing_registration(context: &Context, r: &pair::Record) -> Result<(
             for model in [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired] {
                 compare_model(r, model)?;
             }
-            if plan.resolve(&r.guard.expected)? != r.guard {
+            if ![&plan.expected, &plan.withdrawn, &plan.base, &plan.desired].contains(&&r.guard) {
                 return Err(GuardError::Conflict);
             }
         }

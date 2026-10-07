@@ -1088,6 +1088,47 @@ fn closing_registration_retains_normal_stop_and_withdrawn_lost_ack_without_rearm
     let mut foreign = r.clone();
     foreign.guard = fixture().1.guard;
     assert!(compare_closing_registration(&c, &foreign).is_err());
+
+    let (_, mut r) = fixture();
+    let desired = usable(r.clone()).guard;
+    let plan = policy::ExchangePlan::new(&r.guard, &desired).unwrap();
+    assert_eq!(plan.expected.expected, plan.base.expected);
+    assert_ne!(plan.expected, plan.base);
+    r.phase = pair::Phase::Closing;
+    r.operation = None;
+    r.active = None;
+    r.pending = Some(pair::Effect::Guard);
+    r.guard = plan.base.clone(); // Actual ACKed probe-bearing deny-only base.
+    r.pending_guard = Some(plan.clone());
+    assert_eq!(compare_closing_registration(&c, &r), Ok(()));
+    assert_eq!(compare_stage(&c, &r, Purpose::Closing), Ok(()));
+    let mut foreign = r.clone();
+    foreign.guard.members[0].as_mut().unwrap().probes[0].source_port += 1;
+    foreign.guard.validate().unwrap(); // Equal WFP snapshot is insufficient.
+    assert!(compare_closing_registration(&c, &foreign).is_err());
+    assert!(compare_stage(&c, &foreign, Purpose::Closing).is_err());
+
+    let empty = policy::Model::empty(r.scope.clone()).unwrap();
+    let unbound = policy::Model::new(
+        r.scope.clone(),
+        desired.carrier.clone().unwrap(),
+        desired.members.clone(),
+        desired.active,
+    )
+    .unwrap();
+    let mut creation = policy::ExchangePlan::new(&empty, &unbound).unwrap();
+    creation.captured_sublayer_weight = desired.assigned_sublayer_weight;
+    creation.base = plan.base;
+    creation.desired = desired;
+    creation.validate().unwrap();
+    r.pending_guard = Some(creation);
+    assert_eq!(compare_closing_registration(&c, &r), Ok(()));
+    assert_eq!(compare_stage(&c, &r, Purpose::Closing), Ok(()));
+    r.guard.assigned_sublayer_weight = Some(42);
+    r.guard.expected.sublayer.as_mut().unwrap().weight = 42;
+    r.guard.validate().unwrap();
+    assert!(compare_closing_registration(&c, &r).is_err());
+    assert!(compare_stage(&c, &r, Purpose::Closing).is_err());
 }
 // Break: giving data permits with no actual canonical original/ACK, or from an
 // equal-shaped provided tuple alone. Production joins supply both real facts.

@@ -1258,12 +1258,6 @@ pub(crate) mod native {
                     expected.stop_stage,
                     |_| Ok(()),
                 )
-                .inspect_err(|_error| {
-                    #[cfg(all(test, windows))]
-                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                        "closing capture Pair preflight: {_error:?}"
-                    ));
-                })
                 .map_err(denied)?;
             let source = root.source.as_ref().ok_or(CarrierError::Pending)?.clone();
             let capture = root.closing.clone();
@@ -1276,12 +1270,6 @@ pub(crate) mod native {
                 .ok_or(CarrierError::Pending)?;
             authority
                 .select_pair_intent(current.clone(), expected)
-                .inspect_err(|_error| {
-                    #[cfg(all(test, windows))]
-                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                        "closing capture authority selection: {_error:?}"
-                    ));
-                })
                 .map_err(denied)?;
             let original = authority
                 .closing_read_with_pin(|pin| {
@@ -1296,12 +1284,6 @@ pub(crate) mod native {
                         })
                         .map_err(native_denied)
                 })
-                .inspect_err(|_error| {
-                    #[cfg(all(test, windows))]
-                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                        "closing capture authority read: {_error:?}"
-                    ));
-                })
                 .map_err(denied)?;
             capture.confirm(&original)?;
             current
@@ -1312,12 +1294,6 @@ pub(crate) mod native {
                     expected.stop_stage,
                     |_| Ok(()),
                 )
-                .inspect_err(|_error| {
-                    #[cfg(all(test, windows))]
-                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                        "closing capture Pair postflight: {_error:?}"
-                    ));
-                })
                 .map_err(denied)?;
             attempt.completed = true;
             Ok(original)

@@ -2920,8 +2920,9 @@ mod bfe {
                                 .is_ok_and(|keys| keys.sublayer != subkey)
                         {
                             crate::windows::member_carrier_factory_test_os::trace_step(&format!(
-                                "foreign hard permit id={} layer={layer:?} conditions={} null={}",
+                                "foreign hard permit id={} layer={layer:?} provider={:?} sublayer={subkey:?} conditions={} null={}",
                                 f.filterId,
+                                unsafe { f.providerKey.as_ref() }.map(|provider| key(*provider)),
                                 f.numFilterConditions,
                                 f.filterCondition.is_null()
                             ));
@@ -2953,6 +2954,56 @@ mod bfe {
                                         f.filterId, key(condition.fieldKey), condition.matchType, condition.conditionValue.r#type,
                                         unsafe { decode_condition(condition, layer) }
                                     ));
+                                    let app_id =
+                                        key(condition.fieldKey) == key(FWPM_CONDITION_ALE_APP_ID);
+                                    let user_id =
+                                        key(condition.fieldKey) == key(FWPM_CONDITION_ALE_USER_ID);
+                                    if app_id || user_id {
+                                        let value = &condition.conditionValue;
+                                        let bytes = if (app_id
+                                            && value.r#type == FWP_BYTE_BLOB_TYPE)
+                                            || (user_id
+                                                && value.r#type == FWP_SECURITY_DESCRIPTOR_TYPE)
+                                        {
+                                            // Matching SDK tag owns this blob until the page drops.
+                                            match unsafe { value.Anonymous.byteBlob.as_ref() } {
+                                                Some(blob) if blob.size > 32768 => Err("oversize"),
+                                                Some(blob)
+                                                    if blob.size == 0 || blob.data.is_null() =>
+                                                {
+                                                    Err("malformed size/null")
+                                                }
+                                                Some(blob) => Ok(unsafe {
+                                                    std::slice::from_raw_parts(
+                                                        blob.data,
+                                                        blob.size as usize,
+                                                    )
+                                                }),
+                                                None => Err("malformed null blob"),
+                                            }
+                                        } else {
+                                            Err("malformed tag")
+                                        };
+                                        match bytes {
+                                            Ok(bytes) => {
+                                                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                                    "foreign hard permit id={} field={:?} bytes={} hex={bytes:02x?}",
+                                                    f.filterId, key(condition.fieldKey), bytes.len()
+                                                ));
+                                                if app_id {
+                                                    let text = if bytes.len() % 2 == 0 {
+                                                        String::from_utf16(&bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect::<Vec<_>>()).map_err(|_| "malformed UTF16")
+                                                    } else { Err("malformed odd UTF16 size") };
+                                                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                                        "foreign hard permit id={} APP_ID={text:?}", f.filterId
+                                                    ));
+                                                }
+                                            }
+                                            Err(error) => crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                                                "foreign hard permit id={} field={:?} blob={error}", f.filterId, key(condition.fieldKey)
+                                            )),
+                                        }
+                                    }
                                 }
                             }
                         }

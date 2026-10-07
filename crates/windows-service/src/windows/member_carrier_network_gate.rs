@@ -887,6 +887,7 @@ fn compare_retired_resource_journals(
     record: &pair::Record,
     journal: &NetworkJournal,
     dns_child_present: bool,
+    dns_attempts: usize,
     dns_acks: &[dns::Snapshot],
 ) -> io::Result<()> {
     compare_retired_resource_stage(context, record)?;
@@ -897,11 +898,14 @@ fn compare_retired_resource_journals(
         || view.recorded_active().is_some()
         || view.pending_active().is_some()
         || dns_child_present
-        || dns_acks.last()
-            != record
-                .network
-                .as_ref()
-                .and_then(|n| n.baseline.dns.as_ref())
+        || dns_attempts > 32768
+        || dns_attempts != dns_acks.len()
+        || (dns_attempts > 0
+            && dns_acks.last()
+                != record
+                    .network
+                    .as_ref()
+                    .and_then(|n| n.baseline.dns.as_ref()))
     {
         return Err(conflict());
     }
@@ -2273,7 +2277,8 @@ pub(crate) mod native {
                 self.compare_retired_bindings(record, retired, bindings)?;
                 let before_pair = self.protected_pair(record)?;
                 let ack = self.ack_pin()?;
-                let (attempts, dns_acks) = ack.acknowledgements()?;
+                let (attempts, _) = ack.acknowledgements()?;
+                let (dns_attempts, dns_acks) = ack.dns_exchange_history()?;
                 let leases = ack.physical_leases()?;
                 if leases.len() > 32768 {
                     return Err(conflict());
@@ -2292,6 +2297,7 @@ pub(crate) mod native {
                     record,
                     &saved.journal,
                     self.dns_child.try_borrow().map_err(denied)?.is_some(),
+                    dns_attempts,
                     &dns_acks,
                 )?;
                 let read_rows = || {
