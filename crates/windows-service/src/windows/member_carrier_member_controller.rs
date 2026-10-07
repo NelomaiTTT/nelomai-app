@@ -4743,67 +4743,6 @@ pub(crate) mod native {
             owned.member.verify_closed(receipt).map_err(owner_error)?;
             envelope(owned, lock)
         }
-        /// Attached pending owner that never entered actual MemberOwner Start.
-        /// Failed/lost Start ACK is NOT unstarted; private pending reader denies.
-        /// Retains all roots, never fabricates a stopped record or close receipt.
-        pub(crate) fn verify_unstarted_absent(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            closing: &NativeClosingRead,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            self.verify_unstarted_absent_inner(pair, expected, closing, lock)
-                .map_err(pending_unknown)
-        }
-        fn verify_unstarted_absent_inner(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            closing: &NativeClosingRead,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            if self.root.running.is_some() || self.root.closed.is_some() {
-                return Err(Error::Pending);
-            }
-            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            if !closing.matches_source_origin(&owned.original_source) {
-                return Err(Error::Conflict);
-            }
-            let envelope = UnstartedEnvelope {
-                context: &owned.context,
-                runtime: &owned.runtime,
-                source: &owned.source,
-                carrier: &owned.carrier,
-                supervisor: &owned.supervisor,
-                intent: &owned.intent,
-            };
-            let native = envelope.verify(pair, expected, lock)?;
-            owned
-                .inventory
-                .verify_pending_cleanup(&owned.source, &owned.pending)?;
-            let before = owned
-                .pending
-                .read_unstarted_for_cleanup()
-                .map_err(owner_error)?;
-            if before.0 != owned.intent || owned.prior.as_ref().is_some_and(|p| p != &before.1) {
-                return Err(Error::Conflict);
-            }
-            envelope.inspect_sdk(expected, Some(closing))?;
-            owned
-                .inventory
-                .verify_pending_cleanup(&owned.source, &owned.pending)?;
-            if owned
-                .pending
-                .read_unstarted_for_cleanup()
-                .map_err(owner_error)?
-                != before
-                || envelope.verify(pair, expected, lock)? != native
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(())
-        }
         /// Actual SAME owner's Stop receipt after fully published normal
         /// Retire. This is NOT inventory/row/key retirement or replacement
         /// permission: caller must root/consume this original in those owners
