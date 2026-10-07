@@ -5480,6 +5480,16 @@ pub(crate) mod native {
                 r.probe_read
                     .matches_caps(&r.pins.source, &r.guard, &r.probe_state.gate())
                     .map_err(|error| denied(error))?;
+                if record.phase == pair::Phase::Closing
+                    && record.stop_stage == 8
+                    && effect == pair::Effect::CarrierClose
+                {
+                    this.roots_mut()?
+                        .carrier
+                        .verify_pending_close_in_call(pin, record)
+                        .map_err(denied)?;
+                }
+                let r = this.roots()?;
                 let retired = if record.phase == pair::Phase::Closing && record.stop_stage >= 8 {
                     retired_at_boundary(record.stop_stage, r.carrier.retired_pin())?
                 } else {

@@ -1654,6 +1654,17 @@ impl<K: Kernel> Carrier<K> {
     pub(crate) fn close_original(&mut self, cancel: &AtomicBool) -> Result<()> {
         with_call_resources(self, |owner| owner.close_inner(cancel))
     }
+    /// Reauthenticate the retained close ACK only; leave handle/module cleanup
+    /// pending for the original close path, with no repeated native close.
+    pub(crate) fn verify_pending_close(&mut self) -> Result<bool> {
+        with_call_resources(self, |owner| {
+            if owner.phase != Phase::ClosePending {
+                return Ok(false);
+            }
+            owner.kernel.verify(&owner.binding, Stage::AfterClose)?;
+            Ok(true)
+        })
+    }
     fn close_inner(&mut self, cancel: &AtomicBool) -> Result<()> {
         if self.phase == Phase::Closed {
             return Ok(());

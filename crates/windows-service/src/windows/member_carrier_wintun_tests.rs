@@ -1349,10 +1349,33 @@ mod tests {
             assert_eq!(n.0.borrow().ended, ended);
             assert_eq!(n.0.borrow().closed, closed);
             assert!(!n.0.borrow().calls.iter().any(|c| c == "unpin_module"));
+            if stage == Stage::AfterClose {
+                assert_eq!(c.phase(), Phase::ClosePending);
+                assert!(c.verify_pending_close().is_err());
+                assert_eq!(c.phase(), Phase::ClosePending);
+                assert_eq!(n.0.borrow().closed, 1);
+                assert!(!n.0.borrow().calls.iter().any(|c| c == "unpin_module"));
+            }
             n.0.borrow_mut().fail_stage = None;
+            if stage == Stage::AfterClose {
+                assert!(c.verify_pending_close().unwrap());
+                assert_eq!(c.phase(), Phase::ClosePending);
+                assert_eq!(n.0.borrow().closed, 1);
+                assert!(!n.0.borrow().calls.iter().any(|c| c == "unpin_module"));
+            }
             c.close().unwrap();
             assert_eq!(n.0.borrow().ended, 1);
             assert_eq!(n.0.borrow().closed, 1);
+            c.close().unwrap();
+            assert_eq!(n.0.borrow().closed, 1);
+            assert_eq!(
+                n.0.borrow()
+                    .calls
+                    .iter()
+                    .filter(|c| *c == "unpin_module")
+                    .count(),
+                1
+            );
         }
     }
     #[test]

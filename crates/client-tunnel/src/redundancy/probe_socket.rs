@@ -48,8 +48,8 @@ impl NativeProbeSocket {
     }
 
     /// Fresh readback from THIS retained kernel socket, not a tuple cache.
-    /// Windows only: checks exclusive binding, IPv4 UDP protocol, network-order
-    /// IP_UNICAST_IF, exact source/peer and the actual nonzero ephemeral port.
+    /// Windows only: checks exclusive binding, IPv4 UDP protocol, host-order
+    /// IP_UNICAST_IF readback, exact source/peer and the actual nonzero ephemeral port.
     /// This returns comparison data, never interface or firewall authority.
     pub fn attest_binding(
         &self,
@@ -115,7 +115,7 @@ mod binding_read {
         pub local: SocketAddr,
         pub peer: SocketAddr,
         pub exclusive: i32,
-        pub network_order_index: u32,
+        pub host_order_index: u32,
         pub family: i32,
         pub socket_type: i32,
         pub protocol: i32,
@@ -131,7 +131,7 @@ mod binding_read {
             SocketAddr::V4(local)
                 if index != 0
                     && observed.exclusive == 1
-                    && observed.network_order_index == index.to_be()
+                    && observed.host_order_index == index
                     && observed.family == 2
                     && observed.socket_type == 2
                     && observed.protocol == 17
@@ -154,7 +154,7 @@ mod binding_read {
                 local: SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 2), 49152).into(),
                 peer: SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 53).into(),
                 exclusive: 1,
-                network_order_index: 0x01020304_u32.to_be(),
+                host_order_index: 0x01020304,
                 family: 2,
                 socket_type: 2,
                 protocol: 17,
@@ -176,7 +176,7 @@ mod binding_read {
                 match case {
                     0 => o.exclusive = 0,
                     1 => o.exclusive = -1,
-                    2 => o.network_order_index = 0x01020304,
+                    2 => o.host_order_index = 0x01020304_u32.to_be(),
                     3 => o.family = 23,
                     4 => o.socket_type = 1,
                     5 => o.protocol = 6,
@@ -334,7 +334,8 @@ mod exclusive {
                 local: socket.local_addr()?,
                 peer: socket.peer_addr()?,
                 exclusive: option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE)?,
-                network_order_index: option(socket, IPPROTO_IP, IP_UNICAST_IF)?,
+                // GET returns host byte order; SET below uses network byte order.
+                host_order_index: option(socket, IPPROTO_IP, IP_UNICAST_IF)?,
                 family: protocol.iAddressFamily,
                 socket_type: protocol.iSocketType,
                 protocol: protocol.iProtocol,

@@ -1720,6 +1720,54 @@ pub(crate) mod native {
         /// Caller already owns the SAME whole cleanup Calling. Selecting the
         /// actual Guard/G before this entry is possible without opening a
         /// second supervisor or borrowing native Authority during registration.
+        pub(crate) fn verify_pending_close_in_call(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &PairRecord,
+        ) -> Result<bool> {
+            if expected.phase != crate::member_carrier_pair::Phase::Closing
+                || expected.stop_stage != 8
+                || expected.pending != Some(crate::member_carrier_pair::Effect::CarrierClose)
+            {
+                return Err(CarrierError::Conflict);
+            }
+            let (carrier, authority) = self
+                .construction
+                .as_mut()
+                .ok_or(CarrierError::Pending)?
+                .retained_parts()
+                .components
+                .as_mut()
+                .ok_or(CarrierError::Pending)?;
+            if carrier.phase() != wintun::Phase::ClosePending {
+                return Ok(false);
+            }
+            let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
+            original
+                .inspect_cleanup_effect(
+                    &meta.runtime,
+                    &meta.supervisor,
+                    expected,
+                    expected.stop_stage,
+                    |_| Ok(()),
+                )
+                .map_err(denied)?;
+            authority
+                .select_pair_intent(original.clone(), expected)
+                .map_err(denied)?;
+            let verified = carrier.verify_pending_close().map_err(denied)?;
+            original
+                .inspect_cleanup_effect(
+                    &meta.runtime,
+                    &meta.supervisor,
+                    expected,
+                    expected.stop_stage,
+                    |_| Ok(()),
+                )
+                .map_err(denied)?;
+            Ok(verified)
+        }
+        /// Execute the original C cleanup under the caller's SAME Calling.
         pub(crate) fn cleanup_carrier_in_call(
             &mut self,
             original: Rc<NativePairIntentRead>,

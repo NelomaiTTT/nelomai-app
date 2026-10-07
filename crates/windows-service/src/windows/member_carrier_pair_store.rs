@@ -1118,7 +1118,6 @@ pub(crate) mod native_store {
                 pin: self,
                 completed: false,
             };
-            self.verify()?;
             self.span
                 .dns_transition(cleanup, expected, desired, native_ack)?;
             self.verify()?;
