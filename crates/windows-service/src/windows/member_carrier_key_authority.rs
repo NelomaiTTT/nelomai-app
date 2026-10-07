@@ -75,6 +75,9 @@ struct Runtime {
     directory: PathBuf,
     executable: PathBuf,
     installation: Installation,
+    // Retain the authenticated original files and lexical ancestors for this
+    // runtime's lifetime, keeping their bytes and names pinned. ACLs remain
+    // mutable; current owner/root/ancestor checks still run on every verify.
     installed: PinnedInstalledRuntime,
     owner: Arc<MutationGuard>,
     lease: KeyLockPin,
@@ -261,18 +264,6 @@ impl Runtime {
     fn verify(&self, pin: &KeyLockPin, context: &Context) -> Result<()> {
         #[cfg(test)]
         super::member_carrier_factory_test_os::trace_step("runtime current check");
-        // SAME retained deny-write/delete handles keep the signed byte proof
-        // alive. Reading this retained layout and canonical executable path
-        // grants no authority; the final original-context check verifies the
-        // actual owner/root/context before any successful return.
-        let live = self.installed.layout();
-        if live.identity != self.identity
-            || live.directory != self.directory
-            || std::fs::canonicalize(live.engine_path()).map_err(|_| Error::Native)?
-                != self.executable
-        {
-            return Err(Error::Conflict);
-        }
         self.verify_original_context(pin, context)
     }
 }
