@@ -661,7 +661,12 @@ fn read_mixed_closed_bindings<
     }
     Ok(result)
 }
-type MixedClosingSample = (Vec<u8>, Vec<ExpectedProvider>, Vec<ClosedMemberBinding>);
+#[derive(PartialEq, Eq)]
+struct MemberBindingFacts {
+    history: Vec<ClosedMemberBinding>,
+    service_domains: Vec<crate::member_owner::ServiceDomain>,
+}
+type MixedClosingSample = (Vec<u8>, Vec<ExpectedProvider>, MemberBindingFacts);
 fn read_terminal_closed_bindings<
     J: crate::member_owner::Journal,
     I: crate::member_owner::MemberIo,
@@ -713,10 +718,10 @@ fn read_terminal_closed_bindings<
     read_mixed_closed_bindings(context, entries, pending, verify)
 }
 
-fn inspect_mixed_closing_with<T>(
-    mut read: impl FnMut() -> Result<MixedClosingSample>,
+fn inspect_mixed_closing_with<T, F: PartialEq>(
+    mut read: impl FnMut() -> Result<(Vec<u8>, Vec<ExpectedProvider>, F)>,
     mut query: impl FnMut(&[ExpectedProvider]) -> Result<()>,
-    inspect: impl FnOnce(&[ExpectedProvider], &[ClosedMemberBinding]) -> Result<T>,
+    inspect: impl FnOnce(&[ExpectedProvider], &F) -> Result<T>,
 ) -> Result<T> {
     let before = read()?;
     query(&before.1)?;
@@ -938,8 +943,29 @@ fn read_pending_members_excluding<
 fn read_closing_members<J: crate::member_owner::Journal, I: crate::member_owner::MemberIo, S>(
     context: &Context,
     entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
+    verify_source: impl FnMut(&S, Option<&Intent>) -> Result<()>,
+    native_identity: impl FnMut(&S, &NativeProof) -> Result<ExpectedProvider>,
+) -> Result<Vec<ExpectedProvider>> {
+    read_closing_members_with(
+        context,
+        entries,
+        verify_source,
+        native_identity,
+        |original| original.read_for_cleanup(),
+    )
+}
+fn read_closing_members_with<
+    J: crate::member_owner::Journal,
+    I: crate::member_owner::MemberIo,
+    S,
+>(
+    context: &Context,
+    entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
     mut verify_source: impl FnMut(&S, Option<&Intent>) -> Result<()>,
     mut native_identity: impl FnMut(&S, &NativeProof) -> Result<ExpectedProvider>,
+    mut read: impl FnMut(
+        &mut crate::member_original::OriginalMemberRead<J, I>,
+    ) -> crate::member_owner::Result<(Intent, NativeProof)>,
 ) -> Result<Vec<ExpectedProvider>> {
     for entry in entries.iter().flatten() {
         entry.original.retire_forward();
@@ -961,10 +987,7 @@ fn read_closing_members<J: crate::member_owner::Journal, I: crate::member_owner:
             verify_source(&entry.source, Some(&intent))?;
             continue;
         }
-        let (intent, proof) = entry
-            .original
-            .read_for_cleanup()
-            .map_err(|_| Error::Conflict)?;
+        let (intent, proof) = read(&mut entry.original).map_err(|_| Error::Conflict)?;
         verify_source(&entry.source, Some(&intent))?;
         let provider = native_identity(&entry.source, &proof)?;
         if provider != entry.provider
@@ -1013,6 +1036,24 @@ pub(crate) mod native {
         IpHelper::{GetIfEntry2, MIB_IF_ROW2},
         Ndis::NET_LUID_LH,
     };
+
+    fn read_service_binding(
+        original: &mut MemberRead,
+        cleanup: bool,
+        domains: &mut Vec<crate::member_owner::ServiceDomain>,
+    ) -> crate::member_owner::Result<(Intent, NativeProof)> {
+        let (facts, domain) = if cleanup {
+            original.service_domain_for_cleanup()?
+        } else {
+            // The sole live caller performs its existing original postflight
+            // AFTER the native interface read; this pin brackets the domain IO.
+            original.read_with(|live| live.native_read_pin()?.service_domain())?
+        };
+        if let Some(domain) = domain {
+            domains.push(domain);
+        }
+        Ok(facts)
+    }
 
     type MemberRead = OriginalMemberRead<MemberFiles, NativeMemberIo<MemberFiles>>;
     type Closed = ClosedMemberReceipt<MemberFiles, NativeMemberIo<MemberFiles>>;
@@ -1536,7 +1577,7 @@ pub(crate) mod native {
                 if Record::decode(&before)?.phase != Phase::Preparing {
                     return Err(Error::Conflict);
                 }
-                let members = inventory.read_all_in_revision(&before)?;
+                let members = inventory.read_all_in_revision(&before, None)?;
                 if inventory.revision()? != before {
                     return Err(Error::Conflict);
                 }
@@ -1594,7 +1635,11 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             image: &OriginalImage,
             carrier: &[ExpectedProvider],
-            inspect: impl FnOnce(&[ExpectedProvider], &[ClosedMemberBinding]) -> Result<T>,
+            inspect: impl FnOnce(
+                &[ExpectedProvider],
+                &[ClosedMemberBinding],
+                &[crate::member_owner::ServiceDomain],
+            ) -> Result<T>,
         ) -> Result<T> {
             self.health.cleanup(|| {
                 self.inventory
@@ -1614,7 +1659,11 @@ pub(crate) mod native {
             image: &OriginalImage,
             carrier: &[ExpectedProvider],
             partial: &super::super::member_carrier_member_controller::native::PartialCleanup,
-            inspect: impl FnOnce(&[ExpectedProvider], &[ClosedMemberBinding]) -> Result<T>,
+            inspect: impl FnOnce(
+                &[ExpectedProvider],
+                &[ClosedMemberBinding],
+                &[crate::member_owner::ServiceDomain],
+            ) -> Result<T>,
         ) -> Result<T> {
             self.health.cleanup(|| {
                 if carrier.len() != 1 {
@@ -1645,7 +1694,7 @@ pub(crate) mod native {
                         )
                         .map_err(|_| Error::Pending)
                     },
-                    inspect,
+                    |live, facts| inspect(live, &facts.history, &facts.service_domains),
                 )
             })
         }
@@ -1658,7 +1707,11 @@ pub(crate) mod native {
             context: &Context,
             runtime: &RuntimeRead,
             image: &OriginalImage,
-        ) -> Result<(Vec<ExpectedProvider>, Vec<ClosedMemberBinding>)> {
+        ) -> Result<(
+            Vec<ExpectedProvider>,
+            Vec<ClosedMemberBinding>,
+            Vec<crate::member_owner::ServiceDomain>,
+        )> {
             self.health.forward(|| {
                 let mut inventory = self
                     .inventory
@@ -1667,7 +1720,7 @@ pub(crate) mod native {
                 // The complete revision brackets originals and receipts; the
                 // enclosing Source independently brackets its full SDK join.
                 let before = inventory.source_bindings_revision(context, runtime, image)?;
-                Ok((before.1, before.2))
+                Ok((before.1, before.2.history, before.2.service_domains))
             })
         }
 
@@ -1701,11 +1754,11 @@ pub(crate) mod native {
                         }
                         Ok(())
                     },
-                    |live, history| {
+                    |live, facts| {
                         if !live.is_empty() {
                             return Err(Error::Conflict);
                         }
-                        inspect(history)
+                        inspect(&facts.history)
                     },
                 )
             })
@@ -1741,11 +1794,11 @@ pub(crate) mod native {
                         }
                         Ok(())
                     },
-                    |live, history| {
+                    |live, facts| {
                         if !live.is_empty() {
                             return Err(Error::Conflict);
                         }
-                        inspect(history)
+                        inspect(&facts.history)
                     },
                 )
             })
@@ -1804,7 +1857,14 @@ pub(crate) mod native {
             if self.terminal_revision(context, runtime, image)? != before {
                 return Err(Error::Conflict);
             }
-            Ok((before, vec![], history))
+            Ok((
+                before,
+                vec![],
+                MemberBindingFacts {
+                    history,
+                    service_domains: Vec::new(),
+                },
+            ))
         }
         pub(crate) fn retain(
             runtime: &RuntimeRead,
@@ -2030,7 +2090,7 @@ pub(crate) mod native {
 
         fn read_all_inner(&mut self) -> Result<Vec<ExpectedProvider>> {
             let before = self.revision()?;
-            let wants = self.read_all_in_revision(&before)?;
+            let wants = self.read_all_in_revision(&before, None)?;
             if before != self.revision()? {
                 return Err(Error::Conflict);
             }
@@ -2040,7 +2100,11 @@ pub(crate) mod native {
         // Factual member reads inside the caller's complete revision frame.
         // Original service/process/close receipts are still read twice; this
         // does not grant Start or reconstruct an owner from the saved bytes.
-        fn read_all_in_revision(&mut self, revision: &[u8]) -> Result<Vec<ExpectedProvider>> {
+        fn read_all_in_revision(
+            &mut self,
+            revision: &[u8],
+            mut domains: Option<&mut Vec<crate::member_owner::ServiceDomain>>,
+        ) -> Result<Vec<ExpectedProvider>> {
             let mut wants = Vec::with_capacity(2);
             for (index, entry) in self.entries.iter_mut().enumerate() {
                 let Some(entry) = entry else {
@@ -2055,7 +2119,12 @@ pub(crate) mod native {
                         .map_err(|_| Error::Conflict)?;
                     continue;
                 }
-                let (intent, proof) = entry.original.read().map_err(|_| Error::Conflict)?;
+                let (intent, proof) = if let Some(domains) = domains.as_deref_mut() {
+                    read_service_binding(&mut entry.original, false, domains)
+                } else {
+                    entry.original.read()
+                }
+                .map_err(|_| Error::Conflict)?;
                 self.runtime
                     .verify_member_intent(&self.context, &entry.source, &intent)?;
                 let provider = native_identity(&proof, entry.source.transport())?;
@@ -2081,6 +2150,7 @@ pub(crate) mod native {
             context: &Context,
             runtime: &RuntimeRead,
             image: &OriginalImage,
+            mut domains: Option<&mut Vec<crate::member_owner::ServiceDomain>>,
         ) -> Result<(Vec<u8>, Vec<ExpectedProvider>)> {
             if context != &self.context {
                 return Err(Error::Conflict);
@@ -2090,7 +2160,7 @@ pub(crate) mod native {
             if Record::decode(&before)?.phase != Phase::Closing {
                 return Err(Error::Conflict);
             }
-            let mut members = read_closing_members(
+            let mut members = read_closing_members_with(
                 &self.context,
                 &mut self.entries,
                 |source, intent| {
@@ -2102,6 +2172,10 @@ pub(crate) mod native {
                     }
                 },
                 |source, proof| native_identity(proof, source.transport()),
+                |original| match domains.as_deref_mut() {
+                    Some(domains) => read_service_binding(original, true, domains),
+                    None => original.read_for_cleanup(),
+                },
             )?;
             members.extend(self.pending_members(true, false)?);
             self.matches_original_runtime_image(runtime, image)?;
@@ -2128,7 +2202,8 @@ pub(crate) mod native {
             if Record::decode(&before)?.phase != Phase::Preparing {
                 return Err(Error::Conflict);
             }
-            let live = self.read_all_in_revision(&before)?;
+            let mut service_domains = Vec::new();
+            let live = self.read_all_in_revision(&before, Some(&mut service_domains))?;
             let history = read_mixed_closed_bindings(
                 &self.context,
                 &mut self.entries,
@@ -2146,7 +2221,14 @@ pub(crate) mod native {
             if self.revision()? != before {
                 return Err(Error::Conflict);
             }
-            Ok((before, live, history))
+            Ok((
+                before,
+                live,
+                MemberBindingFacts {
+                    history,
+                    service_domains,
+                },
+            ))
         }
 
         fn inspect_closing_full_inner<T>(
@@ -2163,7 +2245,7 @@ pub(crate) mod native {
                 entry.original.retire_forward();
             }
             inspect_closing_with(
-                || self.closing_live_revision(context, runtime, image),
+                || self.closing_live_revision(context, runtime, image, None),
                 inspect,
             )
         }
@@ -2174,7 +2256,9 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             image: &OriginalImage,
         ) -> Result<MixedClosingSample> {
-            let (revision, live) = self.closing_live_revision(context, runtime, image)?;
+            let mut service_domains = Vec::new();
+            let (revision, live) =
+                self.closing_live_revision(context, runtime, image, Some(&mut service_domains))?;
             let history = read_mixed_closed_bindings(
                 &self.context,
                 &mut self.entries,
@@ -2192,7 +2276,14 @@ pub(crate) mod native {
             if self.revision()? != revision {
                 return Err(Error::Conflict);
             }
-            Ok((revision, live, history))
+            Ok((
+                revision,
+                live,
+                MemberBindingFacts {
+                    history,
+                    service_domains,
+                },
+            ))
         }
 
         fn partial_closing_bindings_revision(
@@ -2221,7 +2312,8 @@ pub(crate) mod native {
             self.runtime
                 .verify_member_intent(context, &entry.source, partial.intent())?;
             let observed = partial.inspect().map_err(|_| Error::Conflict)?;
-            let mut live = read_closing_members(
+            let mut service_domains = Vec::new();
+            let mut live = read_closing_members_with(
                 context,
                 &mut self.entries,
                 |source, intent| match intent {
@@ -2229,6 +2321,7 @@ pub(crate) mod native {
                     None => self.runtime.verify_member_source(context, source),
                 },
                 |source, proof| native_identity(proof, source.transport()),
+                |original| read_service_binding(original, true, &mut service_domains),
             )?;
             let registered = self.entries.each_ref().map(Option::is_some);
             live.extend(read_pending_members_excluding(
@@ -2260,7 +2353,14 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             self.matches_original_runtime_image(runtime, image)?;
-            Ok((before, live, history))
+            Ok((
+                before,
+                live,
+                MemberBindingFacts {
+                    history,
+                    service_domains,
+                },
+            ))
         }
         fn inspect_closing_bindings_full_inner<T>(
             &mut self,
@@ -2268,7 +2368,11 @@ pub(crate) mod native {
             runtime: &RuntimeRead,
             image: &OriginalImage,
             carrier: &[ExpectedProvider],
-            inspect: impl FnOnce(&[ExpectedProvider], &[ClosedMemberBinding]) -> Result<T>,
+            inspect: impl FnOnce(
+                &[ExpectedProvider],
+                &[ClosedMemberBinding],
+                &[crate::member_owner::ServiceDomain],
+            ) -> Result<T>,
         ) -> Result<T> {
             for entry in self.entries.iter().flatten() {
                 entry.original.retire_forward();
@@ -2287,7 +2391,7 @@ pub(crate) mod native {
                         .map(|_| ())
                         .map_err(|_| Error::Pending)
                 },
-                inspect,
+                |live, facts| inspect(live, &facts.history, &facts.service_domains),
             )
         }
 
@@ -2325,9 +2429,9 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            let members = self.read_all_in_revision(&before)?;
+            let members = self.read_all_in_revision(&before, None)?;
             let facts = inspect(&members)?;
-            if self.read_all_in_revision(&before)? != members || self.revision()? != before {
+            if self.read_all_in_revision(&before, None)? != members || self.revision()? != before {
                 return Err(Error::Conflict);
             }
             image.verify_runtime(runtime).map_err(|_| Error::Conflict)?;

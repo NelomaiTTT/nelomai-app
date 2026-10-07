@@ -986,6 +986,7 @@ pub(crate) mod native {
                 if window_channel(&selected.record)? == WindowChannel::Retired {
                     return self.originals.inspect_retired(&selected, |_, bindings| {
                         Ok(Bindings {
+                            service_domains: bindings.service_domains.clone(),
                             scope: bindings.scope.clone(),
                             carrier: bindings.carrier.clone(),
                             egress: bindings.egress.clone(),
@@ -1010,6 +1011,7 @@ pub(crate) mod native {
                     )
                     .map_err(native_denied)?;
                     Ok(Bindings {
+                        service_domains: bindings.service_domains.clone(),
                         scope: bindings.scope.clone(),
                         carrier: bindings.carrier.clone(),
                         egress: bindings.egress.clone(),
@@ -1098,7 +1100,7 @@ pub(crate) mod native {
                             if desired.permits {
                                 current
                                     .borrow_mut()
-                                    .priority_barrier()
+                                    .priority_barrier(&window.bindings().service_domains)
                                     .inspect_err(|_error| {
                                         #[cfg(all(windows, test))]
                                         crate::windows::member_carrier_factory_test_os::trace_step(

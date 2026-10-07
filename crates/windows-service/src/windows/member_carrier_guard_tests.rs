@@ -600,6 +600,7 @@ mod terminal_guard {
     }
     fn bindings() -> Bindings {
         Bindings {
+            service_domains: Vec::new(),
             scope: scope(),
             carrier: None,
             egress: [None, None],
@@ -1102,6 +1103,7 @@ fn cold_static_capture_denies_foreign_extra_permit_unknown_policy_and_reused_ids
             let weight = w.objects.sublayer.as_ref().unwrap().weight;
             match fault {
                 0 | 1 => w.arbitration_extra.push(ArbitrationFilter {
+                    service_domain: None,
                     key: Key([99; 16]),
                     id: 98765,
                     layer: own.policy.layer,
@@ -1152,6 +1154,7 @@ fn cold_static_capture_denies_foreign_extra_permit_unknown_policy_and_reused_ids
                     w.objects.filters.values_mut().nth(1).unwrap().0.id = id;
                 }
                 _ => w.arbitration_extra.push(ArbitrationFilter {
+                    service_domain: None,
                     key: Key([98; 16]),
                     id: own.id,
                     layer: own.policy.layer,
@@ -1459,6 +1462,7 @@ fn cold_static_scope_reads_all_48_keys_and_unrelated_layers_objects_remain_untou
         .borrow_mut()
         .arbitration_extra
         .push(ArbitrationFilter {
+            service_domain: None,
             key: Key([90; 16]),
             id: 12345,
             layer: Layer::AleConnectV6,
@@ -1790,6 +1794,7 @@ impl NativeApi for Api {
             .filters
             .values()
             .map(|(f, _)| ArbitrationFilter {
+                service_domain: None,
                 key: f.policy.key,
                 id: f.id,
                 layer: f.policy.layer,
@@ -1877,6 +1882,7 @@ impl BindingAttestor for Attestor {
             5 => return Err(GuardError::Conflict),
             7 => {
                 return Ok(Bindings {
+                    service_domains: Vec::new(),
                     scope,
                     carrier: None,
                     egress: e,
@@ -1890,6 +1896,7 @@ impl BindingAttestor for Attestor {
             _ => {}
         }
         Ok(Bindings {
+            service_domains: Vec::new(),
             scope,
             carrier: Some(c),
             egress: e,
@@ -2093,6 +2100,7 @@ fn priority_barrier_rejects_higher_or_equal_hard_permits_and_opaque_callouts() {
             let desired = pair(Some(Slot::A)).inherit_sublayer_weight(&model).unwrap();
             w.borrow_mut().events.clear();
             w.borrow_mut().arbitration_extra.push(ArbitrationFilter {
+                service_domain: None,
                 key: Key([91; 16]),
                 id: 9091,
                 layer: Layer::AleConnectV4,
@@ -2139,6 +2147,7 @@ fn priority_barrier_accepts_soft_foreign_policy_without_changing_it() {
         let model = base(&mut guard);
         let desired = pair(Some(Slot::A)).inherit_sublayer_weight(&model).unwrap();
         w.borrow_mut().arbitration_extra.push(ArbitrationFilter {
+            service_domain: None,
             key: Key([91; 16]),
             id: 9091,
             layer: Layer::AleConnectV4,
@@ -2167,7 +2176,50 @@ fn priority_inventory_requires_complete_original_ids_layers_flags_and_assigned_p
     io.begin(SessionKind::DynamicPermits, false).unwrap();
     let filters = io.arbitration(SessionKind::DynamicPermits).unwrap();
     let ids: BTreeMap<_, _> = filters.iter().map(|f| (f.key, f.id)).collect();
-    assert!(validate_arbitration(&scope(), &model.expected, &ids, &filters).is_ok());
+    assert!(validate_arbitration(&scope(), &model.expected, &ids, &filters, &[]).is_ok());
+    let domain = crate::member_owner::ServiceDomain {
+        app_id: "\\device\\volume\\wireguard.exe\0".encode_utf16().collect(),
+        service_sid: [
+            vec![1, 6, 0, 0, 0, 0, 0, 5],
+            80u32.to_le_bytes().to_vec(),
+            vec![7; 20],
+        ]
+        .concat(),
+    };
+    let mut service_filters = filters.clone();
+    service_filters.push(ArbitrationFilter {
+        service_domain: Some(domain.clone()),
+        key: Key([91; 16]),
+        id: 9091,
+        layer: Layer::AleConnectV4,
+        sublayer: Key([92; 16]),
+        sublayer_weight: u16::MAX,
+        flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        action: FWP_ACTION_PERMIT,
+    });
+    assert!(validate_arbitration(
+        &scope(),
+        &model.expected,
+        &ids,
+        &service_filters,
+        &[domain.clone()]
+    )
+    .is_ok());
+    assert!(validate_arbitration(&scope(), &model.expected, &ids, &service_filters, &[]).is_err());
+    for fault in 0..4 {
+        let mut changed = service_filters.clone();
+        let foreign = changed.last_mut().unwrap();
+        match fault {
+            0 => foreign.service_domain = None,
+            1 => foreign.service_domain.as_mut().unwrap().service_sid[31] ^= 1,
+            2 => foreign.service_domain.as_mut().unwrap().app_id[1] ^= 1,
+            _ => foreign.layer = Layer::ForwardV4,
+        }
+        assert!(
+            validate_arbitration(&scope(), &model.expected, &ids, &changed, &[domain.clone()])
+                .is_err()
+        );
+    }
     for fault in 0..10 {
         let mut changed = filters.clone();
         match fault {
@@ -2185,7 +2237,7 @@ fn priority_inventory_requires_complete_original_ids_layers_flags_and_assigned_p
             _ => changed[0].action = FWP_ACTION_PERMIT,
         }
         assert!(
-            validate_arbitration(&scope(), &model.expected, &ids, &changed).is_err(),
+            validate_arbitration(&scope(), &model.expected, &ids, &changed, &[]).is_err(),
             "fault={fault}"
         );
     }
@@ -2239,6 +2291,7 @@ fn snapshot_brackets_the_whole_native_inventory_with_independent_owners() {
     let world = Rc::new(RefCell::new(World::default()));
     let mut io = Api(world.clone());
     let c_only = Bindings {
+        service_domains: Vec::new(),
         scope: scope(),
         carrier: pair(None).carrier,
         egress: [None, None],
@@ -2257,6 +2310,7 @@ fn snapshot_brackets_the_whole_native_inventory_with_independent_owners() {
     assert_eq!(world.borrow().lookups.len(), 49);
     for fault in 0..12 {
         let mut changed = Bindings {
+            service_domains: Vec::new(),
             scope: c_only.scope.clone(),
             carrier: c_only.carrier.clone(),
             egress: c_only.egress.clone(),
@@ -2810,6 +2864,80 @@ fn adapter_foreign_replacement_ids_or_orphan_allow_keys_cannot_be_adopted_or_del
 
 #[test]
 fn native_conditions_reject_duplicate_fields_wrong_family_types_match_masks_and_layer_aliases() {
+    // Pinned SDK WireGuard hard permit: app ID plus exactly one service
+    // ALLOW/MATCH_FILTER ACE. Any widened/opaque descriptor fails closed.
+    let mut app_bytes: Vec<u8> = "\\device\\volume\\wireguard.exe\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut descriptor = [
+        vec![
+            1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 2, 0, 48, 0, 1, 0, 0, 0,
+            0, 0, 40, 0, 1, 0, 0, 0,
+        ],
+        vec![1, 6, 0, 0, 0, 0, 0, 5],
+        80u32.to_le_bytes().to_vec(),
+        vec![7; 20],
+    ]
+    .concat();
+    let mut app = FWP_BYTE_BLOB {
+        size: app_bytes.len() as u32,
+        data: app_bytes.as_mut_ptr(),
+    };
+    let mut user = FWP_BYTE_BLOB {
+        size: descriptor.len() as u32,
+        data: descriptor.as_mut_ptr(),
+    };
+    let mut conditions = [
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_ALE_APP_ID,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_BYTE_BLOB_TYPE,
+                Anonymous: FWP_CONDITION_VALUE0_0 { byteBlob: &mut app },
+            },
+        },
+        FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_ALE_USER_ID,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_SECURITY_DESCRIPTOR_TYPE,
+                Anonymous: FWP_CONDITION_VALUE0_0 {
+                    byteBlob: &mut user,
+                },
+            },
+        },
+    ];
+    let raw = FWPM_FILTER0 {
+        flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+        action: FWPM_ACTION0 {
+            r#type: FWP_ACTION_PERMIT,
+            ..Default::default()
+        },
+        numFilterConditions: 2,
+        filterCondition: conditions.as_mut_ptr(),
+        ..Default::default()
+    };
+    let exact = service_filter_domain(&raw, Layer::AleConnectV4).unwrap();
+    assert_eq!(exact.service_sid, descriptor[36..]);
+    assert!(service_filter_domain(&raw, Layer::AleConnectV6).is_some());
+    assert!(service_filter_domain(&raw, Layer::ForwardV4).is_none());
+    for (offset, byte) in descriptor.clone().into_iter().take(48).enumerate() {
+        descriptor[offset] = byte ^ 1;
+        assert!(
+            service_filter_domain(&raw, Layer::AleConnectV4).is_none(),
+            "offset={offset}"
+        );
+        descriptor[offset] = byte;
+    }
+    conditions[1].conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
+    assert!(service_filter_domain(&raw, Layer::AleConnectV4).is_none());
+    conditions[1].conditionValue.r#type = FWP_SECURITY_DESCRIPTOR_TYPE;
+    conditions[1].matchType = FWP_MATCH_NOT_EQUAL;
+    assert!(service_filter_domain(&raw, Layer::AleConnectV4).is_none());
+    conditions[1].matchType = FWP_MATCH_EQUAL;
+    conditions[1].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    assert!(service_filter_domain(&raw, Layer::AleConnectV4).is_none());
     for layer in [
         Layer::TransportV4,
         Layer::PacketV6,

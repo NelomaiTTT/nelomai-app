@@ -165,6 +165,12 @@ pub(crate) trait MemberIo {
 
 /// Optional native factual-pin surface, with no default/fact constructor.
 /// Ordinary lifecycle adapters do not implement this extra surface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceDomain {
+    pub app_id: Vec<u16>,
+    pub service_sid: Vec<u8>,
+}
+
 pub(crate) trait OriginalMemberPinSource: MemberIo {
     type Pin;
     fn original_read_pin(&mut self) -> Result<Self::Pin>;
@@ -1018,8 +1024,24 @@ impl<S, P> RetainedMemberOrigin<S, P> {
         boundary: &mut B,
         intent: &Intent,
         retained: &NativeProof,
-        mut read_config: impl FnMut() -> Result<Option<[u8; 32]>>,
+        read_config: impl FnMut() -> Result<Option<[u8; 32]>>,
     ) -> Result<Observation> {
+        self.inspect_original_for_cleanup_with(boundary, intent, retained, read_config, |_, _| {
+            Ok(())
+        })
+        .map(|(facts, ())| facts)
+    }
+    pub(crate) fn inspect_original_for_cleanup_with<
+        B: OriginalMemberNative<Service = S, Process = P>,
+        T,
+    >(
+        &mut self,
+        boundary: &mut B,
+        intent: &Intent,
+        retained: &NativeProof,
+        mut read_config: impl FnMut() -> Result<Option<[u8; 32]>>,
+        inspect: impl FnOnce(&Intent, &P) -> Result<T>,
+    ) -> Result<(Observation, T)> {
         let mut state = self.resources.try_borrow_mut().map_err(|_| {
             self.read_tainted.set(true);
             OwnerError::Conflict
@@ -1033,11 +1055,19 @@ impl<S, P> RetainedMemberOrigin<S, P> {
         {
             return Err(OwnerError::Retired);
         }
-        for _ in 0..2 {
+        let mut inspect = Some(inspect);
+        let mut value = None;
+        for step in 0..2 {
             if read_config()? != Some(intent.config_sha256) {
                 return Err(OwnerError::Conflict);
             }
             read_original_native(&state, boundary)?;
+            if step == 0 {
+                value = Some(inspect.take().ok_or(OwnerError::Conflict)?(
+                    intent,
+                    state.process.as_ref().ok_or(OwnerError::Retired)?,
+                )?);
+            }
             if self.read_tainted.get() {
                 return Err(OwnerError::Conflict);
             }
@@ -1045,16 +1075,19 @@ impl<S, P> RetainedMemberOrigin<S, P> {
         if read_config()? != Some(intent.config_sha256) || self.read_tainted.get() {
             return Err(OwnerError::Conflict);
         }
-        Ok(Observation {
-            config_sha256: Some(intent.config_sha256),
-            service: Some(ServiceObservation {
-                exact_spec: true,
-                process: Some(retained.process),
-            }),
-            alternative_service_present: false,
-            interface: Some(retained.interface),
-            retained_interfaces: vec![retained.interface],
-        })
+        Ok((
+            Observation {
+                config_sha256: Some(intent.config_sha256),
+                service: Some(ServiceObservation {
+                    exact_spec: true,
+                    process: Some(retained.process),
+                }),
+                alternative_service_present: false,
+                interface: Some(retained.interface),
+                retained_interfaces: vec![retained.interface],
+            },
+            value.ok_or(OwnerError::Conflict)?,
+        ))
     }
 }
 fn require_closed_pinned_process(actual: (ProcessProof, u32), old: ProcessProof) -> Result<()> {
@@ -1071,6 +1104,35 @@ impl<S, P> Drop for RetainedMemberOrigin<S, P> {
     }
 }
 impl<S, P> OriginalMemberPin<S, P> {
+    pub(crate) fn inspect<B: OriginalMemberNative<Service = S, Process = P>, T>(
+        &mut self,
+        boundary: &mut B,
+        inspect: impl FnOnce(&Intent, &P) -> Result<T>,
+    ) -> Result<((Intent, NativeProof), T)> {
+        let mut state = self.resources.try_borrow_mut().map_err(|_| {
+            self.read_tainted.set(true);
+            OwnerError::Conflict
+        })?;
+        if state.proof != Some(self.proof)
+            || state.revoked
+            || !matches!(state.scm_state, OriginalScmState::Live)
+        {
+            return Err(OwnerError::Retired);
+        }
+        state.revoked = true;
+        self.read_tainted.set(false);
+        let before = read_original_native(&state, boundary)?;
+        let value = inspect(
+            &before.0,
+            state.process.as_ref().ok_or(OwnerError::Retired)?,
+        )?;
+        if read_original_native(&state, boundary)? != before || self.read_tainted.get() {
+            return Err(OwnerError::Conflict);
+        }
+        state.revoked = false;
+        Ok((before, value))
+    }
+
     pub(crate) fn read<B: OriginalMemberNative<Service = S, Process = P>>(
         &mut self,
         boundary: &mut B,
@@ -1790,6 +1852,29 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         self.read_original(true)
     }
     fn read_original(&mut self, cleanup: bool) -> Result<(Intent, NativeProof)> {
+        self.read_original_with(cleanup, |io, intent, retained| {
+            let facts = if cleanup {
+                io.inspect_original_for_cleanup(intent, retained)
+            } else {
+                io.inspect_original(intent, retained)
+            }?;
+            Ok((facts, ()))
+        })
+        .map(|(facts, ())| facts)
+    }
+    fn read_original_for_cleanup_with<T>(
+        &mut self,
+        inspect: impl FnOnce(&mut I, &Intent, &NativeProof) -> Result<(Observation, T)>,
+    ) -> Result<((Intent, NativeProof), T)> {
+        self.original_read_revoked = true;
+        self.io.revoke_original();
+        self.read_original_with(true, inspect)
+    }
+    fn read_original_with<T>(
+        &mut self,
+        cleanup: bool,
+        inspect: impl FnOnce(&mut I, &Intent, &NativeProof) -> Result<(Observation, T)>,
+    ) -> Result<((Intent, NativeProof), T)> {
         let expected = self
             .original_run
             .as_ref()
@@ -1803,12 +1888,7 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         // This is sampled factual readback under the actual mutable owner borrow,
         // not an atomic cross-resource CAS or native lifecycle authorization.
         self.require_current(&expected)?;
-        let before = if cleanup {
-            self.io
-                .inspect_original_for_cleanup(&self.intent, &retained)
-        } else {
-            self.io.inspect_original(&self.intent, &retained)
-        }?;
+        let (before, value) = inspect(&mut self.io, &self.intent, &retained)?;
         original_running_proof(&expected, &before)?;
         self.require_current(&expected)?;
         let after = if cleanup {
@@ -1822,7 +1902,7 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
             return Err(OwnerError::Conflict);
         }
         self.require_current(&expected)?;
-        Ok((expected.intent, proof))
+        Ok(((expected.intent, proof), value))
     }
     pub(crate) fn verify_live(&mut self, expected: &Record) -> Result<()> {
         if self.cleanup_only || expected.phase != Phase::Running {
@@ -4388,5 +4468,18 @@ pub(super) mod cold_wireguard_data {
             + day
             - 1;
         Ok(days * 864000000000)
+    }
+}
+
+#[cfg(windows)]
+impl<J: Journal, F: crate::windows::member_owner::PrivateConfig>
+    MemberOwner<J, crate::windows::member_owner::NativeMemberIo<F>>
+{
+    pub(crate) fn service_domain_for_cleanup(
+        &mut self,
+    ) -> Result<((Intent, NativeProof), Option<ServiceDomain>)> {
+        self.read_original_for_cleanup_with(|io, intent, retained| {
+            io.service_domain_for_cleanup(intent, retained)
+        })
     }
 }

@@ -561,7 +561,15 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         if (snapshot.phase == SessionPhase::Stopping && self.stop_deadline.is_none())
             || self.stop_deadline.is_some_and(|deadline| now >= deadline)
         {
-            self.stop(&snapshot.scope)?;
+            if let Err(error) = self.stop(&snapshot.scope) {
+                // Keep the same cleanup owner through a pending native close.
+                // A new failure or lost final Stopped publication still escapes.
+                if snapshot.phase != SessionPhase::Stopping
+                    || self.state.snapshot().phase != SessionPhase::Stopping
+                {
+                    return Err(error);
+                }
+            }
             return Ok(TickResult::default());
         }
         if snapshot.phase == SessionPhase::Running {

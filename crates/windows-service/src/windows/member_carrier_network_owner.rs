@@ -220,16 +220,29 @@ impl<I: DnsSystem, J: DnsJournal> DnsOwner<I, J> {
             }
             self.ack = retained;
         }
-        self.record.as_mut().ok_or_else(conflict)?.pending = Some(baseline.clone());
-        self.journal.save(self.record.as_ref())?;
-        let observed = self.io.exchange(&actual, &baseline)?;
-        if observed != baseline {
-            return Err(conflict());
-        }
+        // A cleanup ACK may outlive failed child publication/deletion. Retry
+        // that exact baseline ACK without a redundant native mutation; a read
+        // or an unrelated prior selection ACK never supplies this exception.
+        let restored = actual == baseline
+            && (record.pending.as_ref() == Some(&baseline)
+                || record.current == baseline && record.pending.is_none())
+            && self.io.retained_ack()?.as_ref() == Some(&baseline);
+        let observed = if restored {
+            baseline
+        } else {
+            self.record.as_mut().ok_or_else(conflict)?.pending = Some(baseline.clone());
+            self.journal.save(self.record.as_ref())?;
+            let observed = self.io.exchange(&actual, &baseline)?;
+            if observed != baseline {
+                return Err(conflict());
+            }
+            observed
+        };
         self.ack = Some(observed.clone());
         let r = self.record.as_mut().ok_or_else(conflict)?;
         r.current = observed;
         r.pending = None;
+        self.journal.save(self.record.as_ref())?;
         self.journal.save(None)?;
         self.record = None;
         Ok(())

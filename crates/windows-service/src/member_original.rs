@@ -1100,6 +1100,15 @@ impl<J: Journal, I: MemberIo> OriginalMemberRead<J, I> {
     /// Forward poison is never reset; Stop, absence and source checks still
     /// belong to their actual owners and cannot be manufactured from this DATA.
     pub(crate) fn read_for_cleanup(&mut self) -> Result<(Intent, NativeProof)> {
+        self.read_for_cleanup_with(|owner| {
+            owner.read_original_for_cleanup().map(|facts| (facts, ()))
+        })
+        .map(|(facts, ())| facts)
+    }
+    fn read_for_cleanup_with<T>(
+        &mut self,
+        inspect: impl FnOnce(&mut MemberOwner<J, I>) -> Result<((Intent, NativeProof), T)>,
+    ) -> Result<((Intent, NativeProof), T)> {
         if self.generation != self.shared.read_generation.get() {
             return Err(OwnerError::Retired);
         }
@@ -1112,16 +1121,17 @@ impl<J: Journal, I: MemberIo> OriginalMemberRead<J, I> {
         let _attempt = CleanupAttempt {
             shared: &self.shared,
         };
-        let facts = self
-            .shared
-            .owner
-            .try_borrow_mut()
-            .map_err(|_| OwnerError::Conflict)?
-            .read_original_for_cleanup()?;
+        let (facts, value) = inspect(
+            &mut *self
+                .shared
+                .owner
+                .try_borrow_mut()
+                .map_err(|_| OwnerError::Conflict)?,
+        )?;
         if self.shared.cleanup_tainted.get() || facts != (self.intent.clone(), self.proof) {
             return Err(OwnerError::Conflict);
         }
-        Ok(facts)
+        Ok((facts, value))
     }
 
     /// Cleanup DATA only, captured by this reader while the actual owner was
@@ -1136,6 +1146,15 @@ impl<J: Journal, I: MemberIo> OriginalMemberRead<J, I> {
     }
 
     pub(crate) fn read(&mut self) -> Result<(Intent, NativeProof)> {
+        self.read_with(|live| live.read().map(|facts| (facts, ())))
+            .map(|(facts, ())| facts)
+    }
+    pub(crate) fn read_with<T>(
+        &mut self,
+        inspect: impl FnOnce(
+            &mut crate::member_owner::OriginalLiveMember<'_, J, I>,
+        ) -> Result<((Intent, NativeProof), T)>,
+    ) -> Result<((Intent, NativeProof), T)> {
         if self.generation != self.shared.read_generation.get() {
             return Err(OwnerError::Retired);
         }
@@ -1147,18 +1166,17 @@ impl<J: Journal, I: MemberIo> OriginalMemberRead<J, I> {
             revoked: &self.shared.revoked,
             complete: false,
         };
-        let facts = self
+        let mut owner = self
             .shared
             .owner
             .try_borrow_mut()
-            .map_err(|_| OwnerError::Conflict)?
-            .original_live()?
-            .read()?;
+            .map_err(|_| OwnerError::Conflict)?;
+        let (facts, value) = inspect(&mut owner.original_live()?)?;
         if facts != (self.intent.clone(), self.proof) {
             return Err(OwnerError::Conflict);
         }
         attempt.complete = true;
-        Ok(facts)
+        Ok((facts, value))
     }
 
     pub(crate) fn verify_closed(&mut self, receipt: &ClosedMemberReceipt<J, I>) -> Result<()> {
@@ -1194,3 +1212,17 @@ pub(crate) mod rebind_test_support;
 #[cfg(test)]
 #[path = "member_original_tests.rs"]
 mod tests;
+
+#[cfg(windows)]
+impl<J: Journal, F: crate::windows::member_owner::PrivateConfig>
+    OriginalMemberRead<J, crate::windows::member_owner::NativeMemberIo<F>>
+{
+    pub(crate) fn service_domain_for_cleanup(
+        &mut self,
+    ) -> Result<(
+        (Intent, NativeProof),
+        Option<crate::member_owner::ServiceDomain>,
+    )> {
+        self.read_for_cleanup_with(|owner| owner.service_domain_for_cleanup())
+    }
+}

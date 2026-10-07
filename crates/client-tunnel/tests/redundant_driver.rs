@@ -431,6 +431,44 @@ fn stop_drops_probes_and_disables_members_even_if_journal_is_unwritable() {
     assert_eq!(d.state().snapshot().phase, SessionPhase::Stopped);
     d.tick(100).unwrap();
     assert_eq!(w.borrow().tx, [1, 1]);
+
+    let (mut pending, w) = setup();
+    w.borrow_mut().close_error = true;
+    assert!(pending.stop(&scope()).is_err());
+    for now in [100, 200, 300] {
+        let tick = pending.tick(now).unwrap();
+        assert!(!tick.primary_ready && !tick.standby_ready);
+        assert_eq!(pending.state().snapshot().phase, SessionPhase::Stopping);
+        assert_eq!((w.borrow().native_drops, w.borrow().store_drops), (0, 0));
+    }
+    assert!(
+        pending.tick(250).is_err(),
+        "backward clock still propagates"
+    );
+    w.borrow_mut().close_error = false;
+    let tick = pending.tick(400).unwrap();
+    assert!(!tick.primary_ready && !tick.standby_ready);
+    assert_eq!(pending.state().snapshot().phase, SessionPhase::Stopped);
+
+    let (mut pending, w) = setup();
+    w.borrow_mut().close_error = true;
+    assert!(pending.stop(&scope()).is_err());
+    w.borrow_mut().close_error = false;
+    w.borrow_mut().lost_save_ack = true;
+    assert!(
+        pending.tick(100).is_err(),
+        "Stopped with lost final save ACK propagates"
+    );
+    assert_eq!(pending.state().snapshot().phase, SessionPhase::Stopped);
+
+    let (mut running, w) = setup();
+    w.borrow_mut().integrity_error = true;
+    w.borrow_mut().close_error = true;
+    assert!(
+        running.tick(1000).is_err(),
+        "first Running-to-Stopping close error propagates"
+    );
+    assert_eq!(running.state().snapshot().phase, SessionPhase::Stopping);
 }
 
 #[test]

@@ -297,6 +297,26 @@ impl<F: PrivateConfig> NativeMemberIo<F> {
             pin: self.original.pin()?,
         })
     }
+    pub(crate) fn service_domain_for_cleanup(
+        &mut self,
+        intent: &Intent,
+        retained: &NativeProof,
+    ) -> Result<(Observation, Option<crate::member_owner::ServiceDomain>)> {
+        self.original.revoke();
+        if self.cleanup_only {
+            return Err(OwnerError::Retired);
+        }
+        self.bound(intent)?;
+        let files = &mut self.files;
+        let path = &self.config_path;
+        self.original.inspect_original_for_cleanup_with(
+            &mut NativeOriginalCalls { files: None },
+            intent,
+            retained,
+            || files.read_digest(path),
+            read_service_domain,
+        )
+    }
     fn inspect_once(
         &mut self,
         intent: &Intent,
@@ -602,6 +622,17 @@ pub(crate) struct OriginalMemberReadPin {
     pin: OriginalMemberPin<Service, OwnedHandle>,
 }
 impl OriginalMemberReadPin {
+    pub(crate) fn service_domain(
+        &mut self,
+    ) -> Result<(
+        (Intent, NativeProof),
+        Option<crate::member_owner::ServiceDomain>,
+    )> {
+        self.pin.inspect(
+            &mut NativeOriginalCalls { files: None },
+            read_service_domain,
+        )
+    }
     #[allow(dead_code)]
     pub(crate) fn read(&mut self) -> Result<(Intent, NativeProof)> {
         self.pin.read(&mut NativeOriginalCalls { files: None })
@@ -722,6 +753,182 @@ fn verify_started_process_image(process: &OwnedHandle, original: &Path) -> Resul
     }
     Ok(())
 }
+fn read_service_domain(
+    intent: &Intent,
+    process: &OwnedHandle,
+) -> Result<Option<crate::member_owner::ServiceDomain>> {
+    use windows_sys::Win32::{
+        NetworkManagement::WindowsFilteringPlatform::{
+            FwpmFreeMemory0, FwpmGetAppIdFromFileName0, FWP_BYTE_BLOB,
+        },
+        Security::{
+            GetTokenInformation, LookupAccountNameW, TokenGroups, TOKEN_GROUPS, TOKEN_QUERY,
+        },
+        System::{
+            SystemServices::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY},
+            Threading::OpenProcessToken,
+        },
+    };
+    if intent.transport != TunnelTransport::WireGuard {
+        return Ok(None);
+    }
+    verify_started_process_image(process, &intent.engine)?;
+    let account: Vec<u16> = format!(
+        "NT SERVICE\\{}",
+        slot_service_name(intent.slot, intent.transport)
+    )
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+    let mut sid = [0u64; 4]; // SID authority NT, six subauthorities: exactly 32 bytes.
+    let mut sid_size = 32;
+    let mut domain = [0u16; 256];
+    let mut domain_size = domain.len() as u32;
+    let mut sid_use = 0;
+    if unsafe {
+        LookupAccountNameW(
+            ptr::null(),
+            account.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut sid_use,
+        )
+    } == 0
+        || sid_size != 32
+    {
+        return Err(OwnerError::Native);
+    }
+    let service_sid = unsafe { std::slice::from_raw_parts(sid.as_ptr().cast::<u8>(), 32) }.to_vec();
+    if service_sid[..8] != [1, 6, 0, 0, 0, 0, 0, 5] || service_sid[8..12] != 80u32.to_le_bytes() {
+        return Err(OwnerError::Conflict);
+    }
+    let mut raw_token = ptr::null_mut();
+    if unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut raw_token) } == 0
+        || raw_token.is_null()
+    {
+        return Err(OwnerError::Native);
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+    let mut needed = 0;
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenGroups,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed < std::mem::size_of::<TOKEN_GROUPS>() as u32 || needed > 32768 {
+        return Err(OwnerError::Conflict);
+    }
+    let mut groups = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+    let capacity = groups.len() * std::mem::size_of::<usize>();
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenGroups,
+            groups.as_mut_ptr().cast(),
+            capacity as u32,
+            &mut needed,
+        )
+    } == 0
+        || needed as usize > capacity
+    {
+        return Err(OwnerError::Native);
+    }
+    let offset = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+    if (needed as usize) < offset {
+        return Err(OwnerError::Conflict);
+    }
+    let header = unsafe { &*groups.as_ptr().cast::<TOKEN_GROUPS>() };
+    let count = header.GroupCount as usize;
+    if count > 1024
+        || offset + count * std::mem::size_of::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>()
+            > needed as usize
+    {
+        return Err(OwnerError::Conflict);
+    }
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            groups
+                .as_ptr()
+                .cast::<u8>()
+                .add(offset)
+                .cast::<windows_sys::Win32::Security::SID_AND_ATTRIBUTES>(),
+            count,
+        )
+    };
+    let start = groups.as_ptr() as usize;
+    let end = start
+        .checked_add(needed as usize)
+        .ok_or(OwnerError::Conflict)?;
+    let mut enabled = false;
+    for group in entries {
+        let address = group.Sid as usize;
+        if address < start || address.checked_add(8).is_none_or(|p| p > end) {
+            return Err(OwnerError::Conflict);
+        }
+        let prefix = unsafe { std::slice::from_raw_parts(group.Sid.cast::<u8>(), 8) };
+        let size = 8 + 4 * usize::from(prefix[1]);
+        if prefix[0] != 1 || prefix[1] > 15 || address.checked_add(size).is_none_or(|p| p > end) {
+            return Err(OwnerError::Conflict);
+        }
+        let actual = unsafe { std::slice::from_raw_parts(group.Sid.cast::<u8>(), size) };
+        if actual == service_sid
+            && group.Attributes & SE_GROUP_ENABLED as u32 != 0
+            && group.Attributes & SE_GROUP_USE_FOR_DENY_ONLY as u32 == 0
+        {
+            enabled = true;
+        }
+    }
+    if !enabled {
+        return Err(OwnerError::Conflict);
+    }
+    let image: Vec<u16> = intent
+        .engine
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut raw: *mut FWP_BYTE_BLOB = ptr::null_mut();
+    let status = unsafe { FwpmGetAppIdFromFileName0(image.as_ptr(), &mut raw) };
+    let bytes = match unsafe { raw.as_ref() } {
+        Some(blob)
+            if status == 0
+                && blob.size >= 4
+                && blob.size <= 32768
+                && blob.size % 2 == 0
+                && !blob.data.is_null() =>
+        {
+            Some(unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) }.to_vec())
+        }
+        _ => None,
+    };
+    if !raw.is_null() {
+        unsafe {
+            FwpmFreeMemory0((&mut raw as *mut *mut FWP_BYTE_BLOB).cast());
+        }
+    }
+    let bytes = bytes.ok_or(OwnerError::Native)?;
+    let app_id: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    if app_id.last() != Some(&0)
+        || app_id[..app_id.len() - 1].contains(&0)
+        || String::from_utf16(&app_id[..app_id.len() - 1]).is_err()
+    {
+        return Err(OwnerError::Conflict);
+    }
+    Ok(Some(crate::member_owner::ServiceDomain {
+        app_id,
+        service_sid,
+    }))
+}
+
 impl OriginalMemberNative for NativeOriginalCalls<'_> {
     type Service = Service;
     type Process = OwnedHandle;

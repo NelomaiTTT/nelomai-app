@@ -5827,7 +5827,7 @@ pub(crate) mod native {
             // Read the SAME original live tuple, releasing its inventory borrow
             // BEFORE Source/G. That Source bracket independently joins the full
             // native census; exact target absence is still checked below.
-            let (members, _) =
+            let (members, _, _) =
                 self.inventory
                     .read_source_bindings(&self.context, &self.runtime, &self.image)?;
             pair_read

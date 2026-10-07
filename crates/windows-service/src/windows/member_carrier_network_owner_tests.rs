@@ -227,14 +227,75 @@ fn dns_ack_survives_failed_commit_and_restores_original_baseline() {
     assert_eq!(w.borrow().actual, snapshot());
     assert_eq!(w.borrow().writes, 2);
     assert!(w.borrow().saved.is_none());
+
+    for failed_publication in [5, 6] {
+        let (mut o, w) = owner(3);
+        assert!(o.select(&["8.8.8.8".parse().unwrap()]).is_err());
+        w.borrow_mut().fail_save = failed_publication;
+        assert!(o.cleanup().is_err());
+        assert_eq!(w.borrow().actual, snapshot());
+        assert_eq!(w.borrow().writes, 2);
+        assert_eq!(o.ack, Some(snapshot()));
+        let retained = o.record.as_ref().unwrap();
+        assert_eq!(retained.current, snapshot());
+        assert!(retained.pending.is_none());
+        let saved = w.borrow().saved.clone().unwrap();
+        if failed_publication == 5 {
+            assert_eq!(saved.pending, Some(snapshot()));
+        } else {
+            // Child deletion must follow durable publication of the actual ACK.
+            assert_eq!(saved.current, snapshot());
+            assert!(saved.pending.is_none());
+        }
+        assert!(o.select(&["1.1.1.1".parse().unwrap()]).is_err());
+        // Repeated publication failure still preserves the original record
+        // and actual baseline ACK, with no additional baseline mutation.
+        for _ in 0..2 {
+            let next_save = w.borrow().saves + 1;
+            w.borrow_mut().fail_save = next_save;
+            assert!(o.cleanup().is_err());
+            assert_eq!(w.borrow().writes, 2);
+            assert_eq!(o.record.as_ref().unwrap().baseline, snapshot());
+        }
+        w.borrow_mut().fail_save = 0;
+        o.cleanup().unwrap();
+        assert_eq!(w.borrow().writes, 2, "retry repeats no baseline SDK effect");
+        assert_eq!(w.borrow().actual, snapshot());
+        assert!(w.borrow().saved.is_none());
+        assert!(o.record.is_none());
+        assert!(o.select(&["1.1.1.1".parse().unwrap()]).is_err());
+    }
 }
 #[test]
 fn failed_pending_publication_never_writes_and_can_cleanup() {
-    let (mut o, w) = owner(2);
-    assert!(o.select(&["8.8.8.8".parse().unwrap()]).is_err());
-    assert_eq!(w.borrow().writes, 0);
+    for failed_publication in [1, 2] {
+        let (mut o, w) = owner(failed_publication);
+        assert!(o.select(&["8.8.8.8".parse().unwrap()]).is_err());
+        assert_eq!(w.borrow().writes, 0);
+        assert!(w.borrow().retained_ack.is_none());
+        o.cleanup().unwrap();
+        assert_eq!(w.borrow().actual, snapshot());
+        assert_eq!(
+            w.borrow().writes,
+            1,
+            "initial read-only ACK cannot skip native cleanup"
+        );
+        assert!(o.select(&["1.1.1.1".parse().unwrap()]).is_err());
+    }
+    let (mut o, w) = owner(0);
+    w.borrow_mut().actual = snapshot()
+        .with_servers(&["8.8.8.8".parse().unwrap()])
+        .unwrap();
+    o.select(&["8.8.8.8".parse().unwrap()]).unwrap();
+    w.borrow_mut().fail_save = 4;
+    assert!(o.select(&["1.1.1.1".parse().unwrap()]).is_err());
     o.cleanup().unwrap();
-    assert_eq!(w.borrow().actual, snapshot());
+    assert_eq!(
+        w.borrow().writes,
+        2,
+        "unrelated pending selection must publish cleanup target and exchange"
+    );
+    assert!(o.select(&["1.1.1.1".parse().unwrap()]).is_err());
 }
 #[test]
 fn uncertain_dns_write_is_not_adopted_from_matching_metadata() {

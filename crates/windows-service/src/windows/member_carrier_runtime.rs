@@ -1493,6 +1493,7 @@ pub(crate) mod native {
     type SourceRevision = (Vec<u8>, Vec<u8>);
     #[derive(PartialEq, Eq)]
     struct SourceSample {
+        service_domains: Vec<crate::member_owner::ServiceDomain>,
         revision: SourceRevision,
         rows: rows::Snapshot,
         original: creators::Identity,
@@ -3093,6 +3094,7 @@ pub(crate) mod native {
     }
     #[derive(PartialEq, Eq)]
     struct ClosingSample {
+        service_domains: Vec<crate::member_owner::ServiceDomain>,
         revision: SourceRevision,
         original: creators::Identity,
         // ONLY these providers may enter SDK queries; stopped histories never
@@ -3690,7 +3692,7 @@ pub(crate) mod native {
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
                 return Err(Error::Conflict);
             }
-            let (members, history) = self
+            let (members, history, service_domains) = self
                 .members
                 .read_source_bindings(&self.scope.context, &self.runtime, &self.image)
                 .map_err(denied)?;
@@ -3736,6 +3738,7 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             Ok(SourceSample {
+                service_domains,
                 revision: before,
                 rows: snapshot,
                 original: all.originals[0].identity.clone(),
@@ -3818,6 +3821,7 @@ pub(crate) mod native {
                     let window = NativeBindingsWindow {
                         origin: WindowOrigin::Source(self, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
+                            service_domains: facts.service_domains.clone(),
                             scope: projected.scope,
                             carrier: projected.carrier,
                             egress: projected.egress,
@@ -3902,6 +3906,7 @@ pub(crate) mod native {
         ) -> Result<(
             Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
             Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
+            Vec<crate::member_owner::ServiceDomain>,
         )> {
             use crate::windows::member_carrier_provider::{
                 Expected, ExpectedProvider, ProviderKind,
@@ -3927,7 +3932,9 @@ pub(crate) mod native {
                         &self.image,
                         &[c],
                         partial,
-                        |live, history| Ok((live.to_vec(), history.to_vec())),
+                        |live, history, domains| {
+                            Ok((live.to_vec(), history.to_vec(), domains.to_vec()))
+                        },
                     )
                     .map_err(denied);
             }
@@ -3937,7 +3944,9 @@ pub(crate) mod native {
                     &self.runtime,
                     &self.image,
                     &[c],
-                    |live, history| Ok((live.to_vec(), history.to_vec())),
+                    |live, history, domains| {
+                        Ok((live.to_vec(), history.to_vec(), domains.to_vec()))
+                    },
                 )
                 .map_err(denied)
         }
@@ -3967,7 +3976,8 @@ pub(crate) mod native {
             if all.originals.len() != 1 || all.originals[0].scope != self.scope {
                 return Err(Error::Conflict);
             }
-            let (members, history) = self.members(&all.originals[0].identity, partial)?;
+            let (members, history, service_domains) =
+                self.members(&all.originals[0].identity, partial)?;
             // Matching rows still grant no native ACK. Protected full-row
             // binding must agree with this actual retained original C.
             let rows = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
@@ -3981,6 +3991,7 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             Ok(ClosingSample {
+                service_domains,
                 revision: before,
                 original: all.originals[0].identity.clone(),
                 members,
@@ -4015,6 +4026,7 @@ pub(crate) mod native {
                     let window = NativeBindingsWindow {
                         origin: WindowOrigin::PartialClosing(self, partial, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
+                            service_domains: facts.service_domains.clone(),
                             scope: projected.scope,
                             carrier: projected.carrier,
                             egress: projected.egress,
@@ -4057,6 +4069,7 @@ pub(crate) mod native {
                     let window = NativeBindingsWindow {
                         origin: WindowOrigin::Closing(self, facts),
                         bindings: crate::windows::member_carrier_guard::Bindings {
+                            service_domains: facts.service_domains.clone(),
                             scope: projected.scope,
                             carrier: projected.carrier,
                             egress: projected.egress,
@@ -4294,6 +4307,7 @@ pub(crate) mod native {
                                 )
                                 .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
                                 let bindings = crate::windows::member_carrier_guard::Bindings {
+                                    service_domains: Vec::new(),
                                     scope: facts.scope,
                                     carrier: facts.carrier,
                                     egress: facts.egress,
@@ -4397,6 +4411,7 @@ pub(crate) mod native {
                             )
                             .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
                             let bindings = crate::windows::member_carrier_guard::Bindings {
+                                service_domains: Vec::new(),
                                 scope: facts.scope,
                                 carrier: facts.carrier,
                                 egress: facts.egress,

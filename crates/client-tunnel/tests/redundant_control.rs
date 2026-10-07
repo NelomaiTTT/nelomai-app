@@ -1600,7 +1600,7 @@ fn prepare_stop_deadline_cleanup_failure_retries_on_next_tick() {
                 .execute(Command::Stop { scope: scope() }, 100)
                 .map(|_| ())
         };
-        assert!(first.is_err());
+        assert_eq!(first.is_ok(), deferred);
         let pending = owner.snapshot();
         assert_eq!(pending.session.scope, scope());
         assert_eq!(pending.session.phase, SessionPhase::Stopping);
@@ -1608,6 +1608,15 @@ fn prepare_stop_deadline_cleanup_failure_retries_on_next_tick() {
         assert!(!pending.primary_ready && !pending.standby_ready);
         assert_eq!(world.borrow().closed_scopes, [scope()]);
         assert_eq!(world.borrow().native, [true, false]);
+        let retry = owner.tick(1150).unwrap();
+        assert!(!retry.primary_ready && !retry.standby_ready);
+        assert_eq!(owner.snapshot(), pending);
+        assert_eq!(world.borrow().closed_scopes, [scope(), scope()]);
+        assert_eq!(world.borrow().native, [true, false]);
+        assert_eq!(
+            (world.borrow().native_drops, world.borrow().store_drops),
+            (0, 0)
+        );
         world.borrow_mut().fail_close = false;
         let tick = owner.tick(1200).unwrap();
         assert!(!tick.primary_ready && !tick.standby_ready);
@@ -1615,8 +1624,14 @@ fn prepare_stop_deadline_cleanup_failure_retries_on_next_tick() {
         assert_eq!(stopped.session.scope, scope());
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
-        assert_eq!(world.borrow().closed_scopes, [scope(), scope()]);
+        assert_eq!(world.borrow().closed_scopes, [scope(), scope(), scope()]);
         assert_eq!(world.borrow().native, [false, false]);
+        let world = world.borrow();
+        for (index, event) in world.events.iter().enumerate() {
+            if event == "close" {
+                assert_eq!(world.events[index - 1], "save Stopping");
+            }
+        }
     }
 }
 

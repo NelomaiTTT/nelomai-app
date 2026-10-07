@@ -447,6 +447,7 @@ unsafe fn decode_condition(raw: &FWPM_FILTER_CONDITION0, layer: Layer) -> Result
 /// native authorizer must bracket the locked WFP read with actual C/A/B reads.
 #[derive(PartialEq, Eq)]
 pub(crate) struct Bindings {
+    pub service_domains: Vec<crate::member_owner::ServiceDomain>,
     pub scope: SessionScope,
     pub carrier: Option<Carrier>,
     pub egress: [Option<Identity>; 2],
@@ -716,6 +717,7 @@ impl EngineLifetime {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArbitrationFilter {
+    pub service_domain: Option<crate::member_owner::ServiceDomain>,
     pub key: Key,
     pub id: u64,
     pub layer: Layer,
@@ -724,6 +726,78 @@ pub(crate) struct ArbitrationFilter {
     pub flags: u32,
     pub action: u32,
 }
+fn service_filter_domain(
+    raw: &FWPM_FILTER0,
+    layer: Layer,
+) -> Option<crate::member_owner::ServiceDomain> {
+    if !matches!(layer, Layer::AleConnectV4 | Layer::AleConnectV6)
+        || raw.flags & FWPM_FILTER_FLAG_DISABLED != 0
+        || raw.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT == 0
+        || raw.action.r#type != FWP_ACTION_PERMIT
+        || raw.numFilterConditions != 2
+        || raw.filterCondition.is_null()
+    {
+        return None;
+    }
+    let conditions = unsafe { std::slice::from_raw_parts(raw.filterCondition, 2) };
+    let mut app_id = None;
+    let mut service_sid = None;
+    for condition in conditions {
+        if condition.matchType != FWP_MATCH_EQUAL {
+            return None;
+        }
+        let app = key(condition.fieldKey) == key(FWPM_CONDITION_ALE_APP_ID);
+        let user = key(condition.fieldKey) == key(FWPM_CONDITION_ALE_USER_ID);
+        let value = &condition.conditionValue;
+        if !((app && app_id.is_none() && value.r#type == FWP_BYTE_BLOB_TYPE)
+            || (user && service_sid.is_none() && value.r#type == FWP_SECURITY_DESCRIPTOR_TYPE))
+        {
+            return None;
+        }
+        // Only the matching native type may select byteBlob, owned by this SDK page.
+        let blob = unsafe { value.Anonymous.byteBlob.as_ref() }?;
+        if blob.size == 0 || blob.size > 32768 || blob.data.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) };
+        if app {
+            if bytes.len() < 4 || bytes.len() % 2 != 0 {
+                return None;
+            }
+            let text: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect();
+            if text.last() != Some(&0)
+                || text[..text.len() - 1].contains(&0)
+                || String::from_utf16(&text[..text.len() - 1]).is_err()
+            {
+                return None;
+            }
+            app_id = Some(text);
+        } else {
+            // Pinned WG producer: exact self-relative DACL, one ALLOW/MATCH_FILTER
+            // ACE, no owner/group/SACL, NT service SID with six subauthorities.
+            if bytes.len() != 68
+                || bytes[..36]
+                    != [
+                        1, 0, 4, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 2, 0, 48, 0,
+                        1, 0, 0, 0, 0, 0, 40, 0, 1, 0, 0, 0,
+                    ]
+                || bytes[36..44] != [1, 6, 0, 0, 0, 0, 0, 5]
+                || bytes[44..48] != 80u32.to_le_bytes()
+            {
+                return None;
+            }
+            service_sid = Some(bytes[36..].to_vec());
+        }
+    }
+    Some(crate::member_owner::ServiceDomain {
+        app_id: app_id?,
+        service_sid: service_sid?,
+    })
+}
+
 const MAX_ARBITRATION_FILTERS: usize = 32768;
 
 /// Comparison DATA, not original creator ownership or a WFP permission.
@@ -1235,11 +1309,20 @@ impl<N: NativeApi> LockedWfpRead<'_, N> {
     /// An equal/higher foreign hard permit or opaque callout is rejected. Own
     /// sublayer contamination, incomplete inventory and read errors also fail.
     /// Never change foreign policy, raise priority or convert our soft permits.
-    pub(crate) fn priority_barrier(&mut self) -> Result<()> {
+    pub(crate) fn priority_barrier(
+        &mut self,
+        service_domains: &[crate::member_owner::ServiceDomain],
+    ) -> Result<()> {
         let was_failed = self.failed_read;
         self.failed_read = true;
         let filters = self.io.arbitration(self.kind)?;
-        validate_arbitration(self.scope, self.captured, self.ids, &filters)?;
+        validate_arbitration(
+            self.scope,
+            self.captured,
+            self.ids,
+            &filters,
+            service_domains,
+        )?;
         self.failed_read = was_failed;
         Ok(())
     }
@@ -1251,6 +1334,7 @@ pub(crate) fn validate_arbitration(
     snapshot: &Snapshot,
     ids: &BTreeMap<Key, u64>,
     filters: &[ArbitrationFilter],
+    service_domains: &[crate::member_owner::ServiceDomain],
 ) -> Result<()> {
     let sub = snapshot.sublayer.as_ref().ok_or(GuardError::Conflict)?;
     let keys = crate::member_carrier_guard::resource_keys(scope)?;
@@ -1296,7 +1380,16 @@ pub(crate) fn validate_arbitration(
             if f.flags & FWPM_FILTER_FLAG_DISABLED == 0 && f.sublayer_weight >= sub.weight {
                 let soft_permit = f.action == FWP_ACTION_PERMIT
                     && f.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT == 0;
-                if !soft_permit && f.action != FWP_ACTION_BLOCK && f.action != FWP_ACTION_CONTINUE {
+                let original_service = matches!(f.layer, Layer::AleConnectV4 | Layer::AleConnectV6)
+                    && f.action == FWP_ACTION_PERMIT
+                    && f.service_domain
+                        .as_ref()
+                        .is_some_and(|domain| service_domains.contains(domain));
+                if !soft_permit
+                    && !original_service
+                    && f.action != FWP_ACTION_BLOCK
+                    && f.action != FWP_ACTION_CONTINUE
+                {
                     #[cfg(all(windows, test))]
                     crate::windows::member_carrier_factory_test_os::trace_step(&format!(
                         "guard rejected foreign arbitration id={} layer={:?} subweight={} ownweight={} flags={} action={}",
@@ -1357,6 +1450,7 @@ impl<N: NativeApi> ScopedGuardAbsence<N> {
         let scope = &self.scope;
         let actual = transaction(&mut self.io, SessionKind::StaticBase, true, |io| {
             let bindings = Bindings {
+                service_domains: Vec::new(),
                 scope: scope.clone(),
                 carrier: None,
                 egress: [None, None],
@@ -1430,6 +1524,7 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
             if actual != expected.expected {
                 return Err(GuardError::Conflict);
             }
+            let bindings;
             {
                 let mut locked = LockedWfpRead {
                     io,
@@ -1446,8 +1541,10 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                         #[cfg(all(windows, test))]
                         trace_step(&format!("guard exchange authorize: {_error:?}"));
                     })?;
+                bindings = attestor.observe(scope)?;
+                validate_bindings(scope, &bindings)?;
                 if desired.permits {
-                    locked.priority_barrier()?;
+                    locked.priority_barrier(&bindings.service_domains)?;
                 }
                 if locked.failed_read {
                     return Err(GuardError::Conflict);
@@ -1455,8 +1552,6 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
             }
             // Requery after authority, BEFORE effects; never seed bindings by
             // copying expected/desired. New attach and old removal are explicit.
-            let bindings = attestor.observe(scope)?;
-            validate_bindings(scope, &bindings)?;
             if desired.installed
                 && (bindings.carrier != desired.carrier
                     || desired.members.iter().enumerate().any(|(i, m)| {
@@ -1590,7 +1685,13 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                 let before = self.attestor.observe(&self.scope)?;
                 validate_bindings(&self.scope, &before)?;
                 let filters = io.arbitration(SessionKind::StaticBase)?;
-                validate_arbitration(&self.scope, &actual, &self.owned_ids, &filters)?;
+                validate_arbitration(
+                    &self.scope,
+                    &actual,
+                    &self.owned_ids,
+                    &filters,
+                    &before.service_domains,
+                )?;
                 let after = self.attestor.observe(&self.scope)?;
                 validate_bindings(&self.scope, &after)?;
                 if before != after {
@@ -2194,6 +2295,7 @@ mod bfe {
                     }
                 };
                 result.push(ArbitrationFilter {
+                    service_domain: None,
                     key: key(f.filterKey),
                     id: f.filterId,
                     layer,
@@ -2665,6 +2767,7 @@ mod bfe {
                                     &actual,
                                     &self.owned_ids,
                                     &filters,
+                                    &bindings.service_domains,
                                 )?;
                             }
                             Ok(actual)
@@ -3008,6 +3111,7 @@ mod bfe {
                             }
                         }
                         result.push(ArbitrationFilter {
+                            service_domain: service_filter_domain(f, layer),
                             key: key(f.filterKey),
                             id: f.filterId,
                             layer,

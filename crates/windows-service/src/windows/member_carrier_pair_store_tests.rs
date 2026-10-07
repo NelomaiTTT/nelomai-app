@@ -1549,6 +1549,27 @@ fn cleanup_dns_span_restores_only_exact_baseline_then_accepts_acknowledged_retir
         Some(&initial.baseline),
     )
     .unwrap();
+    span.dns_transition(
+        true,
+        Some(&initial),
+        Some(&initial),
+        Some(&initial.baseline),
+    )
+    .unwrap();
+    assert!(span
+        .dns_transition(true, Some(&initial), Some(&initial), None)
+        .is_err());
+    assert!(span
+        .dns_transition(
+            false,
+            Some(&initial),
+            Some(&initial),
+            Some(&initial.baseline)
+        )
+        .is_err());
+    assert!(span
+        .dns_transition(true, Some(&old), Some(&old), Some(&initial.baseline))
+        .is_err());
     span.dns_transition(true, Some(&initial), None, Some(&initial.baseline))
         .unwrap();
     assert!(span

@@ -417,6 +417,15 @@ impl NetworkIntent {
             {
                 Ok(())
             }
+            (Some(old), Some(next))
+                if cleanup
+                    && old == next
+                    && next.pending.is_none()
+                    && &next.current == baseline
+                    && native_ack == Some(baseline) =>
+            {
+                Ok(())
+            }
             (Some(old), None)
                 if cleanup
                     && old.pending.is_none()

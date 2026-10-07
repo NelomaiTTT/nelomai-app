@@ -2816,7 +2816,15 @@ fn retained_member_origin_reads_same_created_service_and_pinned_running_process(
     let mut origin = RetainedMemberOrigin::empty();
     origin.start(&mut boundary, &intent).unwrap();
     let mut pin = origin.pin().unwrap();
-    assert_eq!(pin.read(&mut boundary), Ok((intent, proof())));
+    assert_eq!(pin.read(&mut boundary), Ok((intent.clone(), proof())));
+    assert_eq!(
+        pin.inspect(&mut boundary, |actual, process| {
+            assert_eq!(actual, &intent);
+            assert_eq!(process.0, 1);
+            Ok(7u8)
+        }),
+        Ok(((intent, proof()), 7))
+    );
     boundary.service_id = 2; // Equal facts/name, different SCM object.
     assert_eq!(pin.read(&mut boundary), Err(OwnerError::Conflict));
     boundary.service_id = 1;
@@ -3133,6 +3141,24 @@ fn retained_member_origin_native_drift_error_and_unwind_revoke_all_pins() {
             .unwrap();
         assert_eq!(service_closes.get(), 1);
         assert_eq!(process_closes.get(), 0);
+    }
+    for unwind in [false, true] {
+        let (o, _) = setup();
+        let mut boundary = OriginBoundary::live();
+        let mut origin = RetainedMemberOrigin::empty();
+        origin.start(&mut boundary, o.intent()).unwrap();
+        let mut pin = origin.pin().unwrap();
+        let mut second = origin.pin().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pin.inspect(&mut boundary, |_, _| -> Result<()> {
+                assert!(!unwind, "native domain query unwind");
+                Err(OwnerError::Native)
+            })
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert_eq!(pin.read(&mut boundary), Err(OwnerError::Retired));
+        assert_eq!(second.read(&mut boundary), Err(OwnerError::Retired));
+        assert!(origin.pin().is_err());
     }
 }
 

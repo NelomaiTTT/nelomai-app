@@ -3838,7 +3838,7 @@ pub(crate) mod native {
                 // Retain actual child publication coverage before any later
                 // Source postflight can fail. This is not an out-of-band Pair
                 // CAS; the whole current record/revision stays unchanged.
-                *self.dns_previous.try_borrow_mut().map_err(denied)? = Some(child.clone());
+                *self.dns_previous.try_borrow_mut().map_err(denied)? = Some(expected.cloned());
                 *child = desired.cloned();
                 drop(child);
                 self.verify_pair(&selected, cleanup)
