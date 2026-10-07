@@ -97,6 +97,22 @@ fn native_codec_roundtrips_real_full_four_layer_models_and_preserves_ids() {
             let got = unsafe { decode_filter(&encoded.raw, filter.key, filter.sublayer) }.unwrap();
             assert_eq!(got.policy, *filter);
             assert_eq!(got.id, 9001);
+            if filter.action == Action::Permit
+                && matches!(filter.layer, Layer::ForwardV4 | Layer::ForwardV6)
+            {
+                for forbidden in [
+                    FWPM_FILTER_FLAG_PERSISTENT,
+                    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+                    FWPM_FILTER_FLAG_DISABLED,
+                ] {
+                    let mut changed = returned(filter);
+                    changed.raw.flags |= forbidden;
+                    assert!(
+                        unsafe { decode_filter(&changed.raw, filter.key, filter.sublayer) }
+                            .is_err()
+                    );
+                }
+            }
         }
     }
 }
@@ -159,7 +175,10 @@ fn native_codec_uses_literal_wfp_layer_fields_types_flags_and_eight_ale_conditio
         assert_eq!(encoded.raw.numFilterConditions, count);
         assert_eq!(
             encoded.raw.flags,
-            if matches!(layer, Layer::AleConnectV4 | Layer::AleConnectV6) {
+            if matches!(
+                layer,
+                Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
+            ) {
                 64
             } else {
                 0

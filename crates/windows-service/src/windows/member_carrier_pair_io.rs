@@ -4939,9 +4939,17 @@ pub(crate) mod native {
             let r = self.roots()?;
             r.attestor
                 .select(pin.clone(), record.clone())
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    trace_step(&format!("select_guard attestor: {_error:?}"));
+                })
                 .map_err(|error| denied(error))?;
             r.guard_resources
                 .select(pin.clone(), record.clone())
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    trace_step(&format!("select_guard resources: {_error:?}"));
+                })
                 .map_err(|error| denied(error))?;
             Ok(())
         }
@@ -6286,12 +6294,29 @@ pub(crate) mod native {
                         .map_err(denied);
                 }
                 if record.phase == pair::Phase::Closing && record.stop_stage >= 8 {
-                    let original = r.carrier.retired_pin().map_err(denied)?;
+                    let original = r
+                        .carrier
+                        .retired_pin()
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            trace_step(&format!("guard_snapshot retired_pin: {_error:?}"));
+                        })
+                        .map_err(denied)?;
                     let sample = |bindings: &Bindings| {
                         r.guard
                             .try_borrow_mut()
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!(
+                                    "guard_snapshot retired guard borrow: {_error:?}"
+                                ));
+                            })
                             .map_err(native_denied)?
                             .snapshot_in_retired_bracket(pin, &record, &original, bindings)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!("guard_snapshot retired sample: {_error:?}"));
+                            })
                             .map_err(native_denied)
                     };
                     if record.stop_stage == 11 {
@@ -6316,13 +6341,25 @@ pub(crate) mod native {
                                 .map_err(denied);
                         }
                     }
-                    return original.inspect_bindings(sample).map_err(denied);
+                    return original
+                        .inspect_bindings(sample)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            trace_step(&format!(
+                                "guard_snapshot retired inspect_bindings: {_error:?}"
+                            ));
+                        })
+                        .map_err(denied);
                 }
                 r.guard
                     .try_borrow_mut()
                     .map_err(denied)?
                     .snapshot()
                     .map_err(denied)
+            })
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard_snapshot in_call: {_error:?}"));
             })
         }
 
@@ -6338,27 +6375,45 @@ pub(crate) mod native {
                 let guard_acks = &mut this.guard_acks;
                 let r = this.roots.as_mut().ok_or_else(conflict)?;
                 if record.guard != *expected || record.pending_guard.is_none() {
+                    #[cfg(all(windows, test))]
+                    trace_step(&format!("guard_exchange expected/pending predicate guard_matches={} pending_present={}", record.guard == *expected, record.pending_guard.is_some()));
                     return Err(conflict());
                 }
                 // Each edge is independently authorized by NativeGuard's actual
                 // locked attestor/full resource G. Journaled plan is not a grant.
                 let acknowledged =
                     if record.phase == pair::Phase::Closing && record.stop_stage == 10 {
-                        let retired = r.carrier.retired_pin().map_err(denied)?;
+                        let retired = r.carrier.retired_pin().inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            trace_step(&format!("guard_exchange retired_pin: {_error:?}"));
+                        }).map_err(denied)?;
                         r.network_gate.select_retired_guard_resources(
                             pin.clone(),
                             record.clone(),
                             retired.clone(),
-                        )?;
+                        ).inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            trace_step(&format!("guard_exchange select_retired_guard_resources: {_error:?}"));
+                        })?;
                         // First actual Authority AfterClose hook already retained
                         // this SAME original in both selections. Never bind again.
                         if kind != policy::SessionKind::StaticBase || desired.installed {
+                            #[cfg(all(windows, test))]
+                            trace_step(&format!("guard_exchange retired edge predicate kind={kind:?} desired_installed={}", desired.installed));
                             return Err(conflict());
                         }
                         r.guard
                             .try_borrow_mut()
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!("guard_exchange retired guard borrow: {_error:?}"));
+                            })
                             .map_err(denied)?
                             .remove_base_after_retirement(expected, &retired)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!("guard_exchange remove_base_after_retirement: {_error:?}"));
+                            })
                             .map_err(denied)
                     } else {
                         if kind == policy::SessionKind::StaticBase {
@@ -6382,6 +6437,9 @@ pub(crate) mod native {
                 // BEFORE any fallible coordinator Pair publication/postflight.
                 guard_acks.push(acknowledged.clone());
                 Ok(acknowledged)
+            }).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                trace_step(&format!("guard_exchange in_call: {_error:?}"));
             })
         }
 

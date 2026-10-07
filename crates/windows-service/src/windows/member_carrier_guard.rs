@@ -191,8 +191,11 @@ pub(crate) unsafe fn decode_sublayer(raw: &FWPM_SUBLAYER0, expected_key: Key) ->
     })
 }
 fn validate_action(layer: Layer, action: Action, flags: u32, weight: u64) -> Result<()> {
-    let indexed =
-        action == Action::Permit && matches!(layer, Layer::AleConnectV4 | Layer::AleConnectV6);
+    let indexed = action == Action::Permit
+        && matches!(
+            layer,
+            Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
+        );
     if flags != if indexed { FWPM_FILTER_FLAG_INDEXED } else { 0 }
         || weight != if action == Action::Block { 1 } else { 2 }
     {

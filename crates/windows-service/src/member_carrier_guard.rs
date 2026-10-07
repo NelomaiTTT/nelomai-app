@@ -549,8 +549,10 @@ fn filter(
         layer,
         weight: if action == Action::Block { 1 } else { 2 },
         flags: if action == Action::Permit
-            && matches!(layer, Layer::AleConnectV4 | Layer::AleConnectV6)
-        {
+            && matches!(
+                layer,
+                Layer::ForwardV4 | Layer::ForwardV6 | Layer::AleConnectV4 | Layer::AleConnectV6
+            ) {
             INDEXED
         } else {
             0
