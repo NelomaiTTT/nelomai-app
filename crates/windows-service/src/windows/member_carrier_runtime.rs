@@ -2943,9 +2943,7 @@ pub(crate) mod native {
                 bindings.egress[0].as_ref(),
                 bindings.egress[1].as_ref(),
             ];
-            let mut facts = NativeResourceRowsFacts {
-                rows: [None, None, None],
-            };
+            let mut selected = Vec::new();
             for i in 0..3 {
                 if preparing == Some(i) {
                     if i == 0
@@ -2971,6 +2969,25 @@ pub(crate) mod native {
                     }
                     continue;
                 };
+                let kind = [
+                    RecordKind::CarrierRows,
+                    RecordKind::MemberARows,
+                    RecordKind::MemberBRows,
+                ][i];
+                selected.push((i, original, identity, kind));
+            }
+            let kinds = selected
+                .iter()
+                .map(|(_, _, _, kind)| *kind)
+                .collect::<Vec<_>>();
+            let before = self
+                .runtime
+                .optional_records(&self.context, &kinds)
+                .map_err(denied)?;
+            let mut facts = NativeResourceRowsFacts {
+                rows: [None, None, None],
+            };
+            for (n, (i, original, identity, _)) in selected.into_iter().enumerate() {
                 let closed = if i != 0 {
                     window
                         .closed_member(if i == 1 {
@@ -2991,17 +3008,9 @@ pub(crate) mod native {
                 } else {
                     false
                 };
-                let kind = [
-                    RecordKind::CarrierRows,
-                    RecordKind::MemberARows,
-                    RecordKind::MemberBRows,
-                ][i];
                 let read = |ack: rows::RowRecordFacts<'_>| {
-                    let before = self
-                        .runtime
-                        .record(&self.context, kind)
-                        .map_err(|_| rows::Error::Journal)?;
-                    let protected = rows::Record::decode(&before)?;
+                    let protected =
+                        rows::Record::decode(before[n].as_ref().ok_or(rows::Error::Journal)?)?;
                     let observed = if closed {
                         None
                     } else {
@@ -3033,11 +3042,6 @@ pub(crate) mod native {
                     if !closed
                         && rows::native::read_original_snapshot(ack.binding)?
                             != *observed.as_ref().unwrap()
-                        || self
-                            .runtime
-                            .record(&self.context, kind)
-                            .map_err(|_| rows::Error::Journal)?
-                            != before
                     {
                         return Err(rows::Error::Conflict);
                     }
@@ -3063,6 +3067,13 @@ pub(crate) mod native {
                     }
                     .map_err(denied)?,
                 );
+            }
+            let after = self
+                .runtime
+                .optional_records(&self.context, &kinds)
+                .map_err(denied)?;
+            if after != before {
+                return Err(Error::Conflict);
             }
             Ok(facts)
         }

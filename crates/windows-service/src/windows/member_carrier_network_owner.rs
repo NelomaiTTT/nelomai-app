@@ -642,21 +642,43 @@ pub(crate) mod native {
     }
     impl<G: NativeNetworkEffectGate> NetworkSystem for Rows<G> {
         fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
-            self.0.inspect(&Effect::Read, |window| {
+            let cleanup = self.0.cleanup.get();
+            self.0.fence.require(cleanup)?;
+            let call = |window: &NativeBindingsWindow<'_>| -> io::Result<Option<NetworkValue>> {
+                self.0.fence.require(cleanup)?;
                 let b = window.bindings();
-                MemberRoutes::new(
-                    AcknowledgedRows {
-                        pins: &self.0,
-                        window,
-                        io: NativeRowIo,
-                    },
+                let result = MemberRoutes::new(
+                    NativeRowIo,
                     LiveIdentity {
                         pins: &self.0,
                         bindings: b,
                     },
                 )
-                .read(key)
-            })
+                .read(key)?;
+                self.0.fence.require(cleanup)?;
+                Ok(result)
+            };
+            let run = |window: &NativeBindingsWindow<'_>| {
+                call(window).map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+            };
+            let result = if cleanup {
+                let closing = self
+                    .0
+                    .closing
+                    .try_borrow()
+                    .map_err(|_| conflict())?
+                    .clone()
+                    .ok_or_else(conflict)?;
+                closing.inspect_window(run)
+            } else {
+                self.0.source.inspect_window(run)
+            }
+            .map_err(|_| conflict());
+            if result.is_err() {
+                self.0.fence.revoked.set(true);
+                self.0.fence.tainted.set(true);
+            }
+            result
         }
         fn compare_exchange(
             &mut self,
@@ -776,10 +798,36 @@ pub(crate) mod native {
     }
     impl<G: NativeNetworkEffectGate> DnsSystem for Dns<G> {
         fn read(&mut self) -> io::Result<dns::Snapshot> {
-            self.0.inspect(&Effect::Read, |window| {
+            let cleanup = self.0.cleanup.get();
+            self.0.fence.require(cleanup)?;
+            let call = |window: &NativeBindingsWindow<'_>| -> io::Result<dns::Snapshot> {
+                self.0.fence.require(cleanup)?;
                 let b = window.bindings();
-                Self::owned(b)?.snapshot().map_err(io::Error::other)
-            })
+                let result = Self::owned(b)?.snapshot().map_err(io::Error::other)?;
+                self.0.fence.require(cleanup)?;
+                Ok(result)
+            };
+            let run = |window: &NativeBindingsWindow<'_>| {
+                call(window).map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+            };
+            let result = if cleanup {
+                let closing = self
+                    .0
+                    .closing
+                    .try_borrow()
+                    .map_err(|_| conflict())?
+                    .clone()
+                    .ok_or_else(conflict)?;
+                closing.inspect_window(run)
+            } else {
+                self.0.source.inspect_window(run)
+            }
+            .map_err(|_| conflict());
+            if result.is_err() {
+                self.0.fence.revoked.set(true);
+                self.0.fence.tainted.set(true);
+            }
+            result
         }
         fn exchange(
             &mut self,
@@ -1026,41 +1074,47 @@ pub(crate) mod native {
             servers: &[IpAddr],
         ) -> io::Result<()> {
             self.operation(false, |s| {
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "network owner select capture_plan begin",
+                );
                 self.pins.capture_plan(slot, &values, servers)?;
-                self.pins.inspect(
-                    &Effect::Plan {
-                        slot,
-                        values: &values,
-                        servers,
-                    },
-                    |window| {
-                        let b = window.bindings();
-                        for value in &values {
-                            let NetworkValue::Route(route) = value else {
-                                return Err(conflict());
-                            };
-                            // Physical rows remain EXACT independently reverified
-                            // captured leases, never a member or carrier adoption.
-                            if !b
-                                .egress
-                                .iter()
-                                .flatten()
-                                .any(|e| e.proof.index == route.interface)
-                            {
-                                self.pins.physical(b, route.interface)?;
-                            }
-                        }
-                        Ok(())
-                    },
-                )?;
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "network owner select capture_plan end",
+                );
                 // Reject unsupported family/settings BEFORE any route effect;
                 // this read carries no DNS journal publication or permission.
                 if !servers.is_empty() {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "network owner select dns.preflight begin",
+                    );
                     s.dns.preflight(servers)?;
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "network owner select dns.preflight end",
+                    );
                 }
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "network owner select routes.select begin",
+                );
                 s.routes.select(slot, values)?;
+                #[cfg(test)]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "network owner select routes.select end",
+                );
                 if !servers.is_empty() {
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "network owner select dns.select begin",
+                    );
                     s.dns.select(servers)?;
+                    #[cfg(test)]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "network owner select dns.select end",
+                    );
                 }
                 Ok(())
             })
