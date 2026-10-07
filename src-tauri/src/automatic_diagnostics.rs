@@ -521,8 +521,25 @@ fn read_report(path: &Path) -> io::Result<DiagnosticUploadRequest> {
             "automatic diagnostics report is too large",
         ));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let mut report: DiagnosticUploadRequest = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    // Older desktop builds queued intent reports with a spurious interval end.
+    // Repair only that exact non-session shape in memory; preserve the original
+    // evidence and report ID until the server acknowledges the upload.
+    if matches!(
+        report.trigger.as_str(),
+        "connection_intent_slow_recovery" | "connection_intent_terminal_failure"
+    ) && report.tunnel_session_id.is_none()
+        && report.sequence.is_none()
+        && report.interval_started_at_unix.is_none()
+        && report.tunnel_running.is_none()
+        && report.connection_lease_id.is_none()
+        && report.network_incidents.is_none()
+        && report.interval_ended_at_unix == Some(report.generated_at_unix)
+    {
+        report.interval_ended_at_unix = None;
+    }
+    Ok(report)
 }
 
 fn write_json_atomically(path: &Path, value: &impl Serialize, maximum: usize) -> io::Result<()> {
@@ -603,6 +620,109 @@ mod tests {
             logcat_log: None,
             network_incidents: None,
             resource_usage: None,
+        }
+    }
+
+    #[test]
+    fn legacy_intent_reports_retry_without_the_invalid_interval_field() {
+        for trigger in [
+            "connection_intent_slow_recovery",
+            "connection_intent_terminal_failure",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+            queue.set_current_device("device-1").unwrap();
+            queue.observe(Some("session-1"), true, 10).unwrap();
+            queue.observe(None, false, 20).unwrap();
+            let mut legacy = report(&queue.pending_seal().unwrap().unwrap());
+            legacy.trigger = trigger.into();
+            legacy.tunnel_session_id = None;
+            legacy.sequence = None;
+            legacy.interval_started_at_unix = None;
+            legacy.tunnel_running = None;
+            legacy.connection_lease_id = None;
+            queue.queue_connection_intent_report(&legacy, 20).unwrap();
+            let candidate = queue.upload_candidate(20).unwrap().unwrap();
+            let path = queue.pending_directory().join(&candidate.name);
+            let original_bytes = fs::read(&path).unwrap();
+            let mut expected = legacy.clone();
+            expected.interval_ended_at_unix = None;
+            assert_eq!(
+                serde_json::to_value(&candidate.report).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&original_bytes).unwrap(),
+                serde_json::to_value(&legacy).unwrap()
+            );
+            queue.upload_failed(20).unwrap();
+            drop(candidate);
+            let retry_at = 20 + RETRY_DELAYS_SECONDS[0];
+            let retry = queue.upload_candidate(retry_at).unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&retry.report).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(fs::read(&path).unwrap(), original_bytes);
+            queue.upload_succeeded(&retry, retry_at).unwrap();
+            assert!(!path.exists());
+            assert_eq!(
+                fs::read(queue.sent_directory().join(&retry.name)).unwrap(),
+                original_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_report_repair_does_not_strip_real_or_unknown_session_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+        queue.set_current_device("device-1").unwrap();
+        queue.observe(Some("session-1"), true, 10).unwrap();
+        queue.observe(None, false, 20).unwrap();
+        let session_report = report(&queue.pending_seal().unwrap().unwrap());
+        for trigger in [
+            "tunnel_stopped",
+            "connection_intent_slow_recovery",
+            "unknown",
+        ] {
+            let mut original = session_report.clone();
+            original.trigger = trigger.into();
+            let path = directory.path().join("original.json");
+            fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(read_report(&path).unwrap()).unwrap(),
+                serde_json::to_value(original).unwrap()
+            );
+        }
+        // Each individual field must prevent repair, not only a full session record.
+        let mut legacy = session_report;
+        legacy.trigger = "connection_intent_terminal_failure".into();
+        legacy.tunnel_session_id = None;
+        legacy.sequence = None;
+        legacy.interval_started_at_unix = None;
+        legacy.tunnel_running = None;
+        legacy.connection_lease_id = None;
+        for (field, value) in [
+            ("trigger", serde_json::json!("unknown")),
+            ("tunnel_session_id", serde_json::json!("session-1")),
+            ("sequence", serde_json::json!(0)),
+            ("interval_started_at_unix", serde_json::json!(10)),
+            ("tunnel_running", serde_json::json!(false)),
+            ("connection_lease_id", serde_json::json!("lease-1")),
+            ("network_incidents", serde_json::json!("[]")),
+            ("interval_ended_at_unix", serde_json::json!(19)),
+        ] {
+            let mut original = serde_json::to_value(&legacy).unwrap();
+            original[field] = value;
+            let typed: DiagnosticUploadRequest = serde_json::from_value(original).unwrap();
+            let path = directory.path().join("original.json");
+            fs::write(&path, serde_json::to_vec(&typed).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::to_value(read_report(&path).unwrap()).unwrap(),
+                serde_json::to_value(typed).unwrap(),
+                "must preserve {field}"
+            );
         }
     }
 

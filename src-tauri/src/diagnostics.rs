@@ -763,7 +763,7 @@ impl AppDiagnostics {
             tunnel_session_id: None,
             sequence: None,
             interval_started_at_unix: None,
-            interval_ended_at_unix: Some(generated_at),
+            interval_ended_at_unix: None,
             tunnel_running: None,
             connection_lease_id: None,
             generated_at_unix: generated_at,
@@ -1552,6 +1552,23 @@ mod tests {
         }
         assert!(candidate.report.helper_log.is_none());
         assert!(candidate.report.network_incidents.is_none());
+        // Inspect persisted builder output too: queue repair must not mask a bad builder.
+        let pending = directory.path().join("automatic/pending");
+        let stored = fs::read_dir(&pending)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_file())
+            .unwrap();
+        let stored: DiagnosticUploadRequest =
+            serde_json::from_slice(&fs::read(stored).unwrap()).unwrap();
+        for report in [&candidate.report, &stored] {
+            assert!(report.tunnel_session_id.is_none());
+            assert!(report.sequence.is_none());
+            assert!(report.interval_started_at_unix.is_none());
+            assert!(report.interval_ended_at_unix.is_none());
+            assert!(report.tunnel_running.is_none());
+            assert!(report.connection_lease_id.is_none());
+        }
     }
 
     #[test]
