@@ -329,7 +329,7 @@ fn rebind_requires_all_probes_absent_and_keeps_original_network_active() {
     let dns = dns_snapshot(&r);
     r.network.as_mut().unwrap().baseline.dns = Some(dns.clone());
     r.network.as_mut().unwrap().current.dns = Some(dns.clone());
-    let ack = (vec![], vec![dns.clone()]);
+    let ack = (vec![], (1, vec![dns.clone()]));
     let mut routes = no_routes();
     routes.active = Some(Slot::A);
     let check = |routes: &super::super::member_carrier_network::NetworkFacts| {
@@ -735,7 +735,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
     let (_, r, _) = fixture();
     let actual = no_routes();
     let dns = dns_snapshot(&r);
-    let empty = (vec![], vec![]);
+    let empty = (vec![], (0, vec![]));
     let route = crate::member_routes::Row::static_route(
         RouteValue {
             destination: "1.1.1.1/32".parse().unwrap(),
@@ -800,7 +800,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
                     deleting: false,
                     acknowledged,
                 }],
-                vec![],
+                (0, vec![]),
             );
             assert!(network(
                 &r,
@@ -814,7 +814,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
             )
             .is_err());
         }
-        let dns_history = (vec![], vec![dns.clone()]);
+        let dns_history = (vec![], (1, vec![dns.clone()]));
         assert!(network(
             &r,
             usage,
@@ -826,6 +826,18 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
             Some(&dns_history),
         )
         .is_err());
+        let started_without_ack = (vec![], (1, vec![]));
+        assert!(network(
+            &r,
+            usage,
+            NetworkFact {
+                routes: &actual,
+                dns: &dns,
+                protected: None,
+            },
+            Some(&started_without_ack),
+        )
+        .is_err());
     }
     let (_, mut r, _) = closing(Slot::A);
     let dns = dns_snapshot(&r);
@@ -834,7 +846,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
     n.current = n.baseline.clone();
     let mut actual = no_routes();
     actual.stopping = true;
-    let ack = (vec![], vec![dns.clone()]);
+    let ack = (vec![], (1, vec![dns.clone()]));
     network(
         &r,
         Use::Stop,
@@ -846,6 +858,102 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
         Some(&ack),
     )
     .unwrap();
+    network(
+        &r,
+        Use::Stop,
+        NetworkFact {
+            routes: &actual,
+            dns: &dns,
+            protected: Some(b"original-record"),
+        },
+        Some(&empty),
+    )
+    .expect("restored cleanup with no DNS exchange retains its exact baseline without an ACK");
+    for (started, history) in [
+        (0, vec![dns.clone()]),
+        (2, vec![dns.clone()]),
+        (32769, vec![dns.clone(); 32769]),
+    ] {
+        let inconsistent = (vec![], (started, history));
+        assert!(
+            network(
+                &r,
+                Use::Stop,
+                NetworkFact {
+                    routes: &actual,
+                    dns: &dns,
+                    protected: Some(b"original-record"),
+                },
+                Some(&inconsistent),
+            )
+            .is_err(),
+            "every started DNS exchange needs its own bounded returned ACK"
+        );
+    }
+    let mut stale_dns = dns.clone();
+    stale_dns.settings.enable_llmnr = 1;
+    let stale = (vec![], (1, vec![stale_dns.clone()]));
+    assert!(
+        network(
+            &r,
+            Use::Stop,
+            NetworkFact {
+                routes: &actual,
+                dns: &dns,
+                protected: Some(b"original-record"),
+            },
+            Some(&stale),
+        )
+        .is_err(),
+        "a real exchange still needs its latest exact full DNS ACK"
+    );
+    for fault in 0..4 {
+        let mut drifted = r.clone();
+        let mut actual_dns = dns.clone();
+        let mut protected = Some(b"original-record".as_slice());
+        match fault {
+            0 => protected = None,
+            1 => actual_dns = stale_dns.clone(),
+            2 => {
+                actual_dns = stale_dns.clone();
+                drifted.network.as_mut().unwrap().current.dns = Some(actual_dns.clone());
+            }
+            _ => {
+                let n = drifted.network.as_mut().unwrap();
+                n.baseline.routes.push(route.route.clone());
+                n.current = n.baseline.clone();
+            }
+        }
+        assert!(
+            network(
+                &drifted,
+                Use::Stop,
+                NetworkFact {
+                    routes: &actual,
+                    dns: &actual_dns,
+                    protected,
+                },
+                Some(&empty),
+            )
+            .is_err(),
+            "zero exchanges cannot waive original baseline or current DNS: fault {fault}"
+        );
+    }
+    let forward_routes = no_routes();
+    assert!(
+        network(
+            &r,
+            Use::Reserve,
+            NetworkFact {
+                routes: &forward_routes,
+                dns: &dns,
+                protected: Some(b"original-record"),
+            },
+            Some(&empty),
+        )
+        .is_err(),
+        "zero DNS exchanges never supply a forward network ACK"
+    );
     assert!(network(
         &r,
         Use::Stop,
@@ -857,7 +965,7 @@ fn network_before_effects_accepts_empty_owner_history_and_closing_requires_resto
         None
     )
     .is_err());
-    let bad = (vec![], vec![]);
+    let bad = (vec![], (1, vec![]));
     assert!(network(
         &r,
         Use::Stop,
@@ -1237,7 +1345,7 @@ fn reserve_route_read_requires_exact_last_original_ack_and_no_unknown_or_extra_r
                 deleting: false,
                 acknowledged: true,
             }],
-            vec![dns.clone()],
+            (1, vec![dns.clone()]),
         )
     };
     network(
@@ -1266,7 +1374,7 @@ fn reserve_route_read_requires_exact_last_original_ack_and_no_unknown_or_extra_r
                 actual: Some(row.clone()),
             }),
             7 => actual.pending_active = Some(Slot::B),
-            _ => ack.1[0].settings.enable_llmnr = 1,
+            _ => ack.1 .1[0].settings.enable_llmnr = 1,
         }
         assert!(
             network(
@@ -1444,7 +1552,7 @@ fn retirement_network_requires_other_active_and_target_routes_actually_removed()
     r.network.as_mut().unwrap().current.dns = Some(dns.clone());
     let mut facts = no_routes();
     facts.active = Some(Slot::A);
-    let mut ack = (vec![], vec![dns.clone()]);
+    let mut ack = (vec![], (1, vec![dns.clone()]));
     let check = |record: &pair::Record,
                  facts: &super::super::member_carrier_network::NetworkFacts,
                  ack: &NetworkAcks| {

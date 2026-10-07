@@ -424,7 +424,7 @@ struct NetworkFact<'a> {
 #[cfg(any(windows, test))]
 type NetworkAcks = (
     Vec<super::member_carrier_network_owner::RouteAttempt>,
-    Vec<crate::member_dns::Snapshot>,
+    (usize, Vec<crate::member_dns::Snapshot>),
 );
 #[cfg(any(windows, test))]
 fn network(
@@ -447,7 +447,9 @@ fn network(
     if usage == Use::Primary || cleanup_use(usage) && record.network.is_none() {
         if record.network.is_some()
             || fact.protected.is_some()
-            || ack.is_some_and(|(routes, dns)| !routes.is_empty() || !dns.is_empty())
+            || ack.is_some_and(|(routes, (started, dns))| {
+                !routes.is_empty() || *started != 0 || !dns.is_empty()
+            })
             || !fact.routes.current.is_empty()
             || fact.routes.active.is_some()
             || fact.routes.stopping
@@ -467,11 +469,16 @@ fn network(
         return Ok(());
     }
     let n = record.network.as_ref().ok_or(Error::Conflict)?;
-    let (routes, dns_acks) = ack.ok_or(Error::Pending)?;
+    let (routes, (dns_started, dns_acks)) = ack.ok_or(Error::Pending)?;
     if fact.protected.is_none()
         || n.pending.is_some()
         || n.current.dns.as_ref() != Some(dns)
-        || dns_acks.last() != Some(dns)
+        || *dns_started != dns_acks.len()
+        || *dns_started > 32768
+        // Only restored cleanup may have no DNS exchange to acknowledge.
+        // A started exchange still requires its exact latest returned ACK.
+        || (dns_acks.last() != Some(dns)
+            && !(cleanup_use(usage) && *dns_started == 0 && dns_acks.is_empty()))
         || routes.iter().any(|a| !a.acknowledged)
     {
         return Err(Error::Conflict);
@@ -1098,7 +1105,9 @@ pub(crate) mod native {
                     if !original.matches_origin(&upgrade(&self.source)?, &gate) {
                         return Err(Error::Conflict);
                     }
-                    original.acknowledgements().map_err(denied)
+                    let (routes, _) = original.acknowledgements().map_err(denied)?;
+                    let dns = original.dns_exchange_history().map_err(denied)?;
+                    Ok((routes, dns))
                 })
                 .transpose()?;
             let inspect_network =
