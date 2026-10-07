@@ -2,8 +2,8 @@
 //! This is a child of member_session so ONLY its protected writer can mint ACKs.
 #![allow(dead_code)]
 use super::{
-    Backend, EngineIdentity, ProtectedSessionFiles, RecordKind, SessionFileIo, SessionFiles,
-    SessionIdentity, SessionScope, SessionSnapshot,
+    ProtectedSessionFiles, RecordKind, SessionFileIo, SessionFiles, SessionIdentity, SessionScope,
+    SessionSnapshot,
 };
 use std::{
     io,
@@ -276,30 +276,14 @@ impl<I> Clone for SessionAckRoot<I> {
         }
     }
 }
-pub(crate) struct SessionAckRead<I> {
-    backend: Weak<Mutex<Backend<I>>>,
-    registration: Weak<Mutex<Option<Arc<ClaimHistory>>>>,
-    history: Weak<ClaimHistory>,
-    runtime: EngineIdentity,
-    boot: [u8; 16],
-    current_boot: [u8; 16],
-}
 pub(crate) struct ExecutionRoot<I> {
     origin: SessionAckRoot<I>,
     state: Arc<ExecutionState>,
-}
-pub(crate) struct ExecutionRead<I> {
-    origin: SessionAckRead<I>,
-    state: Weak<ExecutionState>,
 }
 pub(crate) struct BirthCleanupView<I> {
     files: ProtectedSessionFiles<I>,
 }
 impl<I> BirthCleanupView<I> {
-    /// The actual bound frontend, not a reconstructed origin or ACK.
-    pub(crate) fn files(&self) -> &ProtectedSessionFiles<I> {
-        &self.files
-    }
     pub(crate) fn into_files(self) -> ProtectedSessionFiles<I> {
         self.files
     }
@@ -349,21 +333,6 @@ impl<I: SessionFileIo> ExecutionRoot<I> {
         view.retained_scope = Some(self.state.context.intent.scope.clone());
         view.native_carrier_access(&self.state.context.intent.scope)?;
         Ok(BirthCleanupView { files: view })
-    }
-    pub(crate) fn native_birth_cleanup_view(
-        &self,
-        files: &ProtectedSessionFiles<I>,
-    ) -> io::Result<BirthCleanupView<I>> {
-        self.native_cleanup_view(files)
-    }
-    pub(crate) fn downgrade(&self) -> ExecutionRead<I> {
-        ExecutionRead {
-            origin: self.origin.downgrade(),
-            state: Arc::downgrade(&self.state),
-        }
-    }
-    pub(crate) fn same_original(&self, other: &Self) -> bool {
-        self.origin.same_original(&other.origin) && Arc::ptr_eq(&self.state, &other.state)
     }
     /// Original backend/frontend metadata and SAME current claim registration
     /// only. Recovery/foreign files deny; equal bytes grant nothing.
@@ -545,25 +514,6 @@ impl<I: SessionFileIo> ExecutionRoot<I> {
         let mut view = files.clone();
         view.native_execution = Some(Arc::downgrade(&self.state));
         Ok(view)
-    }
-}
-impl<I: SessionFileIo> ExecutionRead<I> {
-    pub(crate) fn same_original(&self, other: &Self) -> bool {
-        Weak::ptr_eq(&self.state, &other.state)
-            && Weak::ptr_eq(&self.origin.history, &other.origin.history)
-            && Weak::ptr_eq(&self.origin.backend, &other.origin.backend)
-    }
-    pub(crate) fn upgrade(&self) -> io::Result<ExecutionRoot<I>> {
-        let state = self.state.upgrade().ok_or_else(conflict)?;
-        let origin = self.origin.upgrade()?;
-        state.require_registered(&origin.history)?;
-        Ok(ExecutionRoot { origin, state })
-    }
-    pub(crate) fn current_lease(&self) -> io::Result<Arc<ExecutionLease>> {
-        self.upgrade()?.current_lease()
-    }
-    pub(crate) fn verify_current(&self, lease: &Arc<ExecutionLease>) -> io::Result<ExecutionFacts> {
-        self.upgrade()?.verify_current(lease)
     }
 }
 struct ExecutionFlight {
@@ -967,9 +917,6 @@ impl<I: SessionFileIo> SessionAckRoot<I> {
             history,
         })
     }
-    pub(crate) fn same_original(&self, other: &Self) -> bool {
-        self.files.same_original_backend(&other.files) && Arc::ptr_eq(&self.history, &other.history)
-    }
     pub(crate) fn matches_origin(&self, files: &ProtectedSessionFiles<I>) -> bool {
         !files.cleanup_only
             && self.files.same_original_backend(files)
@@ -978,16 +925,6 @@ impl<I: SessionFileIo> SessionAckRoot<I> {
                 .epoch_history
                 .try_lock()
                 .is_ok_and(|slot| slot.as_ref().is_some_and(|h| Arc::ptr_eq(h, &self.history)))
-    }
-    pub(crate) fn downgrade(&self) -> SessionAckRead<I> {
-        SessionAckRead {
-            backend: Arc::downgrade(&self.files.backend),
-            registration: Arc::downgrade(&self.files.epoch_history),
-            history: Arc::downgrade(&self.history),
-            runtime: self.files.runtime.clone(),
-            boot: self.files.boot,
-            current_boot: self.files.current_boot,
-        }
     }
     pub(crate) fn acknowledgements(&self) -> io::Result<Vec<SessionWriteAck>> {
         Ok(self
@@ -1058,56 +995,11 @@ impl<I: SessionFileIo> SessionAckRoot<I> {
         Ok(result)
     }
 }
-impl<I: SessionFileIo> SessionAckRead<I> {
-    pub(crate) fn upgrade(&self) -> io::Result<SessionAckRoot<I>> {
-        let history = self.history.upgrade().ok_or_else(conflict)?;
-        let files = ProtectedSessionFiles {
-            backend: self.backend.upgrade().ok_or_else(conflict)?,
-            epoch_history: self.registration.upgrade().ok_or_else(conflict)?,
-            native_execution: None,
-            native_cleanup: false,
-            runtime: self.runtime.clone(),
-            boot: self.boot,
-            current_boot: self.current_boot,
-            cleanup_only: false,
-            retained_scope: None,
-        };
-        if files
-            .epoch_history
-            .try_lock()
-            .map_err(|_| conflict())?
-            .as_ref()
-            .is_none_or(|h| !Arc::ptr_eq(h, &history))
-        {
-            history.revoke();
-            return Err(conflict());
-        }
-        let actual = SessionAckRoot::from_original(&files, history.birth.scope())?;
-        if !Arc::ptr_eq(&actual.history, &history) {
-            return Err(conflict());
-        }
-        Ok(actual)
-    }
-    pub(crate) fn inspect<T>(
-        &self,
-        callback: impl FnOnce(&SessionEpochFacts<'_>) -> io::Result<T>,
-    ) -> io::Result<T> {
-        self.upgrade()?.inspect(callback)
-    }
-}
 #[cfg(windows)]
 pub(crate) type NativeSessionAckRoot = SessionAckRoot<crate::windows::member_files::MemberFiles>;
 #[cfg(windows)]
-pub(crate) type NativeSessionAckRead = SessionAckRead<crate::windows::member_files::MemberFiles>;
-#[cfg(windows)]
 pub(crate) type NativeExecutionRoot = ExecutionRoot<crate::windows::member_files::MemberFiles>;
-#[cfg(windows)]
-pub(crate) type NativeExecutionRead = ExecutionRead<crate::windows::member_files::MemberFiles>;
 pub(crate) type NativeExecutionLease = ExecutionLease;
-pub(crate) type NativeExecutionFacts = ExecutionFacts;
-#[cfg(windows)]
-pub(crate) type NativeBirthCleanupView =
-    BirthCleanupView<crate::windows::member_files::MemberFiles>;
 #[cfg(test)]
 #[path = "member_carrier_epoch_tests.rs"]
 mod tests;

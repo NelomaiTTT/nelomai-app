@@ -1,4 +1,4 @@
-use super::super::{PrivateFile, PrivateRecords, SessionFileIo, SessionFiles};
+use super::super::{EngineIdentity, PrivateFile, PrivateRecords, SessionFileIo, SessionFiles};
 use super::*;
 use nelomai_client_tunnel::redundancy::{
     session::{SessionPhase, SessionState},
@@ -125,7 +125,6 @@ fn actual_claim_and_starting_running_epoch_two_three_keep_birth_fixed() {
     let mut f = files(&d);
     f.claim(&scope()).unwrap();
     let root = f.session_ack_root(&scope()).unwrap();
-    let read = root.downgrade();
     let mut before = initial();
     write(&mut f, None, &before).unwrap();
     let first = root
@@ -147,7 +146,7 @@ fn actual_claim_and_starting_running_epoch_two_three_keep_birth_fixed() {
         next.installed[0] = true;
         next.committed[0] = true;
         write(&mut f, Some(&before), &next).unwrap();
-        read.inspect(|facts| {
+        root.inspect(|facts| {
             assert_eq!(facts.birth.network_epoch(), 1);
             assert_eq!(facts.birth.scope(), &scope());
             assert_eq!(facts.execution.value(), epoch);
@@ -159,7 +158,8 @@ fn actual_claim_and_starting_running_epoch_two_three_keep_birth_fixed() {
         before = next;
     }
     assert_eq!(root.acknowledgements().unwrap().len(), 4);
-    assert!(root.same_original(&f.session_ack_root(&scope()).unwrap()));
+    assert!(root.matches_origin(&f));
+    assert!(f.session_ack_root(&scope()).unwrap().matches_origin(&f));
 }
 
 #[test]
@@ -278,21 +278,17 @@ fn caught_read_or_session_write_reentry_revokes_original_without_deadlock() {
 }
 
 #[test]
-fn unwind_and_dead_weak_origin_do_not_refresh_or_manufacture_epoch() {
+fn unwind_does_not_refresh_or_manufacture_epoch() {
     let d = Disk::default();
     let mut f = files(&d);
     f.claim(&scope()).unwrap();
     let root = f.session_ack_root(&scope()).unwrap();
-    let weak = root.downgrade();
     write(&mut f, None, &initial()).unwrap();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || root.inspect::<()>(|_| panic!("callback"))
     ))
     .is_err());
-    assert!(weak.inspect(|_| Ok(())).is_err());
-    drop(root);
-    drop(f);
-    assert!(weak.upgrade().is_err());
+    assert!(root.inspect(|_| Ok(())).is_err());
 }
 
 #[test]
@@ -310,7 +306,7 @@ fn revoked_root_getter_cannot_refresh_from_restored_equal_session_bytes() {
     assert!(root.inspect(|_| Ok(())).is_err());
     d.0.borrow_mut().bytes.insert(PrivateFile::Session, raw);
     assert!(f.session_ack_root(&scope()).is_err());
-    assert!(root.downgrade().upgrade().is_err());
+    assert!(root.inspect(|_| Ok(())).is_err());
 }
 
 #[test]
@@ -319,7 +315,6 @@ fn completed_claim_and_next_claim_have_distinct_original_histories() {
     let mut f = files(&d);
     f.claim(&scope()).unwrap();
     let old = f.session_ack_root(&scope()).unwrap();
-    let weak = old.downgrade();
     let starting = initial();
     write(&mut f, None, &starting).unwrap();
     let old_ack = old.inspect(|facts| Ok(facts.ack.clone())).unwrap();
@@ -351,9 +346,9 @@ fn completed_claim_and_next_claim_have_distinct_original_histories() {
     next_scope.connection_generation += 1;
     f.claim(&next_scope).unwrap();
     let new = f.session_ack_root(&next_scope).unwrap();
-    assert!(!old.same_original(&new));
     assert!(!old.matches_origin(&f));
-    assert!(weak.upgrade().is_err());
+    assert!(new.matches_origin(&f));
+    assert!(old.inspect(|_| Ok(())).is_err());
     let mut next = initial();
     next.scope = next_scope;
     write(&mut f, None, &next).unwrap();
@@ -835,18 +830,16 @@ fn native_birth_record_false_success_lost_ack_and_outer_drift_fence_original() {
 }
 
 #[test]
-fn native_birth_weak_execution_read_releases_private_lock_and_cannot_keep_root_alive() {
+fn native_birth_execution_read_releases_private_lock_and_cannot_keep_root_alive() {
     let (_, mut f, _, execution, lease, _) = bound_running();
-    let read = execution.downgrade();
-    assert!(read.same_original(&execution.downgrade()));
-    let facts = read.verify_current(&lease).unwrap();
+    let facts = execution.verify_current(&lease).unwrap();
     // This real Session read after return would deadlock/fence if locks leaked.
     assert_eq!(
         f.read(&scope(), RecordKind::Session).unwrap().unwrap(),
         payload(&facts.session)
     );
     drop(execution);
-    assert!(read.upgrade().is_err());
+    assert!(lease.origin.upgrade().is_none());
 }
 
 fn rows_record(
@@ -1203,7 +1196,6 @@ fn native_birth_view_identity_requires_original_bound_state_even_after_cleanup_r
     let (_, _, _, foreign, _, _) = bound_start();
     assert!(!foreign.matches_native_view(&view));
     let cleanup_cap = execution.native_cleanup_view(&files).unwrap();
-    assert!(execution.matches_native_view(cleanup_cap.files()));
     let cleanup = cleanup_cap.into_files();
     assert!(execution.matches_native_view(&cleanup));
     assert!(execution.matches_native_view(&cleanup.clone()));
@@ -1483,10 +1475,7 @@ fn native_birth_cleanup_after_uncertain_session_ack_reads_owned_context_and_only
         assert!(write(&mut f, Some(&s), &next).is_err());
         assert!(execution.verify_current(&lease).is_err());
         assert!(forward.native_carrier_access(&scope()).is_err());
-        let mut cleanup = execution
-            .native_birth_cleanup_view(&f)
-            .unwrap()
-            .into_files();
+        let mut cleanup = execution.native_cleanup_view(&f).unwrap().into_files();
         let facts = cleanup.native_carrier_access(&scope()).unwrap();
         assert!(!facts.is_fresh());
         assert_eq!(facts.provenance, context.provenance);
@@ -1558,15 +1547,12 @@ fn native_birth_cleanup_after_uncertain_session_ack_reads_owned_context_and_only
 #[test]
 fn native_birth_cleanup_facet_denies_other_backend_context_successor_claim_and_dead_root() {
     let (d, mut f, _, execution, _, s) = bound_start();
-    assert!(execution.native_birth_cleanup_view(&files(&d)).is_err());
-    let mut cleanup = execution
-        .native_birth_cleanup_view(&f)
-        .unwrap()
-        .into_files();
+    assert!(execution.native_cleanup_view(&files(&d)).is_err());
+    let mut cleanup = execution.native_cleanup_view(&f).unwrap().into_files();
     assert!(!cleanup.native_carrier_access(&scope()).unwrap().is_fresh());
     let mut alias = f.clone();
     alias.boot = [8; 16];
-    assert!(execution.native_birth_cleanup_view(&alias).is_err());
+    assert!(execution.native_cleanup_view(&alias).is_err());
     // A different active private claim may never become cleanup authority.
     let mut index: super::super::SessionIndex =
         serde_json::from_slice(d.0.borrow().bytes.get(&PrivateFile::Index).unwrap()).unwrap();
