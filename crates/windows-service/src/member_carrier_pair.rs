@@ -767,7 +767,6 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
     /// Failed ACK is always sticky, even when readback proves the exact write.
     /// Readback classifies ONLY cleanup authority; it never resumes execution.
     fn save(&mut self, mut next: Record) -> io::Result<()> {
-        self.require_current()?;
         next.revision = self.record.revision.checked_add(1).ok_or_else(failed)?;
         validate_transition(Some(&self.record), &next)?;
         self.uncertain_write = Some(next.clone());
