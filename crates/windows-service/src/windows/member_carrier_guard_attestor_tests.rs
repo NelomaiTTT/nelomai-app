@@ -107,7 +107,14 @@ fn fixture() -> (Context, pair::Record, Model) {
                     creation_time: 100,
                 },
             }),
-            retired_proof: None,
+            // The prior process identity remains factual after a fresh Start.
+            retired_proof: Some(owner::NativeProof {
+                interface: a,
+                process: owner::ProcessProof {
+                    pid: 40,
+                    creation_time: 90,
+                },
+            }),
             previous_config_sha256: None,
         },
         lease_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -291,6 +298,15 @@ fn first_static_base_accepts_exact_starting_original_comparison() {
         compare_exchange(&c, &r, SessionKind::StaticBase, &r.guard, &d),
         Ok(ExchangeEdge::Base)
     );
+    let mut fresh = r.clone();
+    fresh.members[0].as_mut().unwrap().owner.retired_proof = None;
+    assert_eq!(compare_bindings(&c, &fresh, &facts(&d)), Ok(()));
+    let mut prepared = r.clone();
+    prepared.members[0].as_mut().unwrap().owner.phase = owner::Phase::Prepared;
+    prepared.members[0].as_mut().unwrap().owner.proof = None;
+    assert!(compare_pair(&c, &prepared).is_err());
+    prepared.members[0].as_mut().unwrap().owner.retired_proof = None;
+    assert_eq!(compare_pair(&c, &prepared), Ok(()));
 }
 // Break: allowing a Dynamic transaction to create persistent blocks.
 #[test]

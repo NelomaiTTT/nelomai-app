@@ -8357,21 +8357,19 @@ pub(crate) mod native {
                             {
                                 return Err(CarrierError::Conflict);
                             }
-                            let prior = controller.retained_stopped().cloned();
                             #[cfg(test)]
                             super::super::member_carrier_factory_test_os::trace_step(
                                 "member start controller.start entered",
                             );
-                            acknowledged = Some(
-                                controller
-                                    .start(&pin, record, receipt, prior.as_ref())
-                                    .inspect_err(|_error| {
+                            acknowledged =
+                                Some(controller.start(&pin, record, receipt).inspect_err(
+                                    |_error| {
                                         #[cfg(test)]
                                         eprintln!(
                                             "actual member start controller.start error={_error:?}"
                                         );
-                                    })?,
-                            );
+                                    },
+                                )?);
                             Ok(())
                         },
                     )

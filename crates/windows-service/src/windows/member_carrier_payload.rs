@@ -347,13 +347,11 @@ pub(crate) mod native {
             #[cfg(test)]
             trace_step("source current check");
             // SAME retained handles keep both slots' signed byte proof alive.
-            // This retained layout and canonical path read grants no authority;
-            // the final strict DLL/owner/root checks precede successful return.
+            // The initial canonical engine binding stays pinned by the original
+            // payload/ancestor handles; strict DLL/owner/root checks still run.
             let layout = self.installed.layout();
             if layout.identity != self.identity
                 || layout.directory != self.directory
-                || std::fs::canonicalize(layout.engine_path()).map_err(|_| Error::Native)?
-                    != self.executable
                 || layout.engine_path().with_file_name(self.kind.path()) != self.payload.path()
             {
                 return Err(Error::Conflict);
@@ -610,8 +608,6 @@ pub(crate) mod native {
             let layout = carrier.installed.layout();
             if layout.identity != carrier.identity
                 || layout.directory != carrier.directory
-                || std::fs::canonicalize(layout.engine_path()).map_err(|_| Error::Native)?
-                    != carrier.executable
                 || layout.engine_path().with_file_name(carrier.kind.path())
                     != carrier.payload.path()
             {

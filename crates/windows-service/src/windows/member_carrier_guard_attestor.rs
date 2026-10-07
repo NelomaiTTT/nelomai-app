@@ -238,7 +238,9 @@ fn compare_pair(context: &Context, record: &pair::Record) -> Result<()> {
         if let Some(member) = member {
             let proof = member.owner.proof.or(member.owner.retired_proof);
             if proof.is_some_and(|p| p.interface.guid != context.bindings[i + 1].guid)
-                || (record.phase != pair::Phase::Closing && member.owner.retired_proof.is_some())
+                || (record.phase != pair::Phase::Closing
+                    && member.owner.phase != crate::member_owner::Phase::Running
+                    && member.owner.retired_proof.is_some())
             {
                 return Err(GuardError::Conflict);
             }

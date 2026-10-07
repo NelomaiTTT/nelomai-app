@@ -72,7 +72,14 @@ fn network_fixture() -> (Context, pair::Record) {
                     creation_time: 100,
                 },
             }),
-            retired_proof: None,
+            // The prior process identity remains factual after a fresh Start.
+            retired_proof: Some(owner::NativeProof {
+                interface: a,
+                process: owner::ProcessProof {
+                    pid: 40,
+                    creation_time: 90,
+                },
+            }),
             previous_config_sha256: None,
         },
         lease_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -375,6 +382,7 @@ fn retire_fixture() -> (
             creation_time: 110,
         },
     });
+    b.owner.retired_proof.as_mut().unwrap().interface = b.owner.proof.unwrap().interface;
     b.lease_id = "33333333-3333-4333-8333-333333333333".into();
     b.probe.target_ipv4 = "9.9.9.9".parse().unwrap();
     b.endpoint = "192.0.2.12".parse().unwrap();

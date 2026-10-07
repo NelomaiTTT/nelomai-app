@@ -5016,9 +5016,6 @@ pub(crate) mod native {
             owned.forward_read_envelope(pair, expected, lock)?;
             Ok(receipt.running_record().clone()) // DATA backed by this rooted original ACK, not adoption.
         }
-        pub(crate) fn retained_stopped(&self) -> Option<&MemberRecord> {
-            self.root.stopped.as_ref()
-        }
         pub(crate) fn prepared_intent(&self) -> &Intent {
             &self
                 .root
@@ -5036,9 +5033,8 @@ pub(crate) mod native {
             pair_read: &NativePairIntentRead,
             expected: &PairRecord,
             receipt: Receipt<'_>,
-            prior: Option<&MemberRecord>,
         ) -> Result<MemberRecord> {
-            self.start_inner(pair_read, expected, receipt, prior)
+            self.start_inner(pair_read, expected, receipt)
                 .map_err(pending_unknown)
         }
         fn start_inner(
@@ -5046,16 +5042,11 @@ pub(crate) mod native {
             pair_read: &NativePairIntentRead,
             expected: &PairRecord,
             receipt: Receipt<'_>,
-            prior: Option<&MemberRecord>,
         ) -> Result<MemberRecord> {
             let owner = self.root.owner.as_ref().ok_or(Error::Retired)?;
-            if owner
-                .prior
-                .as_ref()
-                .is_some_and(|actual| actual.as_ref() != prior)
-            {
-                return Err(Error::Conflict);
-            }
+            // Bind Start to the SAME predecessor captured by preparation;
+            // this new controller has not issued its own Stopped ACK yet.
+            let prior = owner.prior.as_ref().ok_or(Error::Pending)?.clone();
             let context = owner.context.clone();
             let runtime = owner.runtime.read_pin()?;
             let source = owner.source.clone();
@@ -5071,7 +5062,7 @@ pub(crate) mod native {
                     // Real service/process path, never a successful stub.
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::trace_step("member start native begin");
-                    let result = owned.member.start_with_prior(prior).map_err(owner_error);
+                    let result = owned.member.start_with_prior(prior.as_ref()).map_err(owner_error);
                     #[cfg(test)]
                     super::super::member_carrier_factory_test_os::trace_step("member start native returned");
                     result

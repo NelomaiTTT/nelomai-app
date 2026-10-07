@@ -1024,7 +1024,18 @@ fn fixture() -> (Context, pair::Record) {
                     creation_time: 100,
                 },
             }),
-            retired_proof: None,
+            // Running retains the distinct retired identity of its predecessor.
+            retired_proof: Some(owner::NativeProof {
+                interface: owner::InterfaceProof {
+                    index: 18,
+                    luid: 191,
+                    guid: [12; 16],
+                },
+                process: owner::ProcessProof {
+                    pid: 40,
+                    creation_time: 90,
+                },
+            }),
             previous_config_sha256: None,
         },
         lease_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -1513,6 +1524,13 @@ fn static_base_checks_stable_network_without_future_operation_plan() {
 fn exact_network_stage_selects_only_source_or_stage_two_closing() {
     let (c, r) = fixture();
     assert_eq!(compare_stage(&c, &r, false).unwrap(), Channel::Source);
+    let mut fresh = r.clone();
+    fresh.members[0].as_mut().unwrap().owner.retired_proof = None;
+    assert_eq!(compare_stage(&c, &fresh, false).unwrap(), Channel::Source);
+    let mut wrong = r.clone();
+    let owner = &mut wrong.members[0].as_mut().unwrap().owner;
+    owner.proof = owner.retired_proof;
+    assert!(compare_stage(&c, &wrong, false).is_err());
     let mut stop = r.clone();
     stop.phase = pair::Phase::Closing;
     stop.active = None;

@@ -141,7 +141,6 @@ fn compare_stage(context: &Context, record: &pair::Record, cleanup: bool) -> io:
             if m.owner
                 .proof
                 .is_none_or(|p| p.interface.guid != context.bindings[i + 1].guid)
-                || m.owner.retired_proof.is_some()
                 || m.owner.phase != crate::member_owner::Phase::Running
             {
                 return Err(conflict());
@@ -299,7 +298,6 @@ fn compare_guard_resource_stage(context: &Context, record: &pair::Record) -> io:
                 .owner
                 .proof
                 .is_none_or(|p| p.interface.guid != context.bindings[i + 1].guid)
-                || member.owner.retired_proof.is_some()
                 || member.owner.phase != crate::member_owner::Phase::Running
             {
                 return Err(conflict());
@@ -1552,7 +1550,6 @@ fn compare_guard_member_lineage(
         || current.active == Some(slot)
         || current.active != old.active
         || original.owner.phase != crate::member_owner::Phase::Running
-        || original.owner.retired_proof.is_some()
         || current
             .network
             .as_ref()
@@ -1630,7 +1627,6 @@ fn compare_closed_resource_row(
         if member.owner.intent != history.intent
             || member.owner.proof != Some(history.proof)
             || member.owner.phase != crate::member_owner::Phase::Running
-            || member.owner.retired_proof.is_some()
         {
             return Err(conflict());
         }
@@ -3140,7 +3136,6 @@ pub(crate) mod native {
                             || original.owner.intent != history.intent
                             || original.owner.proof != Some(history.proof)
                             || original.owner.phase != crate::member_owner::Phase::Running
-                            || original.owner.retired_proof.is_some()
                             || r.members[i].as_ref().is_some_and(|m| m != original)
                         {
                             return Err(conflict());

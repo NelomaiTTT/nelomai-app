@@ -61,7 +61,6 @@ fn compare_identity(context: &Context, r: &pair::Record) -> Result<()> {
     for (i, m) in r.members.iter().enumerate() {
         if let Some(m) = m {
             if m.owner.phase != crate::member_owner::Phase::Running
-                || m.owner.retired_proof.is_some()
                 || m.owner
                     .proof
                     .is_none_or(|p| p.interface.guid != context.bindings[i + 1].guid)
