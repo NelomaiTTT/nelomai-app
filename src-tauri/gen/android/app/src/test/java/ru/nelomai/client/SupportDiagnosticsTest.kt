@@ -36,6 +36,9 @@ class SupportDiagnosticsTest {
         val body = JSONObject(report.payload)
         assertEquals("manual", body.getString("trigger"))
         assertEquals("0.3.3", body.getString("app_version"))
+        assertEquals("0.3.3", body.getString("container_version"))
+        assertFalse(body.has("runtime_version"))
+        assertFalse(body.has("runtime_contract_version"))
         assertFalse(body.has("platform"))
         assertEquals("aarch64", body.getString("architecture"))
         assertEquals("Android 16", body.getString("platform_version"))
@@ -55,7 +58,7 @@ class SupportDiagnosticsTest {
             JSONObject(it.bufferedReader(Charsets.UTF_8).readText())
         }
         val body = JSONObject(SupportDiagnosticCollector(files, backup, "Android 13 (API 33)").collect("").payload)
-        assertEquals(fixture.keys().asSequence().toSet(), body.keys().asSequence().toSet())
+        assertEquals(fixture.keys().asSequence().toSet() + "container_version", body.keys().asSequence().toSet())
         // The fixture records an older client's schema, not this build's version.
         assertEquals("0.3.3", body.getString("app_version"))
         for (field in listOf("trigger", "architecture", "platform_version")) {

@@ -1130,9 +1130,18 @@ impl DesktopConnectionIntent {
         if !actions.queue_report {
             return;
         }
+        let identity_before = crate::diagnostics::diagnostic_runtime_snapshot(&self.app).await;
+        let identity_after = crate::diagnostics::diagnostic_runtime_snapshot(&self.app).await;
         if let Err(error) = self
             .diagnostics
-            .queue_connection_intent_report(trigger, crate::current_unix_time())
+            .queue_connection_intent_report_with_identity(
+                trigger,
+                crate::current_unix_time(),
+                crate::diagnostics::coherent_diagnostic_identity(
+                    identity_before.as_ref(),
+                    identity_after.as_ref(),
+                ),
+            )
         {
             self.state
                 .lock()

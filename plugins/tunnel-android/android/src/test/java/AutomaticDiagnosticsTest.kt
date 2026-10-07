@@ -12,7 +12,103 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
+@org.junit.runner.RunWith(org.robolectric.RobolectricTestRunner::class)
+@org.robolectric.annotation.Config(sdk = [34], manifest = org.robolectric.annotation.Config.NONE,
+    shadows = [DiagnosticMemoryShadow::class])
+class AutomaticDiagnosticsIdentityBuildersTest {
+    @Test fun actualAutomaticBuildersUseFrozenIdentityWithoutRelabelingLegacyReports() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val identity = JSONObject().put("container_version", "0.3.3")
+            .put("runtime_version", "0.2.20").put("runtime_slot", "stable").put("runtime_contract_version", 1)
+        // Materialize a persisted identity after a container update, not from current provenance.
+        val frozenIdentity = identity.toString()
+        val packageInfo = context.packageManager.getPackageInfo(context.packageName, 0).apply {
+            versionName = "0.3.4"
+        }
+        org.robolectric.Shadows.shadowOf(context.packageManager).installPackage(packageInfo)
+        assertEquals("0.3.4", context.packageManager.getPackageInfo(context.packageName, 0).versionName)
+        val session = AutomaticDiagnostics.javaClass.declaredMethods.single { it.name == "buildReport" }.apply { isAccessible = true }
+        val failure = AutomaticDiagnostics.javaClass.declaredMethods.single { it.name == "buildStartFailureReport" }.apply { isAccessible = true }
+        val known = listOf(
+            session.invoke(AutomaticDiagnostics, context, "report", "tunnel_interrupted", "session", 1, 10L, 20L, false, null, JSONObject(frozenIdentity)) as JSONObject,
+            failure.invoke(AutomaticDiagnostics, context, "report", 20L, "service_timeout", null, "connection_start_failed", JSONObject(frozenIdentity)) as JSONObject,
+            failure.invoke(AutomaticDiagnostics, context, "report", 20L, "service_timeout", null, "connection_intent_terminal_failure", JSONObject(frozenIdentity)) as JSONObject,
+        )
+        identity.put("runtime_version", "changed-after-creation")
+        for (report in known) {
+            assertEquals("0.2.20", report.optString("runtime_version"))
+            assertEquals("stable", report.getString("runtime_slot"))
+            assertEquals(1, report.getInt("runtime_contract_version"))
+            assertEquals("0.3.3", report.getString("container_version"))
+            assertEquals("0.3.3", report.getString("app_version"))
+            assertFalse(report.has("session_generation"))
+        }
+        val legacyReports = listOf(
+            session.invoke(AutomaticDiagnostics, context, "report", "tunnel_interrupted", "session", 1, 10L, 20L, false, null, null) as JSONObject,
+            failure.invoke(AutomaticDiagnostics, context, "report", 20L, "service_timeout", null, "connection_start_failed", null) as JSONObject,
+            failure.invoke(AutomaticDiagnostics, context, "report", 20L, "service_timeout", null, "connection_intent_terminal_failure", null) as JSONObject,
+        )
+        for (legacy in legacyReports) {
+            assertEquals("0.3.4", legacy.getString("app_version"))
+            for (field in listOf("container_version", "runtime_version", "runtime_slot", "runtime_contract_version")) {
+                assertFalse("Legacy ${legacy.getString("trigger")} acquired $field", legacy.has(field))
+            }
+        }
+    }
+}
+
+// Robolectric does not implement this platform memory query. Keep the report builder real.
+@org.robolectric.annotation.Implements(android.app.ActivityManager::class)
+class DiagnosticMemoryShadow : org.robolectric.shadows.ShadowActivityManager() {
+    @org.robolectric.annotation.Implementation
+    fun getProcessMemoryInfo(pids: IntArray): Array<android.os.Debug.MemoryInfo> =
+        Array(pids.size) { android.os.Debug.MemoryInfo() }
+}
+
 class AutomaticDiagnosticsTest {
+    private fun diagnosticOwner(generation: Long = 7) = NativeOwnerScope(
+        1, "private-family", "11111111-1111-4111-8111-111111111111", "stable",
+        "0.3.3", "0.2.20", 1, generation,
+    )
+
+    @Test fun diagnosticIdentityUsesOwnerVersionAndFailsUnknownAcrossGenerationChanges() {
+        val owner = diagnosticOwner()
+        val known = automaticDiagnosticsIdentity("0.3.3", owner, owner)
+        assertEquals("0.2.20", known.optString("runtime_version"))
+        assertEquals("stable", known.getString("runtime_slot"))
+        assertEquals(1, known.getInt("runtime_contract_version"))
+        assertEquals(setOf("container_version", "runtime_version", "runtime_slot", "runtime_contract_version"), known.keys().asSequence().toSet())
+        for (after in listOf(diagnosticOwner(8), null, owner.copy(runtimeVersion = "0.3.3", slot = "latest"))) {
+            val unknown = automaticDiagnosticsIdentity("0.3.3", owner, after)
+            assertEquals(setOf("container_version"), unknown.keys().asSequence().toSet())
+        }
+        assertEquals(setOf("container_version"), automaticDiagnosticsIdentity("0.3.3", null, null).keys().asSequence().toSet())
+        assertEquals(setOf("container_version"), automaticDiagnosticsIdentity("0.3.4", owner, owner).keys().asSequence().toSet())
+    }
+
+    @Test fun diagnosticIdentityRejectsAConcurrentGenerationChange() {
+        val reference = java.util.concurrent.atomic.AtomicReference(diagnosticOwner())
+        val before = reference.get()
+        val changed = CountDownLatch(1)
+        val writer = thread { reference.set(diagnosticOwner(8)); changed.countDown() }
+        assertTrue(changed.await(2, TimeUnit.SECONDS))
+        val payload = automaticDiagnosticsIdentity("0.3.3", before, reference.get())
+        writer.join()
+        assertFalse(payload.has("runtime_version"))
+        assertFalse(payload.has("session_generation"))
+    }
+
+    @Test fun startFailureMarkerPreservesFrozenIdentityAndLegacyMarkersStayUnknown() {
+        val request = StartFailureRequest("33333333-3333-4333-8333-333333333333",
+            "11111111-1111-4111-8111-111111111111", "service_timeout", 100, false)
+        val value = JSONObject(request.toJson()).put("runtime_identity", JSONObject()
+            .put("container_version", "0.3.3").put("runtime_version", "0.2.20")
+            .put("runtime_slot", "stable").put("runtime_contract_version", 1))
+        val restored = JSONObject(StartFailureRequest.fromJson(value.toString()).toJson())
+        assertEquals("0.2.20", restored.optJSONObject("runtime_identity")?.optString("runtime_version"))
+        assertFalse(JSONObject(StartFailureRequest.fromJson(request.toJson()).toJson()).has("runtime_identity"))
+    }
+
     @Test fun intentReportRetainsSafeProbeFailureCodeAlongsideItsClass() {
         val event = automaticDiagnosticsConnectionIntentEvent("retry_scheduled", "server_probes_unavailable", 1, 2)
         val safe = JSONObject(automaticDiagnosticsSafeConnectionIntentLog(event.toString()).trim())

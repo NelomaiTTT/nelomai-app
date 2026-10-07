@@ -51,7 +51,7 @@ class RedundantTransportDiagnosticsTest {
         method.isAccessible = true
         val epoch = System.currentTimeMillis() / 1000
         val report = method.invoke(AutomaticDiagnostics, context, "report", "tunnel_interrupted", "session", 1,
-            epoch - 60, epoch + 60, false, null) as JSONObject
+            epoch - 60, epoch + 60, false, null, null) as JSONObject
         assertTrue(report.getString("helper_log").contains("redundant.transport"))
         assertTrue(report.getString("helper_log").contains("before_stop"))
     }

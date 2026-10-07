@@ -2,10 +2,7 @@ package ru.nelomai.client
 
 import android.app.Activity
 import android.util.Log
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
-import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
+import ru.nelomai.runtime.v1.RuntimeActivityRecovery
 
 internal enum class SupportStartupStage(val code: String) {
     LAUNCHER_OWNER_START("startup.launcher.owner_start_failed"),
@@ -23,17 +20,8 @@ internal object SupportDiagnosticsStartup {
         val cause = (error as? java.lang.reflect.InvocationTargetException)?.targetException ?: error
         // Exception messages/bootstrap payloads can contain credentials. Log only a fixed stage and class.
         Log.e("NelomaiStartup", "code=${stage.code} error_class=${cause.javaClass.name}")
-        activity.setContentView(LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 64, 32, 32)
-            addView(TextView(activity).apply {
-                text = "Не удалось запустить Nelomai. Закройте и откройте приложение. Данные сохранены."
-            })
-            addView(Button(activity).apply {
-                id = OPEN_BUTTON
-                text = "Диагностика"
-                setOnClickListener { SupportDiagnosticsEntry.open(activity) }
-            })
-        })
+        RuntimeActivityRecovery.showFailure(activity, allowRetry = stage in setOf(
+            SupportStartupStage.LAUNCHER_OWNER_START, SupportStartupStage.LAUNCHER_OWNER_READ,
+            SupportStartupStage.BOOTSTRAP_OWNER_READ, SupportStartupStage.BOOTSTRAP_OWNER_ATTACH))
     }
 }

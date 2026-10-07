@@ -111,6 +111,19 @@
 - [ ] Server supportupload: локальныеpanelmigration/APIcode ещё неразвёрнуты. Перед end-to-end отправкой нужна отдельно авторизованная штатнаявыкладка и admincode; безнеё можно принять localexport, но нельзя объявить uploadworking.
 - [ ] Сохранить результаты соsource/run/deviceidentity; после hardware вынести итог и только затем отдельно решать publish. Ничего не выключать/перезагружать по старым heartbeatинструкциям: актуальнуюдоступность/желаниепользователя подтвердить перед hardware.
 
+## Дополнение08.10 — NLM002/058–060 и подтверждённая часть042
+
+Пользователь согласовал этот срез после Task7 diagnostics и отдельно потребовал не добавлять лишнюю архитектуру. Текущий delivery: существующая ветка `Future/diagnostics-032-login-upload`, push и `sign_candidate`0.3.3 без публикации; main не переписывать в рамках этого среза.
+
+- [x] NLM002: после подтверждённого exact-scope logout погасить старое обязательство первоначального перехода; сохранить pending update/switch и чужие receipt guards. Регрессия: failed startup → logout → bootstrap без перезапуска owner, затем новый login/Start.
+- [x] NLM058: при смене boot identity атомарно отменить устаревшее recovery-намерение, сохранив точные session/lease/Start/Stop identity и ACK для существующего cleanup. Проверить staged/lost-acquire candidate через реальный coordinator Stop path; не удалять журнал и не начинать новое подключение.
+- [x] NLM059: отсутствие одноразовых bootstrap inputs до native admission даёт безопасный экран ошибки и только ручной Retry через существующий bootstrap. Нет автоматических циклов, нового recovery manager, сброса данных или убийства работающего runtime/VPN. Проверить lifecycle, частичную native initialization, повторный клик, конфликт runtime и сохранение защиты после генерации release sources. Immutable stable AAR не изменять.
+- [x] NLM060: public container/runtime version/slot/contract identity из доступного согласованного admitted snapshot; неизвестное остаётся неизвестным. Заморозить данные в существующем report/pending marker, не подставлять новую identity в исторический отчёт. Не расширять pinned IPC ABI и не отправлять неподдерживаемый сервером session_generation.
+- [x] NLM042: сохранить `invalid_access_token` в диагностическом allowlist с классом authorization; добавить безопасные stage/error-class события отказа Android dispatch. Не менять retry/token policy и не объявлять сетевую первопричину исправленной.
+- [x] Полный Rust/Android/UI/scripts прогон, strict host Clippy, Android Rust check, stable Kotlin compile, diff/fmt. Inline review → исправления → повторная проверка до отсутствия открытых находок.
+- [x] Отдельное read-only ревью **gpt-6-astra xhigh** по явному требованию пользователя; исправить подтверждённые находки и получить чистый итог по исправлениям. Найденный P2: legacy Android report получал текущий container_version без captured identity; regression RED→GREEN, все три builder paths и смена0.3.3→0.3.4 покрыты. Повторное ревью: нет оставшихся actionable findings, signed candidate разрешён; hardware/server/stable/signatures не объявлены проверенными.
+- [ ] Коммит с NLM IDs, normal push существующей ветки, exact-source `release.yml`/`sign_candidate`, version0.3.3, critical/minimum_supported/panel_notification_ready=false. Сборка кандидата — не release, не deploy, не аппаратная приёмка.
+
 ## Состояние плана
 
 - План составлен по согласованной картеисправлений, существующимфайлам и текущемуgitсостоянию; inline self-review выполнен.

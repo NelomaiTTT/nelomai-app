@@ -829,6 +829,184 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun bootChangeCancelsTotalLossReplayWithoutLosingExactCleanupIdentity() {
+        for (stopState in RedundantStopState.values()) {
+            val backend = FakeEncryptedRecordBackend()
+            val recovery = store(backend)
+            recovery.beginRedundant(redundantTransaction("v2-start")).success()
+            recovery.prepareRedundantTotalLoss(
+                "v2-start", AndroidStartReplay("replacement-start", 2, "replacement-fingerprint"),
+            ).success()
+            if (stopState != RedundantStopState.NONE) {
+                recovery.deferRedundantStop("original-stop", "v2-start").success()
+                recovery.updateRedundant("v2-start") {
+                    it.copy(retry = it.retry.copy(stopState = stopState))
+                }.success()
+            }
+
+            val rebooted = store(backend, bootCount = 8)
+            val stale = rebooted.read().success()
+            val transaction = requireNotNull(stale.redundantTransaction)
+            assertFalse(stale.intent.desiredActive)
+            assertEquals(1L, stale.intent.generation)
+            assertEquals(8L, stale.intent.bootCount)
+            assertFalse(transaction.desiredActive)
+            assertEquals("22222222-2222-4222-8222-222222222222", transaction.sessionId)
+            assertEquals("lease-a", transaction.slotALeaseId)
+            assertEquals("lease-b", transaction.slotBLeaseId)
+            assertEquals("lease-a", transaction.localActiveLeaseId)
+            assertEquals("v2-start", transaction.startOperationId)
+            assertEquals("v2-fingerprint", transaction.startRequestFingerprint)
+            assertEquals(template(), transaction.template)
+            assertEquals(stopState, transaction.retry.stopState)
+            assertEquals(if (stopState == RedundantStopState.NONE) null else "original-stop",
+                transaction.stopOperationId)
+            assertNull(transaction.retry.totalLossRestartReplay)
+            assertNull(transaction.retry.totalLossIntentGeneration)
+            assertNull(transaction.retry.totalLossSourceStartOperationId)
+            assertFalse(transaction.retry.sessionStalledRecorded)
+            assertNull(stale.leaseTransaction)
+            val writes = backend.writeCount
+            repeat(2) { assertEquals(stale, store(backend, bootCount = 8).read().success()) }
+            assertEquals(writes, backend.writeCount)
+
+            assertEquals("redundant_recovery_generation_conflict",
+                rebooted.cancelRedundantIntentAndDeferStop("foreign-stop", "foreign-start")
+                    .failure().code)
+            assertEquals(stale, rebooted.read().success())
+            assertTrue(rebooted.beginStart(stale.intent.generation, template(), replay())
+                is RecoveryStoreResult.Failure)
+            val stopped = rebooted.cancelRedundantIntentAndDeferStop("user-stop", "v2-start")
+                .success()
+            val stopId = if (stopState == RedundantStopState.NONE) "user-stop" else "original-stop"
+            assertEquals(stopId, stopped.redundantTransaction?.stopOperationId)
+            assertEquals("redundant_stop_not_acknowledged",
+                rebooted.completeRedundantStop(stopId, "v2-start").failure().code)
+            rebooted.updateRedundant("v2-start") {
+                it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+            }.success()
+            val completed = rebooted.completeRedundantStop(stopId, "v2-start").success()
+            assertFalse(completed.intent.desiredActive)
+            assertNull(completed.leaseTransaction)
+            assertNull(completed.redundantTransaction)
+            assertNull(completed.intent.retry.pendingAction)
+        }
+    }
+
+    @Test
+    fun bootChangeCancelsPendingRedundantSideEffectsBeforeCleanup() {
+        val backend = FakeEncryptedRecordBackend()
+        val recovery = store(backend)
+        recovery.beginRedundant(redundantTransaction("v2-start").copy(
+            candidateLeaseId = "lease-b",
+            candidateSlot = RedundantSlot.B,
+            retry = AndroidRedundantRetryState(
+                roleObservationPending = true,
+                pendingRoleLeaseId = "lease-a",
+                pendingRoleReason = "primary_unhealthy",
+                acquirePending = true,
+                acquireOperationId = "acquire-operation",
+                acquireReplaceLeaseId = "lease-b",
+                standbyReleasePending = true,
+                pendingNativeSourceLeaseId = "lease-a",
+                pendingNativeActiveLeaseId = "lease-b",
+                pendingNativeActiveSlot = RedundantSlot.B,
+                pendingNativeMembershipGeneration = 0,
+                pendingNativeSwitchReason = "primary_unhealthy",
+                pendingNativeSwitchAttempt = 2,
+            ),
+        )).success()
+        recovery.prepareRedundantTotalLoss(
+            "v2-start", AndroidStartReplay("replacement-start", 2, "replacement-fingerprint"),
+        ).success()
+
+        val stale = store(backend, bootCount = 8).read().success()
+        val transaction = requireNotNull(stale.redundantTransaction)
+        assertFalse(transaction.desiredActive)
+        assertEquals(AndroidRedundantRetryState(), transaction.retry)
+        assertNull(transaction.candidateLeaseId)
+        assertNull(transaction.candidateSlot)
+        assertEquals("lease-a", transaction.slotALeaseId)
+        assertEquals("lease-b", transaction.slotBLeaseId)
+        assertEquals("lease-a", transaction.localActiveLeaseId)
+        assertNull(transaction.stopOperationId)
+    }
+
+    @Test
+    fun unavailableBootCancelsTotalLossReplayButRetainsCleanupAcrossRepeatedReads() {
+        val backend = FakeEncryptedRecordBackend()
+        val recovery = store(backend)
+        recovery.beginRedundant(redundantTransaction("v2-start")).success()
+        recovery.prepareRedundantTotalLoss(
+            "v2-start", AndroidStartReplay("replacement-start", 2, "replacement-fingerprint"),
+        ).success()
+        recovery.deferRedundantStop("original-stop", "v2-start").success()
+
+        repeat(2) {
+            assertEquals("boot_identity_unavailable",
+                store(backend, bootCount = null).read().failure().code)
+            val persisted = AndroidRecoveryEnvelopeCodec.decode(requireNotNull(backend.record))
+            assertFalse(persisted.intent.desiredActive)
+            val transaction = requireNotNull(persisted.redundantTransaction)
+            assertFalse(transaction.desiredActive)
+            assertEquals("22222222-2222-4222-8222-222222222222", transaction.sessionId)
+            assertEquals("lease-a", transaction.slotALeaseId)
+            assertEquals("lease-b", transaction.slotBLeaseId)
+            assertEquals("v2-start", transaction.startOperationId)
+            assertEquals("original-stop", transaction.stopOperationId)
+            assertEquals(AndroidRedundantRetryState(stopState = RedundantStopState.PENDING),
+                transaction.retry)
+            assertNull(persisted.leaseTransaction)
+        }
+        val stopped = store(backend, bootCount = 8)
+            .cancelRedundantIntentAndDeferStop("ignored-stop", "v2-start").success()
+        assertEquals("original-stop", stopped.redundantTransaction?.stopOperationId)
+    }
+
+    @Test
+    fun failedTotalLossBootNormalizationPreservesTheLastValidJournalForRetry() {
+        for (bootCount in listOf(8L, null)) {
+            val backend = FakeEncryptedRecordBackend()
+            val recovery = store(backend)
+            recovery.beginRedundant(redundantTransaction("v2-start")).success()
+            recovery.prepareRedundantTotalLoss(
+                "v2-start", AndroidStartReplay("replacement-start", 2, "replacement-fingerprint"),
+            ).success()
+            recovery.deferRedundantStop("original-stop", "v2-start").success()
+            val before = requireNotNull(backend.record).copyOf()
+            val writes = backend.writeCount
+            backend.failWrites = true
+
+            repeat(2) {
+                assertEquals("recovery_record_write_failed",
+                    store(backend, bootCount).read().failure().code)
+                assertTrue(before.contentEquals(requireNotNull(backend.record)))
+            }
+            assertEquals(writes + 2, backend.writeCount)
+            backend.failWrites = false
+            val stale = store(backend, bootCount = 8).read().success()
+            assertFalse(stale.intent.desiredActive)
+            assertEquals("original-stop", stale.redundantTransaction?.stopOperationId)
+            assertNull(stale.redundantTransaction?.retry?.totalLossRestartReplay)
+        }
+    }
+
+    @Test
+    fun ordinaryRedundantBootChangeDisarmsTheSessionAndSameBootReadsRemainUnchanged() {
+        val backend = FakeEncryptedRecordBackend()
+        val current = store(backend).beginRedundant(redundantTransaction("v2-start")).success()
+        val writes = backend.writeCount
+        assertEquals(current, store(backend).read().success())
+        assertEquals(writes, backend.writeCount)
+
+        val stale = store(backend, bootCount = 8).read().success()
+        assertFalse(stale.intent.desiredActive)
+        assertEquals(redundantTransaction("v2-start").copy(desiredActive = false),
+            stale.redundantTransaction)
+        assertNull(stale.leaseTransaction)
+    }
+
+    @Test
     fun explicitRedundantStopWinsAndClearsEveryRestartAndSwitchFence() {
         val store = store(FakeEncryptedRecordBackend())
         store.beginRedundant(redundantTransaction("v2-start").copy(

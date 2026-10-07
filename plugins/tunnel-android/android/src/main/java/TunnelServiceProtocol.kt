@@ -648,8 +648,14 @@ internal object TunnelServiceClient {
             } else {
                 context.applicationContext.startService(intent)
             }
-        } catch (_: Throwable) {
-            onError(androidServiceDispatchErrorCode())
+        } catch (error: Throwable) {
+            val code = androidServiceDispatchErrorCode()
+            TunnelLog.warning(
+                if (foreground) "client_service.foreground_dispatch_failed" else "client_service.dispatch_failed",
+                code,
+                error,
+            )
+            onError(code)
         }
     }
 }

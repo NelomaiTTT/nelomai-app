@@ -1548,9 +1548,20 @@ async fn queue_desktop_tunnel_stopped(app: &AppHandle) {
     let Ok(Some(seal)) = diagnostics.pending_automatic_seal() else {
         return;
     };
+    let identity_before = crate::diagnostics::diagnostic_runtime_snapshot(app).await;
     let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(app);
-    match diagnostics.materialize_automatic_report(&seal, resource_snapshot, helper_log) {
+    let identity_after = crate::diagnostics::diagnostic_runtime_snapshot(app).await;
+    let identity = crate::diagnostics::coherent_diagnostic_identity(
+        identity_before.as_ref(),
+        identity_after.as_ref(),
+    );
+    match diagnostics.materialize_automatic_report_with_identity(
+        &seal,
+        resource_snapshot,
+        helper_log,
+        identity,
+    ) {
         Ok(true) => diagnostics.record_named(
             "diagnostics.automatic_report_queued",
             Some(&seal.session_id),
@@ -3769,6 +3780,7 @@ pub async fn app_send_diagnostics(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     tunnel: State<'_, Arc<crate::platform::PlatformTunnelController>>,
 ) -> Result<DiagnosticUploadResponse, CommandError> {
+    let identity_before = crate::diagnostics::diagnostic_runtime_snapshot(&app).await;
     let connection_before = application
         .connection_metrics_context()
         .await
@@ -3787,11 +3799,16 @@ pub async fn app_send_diagnostics(
         .map(|context| context.session_id);
     let connection_lease_id =
         stable_diagnostics_connection_lease(connection_before, connection_after);
+    let identity_after = crate::diagnostics::diagnostic_runtime_snapshot(&app).await;
     let report = diagnostics
-        .build_report_with_helper(
+        .build_report_with_identity(
             resource_snapshot,
             helper_log,
             connection_lease_id.as_deref(),
+            crate::diagnostics::coherent_diagnostic_identity(
+                identity_before.as_ref(),
+                identity_after.as_ref(),
+            ),
         )
         .map_err(|_| {
             CommandError::new(

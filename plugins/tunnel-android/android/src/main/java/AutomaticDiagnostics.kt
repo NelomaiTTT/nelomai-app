@@ -171,6 +171,48 @@ private const val CONNECTION_INTENT_TERMINAL_TRIGGER = "connection_intent_termin
 
 private fun Long.saturatingIncrement(): Long = if (this == Long.MAX_VALUE) this else this + 1
 
+internal fun automaticDiagnosticsIdentity(
+    containerVersion: String,
+    before: NativeOwnerScope?,
+    after: NativeOwnerScope?,
+): JSONObject = JSONObject().put("container_version", containerVersion).apply {
+    if (before != null && before == after && before.containerVersion == containerVersion &&
+        before.runtimeVersion.length <= 64 && before.runtimeContractVersion <= Int.MAX_VALUE
+    ) {
+        put("runtime_version", before.runtimeVersion)
+        put("runtime_slot", before.slot)
+        put("runtime_contract_version", before.runtimeContractVersion)
+    }
+}
+
+private fun diagnosticOwnerScope(context: Context): NativeOwnerScope? = runCatching {
+    val result = AndroidBackgroundCredentialStores.open(context).read()
+    val envelope = (result as? CredentialStoreResult.Success)?.value ?: return@runCatching null
+    envelope.ownerScope?.takeIf { scope ->
+        envelope.logoutState == null && !envelope.requiresFreshProvision &&
+            envelope.ownerCancelEpoch?.let { it >= scope.authEpoch } != true &&
+            envelope.active?.ownerScope == scope && envelope.active.deviceId == scope.deviceId &&
+            scope.slot == AndroidRuntimeNamespace.slot && scope.runtimeVersion == AndroidRuntimeNamespace.version
+    }
+}.getOrNull()
+
+private fun captureDiagnosticIdentity(context: Context): JSONObject {
+    val before = diagnosticOwnerScope(context)
+    val container = appVersion(context)
+    return automaticDiagnosticsIdentity(container, before, diagnosticOwnerScope(context))
+}
+
+private fun JSONObject.putDiagnosticIdentity(context: Context, identity: JSONObject?) {
+    // Copy only public report fields; owner family, auth epoch and generation stay private.
+    val container = identity?.optString("container_version")?.takeIf(String::isNotBlank)
+    // Legacy markers have no captured provenance; retain only the required app_version fallback.
+    put("app_version", container ?: appVersion(context))
+    container?.let { put("container_version", it) }
+    for (field in listOf("runtime_version", "runtime_slot", "runtime_contract_version")) {
+        identity?.opt(field)?.takeIf { it != JSONObject.NULL }?.let { put(field, it) }
+    }
+}
+
 internal data class AutomaticDiagnosticsConnectionIntentActions(
     val queueReport: Boolean = false,
     val notifyUser: Boolean = false,
@@ -240,7 +282,7 @@ internal class AutomaticDiagnosticsConnectionIntentEpisode(
 internal fun automaticDiagnosticsStartFailureCode(errorCode: String): String = when (errorCode) {
     "temporarily_unavailable", "android_service_status_unavailable",
     "invalid_probe_results", "quick_action_plan_unavailable", "server_probes_unavailable",
-    "transport_error", "android_service_dispatch_unavailable", "tunnel_start_timeout",
+    "transport_error", "android_service_dispatch_unavailable", "tunnel_start_timeout", "invalid_access_token",
     "tunnel_handshake_timeout", "background_transport_unavailable", "connection_start_failed",
     -> errorCode
     else -> automaticDiagnosticsConnectionIntentReasonClass(errorCode)
@@ -298,6 +340,7 @@ internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String):
         "signed_out",
         "access_expired",
         "background_credential_unavailable",
+        "invalid_access_token",
         "invalid_background_token",
         "missing_background_token",
         -> "authorization"
@@ -541,6 +584,7 @@ private data class PendingSeal(
     val endedAt: Long,
     val tunnelRunning: Boolean,
     val connectionLeaseId: String?,
+    val runtimeIdentity: String? = null,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("report_id", reportId)
@@ -552,6 +596,7 @@ private data class PendingSeal(
         put("ended_at", endedAt)
         put("tunnel_running", tunnelRunning)
         put("connection_lease_id", connectionLeaseId ?: JSONObject.NULL)
+        runtimeIdentity?.let { put("runtime_identity", JSONObject(it)) }
     }.toString()
 }
 
@@ -686,6 +731,7 @@ internal object AutomaticDiagnostics {
                         stoppedSession.trigger,
                         tunnelRunning = false,
                         endedAtUnix = stoppedSession.endedAt,
+                        captureRuntimeIdentity = false,
                     )
                 ) {
                     scheduleRetry(applicationContext, "automatic_diagnostics_report_queue_failed")
@@ -719,6 +765,7 @@ internal object AutomaticDiagnostics {
                         stoppedSession.trigger,
                         tunnelRunning = false,
                         endedAtUnix = stoppedSession.endedAt,
+                        captureRuntimeIdentity = false,
                     ),
                 ) { "automatic_diagnostics_previous_session_not_saved" }
             }
@@ -1298,6 +1345,7 @@ internal object AutomaticDiagnostics {
         trigger: String,
         tunnelRunning: Boolean,
         endedAtUnix: Long? = null,
+        captureRuntimeIdentity: Boolean = true,
     ): Boolean {
         val preferences = preferences(context)
         val sessionId = preferences.getString(KEY_SESSION_ID, null) ?: return false
@@ -1319,6 +1367,7 @@ internal object AutomaticDiagnostics {
                     endedAt = (endedAtUnix ?: nowUnix()).coerceAtLeast(startedAt),
                     tunnelRunning = tunnelRunning,
                     connectionLeaseId = preferences.getString(KEY_SESSION_LEASE_ID, null),
+                    runtimeIdentity = if (!captureRuntimeIdentity || trigger == "tunnel_interrupted") null else captureDiagnosticIdentity(context).toString(),
                 )
                 val markerSaved = preferences.edit()
                     .putString(KEY_PENDING_SEAL, seal.toJson())
@@ -1347,6 +1396,7 @@ internal object AutomaticDiagnostics {
                     seal.endedAt,
                     seal.tunnelRunning,
                     seal.connectionLeaseId,
+                    seal.runtimeIdentity?.let(::JSONObject),
                 )
                 writePendingReport(finalFile, payload)
             }
@@ -1381,7 +1431,7 @@ internal object AutomaticDiagnostics {
                 (seal.trigger != trigger || seal.tunnelRunning != tunnelRunning) &&
                 preferences.getBoolean(KEY_SESSION_RUNNING, false)
             ) {
-                sealCurrentInterval(context, trigger, tunnelRunning, endedAtUnix)
+                sealCurrentInterval(context, trigger, tunnelRunning, endedAtUnix, captureRuntimeIdentity)
             } else {
                 true
             }
@@ -1401,6 +1451,7 @@ internal object AutomaticDiagnostics {
         endedAt: Long,
         tunnelRunning: Boolean,
         connectionLeaseId: String?,
+        runtimeIdentity: JSONObject?,
     ): JSONObject {
         val processes = if (automaticDiagnosticsIncludeCurrentProcessMemory(trigger)) {
             androidProcessMemory(context).also {
@@ -1434,7 +1485,7 @@ internal object AutomaticDiagnostics {
             put("tunnel_running", tunnelRunning)
             connectionLeaseId?.let { put("connection_lease_id", it) }
             put("generated_at_unix", endedAt)
-            put("app_version", appVersion(context))
+            putDiagnosticIdentity(context, runtimeIdentity)
             put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
             put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
             put(
@@ -1523,6 +1574,7 @@ internal object AutomaticDiagnostics {
                         capturedMemorySamples.orEmpty(),
                     ),
                     diagnosticsEpisodeId = diagnosticsEpisodeId,
+                    runtimeIdentity = captureDiagnosticIdentity(context).toString(),
                 ).also {
                     writeStartFailureRequest(requestFile, it)
                 }
@@ -1612,6 +1664,7 @@ internal object AutomaticDiagnostics {
                     request.errorCode,
                     request.memorySamplesJson?.let(::automaticDiagnosticsDecodeMemorySamples),
                     request.trigger,
+                    request.runtimeIdentity?.let(::JSONObject),
                 ),
             )
         }
@@ -1624,6 +1677,7 @@ internal object AutomaticDiagnostics {
         errorCode: String,
         capturedMemorySamples: List<JSONObject>?,
         trigger: String,
+        runtimeIdentity: JSONObject?,
     ): JSONObject {
         val startedAt = (endedAt - START_FAILURE_WINDOW_SECONDS).coerceAtLeast(0)
         if (trigger != CONNECTION_START_FAILURE_TRIGGER) {
@@ -1640,7 +1694,7 @@ internal object AutomaticDiagnostics {
                 put("report_id", reportId)
                 put("trigger", trigger)
                 put("generated_at_unix", endedAt)
-                put("app_version", appVersion(context))
+                putDiagnosticIdentity(context, runtimeIdentity)
                 put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
                 put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
                 put("application_log", safeLog)
@@ -1657,7 +1711,7 @@ internal object AutomaticDiagnostics {
             put("report_id", reportId)
             put("trigger", CONNECTION_START_FAILURE_TRIGGER)
             put("generated_at_unix", endedAt)
-            put("app_version", appVersion(context))
+            putDiagnosticIdentity(context, runtimeIdentity)
             put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
             put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
             put("application_log", applicationLog(context, startedAt, endedAt))
@@ -1751,6 +1805,7 @@ internal object AutomaticDiagnostics {
                 } else {
                     UUID.fromString(payload.getString("connection_lease_id")).toString()
                 },
+                runtimeIdentity = payload.optJSONObject("runtime_identity")?.toString(),
             )
         }.getOrNull()
     }
@@ -1936,6 +1991,7 @@ internal object AutomaticDiagnostics {
                             stoppedSession.trigger,
                             tunnelRunning = false,
                             endedAtUnix = stoppedSession.endedAt,
+                            captureRuntimeIdentity = false,
                         )
                     ) {
                         scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
@@ -1947,7 +2003,7 @@ internal object AutomaticDiagnostics {
                         preferences.edit().remove(KEY_PENDING_SEAL).apply()
                     }
                     seal?.let {
-                        if (!sealCurrentInterval(context, it.trigger, it.tunnelRunning)) {
+                        if (!sealCurrentInterval(context, it.trigger, it.tunnelRunning, captureRuntimeIdentity = false)) {
                             scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
                             return true
                         }
@@ -3501,6 +3557,7 @@ internal data class StartFailureRequest(
     val memorySamplesJson: String? = null,
     val trigger: String = CONNECTION_START_FAILURE_TRIGGER,
     val diagnosticsEpisodeId: Long? = null,
+    val runtimeIdentity: String? = null,
 ) {
     val reportName: String
         get() = automaticDiagnosticsPendingReportName(queuedAt, deviceId, reportId)
@@ -3516,6 +3573,7 @@ internal data class StartFailureRequest(
         put("trigger", trigger)
         diagnosticsEpisodeId?.let { put("diagnostics_episode_id", it) }
         memorySamplesJson?.let { put("memory_samples", JSONArray(it)) }
+        runtimeIdentity?.let { put("runtime_identity", JSONObject(it)) }
     }.toString()
 
     companion object {
@@ -3534,6 +3592,7 @@ internal data class StartFailureRequest(
                 ),
                 queuedAt = payload.getLong("queued_at").coerceAtLeast(0),
                 sent = payload.getBoolean("sent"),
+                runtimeIdentity = payload.optJSONObject("runtime_identity")?.toString(),
                 trigger = payload.optString("trigger", CONNECTION_START_FAILURE_TRIGGER)
                     .takeIf {
                         it in setOf(

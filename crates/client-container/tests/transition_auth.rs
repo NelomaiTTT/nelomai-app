@@ -2835,7 +2835,7 @@ async fn repeated_updates_recover_active_successor_source_after_committed_apply(
 }
 
 #[tokio::test]
-async fn logout_at_auth_resuming_retires_only_its_barrier_before_new_login_start() {
+async fn logout_at_auth_resuming_retires_initial_startup_barrier_before_new_login_start() {
     exercise_logout_switch_cleanup(false, false, false).await;
 }
 
@@ -2923,7 +2923,8 @@ async fn exercise_logout_switch_cleanup(
     let mut coordinator = Arc::new(
         SwitchCoordinator::open(owner.clone(), manifest())
             .unwrap()
-            .attach(broker.clone(), control.clone()),
+            .attach(broker.clone(), control.clone())
+            .require_initial_transition(RuntimeSlot::Latest),
     );
     let make_port = |coordinator: Arc<SwitchCoordinator>| {
         Arc::new(
@@ -3043,11 +3044,24 @@ async fn exercise_logout_switch_cleanup(
         coordinator = Arc::new(
             SwitchCoordinator::open(owner.clone(), manifest())
                 .unwrap()
-                .attach(broker.clone(), control),
+                .attach(broker.clone(), control)
+                .require_initial_transition(RuntimeSlot::Latest),
         );
         port = make_port(coordinator.clone());
     }
     port.recover_logout_cleanup().await.unwrap();
+    coordinator.before_tunnel_start().await.expect(
+        "completed logout must discharge the old initial transition without login or owner restart",
+    );
+    // The logout receipt does not authorize bypassing an independent update.
+    let update_path = root.path().join("common/update-journal-v1.json");
+    std::fs::write(&update_path, b"unreadable pending update").unwrap();
+    assert!(coordinator.before_tunnel_start().await.is_err());
+    assert_eq!(
+        std::fs::read(&update_path).unwrap(),
+        b"unreadable pending update"
+    );
+    std::fs::remove_file(update_path).unwrap();
     port.login(nelomai_client_api::RuntimeLogin {
         login: "b".into(),
         password: "synthetic-password".into(),

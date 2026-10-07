@@ -655,8 +655,23 @@ pub struct SuccessResponse {
     pub ok: bool,
 }
 
+/// Report-time identity only. Absent fields stay absent on legacy queue replay.
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DiagnosticRuntimeIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_slot: Option<RuntimeSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_contract_version: Option<u32>,
+}
+
 #[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiagnosticUploadRequest {
+    #[serde(flatten)]
+    pub runtime_identity: DiagnosticRuntimeIdentity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_id: Option<String>,
     pub trigger: String,
@@ -2452,6 +2467,45 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_runtime_identity_round_trips_without_inventing_legacy_fields() {
+        let legacy = serde_json::json!({
+            "trigger":"manual", "generated_at_unix":1, "app_version":"0.3.3",
+            "platform_version":null, "architecture":"aarch64",
+            "application_log":"", "helper_log":null
+        });
+        let mut known = legacy.clone();
+        for (field, value) in [
+            ("container_version", serde_json::json!("0.3.3")),
+            ("runtime_version", serde_json::json!("0.2.20")),
+            ("runtime_slot", serde_json::json!("stable")),
+            ("runtime_contract_version", serde_json::json!(1)),
+        ] {
+            known[field] = value;
+        }
+        let request: DiagnosticUploadRequest = serde_json::from_value(known.clone()).unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        for field in [
+            "container_version",
+            "runtime_version",
+            "runtime_slot",
+            "runtime_contract_version",
+        ] {
+            assert_eq!(encoded.get(field), known.get(field), "{field}");
+        }
+        let old: DiagnosticUploadRequest = serde_json::from_value(legacy).unwrap();
+        let encoded = serde_json::to_value(old).unwrap();
+        for field in [
+            "container_version",
+            "runtime_version",
+            "runtime_slot",
+            "runtime_contract_version",
+            "session_generation",
+        ] {
+            assert!(encoded.get(field).is_none(), "{field}");
+        }
+    }
+
+    #[test]
     fn diagnostics_optional_logcat_round_trips_and_is_redacted() {
         let old_payload = serde_json::json!({
             "trigger": "manual", "generated_at_unix": 1, "app_version": "0.2.16",
@@ -2476,6 +2530,7 @@ mod tests {
     #[test]
     fn diagnostics_debug_output_redacts_both_logs() {
         let request = DiagnosticUploadRequest {
+            runtime_identity: DiagnosticRuntimeIdentity::default(),
             report_id: None,
             trigger: "manual".to_string(),
             tunnel_session_id: None,

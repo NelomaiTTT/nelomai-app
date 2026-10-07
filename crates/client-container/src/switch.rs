@@ -679,10 +679,17 @@ impl SwitchCoordinator {
         &self,
         receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
     ) -> Result<(), SwitchError> {
+        let (broker, _) = self.components()?;
+        if broker.completed_runtime_logout().await?.as_ref() != Some(receipt) {
+            return Err(SwitchError::RecoveryRequired);
+        }
         let Some(journal) = self.snapshot()? else {
+            // Replay after durable retirement but before ACK consumption. The
+            // caller already stopped/cleared the receipt's exact runtime scope.
+            self.initial_transition_satisfied
+                .store(true, Ordering::SeqCst);
             return Ok(());
         };
-        let (broker, _) = self.components()?;
         if !broker
             .logout_covers_transition(
                 receipt,
@@ -710,6 +717,10 @@ impl SwitchCoordinator {
         File::open(self.path.parent().ok_or(SwitchJournalError::Invalid)?)
             .and_then(|directory| directory.sync_all())
             .map_err(SwitchJournalError::Io)?;
+        // This process must not resurrect the retired startup transition on
+        // the next login. Independent update/pending-switch barriers remain.
+        self.initial_transition_satisfied
+            .store(true, Ordering::SeqCst);
         Ok(())
     }
 

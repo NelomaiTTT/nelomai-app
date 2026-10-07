@@ -9,6 +9,7 @@ import importlib.util
 import json
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
@@ -23,6 +24,7 @@ def packages(root):
 
 
 def generate(root, output):
+    guard_source = runpy.run_path(str(Path(__file__).with_name('runtime_activity_lifecycle.py')))['guard_source']
     deps = packages(root)
     output.mkdir(parents=True, exist_ok=True)
     java = output / 'java'
@@ -78,7 +80,7 @@ def generate(root, output):
         return value
 
     for file in selected:
-        value = transform(file.read_text())
+        value = transform(guard_source(file.name, file.read_text()))
         match = re.search(r'^package\s+([\w.]+)', value, re.MULTILINE)
         if not match or not match[1].startswith(NAMESPACE):
             raise ValueError('unrelocated stable source package')

@@ -55,6 +55,7 @@ internal class SupportDiagnosticCollector(
             .put("trigger", "manual")
             .put("generated_at_unix", System.currentTimeMillis() / 1000L)
             .put("app_version", BuildConfig.VERSION_NAME)
+            .put("container_version", BuildConfig.VERSION_NAME)
             .put("platform_version", platformVersion ?: JSONObject.NULL)
             .put("architecture", "aarch64")
             .put("application_log", application)

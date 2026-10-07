@@ -8,6 +8,8 @@ fun buildValue(name: String): String = (System.getenv(name) ?: "").replace("\\",
 val generatedStable = layout.buildDirectory.dir("generated/stableRuntime")
 val prepareStableSources by tasks.registering(Exec::class) {
     dependsOn(":amneziawg-tunnel:prepareRuntimeHostAdapter")
+    mustRunAfter(rootProject.project(":app").tasks.matching { it.name.startsWith("rustBuild") })
+    inputs.file(repositoryRoot.resolve("scripts/android/runtime_activity_lifecycle.py"))
     commandLine("python3", repositoryRoot.resolve("scripts/android/generate-stable-sources.py"),
         "--root", repositoryRoot, "--output", generatedStable.get().asFile)
 }

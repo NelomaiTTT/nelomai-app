@@ -40,6 +40,8 @@ def generate(root):
             if '{{' in value:
                 raise ValueError('unknown Kotlin generator placeholder')
             (output / file.name).write_text(value)
+    subprocess.run(['python3', str(Path(__file__).with_name('runtime_activity_lifecycle.py')),
+                    '--directory', str(output)], check=True)
     return projects
 
 

@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -1851,6 +1852,109 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(2, native.stopCalls)
         assertEquals(null, replayed.status())
         assertTrue(replayed.start(transaction(), mapOf("lease-a" to "active".toByteArray())))
+    }
+
+    @Test
+    fun bootChangedTotalLossResumesExactSessionStopWithStagedOrLostAcquireCandidate() {
+        for (loseAcquireReply in listOf(false, true)) {
+            val backend = CoordinatorRecordBackend()
+            val originalStore = AndroidRecoveryStore(backend, CoordinatorBootIdentity())
+            assertTrue(originalStore.beginRedundant(transaction()) is RecoveryStoreResult.Success)
+            val delegate = FakePanel()
+            val stopRequests = mutableListOf<JSONObject>()
+            var sessionCleanupAcknowledged = false
+            val stopAdapter = ServiceRedundantConnectionPanel(
+                credential = { BackgroundCredential(it, "https://nelomai.example", "token", 1_900_000_000) },
+                stopTransport = { _, requested, lease ->
+                    stopRequests += backgroundRedundantStopPayload(requested, lease)
+                    // The primary is released, but the session (including the
+                    // allocated candidate) is not terminal until cleanup finishes.
+                    JSONObject().put("connection", JSONObject()
+                        .put("lease_id", "lease-a")
+                        .put("status", "released")
+                        .put("session_id", if (sessionCleanupAcknowledged) JSONObject.NULL
+                            else "22222222-2222-4222-8222-222222222222"))
+                },
+            )
+            val panel = object : RedundantConnectionPanel by delegate {
+                override fun acquireStandby(transaction: AndroidRedundantTransaction,
+                    operationId: String, replaceLeaseId: String?): BackgroundRedundantCandidate {
+                    val allocated = delegate.acquireStandby(transaction, operationId, replaceLeaseId)
+                    if (loseAcquireReply) {
+                        allocated.configuration.fill(0)
+                        throw BackgroundConnectionException("offline")
+                    }
+                    return allocated
+                }
+                override fun stop(transaction: AndroidRedundantTransaction) = stopAdapter.stop(transaction)
+            }
+            val beforeBoot = testRedundantCoordinator(originalStore, panel, FakeNative())
+            assertEquals(!loseAcquireReply,
+                beforeBoot.acquireAndCommitStandby("acquire-before-boot", "lease-b"))
+            val acquiring = requireNotNull(beforeBoot.status())
+            assertTrue(acquiring.retry.acquirePending)
+            assertEquals("acquire-before-boot", acquiring.retry.acquireOperationId)
+            assertEquals(if (loseAcquireReply) null else "candidate", acquiring.candidateLeaseId)
+            // Even the lost-reply case allocated a candidate before the failure.
+            assertEquals(1, delegate.candidateConfigurations.size)
+            assertTrue(originalStore.prepareRedundantTotalLoss("start-operation",
+                AndroidStartReplay("must-not-start", 2, "replacement-fingerprint"))
+                is RecoveryStoreResult.Success)
+            assertTrue(originalStore.deferRedundantStop("stop-before-boot", "start-operation")
+                is RecoveryStoreResult.Success)
+
+            val rebootedStore = AndroidRecoveryStore(backend, BootIdentityProvider { 2L })
+            val native = FakeNative()
+            fun resumed() = testRedundantCoordinator(rebootedStore, panel, native,
+                operationId = { error("cleanup must retain its original operation") },
+                expectedStartOperationId = "start-operation")
+
+            assertFalse(resumed().resume()) // A released primary is not a session ACK.
+            assertEquals(1, stopRequests.size)
+            val pending = (rebootedStore.read() as RecoveryStoreResult.Success).value
+            assertFalse(pending.intent.desiredActive)
+            assertEquals(null, pending.leaseTransaction)
+            val cleanup = requireNotNull(pending.redundantTransaction)
+            assertEquals(RedundantStopState.PENDING, cleanup.retry.stopState)
+            assertEquals(null, cleanup.candidateLeaseId)
+            assertEquals(null, cleanup.retry.acquireOperationId)
+            assertEquals(null, cleanup.retry.totalLossRestartReplay)
+
+            sessionCleanupAcknowledged = true
+            // Persist the exact ACK, then simulate process death before journal removal.
+            backend.failOnWriteNumber = backend.writeCount + 2
+            assertFalse(resumed().resume())
+            val acknowledged = requireNotNull((rebootedStore.read() as RecoveryStoreResult.Success)
+                .value.redundantTransaction)
+            assertEquals(RedundantStopState.ACKNOWLEDGED, acknowledged.retry.stopState)
+            assertEquals("stop-before-boot", acknowledged.stopOperationId)
+            assertEquals("22222222-2222-4222-8222-222222222222", acknowledged.sessionId)
+            backend.failOnWriteNumber = null
+            assertTrue(resumed().resume())
+            assertTrue(resumed().revoke()) // Repeated cleanup must not send another Stop.
+
+            assertEquals(3, stopRequests.size)
+            for (request in stopRequests) {
+                assertEquals("22222222-2222-4222-8222-222222222222", request.getString("session_id"))
+                assertEquals("stop-before-boot", request.getString("operation_id"))
+                assertEquals("lease-a", request.getString("lease_id"))
+                assertEquals(2, request.getInt("recovery_contract_version"))
+                assertFalse(request.has("retain_active_peer"))
+            }
+            val completed = (rebootedStore.read() as RecoveryStoreResult.Success).value
+            assertFalse(completed.intent.desiredActive)
+            assertEquals(null, completed.redundantTransaction)
+            assertEquals(null, completed.leaseTransaction)
+            assertEquals(null, completed.intent.retry.pendingAction)
+            assertEquals(listOf("acquire-before-boot"), delegate.acquireOperationIds)
+            assertEquals(0, delegate.commitCalls)
+            assertEquals(0, delegate.recoverCalls)
+            assertEquals(0, delegate.roleCalls)
+            assertTrue(delegate.releaseAttempts.isEmpty())
+            assertEquals(3, native.stopCalls)
+            assertTrue(native.started.isEmpty())
+            assertTrue(native.activationAttempts.isEmpty())
+        }
     }
 
     @Test

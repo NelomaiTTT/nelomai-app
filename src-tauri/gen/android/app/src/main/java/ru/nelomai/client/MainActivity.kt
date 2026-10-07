@@ -52,19 +52,29 @@ class MainActivity : Activity() {
 /** Runs in :runtime so Binder records the actual admitted child PID. */
 class RuntimeBootstrapActivity : Activity() {
     private lateinit var selection: RuntimeSelectionStore
+    private var failureStage: SupportStartupStage? = null
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         selection = RuntimeSelectionStore(this)
+        state?.getString("nelomai.bootstrap.failure_stage")?.let { saved ->
+            val stage = runCatching { SupportStartupStage.valueOf(saved) }
+                .getOrDefault(SupportStartupStage.BOOTSTRAP_ACTIVITY_PREPARE)
+            showFailure(stage, IllegalStateException("bootstrap_failure_restored"))
+            return
+        }
         selection.read { result ->
             if (isFinishing || isDestroyed) return@read
             if (result.isFailure) {
-                SupportDiagnosticsStartup.showFailure(this, SupportStartupStage.BOOTSTRAP_OWNER_READ, requireNotNull(result.exceptionOrNull()))
+                showFailure(SupportStartupStage.BOOTSTRAP_OWNER_READ, requireNotNull(result.exceptionOrNull()))
                 return@read
             }
             result.onSuccess { selected ->
                 var stage = SupportStartupStage.BOOTSTRAP_PROCESS_CLAIM
                 runCatching {
                     if (RuntimeProcessSelection.needsExit(selected)) {
+                        check(!intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeActivityRecovery.MANUAL_RETRY, false)) {
+                            "runtime_recovery_process_conflict"
+                        }
                         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                         android.os.Process.killProcess(android.os.Process.myPid())
                         return@runCatching
@@ -87,12 +97,20 @@ class RuntimeBootstrapActivity : Activity() {
                         startActivity(launch)
                     }
                 }.onFailure {
-                    SupportDiagnosticsStartup.showFailure(this, stage, it)
+                    showFailure(stage, it)
                     return@read
                 }
             }
             finish()
         }
+    }
+    private fun showFailure(stage: SupportStartupStage, error: Throwable) {
+        failureStage = stage
+        SupportDiagnosticsStartup.showFailure(this, stage, error)
+    }
+    override fun onSaveInstanceState(state: Bundle) {
+        super.onSaveInstanceState(state)
+        failureStage?.let { state.putString("nelomai.bootstrap.failure_stage", it.name) }
     }
     override fun onDestroy() { selection.close(); super.onDestroy() }
 }

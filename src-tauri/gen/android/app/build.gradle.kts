@@ -162,3 +162,18 @@ dependencies {
 }
 
 apply(from = "tauri.build.gradle.kts")
+
+// Cargo/Tauri CLI can overwrite these sources after direct Gradle generation.
+// Guard at the compiler boundary as well, after any native code generation.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+    inputs.file(rootDir.resolve("../../../scripts/android/runtime_activity_lifecycle.py"))
+    // Order codegen already present in the graph; do not make JVM tests or
+    // staged shipping builds execute Rust tasks they deliberately omit/-x.
+    mustRunAfter(tasks.matching { it.name.startsWith("rustBuild") })
+    doFirst {
+        project.exec {
+            commandLine("python3", rootDir.resolve("../../../scripts/android/runtime_activity_lifecycle.py"),
+                "--directory", projectDir.resolve("src/main/java/ru/nelomai/client/generated"))
+        }
+    }
+}

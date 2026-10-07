@@ -2088,6 +2088,34 @@ internal class AndroidRecoveryStore(
                 generation = nextGeneration,
                 phase = LeasePhase.STALE_CLEANUP,
             ),
+            // Disarm recovery work with the intent, retaining the exact session
+            // and any existing Stop acknowledgement for the cleanup owner.
+            redundantTransaction = current.redundantTransaction?.let { transaction ->
+                transaction.copy(
+                    desiredActive = false,
+                    candidateLeaseId = null,
+                    candidateSlot = null,
+                    retry = transaction.retry.copy(
+                        roleObservationPending = false,
+                        pendingRoleLeaseId = null,
+                        pendingRoleReason = null,
+                        acquirePending = false,
+                        acquireOperationId = null,
+                        acquireReplaceLeaseId = null,
+                        standbyReleasePending = false,
+                        pendingNativeSourceLeaseId = null,
+                        pendingNativeActiveLeaseId = null,
+                        pendingNativeActiveSlot = null,
+                        pendingNativeMembershipGeneration = null,
+                        pendingNativeSwitchReason = null,
+                        pendingNativeSwitchAttempt = 0,
+                        sessionStalledRecorded = false,
+                        totalLossRestartReplay = null,
+                        totalLossIntentGeneration = null,
+                        totalLossSourceStartOperationId = null,
+                    ),
+                )
+            },
         )
     }
 

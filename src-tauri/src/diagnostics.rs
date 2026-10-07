@@ -5,7 +5,7 @@ use crate::automatic_diagnostics::{
 #[cfg(desktop)]
 use crate::network_incidents::{NetworkIncidentObservation, NetworkIncidentRecorder};
 use crate::resource_usage::ResourceSnapshot;
-use nelomai_client_api::DiagnosticUploadRequest;
+use nelomai_client_api::{DiagnosticRuntimeIdentity, DiagnosticUploadRequest};
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
 use nelomai_client_tunnel::TunnelMetrics;
 use serde::Serialize;
@@ -21,6 +21,60 @@ const CURRENT_LOG: &str = "application.jsonl";
 const PREVIOUS_LOG: &str = "application.previous.jsonl";
 const ROTATE_AT_BYTES: u64 = 256 * 1024;
 const MAX_APPLICATION_REPORT_BYTES: usize = 320 * 1024;
+
+pub(crate) fn coherent_diagnostic_identity(
+    before: Option<&nelomai_contracts::RuntimeIdentity>,
+    after: Option<&nelomai_contracts::RuntimeIdentity>,
+) -> DiagnosticRuntimeIdentity {
+    let container_version = before
+        .or(after)
+        .map(|value| value.container_version.clone());
+    let Some(identity) = before.filter(|value| Some(*value) == after && value.validate().is_ok())
+    else {
+        return DiagnosticRuntimeIdentity {
+            container_version,
+            ..Default::default()
+        };
+    };
+    DiagnosticRuntimeIdentity {
+        container_version,
+        runtime_version: Some(identity.runtime_version.clone()),
+        runtime_slot: Some(identity.slot),
+        runtime_contract_version: Some(identity.runtime_contract_version),
+    }
+}
+
+/// Read the existing owner projection only at report creation; never refresh auth.
+pub(crate) async fn diagnostic_runtime_snapshot(
+    app: &tauri::AppHandle,
+) -> Option<nelomai_contracts::RuntimeIdentity> {
+    use tauri::Manager;
+    let controls = app.try_state::<std::sync::Arc<crate::runtime_control::RuntimeControls>>()?;
+    let status = controls.status().await.ok()?;
+    diagnostic_identity_from_status(status)
+}
+
+fn diagnostic_identity_from_status(
+    status: nelomai_client_container::RuntimeSwitchStatusV1,
+) -> Option<nelomai_contracts::RuntimeIdentity> {
+    if !status.manifest_verified {
+        return None;
+    }
+    let runtime_version = match status.active_slot {
+        nelomai_contracts::RuntimeSlot::Latest => status.latest_version,
+        nelomai_contracts::RuntimeSlot::Stable => status.stable_version?,
+    };
+    let identity = nelomai_contracts::RuntimeIdentity {
+        container_version: status.container_version,
+        runtime_version,
+        slot: status.active_slot,
+        runtime_contract_version: status.runtime_contract_version,
+        // The pinned owner status ABI does not expose a generation.
+        session_generation: None,
+    };
+    identity.validate().ok()?;
+    Some(identity)
+}
 #[cfg(target_os = "android")]
 const ANDROID_STARTUP_LOG: &str = "android-startup.jsonl";
 #[cfg(target_os = "android")]
@@ -595,11 +649,27 @@ impl AppDiagnostics {
         self.build_report_with_helper(resource_snapshot, None, None)
     }
 
+    #[cfg(test)]
     pub fn build_report_with_helper(
         &self,
         resource_snapshot: ResourceSnapshot,
         helper_override: Option<String>,
         connection_lease_id: Option<&str>,
+    ) -> io::Result<DiagnosticUploadRequest> {
+        self.build_report_with_identity(
+            resource_snapshot,
+            helper_override,
+            connection_lease_id,
+            DiagnosticRuntimeIdentity::default(),
+        )
+    }
+
+    pub(crate) fn build_report_with_identity(
+        &self,
+        resource_snapshot: ResourceSnapshot,
+        helper_override: Option<String>,
+        connection_lease_id: Option<&str>,
+        identity: DiagnosticRuntimeIdentity,
     ) -> io::Result<DiagnosticUploadRequest> {
         let _guard = self
             .write_gate
@@ -637,6 +707,7 @@ impl AppDiagnostics {
         #[cfg(all(not(desktop), not(target_os = "android")))]
         let network_incidents = None;
         Ok(DiagnosticUploadRequest {
+            runtime_identity: identity.clone(),
             report_id: None,
             trigger: "manual".to_string(),
             tunnel_session_id: None,
@@ -646,7 +717,10 @@ impl AppDiagnostics {
             tunnel_running: None,
             connection_lease_id: connection_lease_id.map(str::to_string),
             generated_at_unix: now_unix(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: identity
+                .container_version
+                .clone()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
@@ -735,11 +809,25 @@ impl AppDiagnostics {
         self.automatic.pending_seal()
     }
 
-    #[cfg(desktop)]
+    #[cfg(all(desktop, test))]
     pub(crate) fn queue_connection_intent_report(
         &self,
         trigger: ConnectionIntentReportTrigger,
         generated_at: i64,
+    ) -> io::Result<()> {
+        self.queue_connection_intent_report_with_identity(
+            trigger,
+            generated_at,
+            DiagnosticRuntimeIdentity::default(),
+        )
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn queue_connection_intent_report_with_identity(
+        &self,
+        trigger: ConnectionIntentReportTrigger,
+        generated_at: i64,
+        identity: DiagnosticRuntimeIdentity,
     ) -> io::Result<()> {
         let _guard = self
             .write_gate
@@ -758,6 +846,7 @@ impl AppDiagnostics {
             safe_connection_intent_log(&format!("{previous}{current}")),
         );
         let report = DiagnosticUploadRequest {
+            runtime_identity: identity.clone(),
             report_id: Some(Uuid::new_v4().to_string()),
             trigger: trigger.as_str().to_string(),
             tunnel_session_id: None,
@@ -767,7 +856,10 @@ impl AppDiagnostics {
             tunnel_running: None,
             connection_lease_id: None,
             generated_at_unix: generated_at,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: identity
+                .container_version
+                .clone()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
@@ -781,13 +873,34 @@ impl AppDiagnostics {
             .queue_connection_intent_report(&report, generated_at)
     }
 
-    #[cfg(desktop)]
+    #[cfg(all(desktop, test))]
     pub fn materialize_automatic_report(
         &self,
         seal: &PendingSeal,
         resource_snapshot: ResourceSnapshot,
         helper_override: Option<String>,
     ) -> io::Result<bool> {
+        self.materialize_automatic_report_with_identity(
+            seal,
+            resource_snapshot,
+            helper_override,
+            DiagnosticRuntimeIdentity::default(),
+        )
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn materialize_automatic_report_with_identity(
+        &self,
+        seal: &PendingSeal,
+        resource_snapshot: ResourceSnapshot,
+        helper_override: Option<String>,
+        identity: DiagnosticRuntimeIdentity,
+    ) -> io::Result<bool> {
+        let Some(frozen_seal) = self.automatic.freeze_identity(seal, identity)? else {
+            return Ok(false);
+        };
+        let seal = &frozen_seal;
+        let identity = seal.runtime_identity.clone();
         let _guard = self
             .write_gate
             .lock()
@@ -825,6 +938,7 @@ impl AppDiagnostics {
             Some(seal.ended_at),
         )?;
         let report = DiagnosticUploadRequest {
+            runtime_identity: identity.clone(),
             report_id: Some(seal.report_id.clone()),
             trigger: seal.trigger.clone(),
             tunnel_session_id: Some(seal.session_id.clone()),
@@ -834,7 +948,10 @@ impl AppDiagnostics {
             tunnel_running: Some(seal.tunnel_running),
             connection_lease_id: seal.connection_id.clone(),
             generated_at_unix: seal.ended_at,
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            app_version: identity
+                .container_version
+                .clone()
+                .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string()),
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
@@ -1398,6 +1515,252 @@ mod tests {
         assert_eq!(RuntimeActionSource::Status.as_str(), "ui_status");
         assert_eq!(RuntimeActionSource::Selection.as_str(), "ui_select");
         assert_eq!(RuntimeActionSource::Restart.as_str(), "ui_restart");
+    }
+
+    fn admitted_identity() -> nelomai_contracts::RuntimeIdentity {
+        nelomai_contracts::RuntimeIdentity {
+            container_version: "0.3.3".into(),
+            runtime_version: "0.2.20".into(),
+            slot: nelomai_contracts::RuntimeSlot::Stable,
+            runtime_contract_version: 1,
+            session_generation: None,
+        }
+    }
+
+    #[test]
+    fn diagnostic_identity_requires_coherent_snapshots() {
+        let before = admitted_identity();
+        let known = coherent_diagnostic_identity(Some(&before), Some(&before));
+        assert_eq!(
+            serde_json::to_value(known).unwrap(),
+            serde_json::json!({
+                "container_version":"0.3.3", "runtime_version":"0.2.20",
+                "runtime_slot":"stable", "runtime_contract_version":1
+            })
+        );
+        let mut after = before.clone();
+        after.runtime_version = "0.3.3".into();
+        after.slot = nelomai_contracts::RuntimeSlot::Latest;
+        for after in [Some(&after), None] {
+            let value =
+                serde_json::to_value(coherent_diagnostic_identity(Some(&before), after)).unwrap();
+            assert!(value.get("runtime_version").is_none());
+            assert!(value.get("runtime_slot").is_none());
+            assert!(value.get("runtime_contract_version").is_none());
+            assert!(value.get("session_generation").is_none());
+        }
+    }
+
+    #[test]
+    fn diagnostic_status_uses_admitted_slot_and_keeps_partial_startup_unknown() {
+        let mut status: nelomai_client_container::RuntimeSwitchStatusV1 =
+            serde_json::from_value(serde_json::json!({
+                "containerVersion":"0.3.3", "selectedSlot":"latest", "activeSlot":"stable",
+                "pendingSlot":"latest", "latestVersion":"0.3.3", "stableVersion":"0.2.20",
+                "runtimeContractVersion":1, "manifestVerified":true, "stableAvailable":true,
+                "switchId":null, "phase":null, "engineRole":"primary"
+            }))
+            .unwrap();
+        let identity = diagnostic_identity_from_status(status.clone()).unwrap();
+        assert_eq!(identity.runtime_version, "0.2.20");
+        assert_eq!(identity.slot, nelomai_contracts::RuntimeSlot::Stable);
+        assert_eq!(identity.session_generation, None); // The live pinned ABI supplies none.
+        status.manifest_verified = false;
+        assert!(diagnostic_identity_from_status(status.clone()).is_none());
+        status.manifest_verified = true;
+        status.stable_version = None;
+        assert!(diagnostic_identity_from_status(status.clone()).is_none());
+        status.active_slot = nelomai_contracts::RuntimeSlot::Latest;
+        status.latest_version.clear();
+        assert!(diagnostic_identity_from_status(status).is_none());
+        let unknown = coherent_diagnostic_identity(None, None);
+        assert_eq!(
+            serde_json::to_value(unknown).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn diagnostic_identity_survives_failed_materialization_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        diagnostics
+            .observe_automatic_tunnel(Some("lease-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+        let identity =
+            coherent_diagnostic_identity(Some(&admitted_identity()), Some(&admitted_identity()));
+        fs::remove_file(directory.path().join(CURRENT_LOG)).unwrap();
+        fs::create_dir(directory.path().join(CURRENT_LOG)).unwrap();
+        assert!(diagnostics
+            .materialize_automatic_report_with_identity(
+                &seal,
+                ResourceSnapshot::capture_for_test(),
+                None,
+                identity.clone()
+            )
+            .is_err());
+        fs::remove_dir(directory.path().join(CURRENT_LOG)).unwrap();
+        drop(diagnostics);
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+        diagnostics
+            .materialize_automatic_report_with_identity(
+                &seal,
+                ResourceSnapshot::capture_for_test(),
+                None,
+                DiagnosticRuntimeIdentity::default(),
+            )
+            .unwrap();
+        let candidate = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+        assert_eq!(candidate.report.runtime_identity, identity);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn diagnostic_recovered_seals_and_intervals_never_acquire_current_identity() {
+        for pending_seal in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().into(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics.set_automatic_device("device-1");
+            diagnostics
+                .observe_automatic_tunnel(Some("lease-1"), true, 10)
+                .unwrap();
+            if pending_seal {
+                diagnostics
+                    .observe_automatic_tunnel(None, false, 20)
+                    .unwrap();
+            }
+            drop(diagnostics);
+            // Emulate a pre-NLM-060 pending marker with no identity member at all.
+            if pending_seal {
+                let path = directory.path().join("automatic/state.json");
+                let mut state: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                state["pending_seal"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("runtime_identity");
+                fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+            }
+            let diagnostics = AppDiagnostics::new(
+                directory.path().into(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics
+                .observe_automatic_tunnel(None, false, 30)
+                .unwrap();
+            let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+            let current = coherent_diagnostic_identity(
+                Some(&admitted_identity()),
+                Some(&admitted_identity()),
+            );
+            diagnostics
+                .materialize_automatic_report_with_identity(
+                    &seal,
+                    ResourceSnapshot::capture_for_test(),
+                    None,
+                    current,
+                )
+                .unwrap();
+            let candidate = diagnostics.automatic_upload_candidate(30).unwrap().unwrap();
+            let payload = serde_json::to_value(&candidate.report).unwrap();
+            assert!(payload.get("runtime_version").is_none());
+            assert!(payload.get("runtime_slot").is_none());
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn diagnostic_builders_freeze_identity_for_manual_and_automatic_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        let identity: DiagnosticRuntimeIdentity = serde_json::from_value(serde_json::json!({
+            "container_version":"0.3.4", "runtime_version":"0.2.20",
+            "runtime_slot":"stable", "runtime_contract_version":1
+        }))
+        .unwrap();
+        let manual = diagnostics
+            .build_report_with_identity(
+                ResourceSnapshot::capture_for_test(),
+                None,
+                None,
+                identity.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&manual).unwrap()["runtime_version"],
+            "0.2.20"
+        );
+        assert_eq!(manual.app_version, "0.3.4");
+        diagnostics
+            .observe_automatic_tunnel(Some("lease-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+        diagnostics
+            .materialize_automatic_report_with_identity(
+                &seal,
+                ResourceSnapshot::capture_for_test(),
+                None,
+                identity.clone(),
+            )
+            .unwrap();
+        let first = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+        assert_eq!(first.report.runtime_identity, identity);
+        let original = serde_json::to_value(&first.report).unwrap();
+        diagnostics.automatic_upload_failed(20).unwrap();
+        drop(first);
+        let retry = diagnostics
+            .automatic_upload_candidate(320)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(&retry.report).unwrap(), original);
+        diagnostics.automatic_upload_succeeded(&retry, 320).unwrap();
+        drop(retry);
+        diagnostics
+            .queue_connection_intent_report_with_identity(
+                ConnectionIntentReportTrigger::SlowRecovery,
+                400,
+                identity.clone(),
+            )
+            .unwrap();
+        let intent = diagnostics
+            .automatic_upload_candidate(400)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.report.runtime_identity, identity);
+        let unknown = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        let value = serde_json::to_value(unknown).unwrap();
+        assert!(value.get("runtime_version").is_none());
+        assert!(value.get("session_generation").is_none());
     }
 
     #[test]
