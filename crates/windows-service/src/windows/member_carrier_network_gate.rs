@@ -1404,12 +1404,23 @@ fn compare_route_reads(
     let broadcast = "255.255.255.255/32"
         .parse::<ipnet::IpNet>()
         .map_err(denied)?;
+    let ipv6_multicast = "ff00::/8".parse::<ipnet::IpNet>().map_err(denied)?;
+    let link_local = "fe80::/64".parse::<ipnet::Ipv6Net>().map_err(denied)?;
     for row in actual {
-        let control = (row.route.destination == multicast || row.route.destination == broadcast)
+        let control = (((row.route.destination == multicast
+            || row.route.destination == ipv6_multicast)
+            && row.origin == 1
+            && row.flags == [0, 1, 0, 0])
+            || ((row.route.destination == broadcast
+                || matches!(row.route.destination, ipnet::IpNet::V6(net)
+                    if net.prefix_len() == 128 && link_local.contains(&net.addr())))
+                && row.origin == 0
+                && row.flags == [1, 1, 0, 0])
+            || (row.route.destination == ipnet::IpNet::V6(link_local)
+                && row.origin == 0
+                && row.flags == [0, 1, 0, 0]))
             && row.route.gateway.is_none()
             && row.protocol == 2
-            && row.origin == 1
-            && row.flags == [0, 1, 0, 0]
             && row.site_prefix_length == 0
             && row.valid_lifetime == u32::MAX
             && row.preferred_lifetime == u32::MAX;
