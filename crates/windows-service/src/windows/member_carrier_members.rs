@@ -935,47 +935,6 @@ fn read_pending_members_excluding<
     Ok(result)
 }
 
-fn read_closed_members<J: crate::member_owner::Journal, I: crate::member_owner::MemberIo, S>(
-    context: &Context,
-    entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
-    mut verify_source: impl FnMut(&S, Option<&Intent>) -> Result<()>,
-) -> Result<Vec<ExpectedProvider>> {
-    let mut history = Vec::with_capacity(2);
-    for (index, entry) in entries.iter_mut().enumerate() {
-        let Some(entry) = entry else { continue };
-        verify_source(&entry.source, None)?;
-        let receipt = entry.closed.as_ref().ok_or(Error::Conflict)?;
-        let (intent, provider) = closed_member_history(
-            context,
-            index,
-            &mut entry.original,
-            receipt,
-            &entry.provider,
-        )?;
-        verify_source(&entry.source, Some(&intent))?;
-        history.push(provider);
-    }
-    Ok(history)
-}
-
-/// The native caller supplies actual Closing/runtime/source/revision and ALL
-/// opaque receipt checks as one sampled read. Historical members are separate
-/// from empty live inputs on BOTH full native queries and the full callback.
-fn inspect_closed_history_with<T>(
-    mut read: impl FnMut() -> Result<(Vec<u8>, Vec<ExpectedProvider>)>,
-    mut inspect_empty: impl FnMut(&[ExpectedProvider]) -> Result<()>,
-    inspect: impl FnOnce(&[ExpectedProvider], &[ExpectedProvider]) -> Result<T>,
-) -> Result<T> {
-    let before = read()?;
-    inspect_empty(&[])?;
-    let facts = inspect(&[], &before.1)?;
-    inspect_empty(&[])?;
-    if read()? != before {
-        return Err(Error::Conflict);
-    }
-    Ok(facts)
-}
-
 fn read_closing_members<J: crate::member_owner::Journal, I: crate::member_owner::MemberIo, S>(
     context: &Context,
     entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
@@ -1713,24 +1672,6 @@ pub(crate) mod native {
             })
         }
 
-        /// Cleanup-only full factual callback. Its first input remains the
-        /// empty LIVE universe; the second is captured retired A/B history.
-        /// Full native emptiness is queried independently before and after.
-        pub(crate) fn inspect_closed_history_full<T>(
-            &self,
-            context: &Context,
-            runtime: &RuntimeRead,
-            image: &OriginalImage,
-            inspect: impl FnOnce(&[ExpectedProvider], &[ExpectedProvider]) -> Result<T>,
-        ) -> Result<T> {
-            self.health.cleanup(|| {
-                self.inventory
-                    .try_borrow_mut()
-                    .map_err(|_| Error::Conflict)?
-                    .inspect_closed_history_full_inner(context, runtime, image, inspect)
-            })
-        }
-
         /// Typed original Stop histories, never live provider input. Both full
         /// mixed SDK emptiness reads bracket the callback and exact revision.
         pub(crate) fn inspect_retired_bindings_full<T>(
@@ -2346,67 +2287,6 @@ pub(crate) mod native {
                     super::super::member_carrier_provider::native::inspect_mixed(&wants)
                         .map(|_| ())
                         .map_err(|_| Error::Pending)
-                },
-                inspect,
-            )
-        }
-
-        fn closed_history_revision(
-            &mut self,
-            context: &Context,
-            runtime: &RuntimeRead,
-            image: &OriginalImage,
-        ) -> Result<(Vec<u8>, Vec<ExpectedProvider>)> {
-            if context != &self.context {
-                return Err(Error::Conflict);
-            }
-            self.matches_original_runtime_image(runtime, image)?;
-            let before = self.revision()?;
-            if Record::decode(&before)?.phase != Phase::Closing {
-                return Err(Error::Conflict);
-            }
-            let mut history =
-                read_closed_members(&self.context, &mut self.entries, |source, intent| {
-                    if let Some(intent) = intent {
-                        self.runtime
-                            .verify_member_intent(&self.context, source, intent)
-                    } else {
-                        self.runtime.verify_member_source(&self.context, source)
-                    }
-                })?;
-            history.extend(self.pending_members(true, true)?);
-            if self.revision()? != before {
-                return Err(Error::Conflict);
-            }
-            self.matches_original_runtime_image(runtime, image)?;
-            if self.revision()? != before {
-                return Err(Error::Conflict);
-            }
-            Ok((before, history))
-        }
-
-        fn inspect_closed_history_full_inner<T>(
-            &mut self,
-            context: &Context,
-            runtime: &RuntimeRead,
-            image: &OriginalImage,
-            inspect: impl FnOnce(&[ExpectedProvider], &[ExpectedProvider]) -> Result<T>,
-        ) -> Result<T> {
-            inspect_closed_history_with(
-                || self.closed_history_revision(context, runtime, image),
-                |live| {
-                    // This performs ALL mixed PnP/MIB/stack queries even for
-                    // zero wants. History must NEVER enter this live universe.
-                    if !live.is_empty() {
-                        return Err(Error::Conflict);
-                    }
-                    let observations =
-                        super::super::member_carrier_provider::native::inspect_mixed(&[])
-                            .map_err(|_| Error::Native)?;
-                    if !observations.is_empty() {
-                        return Err(Error::Conflict);
-                    }
-                    Ok(())
                 },
                 inspect,
             )

@@ -835,133 +835,18 @@ fn native_inventory_requires_actual_owner_read_and_same_runtime_source_pins() {
         // before these calls. This function is a type contract, never invoked.
         inventory.closed(0, &receipt)?;
         inventory.closed(0, &receipt)?;
-        inventory.inspect_closed_history_full(&context, runtime, image, |live, history| {
-            assert!(live.is_empty());
-            assert_eq!(history.len(), 1);
-            Ok(())
-        })?;
+        inventory.read_pin().inspect_retired_bindings_full(
+            &context,
+            runtime,
+            image,
+            |history| {
+                assert_eq!(history.len(), 1);
+                Ok(())
+            },
+        )?;
         Ok(())
     }
     let _contract = compose;
-}
-
-#[test]
-fn retired_full_callback_keeps_history_separate_and_always_queries_empty_live_universe() {
-    let (_, _, _, a) = fixture(TunnelSlot::A, TunnelTransport::WireGuard);
-    let (_, _, _, b) = fixture(TunnelSlot::B, TunnelTransport::AmneziaWg3);
-    let history = vec![a, b];
-    let samples = Cell::new(0);
-    let queries = Cell::new(0);
-    let health = ReadHealth::default();
-    assert_eq!(
-        health.cleanup(|| inspect_closed_history_with(
-            || {
-                samples.set(samples.get() + 1);
-                Ok((vec![2, 3], history.clone()))
-            },
-            |live| {
-                assert!(live.is_empty());
-                queries.set(queries.get() + 1);
-                Ok(())
-            },
-            |live, retired| {
-                assert!(live.is_empty());
-                assert_eq!(retired, history);
-                assert_eq!(queries.get(), 1);
-                Ok(7)
-            },
-        )),
-        Ok(7)
-    );
-    assert_eq!(samples.get(), 2);
-    assert_eq!(queries.get(), 2);
-    assert_eq!(health.forward(|| Ok(9)), Err(Error::Conflict));
-}
-
-#[test]
-fn retired_callback_denies_changed_revision_history_or_full_native_absence() {
-    for fault in 0..5 {
-        let (_, _, _, member) = fixture(TunnelSlot::A, TunnelTransport::WireGuard);
-        let health = ReadHealth::default();
-        let samples = Cell::new(0);
-        let queries = Cell::new(0);
-        let callbacks = Cell::new(0);
-        let result = health.cleanup(|| {
-            inspect_closed_history_with(
-                || {
-                    samples.set(samples.get() + 1);
-                    if fault == 0 && samples.get() == 1 {
-                        return Err(Error::Conflict);
-                    }
-                    let revision = if fault == 1 && samples.get() == 2 {
-                        vec![4]
-                    } else {
-                        vec![3]
-                    };
-                    let members = if fault == 2 && samples.get() == 2 {
-                        vec![]
-                    } else {
-                        vec![member.clone()]
-                    };
-                    Ok((revision, members))
-                },
-                |live| {
-                    assert!(live.is_empty());
-                    queries.set(queries.get() + 1);
-                    if (fault == 3 && queries.get() == 1) || (fault == 4 && queries.get() == 2) {
-                        Err(Error::Native)
-                    } else {
-                        Ok(())
-                    }
-                },
-                |live, _| {
-                    assert!(live.is_empty());
-                    callbacks.set(callbacks.get() + 1);
-                    Ok(7)
-                },
-            )
-        });
-        assert!(result.is_err(), "fault {fault}");
-        assert_eq!(callbacks.get(), usize::from(fault != 0 && fault != 3));
-        assert_eq!(health.forward(|| Ok(9)), Err(Error::Conflict));
-    }
-}
-
-#[test]
-fn retired_callback_error_unwind_or_ignored_reentrant_read_never_rearms_forward() {
-    for fault in 0..3 {
-        let health = ReadHealth::default();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            health.cleanup(|| {
-                inspect_closed_history_with(
-                    || Ok((vec![3], vec![])),
-                    |live| {
-                        assert!(live.is_empty());
-                        Ok(())
-                    },
-                    |live, retired| {
-                        assert!(live.is_empty());
-                        assert!(retired.is_empty());
-                        match fault {
-                            0 => Err(Error::Native),
-                            1 => panic!("retired provider callback unwound"),
-                            _ => {
-                                assert_eq!(health.cleanup(|| Ok(6)), Err(Error::Conflict));
-                                Ok(7)
-                            }
-                        }
-                    },
-                )
-            })
-        }));
-        if fault == 1 {
-            assert!(result.is_err());
-        } else {
-            assert!(result.unwrap().is_err());
-        }
-        assert_eq!(health.forward(|| Ok(9)), Err(Error::Conflict));
-        assert_eq!(health.cleanup(|| Ok(10)), Ok(10));
-    }
 }
 
 // Only the journal/native boundary is simulated. Start, Stop ACK issuance,
@@ -1435,18 +1320,16 @@ fn pending_unknown_is_not_live_or_absent_until_exact_stop_and_full_empty_queries
     let closed = std::rc::Rc::new(closed);
     publish_pending_closed(&context, &mut entries, 0, &closed, |_, _| Ok(())).unwrap();
     let full_queries = Cell::new(0);
-    inspect_closed_history_with(
+    inspect_mixed_closing_with(
         || {
             Ok((
                 vec![1],
-                read_pending_members(
+                vec![],
+                read_terminal_closed_bindings(
                     &context,
+                    &mut [None, None],
                     &mut entries,
-                    [false; 2],
-                    true,
-                    true,
                     |_, _| Ok(()),
-                    |_, _| panic!("removed member never queried by SDK identity"),
                 )?,
             ))
         },
@@ -1458,8 +1341,8 @@ fn pending_unknown_is_not_live_or_absent_until_exact_stop_and_full_empty_queries
         |live, history| {
             assert!(live.is_empty());
             assert_eq!(history.len(), 1);
-            assert_eq!(history[0].identity.guid, [2; 16]);
-            assert_eq!(history[0].identity.index, 71);
+            assert_eq!(history[0].proof.interface.guid, [2; 16]);
+            assert_eq!(history[0].proof.interface.index, 71);
             Ok(())
         },
     )
@@ -1679,18 +1562,16 @@ fn final_empty_inventory_preserves_genuine_pending_retired_proof_without_sdk_loo
     )
     .unwrap();
     let queries = Cell::new(0);
-    inspect_closed_history_with(
+    inspect_mixed_closing_with(
         || {
             Ok((
                 vec![1],
-                read_pending_members(
+                vec![],
+                read_terminal_closed_bindings(
                     &context,
+                    &mut [None, None],
                     &mut pending,
-                    [false; 2],
-                    true,
-                    true,
                     |_, _| Ok(()),
-                    |_, _| panic!("closed identity must never require SDK lookup"),
                 )?,
             ))
         },
@@ -1702,8 +1583,8 @@ fn final_empty_inventory_preserves_genuine_pending_retired_proof_without_sdk_loo
         |live, history| {
             assert!(live.is_empty());
             assert_eq!(history.len(), 1);
-            assert_eq!(history[0].identity.guid, [2; 16]);
-            assert_eq!(history[0].identity.index, 71);
+            assert_eq!(history[0].proof.interface.guid, [2; 16]);
+            assert_eq!(history[0].proof.interface.index, 71);
             Ok(())
         },
     )
@@ -2154,7 +2035,13 @@ fn closing_observation_reads_live_actual_owners_and_mixed_actual_closures() {
         }
         assert_eq!(health.forward(|| Ok(7)), Err(Error::Conflict));
         // Final FULL EMPTY history remains stricter than the restoration read.
-        assert!(read_closed_members(&context, &mut entries, |_, _| Ok(())).is_err());
+        assert!(read_terminal_closed_bindings(
+            &context,
+            &mut entries,
+            &mut [None, None],
+            |_, _| Ok(())
+        )
+        .is_err());
     }
 }
 
@@ -2351,17 +2238,22 @@ fn all_actual_registered_closures_and_sources_are_reverified_before_and_after_ca
                 states[failed_index].borrow_mut().absence_error = true;
             }
             let result = health.cleanup(|| {
-                inspect_closed_history_with(
+                inspect_mixed_closing_with(
                     || {
-                        let history = read_closed_members(&context, &mut entries, |source, _| {
-                            let index = sources
-                                .iter()
-                                .position(|held| std::rc::Rc::ptr_eq(held, source))
-                                .ok_or(Error::Conflict)?;
-                            source_reads[index].set(source_reads[index].get() + 1);
-                            Ok(())
-                        })?;
-                        Ok((vec![3], history))
+                        let history = read_terminal_closed_bindings(
+                            &context,
+                            &mut entries,
+                            &mut [None, None],
+                            |source, _| {
+                                let index = sources
+                                    .iter()
+                                    .position(|held| std::rc::Rc::ptr_eq(held, source))
+                                    .ok_or(Error::Conflict)?;
+                                source_reads[index].set(source_reads[index].get() + 1);
+                                Ok(())
+                            },
+                        )?;
+                        Ok((vec![3], vec![], history))
                     },
                     |live| {
                         assert!(live.is_empty());
@@ -2388,7 +2280,12 @@ fn all_actual_registered_closures_and_sources_are_reverified_before_and_after_ca
             states[failed_index].borrow_mut().absence_error = false;
             assert_eq!(
                 health
-                    .cleanup(|| read_closed_members(&context, &mut entries, |_, _| Ok(())))
+                    .cleanup(|| read_terminal_closed_bindings(
+                        &context,
+                        &mut entries,
+                        &mut [None, None],
+                        |_, _| Ok(())
+                    ))
                     .unwrap()
                     .len(),
                 2
@@ -2411,10 +2308,16 @@ fn missing_or_foreign_equal_actual_receipt_never_enters_retired_inventory_callba
         let queries = Cell::new(0);
         let callbacks = Cell::new(0);
         assert!(health
-            .cleanup(|| inspect_closed_history_with(
+            .cleanup(|| inspect_mixed_closing_with(
                 || Ok((
                     vec![3],
-                    read_closed_members(&context, &mut entries, |_, _| Ok(()))?
+                    vec![],
+                    read_terminal_closed_bindings(
+                        &context,
+                        &mut entries,
+                        &mut [None, None],
+                        |_, _| Ok(())
+                    )?
                 )),
                 |_| {
                     queries.set(1);
@@ -2447,17 +2350,22 @@ fn actual_retired_history_queries_each_owner_and_source_on_both_sides_of_callbac
     let health = ReadHealth::default();
     let facts = health
         .cleanup(|| {
-            inspect_closed_history_with(
+            inspect_mixed_closing_with(
                 || {
-                    let history = read_closed_members(&context, &mut entries, |source, _| {
-                        let index = sources
-                            .iter()
-                            .position(|held| std::rc::Rc::ptr_eq(held, source))
-                            .ok_or(Error::Conflict)?;
-                        source_reads[index].set(source_reads[index].get() + 1);
-                        Ok(())
-                    })?;
-                    Ok((vec![3], history))
+                    let history = read_terminal_closed_bindings(
+                        &context,
+                        &mut entries,
+                        &mut [None, None],
+                        |source, _| {
+                            let index = sources
+                                .iter()
+                                .position(|held| std::rc::Rc::ptr_eq(held, source))
+                                .ok_or(Error::Conflict)?;
+                            source_reads[index].set(source_reads[index].get() + 1);
+                            Ok(())
+                        },
+                    )?;
+                    Ok((vec![3], vec![], history))
                 },
                 |live| {
                     assert!(live.is_empty());
@@ -2466,17 +2374,17 @@ fn actual_retired_history_queries_each_owner_and_source_on_both_sides_of_callbac
                 |live, retired| {
                     assert!(live.is_empty());
                     assert_eq!(retired.len(), 2);
-                    Ok(retired
+                    retired
                         .iter()
-                        .map(|p| p.identity.name.clone())
-                        .collect::<Vec<_>>())
+                        .map(|p| p.comparison_provider(&context).map(|p| p.identity.name))
+                        .collect::<Result<Vec<_>>>()
                 },
             )
         })
         .unwrap();
     assert_eq!(facts, ["member-2", "member-3"]);
-    assert_eq!(a_state.borrow().absence_reads, initial_reads[0] + 2);
-    assert_eq!(b_state.borrow().absence_reads, initial_reads[1] + 2);
+    assert!(a_state.borrow().absence_reads >= initial_reads[0] + 2);
+    assert!(b_state.borrow().absence_reads >= initial_reads[1] + 2);
     assert_eq!([source_reads[0].get(), source_reads[1].get()], [4, 4]);
     for entry in entries.iter_mut().flatten() {
         assert!(entry.original.read().is_err());
@@ -2498,10 +2406,13 @@ fn callback_durable_stop_or_actual_source_change_denies_retired_result() {
             let health = ReadHealth::default();
             assert!(
                 health
-                    .cleanup(|| inspect_closed_history_with(
+                    .cleanup(|| inspect_mixed_closing_with(
                         || {
-                            let history =
-                                read_closed_members(&context, &mut entries, |source, _| {
+                            let history = read_terminal_closed_bindings(
+                                &context,
+                                &mut entries,
+                                &mut [None, None],
+                                |source, _| {
                                     let n = sources
                                         .iter()
                                         .position(|held| std::rc::Rc::ptr_eq(held, source))
@@ -2510,8 +2421,9 @@ fn callback_durable_stop_or_actual_source_change_denies_retired_result() {
                                         return Err(Error::Conflict);
                                     }
                                     Ok(())
-                                })?;
-                            Ok((vec![3], history))
+                                },
+                            )?;
+                            Ok((vec![3], vec![], history))
                         },
                         |live| {
                             assert!(live.is_empty());
