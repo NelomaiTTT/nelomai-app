@@ -89,8 +89,8 @@
 **Files:** Android `{RedundantHealthMonitor,RedundantProductionAdapters,RedundantConnectionCoordinator,NelomaiVpnService,TunnelPlugin}.kt` и соответствующие тесты; `package.json`, locks/Cargo manifest versions, `src-tauri/tauri.conf.json`, release/checks workflows и versioned packaging tests.
 **Interfaces:** available физическойсети вместо VALIDATED при readiness; независимые реальные probe/handshake обязательны. Version0.3.3 согласована во всех проверках; trustedstable0.2.20 неизменен.
 
-- [ ] Перенести5actual-coordinator regressions изAndroid6f9d112: unvalidatedavailable Tic/Stray допускаются только при здоровыхprobe+handshake; missingnetwork/failedprobe/stalehandshake запрещены; manualrebind не выдумываетtrue.
-- [ ] ПолучитьRED, перенести только Android срез, прогнать полный Androidplugin suite и stablecompile; review/commitNLM063.
+- [x] Из6f9d112 перенесены4actual-coordinator regressions (оба Tic/Stray) и native-probe return test; shared production mapping даёт настоящий RED на unvalidatedavailable, negative missingnetwork/probe/handshake guards сохранены. Manualrebind читает snapshot, при ошибке false.
+- [x] Android-only NLM063: полный plugin981PASS/0fail/errors/skips/46suites, stable Kotlin compile PASS, diff check/inline review без замечаний. Без Macroute/carrier/0.4.0 изменений; hardware gate отдельно.
 - [ ] Обновить версии/workflow/gates/fixtures штатно на0.3.3; не ослаблять existingpublishedtag immutable gate или sourceSHA/signature checks. Не включать carrierCI из0.4.0.
 - [ ] Сборщик поддержки сейчас содержит literal0.3.2 и versioneddirectory0.3.2: при выпуске перейти на проверенную buildversion, сохранить bounded allowlist исторических0.3.2/stable0.2.20/current0.3.3, добавить regression currentlog+historicaltails+точнаяapp_version. Не подменять неизвестный activeruntime версией контейнера (NLM060 отдельно).
 - [ ] Прогнать version/script tests, Androidapp unit suite, fullRustworkspace, npmtest,fmt,Clippy; каждый пропуск явно записать.

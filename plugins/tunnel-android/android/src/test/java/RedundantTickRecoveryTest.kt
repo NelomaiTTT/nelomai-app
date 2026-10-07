@@ -240,7 +240,7 @@ class RedundantTickRecoveryTest {
         assertTrue(requireNotNull(f.coordinator.status()).retry.acquirePending)
         assertEquals("lease-b", f.coordinator.status()?.retry?.acquireReplaceLeaseId)
     }
-    @Test fun healthyStandbyAndUnvalidatedNetworkDoNotScheduleReplacement() {
+    @Test fun healthyStandbyAndUnavailableNetworkDoNotScheduleReplacement() {
         val f = Fixture(); start(f)
         f.coordinator.tick()
         assertFalse(requireNotNull(f.coordinator.status()).retry.acquirePending)

@@ -46,7 +46,7 @@ internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
     private val resumeQueued = AtomicBoolean(false)
     private val networkGate = Any()
     private var networkQueued = false
-    private var pendingValidated: Boolean? = null
+    private var pendingAvailable: Boolean? = null
 
     fun execute(action: () -> Unit) = executor.execute(action)
 
@@ -74,9 +74,9 @@ internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
         return true
     }
 
-    fun network(validated: Boolean, action: (Boolean) -> Unit): Boolean {
+    fun network(available: Boolean, action: (Boolean) -> Unit): Boolean {
         val schedule = synchronized(networkGate) {
-            pendingValidated = validated
+            pendingAvailable = available
             if (networkQueued) false else {
                 networkQueued = true
                 true
@@ -86,7 +86,7 @@ internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
         executor.execute {
             while (true) {
                 val current = synchronized(networkGate) {
-                    pendingValidated?.also { pendingValidated = null } ?: run {
+                    pendingAvailable?.also { pendingAvailable = null } ?: run {
                         networkQueued = false
                         return@execute
                     }
@@ -1419,7 +1419,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 )
             },
             probeSourceIpv4 = probeSourceIpv4,
-            initialNetworkValidated = physicalState.validated,
+            initialNetworkAvailable = physicalState.available,
         )
         val ownerServiceGeneration = serviceGeneration
         var coordinatorOwner: RedundantConnectionCoordinator? = null
@@ -1427,9 +1427,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             recoveryStore,
             ServiceRedundantConnectionPanel(::serviceActiveCredential),
             native,
-            healthMonitor = RedundantHealthMonitor(
-                initialNetworkValidated = physicalState.validated,
-            ),
+            healthMonitor = redundantHealthMonitorForNetwork(physicalState),
             onAllSlotsStalled = {
                 coordinatorOwner?.let { owner ->
                     restoreHandler.post {
@@ -1591,7 +1589,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             }
             candidateProbeCache.invalidateNetwork()
             setUnderlyingNetworks(state.networks.toTypedArray().takeIf { it.isNotEmpty() })
-            redundantWork.network(state.validated) { latestValidated ->
+            redundantWork.network(state.available) { latestAvailable ->
                 if (!identity.isCurrent(currentRedundantPhysicalNetworkCallbackState())) {
                     return@network
                 }
@@ -1601,7 +1599,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 )
                 if (transaction != null &&
                     redundantOwnerForOperation(transaction.startOperationId)
-                        ?.onUnderlyingNetworkChanged(latestValidated) != true
+                        ?.onUnderlyingNetworkChanged(latestAvailable) != true
                 ) {
                     TunnelLog.warning("redundant.network_change_failed")
                 }
@@ -1618,7 +1616,6 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun applyPluginPhysicalNetworks(
         networks: List<Network>,
-        validated: Boolean,
     ) {
         val installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId
         val apply = {
@@ -1629,7 +1626,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             } else {
                 candidateProbeCache.invalidateNetwork()
                 setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
-                redundantWork.network(validated) { latestValidated ->
+                redundantWork.network(networks.isNotEmpty()) { latestAvailable ->
                     val recovery = recoveryStore.read()
                     if (!shouldEnterLegacyVpnRecovery(recovery)) {
                         val transaction = activeRedundantTransactionForCurrentWork(
@@ -1638,7 +1635,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                         )
                         val changed = transaction?.let {
                             redundantOwnerForOperation(it.startOperationId)
-                                ?.onUnderlyingNetworkChanged(latestValidated)
+                                ?.onUnderlyingNetworkChanged(latestAvailable)
                         } == true
                         if (transaction != null && !changed) {
                             TunnelLog.warning("redundant.network_change_failed")
@@ -2686,7 +2683,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     redundantOwnerForOperation(it.startOperationId)
                         ?: ensureRedundantCoordinator(it)
                 }
-                val rebound = owner?.onUnderlyingNetworkChanged(validated = true) == true
+                // A manual rebind is not evidence of connectivity. Do not resume
+                // probes on a missing physical network (or a failed snapshot).
+                val available = runCatching {
+                    PhysicalNetworks(applicationContext).snapshotState().available
+                }.getOrDefault(false)
+                val rebound = owner?.onUnderlyingNetworkChanged(available = available) == true
                 restoreHandler.post {
                     if (rebound) receiver.sendOperation(SessionState.RUNNING, 0)
                     else receiver.sendError("redundant_rebind_failed")
@@ -5032,8 +5034,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             activeService?.scheduleConnectionIntentAttempt()
         }
 
-        fun setPhysicalNetworks(networks: List<Network>, validated: Boolean) {
-            activeService?.applyPluginPhysicalNetworks(networks, validated)
+        fun setPhysicalNetworks(networks: List<Network>) {
+            activeService?.applyPluginPhysicalNetworks(networks)
         }
 
         private fun quickActionError(code: String): String = when (code) {

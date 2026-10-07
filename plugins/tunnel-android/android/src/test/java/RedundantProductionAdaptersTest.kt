@@ -723,7 +723,7 @@ class RedundantProductionAdaptersTest {
         assertEquals(null, reboundObservation.softFailureStartedAtMs)
 
         val invalidated = suspectedFixture()
-        invalidated.native.setNetworkValidated(false)
+        invalidated.native.setNetworkAvailable(false)
         val invalidatedObservation = invalidated.native.healthObservations().single()
         assertFalse(invalidatedObservation.probeFailed)
         assertFalse(invalidatedObservation.independentFailureSignal)
@@ -853,14 +853,14 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
-    fun availableButUnvalidatedNetworkSuspendsNativeProbeProgress() {
+    fun noPhysicalNetworkSuspendsNativeProbeProgress() {
         val backend = RecordingSessionBackend()
         val native = ServiceRedundantConnectionNative(
             backend = backend,
             establishTun = { 41 },
             prepare = ::prepared,
             probeSourceIpv4 = "10.200.0.2/32",
-            initialNetworkValidated = false,
+            initialNetworkAvailable = false,
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
 
@@ -869,6 +869,27 @@ class RedundantProductionAdaptersTest {
         assertEquals(0, backend.probeStatuses.size)
         assertEquals(0, observation.consecutiveProbeSuccesses)
         assertEquals(BackendHealth.WARMING, observation.health)
+    }
+
+    @Test
+    fun physicalNetworkReturnResumesOwnProbesWithoutOsValidation() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            initialNetworkAvailable = false,
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        native.healthObservations()
+        assertTrue(backend.probeLaunches.isEmpty())
+        native.setNetworkAvailable(true)
+        native.healthObservations()
+        assertEquals(1, backend.probeLaunches.size)
+        native.setNetworkAvailable(false)
+        native.healthObservations()
+        assertEquals("offline state must not start another probe", 1, backend.probeLaunches.size)
     }
 
     @Test

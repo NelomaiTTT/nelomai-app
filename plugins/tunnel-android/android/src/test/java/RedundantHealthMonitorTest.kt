@@ -8,10 +8,10 @@ import org.junit.Test
 
 class RedundantHealthMonitorTest {
     @Test
-    fun initiallyUnvalidatedNetworkCannotReportPrimaryReady() {
+    fun initiallyUnavailableNetworkCannotReportPrimaryReady() {
         val monitor = RedundantHealthMonitor(
             rebindStabilizationMs = 0,
-            initialNetworkValidated = false,
+            initialNetworkAvailable = false,
         )
         val ready = slot(
             index = 0,
@@ -22,7 +22,7 @@ class RedundantHealthMonitorTest {
         )
 
         assertFalse(monitor.ready(nowMs = 1_000, observation = ready))
-        monitor.onUnderlyingNetworkChanged(nowMs = 1_000, validated = true)
+        monitor.onUnderlyingNetworkChanged(nowMs = 1_000, available = true)
         assertTrue(monitor.ready(nowMs = 1_000, observation = ready))
     }
 
@@ -113,7 +113,7 @@ class RedundantHealthMonitorTest {
             softFailureConfirmationMs = 0,
             rebindStabilizationMs = 4_000,
         )
-        monitor.onUnderlyingNetworkChanged(nowMs = 10_000, validated = true)
+        monitor.onUnderlyingNetworkChanged(nowMs = 10_000, available = true)
         val observations = listOf(
             slot(
                 index = 0,
@@ -131,9 +131,9 @@ class RedundantHealthMonitorTest {
     }
 
     @Test
-    fun noValidatedNetworkSuspendsHealthInsteadOfSwitchingOrStalling() {
+    fun noAvailableNetworkSuspendsHealthInsteadOfSwitchingOrStalling() {
         val monitor = RedundantHealthMonitor(softFailureConfirmationMs = 0)
-        monitor.onUnderlyingNetworkChanged(nowMs = 1_000, validated = false)
+        monitor.onUnderlyingNetworkChanged(nowMs = 1_000, available = false)
 
         val decision = monitor.evaluateHealth(
             nowMs = 20_000,

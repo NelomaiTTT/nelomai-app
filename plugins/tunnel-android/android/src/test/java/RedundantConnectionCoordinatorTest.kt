@@ -284,7 +284,7 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun coldStartRebindSkipsEstablishedHandshakeAndTicAndUnvalidatedNetwork() {
+    fun coldStartRebindSkipsEstablishedHandshakeAndTicAndUnavailableNetwork() {
         for (condition in listOf("handshake", "tic", "offline", "stopped")) {
             var now = 0L
             val native = FakeNative()
@@ -293,7 +293,7 @@ class RedundantConnectionCoordinatorTest {
                 template = it.template.copy(layer = if (condition == "tic") "tic" else "stray")) }
             val coordinator = testRedundantCoordinator(emptyStore(), panel, native,
                 monotonicMs = { now }, healthMonitor = RedundantHealthMonitor(
-                    initialNetworkValidated = condition != "offline"))
+                    initialNetworkAvailable = condition != "offline"))
             assertTrue(coordinator.start(original, mapOf("lease-a" to byteArrayOf(1)),
                 mapOf("lease-a" to probe())))
             if (condition == "stopped") assertTrue(coordinator.fenceRevoke())
@@ -906,7 +906,7 @@ class RedundantConnectionCoordinatorTest {
         ))
         assertFalse(coordinator.isRunning())
 
-        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(available = false))
         assertEquals(listOf("lease-a", "lease-b"), native.rebound)
     }
 
@@ -937,7 +937,7 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun initiallyUnvalidatedStartRebindsBeforeLaterReadiness() {
+    fun initiallyUnavailableStartRebindsBeforeLaterReadiness() {
         val native = FakeNative().apply {
             healthSnapshots += listOf(
                 healthSlot(
@@ -959,7 +959,7 @@ class RedundantConnectionCoordinatorTest {
             monotonicMs = { 1_000L },
             healthMonitor = RedundantHealthMonitor(
                 rebindStabilizationMs = 0,
-                initialNetworkValidated = false,
+                initialNetworkAvailable = false,
             ),
         )
 
@@ -971,7 +971,7 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(coordinator.tick())
         assertFalse(coordinator.isRunning())
 
-        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = true))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(available = true))
         assertEquals(listOf("lease-a", "lease-b"), native.rebound)
         assertTrue(coordinator.tick())
         assertTrue(coordinator.isRunning())
@@ -2069,21 +2069,21 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun validatedNetworkHandoffRebindsBothMembersBeforeStabilization() {
+    fun availableNetworkHandoffRebindsBothMembersBeforeStabilization() {
         val native = FakeNative()
         val coordinator = testRedundantCoordinator(store(transaction()), FakePanel(), native)
 
-        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = true))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(available = true))
 
         assertEquals(listOf("lease-a", "lease-b"), native.rebound)
     }
 
     @Test
-    fun availableUnvalidatedNetworkRebindsBothMembersWhileHealthStaysSuspended() {
+    fun unavailableNetworkRebindsBothMembersWhileHealthStaysSuspended() {
         val native = FakeNative()
         val coordinator = testRedundantCoordinator(store(transaction()), FakePanel(), native)
 
-        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(available = false))
 
         assertEquals(listOf("lease-a", "lease-b"), native.rebound)
     }
@@ -2093,7 +2093,7 @@ class RedundantConnectionCoordinatorTest {
         val native = FakeNative(rebindResults = ArrayDeque(listOf(false, true)))
         val coordinator = testRedundantCoordinator(store(transaction()), FakePanel(), native)
 
-        assertFalse(coordinator.onUnderlyingNetworkChanged(validated = true))
+        assertFalse(coordinator.onUnderlyingNetworkChanged(available = true))
 
         assertEquals(listOf("lease-a", "lease-b"), native.rebindAttempts)
         assertEquals(listOf("lease-b"), native.rebound)
@@ -3336,7 +3336,7 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun unvalidatedNetworkCannotCommitAnOtherwiseReadyCandidate() {
+    fun unavailableNetworkCannotCommitAnOtherwiseReadyCandidate() {
         var nowMs = 1_000_000L
         val panel = FakePanel()
         val native = FakeNative(usable = setOf("lease-a", "candidate"))
@@ -3348,7 +3348,7 @@ class RedundantConnectionCoordinatorTest {
             monotonicMs = { nowMs },
         )
         assertTrue(coordinator.acquireAndCommitStandby("acquire-1"))
-        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(available = false))
         native.healthSnapshots.addLast(listOf(
             healthSlot(index = 0, health = BackendHealth.READY),
             healthSlot(

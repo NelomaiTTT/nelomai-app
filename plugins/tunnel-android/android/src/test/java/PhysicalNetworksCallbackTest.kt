@@ -52,7 +52,7 @@ class PhysicalNetworksCallbackTest {
         try {
             monitor.start(initialState = baseline) {
                 updates += it
-                health.onUnderlyingNetworkChanged(1_000L, it.validated)
+                health.onUnderlyingNetworkChanged(1_000L, it.available)
             }
             flush()
             assertEquals("initial network is already applied by the VPN owner", 0, updates.size)
@@ -63,6 +63,8 @@ class PhysicalNetworksCallbackTest {
             flush()
             assertEquals(1, updates.size)
             assertEquals(false, health.primaryReady(1_301L, working))
+            assertTrue("OS validation failure must not permanently block a healthy tunnel on an available network",
+                health.primaryReady(5_000L, working))
             shadowOf(caps).addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             callback.onCapabilitiesChanged(network, caps)
             flush()
