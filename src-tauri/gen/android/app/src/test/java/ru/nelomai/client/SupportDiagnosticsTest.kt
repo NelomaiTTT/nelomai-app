@@ -35,7 +35,7 @@ class SupportDiagnosticsTest {
         source.writeText("changed after collection\n")
         val body = JSONObject(report.payload)
         assertEquals("manual", body.getString("trigger"))
-        assertEquals("0.3.2", body.getString("app_version"))
+        assertEquals("0.3.3", body.getString("app_version"))
         assertFalse(body.has("platform"))
         assertEquals("aarch64", body.getString("architecture"))
         assertEquals("Android 16", body.getString("platform_version"))
@@ -56,7 +56,9 @@ class SupportDiagnosticsTest {
         }
         val body = JSONObject(SupportDiagnosticCollector(files, backup, "Android 13 (API 33)").collect("").payload)
         assertEquals(fixture.keys().asSequence().toSet(), body.keys().asSequence().toSet())
-        for (field in listOf("trigger", "app_version", "architecture", "platform_version")) {
+        // The fixture records an older client's schema, not this build's version.
+        assertEquals("0.3.3", body.getString("app_version"))
+        for (field in listOf("trigger", "architecture", "platform_version")) {
             assertEquals(fixture.getString(field), body.getString(field))
         }
         assertEquals(4, java.util.UUID.fromString(body.getString("report_id")).version())
@@ -66,7 +68,7 @@ class SupportDiagnosticsTest {
 
     @Test fun collectorReadsOnlyExactLogsAndRejectsSymlinksWithoutWritingAnything() = roots { files, backup ->
         val forbidden = log(files, "runtime/latest/state/0.3.2/auth.json", "DO_NOT_EXPORT_AUTH")
-        log(files, "runtime/latest/state/0.3.3/diagnostics/application.jsonl", "DO_NOT_EXPORT_033")
+        log(files, "runtime/latest/state/0.4.0/diagnostics/application.jsonl", "DO_NOT_EXPORT_040")
         val link = File(files, "runtime/latest/state/0.3.2/diagnostics/application.jsonl")
         requireNotNull(link.parentFile).mkdirs(); Files.createSymbolicLink(link.toPath(), forbidden.toPath())
         log(files, "runtime/stable/state/0.2.20/diagnostics/android-tunnel.jsonl", "vpn_permission_cancelled\n")
@@ -114,7 +116,7 @@ class SupportDiagnosticsTest {
     }
 
     @Test fun fullRotatedLogsPreserveTheLatestRecordFromEverySource() = roots { files, backup ->
-        val directories = listOf("runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics")
+        val directories = listOf("runtime/latest/state/0.3.3/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics")
         val markers = mutableListOf<Pair<String, String>>()
         for ((index, directory) in directories.withIndex()) {
             for (name in listOf("android-startup.jsonl", "application.previous.jsonl", "application.jsonl", "auth-refresh.previous.jsonl", "auth-refresh.jsonl", "android-tunnel.previous.jsonl", "android-tunnel.jsonl")) {
@@ -139,7 +141,7 @@ class SupportDiagnosticsTest {
 
     @Test fun refreshJournalsAreCollectedBoundedAndSanitizedFromEveryNamespace() = roots { files, backup ->
         val markers = mutableListOf<String>()
-        for ((index, directory) in listOf("runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics").withIndex()) {
+        for ((index, directory) in listOf("runtime/latest/state/0.3.3/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics").withIndex()) {
             for (name in listOf("auth-refresh.previous.jsonl", "auth-refresh.jsonl")) {
                 val marker = "refresh-$index-$name"
                 log(files, "$directory/$name", "old refresh event\n".repeat(5000) + "$marker\npassword=do-not-include\n")

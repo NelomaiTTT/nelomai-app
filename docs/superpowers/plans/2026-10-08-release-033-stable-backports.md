@@ -91,9 +91,9 @@
 
 - [x] Из6f9d112 перенесены4actual-coordinator regressions (оба Tic/Stray) и native-probe return test; shared production mapping даёт настоящий RED на unvalidatedavailable, negative missingnetwork/probe/handshake guards сохранены. Manualrebind читает snapshot, при ошибке false.
 - [x] Android-only NLM063: полный plugin981PASS/0fail/errors/skips/46suites, stable Kotlin compile PASS, diff check/inline review без замечаний. Без Macroute/carrier/0.4.0 изменений; hardware gate отдельно.
-- [ ] Обновить версии/workflow/gates/fixtures штатно на0.3.3; не ослаблять existingpublishedtag immutable gate или sourceSHA/signature checks. Не включать carrierCI из0.4.0.
-- [ ] Сборщик поддержки сейчас содержит literal0.3.2 и versioneddirectory0.3.2: при выпуске перейти на проверенную buildversion, сохранить bounded allowlist исторических0.3.2/stable0.2.20/current0.3.3, добавить regression currentlog+historicaltails+точнаяapp_version. Не подменять неизвестный activeruntime версией контейнера (NLM060 отдельно).
-- [ ] Прогнать version/script tests, Androidapp unit suite, fullRustworkspace, npmtest,fmt,Clippy; каждый пропуск явно записать.
+- [x] Версии/locks/workflow/gates/fixtures согласованы на0.3.3. Только четыре продуктовых Cargo packages, внешние зависимости не обновлены; immutable tag/sourceSHA/signatures и pinned stable0.2.20 неизменны. Feature pushtrigger af4929d сохранён без carrierCI.
+- [x] Collector использует проверенный Gradle BuildConfig.VERSION_NAME для container app_version/currentlog; исторические0.3.2/stable0.2.20/legacy bounded tails сохранены. RED4collector regressions→GREEN, unknown active-runtime не выдумывается. Packaging RED0.3.2!=0.3.3→GREEN.
+- [x] FullRust1126PASS/0fail/1existingignored/88suites + workspace strictClippy alltargets/fmt; npm143PASS/check/build; Androidapp63PASS; scripts141PASS/5opt-in native/UI skips (146 total); sharedfixtures32/release-workflow-check PASS. Shipping artifacts/WindowsnativeCI/hardware не запускались, остаются Task7 gates.
 
 ## Task 7: Интеграция и аппаратный release gate
 

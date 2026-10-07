@@ -20,11 +20,12 @@ internal class SupportDiagnosticCollector(
     fun collect(supportCode: String): SupportDiagnosticReport {
         val deadline = System.nanoTime() + 3_000_000_000L
         val directories = listOf(
+            "runtime/latest/state/${BuildConfig.VERSION_NAME}/diagnostics",
             "runtime/latest/state/0.3.2/diagnostics",
             "runtime/stable/state/0.2.20/diagnostics",
             // Legacy Android releases used the unversioned diagnostics directory.
             "diagnostics",
-        )
+        ).distinct()
         fun logs(names: List<String>, maximum: Int): String = buildString {
             // Reserve space for EVERY source, including its label. Never let an older
             // namespace/rotated file consume the budget of the current failing log.
@@ -53,7 +54,7 @@ internal class SupportDiagnosticCollector(
             .put("report_id", id)
             .put("trigger", "manual")
             .put("generated_at_unix", System.currentTimeMillis() / 1000L)
-            .put("app_version", "0.3.2")
+            .put("app_version", BuildConfig.VERSION_NAME)
             .put("platform_version", platformVersion ?: JSONObject.NULL)
             .put("architecture", "aarch64")
             .put("application_log", application)
