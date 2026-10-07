@@ -2108,12 +2108,12 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
-            self.runtime
+            let fresh = self
+                .runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
             if kind != GuardResourceKind::Retired
-                && (self.cancelled.load(Ordering::Acquire)
-                    || !self.runtime.fresh(&self.context).map_err(denied)?)
+                && (self.cancelled.load(Ordering::Acquire) || !fresh)
             {
                 return Err(conflict());
             }
@@ -2832,10 +2832,11 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
-            self.runtime
+            let fresh = self
+                .runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            if !self.runtime.fresh(&self.context).map_err(denied)? {
+            if !fresh {
                 return Err(conflict());
             }
             self.deadline
@@ -2938,10 +2939,11 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime_call(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
-            self.runtime
+            let fresh = self
+                .runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            if !cleanup && !self.runtime.fresh(&self.context).map_err(denied)? {
+            if !cleanup && !fresh {
                 return Err(conflict());
             }
             self.deadline
@@ -2960,10 +2962,11 @@ pub(crate) mod native {
             self.deadline
                 .verify_runtime(&self.supervisor, &self.runtime, &self.context)
                 .map_err(denied)?;
-            self.runtime
+            let fresh = self
+                .runtime
                 .verify_same_session_files(&self.context, &self.files)
                 .map_err(denied)?;
-            if !self.runtime.fresh(&self.context).map_err(denied)? {
+            if !fresh {
                 return Err(conflict());
             }
             self.deadline

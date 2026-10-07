@@ -362,48 +362,12 @@ impl RuntimeRead {
         context: &Context,
         original: &NativeSessionFiles,
     ) -> Result<NativeSessionFiles> {
-        // One complete runtime authentication bracket surrounds the SAME
-        // protected context, backend and execution-origin comparisons. Nesting
-        // RuntimeRead::verify here authenticates the identical runtime twice
-        // on each side without adding another original owner or ACK.
-        self.runtime.verify(&self.lease, context)?;
-        let canonical = {
-            let mut files = self
-                .runtime
-                .files
-                .try_borrow_mut()
-                .map_err(|_| Error::Conflict)?;
-            files
-                .native_carrier_access(&context.intent.scope)
-                .map_err(|_| Error::Journal)?
-                .require_native_context(context)
-                .map_err(|_| Error::Conflict)?;
-            files.clone()
-        };
-        if !canonical.same_original_backend(original) {
-            return Err(Error::Conflict);
-        }
-        let execution = self
-            .runtime
-            .execution
-            .try_borrow()
-            .map_err(|_| Error::Conflict)?;
-        if let Some(root) = execution.as_ref() {
-            if !root.matches_origin(original) && !root.matches_native_view(original) {
-                return Err(Error::Conflict);
-            }
-        }
-        drop(execution);
-        self.runtime.verify(&self.lease, context)?;
+        self.verify_same_session_files(context, original)?;
         self.runtime
             .files
-            .try_borrow_mut()
-            .map_err(|_| Error::Conflict)?
-            .native_carrier_access(&context.intent.scope)
-            .map_err(|_| Error::Journal)?
-            .require_native_context(context)
-            .map_err(|_| Error::Conflict)?;
-        Ok(canonical)
+            .try_borrow()
+            .map(|files| files.clone())
+            .map_err(|_| Error::Conflict)
     }
     /// SAME retained common Network journal, not a typed native birth facet.
     /// The canonical native context/backend/execution bracket stays mandatory;
@@ -513,17 +477,43 @@ impl RuntimeRead {
     /// Bind storage to THIS retained authenticated runtime and shared backend,
     /// not an independent reopen with equal directory/scope/JSON. Identity
     /// comparison is bracketed by actual lease, private-root/runtime and current
-    /// protected-context reads. It supplies no native effect or freshness grant.
+    /// protected-context reads. Returned freshness is factual, not an effect grant.
     pub(super) fn verify_same_session_files(
         &self,
         context: &Context,
         files: &NativeSessionFiles,
-    ) -> Result<()> {
-        // The canonical original view already requires the protected context
-        // before and after full runtime authentication, in addition to backend
-        // and execution-origin identity. Returning it creates no native grant.
-        self.native_files_for_original(context, files)?;
-        Ok(())
+    ) -> Result<bool> {
+        crate::member_fresh_read::read(
+            || self.runtime.verify(&self.lease, context),
+            || {
+                let mut canonical = self
+                    .runtime
+                    .files
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?;
+                let access = canonical
+                    .native_carrier_access(&context.intent.scope)
+                    .map_err(|_| Error::Journal)?;
+                access
+                    .require_native_context(context)
+                    .map_err(|_| Error::Conflict)?;
+                if !canonical.same_original_backend(files) {
+                    return Err(Error::Conflict);
+                }
+                let execution = self
+                    .runtime
+                    .execution
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?;
+                if let Some(root) = execution.as_ref() {
+                    if !root.matches_origin(files) && !root.matches_native_view(files) {
+                        return Err(Error::Conflict);
+                    }
+                }
+                drop(execution);
+                Ok(!self.runtime.forward_closed.get() && access.is_fresh())
+            },
+        )
     }
     pub(super) fn matches_lock(&self, lock: &KeyLock) -> bool {
         lock.matches_pin(&self.lease)

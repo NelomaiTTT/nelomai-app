@@ -947,6 +947,7 @@ pub(crate) mod native_store {
             self.intent.verify_files(&mut files)?;
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)
+                .map(|_| ())
                 .map_err(|_| conflict())
         }
         /// Brackets READ-ONLY independent gate facts under the actual Calling
@@ -1267,6 +1268,7 @@ pub(crate) mod native_store {
             }
             self.runtime
                 .verify_same_session_files(&self.context, &self.original_files)
+                .map(|_| ())
                 .map_err(|_| conflict())
         }
     }

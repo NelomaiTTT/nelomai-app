@@ -1000,6 +1000,7 @@ pub(crate) mod native {
                 input
                     .runtime
                     .verify_same_session_files(&input.context, &input.files)
+                    .map(|_| ())
             };
             if self
                 .canonical
