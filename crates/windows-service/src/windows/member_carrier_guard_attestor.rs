@@ -1096,7 +1096,15 @@ pub(crate) mod native {
                         },
                         || {
                             if desired.permits {
-                                current.borrow_mut().priority_barrier()?;
+                                current
+                                    .borrow_mut()
+                                    .priority_barrier()
+                                    .inspect_err(|_error| {
+                                        #[cfg(all(windows, test))]
+                                        crate::windows::member_carrier_factory_test_os::trace_step(
+                                            &format!("guard inner priority barrier: {_error:?}"),
+                                        );
+                                    })?;
                             }
                             gate.authorize(&selected.record, kind, edge, expected, desired, window)
                         },

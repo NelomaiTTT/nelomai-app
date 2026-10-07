@@ -931,7 +931,20 @@ fn validate_table(rows: &[Interface]) -> Result<()> {
 fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) -> Result<()> {
     let before = query.table()?;
     // Validate the MIB before any later error can mask a direct collision.
-    validate_absence_table(targets, &before)?;
+    validate_absence_table(targets, &before).inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        if crate::windows::member_carrier_factory_test_os::state().is_some() {
+            match query.device_snapshot(targets) {
+                Ok(snapshot) => eprintln!(
+                    "actual native MIB absence denied; PnP (presence,status,problem,guid,name)={:?}",
+                    snapshot.nodes.iter().filter(|d| device_related(targets, d).unwrap_or(true))
+                        .take(8).map(|d| (&d.presence, d.status, d.problem, &d.netcfg_instance_id, &d.name))
+                        .collect::<Vec<_>>()
+                ),
+                Err(diagnostic) => eprintln!("actual native MIB absence denied; PnP query: {diagnostic:?}"),
+            }
+        }
+    })?;
     let devices_before = query.device_snapshot(targets)?;
     let stack_before = query.stack()?;
     validate_snapshot(None, targets, &before, &devices_before, &stack_before)?;

@@ -1297,6 +1297,11 @@ pub(crate) fn validate_arbitration(
                 let soft_permit = f.action == FWP_ACTION_PERMIT
                     && f.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT == 0;
                 if !soft_permit && f.action != FWP_ACTION_BLOCK && f.action != FWP_ACTION_CONTINUE {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "guard rejected foreign arbitration id={} layer={:?} subweight={} ownweight={} flags={} action={}",
+                        f.id, f.layer, f.sublayer_weight, sub.weight, f.flags, f.action
+                    ));
                     return Err(GuardError::Conflict);
                 }
             }
@@ -1442,10 +1447,7 @@ impl<N: NativeApi, A: BindingAttestor> NativeGuard<N, A> {
                         trace_step(&format!("guard exchange authorize: {_error:?}"));
                     })?;
                 if desired.permits {
-                    locked.priority_barrier().inspect_err(|_error| {
-                        #[cfg(all(windows, test))]
-                        trace_step(&format!("guard exchange priority barrier: {_error:?}"));
-                    })?;
+                    locked.priority_barrier()?;
                 }
                 if locked.failed_read {
                     return Err(GuardError::Conflict);
