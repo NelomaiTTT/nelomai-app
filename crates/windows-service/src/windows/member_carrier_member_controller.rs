@@ -50,15 +50,6 @@ fn inspect_never_member_key<K: NeverRegistryRead>(
     Ok(())
 }
 
-fn require_never_native_records(
-    records: &[Option<Vec<u8>>; 7],
-) -> crate::member_carrier::Result<()> {
-    if records.iter().any(Option::is_some) {
-        return Err(crate::member_carrier::CarrierError::Pending);
-    }
-    Ok(())
-}
-
 /// Protected comparison inventory only. Initial receipt admission must come
 /// from the registered original Assembly reader, never this DATA predicate.
 fn require_never_inventory(
@@ -1592,9 +1583,6 @@ pub(crate) mod native {
         acknowledged: std::cell::Cell<bool>,
     }
     impl NativeMemberStartedInitial {
-        pub(crate) fn context(&self) -> &Context {
-            &self.lineage.original.context
-        }
         pub(crate) fn slot(&self) -> TunnelSlot {
             self.lineage.original.intent.slot
         }
@@ -1658,15 +1646,6 @@ pub(crate) mod native {
             self.registration
                 .verify_pending_read(reader)
                 .map_err(owner_error)
-        }
-        pub(crate) fn verify_prepared(&self, prepared: &NativePreparedMember) -> Result<()> {
-            self.verify_retained_original()?;
-            if !Rc::ptr_eq(&self.lineage.original, &prepared.origin)
-                || prepared.root.owner.is_some()
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(())
         }
         pub(crate) fn verify_source(&self, source: &Rc<NativeSourceRead>) -> Result<()> {
             self.verify_retained_original()?;
@@ -1766,17 +1745,6 @@ pub(crate) mod native {
                 .verify_pending_read(reader)
                 .map_err(owner_error)
         }
-        pub(crate) fn verify_prepared(&self, prepared: &NativePreparedMember) -> Result<()> {
-            if !Rc::ptr_eq(&self.origin, &prepared.origin) || prepared.root.owner.is_some() {
-                return Err(Error::Conflict);
-            }
-            self.verify_original(
-                &self.ticket,
-                &self.origin.never_effects,
-                &self.origin.runtime,
-                &self.origin.context,
-            )
-        }
         pub(crate) fn verify_source(&self, source: &Rc<NativeSourceRead>) -> Result<()> {
             self.verify_original(
                 &self.ticket,
@@ -1793,9 +1761,6 @@ pub(crate) mod native {
         }
         pub(crate) fn slot(&self) -> TunnelSlot {
             self.slot
-        }
-        pub(crate) fn old_generation(&self) -> u64 {
-            self.old
         }
         pub(crate) fn next_generation(&self) -> u64 {
             self.next
@@ -3522,9 +3487,6 @@ pub(crate) mod native {
                 .verify_call(&self.supervisor, &self.context)
                 .map_err(|_| Error::Conflict)?;
             Ok(())
-        }
-        pub(crate) fn same_original(&self, other: &Self) -> bool {
-            std::ptr::eq(self, other)
         }
     }
     struct PreparedOwner {

@@ -1129,7 +1129,9 @@ fn never_bootstrap_full_denies_foreign_origin_native_history_guard_and_unknown_r
             &NeverMemberHistory::default(),
             &context,
             &record,
-            || require_never_native_records(&records)
+            || require_never_inventory(&context, &records, None, |_| {
+                panic!("malformed or foreign native records must deny before original receipt admission")
+            })
         )
         .is_err());
     }
@@ -1260,17 +1262,6 @@ fn never_member_key_read_requires_exact_absence_without_mutation() {
         registry.present = fault == 1;
         registry.unknown = fault == 2;
         assert!(inspect_never_member_key(&mut registry, &context, 1).is_err());
-    }
-}
-
-#[test]
-fn never_member_all_native_record_kinds_must_be_absent_not_missing_receipt_alone() {
-    let none = std::array::from_fn(|_| None);
-    require_never_native_records(&none).unwrap();
-    for kind in 0..7 {
-        let mut records = none.clone();
-        records[kind] = Some(vec![0]);
-        assert!(require_never_native_records(&records).is_err());
     }
 }
 
