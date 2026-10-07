@@ -1340,7 +1340,9 @@ fn full_foreign_pnp_crossbinding_coexists_with_strict_owned_original() {
     };
     q.rows[0].interfaces.extend(measured_foreign_bases());
     q.rows[0].devices.extend(foreign_nodes());
-    let got = inspect_queries(&expected(), &mut q).unwrap();
+    let got = inspect_all_queries(std::slice::from_ref(&expected()), &mut q)
+        .unwrap()
+        .remove(0);
     assert_eq!(
         got.instance.instance,
         "SWD\\WINTUN\\{12345678-9ABC-DEF0-8123-456789ABCDEF}"
@@ -1591,7 +1593,12 @@ fn foreign_crossbinding_requires_metadata_and_exact_rows_but_live_state_only_for
                         q.tables[phase].extend(observed().interfaces);
                         q.nodes[phase].extend(observed().devices);
                     }
-                    let got = inspect_queries(&expected(), &mut FullQueries { source: q }).unwrap();
+                    let got = inspect_all_queries(
+                        std::slice::from_ref(&expected()),
+                        &mut FullQueries { source: q },
+                    )
+                    .unwrap()
+                    .remove(0);
                     assert_eq!(got.instance.name, "Nelomai VIP");
                 }
             }
@@ -1762,7 +1769,9 @@ fn owned_foreign_query() -> FullQueries {
 #[test]
 fn full_owned_query_explains_foreign_filters_and_preserves_every_original_predicate() {
     let mut q = owned_foreign_query();
-    let got = inspect_queries(&expected(), &mut q).unwrap();
+    let got = inspect_all_queries(std::slice::from_ref(&expected()), &mut q)
+        .unwrap()
+        .remove(0);
     assert_eq!(got.instance.driver.provider, "WireGuard LLC");
     assert_eq!(got.instance.name, "Nelomai VIP");
     assert_eq!(
@@ -1795,7 +1804,7 @@ fn full_owned_query_explains_foreign_filters_and_preserves_every_original_predic
             }
         }
         assert!(
-            inspect_queries(&expected(), &mut q).is_err(),
+            inspect_all_queries(std::slice::from_ref(&expected()), &mut q).is_err(),
             "field {field}"
         );
     }
@@ -1813,7 +1822,7 @@ fn full_owned_query_rejects_foreign_guid_name_reuse_and_filters_on_original() {
             }
         }
         assert!(
-            inspect_queries(&expected(), &mut q).is_err(),
+            inspect_all_queries(std::slice::from_ref(&expected()), &mut q).is_err(),
             "field {field}"
         );
     }
@@ -1838,7 +1847,7 @@ fn every_full_foreign_query_error_propagates_in_empty_absence_and_owned_paths() 
         let mut q = owned_foreign_query();
         q.source.fail = Some(n);
         assert_eq!(
-            inspect_queries(&expected(), &mut q),
+            inspect_all_queries(std::slice::from_ref(&expected()), &mut q),
             Err(Error::Native("absence read", 5))
         );
         assert_eq!(q.source.events.len(), n);
@@ -2282,7 +2291,7 @@ fn actual_software_bus_generic_id_is_required_not_ignored() {
     // SW_DEVICE_CREATE_INFO adds this least-specific software-bus ID itself.
     let mut seen = observed();
     seen.devices[0].compatible_ids = vec!["SWD\\Generic".into()];
-    let result = validate(&expected(), &seen, &seen).unwrap();
+    let result = validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).unwrap();
     assert_eq!(result.instance.compatible_ids, ["SWD\\Generic"]);
     for ids in [
         vec![],
@@ -2294,7 +2303,7 @@ fn actual_software_bus_generic_id_is_required_not_ignored() {
         vec!["SWD\\GenericX"],
     ] {
         seen.devices[0].compatible_ids = ids.into_iter().map(str::to_owned).collect();
-        assert!(validate(&expected(), &seen, &seen).is_err());
+        assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     }
 }
 
@@ -2312,17 +2321,17 @@ fn pnp_description_and_original_mib_duplicate_suffix_are_separate_exact_fields()
         row.identity.description = "Nelomai Tunnel #2".into();
     }
     // The device property still has precisely the requested, unsuffixed type.
-    let result = validate(&want, &seen, &seen).unwrap();
+    let result = validate_provider(&want, ProviderKind::Wintun, &seen, &seen).unwrap();
     assert_eq!(result.interface.description, "Nelomai Tunnel #2");
     assert_eq!(result.instance.description, "Nelomai Tunnel");
     seen.devices[0].description = "Foreign Tunnel".into();
-    assert!(validate(&want, &seen, &seen).is_err());
+    assert!(validate_provider(&want, ProviderKind::Wintun, &seen, &seen).is_err());
 }
 
 #[test]
 fn exact_native_facts_return_concrete_instance_and_metadata() {
     let seen = observed();
-    let result = validate(&expected(), &seen, &seen).unwrap();
+    let result = validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).unwrap();
     assert_eq!(result.interface.guid, GUID);
     assert_eq!(
         result.instance.instance,
@@ -2353,7 +2362,7 @@ fn reused_interface_guid_index_luid_name_description_type_are_rejected() {
                 _ => row.identity.tunnel_type = 1,
             }
             assert!(
-                validate(&expected(), &seen, &seen).is_err(),
+                validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err(),
                 "field {field}, selector {selector}"
             );
         }
@@ -2364,7 +2373,7 @@ fn reused_interface_guid_index_luid_name_description_type_are_rejected() {
 fn missing_duplicate_or_colliding_table_rows_fail() {
     let mut seen = observed();
     seen.interfaces.clear();
-    assert!(validate(&expected(), &seen, &seen).is_err());
+    assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     for field in 0..4 {
         let mut seen = observed();
         let mut foreign = seen.interfaces[0].clone();
@@ -2379,7 +2388,7 @@ fn missing_duplicate_or_colliding_table_rows_fail() {
             _ => foreign.identity.name = "nelomai vip".into(),
         }
         seen.interfaces.push(foreign);
-        assert!(validate(&expected(), &seen, &seen).is_err());
+        assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     }
 }
 
@@ -2398,12 +2407,12 @@ fn unknown_zero_malformed_expected_identity_and_physical_roles_fail() {
             7 => want.luid = (6 << 48) | (0x123456 << 24),
             _ => want.luid = 53 << 48,
         }
-        assert!(validate(&want, &observed(), &observed()).is_err());
+        assert!(validate_provider(&want, ProviderKind::Wintun, &observed(), &observed()).is_err());
     }
     for flag in [1, 2, 0x80] {
         let mut seen = observed();
         seen.by_index.role_flags |= flag;
-        assert!(validate(&expected(), &seen, &seen).is_err());
+        assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     }
 }
 
@@ -2423,7 +2432,7 @@ fn expected_name_scope_matches_the_carrier_ascii_binding_contract() {
         seen.by_guid.identity = want.clone();
         seen.interfaces[0].identity = want.clone();
         seen.devices[0].name = want.name.clone();
-        assert!(validate(&want, &seen, &seen).is_err());
+        assert!(validate_provider(&want, ProviderKind::Wintun, &seen, &seen).is_err());
     }
 }
 
@@ -2440,7 +2449,10 @@ fn legacy_foreign_malformed_or_inexact_instance_is_rejected() {
     ] {
         let mut seen = observed();
         seen.devices[0].instance = instance.into();
-        assert!(validate(&expected(), &seen, &seen).is_err(), "{instance}");
+        assert!(
+            validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err(),
+            "{instance}"
+        );
     }
 }
 
@@ -2472,7 +2484,7 @@ fn wrong_driver_service_provider_version_date_binding_or_properties_fail() {
             _ => d.driver.provider.push('\0'),
         }
         assert!(
-            validate(&expected(), &seen, &seen).is_err(),
+            validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err(),
             "field {field}"
         );
     }
@@ -2484,16 +2496,16 @@ fn phantom_nonstarted_problem_removal_missing_and_duplicate_devices_fail() {
         let mut seen = observed();
         seen.devices[0].status = status;
         seen.devices[0].problem = problem;
-        assert!(validate(&expected(), &seen, &seen).is_err());
+        assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     }
     let mut seen = observed();
     seen.devices.clear();
-    assert!(validate(&expected(), &seen, &seen).is_err());
+    assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     let mut seen = observed();
     seen.devices.push(seen.devices[0].clone());
-    assert!(validate(&expected(), &seen, &seen).is_err());
+    assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
     seen.devices[1].instance = "ROOT\\NET\\0001".into();
-    assert!(validate(&expected(), &seen, &seen).is_err());
+    assert!(validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err());
 }
 
 #[test]
@@ -2502,7 +2514,7 @@ fn private_boot_resource_and_pending_reenumeration_problems_are_not_live_facts()
         let mut seen = observed();
         seen.devices[0].status |= flag;
         assert!(
-            validate(&expected(), &seen, &seen).is_err(),
+            validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err(),
             "status flag {flag:#x}"
         );
     }
@@ -2523,7 +2535,7 @@ fn reread_changes_in_interface_or_device_facts_are_rejected() {
                     "{4d36e972-e325-11ce-bfc1-08002be10318}\\0043".into()
             }
         }
-        assert!(validate(&expected(), &before, &after).is_err());
+        assert!(validate_provider(&expected(), ProviderKind::Wintun, &before, &after).is_err());
     }
 }
 
@@ -2668,8 +2680,9 @@ fn native_query_sequence_brackets_two_device_reads_with_real_interface_queries()
         changed: false,
     };
     assert_eq!(
-        inspect_queries(&expected(), &mut q)
+        inspect_all_queries(std::slice::from_ref(&expected()), &mut q)
             .unwrap()
+            .remove(0)
             .instance
             .driver
             .version,
@@ -2696,7 +2709,7 @@ fn every_query_error_and_changed_final_binding_propagate_without_fallback() {
             changed: false,
         };
         assert!(matches!(
-            inspect_queries(&expected(), &mut q),
+            inspect_all_queries(std::slice::from_ref(&expected()), &mut q),
             Err(Error::Native(_, 5))
         ));
         assert_eq!(q.events.len(), n);
@@ -2706,7 +2719,7 @@ fn every_query_error_and_changed_final_binding_propagate_without_fallback() {
         fail: None,
         changed: true,
     };
-    assert!(inspect_queries(&expected(), &mut q).is_err());
+    assert!(inspect_all_queries(std::slice::from_ref(&expected()), &mut q).is_err());
     let mut q = Script {
         events: vec![],
         fail: None,
@@ -2714,7 +2727,7 @@ fn every_query_error_and_changed_final_binding_propagate_without_fallback() {
     };
     let mut want = expected();
     want.index = 0;
-    assert!(inspect_queries(&want, &mut q).is_err());
+    assert!(inspect_all_queries(std::slice::from_ref(&want), &mut q).is_err());
     assert!(q.events.is_empty());
 }
 #[test]
@@ -2759,11 +2772,29 @@ fn classification_includes_legacy_other_classes_service_hardware_and_reused_guid
             Some("nelomai vip"),
         ),
     ] {
-        assert!(related_device(&expected(), instance, &ids, &compat, service, cfg, name).unwrap());
+        assert!(related_targets(
+            &[target(&expected())],
+            instance,
+            &ids,
+            &compat,
+            service,
+            cfg,
+            name
+        )
+        .unwrap());
     }
-    assert!(!related_device(&expected(), "USB\\Unrelated", &[], &[], None, None, None).unwrap());
-    assert!(related_device(
-        &expected(),
+    assert!(!related_targets(
+        &[target(&expected())],
+        "USB\\Unrelated",
+        &[],
+        &[],
+        None,
+        None,
+        None
+    )
+    .unwrap());
+    assert!(related_targets(
+        &[target(&expected())],
         "USB\\Unrelated",
         &[],
         &[],
@@ -3045,8 +3076,8 @@ fn nonempty_universe_rejects_extra_mib_only_provider_rows_in_both_reads() {
                 self.q.stack()
             }
         }
-        assert!(inspect_queries(
-            &expected(),
+        assert!(inspect_all_queries(
+            std::slice::from_ref(&expected()),
             &mut ExtraRow {
                 q: &mut q,
                 final_read

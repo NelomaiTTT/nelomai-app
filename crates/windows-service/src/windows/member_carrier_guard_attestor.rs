@@ -1,5 +1,4 @@
-//! Original-window guard transaction attestation. Product factory stays off.
-#![allow(dead_code)]
+//! Original-window guard transaction attestation.
 
 #[cfg(not(windows))]
 use crate::member_carrier_members as original_members;
@@ -162,14 +161,6 @@ impl<T> Registration<T> {
             value: std::cell::RefCell::new(value),
         }
     }
-}
-fn register_original<T>(
-    slot: &Registration<T>,
-    fence: &AttestorFence,
-    original: T,
-    check: impl FnOnce(&T) -> Result<()>,
-) -> Result<()> {
-    register_original_channel(slot, fence, original, false, check)
 }
 fn register_original_channel<T>(
     slot: &Registration<T>,
@@ -526,9 +517,6 @@ impl AttestorFence {
             tainted: Cell::new(false),
             active_tainted: Cell::new(false),
         }
-    }
-    fn inspect<T>(&self, call: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.inspect_channel(false, call)
     }
     fn fail(&self) {
         self.tainted.set(true);

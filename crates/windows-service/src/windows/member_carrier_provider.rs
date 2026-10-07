@@ -1,5 +1,4 @@
 //! Read-only native provider facts. Never creator, runtime, or effect authority.
-#![allow(dead_code)] // Main integrates this independent factual layer separately.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -97,6 +96,7 @@ pub(crate) struct Observation {
 }
 
 const MAX_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
 const MAX_NODES: u32 = 65_536;
 const MAX_INTERFACES: usize = 4096;
 const NET_CLASS: [u8; 16] = [
@@ -255,9 +255,6 @@ fn validate_provider_device(want: &Expected, kind: ProviderKind, devices: &[Devi
         return Err(Error::Conflict("non-live/problem/removing instance"));
     }
     Ok(())
-}
-fn validate(want: &Expected, before: &Observed, after: &Observed) -> Result<Observation> {
-    validate_provider(want, ProviderKind::Wintun, before, after)
 }
 fn validate_provider(
     want: &Expected,
@@ -969,9 +966,6 @@ fn related_targets(
             guid == Some(t.guid) || name.is_some_and(|name| name.eq_ignore_ascii_case(&t.name))
         }))
 }
-fn inspect_queries(want: &Expected, query: &mut impl Queries) -> Result<Observation> {
-    Ok(inspect_all_queries(std::slice::from_ref(want), query)?.remove(0))
-}
 fn inspect_mixed_queries(
     wants: &[ExpectedProvider],
     query: &mut impl Queries,
@@ -1167,26 +1161,6 @@ fn returned_bytes(mut bytes: Vec<u8>, required: u32) -> Result<Vec<u8>> {
     bytes.truncate(required as usize);
     Ok(bytes)
 }
-fn related_device(
-    want: &Expected,
-    instance: &str,
-    ids: &[String],
-    compatible: &[String],
-    service: Option<&str>,
-    cfg: Option<&str>,
-    name: Option<&str>,
-) -> Result<bool> {
-    related_targets(
-        &[target(want)],
-        instance,
-        ids,
-        compatible,
-        service,
-        cfg,
-        name,
-    )
-}
-
 fn network_guid_read(value: Result<Option<String>>) -> Result<String> {
     let value = value?.ok_or(Error::Invalid("missing network NetCfgInstanceId"))?;
     if parse_guid(&value)? == [0; 16] {
@@ -1239,11 +1213,6 @@ pub(crate) mod native {
     };
     const INSTANCE_WORDS: usize = 200; // SDK MAX_DEVICE_ID_LEN, includes NUL.
 
-    /// identity is ONLY a comparison target. Success says what Windows reported
-    /// during these reads, never who created the interface or may operate it.
-    pub(crate) fn inspect(identity: &Identity) -> Result<Observation> {
-        Ok(inspect_all(std::slice::from_ref(identity))?.remove(0))
-    }
     /// Whole observed Wintun universe, still factual, NOT original ownership.
     /// The caller supplies only identities freshly obtained from retained
     /// creators; this observer itself cannot establish that provenance.
@@ -1336,18 +1305,6 @@ pub(crate) mod native {
             },
             &mut NativeQueries,
         )
-    }
-
-    /// Enumerate an actually empty universe; zero input is not zero OS queries.
-    pub(crate) fn inspect_empty() -> Result<()> {
-        let result = inspect_all(&[]).map(|_| ());
-        #[cfg(test)]
-        if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            if let Err(error) = &result {
-                eprintln!("actual native empty provider census: {error:?}");
-            }
-        }
-        result
     }
 
     fn last(api: &'static str) -> Error {

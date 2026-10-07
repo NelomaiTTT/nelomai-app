@@ -18,11 +18,11 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 fn guard_attestor_cleanup_read_after_failed_forward_never_rearms_forward() {
     let fence = AttestorFence::new();
     assert!(fence
-        .inspect(|| Err::<(), _>(GuardError::Conflict))
+        .inspect_channel(false, || Err::<(), _>(GuardError::Conflict))
         .is_err());
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
     assert_eq!(fence.inspect_cleanup(|| Ok(17)), Ok(17));
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
     assert_eq!(fence.inspect_cleanup(|| Ok(19)), Ok(19));
 }
 #[test]
@@ -30,12 +30,12 @@ fn guard_attestor_cleanup_ignored_nested_failure_cannot_complete_outer_call() {
     for fault in 0..3 {
         let fence = AttestorFence::new();
         assert!(fence
-            .inspect(|| Err::<(), _>(GuardError::Conflict))
+            .inspect_channel(false, || Err::<(), _>(GuardError::Conflict))
             .is_err());
         let result = catch_unwind(AssertUnwindSafe(|| {
             fence.inspect_cleanup(|| {
                 match fault {
-                    0 => assert!(fence.inspect(|| Ok(())).is_err()),
+                    0 => assert!(fence.inspect_channel(false, || Ok(())).is_err()),
                     1 => assert!(fence.inspect_cleanup(|| Ok(())).is_err()),
                     _ => panic!("cleanup SDK observation unwound"),
                 }
@@ -43,7 +43,7 @@ fn guard_attestor_cleanup_ignored_nested_failure_cannot_complete_outer_call() {
             })
         }));
         assert!(!matches!(result, Ok(Ok(()))));
-        assert!(fence.inspect(|| Ok(())).is_err());
+        assert!(fence.inspect_channel(false, || Ok(())).is_err());
     }
 }
 
@@ -557,11 +557,11 @@ fn sticky_fence_rejects_error_unwind_and_swallowed_reentry() {
     for fault in 0..3 {
         let fence = AttestorFence::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            fence.inspect(|| match fault {
+            fence.inspect_channel(false, || match fault {
                 0 => Err(GuardError::RemovalUnconfirmed),
                 1 => panic!("actual read unwind"),
                 _ => {
-                    assert!(fence.inspect(|| Ok(())).is_err());
+                    assert!(fence.inspect_channel(false, || Ok(())).is_err());
                     Ok(())
                 }
             })
@@ -571,15 +571,15 @@ fn sticky_fence_rejects_error_unwind_and_swallowed_reentry() {
         } else {
             assert!(result.unwrap().is_err());
         }
-        assert!(fence.inspect(|| Ok(())).is_err());
+        assert!(fence.inspect_channel(false, || Ok(())).is_err());
     }
 }
 // Break: poisoning valid sequential reads or failing to execute their callback.
 #[test]
 fn successful_factual_reads_do_not_grant_or_poison_later_valid_reads() {
     let fence = AttestorFence::new();
-    assert_eq!(fence.inspect(|| Ok(7)), Ok(7));
-    assert_eq!(fence.inspect(|| Ok(9)), Ok(9));
+    assert_eq!(fence.inspect_channel(false, || Ok(7)), Ok(7));
+    assert_eq!(fence.inspect_channel(false, || Ok(9)), Ok(9));
 }
 
 // Break: reopening forward selection or changing protected bytes at the same revision.
@@ -685,7 +685,7 @@ fn locked_error_or_drift_poison_fence_and_first_read_failure_never_calls_gate() 
     let fence = AttestorFence::new();
     let gate_called = Cell::new(false);
     assert!(fence
-        .inspect(|| check_locked(
+        .inspect_channel(false, || check_locked(
             &base,
             || Err(GuardError::Conflict),
             || {
@@ -695,7 +695,7 @@ fn locked_error_or_drift_poison_fence_and_first_read_failure_never_calls_gate() 
         ))
         .is_err());
     assert!(!gate_called.get());
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
 }
 
 // Break: keeping G inside a joined snapshot, so actual resource APIs cannot
@@ -708,7 +708,7 @@ fn resource_gate_can_join_between_two_separate_locked_snapshot_joins() {
     assert_eq!(
         check_window_locked(
             &base,
-            |callback| joined.inspect(|| {
+            |callback| joined.inspect_channel(false, || {
                 events.borrow_mut().push("snapshot-join");
                 callback(&base.expected)
             }),
@@ -720,11 +720,11 @@ fn resource_gate_can_join_between_two_separate_locked_snapshot_joins() {
                 // These are production serialization/failure guards, not fake
                 // opaque native Source/G capabilities. The actual native adapter
                 // supplies NativeBindingsWindow.inspect to this SAME helper.
-                joined.inspect(|| {
+                joined.inspect_channel(false, || {
                     events.borrow_mut().push("held-probe-join");
                     Ok(())
                 })?;
-                joined.inspect(|| {
+                joined.inspect_channel(false, || {
                     events.borrow_mut().push("network-join");
                     Ok(())
                 })
@@ -931,22 +931,24 @@ fn registration_retains_first_original_before_error_and_denies_equal_replacement
     let registration = Registration::new(None);
     let fence = AttestorFence::new();
     assert!(
-        register_original(&registration, &fence, Tracked(&drops), |_| Err(
+        register_original_channel(&registration, &fence, Tracked(&drops), false, |_| Err(
             GuardError::Conflict
         ))
         .is_err()
     );
     assert!(registration.value.borrow().is_some());
     assert_eq!(drops.get(), 0);
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
     let original = std::rc::Rc::new(7);
     let valid = Registration::new(None);
     let other = AttestorFence::new();
     assert_eq!(
-        register_original(&valid, &other, original.clone(), |_| Ok(())),
+        register_original_channel(&valid, &other, original.clone(), false, |_| Ok(())),
         Ok(())
     );
-    assert!(register_original(&valid, &other, original.clone(), |_| Ok(())).is_err());
+    assert!(
+        register_original_channel(&valid, &other, original.clone(), false, |_| Ok(())).is_err()
+    );
     assert!(std::rc::Rc::ptr_eq(
         valid.value.borrow().as_ref().unwrap(),
         &original
@@ -960,7 +962,7 @@ fn registration_wrong_origin_and_swallowed_reentry_never_replace_or_rearm() {
     let slot = Registration::new(None);
     let fence = AttestorFence::new();
     assert!(
-        register_original(&slot, &fence, equal_foreign.clone(), |actual| {
+        register_original_channel(&slot, &fence, equal_foreign.clone(), false, |actual| {
             if std::rc::Rc::ptr_eq(actual, &original) {
                 Ok(())
             } else {
@@ -975,12 +977,17 @@ fn registration_wrong_origin_and_swallowed_reentry_never_replace_or_rearm() {
     ));
     let slot = Registration::new(None);
     let fence = AttestorFence::new();
-    assert!(register_original(&slot, &fence, original.clone(), |_| {
-        assert!(register_original(&slot, &fence, original.clone(), |_| Ok(())).is_err());
-        Ok(())
-    })
-    .is_err());
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(
+        register_original_channel(&slot, &fence, original.clone(), false, |_| {
+            assert!(
+                register_original_channel(&slot, &fence, original.clone(), false, |_| Ok(()))
+                    .is_err()
+            );
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
 }
 
 // Break: losing the first retained original on callback unwind.
@@ -996,14 +1003,14 @@ fn registration_unwind_retains_original_and_taints_all_later_calls() {
     let slot = Registration::new(None);
     let fence = AttestorFence::new();
     assert!(catch_unwind(AssertUnwindSafe(|| {
-        register_original(&slot, &fence, Tracked(&drops), |_| {
+        register_original_channel(&slot, &fence, Tracked(&drops), false, |_| {
             panic!("registration unwind")
         })
     }))
     .is_err());
     assert!(slot.value.borrow().is_some());
     assert_eq!(drops.get(), 0);
-    assert!(fence.inspect(|| Ok(())).is_err());
+    assert!(fence.inspect_channel(false, || Ok(())).is_err());
     drop(slot);
     assert_eq!(drops.get(), 1);
 }
@@ -1101,16 +1108,4 @@ fn split_join_requires_one_successful_callback_per_snapshot_and_second_read() {
         .is_err());
         assert_eq!(gate_calls.get(), u32::from(fault == 2));
     }
-}
-
-#[cfg(windows)]
-fn actual_native_guard_window<G: native::NativeGuardGate>(
-    guard: &mut crate::windows::member_carrier_guard::NativeGuard<
-        crate::windows::member_carrier_guard::Wfp,
-        native::NativeGuardAttestor<G>,
-    >,
-    window: &crate::windows::member_carrier_runtime::native::NativeBindingsWindow<'_>,
-) -> Result<Snapshot> {
-    // Compile ONLY. Actual Wfp/native ownership and unsafe G remain mandatory.
-    guard.snapshot_in_window(window)
 }
