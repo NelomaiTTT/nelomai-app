@@ -4945,8 +4945,16 @@ pub(crate) mod native {
                         if Some(&current) != expected.members[index].as_ref().map(|m| &m.owner) {
                             return Err(Error::Conflict);
                         }
-                        // The private SAME owner, not an imported/equal JSON owner.
-                        owned.member.stop(&current).map_err(owner_error)
+                        // The private SAME owner and retained NEW-service pin;
+                        // native absence remains mandatory before its Closed ACK.
+                        let original = owned.partial_cleanup.as_ref().ok_or(Error::Pending)?;
+                        original
+                            .verify_pending_original(&owned.pending)
+                            .map_err(owner_error)?;
+                        owned
+                            .member
+                            .stop_partial_original(&current, original)
+                            .map_err(owner_error)
                     },
                     |receipt| {
                         inventory.closed_retirement(

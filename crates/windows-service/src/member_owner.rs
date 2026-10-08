@@ -198,7 +198,11 @@ pub(crate) trait OriginalMemberPartialCleanupIo: MemberIo {
         &mut self,
         pin: &Self::CleanupPin,
     ) -> Result<PartialServiceObservation>;
-    fn stop_partial_original(&mut self, pin: &Self::CleanupPin) -> Result<()>;
+    fn stop_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: Option<&NativeProof>,
+    ) -> Result<()>;
 }
 pub(crate) trait OriginalServiceCleanupNative: OriginalMemberNative {
     fn service_cleanup_facts(
@@ -1648,16 +1652,6 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> MemberOwner<J, I> {
                     .compare_exchange(self.intent.slot, Some(expected), &stopping)?;
             }
         }
-        self.require_current(&stopping)?;
-        self.io.stop_partial_original(pin)?; // SAME retained SCM only; no recovery fallback.
-        let original = self.io.inspect_partial_cleanup(pin)?;
-        if !original.service_deleted() || original.process.is_none() {
-            // SCM absence/PID zero alone cannot prove an uncertain Start never
-            // spawned a process. Only SAME original held-process exit may close
-            // a member; the separate unstarted/never-effect lane is unchanged.
-            return Err(OwnerError::Pending);
-        }
-        self.require_current(&stopping)?;
         let retained = stopping.proof.or_else(|| {
             self.original_run
                 .as_ref()
@@ -1668,6 +1662,16 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> MemberOwner<J, I> {
                 })
                 .and_then(|run| run.running.proof)
         });
+        self.require_current(&stopping)?;
+        self.io.stop_partial_original(pin, retained.as_ref())?; // SAME retained SCM only.
+        let original = self.io.inspect_partial_cleanup(pin)?;
+        if !original.service_deleted() || original.process.is_none() {
+            // SCM absence/PID zero alone cannot prove an uncertain Start never
+            // spawned a process. Only SAME original held-process exit may close
+            // a member; the separate unstarted/never-effect lane is unchanged.
+            return Err(OwnerError::Pending);
+        }
+        self.require_current(&stopping)?;
         let before = self.io.inspect(&self.intent, retained.as_ref())?;
         require_no_native(&before)?;
         if before.config_sha256 != Some(self.intent.config_sha256) {

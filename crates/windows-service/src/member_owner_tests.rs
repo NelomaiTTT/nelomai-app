@@ -3419,7 +3419,22 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
             Ok(self.base.0.borrow().observation.config_sha256)
         })
     }
-    fn stop_partial_original(&mut self, pin: &Self::CleanupPin) -> Result<()> {
+    fn stop_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: Option<&NativeProof>,
+    ) -> Result<()> {
+        // Existing owner supplies its actual current proof, including None for
+        // unpublished partial Start; the boundary never invents an interface.
+        let current = self.base.0.borrow().record.clone().unwrap();
+        assert_eq!(
+            retained.copied(),
+            if current.phase == Phase::Stopped {
+                current.retired_proof
+            } else {
+                current.proof
+            }
+        );
         if !pin.matches_origin(&self.origin) {
             return Err(OwnerError::Conflict);
         }
@@ -3438,15 +3453,19 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
 
 #[test]
 fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader() {
+    use TunnelSlot::{A, B};
+    use TunnelTransport::{AmneziaWg3, WireGuard};
     // Break caught: committed Running required, foreign equal owner accepted,
     // fabricated Closed before original Stop/Delete or double effects on retry.
-    for (slot, transport, lost, published) in [
-        (TunnelSlot::A, TunnelTransport::WireGuard, false, false),
-        (TunnelSlot::B, TunnelTransport::WireGuard, true, false),
-        (TunnelSlot::A, TunnelTransport::AmneziaWg3, true, false),
-        (TunnelSlot::B, TunnelTransport::AmneziaWg3, false, false),
-        (TunnelSlot::A, TunnelTransport::WireGuard, false, true),
-        (TunnelSlot::B, TunnelTransport::AmneziaWg3, false, true),
+    for (slot, transport, lost, published, direct_partial_stop) in [
+        (A, WireGuard, false, false, false),
+        (B, WireGuard, true, false, false),
+        (A, AmneziaWg3, true, false, false),
+        (B, AmneziaWg3, false, false, false),
+        (A, WireGuard, false, true, false),
+        (B, AmneziaWg3, false, true, false),
+        (A, WireGuard, false, true, true),
+        (B, AmneziaWg3, false, true, true),
     ] {
         let (mut owner, state) = origin_owner_for(slot, transport);
         owner.io.boundary.split_start = true;
@@ -3480,7 +3499,16 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
         let obligation = retained.snapshot().unwrap().unwrap();
         if published {
             state.borrow_mut().fail_stop = true;
-            assert!(retained.stop(&obligation).is_err());
+            if direct_partial_stop {
+                // Retirement's original-pin dispatch still rejects lingering
+                // native rows; SAME Delete ACK alone never issues Closed.
+                assert!(retained
+                    .stop_partial_original(&obligation, &capability)
+                    .is_err());
+                assert!(retained.original_read().is_err());
+            } else {
+                assert!(retained.stop(&obligation).is_err());
+            }
             state.borrow_mut().fail_capture = true;
             assert_eq!(service_closes.get(), 1); // Actual SAME Delete ACK.
             assert_eq!(capability.inspect(), Err(OwnerError::Pending));

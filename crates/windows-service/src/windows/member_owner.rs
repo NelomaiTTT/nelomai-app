@@ -569,16 +569,60 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             })
         })
     }
-    fn stop_partial_original(&mut self, pin: &Self::CleanupPin) -> Result<()> {
+    fn stop_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: Option<&NativeProof>,
+    ) -> Result<()> {
         if self.cleanup_only || !pin.matches_origin(&self.original) {
             return Err(OwnerError::Retired);
         }
+        // Share the existing 15-second SCM Stop budget with factual rundown;
+        // no second Stop/Delete or additional stacked wait is permitted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let files = &mut self.files;
         let path = &self.config_path;
-        // No engine primitive, PID/name lookup adoption, or NIC/row effect.
         pin.stop_delete(&mut NativeOriginalCalls { files: None }, || {
             files.read_digest(path)
-        })
+        })?;
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(OwnerError::Pending);
+            }
+            let before = self.inspect_partial_cleanup(pin)?;
+            if !before.service_deleted() || before.process.is_none() {
+                return Err(OwnerError::Pending);
+            }
+            if retained.is_some_and(|proof| before.process != Some(proof.process)) {
+                return Err(OwnerError::Conflict);
+            }
+            let config = self.files.read_digest(&self.config_path)?;
+            let actual = self.observe_once(retained)?;
+            if self.inspect_partial_cleanup(pin)? != before
+                || actual.config_sha256 != config
+                || config.is_none()
+                || actual.alternative_service_present
+                || actual.service.is_some()
+                || actual.retained_interfaces.len() > 1
+                || actual.interface.is_some_and(|interface| {
+                    retained.is_none_or(|proof| interface != proof.interface)
+                })
+                || actual
+                    .retained_interfaces
+                    .iter()
+                    .any(|interface| retained.is_none_or(|proof| *interface != proof.interface))
+            {
+                return Err(OwnerError::Conflict);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(OwnerError::Pending);
+            }
+            if actual.interface.is_none() && actual.retained_interfaces.is_empty() {
+                return Ok(()); // Final stable absence/current/CAS checks remain in MemberOwner.
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+        }
     }
 }
 impl<F: PrivateConfig> OriginalMemberRebindIo for NativeMemberIo<F> {
