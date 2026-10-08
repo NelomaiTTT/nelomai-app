@@ -993,9 +993,6 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
                     }
                     records.push(record.map(|r| r.data.into_bytes()));
                 }
-                if let Some(flight) = &native {
-                    flight.verify(files)?;
-                }
                 Ok((before_index, epoch, records))
             })
             .map_err(|_| failed())?;
@@ -1417,7 +1414,6 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                             flight.verify_record(kind, record.data.as_bytes())?;
                         }
                     }
-                    flight.verify(files)?;
                 }
                 Ok(record.map(|r| r.data.into_bytes()))
             })

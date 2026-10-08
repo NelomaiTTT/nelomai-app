@@ -17,10 +17,18 @@ struct DiskState {
     after: Option<Box<dyn FnOnce()>>,
     lost_file: Option<PrivateFile>,
     false_file: Option<PrivateFile>,
+    reads: BTreeMap<PrivateFile, usize>,
+    transactions: usize,
+    fail_read: Option<PrivateFile>,
 }
 impl PrivateRecords for Disk {
     fn read(&mut self, file: PrivateFile) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.0.borrow().bytes.get(&file).cloned())
+        let mut disk = self.0.borrow_mut();
+        *disk.reads.entry(file).or_default() += 1;
+        if disk.fail_read == Some(file) {
+            return Err(conflict());
+        }
+        Ok(disk.bytes.get(&file).cloned())
     }
     fn compare_exchange(
         &mut self,
@@ -50,6 +58,7 @@ impl SessionFileIo for Disk {
         &mut self,
         f: impl FnOnce(&mut dyn PrivateRecords) -> io::Result<T>,
     ) -> io::Result<T> {
+        self.0.borrow_mut().transactions += 1;
         let result = f(self);
         let after = self.0.borrow_mut().after.take();
         if let Some(after) = after {
@@ -1244,6 +1253,73 @@ fn actual_carrier_access_birth_fact_failed_postflight_fences_all_registered_sibl
     assert!(access.is_registered_native_birth_view());
     assert!(!access.is_fresh());
     assert_eq!(records, expected);
+
+    for batch in [false, true] {
+        let (disk, files, _, execution, _, _) = bound_running();
+        let context = native_context(&files);
+        let mut view = files.native_birth_view(&execution).unwrap();
+        let bytes = native_record(&context).encode().unwrap();
+        view.compare_exchange(&scope(), RecordKind::NativeCarrierReceipts, None, &bytes)
+            .unwrap();
+        disk.0.borrow_mut().reads.clear();
+        disk.0.borrow_mut().transactions = 0;
+        if batch {
+            view.native_records(&context, &kinds).unwrap();
+        } else {
+            view.read(&scope(), RecordKind::Session).unwrap();
+        }
+        let disk = disk.0.borrow();
+        // Two mandatory original ACK brackets plus the selected record/epoch
+        // reads, with no third Session/index verification inside transaction one.
+        assert_eq!(disk.transactions, 2);
+        assert_eq!(disk.reads[&PrivateFile::Index], 3);
+        assert_eq!(disk.reads[&PrivateFile::Session], if batch { 4 } else { 3 });
+    }
+    for batch in [false, true] {
+        for fault in 0..4 {
+            let (disk, files, root, execution, lease, _) = bound_running();
+            let context = native_context(&files);
+            let mut view = files.native_birth_view(&execution).unwrap();
+            let original = disk.0.borrow().bytes.clone();
+            let changed = disk.clone();
+            disk.0.borrow_mut().after = Some(Box::new(move || match fault {
+                0 => {
+                    changed.0.borrow_mut().bytes.remove(&PrivateFile::Index);
+                }
+                1 => {
+                    let mut disk = changed.0.borrow_mut();
+                    let mut record: super::super::SavedRecord =
+                        serde_json::from_slice(&disk.bytes[&PrivateFile::Session]).unwrap();
+                    let mut session: super::super::Envelope<SessionSnapshot> =
+                        serde_json::from_str(&record.data).unwrap();
+                    session.payload.local_revision += 1;
+                    record.data = serde_json::to_string(&session).unwrap();
+                    disk.bytes
+                        .insert(PrivateFile::Session, serde_json::to_vec(&record).unwrap());
+                }
+                2 => changed.0.borrow_mut().fail_read = Some(PrivateFile::Session),
+                _ => panic!("selected read directory postflight"),
+            }));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if batch {
+                    view.native_records(&context, &kinds).map(|_| ())
+                } else {
+                    view.read(&scope(), RecordKind::Session).map(|_| ())
+                }
+            }));
+            if fault == 3 {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            // Restoring equal private bytes must not refresh the original roots.
+            disk.0.borrow_mut().bytes = original;
+            disk.0.borrow_mut().fail_read = None;
+            assert!(view.native_carrier_access(&scope()).is_err());
+            assert!(execution.verify_current(&lease).is_err());
+            assert!(root.inspect(|_| Ok(())).is_err());
+        }
+    }
 
     for fault in 0..5 {
         let (disk, mut files, root, execution, lease, session) = bound_running();
