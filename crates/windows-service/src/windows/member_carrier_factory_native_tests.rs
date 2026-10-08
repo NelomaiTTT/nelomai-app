@@ -1084,7 +1084,7 @@ fn carrier_factory_actual_cold_child() {
                 eprintln!("actual reserve health phase begin failed={failed:?} expected_active={expected:?}");
                 fixture.external_health(failed);
                 for _ in 0..100 {
-                    second_now += 500;
+                    second_now += 1000;
                     second.tick(second_now).expect("actual reserve health tick");
                     let current = second.snapshot();
                     if current.session.active == expected

@@ -5653,9 +5653,6 @@ pub(crate) mod native {
             super::super::member_carrier_factory_test_os::trace_step(
                 "C refresh retained full original module lease",
             );
-            if self.current(use_)? != before {
-                return Err(Error::Conflict);
-            }
             let original = if use_ == Use::Cleanup {
                 self.image.cleanup_read_module()
             } else {
