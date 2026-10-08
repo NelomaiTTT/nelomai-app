@@ -30,7 +30,7 @@ internal class SupportDiagnosticUploader(
     }
 
     fun upload(report: SupportDiagnosticReport, supportCode: String): SupportUploadResult {
-        require(validSupportDiagnosticsCode(supportCode))
+        require(supportCode.isEmpty() || validSupportDiagnosticsCode(supportCode))
         val bytes = report.payload.toByteArray(Charsets.UTF_8)
         require(bytes.size <= 768 * 1024)
         if (cancelled.get()) return SupportUploadResult.Failure("upload_cancelled")
@@ -72,7 +72,7 @@ internal class SupportDiagnosticUploader(
             request.setRequestProperty("Content-Type", "application/json")
             request.setRequestProperty("Accept", "application/json")
             request.setRequestProperty("Cookie", "")
-            request.setRequestProperty("X-Nelomai-Diagnostics-Code", supportCode)
+            if (supportCode.isNotEmpty()) request.setRequestProperty("X-Nelomai-Diagnostics-Code", supportCode)
             request.setFixedLengthStreamingMode(bytes.size)
             request.outputStream.use { it.write(bytes) }
             val status = request.responseCode

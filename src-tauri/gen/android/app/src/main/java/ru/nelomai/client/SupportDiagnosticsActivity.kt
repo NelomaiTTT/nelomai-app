@@ -56,7 +56,8 @@ class SupportDiagnosticsActivity : Activity() {
         fun text(value: String) = TextView(this).apply { text = value; setPadding(0, 8, 0, 16); layout.addView(this) }
         text("Диагностика Nelomai").textSize = 24f
         text("Вход в аккаунт не нужен. Собираются только ограниченные журналы Nelomai с удалением секретов. " +
-            "Код поддержки разрешает только отправку отчёта; его срок и лимит проверяет сервер. Можно сохранить или поделиться отчётом без кода.")
+            "Код поддержки необязателен: без него отчёт отправляется без привязки к пользователю и устройству. " +
+            "Если код указан, его срок и лимит проверяет сервер. Можно также сохранить или поделиться отчётом.")
         text("Обычно сохраняются информационные сообщения, предупреждения и ошибки. " +
             "Подробная запись выключится через 15 минут, при достижении 2 МиБ или после перезапуска процесса приложения. " +
             "Закрытие этого экрана запись не останавливает. После воспроизведения ошибки нажмите «Собрать новый отчёт». " +
@@ -77,10 +78,10 @@ class SupportDiagnosticsActivity : Activity() {
             layout.addView(this)
         }
         refreshVerboseStatus()
-        text("Код поддержки")
+        text("Код поддержки (необязательно)")
         code = EditText(this).apply {
             id = CODE_FIELD
-            hint = "Введите код вручную"
+            hint = "Можно оставить пустым"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
             isSingleLine = true
             isSaveEnabled = false
@@ -102,7 +103,7 @@ class SupportDiagnosticsActivity : Activity() {
         cancel = button(View.generateViewId(), "Отменить") { cancelOperation() }
         cancel.isEnabled = false
         setContentView(ScrollView(this).apply { addView(layout) })
-        report?.let { status.text = "Отчёт ${it.reportId} сохранён в памяти. Для повторной отправки введите код." }
+        report?.let { status.text = "Отчёт ${it.reportId} сохранён в памяти. Код для повторной отправки необязателен; используйте тот же способ отправки." }
         if (pendingSave != null) setBusy(true)
     }
 
@@ -147,7 +148,8 @@ class SupportDiagnosticsActivity : Activity() {
     private fun send() {
         if (busy) return
         val enteredCode = code.text.toString().trim()
-        if (!validSupportDiagnosticsCode(enteredCode)) {
+        if ((enteredCode.isEmpty() && code.text.isNotEmpty()) ||
+            (enteredCode.isNotEmpty() && !validSupportDiagnosticsCode(enteredCode))) {
             status.text = "Введите код поддержки: nld_ и 43 символа, без пробелов и переносов строк."
             return
         }

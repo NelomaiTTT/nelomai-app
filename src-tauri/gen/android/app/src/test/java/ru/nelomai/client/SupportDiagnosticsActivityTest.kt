@@ -93,12 +93,44 @@ class SupportDiagnosticsActivityTest {
         assertNull(shadowOf(activity.application).nextStartedService)
     }
 
-    @Test fun emptyCodeDoesNotUploadOrStartAnAccountService() {
-        val activity = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup().get()
-        activity.findViewById<Button>(SupportDiagnosticsActivity.SEND_BUTTON).performClick()
-        assertNull(shadowOf(activity.application).nextStartedService)
-        assertNull(shadowOf(activity).nextStartedActivity)
-        assertTrue(activity.findViewById<android.widget.TextView>(SupportDiagnosticsActivity.STATUS_VIEW).text.contains("код"))
+    @Test fun emptyCodeUploadsOnlyOnClickAndManualRetryUsesTheFrozenSanitizedReport() {
+        val requests = java.util.concurrent.CopyOnWriteArrayList<ScreenConnection>()
+        ScreenHttps.response = { url -> ScreenConnection(url).also { requests += it } }
+        val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val log = File(activity.filesDir, "diagnostics/application.jsonl")
+            requireNotNull(log.parentFile).mkdirs(); log.writeText("password=never-send\nprelogin_failed\n")
+            shadowOf(android.os.Looper.getMainLooper()).idle()
+            assertTrue("opening screen must not upload", requests.isEmpty())
+            val send = activity.findViewById<Button>(SupportDiagnosticsActivity.SEND_BUTTON)
+            send.performClick()
+            await { activity.findViewById<android.widget.TextView>(SupportDiagnosticsActivity.STATUS_VIEW).text.contains("отправлен") }
+            log.writeText("changed after first upload\n")
+            send.performClick()
+            await { requests.size == 2 && send.isEnabled }
+            assertEquals(requests[0].sent.toString("UTF-8"), requests[1].sent.toString("UTF-8"))
+            for (request in requests) {
+                assertNull(request.getRequestProperty("X-Nelomai-Diagnostics-Code"))
+                assertNull(request.getRequestProperty("Authorization"))
+                assertFalse(request.sent.toString("UTF-8").contains("never-send"))
+                assertTrue(request.sent.toString("UTF-8").contains("prelogin_failed"))
+            }
+            assertNull(shadowOf(activity.application).nextStartedService)
+            assertNull(shadowOf(activity).nextStartedActivity)
+        } finally { controller.pause().stop().destroy(); ScreenHttps.response = null }
+    }
+
+    @Test fun malformedSuppliedCodeDoesNotUploadOrStartAnAccountService() {
+        val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            activity.findViewById<EditText>(SupportDiagnosticsActivity.CODE_FIELD).setText("bad-code")
+            activity.findViewById<Button>(SupportDiagnosticsActivity.SEND_BUTTON).performClick()
+            assertTrue(activity.findViewById<Button>(SupportDiagnosticsActivity.SEND_BUTTON).isEnabled)
+            assertNull(shadowOf(activity.application).nextStartedService)
+            assertTrue(activity.findViewById<android.widget.TextView>(SupportDiagnosticsActivity.STATUS_VIEW).text.contains("код"))
+        } finally { controller.pause().stop().destroy() }
     }
 
     @Test fun entryCreatesOnlyAnExplicitContainerIntentAndRejectsRemoteWebOrigins() {
@@ -214,4 +246,42 @@ class SupportDiagnosticsActivityTest {
         shadowOf(android.os.Looper.getMainLooper()).idle()
         assertTrue("operation did not finish within 3 seconds", condition())
     }
+}
+
+/** Network boundary only: the real activity, collector and uploader execute.
+ * This test worker cannot contact the public diagnostics endpoint. */
+private object ScreenHttps {
+    @Volatile var response: ((java.net.URL) -> javax.net.ssl.HttpsURLConnection)? = null
+    init {
+        java.net.URL.setURLStreamHandlerFactory { protocol ->
+            if (protocol != "https") null else object : java.net.URLStreamHandler() {
+                override fun openConnection(url: java.net.URL): java.net.URLConnection =
+                    error("test HTTPS requires an explicit fixture")
+                override fun openConnection(url: java.net.URL, proxy: java.net.Proxy): java.net.URLConnection {
+                    check(url.toString() == "https://nelomai.ru/api/client/v1/diagnostics/support")
+                    check(proxy == java.net.Proxy.NO_PROXY)
+                    return requireNotNull(response) { "test HTTPS fixture is inactive" }(url)
+                }
+            }
+        }
+    }
+}
+
+private class ScreenConnection(url: java.net.URL) : javax.net.ssl.HttpsURLConnection(url) {
+    val sent = java.io.ByteArrayOutputStream()
+    override fun getOutputStream() = sent
+    override fun getResponseCode() = 200
+    override fun getInputStream(): java.io.InputStream {
+        val report = org.json.JSONObject(sent.toString("UTF-8"))
+        return java.io.ByteArrayInputStream(org.json.JSONObject()
+            .put("report_id", report.getString("report_id"))
+            .put("request_id", "screen-request")
+            .put("received_bytes", sent.size()).toString().toByteArray())
+    }
+    override fun connect() {}
+    override fun disconnect() {}
+    override fun usingProxy() = false
+    override fun getCipherSuite() = "test"
+    override fun getLocalCertificates(): Array<java.security.cert.Certificate>? = null
+    override fun getServerCertificates(): Array<java.security.cert.Certificate> = emptyArray()
 }

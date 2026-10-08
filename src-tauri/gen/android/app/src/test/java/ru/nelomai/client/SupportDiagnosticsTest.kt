@@ -35,8 +35,8 @@ class SupportDiagnosticsTest {
         source.writeText("changed after collection\n")
         val body = JSONObject(report.payload)
         assertEquals("manual", body.getString("trigger"))
-        assertEquals("0.3.3", body.getString("app_version"))
-        assertEquals("0.3.3", body.getString("container_version"))
+        assertEquals(BuildConfig.VERSION_NAME, body.getString("app_version"))
+        assertEquals(BuildConfig.VERSION_NAME, body.getString("container_version"))
         assertFalse(body.has("runtime_version"))
         assertFalse(body.has("runtime_contract_version"))
         assertFalse(body.has("platform"))
@@ -60,7 +60,7 @@ class SupportDiagnosticsTest {
         val body = JSONObject(SupportDiagnosticCollector(files, backup, "Android 13 (API 33)").collect("").payload)
         assertEquals(fixture.keys().asSequence().toSet() + "container_version", body.keys().asSequence().toSet())
         // The fixture records an older client's schema, not this build's version.
-        assertEquals("0.3.3", body.getString("app_version"))
+        assertEquals(BuildConfig.VERSION_NAME, body.getString("app_version"))
         for (field in listOf("trigger", "architecture", "platform_version")) {
             assertEquals(fixture.getString(field), body.getString(field))
         }
@@ -119,7 +119,7 @@ class SupportDiagnosticsTest {
     }
 
     @Test fun fullRotatedLogsPreserveTheLatestRecordFromEverySource() = roots { files, backup ->
-        val directories = listOf("runtime/latest/state/0.3.3/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics")
+        val directories = listOf("runtime/latest/state/${BuildConfig.VERSION_NAME}/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics")
         val markers = mutableListOf<Pair<String, String>>()
         for ((index, directory) in directories.withIndex()) {
             for (name in listOf("android-startup.jsonl", "application.previous.jsonl", "application.jsonl", "auth-refresh.previous.jsonl", "auth-refresh.jsonl", "android-tunnel.previous.jsonl", "android-tunnel.jsonl")) {
@@ -144,7 +144,7 @@ class SupportDiagnosticsTest {
 
     @Test fun refreshJournalsAreCollectedBoundedAndSanitizedFromEveryNamespace() = roots { files, backup ->
         val markers = mutableListOf<String>()
-        for ((index, directory) in listOf("runtime/latest/state/0.3.3/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics").withIndex()) {
+        for ((index, directory) in listOf("runtime/latest/state/${BuildConfig.VERSION_NAME}/diagnostics", "runtime/latest/state/0.3.2/diagnostics", "runtime/stable/state/0.2.20/diagnostics", "diagnostics").withIndex()) {
             for (name in listOf("auth-refresh.previous.jsonl", "auth-refresh.jsonl")) {
                 val marker = "refresh-$index-$name"
                 log(files, "$directory/$name", "old refresh event\n".repeat(5000) + "$marker\npassword=do-not-include\n")
@@ -189,6 +189,25 @@ class SupportDiagnosticsTest {
         }
     }
 
+    @Test fun absentCodeUploadsFrozenSanitizedReportWithoutAnAuthorizationHeader() = roots { files, backup ->
+        log(files, "diagnostics/application.jsonl", "password=never-upload\nlogin_failed\n")
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        val requests = mutableListOf<Connection>()
+        val uploader = SupportDiagnosticUploader { url -> Connection(url, 200,
+            """{"report_id":"${report.reportId}","request_id":"anonymous-request","received_bytes":123}""").also { requests += it } }
+        repeat(2) { assertTrue(uploader.upload(report, "") is SupportUploadResult.Success) }
+        assertEquals(2, requests.size)
+        for (request in requests) {
+            assertEquals("https://nelomai.ru/api/client/v1/diagnostics/support", request.url.toString())
+            assertNull(request.getRequestProperty("X-Nelomai-Diagnostics-Code"))
+            assertNull(request.getRequestProperty("Authorization"))
+            assertEquals("", request.getRequestProperty("Cookie"))
+            assertFalse(request.instanceFollowRedirects)
+            assertEquals(report.payload, request.sent.toString("UTF-8"))
+            assertFalse(request.sent.toString("UTF-8").contains("never-upload"))
+        }
+    }
+
     @Test fun redirectIsFailureAndApiErrorKeepsRetryAfterWithoutEchoingSecrets() = roots { files, backup ->
         val report = SupportDiagnosticCollector(files, backup, null).collect("")
         val redirect = Connection(URL("https://nelomai.ru"), 302, "")
@@ -216,7 +235,7 @@ class SupportDiagnosticsTest {
 
     @Test fun invalidCodeFormatCannotOpenAConnection() = roots { files, backup ->
         val report = SupportDiagnosticCollector(files, backup, null).collect("")
-        for (code in listOf("", "fake-code", "nld_" + "A".repeat(42), "nld_" + "A".repeat(44), "nld_" + "/".repeat(43))) {
+        for (code in listOf(" ", "fake-code", "nld_" + "A".repeat(42), "nld_" + "A".repeat(44), "nld_" + "/".repeat(43))) {
             assertThrows(IllegalArgumentException::class.java) {
                 SupportDiagnosticUploader { Connection(URL("https://nelomai.ru"), 200, "{}") }.upload(report, code)
             }
@@ -227,11 +246,14 @@ class SupportDiagnosticsTest {
         val report = SupportDiagnosticCollector(files, backup, null).collect("")
         for ((status, code) in listOf(401 to "invalid_diagnostics_code", 429 to "diagnostics_code_exhausted",
             409 to "diagnostics_report_id_conflict", 422 to "invalid_support_diagnostics")) {
+            val requests = mutableListOf<Connection>()
             val result = SupportDiagnosticUploader {
-                Connection(it, status, """{"api_version":"1","request_id":"r","code":"$code","message":"hidden"}""")
+                Connection(it, status, """{"api_version":"1","request_id":"r","code":"$code","message":"hidden"}""").also { request -> requests += request }
             }.upload(report, uploadCode) as SupportUploadResult.Failure
             assertEquals(status, result.status)
             assertEquals(code, result.code)
+            assertEquals("a coded rejection must never retry anonymously", 1, requests.size)
+            assertEquals(uploadCode, requests.single().getRequestProperty("X-Nelomai-Diagnostics-Code"))
         }
     }
 
