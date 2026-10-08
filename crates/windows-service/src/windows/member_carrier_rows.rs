@@ -367,8 +367,17 @@ pub(super) fn read_original_snapshot_with<K: Kernel>(
     {
         return Err(Error::Conflict);
     }
+    let interface = match kernel.interface(binding.key) {
+        Err(Error::InterfaceAbsent) => {
+            if kernel.identity(binding.key)? != before {
+                return Err(Error::Conflict);
+            }
+            return Err(Error::InterfaceAbsent); // Factual IPv4 absence only.
+        }
+        result => result?,
+    };
     let snapshot = Snapshot {
-        interface: decode_interface(&kernel.interface(binding.key)?)?,
+        interface: decode_interface(&interface)?,
         address: kernel
             .address(binding.key, binding.address)?
             .as_ref()
@@ -399,6 +408,8 @@ pub(crate) mod native {
     /// Uses Get/Convert calls and SDK Initialize lookup buffers ONLY. No native
     /// Set/Create/Delete, reopen, journal, source-ready grant or address adoption.
     /// None denotes only exact managed-address absence, never all-address absence.
+    /// InterfaceAbsent means only exact IPv4 ERROR_NOT_FOUND with the original
+    /// MIB identity verified on both sides; forward callers still reject it.
     /// Returned DAD/SkipAsSource and other known fields are observations; caller
     /// must compare the full snapshot with its original protected row/ACK facts.
     pub(crate) fn read_original_snapshot(binding: &Binding) -> Result<Snapshot> {
@@ -2740,8 +2751,18 @@ mod ip_helper {
             row.Family = AF_INET;
             row.InterfaceLuid.Value = key.luid;
             row.InterfaceIndex = key.index;
-            unsafe {
-                checked(GetIpInterfaceEntry(&mut row))?;
+            let status = unsafe { GetIpInterfaceEntry(&mut row) };
+            if status != 0 {
+                #[cfg(all(windows, test))]
+                eprintln!(
+                    "actual original IP interface read luid={} index={} status={status}",
+                    key.luid, key.index
+                );
+                return Err(if status == 1168 {
+                    Error::InterfaceAbsent
+                } else {
+                    Error::Native
+                });
             }
             let decoded = decode_interface(&row)?;
             if decoded.key != key {

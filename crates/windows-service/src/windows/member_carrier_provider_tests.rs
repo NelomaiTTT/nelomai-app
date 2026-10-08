@@ -11,6 +11,7 @@ fn partial_service_namespace_accepts_only_exact_sdk_facts_without_returning_a_pr
                 &target,
                 wants[2].kind,
                 known.then_some(&wants[2]),
+                false,
                 &mut query
             ),
             Ok(true)
@@ -19,6 +20,80 @@ fn partial_service_namespace_accepts_only_exact_sdk_facts_without_returning_a_pr
         // escapes, never an adoptable provider or Running proof.
         assert_eq!(query.next, query.reads.len());
     }
+    for (deleted, known) in [(false, true), (true, false)] {
+        let (wants, mut query) = mixed_fixture();
+        for nodes in &mut query.source.nodes {
+            nodes.pop();
+        }
+        assert!(inspect_mixed_partial_queries(
+            &wants[..2],
+            &target(&wants[2].identity),
+            wants[2].kind,
+            known.then_some(&wants[2]),
+            deleted,
+            &mut query,
+        )
+        .is_err());
+    }
+    for missing in [0, 1] {
+        let (wants, mut query) = mixed_fixture();
+        for nodes in &mut query.source.nodes {
+            nodes.remove(missing); // No allowance for losing C/the other member.
+        }
+        assert!(inspect_mixed_partial_queries(
+            &wants[..2],
+            &target(&wants[2].identity),
+            wants[2].kind,
+            Some(&wants[2]),
+            true,
+            &mut query,
+        )
+        .is_err());
+    }
+    // Actual Delete ACK can precede exact original MIB rundown. This remains
+    // present comparison data, never absence or a new live provider.
+    let (wants, mut query) = mixed_fixture();
+    for nodes in &mut query.source.nodes {
+        nodes.pop(); // ONLY the target PnP node; C and the other member remain.
+    }
+    assert_eq!(
+        inspect_mixed_partial_queries(
+            &wants[..2],
+            &target(&wants[2].identity),
+            wants[2].kind,
+            Some(&wants[2]),
+            true,
+            &mut query
+        ),
+        Ok(true)
+    );
+    let (wants, mut query) = mixed_fixture();
+    for nodes in &mut query.source.nodes {
+        nodes.pop();
+    }
+    // The residual target never becomes a live provider Observation.
+    assert_eq!(
+        inspect_mixed_queries(&wants, Some(&wants[2]), &mut query)
+            .unwrap()
+            .len(),
+        2
+    );
+    for fail in [1, 4, 5, 6] {
+        let (wants, mut query) = mixed_fixture();
+        for nodes in &mut query.source.nodes {
+            nodes.pop();
+        }
+        query.source.fail = Some(fail);
+        assert!(inspect_mixed_partial_queries(
+            &wants[..2],
+            &target(&wants[2].identity),
+            wants[2].kind,
+            Some(&wants[2]),
+            true,
+            &mut query,
+        )
+        .is_err());
+    }
     let (wants, mut query) = mixed_absence_fixture();
     assert_eq!(
         inspect_mixed_partial_queries(
@@ -26,6 +101,7 @@ fn partial_service_namespace_accepts_only_exact_sdk_facts_without_returning_a_pr
             &mixed_absence_target(),
             ProviderKind::Wintun,
             None,
+            false,
             &mut query
         ),
         Ok(false)
@@ -45,7 +121,8 @@ fn partial_service_namespace_does_not_replace_known_original_or_relax_wrong_kind
             _ => kind = ProviderKind::WireGuardNt,
         }
         assert!(
-            inspect_mixed_partial_queries(&wants[..2], &partial, kind, None, &mut query).is_err(),
+            inspect_mixed_partial_queries(&wants[..2], &partial, kind, None, false, &mut query)
+                .is_err(),
             "{fault}"
         );
     }
@@ -67,6 +144,7 @@ fn partial_service_namespace_does_not_replace_known_original_or_relax_wrong_kind
                 &target(&wants[2].identity),
                 wants[2].kind,
                 Some(&captured),
+                true,
                 &mut query
             )
             .is_err(),
@@ -77,7 +155,9 @@ fn partial_service_namespace_does_not_replace_known_original_or_relax_wrong_kind
 
 #[test]
 fn partial_service_namespace_keeps_full_mib_pnp_stack_and_final_stability_checks() {
-    for fault in 0..8 {
+    for (fault, deleted) in
+        (0..8).flat_map(|fault| [false, true].map(move |deleted| (fault, deleted)))
+    {
         let (wants, mut query) = mixed_fixture();
         let partial = target(&wants[2].identity);
         match fault {
@@ -107,8 +187,15 @@ fn partial_service_namespace_keeps_full_mib_pnp_stack_and_final_stability_checks
             _ => query.source.tables[0].last_mut().unwrap().identity.guid = [0x88; 16],
         }
         assert!(
-            inspect_mixed_partial_queries(&wants[..2], &partial, wants[2].kind, None, &mut query)
-                .is_err(),
+            inspect_mixed_partial_queries(
+                &wants[..2],
+                &partial,
+                wants[2].kind,
+                deleted.then_some(&wants[2]),
+                deleted,
+                &mut query
+            )
+            .is_err(),
             "fault {fault}"
         );
     }
@@ -122,6 +209,7 @@ fn partial_service_namespace_keeps_full_mib_pnp_stack_and_final_stability_checks
             &mixed_absence_target(),
             ProviderKind::Wintun,
             None,
+            false,
             &mut query
         )
         .is_err());
@@ -804,7 +892,7 @@ fn mixed_c_wireguard_awg_returns_every_concrete_observation_in_caller_order() {
             node.driver.driver_key = "opaque-driver-key\\12345".into();
         }
     }
-    let got = inspect_mixed_queries(&wants, &mut q).unwrap();
+    let got = inspect_mixed_queries(&wants, None, &mut q).unwrap();
     assert_eq!(got.len(), 3);
     assert!(got
         .iter()
@@ -834,7 +922,7 @@ fn mixed_c_wireguard_awg_returns_every_concrete_observation_in_caller_order() {
         for nodes in &mut q.source.nodes {
             nodes[3].standard_name = friendly.clone();
         }
-        let got = inspect_mixed_queries(&wants, &mut q).unwrap();
+        let got = inspect_mixed_queries(&wants, None, &mut q).unwrap();
         assert_eq!(got[1].instance.standard_name, friendly);
     }
 }
@@ -855,7 +943,7 @@ fn expected_non_native_tunnel_protocol_never_becomes_a_provider_match() {
             q.reads[read].by_guid.identity.tunnel_type = 1;
         }
         assert!(
-            inspect_mixed_queries(&wants, &mut q).is_err(),
+            inspect_mixed_queries(&wants, None, &mut q).is_err(),
             "member {member}"
         );
     }
@@ -932,7 +1020,7 @@ fn mixed_expected_kind_is_required_and_cannot_crossbind_private_names() {
         } else {
             ProviderKind::WireGuardNt
         };
-        assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+        assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
     }
     for field in 0..6 {
         let (wants, mut q) = mixed_fixture();
@@ -950,7 +1038,7 @@ fn mixed_expected_kind_is_required_and_cannot_crossbind_private_names() {
             }
         }
         assert!(
-            inspect_mixed_queries(&wants, &mut q).is_err(),
+            inspect_mixed_queries(&wants, None, &mut q).is_err(),
             "field {field}"
         );
     }
@@ -962,7 +1050,7 @@ fn mixed_expected_kind_is_required_and_cannot_crossbind_private_names() {
                 value: nodes[member].name.clone(),
             });
         }
-        assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+        assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
     }
 }
 
@@ -1006,7 +1094,7 @@ fn mixed_wireguard_closed_metadata_rejects_wrong_egos_versions_dates_and_states(
             // Stable malformed facts must deny independently of changed reads.
             q.source.nodes[1 - phase] = q.source.nodes[phase].clone();
             assert!(
-                inspect_mixed_queries(&wants, &mut q).is_err(),
+                inspect_mixed_queries(&wants, None, &mut q).is_err(),
                 "{phase}/{field}"
             );
         }
@@ -1016,7 +1104,7 @@ fn mixed_wireguard_closed_metadata_rejects_wrong_egos_versions_dates_and_states(
                 nodes[3].status |= flag;
             }
             assert!(
-                inspect_mixed_queries(&wants, &mut q).is_err(),
+                inspect_mixed_queries(&wants, None, &mut q).is_err(),
                 "flag {flag:x}"
             );
         }
@@ -1048,7 +1136,7 @@ fn mixed_unknown_extra_missing_or_reused_interfaces_and_devices_cannot_be_hidden
             }
         }
         assert!(
-            inspect_mixed_queries(&wants, &mut q).is_err(),
+            inspect_mixed_queries(&wants, None, &mut q).is_err(),
             "field {field}"
         );
     }
@@ -1072,7 +1160,7 @@ fn mixed_unknown_extra_missing_or_reused_interfaces_and_devices_cannot_be_hidden
             }
         }
         assert!(
-            inspect_mixed_queries(&wants, &mut q).is_err(),
+            inspect_mixed_queries(&wants, None, &mut q).is_err(),
             "MIB {field}"
         );
     }
@@ -1099,7 +1187,7 @@ fn mixed_extra_current_version_wireguard_is_never_a_foreign_exemption() {
     for read in &mut q.reads {
         read.interfaces.push(row.clone());
     }
-    assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+    assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
 }
 
 #[test]
@@ -1109,7 +1197,7 @@ fn mixed_each_target_read_and_full_snapshot_must_agree_before_and_after() {
         let (wants, mut q) = mixed_fixture();
         q.reads[read].interfaces[0].identity.description = "Changed foreign description".into();
         assert_eq!(
-            inspect_mixed_queries(&wants, &mut q),
+            inspect_mixed_queries(&wants, None, &mut q),
             Err(Error::Changed),
             "read {read}"
         );
@@ -1121,7 +1209,7 @@ fn mixed_each_target_read_and_full_snapshot_must_agree_before_and_after() {
                 _ => &mut q.reads[read].by_guid,
             };
             row.identity.index += 100;
-            assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+            assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
         }
     }
     for field in 0..8 {
@@ -1138,18 +1226,21 @@ fn mixed_each_target_read_and_full_snapshot_must_agree_before_and_after() {
             _ => d.driver.matching_device_id = "WIREGUARD".into(),
         }
         assert_eq!(
-            inspect_mixed_queries(&wants, &mut q),
+            inspect_mixed_queries(&wants, None, &mut q),
             Err(Error::Changed),
             "field {field}"
         );
     }
     let (wants, mut q) = mixed_fixture();
     q.source.stacks[1].pop();
-    assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+    assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
     // An otherwise valid graph change is a Changed reading too.
     let (wants, mut q) = mixed_fixture();
     q.source.stacks[1][1].lower = 24;
-    assert_eq!(inspect_mixed_queries(&wants, &mut q), Err(Error::Changed));
+    assert_eq!(
+        inspect_mixed_queries(&wants, None, &mut q),
+        Err(Error::Changed)
+    );
 }
 
 #[test]
@@ -1158,7 +1249,7 @@ fn mixed_filters_cannot_derive_foreign_allowance_from_expected_wireguard() {
     for edges in &mut q.source.stacks {
         edges[0].lower = wants[1].identity.index;
     }
-    assert!(inspect_mixed_queries(&wants, &mut q).is_err());
+    assert!(inspect_mixed_queries(&wants, None, &mut q).is_err());
 }
 
 #[test]
@@ -1187,18 +1278,18 @@ fn mixed_bound_alias_and_every_os_boundary_failure_fail_without_default_success(
         let (_, mut q) = mixed_fixture();
         q.source.fail = Some(n);
         assert_eq!(
-            inspect_mixed_queries(&wants, &mut q),
+            inspect_mixed_queries(&wants, None, &mut q),
             Err(Error::Native("absence read", 5))
         );
         assert_eq!(q.source.events.len(), n);
     }
     for invalid in [vec![wants[0].clone(); 4], vec![wants[0].clone(); 2]] {
         let (_, mut q) = mixed_fixture();
-        assert!(inspect_mixed_queries(&invalid, &mut q).is_err());
+        assert!(inspect_mixed_queries(&invalid, None, &mut q).is_err());
         assert!(q.source.events.is_empty());
     }
     let mut q = q;
-    let got = inspect_mixed_queries(&wants, &mut q).unwrap();
+    let got = inspect_mixed_queries(&wants, None, &mut q).unwrap();
     assert_eq!(got.len(), 3);
     assert_eq!(
         q.source.events,
@@ -1216,7 +1307,7 @@ fn mixed_bound_alias_and_every_os_boundary_failure_fail_without_default_success(
         ]
     );
     let mut q = AbsenceScript::empty();
-    assert_eq!(inspect_mixed_queries(&[], &mut q), Ok(vec![]));
+    assert_eq!(inspect_mixed_queries(&[], None, &mut q), Ok(vec![]));
     assert_eq!(
         q.events,
         ["table", "snapshot", "stack", "snapshot", "table", "stack"]
@@ -1239,7 +1330,7 @@ fn mixed_order_and_windows_description_disambiguation_preserve_actual_observatio
         q.reads[read].by_index.identity.description = "Nelomai WG Tunnel #2".into();
         q.reads[read].by_guid.identity.description = "Nelomai WG Tunnel #2".into();
     }
-    let got = inspect_mixed_queries(&wants, &mut q).unwrap();
+    let got = inspect_mixed_queries(&wants, None, &mut q).unwrap();
     assert_eq!(
         got.iter()
             .map(|o| o.interface.name.as_str())

@@ -375,7 +375,12 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> PartialMemberCleanup<J, I> {
         if owner.intent() != &self.intent {
             return Err(OwnerError::Conflict);
         }
-        let observation = owner.inspect_partial_cleanup(&self.pin)?;
+        let observation = owner
+            .inspect_partial_cleanup(&self.pin)
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial member inspect: {_error:?}");
+            })?;
         self.verify_current()?;
         if self.shared.cleanup_tainted.get() {
             return Err(OwnerError::Conflict);

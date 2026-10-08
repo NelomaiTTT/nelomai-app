@@ -92,6 +92,8 @@ pub(crate) enum Error {
     Pending,
     #[error("carrier_rows_native")]
     Native,
+    #[error("carrier_rows_interface_absent")]
+    InterfaceAbsent,
     #[error("carrier_rows_journal")]
     Journal,
     #[error("carrier_rows_invalid")]

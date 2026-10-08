@@ -1215,7 +1215,8 @@ fn compare_resource_rows(
     }
     if channel == ResourceRowChannel::Closing && observed.is_none() {
         // Native caller supplies None only for SAME partial Delete/process ACK
-        // plus full SDK target absence. This is original row restoration DATA,
+        // plus full SDK target absence OR confirmed exact IP InterfaceAbsent.
+        // This is original row restoration DATA,
         // never a Closed member receipt or permission to remove a NIC.
         return if role != 0
             && ack.phase == rows::Phase::Stopped
@@ -3041,21 +3042,28 @@ pub(crate) mod native {
                 } else {
                     false
                 };
-                let partial_absent = i != 0
+                let partial_deleted = i != 0
                     && cleanup
                     && matches!(&window.origin,
                     WindowOrigin::PartialClosing(_, partial, sample)
                         if partial.intent().scope == identity.scope
                             && partial.intent().slot == if i == 1 { nelomai_contracts::dispatcher::TunnelSlot::A } else { nelomai_contracts::dispatcher::TunnelSlot::B }
-                            && sample.partial.as_ref().is_some_and(|(observation, present)|
-                                observation.service_deleted() && observation.process.is_some() && !present));
+                            && sample.partial.as_ref().is_some_and(|(observation, _)|
+                                observation.service_deleted() && observation.process.is_some()));
+                let partial_absent = partial_deleted
+                    && matches!(&window.origin, WindowOrigin::PartialClosing(_, _, sample)
+                        if sample.partial.as_ref().is_some_and(|(_, present)| !present));
                 let read = |ack: rows::RowRecordFacts<'_>| {
                     let protected =
                         rows::Record::decode(before[n].as_ref().ok_or(rows::Error::Journal)?)?;
-                    let observed = if closed || partial_absent {
-                        None
+                    let (observed, interface_absent) = if closed || partial_absent {
+                        (None, false)
                     } else {
-                        Some(rows::native::read_original_snapshot(ack.binding)?)
+                        match rows::native::read_original_snapshot(ack.binding) {
+                            Ok(actual) => (Some(actual), false),
+                            Err(rows::Error::InterfaceAbsent) if partial_deleted => (None, true),
+                            Err(error) => return Err(error),
+                        }
                     };
                     if ack.binding.role
                         != [
@@ -3080,7 +3088,13 @@ pub(crate) mod native {
                         },
                     )
                     .map_err(|_| rows::Error::Conflict)?;
-                    if !closed
+                    if interface_absent {
+                        if rows::native::read_original_snapshot(ack.binding)
+                            != Err(rows::Error::InterfaceAbsent)
+                        {
+                            return Err(rows::Error::Conflict);
+                        }
+                    } else if !closed
                         && !partial_absent
                         && rows::native::read_original_snapshot(ack.binding)?
                             != *observed.as_ref().unwrap()

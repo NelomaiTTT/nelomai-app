@@ -472,7 +472,7 @@ fn inspect_mixed_absent_queries(
     // Keep the actual mixed validator's exact universe, independent per-key
     // lookups, complete tables, stack and double reads. Target absence is an
     // additional factual predicate on those SAME reads, never a filtered set.
-    inspect_mixed_queries(wants, &mut MixedAbsenceQueries { target, query })
+    inspect_mixed_queries(wants, None, &mut MixedAbsenceQueries { target, query })
 }
 struct MixedAbsenceQueries<'a, Q> {
     target: &'a AbsenceTarget,
@@ -730,6 +730,7 @@ fn explain_filters(rows: &[Interface], edges: &[StackEdge], foreign: &mut Vec<u3
 }
 fn validate_snapshot(
     wants: Option<&[ExpectedProvider]>,
+    rundown: Option<&ExpectedProvider>,
     targets: &[AbsenceTarget],
     rows: &[Interface],
     snapshot: &DeviceSnapshot,
@@ -827,7 +828,7 @@ fn validate_snapshot(
                 return Err(Error::Conflict("foreign PnP name reuse"));
             }
         }
-        bind_devices(wants, &related)?;
+        bind_devices(wants, &related, rundown)?;
         wants.iter().map(|w| w.identity.clone()).collect()
     } else {
         if targets.is_empty() && !related.is_empty() {
@@ -849,7 +850,7 @@ fn validate_snapshot(
                 kind: ProviderKind::Wintun,
             })
             .collect::<Vec<_>>();
-        bind_devices(&strict, &related)?;
+        bind_devices(&strict, &related, None)?;
         owned
     };
     explain_filters(rows, edges, &mut foreign)?;
@@ -953,11 +954,11 @@ fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) 
     })?;
     let devices_before = query.device_snapshot(targets)?;
     let stack_before = query.stack()?;
-    validate_snapshot(None, targets, &before, &devices_before, &stack_before)?;
+    validate_snapshot(None, None, targets, &before, &devices_before, &stack_before)?;
     let devices_after = query.device_snapshot(targets)?;
     let after = query.table()?;
     let stack_after = query.stack()?;
-    validate_snapshot(None, targets, &after, &devices_after, &stack_after)?;
+    validate_snapshot(None, None, targets, &after, &devices_after, &stack_after)?;
     if devices_before != devices_after || stack_before != stack_after {
         return Err(Error::Changed);
     }
@@ -998,6 +999,7 @@ fn related_targets(
 }
 fn inspect_mixed_queries(
     wants: &[ExpectedProvider],
+    rundown: Option<&ExpectedProvider>,
     query: &mut impl Queries,
 ) -> Result<Vec<Observation>> {
     if wants.len() > 3 {
@@ -1038,6 +1040,7 @@ fn inspect_mixed_queries(
     for row in &before {
         validate_snapshot(
             Some(wants),
+            rundown,
             &targets,
             &row.interfaces,
             &devices_before,
@@ -1051,18 +1054,19 @@ fn inspect_mixed_queries(
     }
     let related_before = validate_snapshot(
         Some(wants),
+        rundown,
         &targets,
         &before[0].interfaces,
         &devices_before,
         &stack_before,
     )?;
-    let bound_before = bind_devices(wants, &related_before)?;
+    let bound_before = bind_devices(wants, &related_before, rundown)?;
     let devices_after = query.device_snapshot(&targets)?;
     let mut observations = Vec::with_capacity(wants.len());
     let mut final_rows = Vec::with_capacity(wants.len());
     for (i, expected) in wants.iter().enumerate() {
         let want = &expected.identity;
-        before[i].devices = vec![bound_before[i].clone()];
+        before[i].devices = bound_before[i].iter().cloned().collect();
         final_rows.push(query.interfaces(want)?);
     }
     let stack_after = query.stack()?;
@@ -1074,12 +1078,13 @@ fn inspect_mixed_queries(
         let after = &mut final_rows[i];
         let related_after = validate_snapshot(
             Some(wants),
+            rundown,
             &targets,
             &after.interfaces,
             &devices_after,
             &stack_after,
         )?;
-        let bound_after = bind_devices(wants, &related_after)?;
+        let bound_after = bind_devices(wants, &related_after, rundown)?;
         if stable_rows(&before[i].interfaces, &devices_before, &stack_before)?
             != stable_rows(&after.interfaces, &devices_after, &stack_after)?
             || stable_rows(&before[0].interfaces, &devices_before, &stack_before)?
@@ -1087,7 +1092,14 @@ fn inspect_mixed_queries(
         {
             return Err(Error::Changed);
         }
-        after.devices = vec![bound_after[i].clone()];
+        if bound_before[i].is_none() || bound_after[i].is_none() {
+            if bound_before[i].is_some() != bound_after[i].is_some() || rundown != Some(expected) {
+                return Err(Error::Changed);
+            }
+            validate_interfaces(want, after)?;
+            continue; // Exact residual comparison only, never a live Observation.
+        }
+        after.devices = bound_after[i].iter().cloned().collect();
         observations.push(validate_provider(want, expected.kind, &before[i], after)?);
     }
     Ok(observations)
@@ -1102,6 +1114,7 @@ fn inspect_mixed_partial_queries(
     target: &AbsenceTarget,
     kind: ProviderKind,
     original: Option<&ExpectedProvider>,
+    deleted: bool,
     query: &mut impl Queries,
 ) -> Result<bool> {
     validate_target_parts(target.guid, &target.name)?;
@@ -1156,7 +1169,7 @@ fn inspect_mixed_partial_queries(
         comparison.push(partial.clone());
         // Strict full MIB/PnP/stack validation, including all original live
         // providers and aliases. The partial candidate remains LOCAL DATA.
-        inspect_mixed_queries(&comparison, query)?;
+        inspect_mixed_queries(&comparison, deleted.then_some(original).flatten(), query)?;
     } else {
         // A missing MIB row alone is not absence: independently scan both PnP
         // universes with the exact target included, even when wants is empty.
@@ -1179,10 +1192,20 @@ fn inspect_all_queries(wants: &[Expected], query: &mut impl Queries) -> Result<V
             kind: ProviderKind::Wintun,
         })
         .collect::<Vec<_>>();
-    inspect_mixed_queries(&strict, query)
+    inspect_mixed_queries(&strict, None, query)
 }
-fn bind_devices(wants: &[ExpectedProvider], devices: &[Device]) -> Result<Vec<Device>> {
-    if devices.len() != wants.len() {
+fn bind_devices(
+    wants: &[ExpectedProvider],
+    devices: &[Device],
+    rundown: Option<&ExpectedProvider>,
+) -> Result<Vec<Option<Device>>> {
+    let missing = rundown.is_some_and(|original| {
+        wants.contains(original)
+            && !devices.iter().any(|device| {
+                parse_guid(&device.netcfg_instance_id).ok() == Some(original.identity.guid)
+            })
+    });
+    if devices.len() != wants.len() - usize::from(missing) {
         return Err(Error::Conflict("incomplete/extra device universe"));
     }
     let mut bound = Vec::with_capacity(wants.len());
@@ -1194,8 +1217,12 @@ fn bind_devices(wants: &[ExpectedProvider], devices: &[Device]) -> Result<Vec<De
                 matches.push(device.clone());
             }
         }
+        if matches.is_empty() && rundown == Some(expected) {
+            bound.push(None);
+            continue;
+        }
         validate_provider_device(want, expected.kind, &matches)?;
-        bound.push(matches.remove(0));
+        bound.push(Some(matches.remove(0)));
     }
     Ok(bound)
 }
@@ -1285,7 +1312,7 @@ pub(crate) mod native {
     /// Returns all concrete observations in caller order, with the same full
     /// PnP/MIB/stack reads as the strict Wintun entry point. No factory selection.
     pub(crate) fn inspect_mixed(wants: &[ExpectedProvider]) -> Result<Vec<Observation>> {
-        let result = inspect_mixed_queries(wants, &mut NativeQueries);
+        let result = inspect_mixed_queries(wants, None, &mut NativeQueries);
         #[cfg(test)]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
             if let Err(error) = &result {
@@ -1304,6 +1331,7 @@ pub(crate) mod native {
         name: &str,
         kind: ProviderKind,
         original: Option<&ExpectedProvider>,
+        deleted: bool,
     ) -> Result<bool> {
         inspect_mixed_partial_queries(
             wants,
@@ -1313,6 +1341,7 @@ pub(crate) mod native {
             },
             kind,
             original,
+            deleted,
             &mut NativeQueries,
         )
     }

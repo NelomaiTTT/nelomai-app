@@ -3146,6 +3146,32 @@ fn readonly_original_snapshot_returns_complete_decoded_rows_without_owner_or_eff
 }
 #[test]
 fn readonly_original_snapshot_absence_is_factual_and_still_checks_final_identity() {
+    // Exact IPv4 interface absence must still verify the SAME residual MIB
+    // identity; it grants no full NIC absence or cleanup permission.
+    let mut missing = ReadonlySdk::new();
+    missing.interface = Err(Error::InterfaceAbsent);
+    assert_eq!(
+        read_original_snapshot_with(&mut missing, &binding()),
+        Err(Error::InterfaceAbsent)
+    );
+    assert_eq!(missing.reads, ["identity", "interface", "identity"]);
+    missing.assert_no_effects();
+    let mut changed = ReadonlySdk::new();
+    changed.interface = Err(Error::InterfaceAbsent);
+    changed.after.as_mut().unwrap().InterfaceIndex += 1;
+    assert_eq!(
+        read_original_snapshot_with(&mut changed, &binding()),
+        Err(Error::Conflict)
+    );
+    changed.assert_no_effects();
+    let mut unknown = ReadonlySdk::new();
+    unknown.interface = Err(Error::InterfaceAbsent);
+    unknown.after = Err(Error::Native);
+    assert_eq!(
+        read_original_snapshot_with(&mut unknown, &binding()),
+        Err(Error::Native)
+    );
+    unknown.assert_no_effects();
     let mut sdk = ReadonlySdk::new();
     sdk.address = Ok(None);
     let mut expected = readonly_expected();

@@ -1728,17 +1728,28 @@ pub(crate) mod native {
                             .cloned()
                             .collect::<Vec<_>>();
                         let wants = complete_provider_inputs(context, carrier, &others)?;
-                        super::super::member_carrier_provider::native::inspect_mixed_partial(
-                            &wants,
-                            binding.guid,
-                            &binding.name,
-                            kind,
-                            original,
-                        )
-                        .map_err(|_| Error::Pending)
+                        let before = partial.inspect().map_err(|_| Error::Conflict)?;
+                        let present =
+                            super::super::member_carrier_provider::native::inspect_mixed_partial(
+                                &wants,
+                                binding.guid,
+                                &binding.name,
+                                kind,
+                                original,
+                                before.service_deleted() && before.process.is_some(),
+                            )
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!("actual partial member provider census: {_error:?}");
+                            })
+                            .map_err(|_| Error::Pending)?;
+                        if partial.inspect().map_err(|_| Error::Conflict)? != before {
+                            return Err(Error::Conflict);
+                        }
+                        Ok((before, present))
                     },
                     |live, facts, present| {
-                        inspect(live, &facts.history, &facts.service_domains, *present)
+                        inspect(live, &facts.history, &facts.service_domains, present.1)
                     },
                 )
             })

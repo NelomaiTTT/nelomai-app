@@ -305,11 +305,21 @@ impl<S, P> OriginalServiceCleanup<S, P> {
             let mut process = None;
             for _ in 0..2 {
                 if read_config()? != Some(self.intent.config_sha256) {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual original partial config mismatch");
                     return Err(OwnerError::Conflict);
                 }
                 if let Some(handle) = &state.process {
-                    boundary.verify_cleanup_process_image(handle, &self.intent)?;
-                    let (proof, code) = boundary.query_process(handle)?;
+                    boundary
+                        .verify_cleanup_process_image(handle, &self.intent)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual original partial process image: {_error:?}");
+                        })?;
+                    let (proof, code) = boundary.query_process(handle).inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        eprintln!("actual original partial process query: {_error:?}");
+                    })?;
                     if Some(proof.pid) != self.pinned_pid
                         || proof.creation_time == 0
                         || self.process_origin.get().is_some_and(|p| p != proof)
@@ -375,6 +385,8 @@ impl<S, P> OriginalServiceCleanup<S, P> {
         let mut prior = None;
         for _ in 0..2 {
             if read_config()? != Some(self.intent.config_sha256) {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial config mismatch");
                 return Err(OwnerError::Conflict);
             }
             let facts = boundary.service_cleanup_facts(
@@ -394,8 +406,16 @@ impl<S, P> OriginalServiceCleanup<S, P> {
                 ServiceCleanupState::StartPending | ServiceCleanupState::StopPending => 0,
             };
             let process = if let Some(handle) = &state.process {
-                boundary.verify_cleanup_process_image(handle, &self.intent)?;
-                let (proof, code) = boundary.query_process(handle)?;
+                boundary
+                    .verify_cleanup_process_image(handle, &self.intent)
+                    .inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        eprintln!("actual original partial process image: {_error:?}");
+                    })?;
+                let (proof, code) = boundary.query_process(handle).inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual original partial process query: {_error:?}");
+                })?;
                 if Some(proof.pid) != self.pinned_pid
                     || proof.creation_time == 0
                     || state.proof.is_some_and(|p| p.process != proof)

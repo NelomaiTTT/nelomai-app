@@ -563,7 +563,10 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
         let files = &mut self.files;
         let path = &self.config_path;
         pin.inspect(&mut NativeOriginalCalls { files: None }, || {
-            files.read_digest(path)
+            files.read_digest(path).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial config read: {_error:?}");
+            })
         })
     }
     fn stop_partial_original(&mut self, pin: &Self::CleanupPin) -> Result<()> {
