@@ -5095,26 +5095,18 @@ pub(crate) mod native {
                             return Err(Error::Conflict);
                         }
 
-                        let result = if let Some(original) = &owned.partial_cleanup {
-                            if current.proof.is_some()
-                                && !original.inspect().map_err(owner_error)?.service_deleted()
-                            {
-                                // Published first Stop retains the existing native
-                                // boundary. Partial handles only its actual Delete ACK.
-                                owned.member.stop(&current).map_err(owner_error)
-                            } else {
-                                owned
-                                    .member
-                                    .stop_partial_original(&current, original)
-                                    .map_err(owner_error)
-                            }
-                        } else {
-                            owned.member.stop(&current).map_err(owner_error)
-                        };
-                        result.inspect_err(|_error| {
-                            #[cfg(all(windows, test))]
-                            eprintln!("actual native Stop owner slot={index}: {_error:?}");
-                        })
+                        let original = owned.partial_cleanup.as_ref().ok_or(Error::Pending)?;
+                        original
+                            .verify_pending_original(&owned.pending)
+                            .map_err(owner_error)?;
+                        owned
+                            .member
+                            .stop_partial_original(&current, original)
+                            .map_err(owner_error)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!("actual native Stop owner slot={index}: {_error:?}");
+                            })
                     },
                     |receipt| {
                         inventory.closed(index, receipt).inspect_err(|_error| {
