@@ -231,7 +231,7 @@ pub(crate) enum ServiceCleanupState {
 pub(crate) struct PartialServiceObservation {
     pid: u32,
     state: ServiceCleanupState,
-    process: Option<ProcessProof>,
+    pub(crate) process: Option<ProcessProof>,
     deleted: bool,
 }
 impl PartialServiceObservation {
@@ -312,11 +312,22 @@ impl<S, P> OriginalServiceCleanup<S, P> {
                     let (proof, code) = boundary.query_process(handle)?;
                     if Some(proof.pid) != self.pinned_pid
                         || proof.creation_time == 0
-                        || code == 259
                         || self.process_origin.get().is_some_and(|p| p != proof)
                         || process.is_some_and(|p| p != proof)
                     {
                         return Err(OwnerError::Conflict);
+                    }
+                    if code == 259 {
+                        if self.process_origin.get() != Some(proof)
+                            || read_config()? != Some(self.intent.config_sha256)
+                            || self.tainted.get()
+                        {
+                            return Err(OwnerError::Conflict);
+                        }
+                        // Actual Delete ACK and SAME known held process; still
+                        // running grants no absence, but can be reread on retry.
+                        state.partial_denied = false;
+                        return Err(OwnerError::Pending);
                     }
                     process = Some(proof);
                 } else if self.pinned_pid.is_some() {
@@ -1609,13 +1620,23 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> MemberOwner<J, I> {
             return Err(OwnerError::Pending);
         }
         self.require_current(&stopping)?;
-        let before = self.io.inspect(&self.intent, None)?;
+        let retained = stopping.proof.or_else(|| {
+            self.original_run
+                .as_ref()
+                .filter(|run| {
+                    stopping.phase == Phase::Stopped
+                        && run.running.intent == stopping.intent
+                        && run.running.proof == stopping.retired_proof
+                })
+                .and_then(|run| run.running.proof)
+        });
+        let before = self.io.inspect(&self.intent, retained.as_ref())?;
         require_no_native(&before)?;
         if before.config_sha256 != Some(self.intent.config_sha256) {
             return Err(OwnerError::Conflict);
         }
         self.require_current(&stopping)?;
-        let after = self.io.inspect(&self.intent, None)?;
+        let after = self.io.inspect(&self.intent, retained.as_ref())?;
         require_no_native(&after)?;
         if before != after {
             return Err(OwnerError::Conflict);

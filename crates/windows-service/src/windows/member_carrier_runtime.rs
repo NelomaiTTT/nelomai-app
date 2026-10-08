@@ -1213,6 +1213,20 @@ fn compare_resource_rows(
     {
         return Err(CarrierError::Conflict);
     }
+    if channel == ResourceRowChannel::Closing && observed.is_none() {
+        // Native caller supplies None only for SAME partial Delete/process ACK
+        // plus full SDK target absence. This is original row restoration DATA,
+        // never a Closed member receipt or permission to remove a NIC.
+        return if role != 0
+            && ack.phase == rows::Phase::Stopped
+            && ack.current.address.is_none()
+            && ack.current.interface.policy == ack.baseline.interface.policy
+        {
+            Ok(())
+        } else {
+            Err(CarrierError::Conflict)
+        };
+    }
     let observed = observed.ok_or(CarrierError::Conflict)?;
     observed.validate(original).map_err(bad)?;
     if !rows::same_owned(&ack.current, observed) {
@@ -3027,10 +3041,18 @@ pub(crate) mod native {
                 } else {
                     false
                 };
+                let partial_absent = i != 0
+                    && cleanup
+                    && matches!(&window.origin,
+                    WindowOrigin::PartialClosing(_, partial, sample)
+                        if partial.intent().scope == identity.scope
+                            && partial.intent().slot == if i == 1 { nelomai_contracts::dispatcher::TunnelSlot::A } else { nelomai_contracts::dispatcher::TunnelSlot::B }
+                            && sample.partial.as_ref().is_some_and(|(observation, present)|
+                                observation.service_deleted() && observation.process.is_some() && !present));
                 let read = |ack: rows::RowRecordFacts<'_>| {
                     let protected =
                         rows::Record::decode(before[n].as_ref().ok_or(rows::Error::Journal)?)?;
-                    let observed = if closed {
+                    let observed = if closed || partial_absent {
                         None
                     } else {
                         Some(rows::native::read_original_snapshot(ack.binding)?)
@@ -3059,6 +3081,7 @@ pub(crate) mod native {
                     )
                     .map_err(|_| rows::Error::Conflict)?;
                     if !closed
+                        && !partial_absent
                         && rows::native::read_original_snapshot(ack.binding)?
                             != *observed.as_ref().unwrap()
                     {
@@ -3110,16 +3133,22 @@ pub(crate) mod native {
         deadline: NativeDeadlineReadPin,
         fence: Rc<super::SourceFence>,
     }
+    type ClosingMemberFacts = (
+        Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
+        Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
+        Vec<crate::member_owner::ServiceDomain>,
+        Option<bool>,
+    );
     #[derive(PartialEq, Eq)]
     struct ClosingSample {
         service_domains: Vec<crate::member_owner::ServiceDomain>,
         revision: SourceRevision,
         original: creators::Identity,
-        // ONLY these providers may enter SDK queries; stopped histories never
-        // enter that universe or re-create live source permission.
+        // Live providers plus the partial target's captured comparison identity.
+        // The partial target and stopped histories never grant live SDK inputs.
         members: Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
         history: Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
-        partial: Option<crate::member_owner::PartialServiceObservation>,
+        partial: Option<(crate::member_owner::PartialServiceObservation, bool)>,
     }
     /// Independent SAME-original closed C reader for the final static-base
     /// read/removal gate. No current NIC/source-readiness or live row authority
@@ -3597,7 +3626,7 @@ pub(crate) mod native {
                 },
                 |(revision, binding, captured, snapshot)| {
                     self.originals
-                        .inspect_live_carrier_identity(&self.scope, |actual| {
+                        .inspect_live_carrier_identity(&self.scope, false, |actual| {
                             super::ready_source_comparison(
                                 context,
                                 &actual.identity,
@@ -3921,11 +3950,7 @@ pub(crate) mod native {
             partial: Option<
                 &crate::windows::member_carrier_member_controller::native::PartialCleanup,
             >,
-        ) -> Result<(
-            Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
-            Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
-            Vec<crate::member_owner::ServiceDomain>,
-        )> {
+        ) -> Result<ClosingMemberFacts> {
             use crate::windows::member_carrier_provider::{
                 Expected, ExpectedProvider, ProviderKind,
             };
@@ -3950,8 +3975,13 @@ pub(crate) mod native {
                         &self.image,
                         &[c],
                         partial,
-                        |live, history, domains| {
-                            Ok((live.to_vec(), history.to_vec(), domains.to_vec()))
+                        |live, history, domains, present| {
+                            Ok((
+                                live.to_vec(),
+                                history.to_vec(),
+                                domains.to_vec(),
+                                Some(present),
+                            ))
                         },
                     )
                     .map_err(denied);
@@ -3963,7 +3993,7 @@ pub(crate) mod native {
                     &self.image,
                     &[c],
                     |live, history, domains| {
-                        Ok((live.to_vec(), history.to_vec(), domains.to_vec()))
+                        Ok((live.to_vec(), history.to_vec(), domains.to_vec(), None))
                     },
                 )
                 .map_err(denied)
@@ -3987,21 +4017,39 @@ pub(crate) mod native {
             let partial_observation = partial
                 .map(|original| original.inspect().map_err(denied))
                 .transpose()?;
-            let all = self
-                .originals
-                .observe_all_for_cleanup(&self.scope.context)
-                .map_err(denied)?;
-            if all.originals.len() != 1 || all.originals[0].scope != self.scope {
-                return Err(Error::Conflict);
-            }
-            let (members, history, service_domains) =
-                self.members(&all.originals[0].identity, partial)?;
+            let (original, members, history, service_domains, present) =
+                if let Some(partial) = partial {
+                    self.originals
+                        .inspect_live_carrier_identity(&self.scope, true, |actual| {
+                            let (members, history, domains, present) = self
+                                .members(&actual.identity, Some(partial))
+                                .map_err(|_| creators::Error::Conflict)?;
+                            Ok((actual.identity.clone(), members, history, domains, present))
+                        })
+                        .map_err(denied)?
+                } else {
+                    let all = self
+                        .originals
+                        .observe_all_for_cleanup(&self.scope.context)
+                        .map_err(denied)?;
+                    if all.originals.len() != 1 || all.originals[0].scope != self.scope {
+                        return Err(Error::Conflict);
+                    }
+                    let (members, history, domains, present) =
+                        self.members(&all.originals[0].identity, None)?;
+                    (
+                        all.originals[0].identity.clone(),
+                        members,
+                        history,
+                        domains,
+                        present,
+                    )
+                };
             // Matching rows still grant no native ACK. Protected full-row
             // binding must agree with this actual retained original C.
             let rows = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
             if rows.binding
-                != super::rows_binding(&self.scope.context, &all.originals[0].identity)
-                    .map_err(denied)?
+                != super::rows_binding(&self.scope.context, &original).map_err(denied)?
             {
                 return Err(Error::Conflict);
             }
@@ -4011,10 +4059,10 @@ pub(crate) mod native {
             Ok(ClosingSample {
                 service_domains,
                 revision: before,
-                original: all.originals[0].identity.clone(),
+                original,
                 members,
                 history,
-                partial: partial_observation,
+                partial: partial_observation.zip(present),
             })
         }
         /// Only SAME retained partial SCM cleanup, never a live Source window.

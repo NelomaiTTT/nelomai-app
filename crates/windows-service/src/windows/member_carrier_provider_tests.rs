@@ -2,24 +2,33 @@ use super::*;
 
 #[test]
 fn partial_service_namespace_accepts_only_exact_sdk_facts_without_returning_a_provider() {
-    let (wants, mut query) = mixed_fixture();
-    let target = target(&wants[2].identity);
-    assert_eq!(
-        inspect_mixed_partial_queries(&wants[..2], &target, wants[2].kind, &mut query),
-        Ok(())
-    );
-    // All original mixed SDK validation remains mandatory; this reader only
-    // returns unit, never an adoptable interface or Running proof.
-    assert_eq!(query.next, query.reads.len());
+    for known in [false, true] {
+        let (wants, mut query) = mixed_fixture();
+        let target = target(&wants[2].identity);
+        assert_eq!(
+            inspect_mixed_partial_queries(
+                &wants[..2],
+                &target,
+                wants[2].kind,
+                known.then_some(&wants[2]),
+                &mut query
+            ),
+            Ok(true)
+        );
+        // Full mixed SDK validation remains mandatory. Only factual presence
+        // escapes, never an adoptable provider or Running proof.
+        assert_eq!(query.next, query.reads.len());
+    }
     let (wants, mut query) = mixed_absence_fixture();
     assert_eq!(
         inspect_mixed_partial_queries(
             &wants,
             &mixed_absence_target(),
             ProviderKind::Wintun,
+            None,
             &mut query
         ),
-        Ok(())
+        Ok(false)
     );
 }
 
@@ -36,8 +45,32 @@ fn partial_service_namespace_does_not_replace_known_original_or_relax_wrong_kind
             _ => kind = ProviderKind::WireGuardNt,
         }
         assert!(
-            inspect_mixed_partial_queries(&wants[..2], &partial, kind, &mut query).is_err(),
+            inspect_mixed_partial_queries(&wants[..2], &partial, kind, None, &mut query).is_err(),
             "{fault}"
+        );
+    }
+    for field in 0..7 {
+        let (wants, mut query) = mixed_fixture();
+        let mut captured = wants[2].clone();
+        match field {
+            0 => captured.identity.index += 1,
+            1 => captured.identity.luid += 1,
+            2 => captured.identity.description.push('x'),
+            3 => captured.identity.if_type += 1,
+            4 => captured.identity.tunnel_type += 1,
+            5 => captured.identity.name.push('x'),
+            _ => captured.kind = ProviderKind::WireGuardNt,
+        }
+        assert!(
+            inspect_mixed_partial_queries(
+                &wants[..2],
+                &target(&wants[2].identity),
+                wants[2].kind,
+                Some(&captured),
+                &mut query
+            )
+            .is_err(),
+            "captured field {field}"
         );
     }
 }
@@ -74,7 +107,7 @@ fn partial_service_namespace_keeps_full_mib_pnp_stack_and_final_stability_checks
             _ => query.source.tables[0].last_mut().unwrap().identity.guid = [0x88; 16],
         }
         assert!(
-            inspect_mixed_partial_queries(&wants[..2], &partial, wants[2].kind, &mut query)
+            inspect_mixed_partial_queries(&wants[..2], &partial, wants[2].kind, None, &mut query)
                 .is_err(),
             "fault {fault}"
         );
@@ -88,6 +121,7 @@ fn partial_service_namespace_keeps_full_mib_pnp_stack_and_final_stability_checks
             &wants,
             &mixed_absence_target(),
             ProviderKind::Wintun,
+            None,
             &mut query
         )
         .is_err());

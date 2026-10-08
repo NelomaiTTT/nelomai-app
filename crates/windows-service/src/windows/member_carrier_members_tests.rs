@@ -1338,7 +1338,7 @@ fn pending_unknown_is_not_live_or_absent_until_exact_stop_and_full_empty_queries
             full_queries.set(full_queries.get() + 1);
             Ok(())
         },
-        |live, history| {
+        |live, history, _| {
             assert!(live.is_empty());
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].proof.interface.guid, [2; 16]);
@@ -1471,7 +1471,7 @@ fn mixed_closing_exact_a_history_and_live_b_query_only_live_on_both_sides() {
             queries.set(queries.get() + 1);
             Ok(())
         },
-        |live, closed| {
+        |live, closed, _| {
             assert_eq!(live, &[expected_b.clone()]);
             assert_eq!(closed.len(), 1);
             let comparison = closed[0].comparison_provider(&context)?;
@@ -1580,7 +1580,7 @@ fn final_empty_inventory_preserves_genuine_pending_retired_proof_without_sdk_loo
             queries.set(queries.get() + 1);
             Ok(())
         },
-        |live, history| {
+        |live, history, _| {
             assert!(live.is_empty());
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].proof.interface.guid, [2; 16]);
@@ -1594,7 +1594,7 @@ fn final_empty_inventory_preserves_genuine_pending_retired_proof_without_sdk_loo
 
 #[test]
 fn mixed_closing_rechecks_receipt_absence_source_revision_and_live_only_sdk() {
-    for fault in 0..5 {
+    for fault in 0..6 {
         let (a, state) = actual_closed_entry(TunnelSlot::A, TunnelTransport::WireGuard);
         let (context, _, _, _) = fixture(TunnelSlot::A, TunnelTransport::WireGuard);
         let mut entries = [Some(a), None];
@@ -1624,10 +1624,10 @@ fn mixed_closing_rechecks_receipt_absence_source_revision_and_live_only_sdk() {
                 if fault == 4 && sdk.get() == 2 {
                     Err(Error::Native)
                 } else {
-                    Ok(())
+                    Ok(fault != 5 || sdk.get() == 1)
                 }
             },
-            |_, _| {
+            |_, _, _| {
                 match fault {
                     0 => state.borrow_mut().absence_error = true,
                     1 => state.borrow_mut().running = true,
@@ -1681,7 +1681,7 @@ fn mixed_closing_foreign_equal_receipt_and_unknown_live_never_enter_history() {
                 queries.set(queries.get() + 1);
                 Ok(())
             },
-            |_, _| Ok(())
+            |_, _, _| Ok(())
         ),
         Err(Error::Pending)
     );
@@ -1715,7 +1715,7 @@ fn mixed_closing_callback_error_unwind_or_caught_reentry_never_rearms_inventory(
                         assert!(live.is_empty());
                         Ok(())
                     },
-                    |_, _| match fault {
+                    |_, _, _| match fault {
                         0 => Err(Error::Native),
                         1 => panic!("mixed Closing callback unwind"),
                         _ => {
@@ -2259,7 +2259,7 @@ fn all_actual_registered_closures_and_sources_are_reverified_before_and_after_ca
                         assert!(live.is_empty());
                         Ok(())
                     },
-                    |live, retired| {
+                    |live, retired, _| {
                         assert!(live.is_empty());
                         assert_eq!(retired.len(), 2);
                         callbacks.set(1);
@@ -2323,7 +2323,7 @@ fn missing_or_foreign_equal_actual_receipt_never_enters_retired_inventory_callba
                     queries.set(1);
                     Ok(())
                 },
-                |_, _| {
+                |_, _, _| {
                     callbacks.set(1);
                     Ok(7)
                 },
@@ -2371,7 +2371,7 @@ fn actual_retired_history_queries_each_owner_and_source_on_both_sides_of_callbac
                     assert!(live.is_empty());
                     Ok(())
                 },
-                |live, retired| {
+                |live, retired, _| {
                     assert!(live.is_empty());
                     assert_eq!(retired.len(), 2);
                     retired
@@ -2429,7 +2429,7 @@ fn callback_durable_stop_or_actual_source_change_denies_retired_result() {
                             assert!(live.is_empty());
                             Ok(())
                         },
-                        |_, history| {
+                        |_, history, _| {
                             assert_eq!(history.len(), 2);
                             if durable {
                                 states[index].borrow_mut().record = None;

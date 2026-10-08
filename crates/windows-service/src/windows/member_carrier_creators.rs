@@ -842,24 +842,26 @@ impl<N: OriginalNative> Drop for Producer<N> {
 }
 impl<N: OriginalNative> Observer<N> {
     /// Factual SAME raw C handle bracket, not a complete provider universe,
-    /// absence proof or effect permission. A/B process-generation publication
-    /// cannot recursively read the integrated inventory while renewing it.
+    /// absence proof or effect permission. A/B generation publication and
+    /// cleanup bracket their own full inventory without recursive observation.
     /// Its caller MUST independently query the full mixed SDK universe here.
     /// No mutable/retained native capability escapes; errors/unwind/reentry
     /// permanently poison forward use, preserving original cleanup roots.
     pub(crate) fn inspect_live_carrier_identity<T>(
         &self,
         expected: &Scope,
+        cleanup: bool,
         inspect: impl FnOnce(&OriginalIdentity) -> Result<T>,
     ) -> Result<T> {
-        let operation = Operation::enter(&self.shared, false)?;
+        let operation = Operation::enter(&self.shared, cleanup)?;
         if self.shared.scope(expected)? != 0 || expected.binding.role != Role::RoleCarrier {
             return Err(Error::Conflict);
         }
         // This integrated topology owns only C in the raw creator registry.
         // Member SCM/process roots belong to their independent inventory.
         for slot in &self.shared.slots[1..] {
-            if !matches!(slot.state.get(), State::Intent | State::Empty)
+            if !(matches!(slot.state.get(), State::Intent | State::Empty)
+                || cleanup && slot.state.get() == State::Ambiguous)
                 || slot
                     .held
                     .try_borrow()
@@ -894,7 +896,7 @@ impl<N: OriginalNative> Observer<N> {
             )
         };
         let check = || -> Result<()> {
-            if slot.state.get() != State::Live
+            if !(slot.state.get() == State::Live || cleanup && slot.state.get() == State::Ambiguous)
                 || attempt.scope != *expected
                 || !attempt.acknowledged.get()
                 || !attempt.published.get()

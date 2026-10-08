@@ -5566,15 +5566,28 @@ pub(crate) mod native {
                     // Preserve the complete original SDK/Calling bracket.
                     // Each concrete effect independently checks its resource G.
                     if record.phase == pair::Phase::Closing {
-                        this.closing
-                            .as_ref()
-                            .ok_or_else(conflict)?
-                            .inspect_window(|_| Ok(()))
-                            .map_err(|error| denied(error))?;
+                        if let pair::Effect::MemberStop(slot) = effect {
+                            let closing = this.closing.clone().ok_or_else(conflict)?;
+                            let r = this.roots_mut()?;
+                            let i = idx(slot);
+                            if let Some(controller) = &mut r.controllers[i] {
+                                r.member_gates[i].as_ref().ok_or_else(conflict)?
+                                    .try_borrow_mut().map_err(denied)?
+                                    .select_pair(pin.clone()).map_err(denied)?;
+                                controller.verify(pin, record, Some(&closing), &mut r.lock).map_err(denied)?;
+                            } else {
+                                this.closing.as_ref().ok_or_else(conflict)?
+                                    .inspect_window(|_| Ok(())).map_err(denied)?;
+                            }
+                        } else {
+                            this.closing.as_ref().ok_or_else(conflict)?
+                                .inspect_window(|_| Ok(())).map_err(denied)?;
+                        }
                     } else {
                         r.pins.source.inspect_window(|_| Ok(())).map_err(|error| denied(error))?;
                     }
                 }
+                let r = this.roots()?;
                 r.runtime.verify(&r.context).map_err(|error| denied(error))
             })
         }
@@ -6641,7 +6654,7 @@ pub(crate) mod native {
                     r.controllers[i]
                         .as_mut()
                         .ok_or_else(conflict)?
-                        .verify(pin, record, &mut r.lock)
+                        .verify(pin, record, None, &mut r.lock)
                         .inspect_err(|_error| {
                             #[cfg(test)]
                             super::super::member_carrier_factory_test_os::trace_native(

@@ -918,9 +918,9 @@ impl Fixture {
             "primary did not reach the actual carrier package source read"
         );
     }
-    pub(crate) fn trace_pair_stage(&self) {
+    pub(crate) fn trace_pair_stage(&self) -> Option<crate::member_carrier_pair::Record> {
         use member_files::SessionFileIo;
-        let result = (|| -> io::Result<()> {
+        let result = (|| -> io::Result<crate::member_carrier_pair::Record> {
             let mut files = member_files::MemberFiles::new().map_err(io::Error::other)?;
             let raw = files
                 .transaction(|records| records.read(member_files::PrivateFile::Pair))?
@@ -938,10 +938,14 @@ impl Fixture {
                 "actual Pair phase={} stop_stage={} pending={}",
                 pair["phase"], pair["stop_stage"], pair["pending"]
             );
-            Ok(())
+            serde_json::from_value(pair.clone()).map_err(io::Error::other)
         })();
-        if let Err(error) = result {
-            eprintln!("actual Pair diagnostic read: {error}");
+        match result {
+            Ok(record) => Some(record),
+            Err(error) => {
+                eprintln!("actual Pair diagnostic read: {error}");
+                None
+            }
         }
     }
 }

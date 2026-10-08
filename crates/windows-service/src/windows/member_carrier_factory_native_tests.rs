@@ -590,9 +590,11 @@ fn carrier_factory_actual_cold_child() {
         || route_partial
     {
         let retry_started = std::time::Instant::now();
-        while stopped.is_err() && original.snapshot().cleanup_pending {
+        while stopped.is_err()
+            && original.snapshot().cleanup_pending
+            && retry_started.elapsed() <= std::time::Duration::from_secs(30)
+        {
             assert_eq!(original.snapshot().session.phase, SessionPhase::Stopping);
-            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
             let now = 8 + stop_started.elapsed().as_millis() as u64;
             match original.tick(now) {
                 Ok(_) => {
@@ -608,11 +610,56 @@ fn carrier_factory_actual_cold_child() {
                     stopped = Err(error);
                 }
             }
-            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
             if original.snapshot().cleanup_pending {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        if stopped.is_err() && retry_started.elapsed() > std::time::Duration::from_secs(30) {
+            if let Some(record) = fixture.trace_pair_stage().filter(|r| {
+                r.phase == crate::member_carrier_pair::Phase::Closing
+                    && r.stop_stage == 8
+                    && r.pending == Some(crate::member_carrier_pair::Effect::CarrierClose)
+            }) {
+                if let Some(proof) = record.carrier {
+                    eprintln!("actual expired Stop C observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
+                    let observing = std::time::Instant::now();
+                    while observing.elapsed() < std::time::Duration::from_secs(60) {
+                        match crate::windows::member_carrier_provider::native::table() {
+                            Ok(rows) => {
+                                let matches = rows
+                                    .iter()
+                                    .filter(|r| {
+                                        r.identity.guid == proof.guid
+                                            || r.identity.luid == proof.luid
+                                            || r.identity.index == proof.index
+                                    })
+                                    .collect::<Vec<_>>();
+                                let exact = matches
+                                    .iter()
+                                    .filter(|r| {
+                                        r.identity.guid == proof.guid
+                                            && r.identity.luid == proof.luid
+                                            && r.identity.index == proof.index
+                                    })
+                                    .count();
+                                eprintln!("actual expired Stop C rundown elapsed_ms={} exact={} collisions={}", observing.elapsed().as_millis(), exact, matches.len() - exact);
+                            }
+                            Err(error) => eprintln!(
+                                "actual expired Stop C rundown elapsed_ms={} error={error:?}",
+                                observing.elapsed().as_millis()
+                            ),
+                        }
+                        if observing.elapsed() + std::time::Duration::from_secs(5)
+                            >= std::time::Duration::from_secs(60)
+                        {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                    }
+                }
+            }
+        }
+        assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);

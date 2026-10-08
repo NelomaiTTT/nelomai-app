@@ -4488,13 +4488,6 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()>;
-        fn authorize_stop(
-            &mut self,
-            context: &Context,
-            pair: &PairRecord,
-            intent: &Intent,
-            window: &NativeBindingsWindow<'_>,
-        ) -> Result<()>;
         /// Normal Running/Retire(target), exact MemberStop effect, Preparing
         /// ownership and SAME original Source. All permits are withdrawn;
         /// target original probe closed/weak restored/routes removed while
@@ -4653,8 +4646,33 @@ pub(crate) mod native {
             &mut self,
             pair: &NativePairIntentRead,
             expected: &PairRecord,
+            closing: Option<&NativeClosingRead>,
             lock: &mut KeyLock,
         ) -> Result<()> {
+            if expected.phase == pair::Phase::Closing {
+                let closing = closing.ok_or(Error::Conflict)?;
+                if !self.root.attempted {
+                    let owned = self.root.owner.as_ref().ok_or(Error::Retired)?;
+                    owned.cleanup_envelope(pair, expected, lock)?;
+                    closing
+                        .inspect_window(|_| Ok(()))
+                        .map_err(|_| Error::Conflict)?;
+                    return owned.cleanup_envelope(pair, expected, lock);
+                }
+                if self.root.closed_registered {
+                    return self.verify_absent(pair, expected, Some(closing), lock);
+                }
+                let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
+                if let Some(receipt) = &self.root.closed {
+                    owned.cleanup_envelope(pair, expected, lock)?;
+                    owned.member.verify_closed(receipt).map_err(owner_error)?;
+                    return owned.cleanup_envelope(pair, expected, lock);
+                }
+                return owned.partial_stop_preflight(pair, expected, lock);
+            }
+            if closing.is_some() {
+                return Err(Error::Conflict);
+            }
             self.observe_original(pair, expected, lock).map(|_| ())
         }
         /// Absence requires THIS owner's opaque Stop ACK, its actual original
@@ -4921,7 +4939,7 @@ pub(crate) mod native {
             }
             self.rebinds.try_reserve(1).map_err(|_| Error::Pending)?;
             let prior = self.root.running.as_ref().ok_or(Error::Pending)?.clone();
-            self.verify(pair, expected, lock)?;
+            self.verify(pair, expected, None, lock)?;
             let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
             owned.rebind_envelope(pair, expected, lock)?;
             let (running, receipt, reader) =
@@ -5185,6 +5203,11 @@ pub(crate) mod native {
             owned.retirement_envelope(pair_read, expected, lock)?;
             if !had_closed {
                 owned.retirement_preflight(pair_read, expected, lock)?;
+                if owned.partial_cleanup.is_none() {
+                    owned.partial_cleanup = Some(Rc::new(
+                        owned.pending.partial_cleanup().map_err(owner_error)?,
+                    ));
+                } // Keep SAME native cleanup pin before retirement's actual Stop/Delete.
             }
             let mut inventory = owned.inventory.read_pin();
             let supervisor = owned.supervisor.clone();
@@ -5319,14 +5342,8 @@ pub(crate) mod native {
                 // A Closing full inventory cannot precede this republish: its
                 // old live entry may already be absent after a lost register ACK.
                 owned.cleanup_envelope(pair_read, expected, lock)
-            } else if !self.root.registered
-                || expected.members[index]
-                    .as_ref()
-                    .is_some_and(|m| m.owner.proof.is_none())
-            {
-                owned.partial_stop_preflight(pair_read, expected, lock)
             } else {
-                owned.stop_preflight(pair_read, expected, closing, lock)
+                owned.partial_stop_preflight(pair_read, expected, lock)
             };
             preflight.inspect_err(|_error| {
                 #[cfg(all(windows, test))]
@@ -5349,10 +5366,18 @@ pub(crate) mod native {
                         }
 
                         let result = if let Some(original) = &owned.partial_cleanup {
-                            owned
-                                .member
-                                .stop_partial_original(&current, original)
-                                .map_err(owner_error)
+                            if current.proof.is_some()
+                                && !original.inspect().map_err(owner_error)?.service_deleted()
+                            {
+                                // Published first Stop retains the existing native
+                                // boundary. Partial handles only its actual Delete ACK.
+                                owned.member.stop(&current).map_err(owner_error)
+                            } else {
+                                owned
+                                    .member
+                                    .stop_partial_original(&current, original)
+                                    .map_err(owner_error)
+                            }
                         } else {
                             owned.member.stop(&current).map_err(owner_error)
                         };
@@ -5912,77 +5937,6 @@ pub(crate) mod native {
                 .map_err(|_| Error::Conflict)?;
             self.verify_sources()?;
             if !self.runtime.matches_lock(receipt.mutation_lock)
-                || keys_record::Record::decode(
-                    &self
-                        .runtime
-                        .record(&self.context, RecordKind::NativeCarrierReceipts)?,
-                )? != native
-            {
-                return Err(Error::Conflict);
-            }
-            Ok(())
-        }
-        fn stop_preflight(
-            &self,
-            pair_read: &NativePairIntentRead,
-            expected: &PairRecord,
-            closing: &NativeClosingRead,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            self.cleanup_envelope(pair_read, expected, lock)?;
-            self.verify_sources()?;
-            validate_member_operation(
-                &self.context,
-                expected,
-                &self.intent,
-                MemberOperation::Stop,
-            )?;
-            let index = slot_index(self.intent.slot);
-            let native = keys_record::Record::decode(
-                &self
-                    .runtime
-                    .record(&self.context, RecordKind::NativeCarrierReceipts)?,
-            )?;
-            if !self.runtime.matches_lock(lock)
-                || native.context != self.context
-                || native.phase != Phase::Closing
-            {
-                return Err(Error::Conflict);
-            }
-            pair_read
-                .inspect_cleanup_effect(
-                    &self.runtime,
-                    &self.supervisor,
-                    expected,
-                    4 + index as u8,
-                    |_| Ok(()),
-                )
-                .map_err(|_| Error::Conflict)?;
-            // The concrete cleanup gate may reauthenticate the SAME Pair;
-            // release our Pair/inventory borrows before its joined read.
-            closing
-                .inspect_window(|window| {
-                    if !window.matches_closing(closing) || !window.matches_runtime(&self.runtime) {
-                        return Err(super::super::member_carrier_wintun::Error::Conflict);
-                    }
-                    self.gate
-                        .try_borrow_mut()
-                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)?
-                        .authorize_stop(&self.context, expected, &self.intent, window)
-                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
-                })
-                .map_err(|_| Error::Conflict)?;
-            pair_read
-                .inspect_cleanup_effect(
-                    &self.runtime,
-                    &self.supervisor,
-                    expected,
-                    4 + index as u8,
-                    |_| Ok(()),
-                )
-                .map_err(|_| Error::Conflict)?;
-            self.verify_sources()?;
-            if !self.runtime.matches_lock(lock)
                 || keys_record::Record::decode(
                     &self
                         .runtime

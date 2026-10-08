@@ -277,7 +277,7 @@ fn carrier_identity_callback_retains_actual_original_without_recursive_universe(
         })));
     let reads = log.reads.get();
     observer
-        .inspect_live_carrier_identity(&scope(0), |actual| {
+        .inspect_live_carrier_identity(&scope(0), false, |actual| {
             assert_eq!(actual.scope, scope(0));
             assert_eq!(actual.identity.guid, scope(0).binding.guid);
             assert_eq!(log.reads.get(), reads + 1);
@@ -288,6 +288,15 @@ fn carrier_identity_callback_retains_actual_original_without_recursive_universe(
     assert_eq!(producer.original_universe().calls.borrow().len(), calls);
     assert_eq!(log.closes.get(), 0);
     assert_eq!(log.drops.get(), 0);
+    producer.shared.fail();
+    assert_eq!(observer.snapshot(&context()).unwrap()[0], State::Ambiguous);
+    observer
+        .inspect_live_carrier_identity(&scope(0), true, |_| Ok(()))
+        .unwrap();
+    assert!(observer
+        .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
+        .is_err());
+    assert_eq!(log.closes.get(), 0);
 }
 
 #[test]
@@ -303,7 +312,7 @@ fn carrier_identity_callback_denies_nonoriginal_drift_reentry_error_and_unwind()
             log.fail_read.set(true);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            observer.inspect_live_carrier_identity(&expected, |_| {
+            observer.inspect_live_carrier_identity(&expected, false, |_| {
                 entered.set(true);
                 match fault {
                     2 => {
@@ -327,17 +336,17 @@ fn carrier_identity_callback_denies_nonoriginal_drift_reentry_error_and_unwind()
         }
         assert_eq!(entered.get(), fault >= 2);
         assert!(observer
-            .inspect_live_carrier_identity(&scope(0), |_| Ok(()))
+            .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
             .is_err());
         assert_eq!(log.closes.get(), 0);
     }
     let (_producer, observer) = registry();
     assert!(observer
-        .inspect_live_carrier_identity(&scope(0), |_| -> Result<()> { panic!("uncreated") })
+        .inspect_live_carrier_identity(&scope(0), false, |_| -> Result<()> { panic!("uncreated") })
         .is_err());
     let (_producer, observer, _) = live(1);
     assert!(observer
-        .inspect_live_carrier_identity(&scope(1), |_| -> Result<()> { panic!("member") })
+        .inspect_live_carrier_identity(&scope(1), false, |_| -> Result<()> { panic!("member") })
         .is_err());
 }
 
@@ -368,7 +377,7 @@ fn carrier_identity_callback_rejects_actual_handle_drift_before_and_after_consum
             let called = Cell::new(false);
             assert!(
                 observer
-                    .inspect_live_carrier_identity(&scope(0), |_| {
+                    .inspect_live_carrier_identity(&scope(0), false, |_| {
                         called.set(true);
                         if after_callback {
                             change();
@@ -381,7 +390,7 @@ fn carrier_identity_callback_rejects_actual_handle_drift_before_and_after_consum
             assert_eq!(called.get(), after_callback);
             *original.facts.borrow_mut() = captured;
             assert!(observer
-                .inspect_live_carrier_identity(&scope(0), |_| Ok(()))
+                .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
                 .is_err());
             assert_eq!(log.closes.get(), 0);
             assert_eq!(log.drops.get(), 0);

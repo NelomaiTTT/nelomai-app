@@ -3336,6 +3336,13 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
         if !pin.matches_origin(&self.origin) {
             return Err(OwnerError::Conflict);
         }
+        if self.base.0.borrow().fail_stop && self.base.0.borrow().observation.service.is_none() {
+            self.boundary.exit_code = if self.base.0.borrow().fail_capture {
+                259
+            } else {
+                0
+            };
+        }
         pin.inspect(&mut self.boundary, || {
             Ok(self.base.0.borrow().observation.config_sha256)
         })
@@ -3349,8 +3356,10 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
         })?;
         let mut state = self.base.0.borrow_mut();
         state.observation.service = None;
-        state.observation.interface = None;
-        state.observation.retained_interfaces.clear();
+        if !state.fail_stop {
+            state.observation.interface = None;
+            state.observation.retained_interfaces.clear();
+        } // External NIC rundown may lag SAME successful Stop/Delete ACK.
         Ok(())
     }
 }
@@ -3359,22 +3368,29 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
 fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader() {
     // Break caught: committed Running required, foreign equal owner accepted,
     // fabricated Closed before original Stop/Delete or double effects on retry.
-    for (slot, transport, lost) in [
-        (TunnelSlot::A, TunnelTransport::WireGuard, false),
-        (TunnelSlot::B, TunnelTransport::WireGuard, true),
-        (TunnelSlot::A, TunnelTransport::AmneziaWg3, true),
-        (TunnelSlot::B, TunnelTransport::AmneziaWg3, false),
+    for (slot, transport, lost, published) in [
+        (TunnelSlot::A, TunnelTransport::WireGuard, false, false),
+        (TunnelSlot::B, TunnelTransport::WireGuard, true, false),
+        (TunnelSlot::A, TunnelTransport::AmneziaWg3, true, false),
+        (TunnelSlot::B, TunnelTransport::AmneziaWg3, false, false),
+        (TunnelSlot::A, TunnelTransport::WireGuard, false, true),
+        (TunnelSlot::B, TunnelTransport::AmneziaWg3, false, true),
     ] {
         let (mut owner, state) = origin_owner_for(slot, transport);
         owner.io.boundary.split_start = true;
+        let service_closes = owner.io.boundary.service_closes.clone();
         let mut retained = crate::member_original::RetainedMember::new(owner);
         let pending = retained.pending_read().unwrap();
-        if lost {
+        if published {
+            retained.start_with_prior(None).unwrap();
+        } else if lost {
             state.borrow_mut().lost_save_ack = Some(Phase::Running);
         } else {
             state.borrow_mut().fail_save = Some(Phase::Running);
         }
-        assert!(retained.start_with_prior(None).is_err());
+        if !published {
+            assert!(retained.start_with_prior(None).is_err());
+        }
         let capability = Rc::new(pending.partial_cleanup().unwrap());
         assert!(pending.partial_cleanup().is_err()); // SAME original, one issuance/root.
         capability.verify_pending_original(&pending).unwrap();
@@ -3389,6 +3405,29 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
         state.borrow_mut().lost_save_ack = None;
         state.borrow_mut().fail_save = None;
         let obligation = retained.snapshot().unwrap().unwrap();
+        if published {
+            state.borrow_mut().fail_stop = true;
+            assert!(retained.stop(&obligation).is_err());
+            state.borrow_mut().fail_capture = true;
+            assert_eq!(service_closes.get(), 1); // Actual SAME Delete ACK.
+            assert_eq!(capability.inspect(), Err(OwnerError::Pending));
+            state.borrow_mut().fail_capture = false;
+            let stopping = retained.snapshot().unwrap().unwrap();
+            assert_eq!(stopping.phase, Phase::Stopping);
+            assert_eq!(stopping.proof, obligation.proof);
+            assert!(capability.inspect().unwrap().service_deleted());
+            assert!(retained
+                .stop_partial_original(&stopping, &capability)
+                .is_err());
+            assert_eq!(service_closes.get(), 1);
+            state.borrow_mut().fail_stop = false;
+            let (stopped, closed) = retained
+                .stop_partial_original(&stopping, &capability)
+                .unwrap();
+            assert_eq!(stopped.retired_proof, obligation.proof);
+            retained.verify_closed(&closed).unwrap();
+            continue;
+        }
         let (stopped, closed) = retained
             .stop_partial_original(&obligation, &capability)
             .unwrap();
@@ -3566,6 +3605,12 @@ fn service_only_partial_cleanup_read_fault_unwind_or_replaced_process_never_rear
 }
 impl MemberIo for OriginIo {
     fn inspect(&mut self, intent: &Intent, retained: Option<&NativeProof>) -> Result<Observation> {
+        if self.base.0.borrow().fail_stop && self.base.0.borrow().observation.service.is_none() {
+            assert_eq!(
+                retained,
+                self.base.0.borrow().record.as_ref().unwrap().proof.as_ref()
+            );
+        }
         self.base.inspect(intent, retained)
     }
     fn inspect_original(&mut self, intent: &Intent, retained: &NativeProof) -> Result<Observation> {
@@ -3616,6 +3661,10 @@ impl MemberIo for OriginIo {
     ) -> Result<()> {
         self.origin
             .stop_delete(&mut self.boundary, intent, retained, expected)?;
+        if self.base.0.borrow().fail_stop {
+            self.base.0.borrow_mut().observation.service = None;
+            return Ok(()); // Native Delete ACK precedes external NIC rundown.
+        }
         self.base.stop_slot(intent, retained, expected)
     }
     fn rebind(

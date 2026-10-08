@@ -34,13 +34,6 @@ fn service_window_usage(usage: Use, partial: bool) -> Result<()> {
 fn service_stop_stage(context: &Context, record: &pair::Record, intent: &Intent) -> Result<Use> {
     stage(context, record, intent, true)?;
     let target = index(intent);
-    if record.members[target]
-        .as_ref()
-        .is_none_or(|m| m.owner.proof.is_some())
-        || record.guard.members[target].is_some()
-    {
-        return Err(Error::Conflict);
-    }
     Ok(Use::ServiceStop(target))
 }
 fn retirement_target(usage: Use) -> Option<usize> {
@@ -1212,19 +1205,6 @@ pub(crate) mod native {
             let state = &mut self.state;
             self.fence.run(false, || {
                 let usage = state.check_arguments(context, record, intent, false)?;
-                state.authorize(record, usage, window, None)
-            })
-        }
-        fn authorize_stop(
-            &mut self,
-            context: &Context,
-            record: &pair::Record,
-            intent: &Intent,
-            window: &NativeBindingsWindow<'_>,
-        ) -> Result<()> {
-            let state = &mut self.state;
-            self.fence.run(true, || {
-                let usage = state.check_arguments(context, record, intent, true)?;
                 state.authorize(record, usage, window, None)
             })
         }

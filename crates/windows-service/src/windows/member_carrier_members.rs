@@ -718,16 +718,15 @@ fn read_terminal_closed_bindings<
     read_mixed_closed_bindings(context, entries, pending, verify)
 }
 
-fn inspect_mixed_closing_with<T, F: PartialEq>(
+fn inspect_mixed_closing_with<T, F: PartialEq, Q: PartialEq>(
     mut read: impl FnMut() -> Result<(Vec<u8>, Vec<ExpectedProvider>, F)>,
-    mut query: impl FnMut(&[ExpectedProvider]) -> Result<()>,
-    inspect: impl FnOnce(&[ExpectedProvider], &F) -> Result<T>,
+    mut query: impl FnMut(&[ExpectedProvider]) -> Result<Q>,
+    inspect: impl FnOnce(&[ExpectedProvider], &F, &Q) -> Result<T>,
 ) -> Result<T> {
     let before = read()?;
-    query(&before.1)?;
-    let facts = inspect(&before.1, &before.2)?;
-    query(&before.1)?;
-    if read()? != before {
+    let queried = query(&before.1)?;
+    let facts = inspect(&before.1, &before.2, &queried)?;
+    if query(&before.1)? != queried || read()? != before {
         return Err(Error::Conflict);
     }
     Ok(facts)
@@ -949,6 +948,7 @@ fn read_closing_members<J: crate::member_owner::Journal, I: crate::member_owner:
     read_closing_members_with(
         context,
         entries,
+        None,
         verify_source,
         native_identity,
         |original| original.read_for_cleanup(),
@@ -961,12 +961,21 @@ fn read_closing_members_with<
 >(
     context: &Context,
     entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
+    excluded: Option<usize>,
     mut verify_source: impl FnMut(&S, Option<&Intent>) -> Result<()>,
     mut native_identity: impl FnMut(&S, &NativeProof) -> Result<ExpectedProvider>,
     mut read: impl FnMut(
         &mut crate::member_original::OriginalMemberRead<J, I>,
     ) -> crate::member_owner::Result<(Intent, NativeProof)>,
 ) -> Result<Vec<ExpectedProvider>> {
+    if excluded.is_some_and(|index| {
+        entries
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_none_or(|entry| entry.closed.is_some())
+    }) {
+        return Err(Error::Conflict);
+    }
     for entry in entries.iter().flatten() {
         entry.original.retire_forward();
     }
@@ -974,6 +983,9 @@ fn read_closing_members_with<
     for (index, entry) in entries.iter_mut().enumerate() {
         let Some(entry) = entry else { continue };
         verify_source(&entry.source, None)?;
+        if excluded == Some(index) {
+            continue; // Native caller independently verifies SAME pending/live original and partial pin.
+        }
         if let Some(receipt) = &entry.closed {
             // History never becomes a live native query target. Only the
             // actual SAME-owner ACK plus current durable/native absence counts.
@@ -1531,6 +1543,16 @@ pub(crate) mod native {
                 if !Rc::ptr_eq(source, &entry.source) || !original.same_original(&entry.original) {
                     return Err(Error::Conflict);
                 }
+                if let Some(live) = &inventory.entries[index] {
+                    if live.closed.is_some()
+                        || entry.closed.is_some()
+                        || !Rc::ptr_eq(&entry.source, &live.source)
+                        || !entry.original.matches_live(&live.original)
+                        || entry.captured.as_ref().is_some_and(|p| p != &live.provider)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                }
                 inventory.runtime.verify_member_intent(
                     &inventory.context,
                     source,
@@ -1662,9 +1684,9 @@ pub(crate) mod native {
             })
         }
 
-        /// Separate service-only factual channel for the SAME uncommitted
-        /// NEW SCM origin. Its SDK namespace is compared but NEVER enters live
-        /// bindings; the caller's actual partial pin independently attests SCM.
+        /// Factual cleanup channel for the SAME retained NEW SCM origin.
+        /// A published target keeps its exact captured comparison identity while
+        /// staying outside live SDK inputs; the partial pin attests SCM/process.
         pub(crate) fn inspect_partial_closing_bindings<T>(
             &self,
             context: &Context,
@@ -1676,6 +1698,7 @@ pub(crate) mod native {
                 &[ExpectedProvider],
                 &[ClosedMemberBinding],
                 &[crate::member_owner::ServiceDomain],
+                bool,
             ) -> Result<T>,
         ) -> Result<T> {
             self.health.cleanup(|| {
@@ -1698,16 +1721,25 @@ pub(crate) mod native {
                             .partial_closing_bindings_revision(context, runtime, image, partial)
                     },
                     |live| {
-                        let wants = complete_provider_inputs(context, carrier, live)?;
+                        let original = live.iter().find(|p| p.identity.guid == binding.guid);
+                        let others = live
+                            .iter()
+                            .filter(|p| p.identity.guid != binding.guid)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let wants = complete_provider_inputs(context, carrier, &others)?;
                         super::super::member_carrier_provider::native::inspect_mixed_partial(
                             &wants,
                             binding.guid,
                             &binding.name,
                             kind,
+                            original,
                         )
                         .map_err(|_| Error::Pending)
                     },
-                    |live, facts| inspect(live, &facts.history, &facts.service_domains),
+                    |live, facts, present| {
+                        inspect(live, &facts.history, &facts.service_domains, *present)
+                    },
                 )
             })
         }
@@ -1767,7 +1799,7 @@ pub(crate) mod native {
                         }
                         Ok(())
                     },
-                    |live, facts| {
+                    |live, facts, _| {
                         if !live.is_empty() {
                             return Err(Error::Conflict);
                         }
@@ -1807,7 +1839,7 @@ pub(crate) mod native {
                         }
                         Ok(())
                     },
-                    |live, facts| {
+                    |live, facts, _| {
                         if !live.is_empty() {
                             return Err(Error::Conflict);
                         }
@@ -2195,6 +2227,7 @@ pub(crate) mod native {
             let mut members = read_closing_members_with(
                 &self.context,
                 &mut self.entries,
+                None,
                 |source, intent| {
                     if let Some(intent) = intent {
                         self.runtime
@@ -2350,9 +2383,24 @@ pub(crate) mod native {
             }
             let index = pending_index(context, partial.intent())?;
             let entry = self.pending[index].as_ref().ok_or(Error::Pending)?;
-            if self.entries[index].is_some() || entry.captured.is_some() || entry.closed.is_some() {
+            if entry.closed.is_some() {
                 return Err(Error::Conflict);
             }
+            let captured = if let Some(live) = &self.entries[index] {
+                if live.closed.is_some()
+                    || !Rc::ptr_eq(&entry.source, &live.source)
+                    || !entry.original.matches_live(&live.original)
+                    || entry.captured.as_ref().is_some_and(|p| p != &live.provider)
+                {
+                    return Err(Error::Conflict);
+                }
+                Some(live.provider.clone())
+            } else {
+                if entry.captured.is_some() {
+                    return Err(Error::Conflict);
+                }
+                None
+            };
             partial
                 .verify_pending_original(&entry.original)
                 .map_err(|_| Error::Conflict)?;
@@ -2363,6 +2411,7 @@ pub(crate) mod native {
             let mut live = read_closing_members_with(
                 context,
                 &mut self.entries,
+                captured.as_ref().map(|_| index),
                 |source, intent| match intent {
                     Some(intent) => self.runtime.verify_member_intent(context, source, intent),
                     None => self.runtime.verify_member_source(context, source),
@@ -2375,10 +2424,13 @@ pub(crate) mod native {
                 context,
                 &mut self.pending,
                 registered,
-                (true, false, Some(index)),
+                (true, false, captured.is_none().then_some(index)),
                 |source, intent| self.runtime.verify_member_intent(context, source, intent),
                 |source, proof| native_identity(proof, source.transport()),
             )?);
+            if let Some(captured) = captured {
+                live.push(captured);
+            }
             let history = read_mixed_closed_bindings(
                 context,
                 &mut self.entries,
@@ -2438,7 +2490,7 @@ pub(crate) mod native {
                         .map(|_| ())
                         .map_err(|_| Error::Pending)
                 },
-                |live, facts| inspect(live, &facts.history, &facts.service_domains),
+                |live, facts, _| inspect(live, &facts.history, &facts.service_domains),
             )
         }
 

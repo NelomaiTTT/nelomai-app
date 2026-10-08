@@ -1096,12 +1096,14 @@ fn inspect_mixed_queries(
 /// Cleanup-only namespace comparison. A partial original SCM owner supplies
 /// its immutable binding separately; SDK facts here can never become an
 /// ExpectedProvider returned to the caller or an ownership/lifecycle grant.
+/// Only stable factual presence is returned, with full pre/post SDK reads.
 fn inspect_mixed_partial_queries(
     wants: &[ExpectedProvider],
     target: &AbsenceTarget,
     kind: ProviderKind,
+    original: Option<&ExpectedProvider>,
     query: &mut impl Queries,
-) -> Result<()> {
+) -> Result<bool> {
     validate_target_parts(target.guid, &target.name)?;
     if wants.len() > 2
         || wants.iter().any(|w| {
@@ -1110,6 +1112,11 @@ fn inspect_mixed_partial_queries(
     {
         return Err(Error::Conflict("partial namespace aliases original"));
     }
+    if original.is_some_and(|p| {
+        p.kind != kind || p.identity.guid != target.guid || p.identity.name != target.name
+    }) {
+        return Err(Error::Conflict("partial original binding"));
+    }
     let select = |rows: &[Interface]| -> Result<Option<ExpectedProvider>> {
         validate_table(rows)?;
         let candidates = rows
@@ -1117,6 +1124,10 @@ fn inspect_mixed_partial_queries(
             .filter(|row| {
                 row.identity.guid == target.guid
                     || row.identity.name.eq_ignore_ascii_case(&target.name)
+                    || original.is_some_and(|p| {
+                        row.identity.index == p.identity.index
+                            || row.identity.luid == p.identity.luid
+                    })
             })
             .collect::<Vec<_>>();
         if candidates.len() > 1 {
@@ -1130,10 +1141,14 @@ fn inspect_mixed_partial_queries(
         }
         validate_expected(&row.identity)?;
         validate_row(&row.identity, row)?;
-        Ok(Some(ExpectedProvider {
+        let candidate = ExpectedProvider {
             identity: row.identity.clone(),
             kind,
-        }))
+        };
+        if original.is_some_and(|p| p != &candidate) {
+            return Err(Error::Conflict("partial original changed"));
+        }
+        Ok(Some(candidate))
     };
     let observed = select(&query.table()?)?;
     if let Some(partial) = &observed {
@@ -1150,7 +1165,7 @@ fn inspect_mixed_partial_queries(
     if select(&query.table()?)? != observed {
         return Err(Error::Changed);
     }
-    Ok(())
+    Ok(observed.is_some())
 }
 fn inspect_all_queries(wants: &[Expected], query: &mut impl Queries) -> Result<Vec<Observation>> {
     if wants.len() > 3 {
@@ -1288,7 +1303,8 @@ pub(crate) mod native {
         guid: [u8; 16],
         name: &str,
         kind: ProviderKind,
-    ) -> Result<()> {
+        original: Option<&ExpectedProvider>,
+    ) -> Result<bool> {
         inspect_mixed_partial_queries(
             wants,
             &AbsenceTarget {
@@ -1296,6 +1312,7 @@ pub(crate) mod native {
                 name: name.into(),
             },
             kind,
+            original,
             &mut NativeQueries,
         )
     }
@@ -1488,7 +1505,7 @@ pub(crate) mod native {
             devices: vec![],
         })
     }
-    fn table() -> Result<Vec<Interface>> {
+    pub(crate) fn table() -> Result<Vec<Interface>> {
         let mut table = Table(ptr::null_mut());
         status("GetIfTable2", unsafe { GetIfTable2(&mut table.0) })?;
         if table.0.is_null() {

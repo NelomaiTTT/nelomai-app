@@ -1158,6 +1158,43 @@ fn retiring_member_rows_require_stopped_original_ack_and_still_live_sdk() {
         ResourceRowChannel::Retiring
     )
     .is_err());
+    // SAME partial Delete/process ACK + SDK absence is supplied by the native
+    // Closing window; comparison still requires original Stopped row ACK.
+    assert!(compare_resource_rows(
+        &context,
+        &identity,
+        &ack.binding,
+        &ack,
+        &ack,
+        None,
+        ResourceRowChannel::Closing
+    )
+    .is_ok());
+    for fault in 0..5 {
+        let mut changed = ack.clone();
+        let mut protected = ack.clone();
+        let mut target = identity.clone();
+        match fault {
+            0 => changed.phase = rows::Phase::Closing,
+            1 => changed.current.interface.policy.weak_host_send = true,
+            2 => protected.current.interface.policy.weak_host_receive = true,
+            3 => target.proof.index += 1,
+            _ => target.proof.luid += 1,
+        }
+        assert!(
+            compare_resource_rows(
+                &context,
+                &target,
+                &changed.binding,
+                &changed,
+                &protected,
+                None,
+                ResourceRowChannel::Closing
+            )
+            .is_err(),
+            "partial row fault {fault}"
+        );
+    }
 }
 
 #[test]

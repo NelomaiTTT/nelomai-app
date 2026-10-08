@@ -1147,7 +1147,7 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
             0 => wrong.phase = pair::Phase::Starting,
             1 => wrong.stop_stage = 5,
             2 => wrong.pending = Some(pair::Effect::MemberStop(Slot::B)),
-            3 => wrong.members[0].as_mut().unwrap().owner.proof = Some(proof(0)),
+            3 => wrong.members[0] = None,
             4 => wrong.provenance.network_epoch += 1,
             5 => wrong.scope.runtime_generation += 1,
             6 => {
@@ -1200,7 +1200,10 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
     published.members[0].as_mut().unwrap().owner.proof = Some(proof(0));
     published.validate().unwrap();
     assert_eq!(stage(&context, &published, &intent, true), Ok(Use::Stop));
-    assert!(service_stop_stage(&context, &published, &intent).is_err());
+    assert_eq!(
+        service_stop_stage(&context, &published, &intent),
+        Ok(Use::ServiceStop(0))
+    );
     service_window_usage(Use::Stop, false).unwrap();
     guard(&published, Use::Stop, &published.guard.expected).unwrap();
     original_bindings(
