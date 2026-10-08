@@ -589,7 +589,17 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             if std::time::Instant::now() >= deadline {
                 return Err(OwnerError::Pending);
             }
-            let before = self.inspect_partial_cleanup(pin)?;
+            let before = match self.inspect_partial_cleanup(pin) {
+                Err(OwnerError::Pending) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(OwnerError::Pending);
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
+                    continue;
+                }
+                result => result?,
+            };
             if !before.service_deleted() || before.process.is_none() {
                 return Err(OwnerError::Pending);
             }

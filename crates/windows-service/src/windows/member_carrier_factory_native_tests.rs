@@ -327,6 +327,12 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             "empty child selection at {case}"
         );
         if case == "absence-table-error" {
+            for marker in [
+                "actual native original full-mask 15 capture SACL audit ACE count 1",
+                "actual native SACL original disposition and close absence ACK",
+            ] {
+                assert!(stderr.contains(marker), "missing {marker}: {stderr}");
+            }
             assert!(
                 stderr.contains("actual native surviving original key disposition ACK"),
                 "surviving original key disposition was not acknowledged: {stderr}"

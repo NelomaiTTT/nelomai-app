@@ -1005,6 +1005,16 @@ impl<H> OriginalKeyRootObligation<H> {
         {
             return Err(Error::Pending);
         }
+        #[cfg(all(windows, test))]
+        if std::env::var("NELOMAI_FACTORY_OS_CASE").as_deref() == Ok("absence-table-error") {
+            self.owned_disposition
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .ok_or(Error::Pending)?
+                .verify_complete(&self.origin)?;
+            eprintln!("actual native SACL original disposition and close absence ACK");
+        }
         Ok(())
     }
     pub(crate) fn sdk_deleted_read(&self) -> Result<Rc<OriginalSdkDeletedKeyRead>> {
@@ -2531,10 +2541,62 @@ pub(crate) mod win32 {
             h: &Handle,
             capture: &registry_metadata::RegistryMetadataCapture,
         ) -> Result<()> {
+            #[cfg(test)]
+            let audit_fixture =
+                std::env::var("NELOMAI_FACTORY_OS_CASE").as_deref() == Ok("absence-table-error");
+            #[cfg(test)]
+            if audit_fixture {
+                use windows_sys::Win32::{
+                    Foundation::LocalFree,
+                    Security::{
+                        Authorization::{
+                            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+                        },
+                        SACL_SECURITY_INFORMATION,
+                    },
+                };
+                // Caller already rooted this CREATED_NEW original before capture.
+                let raw = h.raw()?;
+                let sddl = wide("S:(AU;SAFA;KA;;;SY)")?;
+                let mut descriptor = ptr::null_mut();
+                if unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(Error::Native);
+                }
+                let code = unsafe { RegSetKeySecurity(raw, SACL_SECURITY_INFORMATION, descriptor) };
+                unsafe {
+                    LocalFree(descriptor);
+                }
+                status(code)?;
+            }
             self.original_key_metadata(h, capture)?;
             let data = capture.present_data().map_err(|_| Error::Pending)?;
             if !data.info.class.is_empty() || data.info.values != 0 || data.info.subkeys != 0 {
                 return Err(Error::Conflict);
+            }
+            #[cfg(test)]
+            if audit_fixture {
+                let registry_metadata::Acl::Present(sacl) = data.security.layout.sacl else {
+                    return Err(Error::Conflict);
+                };
+                let acl = data
+                    .security
+                    .raw
+                    .get(sacl.offset..sacl.offset + sacl.length)
+                    .ok_or(Error::Conflict)?;
+                assert_eq!(
+                    acl.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])),
+                    Some(1)
+                );
+                assert_eq!(acl.get(8).copied(), Some(2)); // SYSTEM_AUDIT_ACE_TYPE.
+                eprintln!("actual native original full-mask 15 capture SACL audit ACE count 1");
             }
             Ok(())
         }
