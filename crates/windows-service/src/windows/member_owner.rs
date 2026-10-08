@@ -584,15 +584,35 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
         let path = &self.config_path;
         pin.stop_delete(&mut NativeOriginalCalls { files: None }, || {
             files.read_digest(path)
+        })
+        .inspect_err(|_error| {
+            #[cfg(all(windows, test))]
+            eprintln!("actual original partial Stop/Delete before rundown: {_error:?}");
         })?;
+        #[cfg(all(windows, test))]
+        let mut last_pending_reason = "stop_delete_budget";
+        #[cfg(all(windows, test))]
+        let mut last_pending_rows: Option<(
+            Option<InterfaceProof>,
+            Option<InterfaceProof>,
+        )> = None;
         loop {
             if std::time::Instant::now() >= deadline {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
                 return Err(OwnerError::Pending);
             }
             let before = match self.inspect_partial_cleanup(pin) {
                 Err(OwnerError::Pending) => {
+                    #[cfg(all(windows, test))]
+                    {
+                        last_pending_reason = "original_process";
+                        last_pending_rows = None;
+                    }
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
+                        #[cfg(all(windows, test))]
+                        eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
                         return Err(OwnerError::Pending);
                     }
                     std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
@@ -601,6 +621,8 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
                 result => result?,
             };
             if !before.service_deleted() || before.process.is_none() {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial rundown Pending reason=original_ack service_deleted={} process={:?}", before.service_deleted(), before.process);
                 return Err(OwnerError::Pending);
             }
             if retained.is_some_and(|proof| before.process != Some(proof.process)) {
@@ -624,8 +646,23 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             {
                 return Err(OwnerError::Conflict);
             }
+            #[cfg(all(windows, test))]
+            {
+                last_pending_reason =
+                    if actual.interface.is_none() && actual.retained_interfaces.is_empty() {
+                        "absence_postflight_budget"
+                    } else {
+                        "exact_mib"
+                    };
+                last_pending_rows = Some((
+                    actual.interface,
+                    actual.retained_interfaces.first().copied(),
+                ));
+            }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
+                #[cfg(all(windows, test))]
+                eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
                 return Err(OwnerError::Pending);
             }
             if actual.interface.is_none() && actual.retained_interfaces.is_empty() {
