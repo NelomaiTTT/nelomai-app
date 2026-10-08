@@ -819,7 +819,9 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         }
         result
     }
-    fn read_live<T>(&self, read: impl FnOnce(&mut I) -> io::Result<T>) -> io::Result<T> {
+    /// Authenticate the current original data/clone read. Protected use and
+    /// mutations independently require the complete live resource graph.
+    fn read_original<T>(&self, read: impl FnOnce(&mut I) -> io::Result<T>) -> io::Result<T> {
         self.check_live(&self.record.scope, self.fence())?;
         let mut flight = ReadFlight {
             faulted: self.faulted.clone(),
@@ -829,25 +831,7 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             self.require_current()?;
             let value = {
                 let mut io = self.io.try_borrow_mut().map_err(|_| failed())?;
-                let verify = |io: &mut I| -> io::Result<()> {
-                    if io.guard_snapshot(&self.record.scope)? != self.record.guard.expected {
-                        return Err(failed());
-                    }
-                    io.verify_carrier_ready(&self.record)?;
-                    for slot in [Slot::A, Slot::B] {
-                        if self.record.members[idx(slot)].is_some() {
-                            io.verify_member(&self.record, slot)?;
-                        }
-                    }
-                    io.verify_network_and_endpoints(
-                        &self.record,
-                        self.record.active.ok_or_else(failed)?,
-                    )
-                };
-                verify(&mut io)?;
-                let value = read(&mut io)?;
-                verify(&mut io)?;
-                value
+                read(&mut io)?
             };
             self.require_current()?;
             if self.faulted.get() {
@@ -858,6 +842,29 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
         let result = self.outcome(result);
         flight.finished = result.is_ok();
         result
+    }
+    fn read_live<T>(&self, read: impl FnOnce(&mut I) -> io::Result<T>) -> io::Result<T> {
+        self.read_original(|io| {
+            let verify = |io: &mut I| -> io::Result<()> {
+                if io.guard_snapshot(&self.record.scope)? != self.record.guard.expected {
+                    return Err(failed());
+                }
+                io.verify_carrier_ready(&self.record)?;
+                for slot in [Slot::A, Slot::B] {
+                    if self.record.members[idx(slot)].is_some() {
+                        io.verify_member(&self.record, slot)?;
+                    }
+                }
+                io.verify_network_and_endpoints(
+                    &self.record,
+                    self.record.active.ok_or_else(failed)?,
+                )
+            };
+            verify(io)?;
+            let value = read(io)?;
+            verify(io)?;
+            Ok(value)
+        })
     }
     pub(crate) fn start(
         &mut self,
@@ -1770,11 +1777,11 @@ impl<I: CarrierPairIo, J: PairJournal> NativePair for CarrierNativePair<I, J> {
     }
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
         self.record.members[idx(slot)].as_ref()?;
-        self.read_live(|io| io.observe(&self.record, slot).map(|(_, s)| s))
+        self.read_original(|io| io.observe(&self.record, slot).map(|(_, s)| s))
             .ok()
     }
     fn open_probe(&mut self, slot: Slot) -> io::Result<(Self::Socket, String)> {
-        self.read_live(|io| {
+        self.read_original(|io| {
             let member = self.record.members[idx(slot)].as_ref().ok_or_else(failed)?;
             let socket = self.sockets[idx(slot)].as_ref().ok_or_else(failed)?;
             io.verify_held_probe(
@@ -1862,7 +1869,7 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
         if self.record.active != Some(slot) {
             return Err(failed());
         }
-        self.read_live(|io| io.observe(&self.record, slot).map(|(m, _)| m))
+        self.read_original(|io| io.observe(&self.record, slot).map(|(m, _)| m))
     }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
         self.read_live(|io| io.fingerprint(&self.record))

@@ -251,6 +251,21 @@ impl Io {
         let mut s = self.0.borrow_mut();
         s.events.push(name.into());
         *s.counts.entry(name.into()).or_default() += 1;
+        if s.fail
+            .as_ref()
+            .is_some_and(|(n, _)| n == &format!("{name}-unwind"))
+        {
+            s.fail = None;
+            drop(s);
+            panic!("original read interrupted at {name}");
+        }
+        if s.fail
+            .as_ref()
+            .is_some_and(|(n, _)| n == &format!("{name}-post-current"))
+        {
+            s.fail = None;
+            s.disk.as_mut().unwrap().revision += 1;
+        }
         let fault = s.fail.as_ref().filter(|(n, _)| n == name).cloned();
         if fault.as_ref().is_none_or(|(_, lost)| *lost) {
             apply(&mut s)
@@ -3359,44 +3374,139 @@ fn different_native_backends_share_logical_network_without_recreating_c() {
 
 #[test]
 fn every_live_read_failure_irrevocably_fences_forward_operations() {
-    for operation in ["metrics", "fingerprint", "open-probe"] {
-        let (mut p, s) = running();
-        let fault = match operation {
-            "metrics" => "observe",
-            "fingerprint" => "fingerprint",
-            _ => "held-proof",
-        };
-        s.borrow_mut().fail = Some((fault.into(), false));
-        let result = match operation {
-            "metrics" => p.metrics(Slot::A).map(|_| ()),
-            "fingerprint" => p.physical_network_fingerprint().map(|_| ()),
-            _ => p.open_probe(Slot::A).map(|_| ()),
-        };
-        assert!(result.is_err(), "{operation}");
-        assert!(p.cleanup_pending(), "{operation}");
-        let before = s.borrow().events.len();
-        assert!(p.sample(Slot::A).is_none(), "{operation}");
-        assert!(p.metrics(Slot::A).is_err(), "{operation}");
-        assert!(p.physical_network_fingerprint().is_err(), "{operation}");
-        assert_eq!(s.borrow().events.len(), before, "{operation}");
-        p.stop(&scope()).unwrap();
+    // An unrelated aggregate failure does not authorize use, but must not turn
+    // authenticated own-original data/clone reads into full graph traversals.
+    for operation in ["sample", "metrics", "open-probe"] {
+        for aggregate in ["snapshot", "ready", "verify-member-B", "endpoints"] {
+            let (mut p, s) = attached();
+            p.complete_start(&scope()).unwrap();
+            s.borrow_mut().fail = Some((aggregate.into(), false));
+            let before = s.borrow().events.len();
+            match operation {
+                "sample" => assert!(p.sample(Slot::A).is_some()),
+                "metrics" => assert!(p.metrics(Slot::A).is_ok()),
+                _ => assert!(p.open_probe(Slot::A).is_ok()),
+            }
+            assert!(!p.cleanup_pending());
+            let events = s.borrow().events[before..].to_vec();
+            assert_eq!(
+                events,
+                [if operation == "open-probe" {
+                    "held-proof"
+                } else {
+                    "observe"
+                }]
+            );
+            assert_eq!(s.borrow().fail.as_ref().unwrap().0, aggregate);
+            assert!(p.check_integrity().is_err());
+            assert!(p.cleanup_pending());
+            p.stop(&scope()).unwrap();
+        }
+    }
+    for operation in ["integrity", "fingerprint", "switch"] {
+        for aggregate in ["snapshot", "ready", "verify-member-B", "endpoints"] {
+            let (mut p, s) = attached();
+            p.complete_start(&scope()).unwrap();
+            s.borrow_mut().fail = Some((aggregate.into(), false));
+            let result = match operation {
+                "integrity" => p.check_integrity(),
+                "fingerprint" => p.physical_network_fingerprint().map(|_| ()),
+                _ => p.switch(&scope(), p.fence(), Slot::B),
+            };
+            assert!(result.is_err(), "{operation} {aggregate}");
+            assert!(p.cleanup_pending());
+            assert_eq!(p.snapshot().active, Some(Slot::A));
+            assert_eq!(s.borrow().counts.get("target-health"), None);
+            p.stop(&scope()).unwrap();
+        }
+    }
+    for operation in ["sample", "metrics", "fingerprint", "open-probe"] {
+        for unwind in [false, true] {
+            let (mut p, s) = running();
+            p.complete_start(&scope()).unwrap();
+            let fault = match operation {
+                "sample" | "metrics" => "observe",
+                "fingerprint" => "fingerprint",
+                _ => "held-proof",
+            };
+            s.borrow_mut().fail = Some((
+                if unwind {
+                    format!("{fault}-unwind")
+                } else {
+                    fault.into()
+                },
+                false,
+            ));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match operation {
+                    "sample" => p.sample(Slot::A).map(|_| ()).ok_or_else(failed),
+                    "metrics" => p.metrics(Slot::A).map(|_| ()),
+                    "fingerprint" => p.physical_network_fingerprint().map(|_| ()),
+                    _ => p.open_probe(Slot::A).map(|_| ()),
+                }));
+            if unwind {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert!(p.cleanup_pending(), "{operation}");
+            let before = s.borrow().events.len();
+            assert!(p.sample(Slot::A).is_none(), "{operation}");
+            assert!(p.metrics(Slot::A).is_err(), "{operation}");
+            assert!(p.open_probe(Slot::A).is_err(), "{operation}");
+            assert!(p.physical_network_fingerprint().is_err(), "{operation}");
+            assert_eq!(s.borrow().events.len(), before, "{operation}");
+            assert_eq!(s.borrow().held, 1);
+            p.stop(&scope()).unwrap();
+        }
     }
 }
 
 #[test]
 fn metrics_and_fingerprint_reject_changed_protected_pair_before_native_reads() {
-    for fingerprint in [false, true] {
-        let (p, s) = running();
-        s.borrow_mut().disk.as_mut().unwrap().revision += 1;
-        let before = s.borrow().events.len();
-        let result = if fingerprint {
-            p.physical_network_fingerprint().map(|_| ())
-        } else {
-            p.metrics(Slot::A).map(|_| ())
-        };
-        assert!(result.is_err());
-        assert!(p.cleanup_pending());
-        assert_eq!(s.borrow().events.len(), before);
+    for operation in ["sample", "metrics", "fingerprint", "open-probe"] {
+        for current in ["changed", "absent", "unknown", "post-current"] {
+            let (mut p, s) = running();
+            p.complete_start(&scope()).unwrap();
+            let original = s.borrow().disk.clone();
+            match current {
+                "changed" => s.borrow_mut().disk.as_mut().unwrap().revision += 1,
+                "absent" => s.borrow_mut().disk = None,
+                "unknown" => s.borrow_mut().require_cleanup_entry = true,
+                _ => {
+                    s.borrow_mut().fail = Some((
+                        format!(
+                            "{}-post-current",
+                            match operation {
+                                "sample" | "metrics" => "observe",
+                                "fingerprint" => "fingerprint",
+                                _ => "held-proof",
+                            }
+                        ),
+                        false,
+                    ))
+                }
+            }
+            let before = s.borrow().events.len();
+            let result = match operation {
+                "sample" => p.sample(Slot::A).map(|_| ()).ok_or_else(failed),
+                "metrics" => p.metrics(Slot::A).map(|_| ()),
+                "fingerprint" => p.physical_network_fingerprint().map(|_| ()),
+                _ => p.open_probe(Slot::A).map(|_| ()),
+            };
+            assert!(result.is_err(), "{operation} {current}");
+            assert!(p.cleanup_pending());
+            if current != "post-current" {
+                assert_eq!(s.borrow().events.len(), before);
+            }
+            s.borrow_mut().disk = original;
+            s.borrow_mut().require_cleanup_entry = false;
+            let after = s.borrow().events.len();
+            assert!(p.metrics(Slot::A).is_err());
+            assert!(p.open_probe(Slot::A).is_err());
+            assert_eq!(s.borrow().events.len(), after);
+            p.stop(&scope()).unwrap();
+        }
     }
 }
 
