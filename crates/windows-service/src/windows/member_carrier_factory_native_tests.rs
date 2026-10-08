@@ -163,6 +163,80 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             "actual native factory cost case={case} runtime_full_auth_attempts={runtime_auth} source_full_auth_attempts={source_auth} runtime_current_check_attempts={runtime_current_checks} source_current_check_attempts={source_current_checks} installed_lifetime_recheck_attempts={lifetime_rechecks} installed_final_inventory_recheck_attempts={final_inventory_rechecks} elapsed_ms={}",
             elapsed.as_millis()
         );
+        if !timed_out && !status.success() {
+            let proofs = stderr
+                .lines()
+                .filter_map(|line| line.strip_prefix("actual expired Stop comparison_only_proof="))
+                .take(2)
+                .collect::<Vec<_>>();
+            let proof = match proofs.as_slice() {
+                [json] if json.len() <= 256 => {
+                    serde_json::from_str::<crate::member_owner::InterfaceProof>(json)
+                        .ok()
+                        .filter(|p| p.guid != [0; 16] && p.luid != 0 && p.index != 0)
+                }
+                _ => None,
+            };
+            if let Some(proof) = proof {
+                use windows_sys::Win32::NetworkManagement::{
+                    IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+                    Ndis::NET_LUID_LH,
+                };
+                println!("actual post-exit comparison case={case} child_pid={} child_process_exited=true static_wfp=unconfirmed guid={:?} luid={} index={}", child.id(), proof.guid, proof.luid, proof.index);
+                let observing = std::time::Instant::now();
+                for sample in 0..4 {
+                    let due = std::time::Duration::from_secs(sample * 5);
+                    if let Some(wait) = due.checked_sub(observing.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
+                    if observing.elapsed() >= std::time::Duration::from_secs(20) {
+                        break;
+                    }
+                    let mut row = MIB_IF_ROW2 {
+                        InterfaceLuid: NET_LUID_LH { Value: proof.luid },
+                        ..Default::default()
+                    };
+                    let status = unsafe { GetIfEntry2(&mut row) };
+                    if status == 0 {
+                        let guid = crate::windows::member_carrier_guard::key(row.InterfaceGuid).0;
+                        let luid = unsafe { row.InterfaceLuid.Value };
+                        let exact = guid == proof.guid
+                            && luid == proof.luid
+                            && row.InterfaceIndex == proof.index;
+                        println!("actual post-exit entry sample={sample} elapsed_ms={} status={status} guid={guid:?} luid={luid} index={} exact={exact} oper_status={} admin_status={} media_connect_state={} flags={:#04x}", observing.elapsed().as_millis(), row.InterfaceIndex, row.OperStatus, row.AdminStatus, row.MediaConnectState, row.InterfaceAndOperStatusFlags._bitfield);
+                    } else {
+                        println!(
+                            "actual post-exit entry sample={sample} elapsed_ms={} status={status}",
+                            observing.elapsed().as_millis()
+                        );
+                    }
+                    match crate::windows::member_carrier_provider::native::table() {
+                        Ok(rows) => {
+                            let mut exact = 0;
+                            let mut collisions = 0;
+                            for row in rows {
+                                let identity = row.identity;
+                                if identity.guid == proof.guid
+                                    && identity.luid == proof.luid
+                                    && identity.index == proof.index
+                                {
+                                    exact += 1;
+                                } else if identity.guid == proof.guid
+                                    || identity.luid == proof.luid
+                                    || identity.index == proof.index
+                                {
+                                    collisions += 1;
+                                }
+                            }
+                            println!("actual post-exit rundown sample={sample} elapsed_ms={} exact={exact} collisions={collisions}", observing.elapsed().as_millis());
+                        }
+                        Err(error) => println!("actual post-exit rundown sample={sample} elapsed_ms={} error={error:?}", observing.elapsed().as_millis()),
+                    }
+                }
+            } else {
+                println!("actual post-exit comparison case={case} child_process_exited=true proof=missing_invalid_or_ambiguous static_wfp=unconfirmed");
+            }
+        }
         assert!(
             !timed_out,
             "actual native factory {case} exceeded whole-case {case_budget:?}: {stdout} {stderr}"
@@ -649,6 +723,10 @@ fn carrier_factory_actual_cold_child() {
                     _ => None,
                 };
                 if let Some((kind, proof)) = comparison {
+                    eprintln!(
+                        "actual expired Stop comparison_only_proof={}",
+                        serde_json::to_string(&proof).expect("comparison-only interface proof")
+                    );
                     eprintln!("actual expired Stop {kind} observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
                     use windows_sys::Win32::{
                         NetworkManagement::{
