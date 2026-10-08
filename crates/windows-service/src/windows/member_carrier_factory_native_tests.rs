@@ -807,7 +807,16 @@ fn carrier_factory_actual_cold_child() {
                         eprintln!("actual expired Stop {kind} registry value_name index={index} status={status} length={length} name={text:?}");
                     }
                     let observing = std::time::Instant::now();
+                    let mut sample = 0;
                     while observing.elapsed() < std::time::Duration::from_secs(60) {
+                        if sample == 4 {
+                            let result =
+                                crate::windows::member_carrier_factory_test_os::diagnostic_withdraw_original_blocks(&record.scope);
+                            eprintln!("actual expired Stop {kind} WFP-only barrier sample={sample} diagnostic_only=true result={result:?}");
+                            if observing.elapsed() >= std::time::Duration::from_secs(60) {
+                                break;
+                            }
+                        }
                         let mut row = MIB_IF_ROW2 {
                             InterfaceLuid: NET_LUID_LH { Value: proof.luid },
                             ..Default::default()
@@ -858,6 +867,7 @@ fn carrier_factory_actual_cold_child() {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_secs(5));
+                        sample += 1;
                     }
                 }
             }

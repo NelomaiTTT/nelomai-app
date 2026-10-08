@@ -25,6 +25,7 @@ struct Inputs {
     native_fault: Option<(NativePublication, bool)>,
     native_fault_reached: Option<NativePublication>,
     native_originals: Vec<(&'static str, Weak<dyn Any>)>,
+    original_guard: Option<Weak<RefCell<super::member_carrier_pair_io::native::Guard>>>,
     package_source_reads: usize,
     package_paths: Option<[PathBuf; 5]>,
     wireguard_package: Option<([PathBuf; 5], u64)>,
@@ -244,6 +245,32 @@ pub(crate) fn native_original_retained<T: Any>(kind: &'static str, original: &Rc
     if kind == "carrier" {
         trace_step("C native CreateAdapter original ACK retained");
     }
+}
+pub(crate) fn native_guard_retained(
+    original: &Rc<RefCell<super::member_carrier_pair_io::native::Guard>>,
+) {
+    INPUTS.with(|inputs| {
+        if let Some(inputs) = inputs.borrow_mut().as_mut() {
+            inputs.original_guard = Some(Rc::downgrade(original));
+        }
+    });
+}
+pub(crate) fn diagnostic_withdraw_original_blocks(
+    scope: &nelomai_client_tunnel::redundancy::SessionScope,
+) -> crate::member_carrier_guard::Result<usize> {
+    use crate::member_carrier_guard::GuardError;
+    let original = INPUTS.with(|inputs| {
+        inputs
+            .borrow()
+            .as_ref()
+            .and_then(|inputs| inputs.original_guard.as_ref())
+            .and_then(Weak::upgrade)
+            .ok_or(GuardError::Conflict)
+    })?;
+    let mut guard = original
+        .try_borrow_mut()
+        .map_err(|_| GuardError::Conflict)?;
+    guard.diagnostic_withdraw_original_blocks(scope)
 }
 fn require_native_originals(inputs: &Inputs, target: NativePublication) {
     for kind in ["carrier", "member"] {
@@ -547,6 +574,7 @@ impl Fixture {
                 native_fault: None,
                 native_fault_reached: None,
                 native_originals: vec![],
+                original_guard: None,
                 package_source_reads: 0,
                 package_paths: None,
                 wireguard_package: None,
