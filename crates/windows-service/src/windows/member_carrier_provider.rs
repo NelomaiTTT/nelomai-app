@@ -1224,6 +1224,13 @@ fn bind_devices(
         validate_provider_device(want, expected.kind, &matches)?;
         bound.push(Some(matches.remove(0)));
     }
+    #[cfg(all(windows, test))]
+    if let Some(original) = rundown.filter(|original| wants.contains(original)) {
+        eprintln!(
+            "actual native partial rundown target PnP guid={:?} present={}",
+            original.identity.guid, !missing
+        );
+    }
     Ok(bound)
 }
 fn returned_bytes(mut bytes: Vec<u8>, required: u32) -> Result<Vec<u8>> {

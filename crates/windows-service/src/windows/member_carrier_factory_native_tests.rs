@@ -624,13 +624,32 @@ fn carrier_factory_actual_cold_child() {
             }
         }
         if stopped.is_err() && retry_started.elapsed() > std::time::Duration::from_secs(30) {
-            if let Some(record) = fixture.trace_pair_stage().filter(|r| {
-                r.phase == crate::member_carrier_pair::Phase::Closing
-                    && r.stop_stage == 8
-                    && r.pending == Some(crate::member_carrier_pair::Effect::CarrierClose)
-            }) {
-                if let Some(proof) = record.carrier {
-                    eprintln!("actual expired Stop C observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
+            if let Some(record) = fixture
+                .trace_pair_stage()
+                .filter(|r| r.phase == crate::member_carrier_pair::Phase::Closing)
+            {
+                let comparison = match record.pending {
+                    Some(crate::member_carrier_pair::Effect::CarrierClose)
+                        if record.stop_stage == 8 =>
+                    {
+                        record.carrier.map(|proof| ("C", proof))
+                    }
+                    Some(crate::member_carrier_pair::Effect::MemberStop(slot))
+                        if record.stop_stage == 4 + u8::from(slot == Slot::B) =>
+                    {
+                        let kind = match slot {
+                            Slot::A => "member A",
+                            Slot::B => "member B",
+                        };
+                        record.members[usize::from(slot == Slot::B)]
+                            .as_ref()
+                            .and_then(|member| member.owner.proof.or(member.owner.retired_proof))
+                            .map(|proof| (kind, proof.interface))
+                    }
+                    _ => None,
+                };
+                if let Some((kind, proof)) = comparison {
+                    eprintln!("actual expired Stop {kind} observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
                     use windows_sys::Win32::{
                         NetworkManagement::{
                             IpHelper::{GetIfEntry2, MIB_IF_ROW2},
@@ -700,14 +719,14 @@ fn carrier_factory_actual_cold_child() {
                         }
                         closed = Some(unsafe { RegCloseKey(key) });
                     }
-                    eprintln!("actual expired Stop C registry by_name_only=true original_handle=unavailable open_status={opened} info_status={info:?} subkeys={subkeys} values={values} names_truncated={} close_status={closed:?}", values > 16);
+                    eprintln!("actual expired Stop {kind} registry by_name_only=true original_handle=unavailable open_status={opened} info_status={info:?} subkeys={subkeys} values={values} names_truncated={} close_status={closed:?}", values > 16);
                     for (index, status, length, name) in names {
                         let text = if status == 0 && (length as usize) <= name.len() {
                             Some(String::from_utf16_lossy(&name[..length as usize]))
                         } else {
                             None
                         };
-                        eprintln!("actual expired Stop C registry value_name index={index} status={status} length={length} name={text:?}");
+                        eprintln!("actual expired Stop {kind} registry value_name index={index} status={status} length={length} name={text:?}");
                     }
                     let observing = std::time::Instant::now();
                     while observing.elapsed() < std::time::Duration::from_secs(60) {
@@ -723,10 +742,10 @@ fn carrier_factory_actual_cold_child() {
                             let exact = actual_guid == proof.guid
                                 && actual_luid == proof.luid
                                 && row.InterfaceIndex == proof.index;
-                            eprintln!("actual expired Stop C entry elapsed_ms={} status={status} guid={actual_guid:?} luid={actual_luid} index={} exact={exact} oper_status={} admin_status={} media_connect_state={} flags={:#04x}", observing.elapsed().as_millis(), row.InterfaceIndex, row.OperStatus, row.AdminStatus, row.MediaConnectState, row.InterfaceAndOperStatusFlags._bitfield);
+                            eprintln!("actual expired Stop {kind} entry elapsed_ms={} status={status} guid={actual_guid:?} luid={actual_luid} index={} exact={exact} oper_status={} admin_status={} media_connect_state={} flags={:#04x}", observing.elapsed().as_millis(), row.InterfaceIndex, row.OperStatus, row.AdminStatus, row.MediaConnectState, row.InterfaceAndOperStatusFlags._bitfield);
                         } else {
                             eprintln!(
-                                "actual expired Stop C entry elapsed_ms={} status={status}",
+                                "actual expired Stop {kind} entry elapsed_ms={} status={status}",
                                 observing.elapsed().as_millis()
                             );
                         }
@@ -748,10 +767,10 @@ fn carrier_factory_actual_cold_child() {
                                             && r.identity.index == proof.index
                                     })
                                     .count();
-                                eprintln!("actual expired Stop C rundown elapsed_ms={} exact={} collisions={}", observing.elapsed().as_millis(), exact, matches.len() - exact);
+                                eprintln!("actual expired Stop {kind} rundown elapsed_ms={} exact={} collisions={}", observing.elapsed().as_millis(), exact, matches.len() - exact);
                             }
                             Err(error) => eprintln!(
-                                "actual expired Stop C rundown elapsed_ms={} error={error:?}",
+                                "actual expired Stop {kind} rundown elapsed_ms={} error={error:?}",
                                 observing.elapsed().as_millis()
                             ),
                         }
@@ -894,8 +913,11 @@ fn carrier_factory_actual_cold_child() {
             }
             Err(_) => {
                 assert!(original.snapshot().cleanup_pending);
-                if let Some((target, _)) = native_partial {
-                    fixture.require_native_publication_fault(target, true);
+                if let Some((target, unwind)) = native_partial {
+                    fixture.require_native_publication_fault(
+                        target,
+                        unwind || original.snapshot().session.phase != SessionPhase::Stopped,
+                    );
                 }
                 // Unknown native/record ACK remains with the original owner.
                 // Process exit is not an invented successful disposition.
