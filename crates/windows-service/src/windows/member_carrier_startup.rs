@@ -5550,6 +5550,7 @@ pub(crate) mod native {
             run_live_preparation(&state, || {
                 supervisor.run(&context, || {
                     self.continuity_runtime(original, current)?;
+                    (preparation.before_preparation)()?;
                     if self.lock.is_some()
                         || !self.runtime.matches_lock(preparation.lock)
                         || self.proof.is_none()
@@ -5582,7 +5583,7 @@ pub(crate) mod native {
                     let never = input.never_effects.clone();
                     let replacement = preparation.controller.is_some();
                     let mut slots = (self, preparation);
-                    prepare_live_generation(
+                    let prepared = prepare_live_generation(
                         &mut slots,
                         replacement,
                         |(startup, preparation)| {
@@ -5630,7 +5631,12 @@ pub(crate) mod native {
                             startup.continuity_runtime(original, current)?;
                             Ok(record)
                         },
-                    )
+                    )?;
+                    if replacement && slots.1.controller.is_some() {
+                        return Err(Error::Conflict);
+                    }
+                    (slots.1.after_preparation)()?;
+                    Ok(prepared)
                 })
             })
         }

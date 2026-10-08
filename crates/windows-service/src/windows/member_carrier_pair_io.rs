@@ -2271,7 +2271,9 @@ pub(crate) mod native {
         /// verify_live_attach_proposal; Fresh-only verification is not valid.
         pub other: &'s mut Option<Controller>,
         pub source: &'s Rc<NativeSourceRead>,
+        pub before_preparation: &'s mut (dyn FnMut() -> crate::member_carrier::Result<()> + 's),
         pub after_ticket: &'s mut NativeAfterGenerationTicket<'s>,
+        pub after_preparation: &'s mut (dyn FnMut() -> crate::member_carrier::Result<()> + 's),
     }
 
     /// # Safety
@@ -4894,9 +4896,6 @@ pub(crate) mod native {
                     .load(&record.scope)?
                     .ok_or_else(conflict)?;
                 let pin = self.current(&actual)?;
-                if self.roots.is_some() {
-                    self.select_guard(&pin, &actual)?;
-                }
                 let startup = self.startup.clone().ok_or_else(conflict)?;
                 let mut startup = startup.try_borrow_mut().map_err(denied)?;
                 if let Some(r) = self.roots.as_mut() {
@@ -4916,6 +4915,76 @@ pub(crate) mod native {
                     };
                     let invoked = Cell::new(false);
                     let completed = Cell::new(false);
+                    let attestor = r.attestor.clone();
+                    let guard_resources = r.guard_resources.clone();
+                    let mut before_preparation = || {
+                        attestor
+                            .select(pin.clone(), actual.clone())
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!("select_guard attestor: {_error:?}"));
+                            })
+                            .map_err(|error| carrier_denied(denied(error)))?;
+                        guard_resources
+                            .select(pin.clone(), actual.clone())
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                trace_step(&format!("select_guard resources: {_error:?}"));
+                            })
+                            .map_err(|error| carrier_denied(denied(error)))?;
+                        Ok(())
+                    };
+                    let probe_state = r.probe_state.clone();
+                    let sockets = self.socket_context.clone();
+                    let held = &mut self.held[i];
+                    let held_read = &mut self.held_reads[i];
+                    let member_gate = &mut r.member_gates[i];
+                    let mut after_preparation = || {
+                        (|| -> io::Result<()> {
+                            if replacement != invoked.get() || replacement != completed.get() {
+                                return Err(conflict()); // No delegate can skip actual projection.
+                            }
+                            if replacement {
+                                let original = held.as_ref().ok_or_else(conflict)?;
+                                let read = held_read.as_ref().ok_or_else(conflict)?;
+                                if !original
+                                    .try_borrow()
+                                    .map_err(denied)?
+                                    .read_pin()
+                                    .same_original(read)
+                                {
+                                    return Err(conflict());
+                                }
+                                let retired = read.retired().map_err(denied)?;
+                                let sockets = sockets.as_ref().ok_or_else(conflict)?;
+                                let mut issued = sockets.issued.try_borrow_mut().map_err(denied)?;
+                                for token in issued
+                                    .iter()
+                                    .filter(|token| Rc::ptr_eq(&token.original, original))
+                                {
+                                    if token.lease.try_borrow().map_err(denied)?.is_some() {
+                                        return Err(conflict());
+                                    }
+                                }
+                                probe_state
+                                    .select(pin.clone(), actual.clone())
+                                    .map_err(denied)?;
+                                probe_state
+                                    .consume_retired_held(member.slot, read, &retired)
+                                    .map_err(denied)?;
+                                // All fallible checks completed; remove only revoked
+                                // tokens belonging to that exact closed original.
+                                issued.retain(|token| !Rc::ptr_eq(&token.original, original));
+                                *held = None;
+                                *held_read = None;
+                                // The retired controller retains its original gate;
+                                // start_member constructs a fresh immutable intent gate.
+                                *member_gate = None;
+                            }
+                            Ok(())
+                        })()
+                        .map_err(carrier_denied)
+                    };
                     let retained = &mut self.member_generation_tickets;
                     let retained_rows = &mut self.row_generation_receipts;
                     let originals = &mut self.member_generation_originals;
@@ -4958,53 +5027,12 @@ pub(crate) mod native {
                                 controller,
                                 other,
                                 source: &r.pins.source,
+                                before_preparation: &mut before_preparation,
                                 after_ticket: &mut after_ticket,
+                                after_preparation: &mut after_preparation,
                             }
                         })
                         .map_err(denied)?;
-                    if replacement != invoked.get() || replacement != completed.get() {
-                        return Err(conflict()); // No delegate can skip actual projection.
-                    }
-                    if replacement {
-                        if r.controllers[i].is_some() {
-                            return Err(conflict());
-                        }
-                        let original = self.held[i].as_ref().ok_or_else(conflict)?;
-                        let read = self.held_reads[i].as_ref().ok_or_else(conflict)?;
-                        if !original
-                            .try_borrow()
-                            .map_err(denied)?
-                            .read_pin()
-                            .same_original(read)
-                        {
-                            return Err(conflict());
-                        }
-                        let retired = read.retired().map_err(denied)?;
-                        let sockets = self.socket_context.as_ref().ok_or_else(conflict)?;
-                        let mut issued = sockets.issued.try_borrow_mut().map_err(denied)?;
-                        for token in issued
-                            .iter()
-                            .filter(|token| Rc::ptr_eq(&token.original, original))
-                        {
-                            if token.lease.try_borrow().map_err(denied)?.is_some() {
-                                return Err(conflict());
-                            }
-                        }
-                        r.probe_state
-                            .select(pin.clone(), actual.clone())
-                            .map_err(denied)?;
-                        r.probe_state
-                            .consume_retired_held(member.slot, read, &retired)
-                            .map_err(denied)?;
-                        // All fallible checks completed; remove only revoked
-                        // token entries belonging to that exact closed original.
-                        issued.retain(|token| !Rc::ptr_eq(&token.original, original));
-                        self.held[i] = None;
-                        self.held_reads[i] = None;
-                        // The retired controller retains its original gate;
-                        // start_member constructs a fresh immutable intent gate.
-                        r.member_gates[i] = None;
-                    }
                     Ok(prepared)
                 } else {
                     #[cfg(test)]

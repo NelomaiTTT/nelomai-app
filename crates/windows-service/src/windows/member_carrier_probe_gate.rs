@@ -1663,9 +1663,7 @@ pub(crate) mod native {
                     || selected.record.pending.is_some()
                     || selected.record.operation.is_some()
                     || selected.record.active == Some(slot)
-                    || selected.record.members[idx(slot)]
-                        .as_ref()
-                        .is_none_or(|m| m.owner.phase != crate::member_owner::Phase::Stopped)
+                    || selected.record.members[idx(slot)].is_some()
                 {
                     return Err(GuardError::Conflict);
                 }
