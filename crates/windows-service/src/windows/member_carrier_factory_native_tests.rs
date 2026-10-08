@@ -622,8 +622,105 @@ fn carrier_factory_actual_cold_child() {
             }) {
                 if let Some(proof) = record.carrier {
                     eprintln!("actual expired Stop C observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
+                    use windows_sys::Win32::{
+                        NetworkManagement::{
+                            IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+                            Ndis::NET_LUID_LH,
+                        },
+                        System::Registry::{
+                            RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW,
+                            HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK,
+                        },
+                    };
+                    // By-name diagnostic only; the retained original HKEY is unavailable here.
+                    let guid = windows_sys::core::GUID::from_u128(u128::from_be_bytes(proof.guid));
+                    let path = format!(
+                        r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+                        guid.data1, guid.data2, guid.data3,
+                        guid.data4[0], guid.data4[1], guid.data4[2], guid.data4[3],
+                        guid.data4[4], guid.data4[5], guid.data4[6], guid.data4[7],
+                    ).encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+                    let mut key = std::ptr::null_mut();
+                    let opened = unsafe {
+                        RegOpenKeyExW(
+                            HKEY_LOCAL_MACHINE,
+                            path.as_ptr(),
+                            REG_OPTION_OPEN_LINK,
+                            KEY_QUERY_VALUE,
+                            &mut key,
+                        )
+                    };
+                    let (mut subkeys, mut values) = (0, 0);
+                    let mut names = Vec::new();
+                    let (mut info, mut closed) = (None, None);
+                    if opened == 0 {
+                        info = Some(unsafe {
+                            RegQueryInfoKeyW(
+                                key,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null(),
+                                &mut subkeys,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                &mut values,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                            )
+                        });
+                        if info == Some(0) {
+                            for index in 0..values.min(16) {
+                                let mut name = [0u16; 512];
+                                let mut length = name.len() as u32;
+                                let status = unsafe {
+                                    RegEnumValueW(
+                                        key,
+                                        index,
+                                        name.as_mut_ptr(),
+                                        &mut length,
+                                        std::ptr::null(),
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                        std::ptr::null_mut(),
+                                    )
+                                };
+                                names.push((index, status, length, name));
+                            }
+                        }
+                        closed = Some(unsafe { RegCloseKey(key) });
+                    }
+                    eprintln!("actual expired Stop C registry by_name_only=true original_handle=unavailable open_status={opened} info_status={info:?} subkeys={subkeys} values={values} names_truncated={} close_status={closed:?}", values > 16);
+                    for (index, status, length, name) in names {
+                        let text = if status == 0 && (length as usize) <= name.len() {
+                            Some(String::from_utf16_lossy(&name[..length as usize]))
+                        } else {
+                            None
+                        };
+                        eprintln!("actual expired Stop C registry value_name index={index} status={status} length={length} name={text:?}");
+                    }
                     let observing = std::time::Instant::now();
                     while observing.elapsed() < std::time::Duration::from_secs(60) {
+                        let mut row = MIB_IF_ROW2 {
+                            InterfaceLuid: NET_LUID_LH { Value: proof.luid },
+                            ..Default::default()
+                        };
+                        let status = unsafe { GetIfEntry2(&mut row) };
+                        if status == 0 {
+                            let actual_guid =
+                                crate::windows::member_carrier_guard::key(row.InterfaceGuid).0;
+                            let actual_luid = unsafe { row.InterfaceLuid.Value };
+                            let exact = actual_guid == proof.guid
+                                && actual_luid == proof.luid
+                                && row.InterfaceIndex == proof.index;
+                            eprintln!("actual expired Stop C entry elapsed_ms={} status={status} guid={actual_guid:?} luid={actual_luid} index={} exact={exact} oper_status={} admin_status={} media_connect_state={} flags={:#04x}", observing.elapsed().as_millis(), row.InterfaceIndex, row.OperStatus, row.AdminStatus, row.MediaConnectState, row.InterfaceAndOperStatusFlags._bitfield);
+                        } else {
+                            eprintln!(
+                                "actual expired Stop C entry elapsed_ms={} status={status}",
+                                observing.elapsed().as_millis()
+                            );
+                        }
                         match crate::windows::member_carrier_provider::native::table() {
                             Ok(rows) => {
                                 let matches = rows

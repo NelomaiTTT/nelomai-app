@@ -303,7 +303,7 @@ pub(crate) mod native {
     #[cfg(all(windows, test))]
     unsafe extern "system" fn native_error_logger(level: i32, timestamp: u64, message: *const u16) {
         let _ = std::panic::catch_unwind(|| {
-            if level != 2 || message.is_null() {
+            if !(0..=2).contains(&level) || message.is_null() {
                 return;
             }
             let mut text = Vec::new();
@@ -316,9 +316,14 @@ pub(crate) mod native {
                 text.push(unit);
             }
             use std::io::Write;
+            let label = match level {
+                0 => "info",
+                1 => "warn",
+                _ => "error",
+            };
             let _ = writeln!(
                 std::io::stderr().lock(),
-                "actual Wintun SDK error timestamp={timestamp}: {}",
+                "actual Wintun SDK {label} timestamp={timestamp}: {}",
                 String::from_utf16_lossy(&text)
             );
         });
