@@ -574,6 +574,105 @@ fn restore_only_closing_three_exact_original_baseline() {
         &ack.current
     )
     .is_err());
+
+    // Running retirement restores only the inactive member's original row;
+    // C and the active sibling keep their ordinary forward read lanes.
+    let (c, mut retire) = fixture();
+    let mut member = retire.members[0].as_ref().unwrap().clone();
+    member.owner.intent.slot = TunnelSlot::B;
+    let proof = member.owner.proof.as_mut().unwrap();
+    proof.interface = owner::InterfaceProof {
+        guid: c.bindings[2].guid,
+        luid: 92,
+        index: 9,
+    };
+    proof.process.pid += 1;
+    retire.members[1] = Some(member);
+    retire.phase = pair::Phase::Running;
+    retire.pending = Some(pair::Effect::RestoreWeak);
+    for (slot, active, role, sibling) in [
+        (Slot::B, Slot::A, rows::Role::MemberB, rows::Role::MemberA),
+        (Slot::A, Slot::B, rows::Role::MemberA, rows::Role::MemberB),
+    ] {
+        retire.active = Some(active);
+        retire.operation = Some(pair::Operation::Retire(slot));
+        retire.validate().unwrap();
+        let mut ack = row_fixture(&c, &retire, role);
+        ack.phase = rows::Phase::Closing;
+        ack.current.interface.policy.weak_host_send = true;
+        ack.current.interface.policy.weak_host_receive = true;
+        let target = rows::Target::Interface(ack.baseline.interface.policy.clone());
+        ack.pending = Some(rows::Pending {
+            before: ack.current.clone(),
+            target: target.clone(),
+        });
+        assert!(
+            compare_row_effect(&c, &retire, &ack.binding, &target, &ack, &ack, &ack.current)
+                .is_ok(),
+            "inactive Running Retire({slot:?}) must restore the SAME Closing original row"
+        );
+        for fault in 0..13 {
+            let mut wrong = retire.clone();
+            match fault {
+                0 => wrong.active = Some(slot),
+                1 => wrong.operation = Some(pair::Operation::Retire(active)),
+                2 => wrong.operation = Some(pair::Operation::Start(slot)),
+                3 => wrong.operation = None,
+                4 => wrong.phase = pair::Phase::Starting,
+                5 => wrong.pending = Some(pair::Effect::WeakRows),
+                6 => wrong.pending = None,
+                7 => wrong.stop_stage = 3,
+                8 => wrong.active = None,
+                9 => wrong.guard.permits = true,
+                10 => wrong.members[role_index(role) - 1] = None,
+                11 => {
+                    let owner = &mut wrong.members[role_index(role) - 1].as_mut().unwrap().owner;
+                    owner.phase = owner::Phase::Stopped;
+                    owner.retired_proof = owner.proof.take();
+                }
+                _ => {
+                    wrong.pending_guard =
+                        Some(policy::ExchangePlan::new(&wrong.guard, &wrong.guard).unwrap());
+                }
+            }
+            assert!(!retiring_member_row(&wrong, ack.binding.role, &target));
+            assert!(
+                compare_row_effect(&c, &wrong, &ack.binding, &target, &ack, &ack, &ack.current)
+                    .is_err(),
+                "retirement fault {fault}"
+            );
+        }
+        for role in [rows::Role::Carrier, sibling] {
+            assert!(compare_row_stage(&c, &retire, role, &target).is_err());
+        }
+        assert!(compare_row_stage(&c, &retire, ack.binding.role, &rows::Target::Delete).is_err());
+        for phase in [rows::Phase::Captured, rows::Phase::Stopped] {
+            let mut wrong = ack.clone();
+            wrong.phase = phase;
+            assert!(compare_row_effect(
+                &c,
+                &retire,
+                &wrong.binding,
+                &target,
+                &wrong,
+                &wrong,
+                &wrong.current
+            )
+            .is_err());
+        }
+        let mut changed = ack.clone();
+        changed.baseline.interface.policy.mtu += 1;
+        assert!(compare_row_effect(
+            &c,
+            &retire,
+            &changed.binding,
+            &target,
+            &changed,
+            &changed,
+            &changed.current
+        )
+        .is_err());
+    }
 }
 // Break: deleting a matching SDK address without the actual original acknowledged creation.
 #[test]

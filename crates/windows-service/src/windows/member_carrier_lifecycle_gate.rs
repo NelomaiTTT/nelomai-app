@@ -117,6 +117,28 @@ fn compare_lifecycle_stage(
         _ => Err(conflict()),
     }
 }
+/// Comparison only for the selected inactive row's cleanup ACK read. Source,
+/// session, registry and sibling rows retain their forward authorization.
+fn retiring_member_row(record: &pair::Record, role: rows::Role, target: &rows::Target) -> bool {
+    let slot = match role {
+        rows::Role::MemberA => nelomai_client_tunnel::redundancy::Slot::A,
+        rows::Role::MemberB => nelomai_client_tunnel::redundancy::Slot::B,
+        rows::Role::Carrier => return false,
+    };
+    record.phase == pair::Phase::Running
+        && record.stop_stage == 0
+        && record.pending == Some(pair::Effect::RestoreWeak)
+        && record.operation == Some(pair::Operation::Retire(slot))
+        && record.active.is_some_and(|active| active != slot)
+        && record.members[role_index(role) - 1]
+            .as_ref()
+            .is_some_and(|member| member.owner.phase == crate::member_owner::Phase::Running)
+        && record.pending_guard.is_none()
+        && !record.guard.permits
+        && record.guard.installed
+        && record.guard.assigned_sublayer_weight.is_some()
+        && matches!(target, rows::Target::Interface(_))
+}
 fn compare_row_stage(
     context: &Context,
     record: &pair::Record,
@@ -140,6 +162,11 @@ fn compare_row_stage(
             Some(pair::Effect::WeakRows),
             rows::Target::Interface(_),
         ) if record.stop_stage == 0 && record.operation.is_some() => Ok(()),
+        (pair::Phase::Running, Some(pair::Effect::RestoreWeak), rows::Target::Interface(_))
+            if retiring_member_row(record, role, target) =>
+        {
+            Ok(())
+        }
         (pair::Phase::Closing, Some(pair::Effect::RestoreWeak), rows::Target::Interface(_))
             if record.stop_stage == 3 && record.active.is_none() && record.operation.is_none() =>
         {
@@ -390,7 +417,13 @@ fn compare_row_effect(
         || ack.baseline.interface.policy.weak_host_send
         || ack.baseline.interface.policy.weak_host_receive
         || (record.phase == pair::Phase::Closing && ack.phase == rows::Phase::Captured)
-        || (record.phase != pair::Phase::Closing && ack.phase != rows::Phase::Captured)
+        || (record.phase != pair::Phase::Closing
+            && ack.phase
+                != if retiring_member_row(record, binding.role, target) {
+                    rows::Phase::Closing
+                } else {
+                    rows::Phase::Captured
+                })
     {
         return Err(conflict());
     }
@@ -2779,17 +2812,22 @@ pub(crate) mod native {
                                 .map_err(native_denied)?;
                         }
                         shared
-                            .row_ack(window, binding.role, cleanup, |ack, actual| {
-                                compare_row_effect(
-                                    &shared.context,
-                                    &record,
-                                    binding,
-                                    target,
-                                    ack,
-                                    ack,
-                                    actual,
-                                )
-                            })
+                            .row_ack(
+                                window,
+                                binding.role,
+                                cleanup || retiring_member_row(&record, binding.role, target),
+                                |ack, actual| {
+                                    compare_row_effect(
+                                        &shared.context,
+                                        &record,
+                                        binding,
+                                        target,
+                                        ack,
+                                        ack,
+                                        actual,
+                                    )
+                                },
+                            )
                             .inspect_err(|_error| {
                                 #[cfg(test)]
                                 trace_step(&format!("lifecycle row row_ack error={_error:?}"));
