@@ -1291,17 +1291,15 @@ pub(crate) mod native {
                 .map_err(denied)?;
             let native = native.ok_or(wintun::Error::Conflict)?;
             let record = receipts::Record::decode(&native).map_err(denied)?;
+            // This original universe brackets SAME members and full mixed SDK
+            // facts. Its validated C prefix leaves no room for a live member.
             let originals = self
-                .members
-                .inspect_closing_full(context, &self.runtime, &self.image, |members| {
-                    if !members.is_empty() {
-                        return Err(Error::Conflict);
-                    }
-                    self.originals
-                        .observe_all_for_cleanup(context)
-                        .map_err(|_| Error::Conflict)
-                })
+                .originals
+                .observe_all_for_cleanup(context)
                 .map_err(denied)?;
+            if originals.complete.len() != originals.originals.len() {
+                return Err(wintun::Error::Conflict);
+            }
             let identities = originals
                 .originals
                 .iter()
