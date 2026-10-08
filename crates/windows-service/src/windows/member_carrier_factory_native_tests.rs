@@ -469,7 +469,16 @@ fn carrier_factory_actual_cold_child() {
             "lost native publication ACK accepted"
         );
         let snapshot = original.snapshot();
-        fixture.require_native_publication_fault(target, snapshot.cleanup_pending);
+        eprintln!(
+            "actual native publication fault {target:?} unwind={unwind} phase={:?} cleanup_pending={}",
+            snapshot.session.phase, snapshot.cleanup_pending
+        );
+        // SAME control reaches Stopped only after actual native terminal close;
+        // aggregate cleanup_pending can still require a protected Session save.
+        fixture.require_native_publication_fault(
+            target,
+            unwind || snapshot.session.phase != SessionPhase::Stopped,
+        );
         if !snapshot.cleanup_pending {
             assert_eq!(
                 snapshot.session.phase,

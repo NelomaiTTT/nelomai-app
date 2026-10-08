@@ -2080,6 +2080,7 @@ impl Drop for ProcessHandle {
 struct OriginBoundary {
     cleanup_state: Option<ServiceCleanupState>,
     image_matches: bool,
+    image_unavailable_after_exit: bool,
     split_start: bool,
     split_fault: u8,
     started_intent: Option<Intent>,
@@ -2112,6 +2113,7 @@ impl OriginBoundary {
         Self {
             cleanup_state: None,
             image_matches: true,
+            image_unavailable_after_exit: false,
             split_start: false,
             split_fault: 0,
             started_intent: None,
@@ -2297,6 +2299,9 @@ impl OriginalServiceCleanupNative for OriginBoundary {
     fn verify_cleanup_process_image(&mut self, process: &ProcessHandle, _: &Intent) -> Result<()> {
         if process.0 != self.process_id || !self.image_matches {
             return Err(OwnerError::Conflict);
+        }
+        if self.image_unavailable_after_exit && self.exit_code != 259 {
+            return Err(OwnerError::Native);
         }
         Ok(())
     }
@@ -2762,23 +2767,46 @@ fn service_only_partial_cleanup_denies_foreign_origin_and_config_without_effects
 fn service_only_partial_cleanup_reconciles_only_actual_delete_ack_without_repeating_effects() {
     let (owner, _) = setup();
     let intent = owner.intent().clone();
-    let mut boundary = OriginBoundary::live();
-    boundary.fail_finish = true;
-    boundary.facts.pid = 0;
-    boundary.exit_code = 0;
-    let mut origin = RetainedMemberOrigin::empty();
-    assert!(origin.start(&mut boundary, &intent).is_err());
-    let pin = origin.partial_cleanup_pin(&intent).unwrap();
-    pin.stop_delete(&mut boundary, || Ok(Some(intent.config_sha256)))
-        .unwrap();
-    let observation = pin
-        .inspect(&mut boundary, || Ok(Some(intent.config_sha256)))
-        .unwrap();
-    assert!(observation.service_deleted());
-    pin.stop_delete(&mut boundary, || Ok(Some(intent.config_sha256)))
-        .unwrap();
-    assert_eq!(boundary.delete_calls, 1);
-    assert_eq!(boundary.service_closes.get(), 1);
+    for lifecycle in 0..3 {
+        let mut boundary = OriginBoundary::live();
+        let mut origin = RetainedMemberOrigin::empty();
+        if lifecycle != 0 {
+            origin
+                .start_retaining_process(&mut boundary, &intent)
+                .unwrap();
+            if lifecycle == 2 {
+                origin
+                    .rebind_original(&mut boundary, &intent, &proof(), || {
+                        Ok(Some(intent.config_sha256))
+                    })
+                    .unwrap();
+                boundary.cleanup_state = Some(ServiceCleanupState::Running);
+            }
+            // The same pin reads the live image before Stop; after exit its
+            // image query can be unavailable before AND after actual Delete ACK.
+            boundary.image_unavailable_after_exit = true;
+        } else {
+            boundary.fail_finish = true;
+            boundary.facts.pid = 0;
+            boundary.exit_code = 0;
+            assert!(origin.start(&mut boundary, &intent).is_err());
+        }
+        let pin = origin.partial_cleanup_pin(&intent).unwrap();
+        pin.stop_delete(&mut boundary, || Ok(Some(intent.config_sha256)))
+            .unwrap();
+        let observation = pin
+            .inspect(&mut boundary, || Ok(Some(intent.config_sha256)))
+            .unwrap();
+        assert!(observation.service_deleted());
+        assert_eq!(
+            observation.process,
+            (lifecycle != 0).then_some(boundary.process)
+        );
+        pin.stop_delete(&mut boundary, || Ok(Some(intent.config_sha256)))
+            .unwrap();
+        assert_eq!(boundary.delete_calls, 1);
+        assert_eq!(boundary.service_closes.get(), 1);
+    }
 }
 
 #[test]
@@ -2805,6 +2833,50 @@ fn service_only_partial_cleanup_closed_ack_never_bypasses_unknown_read() {
         .inspect(&mut boundary, || Ok(Some(intent.config_sha256)))
         .is_err());
     assert_eq!(boundary.delete_calls, 1);
+
+    for cut in 0..7 {
+        let mut boundary = OriginBoundary::live();
+        let mut origin = RetainedMemberOrigin::empty();
+        if cut == 6 {
+            boundary.split_fault = 5; // Birth retained before image acceptance failed.
+            assert!(origin
+                .start_retaining_process(&mut boundary, &intent)
+                .is_err());
+        } else {
+            origin
+                .start_retaining_process(&mut boundary, &intent)
+                .unwrap();
+        }
+        let pin = origin.partial_cleanup_pin(&intent).unwrap();
+        if cut == 1 {
+            boundary.image_matches = false; // Initial live image never authenticated.
+        } else if cut == 0 || cut == 6 {
+            // Captured birth/published proof alone is not this pin's image ACK.
+            boundary.exit_code = 0;
+            boundary.facts.pid = 0;
+            boundary.image_unavailable_after_exit = true;
+        } else {
+            pin.stop_delete(&mut boundary, || Ok(Some(intent.config_sha256)))
+                .unwrap();
+            assert!(boundary.delete_ack);
+            match cut {
+                2 => boundary.process.creation_time += 1,
+                3 => boundary.process.pid += 1,
+                4 => boundary.fail_query = true,
+                5 => boundary.process_id += 1,
+                _ => unreachable!(),
+            }
+            boundary.image_unavailable_after_exit = true;
+        }
+        assert!(pin
+            .inspect(&mut boundary, || Ok(Some(intent.config_sha256)))
+            .is_err());
+        assert_eq!(
+            pin.inspect(&mut boundary, || Ok(Some(intent.config_sha256))),
+            Err(OwnerError::Retired)
+        );
+        assert_eq!(boundary.delete_calls, usize::from((2..6).contains(&cut)));
+    }
 }
 
 #[test]
@@ -3378,6 +3450,7 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
     ] {
         let (mut owner, state) = origin_owner_for(slot, transport);
         owner.io.boundary.split_start = true;
+        owner.io.boundary.image_unavailable_after_exit = true;
         let service_closes = owner.io.boundary.service_closes.clone();
         let mut retained = crate::member_original::RetainedMember::new(owner);
         let pending = retained.pending_read().unwrap();

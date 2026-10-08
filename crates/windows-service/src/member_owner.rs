@@ -271,9 +271,9 @@ impl<S, P> RetainedMemberOrigin<S, P> {
             intent: intent.clone(),
             pinned_pid: state.pinned_pid,
             tainted: self.read_tainted.clone(),
-            process_origin: std::cell::Cell::new(
-                state.proof.map(|p| p.process).or(state.process_birth),
-            ),
+            // This pin's successful image + held-process observation only;
+            // captured Start/rebind birth remains an independent identity fence.
+            process_origin: std::cell::Cell::new(None),
         })
     }
 }
@@ -310,22 +310,31 @@ impl<S, P> OriginalServiceCleanup<S, P> {
                     return Err(OwnerError::Conflict);
                 }
                 if let Some(handle) = &state.process {
-                    boundary
-                        .verify_cleanup_process_image(handle, &self.intent)
-                        .inspect_err(|_error| {
-                            #[cfg(all(windows, test))]
-                            eprintln!("actual original partial process image: {_error:?}");
-                        })?;
                     let (proof, code) = boundary.query_process(handle).inspect_err(|_error| {
                         #[cfg(all(windows, test))]
                         eprintln!("actual original partial process query: {_error:?}");
                     })?;
                     if Some(proof.pid) != self.pinned_pid
                         || proof.creation_time == 0
+                        || state
+                            .proof
+                            .map(|p| p.process)
+                            .or(state.process_birth)
+                            .is_some_and(|p| p != proof)
                         || self.process_origin.get().is_some_and(|p| p != proof)
                         || process.is_some_and(|p| p != proof)
                     {
                         return Err(OwnerError::Conflict);
+                    }
+                    // SAME held-process identity keeps this pin's image
+                    // authentication; exit is freshly queried independently.
+                    if self.process_origin.get() != Some(proof) {
+                        boundary
+                            .verify_cleanup_process_image(handle, &self.intent)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!("actual original partial process image: {_error:?}");
+                            })?;
                     }
                     if code == 259 {
                         if self.process_origin.get() != Some(proof)
@@ -346,6 +355,9 @@ impl<S, P> OriginalServiceCleanup<S, P> {
             }
             if read_config()? != Some(self.intent.config_sha256) || self.tainted.get() {
                 return Err(OwnerError::Conflict);
+            }
+            if let Some(proof) = process {
+                self.process_origin.set(Some(proof));
             }
             state.partial_denied = false;
             return Ok(PartialServiceObservation {
@@ -406,25 +418,31 @@ impl<S, P> OriginalServiceCleanup<S, P> {
                 ServiceCleanupState::StartPending | ServiceCleanupState::StopPending => 0,
             };
             let process = if let Some(handle) = &state.process {
-                boundary
-                    .verify_cleanup_process_image(handle, &self.intent)
-                    .inspect_err(|_error| {
-                        #[cfg(all(windows, test))]
-                        eprintln!("actual original partial process image: {_error:?}");
-                    })?;
                 let (proof, code) = boundary.query_process(handle).inspect_err(|_error| {
                     #[cfg(all(windows, test))]
                     eprintln!("actual original partial process query: {_error:?}");
                 })?;
                 if Some(proof.pid) != self.pinned_pid
                     || proof.creation_time == 0
-                    || state.proof.is_some_and(|p| p.process != proof)
+                    || state
+                        .proof
+                        .map(|p| p.process)
+                        .or(state.process_birth)
+                        .is_some_and(|p| p != proof)
                     || self.process_origin.get().is_some_and(|p| p != proof)
                     || (facts.state == ServiceCleanupState::Running
                         && (pid != proof.pid || code != 259))
                     || (facts.state == ServiceCleanupState::Stopped && code == 259)
                 {
                     return Err(OwnerError::Conflict);
+                }
+                if self.process_origin.get() != Some(proof) {
+                    boundary
+                        .verify_cleanup_process_image(handle, &self.intent)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual original partial process image: {_error:?}");
+                        })?;
                 }
                 self.process_origin.set(Some(proof));
                 Some(proof)
