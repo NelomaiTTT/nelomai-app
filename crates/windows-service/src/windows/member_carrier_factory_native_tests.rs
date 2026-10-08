@@ -1075,6 +1075,7 @@ fn carrier_factory_actual_cold_child() {
                 (Some(Slot::A), Slot::B),
                 (Some(Slot::B), Slot::A),
             ] {
+                eprintln!("actual reserve health phase begin failed={failed:?} expected_active={expected:?}");
                 fixture.external_health(failed);
                 for _ in 0..100 {
                     second_now += 500;
@@ -1088,6 +1089,7 @@ fn carrier_factory_actual_cold_child() {
                     }
                 }
                 let current = second.snapshot();
+                eprintln!("actual reserve health phase complete failed={failed:?} expected_active={expected:?} snapshot={current:?}");
                 assert_eq!(
                     current.session.active, expected,
                     "actual A/B/A native switch"
@@ -1256,6 +1258,35 @@ fn carrier_factory_actual_cold_child() {
                     .intent
                     .config_sha256
             );
+            second_now += 1;
+            let rebound = second
+                .execute(
+                    Command::NetworkChanged {
+                        scope: next.clone(),
+                    },
+                    second_now,
+                )
+                .expect("actual same-owner NetworkChanged after replacement");
+            assert_eq!(rebound.session.phase, SessionPhase::Running);
+            assert_eq!(rebound.session.active, Slot::A);
+            assert_eq!(rebound.session.membership_generation, 3);
+            assert!(!rebound.cleanup_pending);
+            let rebound = fixture.trace_pair_stage().expect("actual rebound Pair");
+            assert_eq!(rebound.carrier, replacement.carrier);
+            assert_eq!(rebound.addresses, replacement.addresses);
+            for slot in 0..2 {
+                let before = &replacement.members[slot].as_ref().unwrap().owner;
+                let after = &rebound.members[slot].as_ref().unwrap().owner;
+                assert!(after == before, "NetworkChanged changed original owner");
+                assert_eq!(after.proof, before.proof); // SAME interface and full PID/creation proof.
+            }
+            second_now += 500;
+            second
+                .tick(second_now)
+                .expect("actual health tick resumes after NetworkChanged");
+            assert_eq!(second.snapshot().session.phase, SessionPhase::Running);
+            assert_eq!(second.snapshot().session.active, Slot::A);
+            assert!(!second.snapshot().cleanup_pending);
         }
         second_now += 1;
         eprintln!("actual factory {case}: repeat Stop");

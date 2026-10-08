@@ -735,13 +735,6 @@ impl CarrierPairIo for Io {
         self.effect("execution-complete", |s| s.rebind_sealed = false)?;
         Ok(self.0.borrow().execution_epoch)
     }
-    fn rebind_member(&mut self, r: &Record, slot: Slot) -> io::Result<OwnerRecord> {
-        let mut owner = r.members[idx(slot)].as_ref().unwrap().owner.clone();
-        owner.retired_proof = owner.proof;
-        owner.proof.as_mut().unwrap().process.creation_time += 1;
-        self.effect("rebind", |s| s.members[idx(slot)] = Some(owner.clone()))?;
-        Ok(owner)
-    }
 }
 fn fresh_state() -> Shared {
     fresh_state_for(scope())
@@ -2979,27 +2972,17 @@ fn failed_withdrawal_readback_keeps_both_ports_and_prevents_network_or_terminal_
 }
 
 #[test]
-fn compatible_rebind_retires_processes_but_keeps_c_and_same_native_interfaces() {
+fn compatible_rebind_keeps_original_members_processes_and_carrier() {
     let (mut p, s) = attached();
-    let c = p.snapshot().carrier;
-    let old = p.snapshot().members.clone();
+    let original = p.snapshot().clone();
     assert!(p.rebind_pair(&scope()).unwrap());
-    assert_eq!(p.snapshot().carrier, c);
-    for slot in [Slot::A, Slot::B] {
-        let owner = &p.snapshot().members[idx(slot)].as_ref().unwrap().owner;
-        assert_eq!(
-            owner.retired_proof,
-            old[idx(slot)].as_ref().unwrap().owner.proof
-        );
-        assert_ne!(
-            owner.proof.unwrap().process,
-            owner.retired_proof.unwrap().process
-        );
-        assert_eq!(
-            owner.proof.unwrap().interface,
-            owner.retired_proof.unwrap().interface
-        );
-    }
+    assert_eq!(p.snapshot().carrier, original.carrier);
+    assert_eq!(p.snapshot().addresses, original.addresses);
+    assert!(
+        p.snapshot().members == original.members,
+        "original owners/proofs/PIDs changed"
+    );
+    assert_eq!(s.borrow().counts.get("rebind"), None);
     assert_eq!(s.borrow().counts.get("carrier-ready"), Some(&1));
     p.stop(&scope()).unwrap();
 }
@@ -3260,7 +3243,7 @@ fn rebind_and_retirement_partial_failures_never_recreate_c_or_resume_after_clean
             vec![
                 "withdraw",
                 "release-A",
-                "rebind",
+                "verify-member-A",
                 "network",
                 "hold-A",
                 "allows",

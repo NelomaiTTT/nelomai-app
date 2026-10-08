@@ -1852,7 +1852,6 @@ fn fresh_coordinator_abort(context: &Context, halt: u8) -> crate::member_carrier
             fn begin_rebind_execution(r: &Record) -> u64;
             fn seal_rebind_execution(r: &Record) -> ();
             fn complete_rebind_execution(r: &Record) -> u64;
-            fn rebind_member(r: &Record, s: Slot) -> crate::member_owner::Record;
         }
     }
     let disk = Rc::new(RefCell::new(None));

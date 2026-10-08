@@ -1648,8 +1648,8 @@ pub(crate) mod native {
                 .clone()
                 .ok_or(GuardError::Conflict)
         }
-        /// Consume current registration only after the SAME original closed and
-        /// the existing member-generation projection removed its closed binding.
+        /// Consume only SAME original close ACKs: after member-generation
+        /// projection, or Rebind's exact fresh HoldProbe for the same live member.
         pub(crate) fn consume_retired_held(
             &self,
             slot: Slot,
@@ -1658,12 +1658,15 @@ pub(crate) mod native {
         ) -> Result<()> {
             self.fence.inspect(Purpose::Preparing, || {
                 let selected = self.selected.try_borrow().map_err(denied)?;
-                self.current(&selected, None)?;
-                if selected.record.phase != pair::Phase::Running
-                    || selected.record.pending.is_some()
-                    || selected.record.operation.is_some()
-                    || selected.record.active == Some(slot)
-                    || selected.record.members[idx(slot)].is_some()
+                let rebind = selected.record.operation == Some(pair::Operation::Rebind);
+                let purpose = rebind.then_some(Purpose::Open(slot));
+                self.current(&selected, purpose)?;
+                if !rebind
+                    && (selected.record.phase != pair::Phase::Running
+                        || selected.record.pending.is_some()
+                        || selected.record.operation.is_some()
+                        || selected.record.active == Some(slot)
+                        || selected.record.members[idx(slot)].is_some())
                 {
                     return Err(GuardError::Conflict);
                 }
@@ -1675,15 +1678,28 @@ pub(crate) mod native {
                         self.original_window(window, Purpose::Preparing)
                             .map_err(native_denied)?;
                         let native_slot = crate::member_pair::slot_native(slot);
-                        if window.closed_member(native_slot).is_some()
-                            || window.bindings().egress[idx(slot)].is_some()
-                        {
+                        if window.closed_member(native_slot).is_some() {
+                            return Err(wintun::Error::Conflict);
+                        }
+                        let egress = &window.bindings().egress[idx(slot)];
+                        if rebind {
+                            let member = selected.record.members[idx(slot)]
+                                .as_ref()
+                                .ok_or(wintun::Error::Conflict)?;
+                            if egress.as_ref().is_none_or(|identity| {
+                                identity.scope != selected.record.scope
+                                    || Some(identity.proof)
+                                        != member.owner.proof.map(|p| p.interface)
+                            }) {
+                                return Err(wintun::Error::Conflict);
+                            }
+                        } else if egress.is_some() {
                             return Err(wintun::Error::Conflict);
                         }
                         Ok(())
                     })
                     .map_err(denied)?;
-                self.current(&selected, None)?;
+                self.current(&selected, purpose)?;
                 inventory.consume_retired(slot, retired, || {
                     let mut registration = self.held[idx(slot)]
                         .value

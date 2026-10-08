@@ -342,7 +342,6 @@ pub(crate) trait CarrierPairIo {
     fn seal_rebind_execution(&mut self, record: &Record) -> io::Result<()>;
     /// Join the second original Session ACK to THAT retained native completion.
     fn complete_rebind_execution(&mut self, record: &Record) -> io::Result<u64>;
-    fn rebind_member(&mut self, record: &Record, slot: Slot) -> io::Result<OwnerRecord>;
 }
 /// Private one-shot holder. Only terminal handoff can remove the value, after
 /// the whole coordinator has left its callable/live owner.
@@ -1980,27 +1979,7 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
             self.release_all()?;
             self.finish(Effect::ReleaseProbes, self.record.clone())?;
             for slot in [Slot::A, Slot::B] {
-                if let Some(member) = self.record.members[idx(slot)].clone() {
-                    self.begin(Effect::Rebind(slot))?;
-                    let rebound = self.io.borrow_mut().rebind_member(&self.record, slot)?;
-                    self.receipts.members[idx(slot)] = Some(rebound.clone());
-                    validate_owner(&self.record, slot, &rebound)?;
-                    let old = member.owner.proof.ok_or_else(failed)?;
-                    let new = rebound.proof.ok_or_else(failed)?;
-                    // The existing MemberOwner retires the process on rebind. An
-                    // interface replacement needs a distinct full-row/base retirement
-                    // protocol; reject it rather than inventing adoption authority.
-                    if rebound.intent != member.owner.intent
-                        || rebound.phase != crate::member_owner::Phase::Running
-                        || rebound.retired_proof != Some(old)
-                        || new.process == old.process
-                        || new.interface != old.interface
-                    {
-                        return Err(failed());
-                    }
-                    let mut next = self.record.clone();
-                    next.members[idx(slot)].as_mut().ok_or_else(failed)?.owner = rebound;
-                    self.finish(Effect::Rebind(slot), next)?;
+                if self.record.members[idx(slot)].is_some() {
                     self.io.borrow_mut().verify_member(&self.record, slot)?;
                 }
             }

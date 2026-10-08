@@ -1266,65 +1266,6 @@ fn validate_original_observation(
     }
     Ok(())
 }
-fn validate_rebind_operation(
-    context: &crate::member_carrier_native_ownership::Context,
-    expected: &crate::member_carrier_pair::Record,
-    intent: &crate::member_owner::Intent,
-) -> crate::member_carrier::Result<()> {
-    use crate::{member_carrier::CarrierError as Error, member_carrier_pair as pair};
-    use nelomai_client_tunnel::redundancy::Slot;
-    let index = usize::from(intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B);
-    let slot = if index == 0 { Slot::A } else { Slot::B };
-    expected.validate().map_err(|_| Error::Conflict)?;
-    if expected.scope != context.intent.scope
-        || expected.provenance != context.provenance
-        || expected.addresses != context.intent.addresses
-        || expected.phase != pair::Phase::Running
-        || expected.operation != Some(pair::Operation::Rebind)
-        || expected.pending != Some(pair::Effect::Rebind(slot))
-        || expected.guard.permits
-        || expected.pending_guard.is_some()
-        || expected.stop_stage != 0
-        || expected.active.is_none()
-        || expected
-            .carrier
-            .is_none_or(|c| c.guid != context.bindings[0].guid)
-        || expected.members[index].as_ref().is_none_or(|m| {
-            m.owner.intent != *intent
-                || m.owner.phase != crate::member_owner::Phase::Running
-                || m.owner.proof.is_none()
-        })
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
-fn validate_rebound_record(
-    context: &crate::member_carrier_native_ownership::Context,
-    expected: &crate::member_carrier_pair::Record,
-    prior: &crate::member_owner::Record,
-    rebound: &crate::member_owner::Record,
-) -> crate::member_carrier::Result<()> {
-    validate_rebind_operation(context, expected, &prior.intent)?;
-    use crate::{member_carrier::CarrierError as Error, member_owner as owner};
-    let index = usize::from(prior.intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B);
-    owner::validate_record_shape(rebound).map_err(|_| Error::Conflict)?;
-    let old = prior.proof.ok_or(Error::Pending)?;
-    let proof = rebound
-        .proof
-        .ok_or(crate::member_carrier::CarrierError::Pending)?;
-    if expected.members[index].as_ref().map(|m| &m.owner) != Some(prior)
-        || rebound.intent != prior.intent
-        || rebound.phase != owner::Phase::Running
-        || rebound.retired_proof != Some(old)
-        || rebound.previous_config_sha256.is_some()
-        || proof.process == old.process
-        || proof.interface != old.interface
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
 
 #[derive(Debug, Eq, PartialEq)]
 enum RootError<E> {
@@ -1474,9 +1415,8 @@ pub(crate) mod native {
         },
         member_carrier_pair::{self as pair, Record as PairRecord},
         member_original::{
-            ClosedMemberReceipt, ClosedOldProcessReceipt, OriginalMemberRead,
-            OriginalMemberRegistration, PartialMemberCleanup, PendingMemberRead, RetainedMember,
-            RetiredMemberGeneration,
+            ClosedMemberReceipt, OriginalMemberRead, OriginalMemberRegistration,
+            PartialMemberCleanup, PendingMemberRead, RetainedMember, RetiredMemberGeneration,
         },
         member_owner::{Intent, MemberOwner, Phase as MemberPhase, Record as MemberRecord},
         windows::{
@@ -1508,9 +1448,6 @@ pub(crate) mod native {
 
     type Member = RetainedMember<MemberFiles, NativeMemberIo<MemberFiles>>;
     pub(crate) type NativeMemberRead = OriginalMemberRead<MemberFiles, NativeMemberIo<MemberFiles>>;
-    pub(crate) type NativeMemberRebindReceipt =
-        ClosedOldProcessReceipt<MemberFiles, NativeMemberIo<MemberFiles>>;
-    pub(crate) type NativeMemberRebindReads = (NativeMemberRead, Pending);
     type Reader = NativeMemberRead;
     type Closed = ClosedMemberReceipt<MemberFiles, NativeMemberIo<MemberFiles>>;
     pub(crate) type RetiredOriginal =
@@ -2285,8 +2222,7 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             if !controller.root.attempted {
-                if !controller.rebinds.is_empty()
-                    || owned.partial_cleanup.is_some()
+                if owned.partial_cleanup.is_some()
                     || owned
                         .member
                         .verify_terminal_unstarted_registration(&owned.pending)
@@ -2309,34 +2245,6 @@ pub(crate) mod native {
                     .is_some_and(|p| p.interface.guid != context.bindings[index + 1].guid)
             {
                 return Err(Error::Conflict);
-            }
-            for (position, rebound) in controller.rebinds.iter().enumerate() {
-                rebound
-                    .receipt
-                    .verify_retired_original_read(&rebound._prior_reader)
-                    .map_err(owner_error)?;
-                if rebound.prior.intent != owned.intent
-                    || rebound.prior.proof != rebound.receipt.running_record().retired_proof
-                {
-                    return Err(Error::Conflict);
-                }
-                if let Some(next) = controller.rebinds.get(position + 1) {
-                    rebound
-                        .receipt
-                        .verify_replacement_original_read(&next._prior_reader)
-                        .map_err(owner_error)?;
-                    if rebound.receipt.running_record() != &next.prior {
-                        return Err(Error::Conflict);
-                    }
-                } else {
-                    rebound
-                        .receipt
-                        .verify_replacement_pending_read(&owned.pending)
-                        .map_err(owner_error)?;
-                    if controller.root.running.as_ref() != Some(rebound.receipt.running_record()) {
-                        return Err(Error::Conflict);
-                    }
-                }
             }
             Ok(TerminalMemberRoot::Closed(owned.generation))
         }
@@ -4420,7 +4328,6 @@ pub(crate) mod native {
                 .attach(
                     slot,
                     |mut state| NativeMemberController {
-                        rebinds: Vec::new(),
                         root: OperationRoot::new(OwnedMember {
                             member: state.retained.take().expect("SAME prepared retained owner"),
                             pending: state.pending.take().expect("SAME pending original"),
@@ -4503,18 +4410,6 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()>;
-        /// Exact current Running/Rebind(target)/Preparing/Calling; all permits
-        /// absent and all original probes retired, SAME original network/rows
-        /// and captured-priority static bases retained. This includes BOTH
-        /// held-SCM Stop and restart and independently rechecks postpublication.
-        /// No Closing grant, no default, no cold driver/install permission.
-        fn authorize_rebind(
-            &mut self,
-            context: &Context,
-            pair: &PairRecord,
-            intent: &Intent,
-            window: &NativeBindingsWindow<'_>,
-        ) -> Result<()>;
         /// Mandatory separate cleanup authorization for an actual enrolled
         /// owner whose Start/read/registration did not return a usable live
         /// reader. No old-live Source window or inferred SDK identity exists.
@@ -4558,12 +4453,6 @@ pub(crate) mod native {
     }
     pub(crate) struct NativeMemberController<G: NativeMemberLifecycle> {
         root: OperationRoot<OwnedMember<G>, MemberRecord, Reader, Closed>,
-        rebinds: Vec<NativeMemberRebindRoot>,
-    }
-    struct NativeMemberRebindRoot {
-        prior: MemberRecord,
-        _prior_reader: Reader,
-        receipt: Rc<NativeMemberRebindReceipt>,
     }
     pub(crate) type NativeRetiredMemberRoots<G> = RetiredGenerationRoots<
         NativePreparedMember,
@@ -4899,173 +4788,6 @@ pub(crate) mod native {
                 ticket.verify_pending_reader(&owned.pending)?;
             }
             Ok(ticket)
-        }
-        /// Actual native ACK stage only, NOT Pair effect completion. Actor must
-        /// publish rebind_readers through SAME inventory and call complete_rebind
-        /// before returning a Running record. ACK/read roots precede postflight.
-        pub(crate) fn rebind(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            lock: &mut KeyLock,
-        ) -> Result<Rc<NativeMemberRebindReceipt>> {
-            self.rebind_inner(pair, expected, lock)
-                .map_err(pending_unknown)
-        }
-        fn rebind_inner(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            lock: &mut KeyLock,
-        ) -> Result<Rc<NativeMemberRebindReceipt>> {
-            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            validate_rebind_operation(&owned.context, expected, &owned.intent)?;
-            owned.forward_read_envelope(pair, expected, lock)?;
-            if let Some(ack) = self.rebinds.last() {
-                if expected.members[slot_index(owned.intent.slot)]
-                    .as_ref()
-                    .map(|m| &m.owner)
-                    == Some(&ack.prior)
-                {
-                    owned
-                        .member
-                        .verify_rebind_receipt(&ack.receipt)
-                        .map_err(owner_error)?;
-                    return Ok(ack.receipt.clone()); // SAME original ACK retry, no second native effects.
-                }
-            }
-            if !self.root.registered || self.root.closed.is_some() || self.root.reader.is_none() {
-                return Err(Error::Pending);
-            }
-            self.rebinds.try_reserve(1).map_err(|_| Error::Pending)?;
-            let prior = self.root.running.as_ref().ok_or(Error::Pending)?.clone();
-            self.verify(pair, expected, None, lock)?;
-            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            owned.rebind_envelope(pair, expected, lock)?;
-            let (running, receipt, reader) =
-                owned.member.rebind_original(&prior).map_err(owner_error)?;
-            let old_reader = self
-                .root
-                .reader
-                .replace(reader)
-                .expect("original reader checked before effects");
-            self.root.running = Some(running);
-            self.rebinds.push(NativeMemberRebindRoot {
-                prior: prior.clone(),
-                _prior_reader: old_reader,
-                receipt: receipt.clone(),
-            });
-            // The SAME native ACK/new reader now remain rooted through EVERY
-            // fallible pending-reader creation, inventory registration and G.
-            validate_rebound_record(&owned.context, expected, &prior, receipt.running_record())?;
-            owned.pending = owned
-                .member
-                .pending_rebind_read(&receipt)
-                .map_err(owner_error)?;
-            owned.forward_read_envelope(pair, expected, lock)?;
-            Ok(receipt)
-        }
-        /// Invoke outside inventory/Source callbacks under whole actual Calling.
-        pub(crate) fn rebind_readers(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            receipt: &Rc<NativeMemberRebindReceipt>,
-            lock: &mut KeyLock,
-        ) -> Result<NativeMemberRebindReads> {
-            self.rebind_readers_inner(pair, expected, receipt, lock)
-                .map_err(pending_unknown)
-        }
-        fn rebind_readers_inner(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            receipt: &Rc<NativeMemberRebindReceipt>,
-            lock: &mut KeyLock,
-        ) -> Result<NativeMemberRebindReads> {
-            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            self.rebinds
-                .last()
-                .filter(|root| Rc::ptr_eq(&root.receipt, receipt))
-                .ok_or(Error::Conflict)?;
-            validate_rebind_operation(&owned.context, expected, &owned.intent)?;
-            owned.forward_read_envelope(pair, expected, lock)?;
-            owned
-                .member
-                .verify_rebind_receipt(receipt)
-                .map_err(owner_error)?;
-            let reader = owned.member.original_read().map_err(owner_error)?;
-            let pending = owned
-                .member
-                .pending_rebind_read(receipt)
-                .map_err(owner_error)?;
-            receipt
-                .verify_replacement_original_read(&reader)
-                .map_err(owner_error)?;
-            receipt
-                .verify_replacement_pending_read(&pending)
-                .map_err(owner_error)?;
-            owned.forward_read_envelope(pair, expected, lock)?;
-            Ok((reader, pending))
-        }
-        /// Mandatory postpublication SAME Source/full SDK/resource G. Old
-        /// inventory readers remain stale, so unregistered renewal fails closed.
-        pub(crate) fn complete_rebind(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            receipt: &Rc<NativeMemberRebindReceipt>,
-            lock: &mut KeyLock,
-        ) -> Result<MemberRecord> {
-            self.complete_rebind_inner(pair, expected, receipt, lock)
-                .map_err(pending_unknown)
-        }
-        fn complete_rebind_inner(
-            &mut self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            receipt: &Rc<NativeMemberRebindReceipt>,
-            lock: &mut KeyLock,
-        ) -> Result<MemberRecord> {
-            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
-            let root = self
-                .rebinds
-                .last()
-                .filter(|r| Rc::ptr_eq(&r.receipt, receipt))
-                .ok_or(Error::Conflict)?;
-            validate_rebound_record(
-                &owned.context,
-                expected,
-                &root.prior,
-                receipt.running_record(),
-            )?;
-            owned
-                .member
-                .verify_rebind_receipt(receipt)
-                .map_err(owner_error)?;
-            let reader = self.root.reader.as_mut().ok_or(Error::Pending)?;
-            receipt
-                .verify_replacement_original_read(reader)
-                .map_err(owner_error)?;
-            let facts = reader.read().map_err(owner_error)?;
-            if facts
-                != (
-                    owned.intent.clone(),
-                    receipt.running_record().proof.ok_or(Error::Pending)?,
-                )
-            {
-                return Err(Error::Conflict);
-            }
-            owned.rebind_envelope(pair, expected, lock)?;
-            owned
-                .member
-                .verify_rebind_receipt(receipt)
-                .map_err(owner_error)?;
-            if reader.read().map_err(owner_error)? != facts {
-                return Err(Error::Conflict);
-            }
-            owned.forward_read_envelope(pair, expected, lock)?;
-            Ok(receipt.running_record().clone()) // DATA backed by this rooted original ACK, not adoption.
         }
         pub(crate) fn prepared_intent(&self) -> &Intent {
             &self
@@ -5537,59 +5259,6 @@ pub(crate) mod native {
                 .verify_pending_read(&self.pending)
                 .map_err(owner_error)?;
             token.acknowledged.set(true);
-            Ok(())
-        }
-        fn rebind_envelope(
-            &self,
-            pair: &NativePairIntentRead,
-            expected: &PairRecord,
-            lock: &mut KeyLock,
-        ) -> Result<()> {
-            validate_rebind_operation(&self.context, expected, &self.intent)?;
-            let before = self.forward_read_envelope(pair, expected, lock)?;
-            let effect = expected.pending.ok_or(Error::Conflict)?;
-            pair.inspect_effect(
-                &self.runtime,
-                &self.supervisor,
-                expected,
-                effect,
-                |_| Ok(()),
-            )
-            .map_err(|_| Error::Conflict)?;
-            self.original_source
-                .inspect_window(|window| {
-                    if !window.matches_source(&self.original_source)
-                        || !window.matches_runtime(&self.runtime)
-                        || window.closed_member(self.intent.slot).is_some()
-                        || window.bindings().carrier.as_ref().map(|c| c.identity.proof)
-                            != expected.carrier
-                        || window.bindings().egress[slot_index(self.intent.slot)]
-                            .as_ref()
-                            .map(|m| m.proof)
-                            != expected.members[slot_index(self.intent.slot)]
-                                .as_ref()
-                                .and_then(|m| m.owner.proof.map(|p| p.interface))
-                    {
-                        return Err(super::super::member_carrier_wintun::Error::Conflict);
-                    }
-                    self.gate
-                        .try_borrow_mut()
-                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)?
-                        .authorize_rebind(&self.context, expected, &self.intent, window)
-                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
-                })
-                .map_err(|_| Error::Conflict)?;
-            pair.inspect_effect(
-                &self.runtime,
-                &self.supervisor,
-                expected,
-                effect,
-                |_| Ok(()),
-            )
-            .map_err(|_| Error::Conflict)?;
-            if self.forward_read_envelope(pair, expected, lock)? != before {
-                return Err(Error::Conflict);
-            }
             Ok(())
         }
         fn forward_read_envelope(

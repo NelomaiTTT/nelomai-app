@@ -174,29 +174,6 @@ fn require_member_row_storage_cleanup_frame(
     Ok(())
 }
 
-/// Comparison only: native receipt/original-controller verification is mandatory
-/// independently. A same-NIC rebind retires the process, never adopts a NIC.
-fn compare_member_rebind_ack(
-    prior: &crate::member_owner::Record,
-    running: &crate::member_owner::Record,
-) -> io::Result<()> {
-    crate::member_owner::validate_record_shape(prior).map_err(|_| conflict())?;
-    crate::member_owner::validate_record_shape(running).map_err(|_| conflict())?;
-    let old = prior.proof.ok_or_else(conflict)?;
-    let new = running.proof.ok_or_else(conflict)?;
-    if prior.phase != crate::member_owner::Phase::Running
-        || running.phase != crate::member_owner::Phase::Running
-        || prior.intent != running.intent
-        || running.retired_proof != Some(old)
-        || new.interface != old.interface
-        || new.process == old.process
-        || running.previous_config_sha256.is_some()
-    {
-        return Err(conflict());
-    }
-    Ok(())
-}
-
 /// FullEmpty has two distinct actual Calling channels. This comparison does not
 /// authorize either channel or infer absence from the coordinator's metadata.
 fn require_full_empty_frame(record: &crate::member_carrier_pair::Record) -> io::Result<()> {
@@ -1431,12 +1408,10 @@ pub(crate) mod native {
             },
             member_carrier_member_controller::native::{
                 NativeMemberAttachment, NativeMemberController, NativeMemberPreparationGeneration,
-                NativeMemberRebindReceipt, NativeNeverMemberEffects,
+                NativeNeverMemberEffects,
             },
             member_carrier_member_gate::native::{NativeMemberGate, NativeMemberGateInputs},
-            member_carrier_members::native::{
-                MemberInventoryRead, NativeRebindPublication, NativeRetirementInputs,
-            },
+            member_carrier_members::native::{MemberInventoryRead, NativeRetirementInputs},
             member_carrier_module::native::NativeModuleReleased,
             member_carrier_module::native::OriginalImage,
             member_carrier_network::native::{NativeClosingNetworkRead, NativeNetworkRead},
@@ -1602,7 +1577,6 @@ pub(crate) mod native {
         _tickets: Vec<Rc<NativeMemberPreparationGeneration>>,
         _row_receipts: Vec<Rc<NativeRowGenerationReceipt>>,
         _originals: Vec<Rc<MemberGenerationOriginal>>,
-        _rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
     }
     pub(crate) type NativeMemberGenerationTerminalResources =
         GenerationTerminalResources<NativeMemberGenerationRoots>;
@@ -1636,7 +1610,6 @@ pub(crate) mod native {
         member_generation_originals: Vec<Rc<MemberGenerationOriginal>>,
         historical_member_rows: Vec<(MemberRowCapture, HistoricalMemberRows)>,
         member_row_captures: Vec<Rc<NativeRowGenerationCapture>>,
-        member_rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
         rebind_proof: Rc<RefCell<RebindProofSlot<NativeRebindProof>>>,
         startup_proof: Rc<RefCell<Option<Rc<NativeRebindProof>>>>,
     }
@@ -1724,7 +1697,6 @@ pub(crate) mod native {
                 || !parts.member_generation_originals.is_empty()
                 || !parts.historical_member_rows.is_empty()
                 || !parts.member_row_captures.is_empty()
-                || !parts.member_rebind_receipts.is_empty()
                 || self
                     .locals
                     .generation_terminal
@@ -1992,7 +1964,6 @@ pub(crate) mod native {
                         _tickets: std::mem::take(&mut parts.member_generation_tickets),
                         _row_receipts: std::mem::take(&mut parts.row_generation_receipts),
                         _originals: std::mem::take(&mut parts.member_generation_originals),
-                        _rebind_receipts: std::mem::take(&mut parts.member_rebind_receipts),
                     });
                     Ok(())
                 })?;
@@ -2022,7 +1993,6 @@ pub(crate) mod native {
             if !parts.member_generation_tickets.is_empty()
                 || !parts.row_generation_receipts.is_empty()
                 || !parts.member_generation_originals.is_empty()
-                || !parts.member_rebind_receipts.is_empty()
             {
                 return Err(conflict());
             }
@@ -3083,7 +3053,6 @@ pub(crate) mod native {
         member_generation_originals: Vec<Rc<MemberGenerationOriginal>>,
         historical_member_rows: Vec<(MemberRowCapture, HistoricalMemberRows)>,
         member_row_captures: Vec<Rc<NativeRowGenerationCapture>>,
-        member_rebind_receipts: Vec<Rc<NativeMemberRebindReceipt>>,
         lifecycle_upgrade: Rc<UpgradeRegistration>,
         terminal_cut: ActorResourceTransfer<NativeActorTerminalCut<'a>>,
         execution: Option<NativeActorExecution>,
@@ -4592,7 +4561,6 @@ pub(crate) mod native {
                 member_generation_originals,
                 historical_member_rows,
                 member_row_captures,
-                member_rebind_receipts,
                 execution,
                 rebind_proof,
                 startup_proof,
@@ -4628,7 +4596,6 @@ pub(crate) mod native {
                                 ),
                                 historical_member_rows: std::mem::take(historical_member_rows),
                                 member_row_captures: std::mem::take(member_row_captures),
-                                member_rebind_receipts: std::mem::take(member_rebind_receipts),
                                 rebind_proof: std::mem::replace(
                                     rebind_proof,
                                     Rc::new(RefCell::new(RebindProofSlot::default())),
@@ -4789,7 +4756,6 @@ pub(crate) mod native {
                 member_generation_originals: Vec::new(),
                 historical_member_rows: Vec::new(),
                 member_row_captures: Vec::new(),
-                member_rebind_receipts: Vec::new(),
                 lifecycle_upgrade: Rc::new(UpgradeRegistration::default()),
                 terminal_cut: ActorResourceTransfer::default(),
                 execution: None,
@@ -4945,38 +4911,15 @@ pub(crate) mod native {
                                 return Err(conflict()); // No delegate can skip actual projection.
                             }
                             if replacement {
-                                let original = held.as_ref().ok_or_else(conflict)?;
-                                let read = held_read.as_ref().ok_or_else(conflict)?;
-                                if !original
-                                    .try_borrow()
-                                    .map_err(denied)?
-                                    .read_pin()
-                                    .same_original(read)
-                                {
-                                    return Err(conflict());
-                                }
-                                let retired = read.retired().map_err(denied)?;
-                                let sockets = sockets.as_ref().ok_or_else(conflict)?;
-                                let mut issued = sockets.issued.try_borrow_mut().map_err(denied)?;
-                                for token in issued
-                                    .iter()
-                                    .filter(|token| Rc::ptr_eq(&token.original, original))
-                                {
-                                    if token.lease.try_borrow().map_err(denied)?.is_some() {
-                                        return Err(conflict());
-                                    }
-                                }
-                                probe_state
-                                    .select(pin.clone(), actual.clone())
-                                    .map_err(denied)?;
-                                probe_state
-                                    .consume_retired_held(member.slot, read, &retired)
-                                    .map_err(denied)?;
-                                // All fallible checks completed; remove only revoked
-                                // tokens belonging to that exact closed original.
-                                issued.retain(|token| !Rc::ptr_eq(&token.original, original));
-                                *held = None;
-                                *held_read = None;
+                                Self::consume_closed_probe(
+                                    &probe_state,
+                                    sockets.as_ref().ok_or_else(conflict)?,
+                                    member.slot,
+                                    &pin,
+                                    &actual,
+                                    held,
+                                    held_read,
+                                )?;
                                 // The retired controller retains its original gate;
                                 // start_member constructs a fresh immutable intent gate.
                                 *member_gate = None;
@@ -6812,85 +6755,6 @@ pub(crate) mod native {
             })
         }
 
-        /// SAME service/owner, new original process generation, SAME NIC. The
-        /// controller retains its actual ACK before returning; this actor roots
-        /// that exact receipt before any reader/publication/postflight. No
-        /// numeric lookup, saved-NIC adoption or new inventory is permitted.
-        pub(crate) fn rebind_member(
-            &mut self,
-            record: &pair::Record,
-            slot: Slot,
-        ) -> io::Result<crate::member_owner::Record> {
-            self.in_call(record, |this, pin| {
-                let i = idx(slot);
-                record.validate()?;
-                if record.phase != pair::Phase::Running
-                    || record.operation != Some(pair::Operation::Rebind)
-                    || record.pending != Some(pair::Effect::Rebind(slot))
-                    || record.stop_stage != 0
-                    || record.pending_guard.is_some()
-                    || record.guard.permits
-                {
-                    return Err(conflict());
-                }
-                let prior = &record.members[i].as_ref().ok_or_else(conflict)?.owner;
-                let Self {
-                    roots,
-                    member_rebind_receipts,
-                    ..
-                } = this;
-                let r = roots.as_mut().ok_or_else(conflict)?;
-                r.member_gates[i]
-                    .as_ref()
-                    .ok_or_else(conflict)?
-                    .try_borrow_mut()
-                    .map_err(denied)?
-                    .select_pair(pin.clone())
-                    .map_err(denied)?;
-                member_rebind_receipts
-                    .try_reserve(1)
-                    .map_err(denied_allocation)?;
-                let controller = r.controllers[i].as_mut().ok_or_else(conflict)?;
-                let actual = controller
-                    .rebind(pin, record, &mut r.lock)
-                    .map_err(denied)?;
-                retain_generation_once(member_rebind_receipts, &actual, |original| {
-                    compare_member_rebind_ack(prior, original.running_record())?;
-                    let (reader, pending) = controller
-                        .rebind_readers(pin, record, original, &mut r.lock)
-                        .map_err(denied)?;
-                    // The occupied inventory slot is renewed ONLY by the
-                    // original receipt's retired/replacement lineage. This
-                    // mutation occurs OUTSIDE Source's readonly callback.
-                    r.members
-                        .publish_rebind(
-                            r.member_source.clone(),
-                            reader,
-                            pending,
-                            NativeRebindPublication {
-                                source: &r.pins.source,
-                                receipt: original,
-                                pair: pin,
-                                expected: record,
-                                supervisor: &r.pins.supervisor,
-                            },
-                        )
-                        .map_err(denied)?;
-                    let acknowledged = controller
-                        .complete_rebind(pin, record, original, &mut r.lock)
-                        .map_err(denied)?;
-                    compare_member_rebind_ack(prior, &acknowledged)?;
-                    if &acknowledged != original.running_record() {
-                        return Err(conflict());
-                    }
-                    // complete_rebind independently brackets THIS Source with
-                    // full SDK + mandatory resource G after publication. Only
-                    // data backed by the rooted native ACK leaves this call.
-                    Ok(acknowledged)
-                })
-            })
-        }
-
         pub(crate) fn verify_member_absent(
             &mut self,
             record: &pair::Record,
@@ -7588,6 +7452,49 @@ pub(crate) mod native {
             })
         }
 
+        // Two actual Calling consumers: completed member replacement and
+        // Rebind's fresh HoldProbe. The gate authenticates their disjoint frames.
+        fn consume_closed_probe(
+            state: &NativeProbeResourceState<OriginalGuardAttestor>,
+            sockets: &SocketContext,
+            slot: Slot,
+            pin: &Rc<NativePairIntentRead>,
+            record: &pair::Record,
+            held: &mut Option<Rc<RefCell<Held>>>,
+            held_read: &mut Option<HeldRead>,
+        ) -> io::Result<()> {
+            let original = held.as_ref().ok_or_else(conflict)?;
+            let read = held_read.as_ref().ok_or_else(conflict)?;
+            if !original
+                .try_borrow()
+                .map_err(denied)?
+                .read_pin()
+                .same_original(read)
+            {
+                return Err(conflict());
+            }
+            let retired = read.retired().map_err(denied)?;
+            let mut issued = sockets.issued.try_borrow_mut().map_err(denied)?;
+            for token in issued
+                .iter()
+                .filter(|token| Rc::ptr_eq(&token.original, original))
+            {
+                if token.lease.try_borrow().map_err(denied)?.is_some() {
+                    return Err(conflict());
+                }
+            }
+            state.select(pin.clone(), record.clone()).map_err(denied)?;
+            state
+                .consume_retired_held(slot, read, &retired)
+                .map_err(denied)?;
+            // All fallible checks completed. Drop only SAME Closed original
+            // registration and its already-revoked tokens, never uncertain roots.
+            issued.retain(|token| !Rc::ptr_eq(&token.original, original));
+            *held = None;
+            *held_read = None;
+            Ok(())
+        }
+
         pub(crate) fn hold_probe(
             &mut self,
             record: &pair::Record,
@@ -7595,10 +7502,25 @@ pub(crate) mod native {
         ) -> io::Result<(NativePairSocket, policy::ProbeTuple)> {
             self.in_call(record, |this, pin| {
                 let i = idx(slot);
-                if this.held[i].is_some() || record.pending != Some(pair::Effect::HoldProbe(slot)) {
+                if record.pending != Some(pair::Effect::HoldProbe(slot)) {
                     return Err(conflict());
                 }
                 this.select_guard(pin, record)?;
+                if record.operation == Some(pair::Operation::Rebind) {
+                    let state = this.roots()?.probe_state.clone();
+                    let sockets = this.socket_context()?;
+                    Self::consume_closed_probe(
+                        &state,
+                        &sockets,
+                        slot,
+                        pin,
+                        record,
+                        &mut this.held[i],
+                        &mut this.held_reads[i],
+                    )?;
+                } else if this.held[i].is_some() {
+                    return Err(conflict());
+                }
                 let target = record.members[i]
                     .as_ref()
                     .ok_or_else(conflict)?
@@ -8759,13 +8681,6 @@ pub(crate) mod native {
         fn verify_member(&mut self, record: &pair::Record, slot: Slot) -> io::Result<()> {
             NativeCarrierPairIo::verify_member(self, record, slot)
         }
-        fn rebind_member(
-            &mut self,
-            record: &pair::Record,
-            slot: Slot,
-        ) -> io::Result<crate::member_owner::Record> {
-            NativeCarrierPairIo::rebind_member(self, record, slot)
-        }
         fn stop_member(&mut self, record: &pair::Record, slot: Slot) -> io::Result<()> {
             NativeCarrierPairIo::stop_member(self, record, slot)
         }
@@ -8942,9 +8857,6 @@ pub(crate) mod native {
                 std::mem::forget(original);
             }
             for original in self.member_row_captures.drain(..) {
-                std::mem::forget(original);
-            }
-            for original in self.member_rebind_receipts.drain(..) {
                 std::mem::forget(original);
             }
             for original in self

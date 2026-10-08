@@ -20,7 +20,6 @@ enum Use {
     ServiceStop(usize),
     Retire(usize),
     Retired(usize),
-    Rebind(usize),
 }
 fn cleanup_use(usage: Use) -> bool {
     matches!(usage, Use::Stop | Use::ServiceStop(_))
@@ -148,34 +147,6 @@ pub(crate) fn validate_retirement(
 fn retirement_stage(context: &Context, record: &pair::Record, intent: &Intent) -> Result<Use> {
     validate_retirement(context, record, intent).map(Use::Retire)
 }
-fn rebind_stage(context: &Context, record: &pair::Record, intent: &Intent) -> Result<Use> {
-    record.validate().map_err(|_| Error::Conflict)?;
-    let target = index(intent);
-    if record.scope != context.intent.scope
-        || record.provenance != context.provenance
-        || record.addresses != context.intent.addresses
-        || record.phase != pair::Phase::Running
-        || record.operation != Some(pair::Operation::Rebind)
-        || record.pending != Some(pair::Effect::Rebind(shared_slot(intent)))
-        || record.pending_guard.is_some()
-        || record.guard.permits
-        || record.active.is_none()
-        || record.stop_stage != 0
-        || record.network.is_none()
-        || record
-            .carrier
-            .is_none_or(|c| c.guid != context.bindings[0].guid)
-        || record.members[target]
-            .as_ref()
-            .is_none_or(|m| m.owner.intent != *intent)
-        || record.members.iter().flatten().any(|m| {
-            m.owner.phase != crate::member_owner::Phase::Running || m.owner.proof.is_none()
-        })
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(Use::Rebind(target))
-}
 fn guard(record: &pair::Record, usage: Use, actual: &policy::Snapshot) -> Result<()> {
     record.guard.validate().map_err(|_| Error::Conflict)?;
     if record.pending_guard.is_some()
@@ -284,7 +255,7 @@ fn resource_rows(
         let mut desired = baseline.clone();
         let restored =
             cleanup_use(usage) || retirement_target(usage).is_some_and(|target| n == target + 1);
-        let weak = matches!(usage, Use::Reserve | Use::Rebind(_))
+        let weak = matches!(usage, Use::Reserve)
             || retirement_target(usage).is_some_and(|target| n != target + 1);
         if weak {
             desired.weak_host_send = true;
@@ -376,7 +347,7 @@ fn original_bindings(
     Ok(())
 }
 fn probes(record: &pair::Record, usage: Use, actual: &[policy::ProbeTuple]) -> Result<()> {
-    if cleanup_use(usage) || matches!(usage, Use::Rebind(_)) {
+    if cleanup_use(usage) {
         return if actual.is_empty() {
             Ok(())
         } else {
@@ -484,7 +455,7 @@ fn network(
     {
         return Err(Error::Conflict);
     }
-    if (matches!(usage, Use::Reserve | Use::Rebind(_)) || retirement_target(usage).is_some())
+    if (matches!(usage, Use::Reserve) || retirement_target(usage).is_some())
         && (fact.routes.stopping || fact.routes.active != record.active)
     {
         return Err(Error::Conflict);
@@ -983,7 +954,7 @@ pub(crate) mod native {
                 &bindings.egress,
                 partial,
             )?;
-            if matches!(usage, Use::Retire(_) | Use::Rebind(_))
+            if matches!(usage, Use::Retire(_))
                 && [TunnelSlot::A, TunnelSlot::B]
                     .into_iter()
                     .any(|s| window.closed_member(s).is_some())
@@ -998,16 +969,6 @@ pub(crate) mod native {
                 let native = receipts::Record::decode(&before)?;
                 let keys = if retirement_target(usage).is_some() {
                     vec![0, 1, 2]
-                } else if matches!(usage, Use::Rebind(_)) {
-                    std::iter::once(0)
-                        .chain(
-                            record
-                                .members
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(n, m)| m.as_ref().map(|_| n + 1)),
-                        )
-                        .collect()
                 } else {
                     vec![0, index(&self.intent) + 1]
                 };
@@ -1111,7 +1072,7 @@ pub(crate) mod native {
                     .map_err(denied)?;
             }
             let inventory = upgrade(&self.probes)?;
-            if cleanup || matches!(usage, Use::Rebind(_)) {
+            if cleanup {
                 let originals = inventory.originals().map_err(denied)?;
                 let retired = inventory.inspect_retired().map_err(denied)?;
                 if originals.len() != retired.len() {
@@ -1119,28 +1080,6 @@ pub(crate) mod native {
                 }
                 for (live, closed) in originals.iter().zip(&retired) {
                     closed.verify_same_original(live).map_err(denied)?;
-                }
-                if matches!(usage, Use::Rebind(_)) {
-                    // Running members must have their actual canonical held
-                    // originals, not an empty/missing slot treated as a close
-                    // ACK. inspect_retired also checks older original attempts.
-                    let by_slot = inventory.originals_by_slot().map_err(denied)?;
-                    for (n, member) in record.members.iter().enumerate() {
-                        if member.is_some() {
-                            let original = by_slot[n].as_ref().ok_or(Error::Pending)?;
-                            inventory
-                                .verify_member_slot(
-                                    if n == 0 { Slot::A } else { Slot::B },
-                                    original,
-                                )
-                                .map_err(denied)?;
-                            original
-                                .retired()
-                                .map_err(denied)?
-                                .verify_same_original(original)
-                                .map_err(denied)?;
-                        }
-                    }
                 }
                 probes(record, usage, &[])?;
             } else if let Some(target) = retirement_target(usage) {
@@ -1246,25 +1185,6 @@ pub(crate) mod native {
                     // the readonly postflight projection; not SDK absence/JSON.
                     usage = Use::Retired(target);
                 }
-                state.authorize(record, usage, window, None)
-            })
-        }
-        fn authorize_rebind(
-            &mut self,
-            context: &Context,
-            record: &pair::Record,
-            intent: &Intent,
-            window: &NativeBindingsWindow<'_>,
-        ) -> Result<()> {
-            let state = &mut self.state;
-            self.fence.run(false, || {
-                if context != &state.context
-                    || intent != &state.intent
-                    || state.selected.as_ref().is_none_or(|s| s.record != *record)
-                {
-                    return Err(Error::Conflict);
-                }
-                let usage = rebind_stage(context, record, intent)?;
                 state.authorize(record, usage, window, None)
             })
         }

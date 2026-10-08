@@ -219,156 +219,6 @@ fn retirement(slot: Slot) -> (Context, pair::Record, Intent) {
     (c, record, intent)
 }
 
-fn rebinding(slot: Slot) -> (Context, pair::Record, Intent) {
-    let (c, mut r, _) = closing(Slot::B);
-    r.phase = pair::Phase::Running;
-    r.active = Some(Slot::A);
-    r.operation = Some(pair::Operation::Rebind);
-    r.stop_stage = 0;
-    r.pending = Some(pair::Effect::Rebind(slot));
-    let intent = r.members[usize::from(slot == Slot::B)]
-        .as_ref()
-        .unwrap()
-        .owner
-        .intent
-        .clone();
-    r.validate().unwrap();
-    (c, r, intent)
-}
-
-#[test]
-fn rebind_stage_is_disjoint_from_creation_retirement_and_closing() {
-    for slot in [Slot::A, Slot::B] {
-        let (c, r, intent) = rebinding(slot);
-        assert_eq!(
-            rebind_stage(&c, &r, &intent).unwrap(),
-            Use::Rebind(index(&intent))
-        );
-        assert!(stage(&c, &r, &intent, false).is_err());
-        assert!(stage(&c, &r, &intent, true).is_err());
-        assert!(retirement_stage(&c, &r, &intent).is_err());
-    }
-}
-
-#[test]
-fn rebind_stage_denies_foreign_scope_epoch_target_and_unfinished_guard() {
-    for fault in 0..9 {
-        let (c, mut r, mut intent) = rebinding(Slot::B);
-        match fault {
-            0 => r.provenance.network_epoch += 1,
-            1 => intent.scope.runtime_generation += 1,
-            2 => r.pending = Some(pair::Effect::Rebind(Slot::A)),
-            3 => r.operation = Some(pair::Operation::Retire(Slot::B)),
-            4 => r.phase = pair::Phase::Closing,
-            5 => r.members[1].as_mut().unwrap().owner.proof = None,
-            6 => r.active = None,
-            7 => r.guard.permits = true,
-            _ => r.network = None,
-        }
-        assert!(rebind_stage(&c, &r, &intent).is_err(), "fault {fault}");
-    }
-}
-
-#[test]
-fn rebind_rows_preserve_c_and_all_live_member_weak_rows_with_actual_readback() {
-    let (c, r, _) = rebinding(Slot::B);
-    let mut records = std::array::from_fn(|n| Some(row(&c, &r, n, Use::Reserve)));
-    let actual = records[0].as_ref().unwrap().current.clone();
-    let acknowledged = records[0].as_mut().unwrap();
-    acknowledged
-        .current
-        .address
-        .as_mut()
-        .unwrap()
-        .observed
-        .dad_state = 1;
-    acknowledged.creation.as_mut().unwrap().observed.dad_state = 1;
-    let mut facts = rowfacts(&records);
-    facts[0].as_mut().unwrap().observed = Some(&actual);
-    resource_rows(&c, &r, Use::Rebind(1), facts).unwrap();
-    for cut in 0..5 {
-        let mut wrong = records.clone();
-        let mut observed = actual.clone();
-        match cut {
-            0 => {
-                wrong[2]
-                    .as_mut()
-                    .unwrap()
-                    .current
-                    .interface
-                    .policy
-                    .weak_host_receive = false
-            }
-            1 => wrong[1].as_mut().unwrap().phase = rows::Phase::Stopped,
-            2 => wrong[0].as_mut().unwrap().binding.network_epoch += 1,
-            3 => wrong[2] = None,
-            _ => observed.address.as_mut().unwrap().observed.dad_state = 1,
-        }
-        let mut facts = rowfacts(&wrong);
-        facts[0].as_mut().unwrap().observed = Some(&observed);
-        assert!(resource_rows(&c, &r, Use::Rebind(1), facts).is_err());
-    }
-    let mut absent = rowfacts(&records);
-    absent[0].as_mut().unwrap().observed = Some(&actual);
-    absent[2].as_mut().unwrap().observed = None;
-    assert!(resource_rows(&c, &r, Use::Rebind(1), absent).is_err());
-}
-
-#[test]
-fn rebind_requires_all_probes_absent_and_keeps_original_network_active() {
-    let (_, mut r, _) = rebinding(Slot::A);
-    probes(&r, Use::Rebind(0), &[]).unwrap();
-    let tuple = policy::ProbeTuple {
-        source: "10.7.0.2".parse().unwrap(),
-        source_port: 53001,
-        target: "1.1.1.1".parse().unwrap(),
-        target_port: 53,
-        protocol: 17,
-    };
-    assert!(probes(&r, Use::Rebind(0), &[tuple]).is_err());
-    let dns = dns_snapshot(&r);
-    r.network.as_mut().unwrap().baseline.dns = Some(dns.clone());
-    r.network.as_mut().unwrap().current.dns = Some(dns.clone());
-    let ack = (vec![], (1, vec![dns.clone()]));
-    let mut routes = no_routes();
-    routes.active = Some(Slot::A);
-    let check = |routes: &super::super::member_carrier_network::NetworkFacts| {
-        network(
-            &r,
-            Use::Rebind(0),
-            NetworkFact {
-                routes,
-                dns: &dns,
-                protected: Some(b"protected actual ACK"),
-            },
-            Some(&ack),
-        )
-    };
-    check(&routes).unwrap();
-    routes.active = Some(Slot::B);
-    assert!(check(&routes).is_err());
-}
-
-#[test]
-fn rebind_guard_retains_actual_captured_priority_and_exact_static_bases() {
-    let (_, r, _) = rebinding(Slot::A);
-    guard(&r, Use::Rebind(0), &r.guard.expected).unwrap();
-    for cut in 0..4 {
-        let mut actual = r.guard.expected.clone();
-        match cut {
-            0 => actual.sublayer.as_mut().unwrap().weight += 1,
-            1 => actual.filters.pop().map(|_| ()).unwrap(),
-            2 => actual.carrier.as_mut().unwrap().identity.proof.luid += 1,
-            _ => actual.egress[1].as_mut().unwrap().proof.index += 1,
-        }
-        assert!(guard(&r, Use::Rebind(0), &actual).is_err());
-    }
-    let mut permitted = r.clone();
-    permitted.guard.permits = true;
-    assert!(guard(&permitted, Use::Rebind(0), &r.guard.expected).is_err());
-}
-
-// Break: normal standby Stop is incorrectly conflated with full Closing.
 #[test]
 fn retirement_stage_is_disjoint_and_preserves_the_other_active_original() {
     for slot in [Slot::A, Slot::B] {
@@ -1271,14 +1121,13 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
 }
 
 #[test]
-fn service_only_window_is_never_ordinary_closing_forward_or_rebind_authority() {
+fn service_only_window_is_never_ordinary_closing_or_forward_authority() {
     for usage in [
         Use::Primary,
         Use::Reserve,
         Use::Stop,
         Use::Retire(0),
         Use::Retired(1),
-        Use::Rebind(0),
     ] {
         service_window_usage(usage, false).unwrap();
         assert!(service_window_usage(usage, true).is_err());

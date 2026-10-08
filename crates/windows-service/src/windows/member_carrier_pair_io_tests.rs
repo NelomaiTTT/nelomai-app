@@ -789,59 +789,6 @@ fn row_storage_cleanup_is_closing_restore_or_exact_member_stop_only() {
 }
 
 #[test]
-fn rebind_ack_requires_same_nic_new_process_and_exact_retired_original() {
-    use crate::member_owner::{Intent, NativeProof, Phase, ProcessProof, Record};
-    let prior = Record {
-        intent: Intent {
-            scope: closing_record().scope,
-            slot: nelomai_contracts::dispatcher::TunnelSlot::A,
-            transport: nelomai_client_tunnel::TunnelTransport::WireGuard,
-            engine: crate::test_engine_path("engine.exe"),
-            config_sha256: [9; 32],
-        },
-        phase: Phase::Running,
-        proof: Some(NativeProof {
-            process: ProcessProof {
-                pid: 301,
-                creation_time: 3001,
-            },
-            interface: crate::member_owner::InterfaceProof {
-                index: 21,
-                luid: 2100,
-                guid: [21; 16],
-            },
-        }),
-        retired_proof: None,
-        previous_config_sha256: None,
-    };
-    crate::member_owner::validate_record_shape(&prior).unwrap();
-    let mut next = prior.clone();
-    next.retired_proof = prior.proof;
-    next.proof.as_mut().unwrap().process = ProcessProof {
-        pid: 302,
-        creation_time: 3002,
-    };
-    compare_member_rebind_ack(&prior, &next).unwrap();
-    let mutations: [fn(&mut Record); 5] = [
-        |r| r.retired_proof = None,
-        |r| r.retired_proof.as_mut().unwrap().process.pid = 303,
-        |r| r.proof.as_mut().unwrap().interface.index = 22,
-        |r| {
-            r.proof.as_mut().unwrap().process = ProcessProof {
-                pid: 301,
-                creation_time: 3001,
-            }
-        },
-        |r| r.previous_config_sha256 = Some([8; 32]),
-    ];
-    for mutation in mutations {
-        let mut foreign = next.clone();
-        mutation(&mut foreign);
-        assert!(compare_member_rebind_ack(&prior, &foreign).is_err());
-    }
-}
-
-#[test]
 fn full_empty_requires_closed_guard_and_separate_exact_final_read_frame() {
     use crate::member_carrier_pair::{Effect, Phase};
     let mut record = closing_record();

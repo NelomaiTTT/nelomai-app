@@ -650,6 +650,24 @@ fn open_requires_exact_current_hold_probe_operation_without_any_allows() {
     running.active = Some(Slot::A);
     running.operation = Some(pair::Operation::Attach(Slot::A));
     assert_eq!(compare_stage(&c, &running, Purpose::Open(Slot::A)), Ok(()));
+    running.operation = Some(pair::Operation::Rebind);
+    let original = running.members[0].as_ref().unwrap().owner.clone();
+    assert_eq!(compare_stage(&c, &running, Purpose::Open(Slot::A)), Ok(()));
+    assert!(running.members[0].as_ref().unwrap().owner == original);
+    for pending in [
+        None,
+        Some(pair::Effect::ReleaseProbes),
+        Some(pair::Effect::HoldProbe(Slot::B)),
+    ] {
+        let mut wrong = running.clone();
+        wrong.pending = pending;
+        assert!(compare_stage(&c, &wrong, Purpose::Open(Slot::A)).is_err());
+    }
+    let mut closed = running.clone();
+    let owner = &mut closed.members[0].as_mut().unwrap().owner;
+    owner.phase = crate::member_owner::Phase::Stopped;
+    owner.retired_proof = owner.proof.take();
+    assert!(compare_stage(&c, &closed, Purpose::Open(Slot::A)).is_err());
     for fault in 0..9 {
         let mut x = r.clone();
         match fault {

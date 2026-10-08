@@ -16,46 +16,6 @@ use nelomai_client_tunnel::TunnelTransport;
 use nelomai_contracts::dispatcher::TunnelSlot;
 use std::cell::Cell;
 
-/// Comparison DATA only. Actual original old/new process ACKs and full
-/// private/SDK brackets are mandatory before inventory renewal.
-pub(crate) fn rebind_registration(
-    context: &Context,
-    native: crate::member_carrier_native_ownership::Phase,
-    record: &crate::member_carrier_pair::Record,
-    index: usize,
-) -> Result<()> {
-    use crate::{member_carrier_native_ownership::Phase, member_carrier_pair as pair};
-    use nelomai_client_tunnel::redundancy::Slot;
-    let slot = match index {
-        0 => Slot::A,
-        1 => Slot::B,
-        _ => return Err(Error::Conflict),
-    };
-    record.validate().map_err(|_| Error::Conflict)?;
-    if native != Phase::Preparing
-        || record.scope != context.intent.scope
-        || record.provenance != context.provenance
-        || record.addresses != context.intent.addresses
-        || record.phase != pair::Phase::Running
-        || record.operation != Some(pair::Operation::Rebind)
-        || record.pending != Some(pair::Effect::Rebind(slot))
-        || record.stop_stage != 0
-        || record.guard.permits
-        || record.pending_guard.is_some()
-        || record
-            .carrier
-            .is_none_or(|c| c.guid != context.bindings[0].guid)
-        || record.members.iter().any(|m| {
-            m.as_ref().is_none_or(|m| {
-                m.owner.phase != crate::member_owner::Phase::Running || m.owner.proof.is_none()
-            })
-        })
-    {
-        return Err(Error::Conflict);
-    }
-    Ok(())
-}
-
 /// Publication comparison only; the native caller additionally authenticates
 /// the SAME opaque Pair pin, runtime and original member Stop receipt.
 pub(crate) fn retirement_registration(
@@ -343,116 +303,6 @@ struct PendingEntry<J, I, S> {
     original: crate::member_original::PendingMemberRead<J, I>,
     captured: Option<ExpectedProvider>,
     closed: Option<std::rc::Rc<crate::member_original::ClosedMemberReceipt<J, I>>>,
-}
-
-/// Actual old-process roots after SAME-owner rebind. They remain inert and
-/// never enter current provider queries or reread a replaced private journal.
-struct ReboundInventoryEntry<J, I, S> {
-    receipt: std::rc::Rc<crate::member_original::ClosedOldProcessReceipt<J, I>>,
-    entry: RetainedEntry<J, I, S>,
-    pending: Option<PendingEntry<J, I, S>>,
-}
-
-struct ReboundInputs<J, I, S> {
-    source: S,
-    original: crate::member_original::OriginalMemberRead<J, I>,
-    pending: crate::member_original::PendingMemberRead<J, I>,
-    receipt: std::rc::Rc<crate::member_original::ClosedOldProcessReceipt<J, I>>,
-}
-
-/// SAME opaque receipt -> retired and replacement reader provenance, not equal
-/// saved proofs. Caller independently brackets full native/provider/private
-/// state. Retain old roots BEFORE postflight; failure cannot erase obligations.
-fn renew_rebound_entry<
-    J: crate::member_owner::Journal,
-    I: crate::member_owner::MemberIo,
-    S: Clone,
->(
-    context: &Context,
-    entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
-    pending: &mut [Option<PendingEntry<J, I, S>>; 2],
-    history: &mut Vec<ReboundInventoryEntry<J, I, S>>,
-    mut input: ReboundInputs<J, I, S>,
-    same_source: impl Fn(&S, &S) -> bool,
-    mut verify: impl FnMut(&S, &Intent, &NativeProof) -> Result<()>,
-) -> Result<usize> {
-    let receipt = &input.receipt;
-    receipt
-        .verify_replacement_original_read(&input.original)
-        .map_err(|_| Error::Conflict)?;
-    receipt
-        .verify_replacement_pending_read(&input.pending)
-        .map_err(|_| Error::Conflict)?;
-    if !input.pending.matches_live(&input.original) {
-        return Err(Error::Conflict);
-    }
-    let (intent, proof) = input.original.read().map_err(|_| Error::Conflict)?;
-    let running = receipt.running_record();
-    if running.phase != crate::member_owner::Phase::Running
-        || running.intent != intent
-        || running.proof != Some(proof)
-        || running
-            .retired_proof
-            .is_none_or(|old| old.interface != proof.interface || old.process == proof.process)
-    {
-        return Err(Error::Conflict);
-    }
-    let index = pending_index(context, &intent)?;
-    let prior = entries[index].as_ref().ok_or(Error::Conflict)?;
-    if prior.closed.is_some() || !same_source(&prior.source, &input.source) {
-        return Err(Error::Conflict);
-    }
-    receipt
-        .verify_retired_original_read(&prior.original)
-        .map_err(|_| Error::Conflict)?;
-    if validate_member_binding(context, &intent, &proof, &prior.provider)? != index {
-        return Err(Error::Conflict);
-    }
-    if let Some(old) = &pending[index] {
-        if old.closed.is_some()
-            || !same_source(&old.source, &input.source)
-            || old.captured.as_ref().is_some_and(|p| p != &prior.provider)
-        {
-            return Err(Error::Conflict);
-        }
-        receipt
-            .verify_retired_pending_read(&old.original)
-            .map_err(|_| Error::Conflict)?;
-    }
-    verify(&input.source, &intent, &proof)?;
-    if input.original.read().map_err(|_| Error::Conflict)? != (intent.clone(), proof) {
-        return Err(Error::Conflict);
-    }
-    history.try_reserve(1).map_err(|_| Error::Pending)?;
-    let provider = prior.provider.clone();
-    let source = input.source.clone();
-    let new_pending = PendingEntry {
-        source: input.source,
-        original: input.pending,
-        captured: Some(provider.clone()),
-        closed: None,
-    };
-    // Caller supplies no clonable native owner. Source clones retain only the
-    // same signed source pins, never SCM/process mutation authority.
-    let old = entries[index].take().ok_or(Error::Conflict)?;
-    history.push(ReboundInventoryEntry {
-        receipt: input.receipt,
-        entry: old,
-        pending: pending[index].take(),
-    });
-    pending[index] = Some(new_pending);
-    entries[index] = Some(RetainedEntry {
-        source,
-        original: input.original,
-        provider,
-        closed: None,
-    });
-    let current = entries[index].as_mut().ok_or(Error::Conflict)?;
-    verify(&current.source, &intent, &proof)?;
-    if current.original.read().map_err(|_| Error::Conflict)? != (intent, proof) {
-        return Err(Error::Conflict);
-    }
-    Ok(index)
 }
 
 /// Inert historical roots kept after an explicitly acknowledged generation
@@ -1084,16 +934,6 @@ pub(crate) mod native {
         pub supervisor: &'a super::super::member_native_deadline::NativeDeadline,
     }
 
-    pub(crate) struct NativeRebindPublication<'a> {
-        pub source: &'a Rc<super::super::member_carrier_runtime::native::NativeSourceRead>,
-        pub receipt: &'a Rc<
-            super::super::member_carrier_member_controller::native::NativeMemberRebindReceipt,
-        >,
-        pub pair: &'a super::super::member_carrier_pair_store::native_store::NativePairIntentRead,
-        pub expected: &'a crate::member_carrier_pair::Record,
-        pub supervisor: &'a super::super::member_native_deadline::NativeDeadline,
-    }
-
     /// Actual original member owners + original signed sources. The global
     /// provider queries remain separate FULL native reads, not owned filtering.
     /// This object exposes no service/native effects or metadata ACK constructor.
@@ -1105,7 +945,6 @@ pub(crate) mod native {
         pending: [Option<PendingNative>; 2],
         retired: Vec<Retired>,
         retired_generations: Vec<Rc<super::super::member_carrier_member_controller::native::NativeMemberPreparationGeneration>>,
-        rebound: Vec<ReboundInventoryEntry<MemberFiles, NativeMemberIo<MemberFiles>, Rc<MemberSource>>>,
     }
 
     /// Read-only shared retention of the actual inventory. The failure signal
@@ -1117,169 +956,6 @@ pub(crate) mod native {
     }
 
     impl MemberInventoryRead {
-        /// Explicit SAME-owner process-reader publication. No owner/SCM/NIC is
-        /// recovered from saved metadata. The caller roots its original native
-        /// ACK before invoking us and performs mandatory resource G afterwards.
-        pub(crate) fn publish_rebind(
-            &self,
-            source: Rc<MemberSource>,
-            original: MemberRead,
-            pending: Pending,
-            input: NativeRebindPublication<'_>,
-        ) -> Result<()> {
-            self.health.forward(|| {
-                let (context, runtime) = {
-                    let inventory = self.inventory.try_borrow().map_err(|_| Error::Conflict)?;
-                    (inventory.context.clone(), inventory.runtime.read_pin()?)
-                };
-                let index = pending_index(&context, &input.receipt.running_record().intent)?;
-                let old = input.expected.members[index]
-                    .as_ref()
-                    .ok_or(Error::Conflict)?;
-                let running = input.receipt.running_record();
-                if old.owner.intent != running.intent
-                    || running.retired_proof != old.owner.proof
-                    || running.proof.is_none_or(|p| {
-                        Some(p.interface) != old.owner.proof.map(|old| old.interface)
-                    })
-                {
-                    return Err(Error::Conflict);
-                }
-                let verify_pair = || -> Result<()> {
-                    input
-                        .pair
-                        .inspect_effect(
-                            &runtime,
-                            input.supervisor,
-                            input.expected,
-                            crate::member_carrier_pair::Effect::Rebind(if index == 0 {
-                                nelomai_client_tunnel::redundancy::Slot::A
-                            } else {
-                                nelomai_client_tunnel::redundancy::Slot::B
-                            }),
-                            |_| Ok(()),
-                        )
-                        .map_err(|_| Error::Conflict)
-                };
-                verify_pair()?;
-                input
-                    .source
-                    .inspect_inventory_renewal_carrier(&context, &runtime, self, |carrier| {
-                        let mut inventory = self
-                            .inventory
-                            .try_borrow_mut()
-                            .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)?;
-                        let run = || -> Result<()> {
-                            let before = inventory.revision()?;
-                            rebind_registration(
-                                &context,
-                                Record::decode(&before)?.phase,
-                                input.expected,
-                                index,
-                            )?;
-                            if !source.matches_carrier(&inventory.carrier)
-                                || Some(crate::member_owner::InterfaceProof {
-                                    guid: carrier.identity.guid,
-                                    index: carrier.identity.index,
-                                    luid: carrier.identity.luid,
-                                }) != input.expected.carrier
-                            {
-                                return Err(Error::Conflict);
-                            }
-                            // Old process aliases are intentionally retired. Only
-                            // its opaque receipt verifies that target; the other
-                            // live member is freshly read through its actual owner.
-                            let mut providers = Vec::with_capacity(2);
-                            for (n, entry) in inventory.entries.iter_mut().enumerate() {
-                                let entry = entry.as_mut().ok_or(Error::Conflict)?;
-                                if entry.closed.is_some() {
-                                    return Err(Error::Conflict);
-                                }
-                                if n == index {
-                                    input
-                                        .receipt
-                                        .verify_retired_original_read(&entry.original)
-                                        .map_err(|_| Error::Conflict)?;
-                                } else {
-                                    let (intent, proof) =
-                                        entry.original.read().map_err(|_| Error::Conflict)?;
-                                    if input.expected.members[n].as_ref().is_none_or(|m| {
-                                        m.owner.intent != intent || m.owner.proof != Some(proof)
-                                    }) {
-                                        return Err(Error::Conflict);
-                                    }
-                                    runtime.verify_member_intent(
-                                        &context,
-                                        &entry.source,
-                                        &intent,
-                                    )?;
-                                    if native_identity(&proof, entry.source.transport())?
-                                        != entry.provider
-                                    {
-                                        return Err(Error::Conflict);
-                                    }
-                                }
-                                providers.push(entry.provider.clone());
-                            }
-                            let complete = complete_provider_inputs(
-                                &context,
-                                std::slice::from_ref(carrier),
-                                &providers,
-                            )?;
-                            let sdk_before =
-                                super::super::member_carrier_provider::native::inspect_mixed(
-                                    &complete,
-                                )
-                                .map_err(|_| Error::Native)?;
-                            verify_pair()?;
-                            let MemberInventory {
-                                entries,
-                                pending: current_pending,
-                                rebound,
-                                ..
-                            } = &mut *inventory;
-                            renew_rebound_entry(
-                                &context,
-                                entries,
-                                current_pending,
-                                rebound,
-                                ReboundInputs {
-                                    source,
-                                    original,
-                                    pending,
-                                    receipt: input.receipt.clone(),
-                                },
-                                Rc::ptr_eq,
-                                |source, intent, proof| {
-                                    runtime.verify_member_intent(&context, source, intent)?;
-                                    let provider = native_identity(proof, source.transport())?;
-                                    if validate_member_binding(&context, intent, proof, &provider)?
-                                        != index
-                                        || provider != providers[index]
-                                    {
-                                        return Err(Error::Conflict);
-                                    }
-                                    Ok(())
-                                },
-                            )?;
-                            if inventory.read_all_inner()? != providers
-                                || super::super::member_carrier_provider::native::inspect_mixed(
-                                    &complete,
-                                )
-                                .map_err(|_| Error::Native)?
-                                    != sdk_before
-                                || inventory.revision()? != before
-                            {
-                                return Err(Error::Conflict);
-                            }
-                            verify_pair()
-                        };
-                        run().map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
-                    })
-                    .map_err(|_| Error::Conflict)?;
-                verify_pair()
-            })
-        }
         /// Exact original aliases only, never equal metadata or a native ACK.
         pub(crate) fn same_original(&self, other: &Self) -> bool {
             Rc::ptr_eq(&self.inventory, &other.inventory) && Rc::ptr_eq(&self.health, &other.health)
@@ -1306,7 +982,6 @@ pub(crate) mod native {
                 || inventory.pending.iter().any(Option::is_some)
                 || !inventory.retired.is_empty()
                 || !inventory.retired_generations.is_empty()
-                || !inventory.rebound.is_empty()
             {
                 return Err(Error::Conflict);
             }
@@ -1937,7 +1612,6 @@ pub(crate) mod native {
                 pending: [None, None],
                 retired: Vec::new(),
                 retired_generations: Vec::new(),
-                rebound: Vec::new(),
             };
             inventory.revision()?;
             Ok(MemberInventoryRead {

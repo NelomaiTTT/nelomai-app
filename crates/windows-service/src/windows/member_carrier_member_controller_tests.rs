@@ -1309,60 +1309,6 @@ fn unknown_native_or_journal_outcome_remains_pending_not_completion() {
     );
 }
 
-#[test]
-fn rebound_record_requires_exact_old_origin_interface_and_new_process() {
-    use crate::{member_carrier_pair as pair, member_owner as owner};
-    use nelomai_client_tunnel::redundancy::Slot;
-    let (context, mut expected, _) = operation_fixture();
-    let old = owner::NativeProof {
-        process: owner::ProcessProof {
-            pid: 51,
-            creation_time: 61,
-        },
-        interface: owner::InterfaceProof {
-            index: 21,
-            luid: 31,
-            guid: [2; 16],
-        },
-    };
-    expected.phase = pair::Phase::Running;
-    expected.active = Some(Slot::A);
-    expected.operation = Some(pair::Operation::Rebind);
-    expected.pending = Some(pair::Effect::Rebind(Slot::A));
-    expected.network = Some(pair::NetworkState {
-        baseline: pair::NetworkSnapshot {
-            routes: vec![],
-            dns: None,
-        },
-        current: pair::NetworkSnapshot {
-            routes: vec![],
-            dns: None,
-        },
-        pending: None,
-    });
-    let prior = expected.members[0].as_mut().unwrap();
-    prior.owner.phase = owner::Phase::Running;
-    prior.owner.proof = Some(old);
-    let prior = prior.owner.clone();
-    let mut next = prior.clone();
-    next.retired_proof = Some(old);
-    next.proof.as_mut().unwrap().process.creation_time += 1;
-    validate_rebound_record(&context, &expected, &prior, &next).unwrap();
-    for fault in 0..7 {
-        let mut wrong = next.clone();
-        match fault {
-            0 => wrong.retired_proof = None,
-            1 => wrong.proof.as_mut().unwrap().process = old.process,
-            2 => wrong.proof.as_mut().unwrap().interface.index += 1,
-            3 => wrong.intent.scope.connection_generation += 1,
-            4 => wrong.intent.config_sha256 = [5; 32],
-            5 => wrong.phase = owner::Phase::Prepared,
-            _ => wrong.proof.as_mut().unwrap().interface.luid += 1,
-        }
-        assert!(validate_rebound_record(&context, &expected, &prior, &wrong).is_err());
-    }
-}
-
 fn operation_fixture() -> (
     crate::member_carrier_native_ownership::Context,
     crate::member_carrier_pair::Record,
@@ -1535,13 +1481,6 @@ fn controller_retirement_accepts_only_exact_running_target_other_active() {
     r.validate().unwrap();
     validate_member_operation(&c, &r, &intent, MemberOperation::Retire).unwrap();
     let running = &r.members[0].as_ref().unwrap().owner;
-    let mut rebind = r.clone();
-    rebind.operation = Some(pair::Operation::Rebind);
-    rebind.pending = Some(pair::Effect::Rebind(Slot::A));
-    validate_rebind_operation(&c, &rebind, &intent).unwrap();
-    assert!(validate_rebind_operation(&c, &r, &intent).is_err());
-    rebind.pending = Some(pair::Effect::Rebind(Slot::B));
-    assert!(validate_rebind_operation(&c, &rebind, &intent).is_err());
     validate_original_observation(&c, &r, running, &(intent.clone(), proof)).unwrap();
     let mut replacement = proof;
     replacement.process.creation_time += 1;
