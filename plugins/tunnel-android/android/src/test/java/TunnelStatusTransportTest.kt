@@ -30,6 +30,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowBinder
 import org.robolectric.util.ReflectionHelpers
 import ru.nelomai.runtime.v1.RuntimeServiceIntents
@@ -371,6 +372,66 @@ class TunnelStatusTransportTest {
         }
     }
 
+    private fun parcelledMessage(reply: ResultReceiver, change: (Message) -> Unit = {}): Message {
+        val request = message(reply).also(change)
+        val parcel = Parcel.obtain()
+        try {
+            parcel.writeBundle(request.data)
+            parcel.setDataPosition(0)
+            // On-device Messenger defaults to a boot loader that cannot see
+            // runtime classes. Robolectric's default can see test/app classes,
+            // so model only that visibility boundary; Parcel remains real.
+            val bootLoader = object : ClassLoader(ResultReceiver::class.java.classLoader) {
+                override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                    if (name.startsWith("ru.nelomai.")) throw ClassNotFoundException(name)
+                    return super.loadClass(name, resolve)
+                }
+            }
+            request.data = parcel.readBundle(bootLoader)!!
+            return request
+        } finally { parcel.recycle() }
+    }
+
+    @Test
+    @Config(shadows = [ParcelResultReceiver::class])
+    fun parcelledReplyReceivesFreshRunningAndStoppedStatusWithoutTimeout() {
+        val host = Host()
+        val states = mutableListOf<String?>()
+        val reply = object : ResultReceiver(Handler(Looper.getMainLooper())) {
+            override fun onReceiveResult(code: Int, data: Bundle?) {
+                assertEquals(SERVICE_RESULT_OK, code)
+                states.add(data?.getString(EXTRA_STATE))
+            }
+        }
+        host.state = SessionState.RUNNING
+        host.endpoint.messenger.send(parcelledMessage(reply))
+        shadowOf(Looper.getMainLooper()).idle()
+        host.state = SessionState.STOPPED
+        host.endpoint.messenger.send(parcelledMessage(reply))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(listOf("running", "stopped"), states)
+        assertEquals(2, host.observations)
+    }
+
+    @Test
+    @Config(shadows = [ParcelResultReceiver::class])
+    fun parcelledReplyStillRejectsStaleGenerationAndRuntime() {
+        val host = Host()
+        val errors = mutableListOf<String?>()
+        val reply = object : ResultReceiver(Handler(Looper.getMainLooper())) {
+            override fun onReceiveResult(code: Int, data: Bundle?) {
+                assertEquals(SERVICE_RESULT_ERROR, code)
+                errors.add(data?.getString(EXTRA_ERROR_CODE))
+            }
+        }
+        host.endpoint.messenger.send(parcelledMessage(reply) { it.data.putLong(EXTRA_STATUS_GENERATION, 43) })
+        host.endpoint.messenger.send(parcelledMessage(reply) { it.data.putString(EXTRA_STATUS_RUNTIME, "old/runtime") })
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(listOf(STATUS_ENDPOINT_UNAVAILABLE, STATUS_ENDPOINT_UNAVAILABLE), errors)
+        assertEquals(0, host.observations)
+        assertEquals(0, host.verifyCalls)
+    }
+
     @Test fun wrongUidIsDroppedBeforeDeserializationAndWrongApiNeverObserves() {
         val host = Host()
         var errors = 0
@@ -535,6 +596,12 @@ class TunnelStatusTransportTest {
         } finally { child.delete(); projectionFile.delete() }
     }
 }
+
+// Robolectric's default ShadowResultReceiver invokes onReceiveResult locally,
+// dropping replies on deserialized receivers. Keep the actual framework Binder
+// send implementation for tests that cross a Parcel boundary.
+@Implements(ResultReceiver::class)
+class ParcelResultReceiver
 
 class ExplodingParcelable : Parcelable {
     override fun describeContents() = 0

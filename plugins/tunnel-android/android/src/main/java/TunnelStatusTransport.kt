@@ -41,6 +41,9 @@ internal class TunnelStatusEndpoint(
             var reply: ResultReceiver? = null
             try {
                 val data = message.data
+                // Messenger does not supply our runtime loader. The caller's
+                // ResultReceiver subclass must be resolved before unparcelling.
+                data.classLoader = TunnelStatusEndpoint::class.java.classLoader
                 @Suppress("DEPRECATION")
                 val receiver = data.getParcelable<android.os.Parcelable>(EXTRA_RESULT_RECEIVER) as? ResultReceiver
                     ?: return
