@@ -6923,35 +6923,43 @@ pub(crate) mod native {
             expected: &pair::NetworkSnapshot,
             desired: &pair::NetworkSnapshot,
         ) -> io::Result<()> {
-            self.in_call(record, |this, pin| {
+            let exchange = |this: &mut Self, pin: &Rc<NativePairIntentRead>, dns: bool| {
                 let n = record.network.as_ref().ok_or_else(conflict)?;
                 if &n.current != expected || n.pending.as_ref() != Some(desired) {
                     return Err(conflict());
                 }
-                let intent = Rc::new(
-                    this.roots()?
-                        .store
-                        .try_borrow_mut()
-                        .map_err(denied)?
-                        .network_intent(record)
-                        .inspect_err(|_error| {
-                            #[cfg(test)]
-                            trace_step(&format!("exchange_network network_intent error={_error}"));
-                        })?,
-                );
-                this.network_intents.push(intent.clone()); // retain before gate read
+                let gate = this.roots()?.network_gate.clone();
+                gate.select_pair_intent(
+                    pin.clone(),
+                    || {
+                        let intent = Rc::new(
+                            this.roots()?
+                                .store
+                                .try_borrow_mut()
+                                .map_err(denied)?
+                                .network_intent(record)
+                                .inspect_err(|_error| {
+                                    #[cfg(test)]
+                                    trace_step(&format!(
+                                        "exchange_network network_intent error={_error}"
+                                    ));
+                                })?,
+                        );
+                        this.network_intents.push(intent.clone()); // retain before gate read
+                        Ok(intent)
+                    },
+                    record.clone(),
+                )
+                .inspect_err(|_error| {
+                    #[cfg(test)]
+                    trace_step(&format!(
+                        "exchange_network select_pair_intent error={_error}"
+                    ));
+                })?;
                 let r = this.roots()?;
-                r.network_gate
-                    .select_pair_intent(pin.clone(), intent, record.clone())
-                    .inspect_err(|_error| {
-                        #[cfg(test)]
-                        trace_step(&format!(
-                            "exchange_network select_pair_intent error={_error}"
-                        ));
-                    })?;
                 if record.phase == pair::Phase::Closing {
                     r.network_owner
-                        .cleanup(this.closing.as_ref().ok_or_else(conflict)?.clone())
+                        .cleanup(this.closing.as_ref().ok_or_else(conflict)?.clone(), dns)
                 } else {
                     let active = network_active(record.active, record.operation)?;
                     r.network_owner.select(
@@ -6971,6 +6979,32 @@ pub(crate) mod native {
                         "exchange_network owner select/cleanup error={_error}"
                     ));
                 })
+            };
+            if record.phase != pair::Phase::Closing {
+                return self.in_call(record, |this, pin| exchange(this, pin, false));
+            }
+            let serial = self.serial.clone();
+            serial.run(true, || {
+                let pin = self.current(record)?;
+                let context = self.roots()?.context.clone();
+                let supervisor = self.roots()?.pins.supervisor.clone();
+                if self.closing.is_none() && !self.closing_attempted {
+                    let r = self.roots_mut()?;
+                    r.assembly
+                        .begin_cleanup(&mut r.lock, &r.runtime, &pin)
+                        .map_err(denied)?;
+                }
+                // DNS ACK/publication and whole-window postflight complete
+                // before routes enter their own Calling under this SAME flight.
+                for dns in [true, false] {
+                    supervisor
+                        .run_cleanup(&context, &pin, || {
+                            self.capture_closing(&pin, record).map_err(carrier_denied)?;
+                            exchange(self, &pin, dns).map_err(carrier_denied)
+                        })
+                        .map_err(denied)?;
+                }
+                Ok(())
             })
         }
 

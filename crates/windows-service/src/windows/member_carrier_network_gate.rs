@@ -1973,7 +1973,7 @@ pub(crate) mod native {
         pub(crate) fn select_pair_intent(
             &self,
             original_pair: Rc<NativePairIntentRead>,
-            original_network: Rc<NativeNetworkIntentRead>,
+            original_network: impl FnOnce() -> io::Result<Rc<NativeNetworkIntentRead>>,
             expected: pair::Record,
         ) -> io::Result<()> {
             let cleanup = expected.phase == pair::Phase::Closing;
@@ -1984,16 +1984,20 @@ pub(crate) mod native {
                     || (expected.revision == old.record.revision
                         && (expected != old.record
                             || !Rc::ptr_eq(&original_pair, &old.pair)
-                            || old
-                                .network
-                                .as_ref()
-                                .is_none_or(|old| !Rc::ptr_eq(&original_network, old))))
+                            || old.network.is_none()))
                     || (old.record.phase == pair::Phase::Closing && !cleanup)
                     || expected.options != old.record.options
                     || expected.dns != old.record.dns
                 {
                     return Err(conflict());
                 }
+                // Same pending revision keeps the actual original across DNS,
+                // routes and retry. A newly minted equal intent is no substitute.
+                let original_network = if expected.revision == old.record.revision {
+                    old.network.as_ref().ok_or_else(conflict)?.clone()
+                } else {
+                    original_network()?
+                };
                 let next = Selected {
                     pair: original_pair,
                     network: Some(original_network),

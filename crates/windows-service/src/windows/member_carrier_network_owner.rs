@@ -1187,7 +1187,7 @@ pub(crate) mod native {
                 Ok(())
             })
         }
-        pub(crate) fn cleanup(&self, closing: Rc<NativeClosingRead>) -> io::Result<()> {
+        pub(crate) fn cleanup(&self, closing: Rc<NativeClosingRead>, dns: bool) -> io::Result<()> {
             self.operation(true, |s| {
                 self.pins.gate.bind_originals(
                     &self.pins.source,
@@ -1243,22 +1243,27 @@ pub(crate) mod native {
                         Ok(())
                     });
                 }
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "network DNS cleanup begin",
-                );
-                s.dns.cleanup()?;
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step("network DNS cleanup end");
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "network routes cleanup begin",
-                );
-                s.routes.cleanup()?;
-                #[cfg(test)]
-                super::super::member_carrier_factory_test_os::trace_step(
-                    "network routes cleanup end",
-                );
+                if dns {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "network DNS cleanup begin",
+                    );
+                    s.dns.cleanup()?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "network DNS cleanup end",
+                    );
+                } else {
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "network routes cleanup begin",
+                    );
+                    s.routes.cleanup()?;
+                    #[cfg(test)]
+                    super::super::member_carrier_factory_test_os::trace_step(
+                        "network routes cleanup end",
+                    );
+                }
                 Ok(())
             })
         }

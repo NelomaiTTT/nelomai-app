@@ -181,6 +181,20 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 "surviving original key disposition was not acknowledged: {stderr}"
             );
         }
+        if matches!(case, "primary" | "running-ack") {
+            let mut completed = 0;
+            for after_dns in stderr.split("network DNS cleanup end").skip(1) {
+                let (boundary, _) = after_dns
+                    .split_once("network routes cleanup begin")
+                    .expect("routes must follow completed DNS cleanup");
+                assert!(
+                    boundary.contains("cleanup Calling authentication completed"),
+                    "routes reused the DNS Calling window: {boundary}"
+                );
+                completed += 1;
+            }
+            assert!(completed > 0, "missing actual DNS/routes cleanup evidence");
+        }
         // Keep meaningful native step/ACK evidence on successful runs as well.
         // Authentication remains real; its repeated timing labels need not
         // obscure the actual lifecycle in the parent output.
