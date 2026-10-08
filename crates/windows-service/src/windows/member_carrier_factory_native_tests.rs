@@ -175,6 +175,12 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             stdout.contains("1 passed; 0 failed"),
             "empty child selection at {case}"
         );
+        if case == "absence-table-error" {
+            assert!(
+                stderr.contains("actual native surviving original key disposition ACK"),
+                "surviving original key disposition was not acknowledged: {stderr}"
+            );
+        }
         // Keep meaningful native step/ACK evidence on successful runs as well.
         // Authentication remains real; its repeated timing labels need not
         // obscure the actual lifecycle in the parent output.
@@ -402,7 +408,7 @@ fn carrier_factory_actual_cold_child() {
             assert!(original.snapshot().cleanup_pending);
             fixture.require_retained_precreate_originals();
         }
-        if absence_partial {
+        if absence_partial && !unwind {
             // No adapter/reference attempt: actual original key/module cleanup
             // must complete; process exit is never a substitute release ACK.
             let stopped = stopped.expect("actual post-key/pre-C Stop completion");
@@ -416,9 +422,11 @@ fn carrier_factory_actual_cold_child() {
         }
         assert!(
             stopped.is_err(),
-            "no-C adapter reference became completed Stop"
+            "uncertain pre-create outcome became completed Stop"
         );
         assert!(original.snapshot().cleanup_pending);
+        // An unwind permanently revokes this original supervisor. Retention
+        // passes without declaring cleanup complete or replacing its runtime.
         // No adapter CloseACK exists, and process exit supplies no release ACK.
         std::mem::forget(original);
         std::mem::forget(factory);

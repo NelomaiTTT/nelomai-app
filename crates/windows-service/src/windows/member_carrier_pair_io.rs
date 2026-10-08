@@ -1757,7 +1757,7 @@ pub(crate) mod native {
             &self,
             context: &Context,
             stopped: &pair::Record,
-            retired: &RetiredCarrierRead,
+            provenance: &crate::windows::member_carrier_ready::native::PrepublicationTerminalRead,
             bindings: &Bindings,
             history: &[crate::windows::member_carrier_members::ClosedMemberBinding],
         ) -> io::Result<()> {
@@ -1765,12 +1765,14 @@ pub(crate) mod native {
             if stopped.scope != context.intent.scope
                 || stopped.provenance != context.provenance
                 || bindings.scope != stopped.scope
-                || bindings.carrier.is_none()
                 || !history.is_empty()
             {
                 return Err(conflict());
             }
-            retired
+            match provenance {
+                crate::windows::member_carrier_ready::native::PrepublicationTerminalRead::Published(retired) => {
+                    if bindings.carrier.is_none() { return Err(conflict()); }
+                    retired
                 .inspect_terminal_history_in_bracket(|actual| {
                     if actual != history {
                         return Err(native_denied(()));
@@ -1778,6 +1780,11 @@ pub(crate) mod native {
                     Ok(())
                 })
                 .map_err(denied)?;
+                }
+                crate::windows::member_carrier_ready::native::PrepublicationTerminalRead::Unattempted { .. }
+                    if bindings.carrier.is_none() && bindings.egress.iter().all(Option::is_none) => {}
+                _ => return Err(conflict()),
+            }
             // This is deliberately the stringent original actor-no-graph
             // fence. It says nothing about C/key/module absence or release.
             self.require_unconstructed_originals()
@@ -1921,10 +1928,16 @@ pub(crate) mod native {
             resources: &NativeActorTerminalResources<C, G>,
             context: &Context,
             stopped: &pair::Record,
-            retired: &RetiredCarrierRead,
+            provenance: &crate::windows::member_carrier_ready::native::PrepublicationTerminalRead,
             bindings: &Bindings,
             history: &[crate::windows::member_carrier_members::ClosedMemberBinding],
         ) -> io::Result<()> {
+            let crate::windows::member_carrier_ready::native::PrepublicationTerminalRead::Published(
+                retired,
+            ) = provenance
+            else {
+                return Err(conflict());
+            };
             let locals = self.locals.upgrade().ok_or_else(conflict)?;
             let canonical = self.canonical.upgrade().ok_or_else(conflict)?;
             let delegate = self.delegate.upgrade().ok_or_else(conflict)?;
@@ -1946,7 +1959,7 @@ pub(crate) mod native {
             check()?;
             delegate
                 .try_borrow()?
-                .authorize_in_retired(&original, context, stopped, retired, bindings, history)?;
+                .authorize_in_retired(&original, context, stopped, provenance, bindings, history)?;
             check()
         }
     }
@@ -6501,9 +6514,10 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             let serial = self.serial.clone();
             serial.run(true, || {
-                if carrier_cleanup_route(record, effect, self.roots.is_some())?
-                    != CarrierCleanupRoute::RetainedStartup
-                    || self.full_capture_attempted
+                if !matches!(
+                    carrier_cleanup_route(record, effect, self.roots.is_some())?,
+                    CarrierCleanupRoute::RetainedStartup | CarrierCleanupRoute::NoConstructorRead
+                ) || self.full_capture_attempted
                     || !self.rejected_inputs.is_empty()
                     || self.registered
                     || !self.network_intents.is_empty()
@@ -6545,7 +6559,7 @@ pub(crate) mod native {
             }
             match carrier_cleanup_route(record, effect, self.roots.is_some())? {
                 CarrierCleanupRoute::NoConstructorRead => {
-                    return self.read_no_constructor_cleanup(record).map(|_| ());
+                    return self.cleanup_pregraph_carrier(record, effect);
                 }
                 CarrierCleanupRoute::RetainedStartup => {
                     return self.cleanup_pregraph_carrier(record, effect);
@@ -7538,18 +7552,11 @@ pub(crate) mod native {
         }
 
         pub(crate) fn restore_owned_keys(&mut self, record: &pair::Record) -> io::Result<()> {
-            if self.roots.is_none() && record.carrier.is_none() {
-                require_effect(record, pair::Effect::RestoreKeys)?;
-                return self.read_no_constructor_cleanup(record).map(|_| ());
-            }
             if self.roots.is_none() {
                 let serial = self.serial.clone();
                 return serial.run(true, || {
                     require_effect(record, pair::Effect::RestoreKeys)?;
-                    if record.phase != pair::Phase::Closing
-                        || record.stop_stage != 11
-                        || record.carrier.is_none()
-                    {
+                    if record.phase != pair::Phase::Closing || record.stop_stage != 11 {
                         return Err(conflict());
                     }
                     let pin = self.current(record)?;
@@ -8180,7 +8187,7 @@ pub(crate) mod native {
         pub(crate) fn restore_weak_rows(&mut self, record: &pair::Record) -> io::Result<()> {
             match carrier_cleanup_route(record, pair::Effect::RestoreWeak, self.roots.is_some())? {
                 CarrierCleanupRoute::NoConstructorRead => {
-                    return self.read_no_constructor_cleanup(record).map(|_| ());
+                    return self.cleanup_pregraph_carrier(record, pair::Effect::RestoreWeak);
                 }
                 CarrierCleanupRoute::RetainedStartup => {
                     return self.cleanup_pregraph_carrier(record, pair::Effect::RestoreWeak);

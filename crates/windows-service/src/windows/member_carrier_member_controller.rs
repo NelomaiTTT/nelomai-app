@@ -2010,7 +2010,7 @@ pub(crate) mod native {
                         crate::windows::member_carrier_ready::compare_pregraph_closing_frame(
                             context,
                             expected,
-                            expected.carrier.ok_or(Error::Conflict)?,
+                            expected.carrier,
                         )?;
                         validate_prepublication_unstarted_origin(
                             context, expected, slot, original,
@@ -2025,7 +2025,7 @@ pub(crate) mod native {
                         crate::windows::member_carrier_ready::compare_pregraph_key_restore_frame(
                             context,
                             expected,
-                            expected.carrier.ok_or(Error::Conflict)?,
+                            expected.carrier,
                         )?;
                         validate_prepublication_unstarted_origin(
                             context, expected, slot, original,

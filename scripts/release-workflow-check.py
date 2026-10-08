@@ -82,11 +82,11 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     cases = re.findall(r'"([a-z-]+)"', inventory.group(1))
     parent_count = re.search(r"let expected = match selected\.as_deref\(\) \{(.*?)\};\s*assert_eq!\(completed, expected\);", factory_test, re.DOTALL)
     require(parent_count is not None and " ".join(parent_count.group(1).split()) ==
-            'Some("resolver-reference-error" | "resolver-reference-unwind") => 2, Some(_) => 1, None => cases.len() + 2,',
-            "Actual native parent must require exact resolver/adapter and ordinary child completion counts")
+            'Some("resolver-reference-error" | "resolver-reference-unwind") => 3, Some(_) => 1, None => cases.len() + 4,',
+            "Actual native parent must require exact resolver/adapter/pre-create and ordinary child completion counts")
     harness = (ROOT / "scripts/windows/test-carrier-factory-system.ps1").read_text()
     completion = re.search(r"^ *\$expectedCompleted =.*?^ *\}", harness, re.MULTILINE | re.DOTALL)
-    require(completion is not None and "\n".join(line.strip() for line in completion.group(0).splitlines()) == r"""$expectedCompleted = if ($Case -in @('resolver-reference-error', 'resolver-reference-unwind')) { 2 } else { 1 }
+    require(completion is not None and "\n".join(line.strip() for line in completion.group(0).splitlines()) == r"""$expectedCompleted = if ($Case -in @('resolver-reference-error', 'resolver-reference-unwind')) { 3 } else { 1 }
 if ($output -notmatch ('(?m)^actual native factory coverage case=' + [regex]::Escape($Case) + ' completed=' + $expectedCompleted + '\r?$')) {
 throw 'Missing exact selected factory case completion; no partial-matrix PASS'
 }""", "SYSTEM harness must reject incomplete selected child coverage")

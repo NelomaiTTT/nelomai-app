@@ -560,9 +560,9 @@ pub(crate) mod native {
         release: ClosedReferenceRelease,
     }
     pub(crate) struct NativeCarrierComponentsTerminalRead {
-        reference: std::rc::Rc<NativeKernelReferenceRead>,
-        adapter_reference: Option<std::rc::Rc<NativeKernelReferenceRead>>,
-        session: SessionEndRead,
+        pub(crate) reference: std::rc::Rc<NativeKernelReferenceRead>,
+        pub(crate) adapter_reference: Option<std::rc::Rc<NativeKernelReferenceRead>>,
+        pub(crate) session: SessionEndRead,
     }
     impl NativeCarrierComponentsTerminalRead {
         pub(crate) fn verify_released(&self) -> Result<()> {
@@ -595,7 +595,7 @@ pub(crate) mod native {
             }
             Ok(())
         }
-        fn verify_acquired_original(&self) -> Result<()> {
+        pub(crate) fn verify_acquired_original(&self) -> Result<()> {
             if !self.attempted.get() {
                 return Err(Error::Pending);
             }

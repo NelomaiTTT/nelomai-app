@@ -176,7 +176,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                         capture_output=True)
                 self.assertEqual(result.returncode == 0, build == native == "success")
         with self.assertRaises(RuntimeError):
-            checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 2", "None => cases.len()"))
+            checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 4", "None => cases.len()"))
 
     def expression(self, expression, *, mode, result="success", cancelled=False):
         """Evaluate the boolean/string expressions used by our dispatch graph."""

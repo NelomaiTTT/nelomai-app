@@ -180,6 +180,7 @@ pub(crate) mod native {
         member_carrier_members::ClosedMemberBinding,
         member_carrier_module::native::{NativeModuleReleased, OriginalImage},
         member_carrier_pair_store::native_store::NativePairIntentRead,
+        member_carrier_ready::native::PrepublicationTerminalRead,
         member_carrier_runtime::native::{NativeSourceRead, RetiredCarrierRead},
         member_native_deadline::NativeDeadline,
     };
@@ -208,7 +209,7 @@ pub(crate) mod native {
             resources: &T,
             context: &Context,
             stopped: &pair::Record,
-            retired: &RetiredCarrierRead,
+            retired: &PrepublicationTerminalRead,
             bindings: &Bindings,
             history: &[ClosedMemberBinding],
         ) -> io::Result<()>;
@@ -218,7 +219,7 @@ pub(crate) mod native {
         context: Context,
         runtime: RuntimeRead,
         source: Option<Rc<NativeSourceRead>>,
-        retired: Rc<RetiredCarrierRead>,
+        retired: PrepublicationTerminalRead,
         stopped: Rc<NativePairIntentRead>,
         expected: pair::Record,
         image: Rc<OriginalImage>,
@@ -263,7 +264,7 @@ pub(crate) mod native {
                     context,
                     runtime,
                     source: Some(source),
-                    retired,
+                    retired: PrepublicationTerminalRead::Published(retired),
                     stopped,
                     expected,
                     image,
@@ -285,7 +286,7 @@ pub(crate) mod native {
         pub(crate) fn new_prepublication(
             context: Context,
             runtime: RuntimeRead,
-            retired: Rc<RetiredCarrierRead>,
+            retired: PrepublicationTerminalRead,
             stopped: Rc<NativePairIntentRead>,
             expected: pair::Record,
             image: Rc<OriginalImage>,
@@ -321,7 +322,7 @@ pub(crate) mod native {
                 || self.terminal_call.attempt.tainted.get()
                 || !p.stopped.matches_runtime(&p.runtime)
                 || p.source.as_ref().is_some_and(|source| {
-                    !p.retired.matches_source_origin(source)
+                    !matches!(&p.retired, PrepublicationTerminalRead::Published(retired) if retired.matches_source_origin(source))
                         || source.network_scope() != &p.context.intent.scope
                 })
                 || !p.image.matches_runtime(&p.runtime)
@@ -378,19 +379,27 @@ pub(crate) mod native {
                 // inspector. Its full-empty SDK/history before-after bracket
                 // must return successfully before prepare/unload can proceed.
                 p.retired
-                    .inspect_terminal_bindings_and_history(|bindings, history| {
+                    .inspect_bindings_and_history(true, true, |bindings, history| {
                         if bindings.scope != p.context.intent.scope
-                            || bindings.carrier.as_ref().is_none_or(|c| {
-                                c.identity.scope != p.context.intent.scope
-                                    || c.identity.proof.guid != p.context.bindings[0].guid
-                                    || c.sources
-                                        != p.context
-                                            .intent
-                                            .addresses
-                                            .iter()
-                                            .map(|a| a.addr())
-                                            .collect::<Vec<_>>()
-                            })
+                            || match &p.retired {
+                                PrepublicationTerminalRead::Published(_) => {
+                                    bindings.carrier.as_ref().is_none_or(|c| {
+                                        c.identity.scope != p.context.intent.scope
+                                            || c.identity.proof.guid != p.context.bindings[0].guid
+                                            || c.sources
+                                                != p.context
+                                                    .intent
+                                                    .addresses
+                                                    .iter()
+                                                    .map(|a| a.addr())
+                                                    .collect::<Vec<_>>()
+                                    })
+                                }
+                                PrepublicationTerminalRead::Unattempted { .. } => {
+                                    bindings.carrier.is_some() || !history.is_empty()
+                                }
+                                PrepublicationTerminalRead::Unpublished(_) => true,
+                            }
                         {
                             return Err(crate::windows::member_carrier_wintun::Error::Conflict);
                         }

@@ -1330,12 +1330,12 @@ fn validate_stage(
     Ok(())
 }
 #[derive(Clone, Copy)]
-enum RetiredReadStage {
+pub(crate) enum RetiredReadStage {
     Cleanup,
     KeyRestore,
     Terminal,
 }
-fn validate_retired_read_stage(
+pub(crate) fn validate_retired_read_stage(
     record: &Record,
     context: &Context,
     binding: &Binding,
@@ -4924,7 +4924,7 @@ pub(crate) mod native {
         }
         pub(crate) fn verify_unpublished_closed_original_in_call(
             &self,
-            original: &Rc<UnpublishedClosedCarrierRead>,
+            provenance: &crate::windows::member_carrier_ready::native::PrepublicationTerminalRead,
         ) -> Result<()> {
             let mut call = ClosedHistoryCall {
                 revoked: &self.shared.original.revoked,
@@ -4932,6 +4932,32 @@ pub(crate) mod native {
             };
             let mut owner = self.shared.borrow()?;
             owner.verify_supervised()?;
+            if let crate::windows::member_carrier_ready::native::PrepublicationTerminalRead::Unattempted {
+                scope, runtime, originals, ..
+            } = provenance {
+                if self.role != rows::Role::Carrier
+                    || scope.as_ref() != &owner.scope
+                    || !runtime.same_original_runtime(&owner.runtime)
+                    || !originals.same_original_registry(&owner.observer)
+                    || owner.pending.is_some()
+                    || owner.effect.is_some()
+                    || owner.retirement.is_some()
+                    || owner.released.is_some()
+                    || owner.retired_reader.is_some()
+                    || owner.unpublished_closed_reader.is_some()
+                { return Err(Error::Conflict); }
+                owner.observer.assert_no_creator_for_key_cleanup(&scope.context, &scope.binding)
+                    .map_err(denied)?;
+                if !matches!(owner.observer.snapshot(&scope.context).map_err(denied)?[0], creators::State::Intent | creators::State::Empty) {
+                    return Err(Error::Conflict);
+                }
+                owner.verify_supervised()?;
+                call.succeeded = true;
+                return Ok(());
+            }
+            let crate::windows::member_carrier_ready::native::PrepublicationTerminalRead::Unpublished(original) = provenance else {
+                return Err(Error::Conflict);
+            };
             if self.role != rows::Role::Carrier
                 || original.scope != owner.scope
                 || !original.runtime.same_original_runtime(&owner.runtime)
@@ -5197,6 +5223,7 @@ pub(crate) mod native {
     }
     pub(crate) struct NativeConstructionParts<'r, 'a, G: NativeLifecycleGate + 'a> {
         pub(crate) components: &'r mut Option<CarrierComponents<'a, G>>,
+        pub(crate) components_complete: bool,
     }
     impl<'a, G: NativeLifecycleGate + 'a> NativeConstructionSlot<'a, G> {
         /// Infallible retention of ALL original owning inputs. Invoke this
@@ -5311,9 +5338,11 @@ pub(crate) mod native {
         /// Mutable borrowed originals for the caller's real cleanup composition.
         /// Keep the slot alive on errors; removal/release needs independent ACKs.
         pub(crate) fn retained_parts(&mut self) -> NativeConstructionParts<'_, 'a, G> {
+            let components_complete = self.root.components_complete.get();
             let parts = self.root.retained_parts();
             NativeConstructionParts {
                 components: &mut parts.components,
+                components_complete,
             }
         }
         /// Borrow ONLY the actual original LoadedWintun retained by this slot.
@@ -5892,19 +5921,26 @@ pub(crate) mod native {
                 self.complete_original_close()?;
                 // Actual owning once-close ACK exists before this handoff.
                 // Keep the SAME Rc even when subsequent G/SDK postflight fails.
-                match self
-                    .released
-                    .as_ref()
-                    .ok_or(Error::Pending)?
-                    .cleanup_read_pin()
-                    .map_err(denied)?
+                if let Some(released) = &self.released {
+                    match released.cleanup_read_pin().map_err(denied)? {
+                        creators::ClosedRead::Published(_) => {
+                            self.retain_retired_reader()?;
+                        }
+                        creators::ClosedRead::Unpublished(_) => {
+                            self.retain_unpublished_closed_reader()?;
+                        }
+                    }
+                } else if self.pending.is_some()
+                    || self.effect.is_some()
+                    || self.retirement.is_some()
+                    || !matches!(
+                        self.observer
+                            .snapshot(&self.scope.context)
+                            .map_err(denied)?[0],
+                        creators::State::Intent | creators::State::Empty
+                    )
                 {
-                    creators::ClosedRead::Published(_) => {
-                        self.retain_retired_reader()?;
-                    }
-                    creators::ClosedRead::Unpublished(_) => {
-                        self.retain_unpublished_closed_reader()?;
-                    }
+                    return Err(Error::Pending);
                 }
             }
             // Acquire new recursive lease BEFORE replacing/releasing the old

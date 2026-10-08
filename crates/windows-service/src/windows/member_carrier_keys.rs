@@ -989,6 +989,8 @@ impl<H> OriginalKeyRootObligation<H> {
             .as_ref()
         {
             owned.verify_complete(&self.origin)?;
+            #[cfg(all(windows, test))]
+            eprintln!("actual native surviving original key disposition ACK");
         } else {
             let read = self.sdk_deleted_read()?;
             self.verify_sdk_deleted_read(&read)?;

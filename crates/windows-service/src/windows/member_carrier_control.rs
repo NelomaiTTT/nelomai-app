@@ -180,7 +180,13 @@ impl<'a> NativeCarrierPairFinalizer<'a> {
         actor: &Rc<NativeActorRootHandoff<'a>>,
         scope: &SessionScope,
     ) -> io::Result<()> {
-        if self.attempted_layout != Some(NativeAttemptedTerminalLayout::PublishedCarrierPregraph) {
+        if !matches!(
+            self.attempted_layout,
+            Some(
+                NativeAttemptedTerminalLayout::PublishedCarrierPregraph
+                    | NativeAttemptedTerminalLayout::UnattemptedCarrierPregraph
+            )
+        ) {
             return Err(conflict());
         }
         if !self.actor_released {
@@ -366,7 +372,13 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
             return Err(conflict());
         }
         let actor = self.actor.as_ref().ok_or_else(conflict)?.clone();
-        if self.attempted_layout == Some(NativeAttemptedTerminalLayout::PublishedCarrierPregraph) {
+        if matches!(
+            self.attempted_layout,
+            Some(
+                NativeAttemptedTerminalLayout::PublishedCarrierPregraph
+                    | NativeAttemptedTerminalLayout::UnattemptedCarrierPregraph
+            )
+        ) {
             return self.finish_pregraph(&actor, scope);
         }
         if !self.actor_released {
@@ -436,7 +448,8 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                 return Err(conflict());
             }
             match self.attempted_layout.ok_or_else(conflict)? {
-                NativeAttemptedTerminalLayout::PublishedCarrierPregraph => {
+                NativeAttemptedTerminalLayout::PublishedCarrierPregraph
+                | NativeAttemptedTerminalLayout::UnattemptedCarrierPregraph => {
                     return self.finish_pregraph(&actor, scope);
                 }
                 NativeAttemptedTerminalLayout::GraphAttempted => {}

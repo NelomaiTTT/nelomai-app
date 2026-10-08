@@ -188,7 +188,9 @@ pub(crate) mod native {
                 NativeActorInputs, NativeActorLocalResources, NativeActorTerminalCut,
                 NativeActorTerminalGate, NativeActorTerminalGraph, NativeActorTerminalResources,
             },
-            member_carrier_ready::native::{NativeCarrierRoot, NativeCarrierTerminalResources},
+            member_carrier_ready::native::{
+                NativeCarrierRoot, NativeCarrierTerminalResources, PrepublicationTerminalRead,
+            },
             member_carrier_runtime::native::{
                 NativeConstructionSlot, NativeResourceRowsRead, RetiredCarrierRead,
             },
@@ -488,7 +490,7 @@ pub(crate) mod native {
         pub(crate) runtime: Rc<crate::windows::member_carrier_key_authority::RuntimeRead>,
         pub(crate) source:
             Option<Rc<crate::windows::member_carrier_runtime::native::NativeSourceRead>>,
-        pub(crate) retired: Rc<RetiredCarrierRead>,
+        pub(crate) retired: PrepublicationTerminalRead,
         pub(crate) stopped:
             Rc<crate::windows::member_carrier_pair_store::native_store::NativePairIntentRead>,
         pub(crate) expected: pair::Record,
@@ -608,7 +610,7 @@ pub(crate) mod native {
                             )
                             .map_err(|_| conflict())?;
                     }
-                    // Exactly the actual successful C construction, not a full
+                    // Exactly the actual completed original composition, not a
                     // module-count fallback for zero/unknown/partial constructors.
                     if modules.constructions.len() != 1
                         || !modules.assembly_assets.is_empty()
@@ -617,6 +619,9 @@ pub(crate) mod native {
                         return Err(conflict());
                     }
                     let parts = modules.constructions[0].retained_parts();
+                    if !parts.components_complete {
+                        return Err(conflict());
+                    }
                     let (carrier, _) = parts.components.as_ref().ok_or_else(conflict)?;
                     c.components.push(carrier.terminal_components_read());
                     carrier
@@ -663,12 +668,40 @@ pub(crate) mod native {
             let startup = raw.startup.as_ref().ok_or_else(conflict)?;
             let carrier = raw.carrier.as_ref().ok_or_else(conflict)?;
             let meta = carrier.meta.as_ref().ok_or_else(conflict)?;
-            let retired = carrier
-                .lifecycle
-                .as_ref()
-                .ok_or_else(conflict)?
-                .retired_pin()
-                .map_err(|_| conflict())?;
+            let lifecycle = carrier.lifecycle.as_ref().ok_or_else(conflict)?;
+            let retired = match lifecycle.retired_pin() {
+                Ok(retired) => PrepublicationTerminalRead::Published(retired),
+                Err(crate::member_carrier::CarrierError::Pending)
+                    if matches!(
+                        lifecycle.unpublished_pin(),
+                        Err(crate::member_carrier::CarrierError::Pending)
+                    ) =>
+                {
+                    let components = c.components.first().ok_or_else(conflict)?.clone();
+                    if components.adapter_reference.is_some()
+                        || lifecycle.attempted()
+                        || carrier.source.is_some()
+                        || carrier.proof.is_some()
+                    {
+                        return Err(conflict());
+                    }
+                    components
+                        .session
+                        .verify_never_started()
+                        .map_err(|_| conflict())?;
+                    components.verify_released().map_err(|_| conflict())?;
+                    PrepublicationTerminalRead::Unattempted {
+                        scope: Box::new(meta.scope.clone()),
+                        runtime: meta.runtime.read_pin().map_err(|_| conflict())?,
+                        image: meta.image.clone(),
+                        members: meta.members.read_pin(),
+                        originals: meta.originals.clone(),
+                        components,
+                        supervisor: meta.supervisor.clone(),
+                    }
+                }
+                _ => return Err(conflict()),
+            };
             let stopped = c.pair.as_ref().ok_or_else(conflict)?;
             let expected = c.record.as_ref().ok_or_else(conflict)?;
             crate::windows::member_carrier_terminal_release::compare_terminal(
@@ -682,7 +715,7 @@ pub(crate) mod native {
                 || carrier
                     .source
                     .as_ref()
-                    .is_some_and(|s| !retired.matches_source_origin(s))
+                    .is_some_and(|s| !matches!(&retired, PrepublicationTerminalRead::Published(r) if r.matches_source_origin(s)))
             {
                 return Err(conflict());
             }
@@ -693,7 +726,7 @@ pub(crate) mod native {
                 retired,
                 stopped: stopped.clone(),
                 expected: expected.clone(),
-                image: Rc::new(meta.image.read_pin().map_err(|_| conflict())?),
+                image: meta.image.clone(),
                 supervisor: startup.supervisor.clone(),
             })
         }
@@ -706,7 +739,7 @@ pub(crate) mod native {
             c.keys_call.run(|| pins.supervisor.run_terminal_cleanup(&pins.context, &pins.stopped, &pins.expected, || {
                 pins.stopped.inspect(&pins.runtime, &pins.supervisor, |record| {
                     if record != &pins.expected { return Err(conflict()); }
-                    pins.retired.inspect_terminal_bindings_and_history(|bindings, history| {
+                    pins.retired.inspect_bindings_and_history(true, true, |bindings, history| {
                         verify_pregraph_resource_facts(c, &pins.context, record, &pins.retired, bindings, history).map_err(|_| native_wintun_conflict())?;
                         let raw = c.startup.as_ref().ok_or_else(native_wintun_conflict)?;
                         let assembly = raw.assembly.as_ref().ok_or_else(native_wintun_conflict)?;
@@ -744,7 +777,7 @@ pub(crate) mod native {
                                     return Err(conflict());
                                 }
                                 pins.retired
-                                    .inspect_terminal_bindings_and_history(|bindings, history| {
+                                    .inspect_bindings_and_history(true, true, |bindings, history| {
                                         verify_pregraph_resource_facts(
                                             c,
                                             &pins.context,
@@ -754,15 +787,23 @@ pub(crate) mod native {
                                             history,
                                         )
                                         .map_err(|_| native_wintun_conflict())?;
-                                        pins.retired
-                                            .release_adapter_reference_in_terminal_bracket(
+                                        match &pins.retired {
+                                        PrepublicationTerminalRead::Published(retired) => retired.release_adapter_reference_in_terminal_bracket(
                                                 &pins.stopped,
                                                 record,
                                                 |ack| {
                                                     retain_same_receipt(&c.adapter, ack)
                                                         .map_err(|_| native_wintun_conflict())
                                                 },
-                                            )?;
+                                            )?,
+                                        PrepublicationTerminalRead::Unattempted { components, .. } => {
+                                            if components.adapter_reference.is_some() || c.adapter.try_borrow().map_err(|_| native_wintun_conflict())?.is_some() {
+                                                return Err(native_wintun_conflict());
+                                            }
+                                            components.verify_released()?;
+                                        }
+                                        _ => return Err(native_wintun_conflict()),
+                                        }
                                         Ok(())
                                     })
                                     .map_err(|_| conflict())
@@ -821,16 +862,46 @@ pub(crate) mod native {
         let startup = raw.startup.as_ref().ok_or_else(conflict)?;
         let carrier = raw.carrier.as_ref().ok_or_else(conflict)?;
         let meta = carrier.meta.as_ref().ok_or_else(conflict)?;
-        let retired = carrier
-            .lifecycle
-            .as_ref()
-            .ok_or_else(conflict)?
-            .retired_pin()
-            .map_err(|_| conflict())?;
+        let lifecycle = carrier.lifecycle.as_ref().ok_or_else(conflict)?;
+        let same_origin = match &pins.retired {
+            PrepublicationTerminalRead::Published(retired) => lifecycle
+                .retired_pin()
+                .is_ok_and(|r| Rc::ptr_eq(&r, retired)),
+            PrepublicationTerminalRead::Unattempted {
+                scope,
+                runtime,
+                originals,
+                components,
+                supervisor,
+                members,
+                image,
+            } => {
+                !lifecycle.attempted()
+                    && matches!(
+                        lifecycle.retired_pin(),
+                        Err(crate::member_carrier::CarrierError::Pending)
+                    )
+                    && matches!(
+                        lifecycle.unpublished_pin(),
+                        Err(crate::member_carrier::CarrierError::Pending)
+                    )
+                    && scope.as_ref() == &meta.scope
+                    && runtime.same_original_runtime(&meta.runtime)
+                    && originals.same_original_registry(&meta.originals)
+                    && Rc::ptr_eq(supervisor, &meta.supervisor)
+                    && members.same_original(&meta.members)
+                    && image.matches_runtime(&meta.runtime)
+                    && components.adapter_reference.is_none()
+                    && c.components
+                        .first()
+                        .is_some_and(|actual| actual.reference.same_original(&components.reference))
+            }
+            _ => false,
+        };
         if startup.context != pins.context
             || !Rc::ptr_eq(&startup.runtime, &pins.runtime)
             || !Rc::ptr_eq(&startup.supervisor, &pins.supervisor)
-            || !Rc::ptr_eq(&retired, &pins.retired)
+            || !same_origin
             || c.pair
                 .as_ref()
                 .is_none_or(|p| !Rc::ptr_eq(p, &pins.stopped))
@@ -838,6 +909,8 @@ pub(crate) mod native {
             || !meta.runtime.same_original_runtime(&pins.runtime)
             || !meta.image.matches_runtime(&pins.runtime)
             || !pins.image.matches_runtime(&pins.runtime)
+            || pins.source.is_some()
+                && !matches!(&pins.retired, PrepublicationTerminalRead::Published(_))
             || match (&carrier.source, &pins.source) {
                 (Some(a), Some(b)) => !Rc::ptr_eq(a, b),
                 (None, None) => false,
@@ -852,7 +925,7 @@ pub(crate) mod native {
         c: &NativePregraphTerminalResources<'_>,
         context: &Context,
         stopped: &pair::Record,
-        retired: &RetiredCarrierRead,
+        retired: &PrepublicationTerminalRead,
         bindings: &Bindings,
         history: &[ClosedMemberBinding],
     ) -> io::Result<()> {
@@ -1076,7 +1149,10 @@ pub(crate) mod native {
                             pins.context,
                             runtime,
                             source,
-                            pins.retired,
+                            match pins.retired {
+                                PrepublicationTerminalRead::Published(retired) => retired,
+                                _ => unreachable!("verified source requires published original"),
+                            },
                             pins.stopped,
                             pins.expected,
                             pins.image,
@@ -1134,7 +1210,7 @@ pub(crate) mod native {
             c: &NativePregraphTerminalResources<'a>,
             context: &Context,
             stopped: &pair::Record,
-            retired: &RetiredCarrierRead,
+            retired: &PrepublicationTerminalRead,
             bindings: &Bindings,
             history: &[ClosedMemberBinding],
         ) -> io::Result<()> {
@@ -1152,13 +1228,22 @@ pub(crate) mod native {
             verify_pregraph_key_originals(c)?;
             require_pregraph_key_roots_disposed(c)?;
             let adapter = c.adapter.try_borrow().map_err(|_| conflict())?;
-            retired
-                .verify_adapter_reference_in_terminal_bracket(
-                    c.pair.as_ref().ok_or_else(conflict)?,
-                    stopped,
-                    adapter.as_ref().ok_or_else(conflict)?,
-                )
-                .map_err(|_| conflict())?;
+            match retired {
+                PrepublicationTerminalRead::Published(retired) => retired
+                    .verify_adapter_reference_in_terminal_bracket(
+                        c.pair.as_ref().ok_or_else(conflict)?,
+                        stopped,
+                        adapter.as_ref().ok_or_else(conflict)?,
+                    )
+                    .map_err(|_| conflict())?,
+                PrepublicationTerminalRead::Unattempted { components, .. } => {
+                    if adapter.is_some() || components.adapter_reference.is_some() {
+                        return Err(conflict());
+                    }
+                    components.verify_released().map_err(|_| conflict())?;
+                }
+                _ => return Err(conflict()),
+            }
             c.components[0].verify_released().map_err(|_| conflict())?;
             for raw in &c.bootstrap_cuts {
                 let raw = raw.try_borrow().map_err(|_| conflict())?;
@@ -2410,10 +2495,13 @@ pub(crate) mod native {
             c: &NativeCanonicalTerminalResources<'_>,
             context: &Context,
             stopped: &pair::Record,
-            retired: &RetiredCarrierRead,
+            provenance: &PrepublicationTerminalRead,
             bindings: &Bindings,
             history: &[ClosedMemberBinding],
         ) -> io::Result<()> {
+            let PrepublicationTerminalRead::Published(retired) = provenance else {
+                return Err(conflict());
+            };
             let complete = self.complete.upgrade().ok_or_else(conflict)?;
             complete.verify()?;
             let published = self.published.upgrade().ok_or_else(conflict)?;
@@ -2488,7 +2576,7 @@ pub(crate) mod native {
                     .find(|(original, _)| Rc::ptr_eq(original, &guard))
                     .ok_or_else(conflict)?;
                 if ack.expected_stopped() != stopped
-                    || !std::ptr::eq(ack.original_retired().as_ref(), retired)
+                    || !std::ptr::eq(ack.original_retired().as_ref(), retired.as_ref())
                 {
                     return Err(conflict());
                 }

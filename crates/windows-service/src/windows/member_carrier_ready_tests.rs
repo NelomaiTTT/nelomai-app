@@ -1147,6 +1147,27 @@ fn key_restore_attestation_selects_before_and_after_actual_native_receipt() {
             "fault {fault}"
         );
     }
+    // A real pre-C failure owns only the carrier key. Member keys were never
+    // acquired; ordinary cleanup publishes their absent obligations as Clean.
+    record.carrier = None;
+    native.phase = n::Phase::Closing;
+    native.keys[0].phase = n::KeyPhase::Disabled;
+    native.keys[0].current = n::Value::DwordZero;
+    for key in &mut native.keys[1..] {
+        key.phase = n::KeyPhase::Unstarted;
+        key.new_key_ack = false;
+    }
+    assert!(!key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    native.keys[0].phase = n::KeyPhase::RestorePending;
+    native.keys[0].pending = Some(n::Value::Absent);
+    assert!(!key_restore_read_is_terminal(&context, &record, &native).unwrap());
+    native.phase = n::Phase::Stopped;
+    for key in &mut native.keys {
+        key.phase = n::KeyPhase::Clean;
+        key.current = n::Value::Absent;
+        key.pending = None;
+    }
+    assert!(key_restore_read_is_terminal(&context, &record, &native).unwrap());
 }
 
 #[test]

@@ -185,6 +185,8 @@ struct StartupInvocationLedger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeAttemptedTerminalLayout {
     PublishedCarrierPregraph,
+    #[cfg(windows)]
+    UnattemptedCarrierPregraph,
     GraphAttempted,
     OtherAttempted,
 }
@@ -1181,6 +1183,9 @@ pub(crate) mod native {
         retired: Option<
             std::rc::Weak<crate::windows::member_carrier_runtime::native::RetiredCarrierRead>,
         >,
+        unattempted: Option<
+            std::rc::Weak<crate::windows::member_carrier_wintun::native::NativeKernelReferenceRead>,
+        >,
     }
     impl NativeStartupAttemptedTerminal {
         /// PURE discriminator, not SDK absence/resource/unload permission.
@@ -1200,13 +1205,29 @@ pub(crate) mod native {
                 .transpose()?
                 .is_some();
             let invocation = self.invocation.upgrade().ok_or(Error::Retired)?;
-            let layout = classify_attempted_layout(
+            let mut layout = classify_attempted_layout(
                 &invocation,
                 self.create,
                 self.attach,
                 graph.construction_attempted.get(),
                 published,
             )?;
+            if let Some(reference) = &self.unattempted {
+                if published
+                    || self.attach
+                    || graph.construction_attempted.get()
+                    || self.expected.carrier.is_some()
+                    || layout != NativeAttemptedTerminalLayout::OtherAttempted
+                {
+                    return Err(Error::Conflict);
+                }
+                reference
+                    .upgrade()
+                    .ok_or(Error::Retired)?
+                    .verify_released()
+                    .map_err(|_| Error::Conflict)?;
+                layout = NativeAttemptedTerminalLayout::UnattemptedCarrierPregraph;
+            }
             if layout != self.layout {
                 return Err(Error::Conflict);
             }
@@ -3729,7 +3750,14 @@ pub(crate) mod native {
                     .construction_attempted
                     .get()
             {
-                if expected.carrier.is_none() {
+                if expected.carrier.is_none()
+                    && self
+                        .carrier
+                        .as_mut()
+                        .ok_or(Error::Pending)?
+                        .pregraph_terminal_read()?
+                        .is_none()
+                {
                     return self.read_module_only_cleanup_root(original, expected);
                 }
                 return self.read_prepublication_full_empty_root(original, expected);
@@ -3858,9 +3886,10 @@ pub(crate) mod native {
             let context = self.context.clone();
             let origin = self
                 .carrier
-                .as_ref()
+                .as_mut()
                 .ok_or(Error::Pending)?
-                .pregraph_terminal_read()?;
+                .pregraph_terminal_read()?
+                .ok_or(Error::Pending)?;
             supervisor.run_cleanup(&context, original, || {
                 self.continuity_runtime_for(original, expected, StartupRead::Cleanup)?;
                 if !self
@@ -3927,6 +3956,19 @@ pub(crate) mod native {
                         }
                         carrier.inspect_unpublished_terminal_in_call(original, expected, inspect)?
                     }
+                    PrepublicationTerminalRead::Unattempted { .. } => {
+                        if native_empty {
+                            carrier.inspect_pregraph_native_empty_in_call(
+                                original,
+                                expected,
+                                |_| inspect(),
+                            )?
+                        } else {
+                            carrier.inspect_pregraph_terminal_in_call(original, expected, |_| {
+                                inspect()
+                            })?
+                        }
+                    }
                 };
                 self.graph
                     .try_borrow()
@@ -3948,13 +3990,20 @@ pub(crate) mod native {
             crate::windows::member_carrier_ready::compare_pregraph_key_restore_frame(
                 &self.context,
                 expected,
-                self.proof.ok_or(Error::Pending)?,
+                self.proof,
             )?;
             if !self.create_attempted
                 || self.attach_attempted
                 || self.terminal_attempted
                 || !self.invocation.attempted(true, false)?
                 || self.pins.is_none()
+                    && !matches!(
+                        self.carrier
+                            .as_mut()
+                            .ok_or(Error::Pending)?
+                            .pregraph_terminal_read()?,
+                        Some(PrepublicationTerminalRead::Unattempted { .. })
+                    )
                 || self
                     .retired_members
                     .as_ref()
@@ -4050,7 +4099,14 @@ pub(crate) mod native {
                     .construction_attempted
                     .get()
             {
-                if expected.carrier.is_none() {
+                if expected.carrier.is_none()
+                    && self
+                        .carrier
+                        .as_mut()
+                        .ok_or(Error::Pending)?
+                        .pregraph_terminal_read()?
+                        .is_none()
+                {
                     return self.read_module_only_cleanup_root(original, expected);
                 }
                 return self.read_prepublication_empty_root(original, expected, true);
@@ -4942,6 +4998,17 @@ pub(crate) mod native {
                         retain(crate::windows::member_carrier_pair_io::OriginalTerminalBranch::ZeroEffect(proof))
                     }).map_err(|_| std::io::Error::other("startup_zero_effect_selection"));
                 }
+                let unattempted = if !self.attach_attempted && !self.graph.try_borrow()
+                    .map_err(|_| std::io::Error::other("startup_graph_layout"))?.construction_attempted.get() {
+                    match self.carrier.as_mut().ok_or_else(|| std::io::Error::other("startup_carrier_layout"))?
+                        .pregraph_terminal_read().map_err(|_| std::io::Error::other("startup_carrier_layout"))? {
+                        Some(PrepublicationTerminalRead::Unattempted { components, .. }) => {
+                            components.verify_released().map_err(|_| std::io::Error::other("startup_resolver_layout"))?;
+                            Some(Rc::downgrade(&components.reference))
+                        }
+                        _ => None,
+                    }
+                } else { None };
                 let proof = Rc::new(NativeStartupAttemptedTerminal {
                     invocation: Rc::downgrade(&self.invocation),
                     create: self.create_attempted,
@@ -4952,12 +5019,14 @@ pub(crate) mod native {
                     graph: Rc::downgrade(&self.graph),
                     layout: {
                         let graph = self.graph.try_borrow().map_err(|_| std::io::Error::other("startup_graph_layout"))?;
-                        classify_attempted_layout(&self.invocation, self.create_attempted, self.attach_attempted,
+                        let layout = classify_attempted_layout(&self.invocation, self.create_attempted, self.attach_attempted,
                             graph.construction_attempted.get(), self.carrier.as_ref()
                                 .and_then(|c| c.retired_pin().ok()).is_some())
-                            .map_err(|_| std::io::Error::other("startup_attempted_layout"))?
+                            .map_err(|_| std::io::Error::other("startup_attempted_layout"))?;
+                        if unattempted.is_some() { NativeAttemptedTerminalLayout::UnattemptedCarrierPregraph } else { layout }
                     },
                     retired: self.carrier.as_ref().and_then(|c| c.retired_pin().ok()).map(|r| Rc::downgrade(&r)),
+                    unattempted,
                 });
                 self.attempted_terminal = Some(proof.clone());
                 let runtime = self.runtime.clone();
@@ -5156,7 +5225,36 @@ pub(crate) mod native {
             // The original Assembly and actual successful loader authenticate
             // no constructor. No Carrier=None, missing graph or JSON fallback.
             if self.create_attempted {
-                return self.read_module_only_cleanup_root(original, expected);
+                match self
+                    .carrier
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .pregraph_terminal_read()?
+                {
+                    None => return self.read_module_only_cleanup_root(original, expected),
+                    Some(PrepublicationTerminalRead::Unattempted { .. }) => {}
+                    Some(_) => return Err(Error::Conflict),
+                }
+                if self.attach_attempted || self.terminal_attempted {
+                    return Err(Error::Retired);
+                }
+                self.supervisor
+                    .begin_original_cleanup_storage(&self.runtime, &self.context)?;
+                self.assembly
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .begin_cleanup(
+                        self.lock.as_mut().ok_or(Error::Retired)?,
+                        &self.runtime,
+                        original,
+                    )?;
+                return match expected.stop_stage {
+                    0..=8 => self.read_pregraph_closing_cleanup(original, expected),
+                    9 | 10 => self.read_bootstrap_native_empty_root(original, expected),
+                    11 => self.read_pregraph_key_restore_root(original, expected, None),
+                    12 => self.read_prepublication_full_empty_root(original, expected),
+                    _ => Err(Error::Conflict),
+                };
             }
             if self.attach_attempted || self.terminal_attempted {
                 return Err(Error::Retired);
@@ -5243,7 +5341,67 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             if self.create_attempted {
-                self.read_module_only_cleanup_root(original, expected)
+                let provenance = self
+                    .carrier
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .pregraph_terminal_read()?;
+                let Some(provenance) = provenance else {
+                    return self.read_module_only_cleanup_root(original, expected);
+                };
+                if !matches!(provenance, PrepublicationTerminalRead::Unattempted { .. })
+                    || self.attach_attempted
+                    || self.terminal_attempted
+                {
+                    return Err(Error::Conflict);
+                }
+                let supervisor = self.supervisor.clone();
+                let context = self.context.clone();
+                supervisor.run_terminal_cleanup(&context, original, expected, || {
+                    self.continuity_runtime_for(original, expected, StartupRead::Terminal)?;
+                    provenance
+                        .inspect_bindings_and_history(true, true, |bindings, history| {
+                            if bindings.carrier.is_some() || !history.is_empty() {
+                                return Err(crate::windows::member_carrier_wintun::Error::Conflict);
+                            }
+                            self.never_effects
+                                .as_ref()
+                                .ok_or(crate::windows::member_carrier_wintun::Error::Pending)?
+                                .verify_terminal_original_roots(
+                                    &self.prepared,
+                                    [None, None],
+                                    self.retired_members.as_deref().ok_or(
+                                        crate::windows::member_carrier_wintun::Error::Pending,
+                                    )?,
+                                    &self.runtime,
+                                    &context,
+                                    expected,
+                                    history,
+                                )
+                                .map_err(|_| {
+                                    crate::windows::member_carrier_wintun::Error::Conflict
+                                })?;
+                            let mut guard =
+                                crate::windows::member_carrier_guard::ScopedGuardAbsence::open(
+                                    expected.scope.clone(),
+                                )
+                                .map_err(|_| {
+                                    crate::windows::member_carrier_wintun::Error::Conflict
+                                })?;
+                            let before = guard.read_snapshot(&expected.scope).map_err(|_| {
+                                crate::windows::member_carrier_wintun::Error::Conflict
+                            })?;
+                            if before != expected.guard.expected
+                                || guard.read_snapshot(&expected.scope).map_err(|_| {
+                                    crate::windows::member_carrier_wintun::Error::Conflict
+                                })? != before
+                            {
+                                return Err(crate::windows::member_carrier_wintun::Error::Conflict);
+                            }
+                            Ok(before)
+                        })
+                        .map_err(|_| Error::Conflict)
+                })
             } else {
                 self.verify_uncaptured_terminal_root(original, expected)
             }
@@ -5561,11 +5719,30 @@ pub(crate) mod native {
             // Join the already-existing original-owner method, not a parallel
             // cleanup implementation. It owns the whole Calling and checks
             // private invocation/graph/Runtime/KeyLock before/after effects.
-            if expected.pending != Some(effect)
-                || expected.carrier.is_none()
-                || expected.carrier != self.proof
-                || self.pins.is_none()
-            {
+            if expected.pending != Some(effect) || expected.carrier != self.proof {
+                return Err(Error::Conflict);
+            }
+            if !self.create_attempted {
+                return self
+                    .read_bootstrap_no_constructor_cleanup(original, expected)
+                    .map(|_| ());
+            }
+            if expected.carrier.is_none() {
+                match self
+                    .carrier
+                    .as_mut()
+                    .ok_or(Error::Pending)?
+                    .pregraph_terminal_read()?
+                {
+                    None => {
+                        return self
+                            .read_module_only_cleanup_root(original, expected)
+                            .map(|_| ())
+                    }
+                    Some(PrepublicationTerminalRead::Unattempted { .. }) => {}
+                    Some(_) => return Err(Error::Conflict),
+                }
+            } else if self.pins.is_none() {
                 return Err(Error::Conflict);
             }
             NativeStartupRoot::cleanup_pregraph_carrier(self, original, expected)
@@ -5585,13 +5762,20 @@ pub(crate) mod native {
             crate::windows::member_carrier_ready::compare_pregraph_closing_frame(
                 &self.context,
                 expected,
-                self.proof.ok_or(Error::Pending)?,
+                self.proof,
             )?;
             if !self.create_attempted
                 || self.attach_attempted
                 || self.terminal_attempted
                 || !self.invocation.attempted(true, false)?
                 || self.pins.is_none()
+                    && !matches!(
+                        self.carrier
+                            .as_mut()
+                            .ok_or(Error::Pending)?
+                            .pregraph_terminal_read()?,
+                        Some(PrepublicationTerminalRead::Unattempted { .. })
+                    )
                 || self
                     .retired_members
                     .as_ref()
@@ -5663,6 +5847,22 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<()> {
+            if !self.create_attempted {
+                return self
+                    .read_bootstrap_no_constructor_cleanup(original, expected)
+                    .map(|_| ());
+            }
+            if self
+                .carrier
+                .as_mut()
+                .ok_or(Error::Pending)?
+                .pregraph_terminal_read()?
+                .is_none()
+            {
+                return self
+                    .read_module_only_cleanup_root(original, expected)
+                    .map(|_| ());
+            }
             // Before and after reads are independent whole Calling intervals.
             // The original key owner performs real restoration OUTSIDE the
             // immutable SDK read bracket, authenticating each effect itself.

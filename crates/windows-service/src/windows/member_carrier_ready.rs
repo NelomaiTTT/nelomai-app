@@ -409,11 +409,12 @@ fn compare_pregraph_native_empty_frame(
 pub(crate) fn compare_pregraph_closing_frame(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
-    original: crate::member_owner::InterfaceProof,
+    original: impl Into<Option<crate::member_owner::InterfaceProof>>,
 ) -> Result<()> {
     use crate::member_carrier_pair as p;
     use nelomai_client_tunnel::redundancy::Slot;
-    if record.carrier != Some(original)
+    let original = original.into();
+    if record.carrier != original
         || !matches!(
             (record.stop_stage, record.pending),
             (0, Some(p::Effect::Guard))
@@ -429,7 +430,7 @@ pub(crate) fn compare_pregraph_closing_frame(
     {
         return Err(CarrierError::Conflict);
     }
-    compare_prepublication_closed_origin(context, record, Some(original))
+    compare_prepublication_closed_origin(context, record, original)
 }
 
 /// Exact factual key-restoration window, not value/delete/handle permission.
@@ -456,7 +457,15 @@ pub(crate) fn key_restore_read_is_terminal(
         || record.operation.is_some()
         || record
             .carrier
-            .is_none_or(|c| c.guid != context.bindings[0].guid)
+            .is_some_and(|c| c.guid != context.bindings[0].guid)
+        || record.carrier.is_none()
+            && native.keys[1..].iter().any(|key| {
+                key.new_key_ack
+                    || !matches!(key.phase, n::KeyPhase::Unstarted | n::KeyPhase::Clean)
+                    || key.baseline != n::Value::Absent
+                    || key.current != n::Value::Absent
+                    || key.pending.is_some()
+            })
     {
         return Err(CarrierError::Conflict);
     }
@@ -478,16 +487,17 @@ pub(crate) fn key_restore_read_is_terminal(
 pub(crate) fn compare_pregraph_key_restore_frame(
     context: &crate::member_carrier_native_ownership::Context,
     record: &crate::member_carrier_pair::Record,
-    original: crate::member_owner::InterfaceProof,
+    original: impl Into<Option<crate::member_owner::InterfaceProof>>,
 ) -> Result<()> {
     use crate::member_carrier_pair as p;
+    let original = original.into();
     if record.stop_stage != 11
         || record.pending != Some(p::Effect::RestoreKeys)
-        || record.carrier != Some(original)
+        || record.carrier != original
     {
         return Err(CarrierError::Conflict);
     }
-    compare_prepublication_closed_origin(context, record, Some(original))
+    compare_prepublication_closed_origin(context, record, original)
 }
 fn compare_prepublication_terminal_origin(
     context: &crate::member_carrier_native_ownership::Context,
@@ -640,6 +650,163 @@ pub(crate) mod native {
     pub(crate) enum PrepublicationTerminalRead {
         Published(Rc<RetiredCarrierRead>),
         Unpublished(Rc<UnpublishedClosedCarrierRead>),
+        Unattempted {
+            scope: Box<creators::Scope>,
+            runtime: RuntimeRead,
+            image: Rc<OriginalImage>,
+            members: MemberInventoryRead,
+            originals: creators::Observer<wintun::native::OriginalWintun>,
+            components: Rc<wintun::native::NativeCarrierComponentsTerminalRead>,
+            supervisor: Rc<NativeDeadline>,
+        },
+    }
+    impl PrepublicationTerminalRead {
+        /// Original factual channel only. A never-attempted creator supplies no
+        /// C identity or adapter ACK. Terminal consumers additionally require
+        /// the actual resolver release and the original never-started session.
+        pub(crate) fn inspect_bindings_and_history<T>(
+            &self,
+            terminal: bool,
+            closed: bool,
+            inspect: impl FnOnce(
+                &crate::windows::member_carrier_guard::Bindings,
+                &[crate::windows::member_carrier_members::ClosedMemberBinding],
+            ) -> wintun::Result<T>,
+        ) -> wintun::Result<T> {
+            match self {
+                Self::Published(original) => {
+                    if terminal {
+                        original.inspect_terminal_bindings_and_history(inspect)
+                    } else {
+                        original.inspect_bindings_and_history(inspect)
+                    }
+                }
+                Self::Unpublished(_) => Err(wintun::Error::Pending),
+                Self::Unattempted {
+                    scope,
+                    runtime,
+                    image,
+                    members,
+                    originals,
+                    components,
+                    supervisor,
+                } => {
+                    let revision = || -> wintun::Result<Vec<u8>> {
+                        supervisor
+                            .read_pin()
+                            .map_err(native_denied)?
+                            .verify_runtime_call(supervisor, runtime, &scope.context)
+                            .map_err(native_denied)?;
+                        image.verify_runtime(runtime).map_err(native_denied)?;
+                        if components.adapter_reference.is_some() {
+                            return Err(wintun::Error::Conflict);
+                        }
+                        components.session.verify_never_started()?;
+                        if closed || terminal {
+                            components.verify_released()?;
+                        }
+                        originals
+                            .assert_no_creator_for_key_cleanup(&scope.context, &scope.binding)
+                            .map_err(native_denied)?;
+                        if !matches!(
+                            originals.snapshot(&scope.context).map_err(native_denied)?[0],
+                            creators::State::Intent | creators::State::Empty
+                        ) {
+                            return Err(wintun::Error::Conflict);
+                        }
+                        let bytes = runtime
+                            .record(&scope.context, RecordKind::NativeCarrierReceipts)
+                            .map_err(native_denied)?;
+                        let native = crate::member_carrier_native_ownership::Record::decode(&bytes)
+                            .map_err(native_denied)?;
+                        let stage = if terminal {
+                            crate::windows::member_carrier_runtime::RetiredReadStage::Terminal
+                        } else if matches!(
+                            native.keys[0].phase,
+                            crate::member_carrier_native_ownership::KeyPhase::RestorePending
+                                | crate::member_carrier_native_ownership::KeyPhase::Clean
+                        ) {
+                            crate::windows::member_carrier_runtime::RetiredReadStage::KeyRestore
+                        } else {
+                            crate::windows::member_carrier_runtime::RetiredReadStage::Cleanup
+                        };
+                        crate::windows::member_carrier_runtime::validate_retired_read_stage(
+                            &native,
+                            &scope.context,
+                            &scope.binding,
+                            scope.generation,
+                            stage,
+                        )
+                        .map_err(native_denied)?;
+                        if runtime
+                            .optional_records(
+                                &scope.context,
+                                &[
+                                    RecordKind::Network,
+                                    RecordKind::CarrierGuard,
+                                    RecordKind::CarrierRows,
+                                    RecordKind::MemberARows,
+                                    RecordKind::MemberBRows,
+                                ],
+                            )
+                            .map_err(native_denied)?
+                            .iter()
+                            .any(Option::is_some)
+                        {
+                            return Err(wintun::Error::Conflict);
+                        }
+                        Ok(bytes)
+                    };
+                    let before = revision()?;
+                    let before_sdk = originals
+                        .observe_all_for_cleanup(&scope.context)
+                        .map_err(native_denied)?;
+                    if !before_sdk.originals.is_empty() {
+                        return Err(wintun::Error::Conflict);
+                    }
+                    let callback = |history: &[crate::windows::member_carrier_members::ClosedMemberBinding]| {
+                        if !history.is_empty() { return Err(CarrierError::Conflict); }
+                        let bindings = crate::windows::member_carrier_guard::Bindings {
+                            scope: scope.context.intent.scope.clone(), carrier: None,
+                            egress: [None, None], service_domains: Vec::new(),
+                        };
+                        let value = inspect(&bindings, history).map_err(denied)?;
+                        if revision().map_err(denied)? != before {
+                            return Err(CarrierError::Conflict);
+                        }
+                        Ok(value)
+                    };
+                    let result = if terminal {
+                        members.inspect_terminal_bindings_full(
+                            &scope.context,
+                            runtime,
+                            image,
+                            callback,
+                        )
+                    } else {
+                        members.inspect_retired_bindings_full(
+                            &scope.context,
+                            runtime,
+                            image,
+                            callback,
+                        )
+                    }
+                    .map_err(native_denied)?;
+                    // The registry's original universe also borrows these
+                    // members. Reobserve after the member bracket released its
+                    // borrow; its own two complete SDK reads enclosed inspect.
+                    if originals
+                        .observe_all_for_cleanup(&scope.context)
+                        .map_err(native_denied)?
+                        != before_sdk
+                        || revision()? != before
+                    {
+                        return Err(wintun::Error::Conflict);
+                    }
+                    Ok(result)
+                }
+            }
+        }
     }
 
     pub(crate) struct Meta {
@@ -649,7 +816,7 @@ pub(crate) mod native {
         pub(crate) expected: PairRecord,
         pub(crate) supervisor: Rc<NativeDeadline>,
         pub(crate) cancelled: Arc<AtomicBool>,
-        pub(crate) image: OriginalImage,
+        pub(crate) image: Rc<OriginalImage>,
         pub(crate) wintun: Rc<WintunSource>,
         pub(crate) members: MemberInventoryRead,
         pub(crate) originals:
@@ -685,14 +852,62 @@ pub(crate) mod native {
         pub(crate) fn verify_pregraph_original_rows(
             &self,
             context: &crate::member_carrier_native_ownership::Context,
-            retired: &RetiredCarrierRead,
+            provenance: &PrepublicationTerminalRead,
             bindings: &crate::windows::member_carrier_guard::Bindings,
         ) -> Result<()> {
             let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
             let lifecycle = self.lifecycle.as_ref().ok_or(CarrierError::Pending)?;
+            if let PrepublicationTerminalRead::Unattempted {
+                scope,
+                runtime,
+                originals,
+                components,
+                ..
+            } = provenance
+            {
+                if &meta.scope != scope.as_ref()
+                    || scope.context != *context
+                    || !meta.runtime.same_original_runtime(runtime)
+                    || !meta.originals.same_original_registry(originals)
+                    || lifecycle.attempted()
+                    || !matches!(lifecycle.retired_pin(), Err(CarrierError::Pending))
+                    || !matches!(lifecycle.unpublished_pin(), Err(CarrierError::Pending))
+                    || self.construction.is_some()
+                    || self.rows.is_some()
+                    || self.row_capture.is_some()
+                    || self.stopped_capture.is_some()
+                    || self.row_capture_attempted
+                    || self.original_rows.is_some()
+                    || self.initial_capture_original.is_some()
+                    || self.source.is_some()
+                    || self.proof.is_some()
+                    || components.adapter_reference.is_some()
+                    || bindings.scope != context.intent.scope
+                    || bindings.carrier.is_some()
+                    || bindings.egress.iter().any(Option::is_some)
+                    || !bindings.service_domains.is_empty()
+                {
+                    return Err(CarrierError::Conflict);
+                }
+                components.session.verify_never_started().map_err(denied)?;
+                components.verify_released().map_err(denied)?;
+                originals
+                    .assert_no_creator_for_key_cleanup(context, &scope.binding)
+                    .map_err(denied)?;
+                if !matches!(
+                    originals.snapshot(context).map_err(denied)?[0],
+                    creators::State::Intent | creators::State::Empty
+                ) {
+                    return Err(CarrierError::Conflict);
+                }
+                return Ok(());
+            }
+            let PrepublicationTerminalRead::Published(retired) = provenance else {
+                return Err(CarrierError::Pending);
+            };
             if meta.scope.context != *context
                 || lifecycle.attempted()
-                || !std::ptr::eq(lifecycle.retired_pin()?.as_ref(), retired)
+                || !std::ptr::eq(lifecycle.retired_pin()?.as_ref(), retired.as_ref())
                 || self.construction.is_some()
                 || self.row_capture.is_some()
                 || self.stopped_capture.is_some()
@@ -1120,9 +1335,82 @@ pub(crate) mod native {
         /// Actual closed origin for an un-upgraded C, including successful
         /// Ready publication before graph attachment. Source is compared by
         /// its SAME opaque origin only, never reread as a historical NIC.
-        pub(crate) fn pregraph_terminal_read(&self) -> Result<PrepublicationTerminalRead> {
+        pub(crate) fn pregraph_terminal_read(
+            &mut self,
+        ) -> Result<Option<PrepublicationTerminalRead>> {
             if self.terminal_attempted || self.lifecycle.attempted() {
                 return Err(CarrierError::Retired);
+            }
+            if self.construction.is_none() && self.meta.is_none() {
+                return Ok(None);
+            }
+            if matches!(self.lifecycle.retired_pin(), Err(CarrierError::Pending))
+                && matches!(self.lifecycle.unpublished_pin(), Err(CarrierError::Pending))
+            {
+                if self.source.is_some()
+                    || self.row_capture_attempted
+                    || self.rows.is_some()
+                    || self.row_capture.is_some()
+                    || self.original_rows.is_some()
+                    || self.initial_capture_original.is_some()
+                    || self.proof.is_some()
+                    || self.closing_attempted
+                {
+                    return Err(CarrierError::Conflict);
+                }
+                let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
+                let parts = self
+                    .construction
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?
+                    .retained_parts();
+                // A failed resolver construction remains uncertain even when
+                // its original pin exists. Only completed original composition
+                // can select this factual pre-C cleanup path.
+                if !parts.components_complete {
+                    return Err(CarrierError::Pending);
+                }
+                let (carrier, _) = parts.components.as_ref().ok_or(CarrierError::Pending)?;
+                if !matches!(
+                    carrier.phase(),
+                    wintun::Phase::Empty | wintun::Phase::Closed
+                ) {
+                    return Err(CarrierError::Pending);
+                }
+                let components = carrier.terminal_components_read();
+                if components.adapter_reference.is_some() {
+                    return Err(CarrierError::Pending);
+                }
+                if carrier.phase() == wintun::Phase::Closed {
+                    components.verify_released().map_err(denied)?;
+                } else {
+                    components
+                        .reference
+                        .verify_acquired_original()
+                        .map_err(denied)?;
+                }
+                components.session.verify_never_started().map_err(denied)?;
+                meta.originals
+                    .assert_no_creator_for_key_cleanup(&meta.scope.context, &meta.scope.binding)
+                    .map_err(denied)?;
+                if !matches!(
+                    meta.originals
+                        .snapshot(&meta.scope.context)
+                        .map_err(denied)?[0],
+                    creators::State::Intent | creators::State::Empty
+                ) {
+                    return Err(CarrierError::Pending);
+                }
+                let original = PrepublicationTerminalRead::Unattempted {
+                    scope: Box::new(meta.scope.clone()),
+                    runtime: meta.runtime.read_pin()?,
+                    image: meta.image.clone(),
+                    members: meta.members.read_pin(),
+                    originals: meta.originals.clone(),
+                    components,
+                    supervisor: meta.supervisor.clone(),
+                };
+                return Ok(Some(original));
             }
             match select_closed_original(
                 self.lifecycle.retired_pin(),
@@ -1136,13 +1424,13 @@ pub(crate) mod native {
                     {
                         return Err(CarrierError::Conflict);
                     }
-                    Ok(PrepublicationTerminalRead::Published(original))
+                    Ok(Some(PrepublicationTerminalRead::Published(original)))
                 }
                 ClosedOriginal::Unpublished(original) => {
                     if self.source.is_some() {
                         return Err(CarrierError::Conflict);
                     }
-                    Ok(PrepublicationTerminalRead::Unpublished(original))
+                    Ok(Some(PrepublicationTerminalRead::Unpublished(original)))
                 }
             }
         }
@@ -1167,7 +1455,11 @@ pub(crate) mod native {
             {
                 return Err(CarrierError::Conflict);
             }
-            let original = self.lifecycle.unpublished_pin()?;
+            let provenance =
+                PrepublicationTerminalRead::Unpublished(self.lifecycle.unpublished_pin()?);
+            let PrepublicationTerminalRead::Unpublished(original) = &provenance else {
+                unreachable!()
+            };
             let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
             let context = &meta.scope.context;
             compare_prepublication_terminal_origin(context, expected, None)?;
@@ -1183,7 +1475,7 @@ pub(crate) mod native {
                 .as_mut()
                 .ok_or(CarrierError::Pending)?;
             authority
-                .verify_unpublished_closed_original_in_call(&original)
+                .verify_unpublished_closed_original_in_call(&provenance)
                 .map_err(denied)?;
             let sample = || -> Result<Vec<u8>> {
                 carrier
@@ -1228,7 +1520,7 @@ pub(crate) mod native {
                 return Err(CarrierError::Conflict);
             }
             authority
-                .verify_unpublished_closed_original_in_call(&original)
+                .verify_unpublished_closed_original_in_call(&provenance)
                 .map_err(denied)?;
             Ok(value)
         }
@@ -1517,6 +1809,9 @@ pub(crate) mod native {
             current: Rc<NativePairIntentRead>,
             expected: &PairRecord,
         ) -> Result<()> {
+            if self.proof.is_none() {
+                return self.cleanup_carrier_in_call(current, expected);
+            }
             let mut attempt = RootCall {
                 root: self,
                 completed: false,
@@ -1810,7 +2105,14 @@ pub(crate) mod native {
                     |_| Ok(()),
                 )
                 .map_err(denied)?;
-            root.enter_rows_storage_cleanup_in_call(&original, expected)?;
+            if root.proof.is_some() {
+                root.enter_rows_storage_cleanup_in_call(&original, expected)?;
+            } else if !matches!(
+                root.pregraph_terminal_read()?,
+                Some(PrepublicationTerminalRead::Unattempted { .. })
+            ) {
+                return Err(CarrierError::Conflict);
+            }
             root.cleanup_step(&context, &original, expected, &cancelled)?;
             original
                 .inspect_cleanup_effect(
@@ -2148,6 +2450,14 @@ pub(crate) mod native {
             if self.terminal_attempted || self.lifecycle.attempted() {
                 return Err(CarrierError::Retired);
             }
+            if self.proof.is_none() {
+                return self.inspect_pregraph_originals_in_call(
+                    pair,
+                    expected,
+                    PregraphRead::CarrierClosed,
+                    inspect,
+                );
+            }
             let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
             let context = meta.scope.context.clone();
             let runtime = meta.runtime.read_pin()?;
@@ -2305,6 +2615,78 @@ pub(crate) mod native {
         ) -> Result<T> {
             if self.terminal_attempted || self.lifecycle.attempted() {
                 return Err(CarrierError::Retired);
+            }
+            if self.proof.is_none() {
+                let provenance = self
+                    .pregraph_terminal_read()?
+                    .ok_or(CarrierError::Pending)?;
+                let PrepublicationTerminalRead::Unattempted { scope, runtime, .. } = &provenance
+                else {
+                    return Err(CarrierError::Pending);
+                };
+                match channel {
+                    PregraphRead::CarrierClosed => {
+                        compare_pregraph_closing_frame(&scope.context, expected, None)?
+                    }
+                    PregraphRead::NativeEmpty => {
+                        if !matches!(
+                            (expected.stop_stage, expected.pending),
+                            (9, Some(crate::member_carrier_pair::Effect::NativeEmpty))
+                                | (10, Some(crate::member_carrier_pair::Effect::Guard))
+                        ) {
+                            return Err(CarrierError::Conflict);
+                        }
+                        compare_prepublication_closed_origin(&scope.context, expected, None)?;
+                    }
+                    PregraphRead::KeyRestoreBefore | PregraphRead::KeyRestoreAfter => {
+                        compare_pregraph_key_restore_frame(&scope.context, expected, None)?
+                    }
+                    PregraphRead::FullEmpty => {
+                        compare_prepublication_terminal_origin(&scope.context, expected, None)?
+                    }
+                }
+                pair.verify_cleanup_entry_for(runtime, &scope.context, expected)
+                    .map_err(denied)?;
+                let (carrier, authority) = self
+                    .construction
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?
+                    .retained_parts()
+                    .components
+                    .as_ref()
+                    .ok_or(CarrierError::Pending)?;
+                let closed = carrier.phase() == wintun::Phase::Closed;
+                if expected.stop_stage >= 9 && !closed {
+                    return Err(CarrierError::Pending);
+                }
+                authority
+                    .verify_unpublished_closed_original_in_call(&provenance)
+                    .map_err(denied)?;
+                let before = runtime.record(&scope.context, RecordKind::Pair)?;
+                let value = provenance
+                    .inspect_bindings_and_history(
+                        matches!(
+                            channel,
+                            PregraphRead::KeyRestoreAfter | PregraphRead::FullEmpty
+                        ),
+                        closed,
+                        |bindings, history| {
+                            if !history.is_empty() {
+                                return Err(wintun::Error::Conflict);
+                            }
+                            inspect(bindings).map_err(native_denied)
+                        },
+                    )
+                    .map_err(denied)?;
+                if runtime.record(&scope.context, RecordKind::Pair)? != before {
+                    return Err(CarrierError::Conflict);
+                }
+                pair.verify_cleanup_entry_for(runtime, &scope.context, expected)
+                    .map_err(denied)?;
+                authority
+                    .verify_unpublished_closed_original_in_call(&provenance)
+                    .map_err(denied)?;
+                return Ok(value);
             }
             let meta = self.meta.as_ref().ok_or(CarrierError::Pending)?;
             if !pair.matches_runtime(&meta.runtime) {
@@ -2522,6 +2904,73 @@ pub(crate) mod native {
             expected: &PairRecord,
             cancelled: &AtomicBool,
         ) -> Result<()> {
+            if self.proof.is_none() {
+                compare_pregraph_closing_frame(context, expected, None)?;
+                if !matches!(
+                    (expected.stop_stage, expected.pending),
+                    (3, Some(crate::member_carrier_pair::Effect::RestoreWeak))
+                        | (
+                            6,
+                            Some(crate::member_carrier_pair::Effect::CarrierAddressDelete)
+                        )
+                        | (
+                            7,
+                            Some(crate::member_carrier_pair::Effect::CarrierSessionEnd)
+                        )
+                        | (8, Some(crate::member_carrier_pair::Effect::CarrierClose))
+                ) {
+                    return Err(CarrierError::Conflict);
+                }
+                let provenance = self
+                    .pregraph_terminal_read()?
+                    .ok_or(CarrierError::Pending)?;
+                if !matches!(provenance, PrepublicationTerminalRead::Unattempted { .. }) {
+                    return Err(CarrierError::Pending);
+                }
+                let (carrier, authority) = self
+                    .construction
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?
+                    .retained_parts()
+                    .components
+                    .as_mut()
+                    .ok_or(CarrierError::Pending)?;
+                authority
+                    .select_pair_intent(original.clone(), expected)
+                    .map_err(denied)?;
+                authority
+                    .verify_unpublished_closed_original_in_call(&provenance)
+                    .map_err(denied)?;
+                provenance
+                    .inspect_bindings_and_history(
+                        false,
+                        carrier.phase() == wintun::Phase::Closed,
+                        |_, history| {
+                            if history.is_empty() {
+                                Ok(())
+                            } else {
+                                Err(wintun::Error::Conflict)
+                            }
+                        },
+                    )
+                    .map_err(denied)?;
+                if expected.stop_stage == 8 {
+                    carrier.close_original(cancelled).map_err(denied)?;
+                    carrier.verify_terminal_components().map_err(denied)?;
+                }
+                authority
+                    .verify_unpublished_closed_original_in_call(&provenance)
+                    .map_err(denied)?;
+                return provenance
+                    .inspect_bindings_and_history(false, expected.stop_stage == 8, |_, history| {
+                        if history.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(wintun::Error::Conflict)
+                        }
+                    })
+                    .map_err(denied);
+            }
             let root = self.construction.as_mut().ok_or(CarrierError::Pending)?;
             let (carrier, authority) = root
                 .retained_parts()
@@ -2654,7 +3103,7 @@ pub(crate) mod native {
                         expected: original.expected.clone(),
                         supervisor: original.supervisor.clone(),
                         cancelled: original.cancelled.clone(),
-                        image: original.image.read_pin().map_err(denied)?,
+                        image: Rc::new(original.image.read_pin().map_err(denied)?),
                         wintun: original.source.clone(),
                         members: original.members.read_pin(),
                         originals: original.observer.clone(),
