@@ -2544,17 +2544,6 @@ pub(crate) mod native {
             closing: Option<&Rc<NativeClosingRead>>,
             actor_lock: Option<&mut KeyLock>,
         ) -> crate::member_carrier::Result<()>;
-        /// No-C Stopped12/None ONLY. Own the actual uncaptured terminal readonly
-        /// Calling via SAME Never ledger and actual terminal Pair publication.
-        /// Invoke Never.verify_uncaptured_terminal_absent inside Calling using
-        /// this startup root's SAME retained lock. Missing roots/SDK lookup or
-        /// imported JSON cannot replace the original zero-attempt ledger.
-        /// Native-keys-Stopped, new Source and native effects are forbidden here.
-        fn verify_uncaptured_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> crate::member_carrier::Result<()>;
         /// Closing12/FullEmpty only, not an acknowledged Stopped read. Own
         /// the SAME bounded cleanup Calling; authenticate the original Never
         /// ledger/partial bootstrap owners, key restoration and full native
@@ -4624,7 +4613,8 @@ pub(crate) mod native {
                             if completed_original_module {
                                 actual.verify_module_only_release(original, expected).map_err(denied)?;
                             } else {
-                                actual.verify_uncaptured_terminal(original, expected).map_err(denied)?;
+                                let snapshot = actual.read_bootstrap_no_constructor_terminal(original, expected).map_err(denied)?;
+                                compare_full_empty_snapshot(expected, &snapshot)?;
                             }
                         }
                         #[cfg(test)]

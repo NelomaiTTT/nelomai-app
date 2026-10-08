@@ -5413,14 +5413,6 @@ pub(crate) mod native {
         ) -> Result<crate::member_carrier_guard::Snapshot> {
             self.read_bootstrap_native_empty_root(original, expected)
         }
-        fn verify_uncaptured_terminal(
-            &mut self,
-            original: &Rc<NativePairIntentRead>,
-            expected: &pair::Record,
-        ) -> Result<()> {
-            let actual = self.verify_uncaptured_terminal_root(original, expected)?;
-            compare_uncaptured_terminal_snapshot(&expected.scope, &actual)
-        }
         fn preflight_fresh(
             &mut self,
             original: &Rc<NativePairIntentRead>,

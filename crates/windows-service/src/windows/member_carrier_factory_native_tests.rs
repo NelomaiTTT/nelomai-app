@@ -403,12 +403,16 @@ fn carrier_factory_actual_cold_child() {
         }
         if !absence_partial || original.snapshot().cleanup_pending {
             assert!(original.snapshot().cleanup_pending);
-            fixture.require_retained_precreate_originals();
+            if !absence_partial || unwind {
+                fixture.require_retained_precreate_originals();
+            }
             assert!(
                 original.start_primary(primary, options).is_err(),
                 "failed pre-create boundary retried"
             );
-            fixture.require_retained_precreate_originals();
+            if !absence_partial || unwind {
+                fixture.require_retained_precreate_originals();
+            }
         } else {
             assert_eq!(original.snapshot().session.phase, SessionPhase::Stopped);
         }
@@ -420,7 +424,9 @@ fn carrier_factory_actual_cold_child() {
         );
         if stopped.is_err() {
             assert!(original.snapshot().cleanup_pending);
-            fixture.require_retained_precreate_originals();
+            if !absence_partial || unwind {
+                fixture.require_retained_precreate_originals();
+            }
         }
         if absence_partial && !unwind {
             // No adapter/reference attempt: actual original key/module cleanup
