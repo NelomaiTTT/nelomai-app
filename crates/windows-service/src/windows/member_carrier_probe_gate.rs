@@ -990,6 +990,7 @@ pub(crate) mod native {
         member_carrier_pair_store::native_store::NativePairIntentRead,
         member_carrier_probes::native::{
             HeldProbeRead, NativeProbeGate, ProbeInventoryRead, ProbeInventoryWeakRead,
+            RetiredProbeRead,
         },
         member_carrier_runtime::native::{
             NativeBindingsWindow, NativeClosingRead, NativeResourceRowsRead, NativeSourceRead,
@@ -1646,6 +1647,59 @@ pub(crate) mod native {
                 .map_err(denied)?
                 .clone()
                 .ok_or(GuardError::Conflict)
+        }
+        /// Consume current registration only after the SAME original closed and
+        /// the existing member-generation projection removed its closed binding.
+        pub(crate) fn consume_retired_held(
+            &self,
+            slot: Slot,
+            original: &Held<A>,
+            retired: &RetiredProbeRead<Wfp, A, WfpProbeGate<A>>,
+        ) -> Result<()> {
+            self.fence.inspect(Purpose::Preparing, || {
+                let selected = self.selected.try_borrow().map_err(denied)?;
+                self.current(&selected, None)?;
+                if selected.record.phase != pair::Phase::Running
+                    || selected.record.pending.is_some()
+                    || selected.record.operation.is_some()
+                    || selected.record.active == Some(slot)
+                    || selected.record.members[idx(slot)]
+                        .as_ref()
+                        .is_none_or(|m| m.owner.phase != crate::member_owner::Phase::Stopped)
+                {
+                    return Err(GuardError::Conflict);
+                }
+                retired.verify_same_original(original)?;
+                let inventory = self.inventory()?;
+                inventory.verify_member_slot(slot, original)?;
+                self.source
+                    .inspect_window(|window| {
+                        self.original_window(window, Purpose::Preparing)
+                            .map_err(native_denied)?;
+                        let native_slot = crate::member_pair::slot_native(slot);
+                        if window.closed_member(native_slot).is_some()
+                            || window.bindings().egress[idx(slot)].is_some()
+                        {
+                            return Err(wintun::Error::Conflict);
+                        }
+                        Ok(())
+                    })
+                    .map_err(denied)?;
+                self.current(&selected, None)?;
+                inventory.consume_retired(slot, retired, || {
+                    let mut registration = self.held[idx(slot)]
+                        .value
+                        .try_borrow_mut()
+                        .map_err(denied)?;
+                    let retained = registration.as_ref().ok_or(GuardError::Conflict)?;
+                    if retained.tuple.try_borrow().map_err(denied)?.is_none() {
+                        return Err(GuardError::Conflict);
+                    }
+                    *registration = None;
+                    self.held[idx(slot)].attempted.set(false);
+                    Ok(())
+                })
+            })
         }
         pub(crate) fn bind_closing(
             &self,

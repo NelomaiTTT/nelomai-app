@@ -26,6 +26,10 @@ struct Inputs {
     native_fault_reached: Option<NativePublication>,
     native_originals: Vec<(&'static str, Weak<dyn Any>)>,
     original_guard: Option<Weak<RefCell<super::member_carrier_pair_io::native::Guard>>>,
+    health_input: Option<(
+        Option<nelomai_client_tunnel::redundancy::Slot>,
+        [[u64; 2]; 2],
+    )>,
     package_source_reads: usize,
     package_paths: Option<[PathBuf; 5]>,
     wireguard_package: Option<([PathBuf; 5], u64)>,
@@ -272,6 +276,43 @@ pub(crate) fn diagnostic_withdraw_original_blocks(
         .map_err(|_| GuardError::Conflict)?;
     guard.diagnostic_withdraw_original_blocks(scope)
 }
+pub(crate) fn probe_io_input(slot: nelomai_client_tunnel::redundancy::Slot) -> Option<bool> {
+    INPUTS.with(|inputs| {
+        inputs.borrow().as_ref().and_then(|inputs| {
+            inputs
+                .health_input
+                .as_ref()
+                .map(|(failed, _)| *failed != Some(slot))
+        })
+    })
+}
+pub(crate) fn metric_input(
+    slot: nelomai_client_tunnel::redundancy::Slot,
+) -> Option<(bool, u64, u64)> {
+    INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        let (failed, counters) = inputs.as_mut()?.health_input.as_mut()?;
+        let counter =
+            &mut counters[usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)];
+        let healthy = *failed != Some(slot);
+        if healthy {
+            counter[0] += 1;
+            counter[1] += 1;
+        }
+        Some((healthy, counter[0], counter[1]))
+    })
+}
+pub(crate) fn accepted_datagram_send(slot: nelomai_client_tunnel::redundancy::Slot) {
+    INPUTS.with(|inputs| {
+        if let Some((_, counters)) = inputs
+            .borrow_mut()
+            .as_mut()
+            .and_then(|inputs| inputs.health_input.as_mut())
+        {
+            counters[usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)][0] += 1;
+        }
+    });
+}
 fn require_native_originals(inputs: &Inputs, target: NativePublication) {
     for kind in ["carrier", "member"] {
         if kind == "member" && target == NativePublication::Carrier {
@@ -480,6 +521,16 @@ pub(crate) struct Fixture {
     executable: PathBuf,
 }
 impl Fixture {
+    pub(crate) fn external_health(&self, failed: Option<nelomai_client_tunnel::redundancy::Slot>) {
+        INPUTS.with(|inputs| {
+            let mut inputs = inputs.borrow_mut();
+            let inputs = inputs.as_mut().expect("fixture inputs");
+            let counter = inputs
+                .health_input
+                .map_or([[0; 2]; 2], |(_, counter)| counter);
+            inputs.health_input = Some((failed, counter));
+        });
+    }
     pub(crate) fn original_root(&self) -> &Path {
         &self.root
     }
@@ -575,6 +626,7 @@ impl Fixture {
                 native_fault_reached: None,
                 native_originals: vec![],
                 original_guard: None,
+                health_input: None,
                 package_source_reads: 0,
                 package_paths: None,
                 wireguard_package: None,

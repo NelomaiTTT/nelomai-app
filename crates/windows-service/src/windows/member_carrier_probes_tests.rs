@@ -430,7 +430,7 @@ fn canonical_entry_exists_before_ack_and_survives_readback_unwind() {
 }
 
 #[test]
-fn reserved_pre_ack_failure_and_closed_success_never_allow_a_second_open() {
+fn reserved_pre_ack_failure_stays_rooted_and_exact_closed_generation_can_be_consumed() {
     let mut inventory = Canonical::new();
     inventory
         .begin(
@@ -451,6 +451,26 @@ fn reserved_pre_ack_failure_and_closed_success_never_allow_a_second_open() {
     assert!(inventory.publish(Slot::B).is_err());
     assert_eq!(inventory.all().count(), 2);
     assert_eq!(inventory.unpublished().count(), 1);
+    // An acknowledged replacement generation must be able to consume only B's
+    // SAME published closed original, while the uncertain A remains rooted.
+    let closed = original.borrow();
+    let foreign = Rc::new(std::cell::RefCell::new(held()));
+    assert!(inventory
+        .consume_closed(Slot::B, &foreign, closed.retired().unwrap(), || Ok(()))
+        .is_err());
+    assert!(inventory
+        .consume_closed(Slot::B, &original, closed.retired().unwrap(), || Err(
+            GuardError::Conflict
+        ))
+        .is_err());
+    assert!(Rc::ptr_eq(inventory.by_slot()[1].unwrap(), &original));
+    inventory
+        .consume_closed(Slot::B, &original, closed.retired().unwrap(), || Ok(()))
+        .unwrap();
+    assert_eq!(inventory.all().count(), 1);
+    inventory
+        .begin(Slot::B, Rc::new(std::cell::RefCell::new(held())))
+        .expect("closed original replacement slot");
 }
 
 #[test]

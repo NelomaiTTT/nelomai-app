@@ -233,6 +233,83 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                         Err(error) => println!("actual post-exit rundown sample={sample} elapsed_ms={} error={error:?}", observing.elapsed().as_millis()),
                     }
                 }
+                // Failure-only comparison evidence, never device/creator
+                // authority. Keep the existing post-exit MIB budget unchanged.
+                let setup = (|| -> std::io::Result<(String, bool)> {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let root = std::env::var_os("SystemRoot")
+                        .ok_or_else(|| std::io::Error::other("SystemRoot unavailable"))?;
+                    let mut file = std::fs::File::open(
+                        std::path::PathBuf::from(root).join("inf/SetupAPI.dev.log"),
+                    )?;
+                    let length = file.metadata()?.len();
+                    let offset = length.saturating_sub(2 * 1024 * 1024);
+                    file.seek(SeekFrom::Start(offset))?;
+                    let mut bytes = Vec::new();
+                    file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
+                    let text = if bytes.starts_with(&[0xff, 0xfe]) || bytes.get(1) == Some(&0) {
+                        let start = usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2;
+                        if (bytes.len() - start) % 2 != 0 {
+                            return Err(std::io::Error::other("truncated UTF16 tail"));
+                        }
+                        String::from_utf16(
+                            &bytes[start..]
+                                .chunks_exact(2)
+                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                                .collect::<Vec<_>>(),
+                        )
+                        .map_err(std::io::Error::other)?
+                    } else {
+                        String::from_utf8(bytes).map_err(std::io::Error::other)?
+                    };
+                    Ok((text, offset != 0))
+                })();
+                match setup {
+                    Ok((text, tail_truncated)) => {
+                        let hex = proof.guid.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+                        let canonical = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
+                        let mut sections = Vec::new();
+                        let mut current: Option<String> = None;
+                        let mut unknown = tail_truncated;
+                        for line in text.lines() {
+                            if line.starts_with(">>>  [") {
+                                if current.is_some() { unknown = true; }
+                                current = Some(String::new());
+                            }
+                            if let Some(section) = current.as_mut() {
+                                if section.len() + line.len() + 1 > 64 * 1024 {
+                                    unknown = true;
+                                    current = None;
+                                    continue;
+                                }
+                                section.push_str(line);
+                                section.push('\n');
+                                if line.starts_with("<<<  [Exit status:") {
+                                    let section = current.take().unwrap();
+                                    if section.to_ascii_lowercase().contains(&canonical) {
+                                        sections.push(section);
+                                    }
+                                }
+                            } else if line.to_ascii_lowercase().contains(&canonical) {
+                                unknown = true;
+                            }
+                        }
+                        unknown |= current.is_some();
+                        let mut emitted = 0;
+                        let mut bytes = 0;
+                        for section in sections.iter().rev() {
+                            if emitted == 4 || bytes + section.len() > 64 * 1024 {
+                                unknown = true;
+                                break;
+                            }
+                            println!("actual post-exit SetupAPI comparison_only=true guid={canonical} section_begin\n{section}actual post-exit SetupAPI section_end");
+                            emitted += 1;
+                            bytes += section.len();
+                        }
+                        println!("actual post-exit SetupAPI comparison_only=true sections={emitted} bytes={bytes} evidence_unknown={}", unknown || emitted == 0);
+                    }
+                    Err(error) => println!("actual post-exit SetupAPI comparison_only=true evidence_unknown=true error={error:?}"),
+                }
             } else {
                 println!("actual post-exit comparison case={case} child_process_exited=true proof=missing_invalid_or_ambiguous static_wfp=unconfirmed");
             }
@@ -924,6 +1001,7 @@ fn carrier_factory_actual_cold_child() {
             .expect("actual repeat factory preparation");
         assert_eq!(second.snapshot().session.scope, next);
         assert_eq!(second.snapshot().session.phase, SessionPhase::Starting);
+        let mut second_now = 9;
         if full_primary {
             let Command::Start {
                 primary, options, ..
@@ -938,14 +1016,255 @@ fn carrier_factory_actual_cold_child() {
             assert_eq!(running.session.scope, next);
             assert_eq!(running.session.phase, SessionPhase::Running);
             assert!(!running.cleanup_pending);
+            // SAME production SessionControl/factory/C. Only external health
+            // samples and DNS datagram replies are inputs; native owners,
+            // selection, WFP, routes and generation transitions remain real.
+            fixture.external_health(None);
+            let initial = fixture.trace_pair_stage().expect("repeat primary Pair");
+            let carrier = initial.carrier.expect("repeat original C");
+            let addresses = initial.addresses;
+            let mut reserve_lease = "33333333-3333-4333-8333-333333333333".to_string();
+            let reserve = |lease: &str| Member {
+                slot: Slot::B,
+                lease_id: lease.into(),
+                configuration: TunnelConfiguration::new(primary.configuration.expose().replace(
+                    "192.0.2.11",
+                    if lease.starts_with("4444") {
+                        "192.0.2.13"
+                    } else {
+                        "192.0.2.12"
+                    },
+                )),
+                probe: primary.probe.clone(),
+            };
+            let before = second.snapshot();
+            let attached = second
+                .execute(
+                    Command::Attach {
+                        scope: next.clone(),
+                        member: reserve(&reserve_lease),
+                        expected_revision: before.session.local_revision,
+                        expected_network_epoch: before.session.network_epoch,
+                        expected_membership_generation: 1,
+                        membership_generation: 2,
+                    },
+                    second_now,
+                )
+                .expect("actual reserve Attach B");
+            assert_eq!(attached.session.membership_generation, 2);
+            let paired = fixture.trace_pair_stage().expect("actual attached Pair");
+            let a = paired.members[0]
+                .as_ref()
+                .unwrap()
+                .owner
+                .proof
+                .unwrap()
+                .interface;
+            let b = paired.members[1]
+                .as_ref()
+                .unwrap()
+                .owner
+                .proof
+                .unwrap()
+                .interface;
+            assert_ne!(a.guid, b.guid);
+            assert_ne!(a.luid, b.luid);
+            assert_ne!(a.index, b.index);
+            for (failed, expected) in [
+                (None, Slot::A),
+                (Some(Slot::A), Slot::B),
+                (Some(Slot::B), Slot::A),
+            ] {
+                fixture.external_health(failed);
+                for _ in 0..100 {
+                    second_now += 500;
+                    second.tick(second_now).expect("actual reserve health tick");
+                    let current = second.snapshot();
+                    if current.session.active == expected
+                        && current.primary_ready
+                        && (failed.is_some() || current.standby_ready)
+                    {
+                        break;
+                    }
+                }
+                let current = second.snapshot();
+                assert_eq!(
+                    current.session.active, expected,
+                    "actual A/B/A native switch"
+                );
+                assert!(current.primary_ready);
+                if failed.is_some() {
+                    assert!(!current.session.role_confirmed);
+                    let active = current.leases[usize::from(expected == Slot::B)].clone();
+                    let confirmed = second
+                        .execute(
+                            Command::ConfirmRole {
+                                scope: next.clone(),
+                                expected_revision: current.session.local_revision,
+                                expected_network_epoch: current.session.network_epoch,
+                                response: nelomai_contracts::RedundantRoleResponse {
+                                    api_version: nelomai_contracts::ApiVersion::V1,
+                                    request_id: "native-fixture-role".into(),
+                                    action: nelomai_contracts::RedundantRoleAction::Accepted,
+                                    local_active_lease_id: active.clone().unwrap(),
+                                    session: nelomai_contracts::RedundantSessionView {
+                                        session_id: next.session_id.clone(),
+                                        state: nelomai_contracts::RedundantSessionState::Connected,
+                                        active_lease_id: active,
+                                        slot_a_lease_id: current.current_leases[0].clone(),
+                                        slot_b_lease_id: current.current_leases[1].clone(),
+                                        standby_desired: true,
+                                        role_generation: current.session.role_generation + 1,
+                                        membership_generation: 2,
+                                        reason: None,
+                                    },
+                                },
+                            },
+                            second_now,
+                        )
+                        .expect("actual role generation ACK");
+                    assert!(confirmed.session.role_confirmed);
+                }
+                let pair = fixture.trace_pair_stage().expect("actual switched Pair");
+                assert_eq!(pair.carrier, Some(carrier));
+                assert_eq!(pair.addresses, addresses);
+                assert_eq!(
+                    pair.members[0]
+                        .as_ref()
+                        .unwrap()
+                        .owner
+                        .proof
+                        .unwrap()
+                        .interface,
+                    a
+                );
+                assert_eq!(
+                    pair.members[1]
+                        .as_ref()
+                        .unwrap()
+                        .owner
+                        .proof
+                        .unwrap()
+                        .interface,
+                    b
+                );
+            }
+            fixture.external_health(None);
+            let current = second.snapshot();
+            assert_eq!(current.session.role_generation, 3);
+            let retired = second
+                .execute(
+                    Command::RetireInactive {
+                        scope: next.clone(),
+                        slot: Slot::B,
+                        lease_id: reserve_lease.clone(),
+                        expected_revision: current.session.local_revision,
+                        expected_network_epoch: current.session.network_epoch,
+                        expected_membership_generation: 2,
+                    },
+                    second_now,
+                )
+                .expect("actual retired inactive B");
+            reserve_lease = "44444444-4444-4444-8444-444444444444".into();
+            let stale = second.execute(
+                Command::StageCandidate {
+                    scope: next.clone(),
+                    member: reserve(&reserve_lease),
+                    expected_revision: current.session.local_revision,
+                    expected_network_epoch: current.session.network_epoch,
+                    expected_membership_generation: 2,
+                },
+                second_now,
+            );
+            assert!(stale.is_err());
+            let staged = second
+                .execute(
+                    Command::StageCandidate {
+                        scope: next.clone(),
+                        member: reserve(&reserve_lease),
+                        expected_revision: retired.session.local_revision,
+                        expected_network_epoch: retired.session.network_epoch,
+                        expected_membership_generation: 2,
+                    },
+                    second_now,
+                )
+                .expect("actual replacement StageCandidate B");
+            let committed = second
+                .execute(
+                    Command::CommitCandidate {
+                        scope: next.clone(),
+                        slot: Slot::B,
+                        expected_revision: staged.session.local_revision,
+                        expected_network_epoch: staged.session.network_epoch,
+                        session: nelomai_contracts::RedundantSessionView {
+                            session_id: next.session_id.clone(),
+                            state: nelomai_contracts::RedundantSessionState::Connected,
+                            active_lease_id: staged.leases[0].clone(),
+                            slot_a_lease_id: staged.leases[0].clone(),
+                            slot_b_lease_id: Some(reserve_lease.clone()),
+                            standby_desired: true,
+                            role_generation: 3,
+                            membership_generation: 3,
+                            reason: None,
+                        },
+                    },
+                    second_now,
+                )
+                .expect("actual replacement CommitCandidate");
+            assert_eq!(committed.session.membership_generation, 3);
+            assert_eq!(committed.session.active, Slot::A);
+            let replacement = fixture.trace_pair_stage().expect("actual replacement Pair");
+            assert_eq!(replacement.carrier, Some(carrier));
+            assert_eq!(replacement.addresses, addresses);
+            assert_eq!(
+                replacement.members[0]
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .proof
+                    .unwrap()
+                    .interface,
+                a
+            );
+            assert_ne!(
+                replacement.members[1]
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .proof
+                    .unwrap()
+                    .process,
+                paired.members[1]
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .proof
+                    .unwrap()
+                    .process
+            );
+            assert_ne!(
+                replacement.members[1]
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .intent
+                    .config_sha256,
+                paired.members[1]
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .intent
+                    .config_sha256
+            );
         }
+        second_now += 1;
         eprintln!("actual factory {case}: repeat Stop");
         let stop_started = std::time::Instant::now();
         let mut stopped = second.execute(
             Command::Stop {
                 scope: next.clone(),
             },
-            10,
+            second_now,
         );
         if let Err(error) = &stopped {
             eprintln!("actual factory {case}: repeat Stop error {error:?}");
@@ -955,7 +1274,7 @@ fn carrier_factory_actual_cold_child() {
         while stopped.is_err() && second.snapshot().cleanup_pending {
             assert_eq!(second.snapshot().session.phase, SessionPhase::Stopping);
             assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
-            let now = 10 + stop_started.elapsed().as_millis() as u64;
+            let now = second_now + stop_started.elapsed().as_millis() as u64;
             match second.tick(now) {
                 Ok(_) => {
                     let snapshot = second.snapshot();
@@ -979,7 +1298,7 @@ fn carrier_factory_actual_cold_child() {
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
         let repeated = second
-            .execute(Command::Stop { scope: next }, 10)
+            .execute(Command::Stop { scope: next }, second_now)
             .expect("actual second repeated Stop");
         assert_eq!(repeated, stopped);
         if let Some((files, records)) = &mut retained_members {

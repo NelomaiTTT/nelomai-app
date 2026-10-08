@@ -78,11 +78,31 @@ struct CloneHandle<S> {
     live: Rc<Cell<bool>>,
 }
 
-// Canonical actor slots are never removed/rearmed, including failed opens and
-// acknowledged retirement. A slot is reserved BEFORE any native creation.
+// Failed/uncertain opens stay canonical. Only a published SAME original's close
+// witness can consume its current entry after the member generation retires.
 struct Entry<T> {
     original: T,
     published: bool,
+}
+impl<T> Canonical<Rc<T>> {
+    fn consume_closed(
+        &mut self,
+        slot: Slot,
+        original: &Rc<T>,
+        _closed: &Closed,
+        consume_registration: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let entry = &mut self.entries[slot_index(slot)];
+        if entry
+            .as_ref()
+            .is_none_or(|entry| !entry.published || !Rc::ptr_eq(&entry.original, original))
+        {
+            return Err(GuardError::Conflict);
+        }
+        consume_registration()?;
+        *entry = None;
+        Ok(())
+    }
 }
 struct Canonical<T> {
     entries: [Option<Entry<T>>; 2],
@@ -692,7 +712,7 @@ pub(crate) mod native {
                 serial: Serial::default(),
             });
             // Canonical entry exists BEFORE the first fallible source/gate read
-            // or native ACK. Never remove it, including after a failed attempt.
+            // or native ACK. Failed attempts cannot consume/reuse their entry.
             self.inventory
                 .entries
                 .try_borrow_mut()
@@ -1005,6 +1025,29 @@ pub(crate) mod native {
         }
     }
     impl<N: NativeApi, A: BindingAttestor, G: NativeProbeGate<N, A>> ProbeInventoryRead<N, A, G> {
+        pub(crate) fn consume_retired(
+            &self,
+            slot: Slot,
+            retired: &RetiredProbeRead<N, A, G>,
+            consume_registration: impl FnOnce() -> Result<()>,
+        ) -> Result<()> {
+            let call = self.inventory.serial.call(false)?;
+            let held = retired
+                .original
+                .held
+                .try_borrow()
+                .map_err(|_| GuardError::Conflict)?;
+            let closed = held.retired()?;
+            let mut entries = self
+                .inventory
+                .entries
+                .try_borrow_mut()
+                .map_err(|_| GuardError::Conflict)?;
+            call.verify()?;
+            entries.consume_closed(slot, &retired.original, closed, consume_registration)?;
+            call.finish()
+        }
+
         pub(crate) fn downgrade(&self) -> ProbeInventoryWeakRead<N, A, G> {
             ProbeInventoryWeakRead {
                 original: crate::windows::member_carrier_original_read::OriginalRead::from_retained(
@@ -1202,6 +1245,15 @@ pub(crate) mod native {
         }
     }
     impl<N: NativeApi, A: BindingAttestor, G: NativeProbeGate<N, A>> HeldProbeLease<N, A, G> {
+        /// Test substitutes only the external datagram IO; all original tuple,
+        /// Source and G pre/postflight checks still run in operate.
+        #[cfg(test)]
+        pub(crate) fn external_datagram<T>(
+            &self,
+            io: impl FnOnce() -> io::Result<T>,
+        ) -> io::Result<T> {
+            self.operate(|_| io())
+        }
         fn operate<T>(
             &self,
             action: impl FnOnce(&mut NativeProbeSocket) -> io::Result<T>,

@@ -2855,7 +2855,11 @@ pub(crate) mod native {
         lease: Rc<RefCell<Option<Lease>>>,
     }
     impl SocketContext {
-        fn issue(self: &Rc<Self>, original: &Rc<RefCell<Held>>) -> io::Result<NativePairSocket> {
+        fn issue(
+            self: &Rc<Self>,
+            original: &Rc<RefCell<Held>>,
+            #[cfg(test)] slot: Slot,
+        ) -> io::Result<NativePairSocket> {
             // Reserve the root borrow BEFORE native clone ACK. The underlying
             // owner also roots its handle before all native clone postflight.
             let mut issued = self.issued.try_borrow_mut().map_err(denied)?;
@@ -2873,6 +2877,10 @@ pub(crate) mod native {
                 original: original.clone(),
                 context: self.clone(),
                 lease,
+                #[cfg(test)]
+                reply: None,
+                #[cfg(test)]
+                slot,
             })
         }
         /// Caller MUST first freshly authenticate actual full Guard allow
@@ -2951,6 +2959,10 @@ pub(crate) mod native {
         original: Rc<RefCell<Held>>,
         context: Rc<SocketContext>,
         lease: Rc<RefCell<Option<Lease>>>,
+        #[cfg(test)]
+        reply: Option<Vec<u8>>,
+        #[cfg(test)]
+        slot: Slot,
     }
     impl PairSocket for NativePairSocket {
         fn duplicate(&self) -> io::Result<Self> {
@@ -2958,7 +2970,11 @@ pub(crate) mod native {
                 if self.lease.try_borrow().map_err(denied)?.is_none() {
                     return Err(conflict());
                 }
-                self.context.issue(&self.original)
+                self.context.issue(
+                    &self.original,
+                    #[cfg(test)]
+                    self.slot,
+                )
             })
         }
     }
@@ -2966,6 +2982,31 @@ pub(crate) mod native {
         fn send(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let context = self.context.clone();
             context.run(|| {
+                #[cfg(test)]
+                if let Some(healthy) =
+                    super::super::member_carrier_factory_test_os::probe_io_input(self.slot)
+                {
+                    let count = self
+                        .lease
+                        .try_borrow_mut()
+                        .map_err(denied)?
+                        .as_mut()
+                        .ok_or_else(conflict)?
+                        .external_datagram(|| Ok(bytes.len()))?;
+                    super::super::member_carrier_factory_test_os::accepted_datagram_send(self.slot);
+                    let mut response = bytes.to_vec();
+                    if response.len() < 12 {
+                        return Err(conflict());
+                    }
+                    response[2] = 0x81;
+                    response[3] = 0x80;
+                    response[7] = 1;
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 198, 51, 100, 53,
+                    ]);
+                    self.reply = healthy.then_some(response);
+                    return Ok(count);
+                }
                 self.lease
                     .try_borrow_mut()
                     .map_err(denied)?
@@ -2977,6 +3018,28 @@ pub(crate) mod native {
         fn receive(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
             let context = self.context.clone();
             context.run(|| {
+                #[cfg(test)]
+                if let Some(healthy) =
+                    super::super::member_carrier_factory_test_os::probe_io_input(self.slot)
+                {
+                    return self
+                        .lease
+                        .try_borrow_mut()
+                        .map_err(denied)?
+                        .as_mut()
+                        .ok_or_else(conflict)?
+                        .external_datagram(|| {
+                            if !healthy {
+                                return Err(io::ErrorKind::WouldBlock.into());
+                            }
+                            let response = self.reply.take().ok_or(io::ErrorKind::WouldBlock)?;
+                            if response.len() > bytes.len() {
+                                return Err(io::ErrorKind::InvalidData.into());
+                            }
+                            bytes[..response.len()].copy_from_slice(&response);
+                            Ok(response.len())
+                        });
+                }
                 self.lease
                     .try_borrow_mut()
                     .map_err(denied)?
@@ -4901,6 +4964,46 @@ pub(crate) mod native {
                         .map_err(denied)?;
                     if replacement != invoked.get() || replacement != completed.get() {
                         return Err(conflict()); // No delegate can skip actual projection.
+                    }
+                    if replacement {
+                        if r.controllers[i].is_some() {
+                            return Err(conflict());
+                        }
+                        let original = self.held[i].as_ref().ok_or_else(conflict)?;
+                        let read = self.held_reads[i].as_ref().ok_or_else(conflict)?;
+                        if !original
+                            .try_borrow()
+                            .map_err(denied)?
+                            .read_pin()
+                            .same_original(read)
+                        {
+                            return Err(conflict());
+                        }
+                        let retired = read.retired().map_err(denied)?;
+                        let sockets = self.socket_context.as_ref().ok_or_else(conflict)?;
+                        let mut issued = sockets.issued.try_borrow_mut().map_err(denied)?;
+                        for token in issued
+                            .iter()
+                            .filter(|token| Rc::ptr_eq(&token.original, original))
+                        {
+                            if token.lease.try_borrow().map_err(denied)?.is_some() {
+                                return Err(conflict());
+                            }
+                        }
+                        r.probe_state
+                            .select(pin.clone(), actual.clone())
+                            .map_err(denied)?;
+                        r.probe_state
+                            .consume_retired_held(member.slot, read, &retired)
+                            .map_err(denied)?;
+                        // All fallible checks completed; remove only revoked
+                        // token entries belonging to that exact closed original.
+                        issued.retain(|token| !Rc::ptr_eq(&token.original, original));
+                        self.held[i] = None;
+                        self.held_reads[i] = None;
+                        // The retired controller retains its original gate;
+                        // start_member constructs a fresh immutable intent gate.
+                        r.member_gates[i] = None;
                     }
                     Ok(prepared)
                 } else {
@@ -7491,7 +7594,11 @@ pub(crate) mod native {
                     .probe_state
                     .register_held(slot, read)
                     .map_err(denied)?;
-                let socket = this.socket_context()?.issue(original)?;
+                let socket = this.socket_context()?.issue(
+                    original,
+                    #[cfg(test)]
+                    slot,
+                )?;
                 Ok((socket, tuple)) // actual lease token remains strong-rooted through supervisor postflight
             })
         }
@@ -8475,6 +8582,18 @@ pub(crate) mod native {
                     .as_millis()
                     .try_into()
                     .map_err(denied)?;
+                #[cfg(test)]
+                let sampled = {
+                    let mut sampled = sampled;
+                    if let Some((healthy, sent, received)) =
+                        super::super::member_carrier_factory_test_os::metric_input(slot)
+                    {
+                        sampled.transport.latest_handshake_epoch_millis = healthy.then_some(now);
+                        sampled.sent_unicast_packets = sent;
+                        sampled.received_unicast_packets = received;
+                    }
+                    sampled
+                };
                 let health = native_health(
                     &sampled.transport,
                     sampled.sent_unicast_packets,

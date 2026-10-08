@@ -2660,7 +2660,6 @@ mod bfe {
             if self.terminal.is_some()
                 || self.terminal_native.is_some()
                 || self.pending.is_some()
-                || self.current.permits
                 || !self.current.installed
                 || &self.scope != scope
                 || &self.io.scope != scope
@@ -2669,16 +2668,15 @@ mod bfe {
                 return Err(GuardError::Conflict);
             }
             self.current.validate()?;
+            let static_model = self.current.without_permits()?;
             let keys = crate::member_carrier_guard::resource_keys(scope)?;
-            let sublayer = self
-                .current
+            let sublayer = static_model
                 .expected
                 .sublayer
                 .as_ref()
                 .filter(|s| s.key == keys.sublayer)
                 .ok_or(GuardError::Conflict)?;
-            let originals = self
-                .current
+            let originals = static_model
                 .expected
                 .filters
                 .iter()
