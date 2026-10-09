@@ -352,13 +352,6 @@ impl<S, P> OriginalServiceCleanup<S, P> {
                         state.partial_denied = false;
                         return Err(OwnerError::Pending);
                     }
-                    #[cfg(all(windows, test))]
-                    if process.is_none() {
-                        eprintln!(
-                            "actual original held process exit pid={} birth={} code={code}",
-                            proof.pid, proof.creation_time
-                        );
-                    }
                     process = Some(proof);
                 } else if self.pinned_pid.is_some() {
                     return Err(OwnerError::Conflict);

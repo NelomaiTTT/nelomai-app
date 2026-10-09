@@ -5535,18 +5535,28 @@ pub(crate) mod native {
             }
             // Factual identity reads do not authorize effects. Mutation G
             // remains mandatory in OriginalCreator::authorize.
-            let facts = if use_ == Use::Cleanup {
-                self.observer.observe_all_for_cleanup(&self.scope.context)
+            let binding = if use_ == Use::Cleanup {
+                // SAME raw C pre/post identity only. G independently brackets
+                // the full partial-aware Closing census before any row effect.
+                self.observer
+                    .inspect_carrier_identity(&self.scope, true, |_, live| {
+                        let original = live.ok_or(creators::Error::Conflict)?;
+                        rows_binding(&self.scope.context, &original.identity)
+                            .map_err(|_| creators::Error::Conflict)
+                    })
+                    .map_err(|_| rows::Error::Conflict)?
             } else {
-                self.observer.observe_all(&self.scope.context)
-            }
-            .map_err(|_| rows::Error::Conflict)?;
-            let original = facts
-                .originals
-                .iter()
-                .find(|o| o.scope == self.scope)
-                .ok_or(rows::Error::Conflict)?;
-            let binding = rows_binding(&self.scope.context, &original.identity)?;
+                let facts = self
+                    .observer
+                    .observe_all(&self.scope.context)
+                    .map_err(|_| rows::Error::Conflict)?;
+                let original = facts
+                    .originals
+                    .iter()
+                    .find(|o| o.scope == self.scope)
+                    .ok_or(rows::Error::Conflict)?;
+                rows_binding(&self.scope.context, &original.identity)?
+            };
             same_record(
                 &before,
                 self.current(use_).map_err(|_| rows::Error::Conflict)?,
@@ -5568,30 +5578,54 @@ pub(crate) mod native {
             }
             // Factual identity reads do not authorize effects. Mutation G
             // remains mandatory in OriginalCreator::authorize.
-            let all_before = if use_ == Use::Cleanup {
-                self.observer.observe_all_for_cleanup(&self.scope.context)
-            } else {
-                self.observer.observe_all(&self.scope.context)
-            }
-            .map_err(|_| rows::Error::Conflict)?;
-            if all_before.originals.len() != 1 || all_before.originals[0].scope != self.scope {
-                return Err(rows::Error::Conflict);
-            }
-            // The whole census already joins SAME member owners, transport
-            // providers and runtime/image with protected receipt pre/postflight.
-            // Repeating member inventory reads adds no facts to this bracket.
             let index = match role {
                 rows::Role::MemberA => 1,
                 rows::Role::MemberB => 2,
                 rows::Role::Carrier => return Err(rows::Error::Conflict),
             };
             let context = &self.scope.context;
-            let (_, member) = all_before
-                .complete
-                .iter()
-                .find(|(_, m)| m.interface.guid == context.bindings[index].guid)
-                .ok_or(rows::Error::Conflict)?;
-            let identity = &member.interface;
+            let identity = if use_ == Use::Cleanup {
+                // FullGraph member cleanup already roots this SAME Closing
+                // reader. Its mixed census retains partial siblings without
+                // presenting their captured identities as live row owners.
+                let closing = self.closing_reader.as_ref().ok_or(rows::Error::Conflict)?;
+                closing
+                    .inspect_window(|window| {
+                        let slot = [
+                            nelomai_contracts::dispatcher::TunnelSlot::A,
+                            nelomai_contracts::dispatcher::TunnelSlot::B,
+                        ][index - 1];
+                        if window.closed_member(slot).is_some()
+                            || window.partial_member(slot).is_some()
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        let WindowOrigin::Closing(_, sample) = &window.origin else {
+                            return Err(Error::Conflict);
+                        };
+                        sample
+                            .members
+                            .iter()
+                            .find(|member| member.identity.guid == context.bindings[index].guid)
+                            .map(|member| member.identity.clone())
+                            .ok_or(Error::Conflict)
+                    })
+                    .map_err(|_| rows::Error::Conflict)?
+            } else {
+                let all_before = self
+                    .observer
+                    .observe_all(context)
+                    .map_err(|_| rows::Error::Conflict)?;
+                if all_before.originals.len() != 1 || all_before.originals[0].scope != self.scope {
+                    return Err(rows::Error::Conflict);
+                }
+                all_before
+                    .complete
+                    .iter()
+                    .find(|(_, member)| member.interface.guid == context.bindings[index].guid)
+                    .map(|(_, member)| member.interface.clone())
+                    .ok_or(rows::Error::Conflict)?
+            };
             let binding = member_rows_binding(
                 context,
                 role,
@@ -5599,8 +5633,8 @@ pub(crate) mod native {
                     guid: identity.guid,
                     luid: identity.luid,
                     index: identity.index,
-                    name: identity.name.clone(),
-                    description: identity.description.clone(),
+                    name: identity.name,
+                    description: identity.description,
                     if_type: identity.if_type,
                     tunnel_type: identity.tunnel_type,
                 },

@@ -844,7 +844,8 @@ impl<N: OriginalNative> Observer<N> {
     /// Factual SAME C original/once-close bracket, not a complete provider universe,
     /// absence proof or effect permission. A/B generation publication and
     /// cleanup bracket their own full inventory without recursive observation.
-    /// Its caller MUST independently query the full mixed SDK universe here.
+    /// Effect/absence callers MUST independently query the full mixed SDK
+    /// universe here; pure raw identity comparisons supply neither permission.
     /// The optional live identity is absent only for a verified original close
     /// receipt; the captured identity then supplies comparison metadata only.
     /// No mutable/retained native capability escapes; errors/unwind/reentry
