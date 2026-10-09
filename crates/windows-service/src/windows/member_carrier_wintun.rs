@@ -1752,6 +1752,7 @@ impl<K: Kernel> Carrier<K> {
             #[cfg(all(test, windows))]
             eprintln!("actual native CarrierClose native close returned");
             self.phase = Phase::ClosePending;
+            self.kernel.release_call_resources();
             self.cleanup_checkpoint(cancel)?;
         }
         self.kernel

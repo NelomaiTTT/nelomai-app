@@ -132,6 +132,8 @@ mod tests {
         initial_description: Option<String>,
         observed_stages: Vec<Stage>,
         call_resources_held: bool,
+        queued_cleanup: bool,
+        panic_stage: Option<Stage>,
         panic_end: bool,
         panic_start: bool,
         fail_after_end: bool,
@@ -194,6 +196,17 @@ mod tests {
             }
             self.call("verify")?;
             self.0.borrow_mut().calls.push(format!("{stage:?}"));
+            if stage == Stage::AfterClose {
+                let state = self.0.borrow();
+                if state.queued_cleanup && state.call_resources_held {
+                    return Err(Error::Pending);
+                }
+            }
+            assert_ne!(
+                self.0.borrow().panic_stage,
+                Some(stage),
+                "native postflight unwind"
+            );
             if let Some((at, cancel)) = &self.0.borrow().cancel_at_stage {
                 if *at == stage {
                     cancel.store(true, std::sync::atomic::Ordering::Release);
@@ -324,13 +337,17 @@ mod tests {
             s.calls.push("close".into());
             s.closed += 1;
             s.clock += s.close_duration;
-            s.present = s.reappear;
+            s.present = s.reappear || s.queued_cleanup;
         }
         fn release_module(&mut self) -> Result<()> {
             self.call("unpin_module")
         }
         fn release_call_resources(&mut self) {
-            self.0.borrow_mut().call_resources_held = false;
+            let mut s = self.0.borrow_mut();
+            s.call_resources_held = false;
+            if s.queued_cleanup && s.closed != 0 {
+                s.present = s.reappear;
+            }
         }
     }
     fn setup() -> (Native, Carrier<Native>) {
@@ -826,15 +843,48 @@ mod tests {
     fn installation_resources_are_released_between_completed_carrier_operations() {
         // Break: retaining Device+Driver locks for the carrier lifetime stalls
         // independent member driver creation in the other process.
-        let (n, mut c) = setup();
-        c.create(TestPrerequisite).unwrap();
-        assert!(!n.0.borrow().call_resources_held);
-        c.start().unwrap();
-        assert!(!n.0.borrow().call_resources_held);
-        assert_eq!(c.phase(), Phase::Session);
-        c.close().unwrap();
-        assert!(!n.0.borrow().call_resources_held);
-        assert_eq!(n.0.borrow().closed, 1);
+        for mode in 0..4 {
+            let (n, mut c) = setup();
+            c.create(TestPrerequisite).unwrap();
+            assert!(!n.0.borrow().call_resources_held);
+            c.start().unwrap();
+            assert!(!n.0.borrow().call_resources_held);
+            assert_eq!(c.phase(), Phase::Session);
+            let pin = c.session_end_read();
+            let cancel = Rc::new(AtomicBool::new(false));
+            n.0.borrow_mut().queued_cleanup = true;
+            match mode {
+                1 => n.0.borrow_mut().fail_stage = Some(Stage::AfterClose),
+                2 => n.0.borrow_mut().panic_stage = Some(Stage::AfterClose),
+                3 => n.0.borrow_mut().cancel_at_stage = Some((Stage::AfterClose, cancel.clone())),
+                _ => {}
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c.close_original(&cancel)
+            }));
+            match mode {
+                0 => assert_eq!(result.unwrap(), Ok(())),
+                1 => assert_eq!(result.unwrap(), Err(Error::Conflict)),
+                2 => assert!(result.is_err()),
+                _ => assert_eq!(result.unwrap(), Err(Error::Cancelled)),
+            }
+            assert!(!n.0.borrow().call_resources_held);
+            assert_eq!(n.0.borrow().closed, 1);
+            assert_eq!(c.captured().unwrap().identity, row().identity);
+            let ack = pin.acknowledged().unwrap();
+            pin.verify_acknowledged(&ack).unwrap();
+            if mode != 0 {
+                assert_eq!(c.phase(), Phase::ClosePending);
+                assert!(!n.0.borrow().calls.iter().any(|s| s == "unpin_module"));
+            }
+            n.0.borrow_mut().fail_stage = None;
+            n.0.borrow_mut().panic_stage = None;
+            n.0.borrow_mut().cancel_at_stage = None;
+            c.close().unwrap();
+            assert_eq!(c.phase(), Phase::Closed);
+            assert_eq!(n.0.borrow().closed, 1);
+            assert_eq!(n.0.borrow().ended, 1);
+        }
     }
 
     #[test]
