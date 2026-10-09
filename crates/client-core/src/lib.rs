@@ -4954,6 +4954,12 @@ where
         stage: FailedStartStage,
         error: &CoreError,
     ) -> Result<(), CoreError> {
+        if stage.local_start_may_be_incomplete() && self.tunnel.owns_redundant_session().await? {
+            // Native recovery owns its whole session, including a prepared or
+            // promoted replacement. An old Start reply is not user Stop and
+            // must not create a competing cleanup journal or panel operation.
+            return Ok(());
+        }
         let FailedStartContext {
             access_token,
             connection,
@@ -5004,7 +5010,15 @@ where
         if stage.local_start_may_be_incomplete()
             && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
         {
-            if let Err(cleanup_error) = self.tunnel.stop().await.map_err(CoreError::from) {
+            // Ownership may change after the read above. Native backends fence
+            // the legacy-only cleanup again when executing this command.
+            if let Err(cleanup_error) = self.tunnel.stop_if_unowned().await.map_err(CoreError::from)
+            {
+                if self.tunnel.owns_redundant_session().await? {
+                    // Confirmed native responsibility is a handoff, not a new
+                    // failure which replaces the original Start outcome.
+                    return Ok(());
+                }
                 *self.state.lock().await = CoreState {
                     phase: Phase::Stopping,
                     connection: Some(connection.clone()),
@@ -5033,6 +5047,11 @@ where
                 });
                 return Err(cleanup_error);
             }
+        }
+        if stage.local_start_may_be_incomplete() && self.tunnel.owns_redundant_session().await? {
+            // Even a delayed Stopped reply cannot grant Core ownership of a
+            // replacement. Keep any exact journal already saved for later.
+            return Ok(());
         }
         let (connection, mut phase) = match self
             .retry_compensation_stop(access_token, &durable_compensation)

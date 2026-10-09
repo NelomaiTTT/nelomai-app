@@ -347,6 +347,9 @@ struct MemoryTunnel {
     stops: AtomicUsize,
     fail_next_starts: AtomicUsize,
     start_failure_code: Mutex<Option<String>>,
+    start_failure_status: Mutex<Option<TunnelStatus>>,
+    take_native_ownership_on_start_failure: AtomicBool,
+    hold_status_after_start_failure: AtomicBool,
     fail_next_stops: AtomicUsize,
     stop_failure_code: Mutex<Option<String>>,
     leave_running_on_start_failure: AtomicBool,
@@ -432,8 +435,19 @@ impl TunnelController for MemoryTunnel {
             })
             .is_ok()
         {
+            if self
+                .take_native_ownership_on_start_failure
+                .load(Ordering::SeqCst)
+            {
+                self.native_session_owned.store(true, Ordering::SeqCst);
+            }
+            if self.hold_status_after_start_failure.load(Ordering::SeqCst) {
+                self.hold_next_status.store(true, Ordering::SeqCst);
+            }
             *self.status.lock().unwrap() =
-                if self.leave_running_on_start_failure.load(Ordering::SeqCst) {
+                if let Some(status) = *self.start_failure_status.lock().unwrap() {
+                    status
+                } else if self.leave_running_on_start_failure.load(Ordering::SeqCst) {
                     TunnelStatus::Running
                 } else if self.leave_failed_on_start_failure.load(Ordering::SeqCst) {
                     TunnelStatus::Failed
@@ -1243,6 +1257,138 @@ async fn recovery_v2_local_failure_uses_only_the_redundant_stop_contract() {
         .unwrap()
         .pending_compensation_stop
         .is_none());
+}
+
+async fn failed_start_preserves_native_replacement(status: TunnelStatus, failure_code: &str) {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    *tunnel.start_failure_code.lock().unwrap() = Some(failure_code.into());
+    *tunnel.start_failure_status.lock().unwrap() = Some(status);
+    tunnel
+        .take_native_ownership_on_start_failure
+        .store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .start_recovery_v2(options(), 1_700_000_000, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Tunnel(code) if code == failure_code));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(*tunnel.status.lock().unwrap(), status);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+}
+
+#[tokio::test]
+async fn cancelled_start_cannot_compensate_a_prepared_native_restart() {
+    failed_start_preserves_native_replacement(TunnelStatus::Stopping, "tunnel_start_cancelled")
+        .await;
+}
+
+#[tokio::test]
+async fn cancelled_start_cannot_compensate_a_promoted_native_restart() {
+    failed_start_preserves_native_replacement(TunnelStatus::Running, "tunnel_start_cancelled")
+        .await;
+}
+
+#[tokio::test]
+async fn cancelled_start_cannot_create_a_second_cleanup_owner_after_native_close() {
+    failed_start_preserves_native_replacement(TunnelStatus::Stopped, "tunnel_start_cancelled")
+        .await;
+}
+
+#[tokio::test]
+async fn native_start_timeout_handoff_preserves_the_original_error() {
+    failed_start_preserves_native_replacement(TunnelStatus::Stopping, "tunnel_start_timeout").await;
+    failed_start_preserves_native_replacement(TunnelStatus::Stopping, "tunnel_handshake_timeout")
+        .await;
+}
+
+#[tokio::test]
+async fn cancelled_start_compensation_is_fenced_when_owner_changes_after_the_read() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    *tunnel.start_failure_code.lock().unwrap() = Some("tunnel_start_cancelled".into());
+    *tunnel.start_failure_status.lock().unwrap() = Some(TunnelStatus::Stopping);
+    tunnel
+        .hold_status_after_start_failure
+        .store(true, Ordering::SeqCst);
+    let core = Arc::new(support::core(
+        api.clone(),
+        store,
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let task = tokio::spawn({
+        let core = core.clone();
+        async move { core.start_recovery_v2(options(), 1_700_000_000, true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), tunnel.status_entered.notified())
+        .await
+        .unwrap();
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    tunnel.status_release.notify_one();
+    assert!(tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        core.has_pending_stop_cleanup().unwrap(),
+        "Already persisted exact cleanup must remain retryable"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_start_stopped_reply_cannot_bypass_a_new_native_owner() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    *tunnel.start_failure_code.lock().unwrap() = Some("tunnel_start_cancelled".into());
+    tunnel
+        .hold_status_after_start_failure
+        .store(true, Ordering::SeqCst);
+    let core = Arc::new(support::core(
+        api.clone(),
+        store,
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let task = tokio::spawn({
+        let core = core.clone();
+        async move { core.start_recovery_v2(options(), 1_700_000_000, true).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), tunnel.status_entered.notified())
+        .await
+        .unwrap();
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    tunnel.status_release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Tunnel(code) if code == "tunnel_start_cancelled"));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert!(core.has_pending_stop_cleanup().unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]

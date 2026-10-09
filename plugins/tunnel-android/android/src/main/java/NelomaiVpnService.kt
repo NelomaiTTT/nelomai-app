@@ -1126,12 +1126,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         if (args.redundancy != null && !redundantStartOperation.begin(
                 requireNotNull(args.clientOperationId),
                 onCancelled = {
-                    QuickTunnelController.updateState(
-                        applicationContext,
-                        SessionState.STOPPED,
-                        desiredActive = false,
-                    )
-                    receiver.sendOperation(SessionState.STOPPED, 0)
+                    // The durable Stop/restart owns the intent and UI state.
+                    // A late callback for the retired Start must not disarm its
+                    // replacement, nor acknowledge a cancelled Start as success.
+                    receiver.sendError("tunnel_start_cancelled")
                 },
             )
         ) {
@@ -2357,7 +2355,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         QuickTunnelController.updateState(
             applicationContext,
             SessionState.STOPPING,
-            desiredActive = false,
+            desiredActive = null,
         )
         beginFailClosedRedundantStop(
             clientOperationId,
@@ -2445,7 +2443,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         QuickTunnelController.updateState(
             applicationContext,
             SessionState.STOPPING,
-            desiredActive = false,
+            desiredActive = null,
         )
         redundantStopWaiters.getOrPut(redundantOperationId, ::mutableListOf).add { result ->
             if (!result.fenced) {
@@ -4214,7 +4212,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         QuickTunnelController.updateState(
             applicationContext,
             SessionState.STOPPING,
-            desiredActive = false,
+            desiredActive = null,
             changed = true,
         )
         beginFailClosedRedundantStop(
