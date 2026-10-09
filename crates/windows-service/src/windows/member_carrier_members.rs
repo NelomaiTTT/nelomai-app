@@ -2187,7 +2187,7 @@ pub(crate) mod native {
             for entry in self.pending.iter().flatten() {
                 entry.original.retire_forward();
             }
-            if carrier.len() != 1 {
+            if carrier.len() > 1 {
                 return Err(Error::Conflict);
             }
             let partials = self.closing_partials()?;

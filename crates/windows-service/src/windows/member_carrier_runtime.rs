@@ -1418,7 +1418,7 @@ pub(crate) mod native {
     };
     use std::{
         cell::{Cell, RefCell, RefMut},
-        rc::Rc,
+        rc::{Rc, Weak},
     };
 
     /// Required INDEPENDENT lifecycle permission, not a protected record or
@@ -3156,6 +3156,7 @@ pub(crate) mod native {
         supervisor: Rc<NativeDeadline>,
         deadline: NativeDeadlineReadPin,
         fence: Rc<super::SourceFence>,
+        retired: RefCell<Option<Weak<RetiredCarrierRead>>>,
     }
     type ClosingMemberFacts = (
         Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
@@ -3556,6 +3557,7 @@ pub(crate) mod native {
                     supervisor: owner.gate.supervisor().clone(),
                     deadline: owner.gate.supervisor().read_pin().map_err(denied)?,
                     fence: owner.source_fence.clone(),
+                    retired: RefCell::new(None),
                 });
                 crate::windows::member_carrier_original_read::retain_first_before(
                     &mut owner.closing_reader,
@@ -3906,7 +3908,7 @@ pub(crate) mod native {
         }
         fn members(
             &self,
-            carrier: &creators::Identity,
+            carrier: Option<&creators::Identity>,
             partial: Option<
                 &crate::windows::member_carrier_member_controller::native::PartialCleanup,
             >,
@@ -3914,26 +3916,32 @@ pub(crate) mod native {
             use crate::windows::member_carrier_provider::{
                 Expected, ExpectedProvider, ProviderKind,
             };
-            let c = ExpectedProvider {
-                identity: Expected {
-                    guid: carrier.guid,
-                    luid: carrier.luid,
-                    index: carrier.index,
-                    name: carrier.name.clone(),
-                    description: carrier.description.clone(),
-                    if_type: carrier.if_type,
-                    tunnel_type: carrier.tunnel_type,
-                },
-                kind: ProviderKind::Wintun,
-            };
+            let carrier = carrier
+                .map(|carrier| ExpectedProvider {
+                    identity: Expected {
+                        guid: carrier.guid,
+                        luid: carrier.luid,
+                        index: carrier.index,
+                        name: carrier.name.clone(),
+                        description: carrier.description.clone(),
+                        if_type: carrier.if_type,
+                        tunnel_type: carrier.tunnel_type,
+                    },
+                    kind: ProviderKind::Wintun,
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
             if let Some(partial) = partial {
+                if carrier.is_empty() {
+                    return Err(Error::Conflict);
+                }
                 return self
                     .members
                     .inspect_partial_closing_bindings(
                         &self.scope.context,
                         &self.runtime,
                         &self.image,
-                        &[c],
+                        &carrier,
                         partial,
                         |live, history, domains, partials| {
                             Ok((
@@ -3951,7 +3959,7 @@ pub(crate) mod native {
                     &self.scope.context,
                     &self.runtime,
                     &self.image,
-                    &[c],
+                    &carrier,
                     |live, history, domains, partials| {
                         Ok((
                             live.to_vec(),
@@ -3979,15 +3987,45 @@ pub(crate) mod native {
             >,
         ) -> Result<ClosingSample> {
             let before = self.revision()?;
-            let (original, members, history, service_domains, partials) = self
-                .originals
-                .inspect_live_carrier_identity(&self.scope, true, |actual| {
-                    let (members, history, domains, partials) = self
-                        .members(&actual.identity, partial)
-                        .map_err(|_| creators::Error::Conflict)?;
-                    Ok((actual.identity.clone(), members, history, domains, partials))
-                })
-                .map_err(denied)?;
+            let retired = self
+                .retired
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .clone();
+            let (original, members, history, service_domains, partials) =
+                if let Some(retired) = retired {
+                    if partial.is_some() {
+                        return Err(Error::Conflict);
+                    }
+                    let retired = retired.upgrade().ok_or(Error::Conflict)?;
+                    retired.inspect(|carrier| {
+                        self.members
+                            .inspect_retired_bindings_full(
+                                &self.scope.context,
+                                &self.runtime,
+                                &self.image,
+                                |history| {
+                                    Ok((
+                                        carrier.captured().identity.clone(),
+                                        Vec::new(),
+                                        history.to_vec(),
+                                        Vec::new(),
+                                        Vec::new(),
+                                    ))
+                                },
+                            )
+                            .map_err(denied)
+                    })?
+                } else {
+                    self.originals
+                        .inspect_carrier_identity(&self.scope, true, |actual, live| {
+                            let (members, history, domains, partials) = self
+                                .members(live.map(|original| &original.identity), partial)
+                                .map_err(|_| creators::Error::Conflict)?;
+                            Ok((actual.identity.clone(), members, history, domains, partials))
+                        })
+                        .map_err(denied)?
+                };
             // Matching rows still grant no native ACK. Protected full-row
             // binding must agree with this actual retained original C.
             let rows = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
@@ -5691,11 +5729,29 @@ pub(crate) mod native {
             });
             // No full SDK/reader inspection or G callback precedes rooting.
             let gate = &mut self.gate;
+            let closing = self.closing_reader.as_ref();
+            let observer = &self.observer;
             crate::windows::member_carrier_original_read::retain_first_before(
                 &mut self.retired_reader,
                 read,
                 Error::Conflict,
-                |original| gate.retain_retired_carrier(original),
+                |original| {
+                    if let Some(closing) = closing {
+                        if !closing.originals.same_original_registry(observer)
+                            || !closing.runtime.same_original_runtime(&original.runtime)
+                            || !closing.members.same_original(&original.members)
+                            || closing.scope != original.scope
+                            || !Rc::ptr_eq(&closing.fence.revoked, &original.revoked)
+                        {
+                            return Err(Error::Conflict);
+                        }
+                        *closing
+                            .retired
+                            .try_borrow_mut()
+                            .map_err(|_| Error::Conflict)? = Some(Rc::downgrade(original));
+                    }
+                    gate.retain_retired_carrier(original)
+                },
             )
         }
         fn retain_unpublished_closed_reader(&mut self) -> Result<Rc<UnpublishedClosedCarrierRead>> {

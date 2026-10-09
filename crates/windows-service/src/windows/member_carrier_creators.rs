@@ -841,17 +841,19 @@ impl<N: OriginalNative> Drop for Producer<N> {
     }
 }
 impl<N: OriginalNative> Observer<N> {
-    /// Factual SAME raw C handle bracket, not a complete provider universe,
+    /// Factual SAME C original/once-close bracket, not a complete provider universe,
     /// absence proof or effect permission. A/B generation publication and
     /// cleanup bracket their own full inventory without recursive observation.
     /// Its caller MUST independently query the full mixed SDK universe here.
+    /// The optional live identity is absent only for a verified original close
+    /// receipt; the captured identity then supplies comparison metadata only.
     /// No mutable/retained native capability escapes; errors/unwind/reentry
     /// permanently poison forward use, preserving original cleanup roots.
-    pub(crate) fn inspect_live_carrier_identity<T>(
+    pub(crate) fn inspect_carrier_identity<T>(
         &self,
         expected: &Scope,
         cleanup: bool,
-        inspect: impl FnOnce(&OriginalIdentity) -> Result<T>,
+        inspect: impl FnOnce(&OriginalIdentity, Option<&OriginalIdentity>) -> Result<T>,
     ) -> Result<T> {
         let operation = Operation::enter(&self.shared, cleanup)?;
         if self.shared.scope(expected)? != 0 || expected.binding.role != Role::RoleCarrier {
@@ -884,19 +886,22 @@ impl<N: OriginalNative> Observer<N> {
             .as_ref()
             .ok_or(Error::Pending)?
             .clone();
-        let (native, captured) = {
+        let (native, captured, closed) = {
             let held = slot.held.try_borrow().map_err(|_| Error::Conflict)?;
             let held = held.as_ref().ok_or(Error::Pending)?;
-            if held.close.is_some() {
+            if held.close.is_some() && !cleanup {
                 return Err(Error::Conflict);
             }
             (
                 held.native.clone(),
                 held.original.as_ref().ok_or(Error::Pending)?.clone(),
+                held.close.clone(),
             )
         };
         let check = || -> Result<()> {
-            if !(slot.state.get() == State::Live || cleanup && slot.state.get() == State::Ambiguous)
+            if !(slot.state.get() == State::Live
+                || cleanup && matches!(slot.state.get(), State::Retiring | State::Ambiguous))
+                || closed.is_some() && slot.state.get() != State::Retiring
                 || attempt.scope != *expected
                 || !attempt.acknowledged.get()
                 || !attempt.published.get()
@@ -910,11 +915,25 @@ impl<N: OriginalNative> Observer<N> {
             {
                 return Err(Error::Conflict);
             }
+            let held = slot.held.try_borrow().map_err(|_| Error::Conflict)?;
+            match (held.as_ref().and_then(|held| held.close.as_ref()), &closed) {
+                (None, None) => (),
+                (Some(current), Some(original)) if Rc::ptr_eq(current, original) => (),
+                _ => return Err(Error::Conflict),
+            }
             self.shared.attempt(&attempt)?;
             operation.check()
         };
         check()?;
-        let before = native.original_identity(expected)?;
+        let before = if let Some(receipt) = &closed {
+            native.verify_close_receipt(expected, receipt)?;
+            OriginalIdentity {
+                scope: captured.scope.clone(),
+                identity: captured.identity.clone(),
+            }
+        } else {
+            native.original_identity(expected)?
+        };
         if before.scope != *expected
             || before.identity != captured.identity
             || captured.scope != *expected
@@ -923,9 +942,11 @@ impl<N: OriginalNative> Observer<N> {
         }
         validate_observation(expected, &captured)?;
         operation.check()?;
-        let value = inspect(&before)?;
+        let value = inspect(&before, closed.is_none().then_some(&before))?;
         operation.check()?;
-        if native.original_identity(expected)? != before {
+        if let Some(receipt) = &closed {
+            native.verify_close_receipt(expected, receipt)?;
+        } else if native.original_identity(expected)? != before {
             return Err(Error::Changed);
         }
         check()?;

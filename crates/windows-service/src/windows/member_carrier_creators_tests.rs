@@ -267,7 +267,7 @@ fn live(i: usize) -> (Producer<Native>, Observer<Native>, Rc<Log>) {
 
 #[test]
 fn carrier_identity_callback_retains_actual_original_without_recursive_universe() {
-    let (producer, observer, log) = live(0);
+    let (mut producer, observer, log) = live(0);
     let calls = producer.original_universe().calls.borrow().len();
     producer
         .original_universe()
@@ -277,7 +277,8 @@ fn carrier_identity_callback_retains_actual_original_without_recursive_universe(
         })));
     let reads = log.reads.get();
     observer
-        .inspect_live_carrier_identity(&scope(0), false, |actual| {
+        .inspect_carrier_identity(&scope(0), false, |actual, live| {
+            assert_eq!(live, Some(actual));
             assert_eq!(actual.scope, scope(0));
             assert_eq!(actual.identity.guid, scope(0).binding.guid);
             assert_eq!(log.reads.get(), reads + 1);
@@ -291,12 +292,53 @@ fn carrier_identity_callback_retains_actual_original_without_recursive_universe(
     producer.shared.fail();
     assert_eq!(observer.snapshot(&context()).unwrap()[0], State::Ambiguous);
     observer
-        .inspect_live_carrier_identity(&scope(0), true, |_| Ok(()))
+        .inspect_carrier_identity(&scope(0), true, |_, _| Ok(()))
         .unwrap();
     assert!(observer
-        .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
+        .inspect_carrier_identity(&scope(0), false, |_, _| Ok(()))
         .is_err());
     assert_eq!(log.closes.get(), 0);
+    let retiring = producer.retire(&scope(0)).unwrap();
+    observer
+        .inspect_carrier_identity(&scope(0), true, |_, _| Ok(()))
+        .unwrap();
+    assert_eq!(log.closes.get(), 0);
+    assert!(observer
+        .inspect_carrier_identity(&scope(0), false, |_, _| Ok(()))
+        .is_err());
+    let receipt = retiring.original().native_close();
+    let ack = retiring.acknowledge_closed(receipt).unwrap();
+    let reads = log.reads.get();
+    log.fail_read.set(true); // Closed adapters must not enter their getter.
+    assert!(observer
+        .inspect_carrier_identity(&scope(0), true, |_, live| {
+            assert!(live.is_none());
+            Err::<(), _>(Error::Native)
+        })
+        .is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observer.inspect_carrier_identity(&scope(0), true, |_, live| -> Result<()> {
+            assert!(live.is_none());
+            panic!("actual close postflight");
+        })
+    }))
+    .is_err());
+    observer
+        .inspect_carrier_identity(&scope(0), true, |actual, live| {
+            assert!(live.is_none());
+            assert_eq!(actual.scope, scope(0));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(log.reads.get(), reads);
+    assert_eq!(log.closes.get(), 1);
+    assert_eq!(log.drops.get(), 0);
+    assert_eq!(observer.snapshot(&context()).unwrap()[0], State::Retiring);
+    producer.original_universe().on_inspect.take();
+    let released = producer.complete_close(ack, &mut absent()).unwrap();
+    released.read_pin().unwrap().observe(&mut absent()).unwrap();
+    assert_eq!(log.reads.get(), reads);
+    assert_eq!(log.closes.get(), 1);
 }
 
 #[test]
@@ -312,7 +354,7 @@ fn carrier_identity_callback_denies_nonoriginal_drift_reentry_error_and_unwind()
             log.fail_read.set(true);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            observer.inspect_live_carrier_identity(&expected, false, |_| {
+            observer.inspect_carrier_identity(&expected, false, |_, _| {
                 entered.set(true);
                 match fault {
                     2 => {
@@ -336,17 +378,19 @@ fn carrier_identity_callback_denies_nonoriginal_drift_reentry_error_and_unwind()
         }
         assert_eq!(entered.get(), fault >= 2);
         assert!(observer
-            .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
+            .inspect_carrier_identity(&scope(0), false, |_, _| Ok(()))
             .is_err());
         assert_eq!(log.closes.get(), 0);
     }
     let (_producer, observer) = registry();
     assert!(observer
-        .inspect_live_carrier_identity(&scope(0), false, |_| -> Result<()> { panic!("uncreated") })
+        .inspect_carrier_identity(&scope(0), false, |_, _| -> Result<()> {
+            panic!("uncreated")
+        })
         .is_err());
     let (_producer, observer, _) = live(1);
     assert!(observer
-        .inspect_live_carrier_identity(&scope(1), false, |_| -> Result<()> { panic!("member") })
+        .inspect_carrier_identity(&scope(1), false, |_, _| -> Result<()> { panic!("member") })
         .is_err());
 }
 
@@ -377,7 +421,7 @@ fn carrier_identity_callback_rejects_actual_handle_drift_before_and_after_consum
             let called = Cell::new(false);
             assert!(
                 observer
-                    .inspect_live_carrier_identity(&scope(0), false, |_| {
+                    .inspect_carrier_identity(&scope(0), false, |_, _| {
                         called.set(true);
                         if after_callback {
                             change();
@@ -390,7 +434,7 @@ fn carrier_identity_callback_rejects_actual_handle_drift_before_and_after_consum
             assert_eq!(called.get(), after_callback);
             *original.facts.borrow_mut() = captured;
             assert!(observer
-                .inspect_live_carrier_identity(&scope(0), false, |_| Ok(()))
+                .inspect_carrier_identity(&scope(0), false, |_, _| Ok(()))
                 .is_err());
             assert_eq!(log.closes.get(), 0);
             assert_eq!(log.drops.get(), 0);
