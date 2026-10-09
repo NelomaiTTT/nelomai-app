@@ -2282,8 +2282,6 @@ pub(crate) mod native {
                 .map_err(|_| Error::Native)?,
             )));
             let guard = self.guard.as_ref().ok_or(Error::Pending)?.clone();
-            #[cfg(test)]
-            crate::windows::member_carrier_factory_test_os::native_guard_retained(&guard);
             graph_result!(
                 selection.select(original.clone(), expected.clone()),
                 "guard selection"

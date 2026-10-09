@@ -163,157 +163,6 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             "actual native factory cost case={case} runtime_full_auth_attempts={runtime_auth} source_full_auth_attempts={source_auth} runtime_current_check_attempts={runtime_current_checks} source_current_check_attempts={source_current_checks} installed_lifetime_recheck_attempts={lifetime_rechecks} installed_final_inventory_recheck_attempts={final_inventory_rechecks} elapsed_ms={}",
             elapsed.as_millis()
         );
-        if !timed_out && !status.success() {
-            let proofs = stderr
-                .lines()
-                .filter_map(|line| line.strip_prefix("actual expired Stop comparison_only_proof="))
-                .take(2)
-                .collect::<Vec<_>>();
-            let proof = match proofs.as_slice() {
-                [json] if json.len() <= 256 => {
-                    serde_json::from_str::<crate::member_owner::InterfaceProof>(json)
-                        .ok()
-                        .filter(|p| p.guid != [0; 16] && p.luid != 0 && p.index != 0)
-                }
-                _ => None,
-            };
-            if let Some(proof) = proof {
-                use windows_sys::Win32::NetworkManagement::{
-                    IpHelper::{GetIfEntry2, MIB_IF_ROW2},
-                    Ndis::NET_LUID_LH,
-                };
-                println!("actual post-exit comparison case={case} child_pid={} child_process_exited=true static_wfp=unconfirmed guid={:?} luid={} index={}", child.id(), proof.guid, proof.luid, proof.index);
-                let observing = std::time::Instant::now();
-                for sample in 0..4 {
-                    let due = std::time::Duration::from_secs(sample * 5);
-                    if let Some(wait) = due.checked_sub(observing.elapsed()) {
-                        std::thread::sleep(wait);
-                    }
-                    if observing.elapsed() >= std::time::Duration::from_secs(20) {
-                        break;
-                    }
-                    let mut row = MIB_IF_ROW2 {
-                        InterfaceLuid: NET_LUID_LH { Value: proof.luid },
-                        ..Default::default()
-                    };
-                    let status = unsafe { GetIfEntry2(&mut row) };
-                    if status == 0 {
-                        let guid = crate::windows::member_carrier_guard::key(row.InterfaceGuid).0;
-                        let luid = unsafe { row.InterfaceLuid.Value };
-                        let exact = guid == proof.guid
-                            && luid == proof.luid
-                            && row.InterfaceIndex == proof.index;
-                        println!("actual post-exit entry sample={sample} elapsed_ms={} status={status} guid={guid:?} luid={luid} index={} exact={exact} oper_status={} admin_status={} media_connect_state={} flags={:#04x}", observing.elapsed().as_millis(), row.InterfaceIndex, row.OperStatus, row.AdminStatus, row.MediaConnectState, row.InterfaceAndOperStatusFlags._bitfield);
-                    } else {
-                        println!(
-                            "actual post-exit entry sample={sample} elapsed_ms={} status={status}",
-                            observing.elapsed().as_millis()
-                        );
-                    }
-                    match crate::windows::member_carrier_provider::native::table() {
-                        Ok(rows) => {
-                            let mut exact = 0;
-                            let mut collisions = 0;
-                            for row in rows {
-                                let identity = row.identity;
-                                if identity.guid == proof.guid
-                                    && identity.luid == proof.luid
-                                    && identity.index == proof.index
-                                {
-                                    exact += 1;
-                                } else if identity.guid == proof.guid
-                                    || identity.luid == proof.luid
-                                    || identity.index == proof.index
-                                {
-                                    collisions += 1;
-                                }
-                            }
-                            println!("actual post-exit rundown sample={sample} elapsed_ms={} exact={exact} collisions={collisions}", observing.elapsed().as_millis());
-                        }
-                        Err(error) => println!("actual post-exit rundown sample={sample} elapsed_ms={} error={error:?}", observing.elapsed().as_millis()),
-                    }
-                }
-                // Failure-only comparison evidence, never device/creator
-                // authority. Keep the existing post-exit MIB budget unchanged.
-                let setup = (|| -> std::io::Result<(String, bool)> {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let root = std::env::var_os("SystemRoot")
-                        .ok_or_else(|| std::io::Error::other("SystemRoot unavailable"))?;
-                    let mut file = std::fs::File::open(
-                        std::path::PathBuf::from(root).join("inf/SetupAPI.dev.log"),
-                    )?;
-                    let length = file.metadata()?.len();
-                    let offset = length.saturating_sub(2 * 1024 * 1024);
-                    file.seek(SeekFrom::Start(offset))?;
-                    let mut bytes = Vec::new();
-                    file.take(2 * 1024 * 1024).read_to_end(&mut bytes)?;
-                    let text = if bytes.starts_with(&[0xff, 0xfe]) || bytes.get(1) == Some(&0) {
-                        let start = usize::from(bytes.starts_with(&[0xff, 0xfe])) * 2;
-                        if (bytes.len() - start) % 2 != 0 {
-                            return Err(std::io::Error::other("truncated UTF16 tail"));
-                        }
-                        String::from_utf16(
-                            &bytes[start..]
-                                .chunks_exact(2)
-                                .map(|b| u16::from_le_bytes([b[0], b[1]]))
-                                .collect::<Vec<_>>(),
-                        )
-                        .map_err(std::io::Error::other)?
-                    } else {
-                        String::from_utf8(bytes).map_err(std::io::Error::other)?
-                    };
-                    Ok((text, offset != 0))
-                })();
-                match setup {
-                    Ok((text, tail_truncated)) => {
-                        let hex = proof.guid.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-                        let canonical = format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]);
-                        let mut sections = Vec::new();
-                        let mut current: Option<String> = None;
-                        let mut unknown = tail_truncated;
-                        for line in text.lines() {
-                            if line.starts_with(">>>  [") {
-                                if current.is_some() { unknown = true; }
-                                current = Some(String::new());
-                            }
-                            if let Some(section) = current.as_mut() {
-                                if section.len() + line.len() + 1 > 64 * 1024 {
-                                    unknown = true;
-                                    current = None;
-                                    continue;
-                                }
-                                section.push_str(line);
-                                section.push('\n');
-                                if line.starts_with("<<<  [Exit status:") {
-                                    let section = current.take().unwrap();
-                                    if section.to_ascii_lowercase().contains(&canonical) {
-                                        sections.push(section);
-                                    }
-                                }
-                            } else if line.to_ascii_lowercase().contains(&canonical) {
-                                unknown = true;
-                            }
-                        }
-                        unknown |= current.is_some();
-                        let mut emitted = 0;
-                        let mut bytes = 0;
-                        for section in sections.iter().rev() {
-                            if emitted == 4 || bytes + section.len() > 64 * 1024 {
-                                unknown = true;
-                                break;
-                            }
-                            println!("actual post-exit SetupAPI comparison_only=true guid={canonical} section_begin\n{section}actual post-exit SetupAPI section_end");
-                            emitted += 1;
-                            bytes += section.len();
-                        }
-                        println!("actual post-exit SetupAPI comparison_only=true sections={emitted} bytes={bytes} evidence_unknown={}", unknown || emitted == 0);
-                    }
-                    Err(error) => println!("actual post-exit SetupAPI comparison_only=true evidence_unknown=true error={error:?}"),
-                }
-            } else {
-                println!("actual post-exit comparison case={case} child_process_exited=true proof=missing_invalid_or_ambiguous static_wfp=unconfirmed");
-            }
-        }
         assert!(
             !timed_out,
             "actual native factory {case} exceeded whole-case {case_budget:?}: {stdout} {stderr}"
@@ -781,10 +630,7 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        if stopped.is_err()
-            && (retry_started.elapsed() > std::time::Duration::from_secs(30)
-                || crate::windows::member_carrier_factory_test_os::apipa_probe_mode())
-        {
+        if stopped.is_err() && crate::windows::member_carrier_factory_test_os::apipa_probe_mode() {
             if let Some(record) = fixture
                 .trace_pair_stage()
                 .filter(|r| r.phase == crate::member_carrier_pair::Phase::Closing)
@@ -810,110 +656,13 @@ fn carrier_factory_actual_cold_child() {
                     _ => None,
                 };
                 if let Some((kind, proof)) = comparison {
-                    eprintln!(
-                        "actual expired Stop comparison_only_proof={}",
-                        serde_json::to_string(&proof).expect("comparison-only interface proof")
-                    );
                     eprintln!("actual expired Stop {kind} observation case={case} pid={} guid={:?} luid={} index={} stop_elapsed_ms={} retry_elapsed_ms={}", std::process::id(), proof.guid, proof.luid, proof.index, stop_started.elapsed().as_millis(), retry_started.elapsed().as_millis());
-                    use windows_sys::Win32::{
-                        NetworkManagement::{
-                            IpHelper::{GetIfEntry2, MIB_IF_ROW2},
-                            Ndis::NET_LUID_LH,
-                        },
-                        System::Registry::{
-                            RegCloseKey, RegEnumValueW, RegOpenKeyExW, RegQueryInfoKeyW,
-                            HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK,
-                        },
+                    use windows_sys::Win32::NetworkManagement::{
+                        IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+                        Ndis::NET_LUID_LH,
                     };
-                    // By-name diagnostic only; the retained original HKEY is unavailable here.
-                    let guid = windows_sys::core::GUID::from_u128(u128::from_be_bytes(proof.guid));
-                    let path = format!(
-                        r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
-                        guid.data1, guid.data2, guid.data3,
-                        guid.data4[0], guid.data4[1], guid.data4[2], guid.data4[3],
-                        guid.data4[4], guid.data4[5], guid.data4[6], guid.data4[7],
-                    ).encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-                    let mut key = std::ptr::null_mut();
-                    let opened = unsafe {
-                        RegOpenKeyExW(
-                            HKEY_LOCAL_MACHINE,
-                            path.as_ptr(),
-                            REG_OPTION_OPEN_LINK,
-                            KEY_QUERY_VALUE,
-                            &mut key,
-                        )
-                    };
-                    let (mut subkeys, mut values) = (0, 0);
-                    let mut names = Vec::new();
-                    let (mut info, mut closed) = (None, None);
-                    if opened == 0 {
-                        info = Some(unsafe {
-                            RegQueryInfoKeyW(
-                                key,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null(),
-                                &mut subkeys,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                &mut values,
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                                std::ptr::null_mut(),
-                            )
-                        });
-                        if info == Some(0) {
-                            for index in 0..values.min(16) {
-                                let mut name = [0u16; 512];
-                                let mut length = name.len() as u32;
-                                let status = unsafe {
-                                    RegEnumValueW(
-                                        key,
-                                        index,
-                                        name.as_mut_ptr(),
-                                        &mut length,
-                                        std::ptr::null(),
-                                        std::ptr::null_mut(),
-                                        std::ptr::null_mut(),
-                                        std::ptr::null_mut(),
-                                    )
-                                };
-                                names.push((index, status, length, name));
-                            }
-                        }
-                        closed = Some(unsafe { RegCloseKey(key) });
-                    }
-                    eprintln!("actual expired Stop {kind} registry by_name_only=true original_handle=unavailable open_status={opened} info_status={info:?} subkeys={subkeys} values={values} names_truncated={} close_status={closed:?}", values > 16);
-                    for (index, status, length, name) in names {
-                        let text = if status == 0 && (length as usize) <= name.len() {
-                            Some(String::from_utf16_lossy(&name[..length as usize]))
-                        } else {
-                            None
-                        };
-                        eprintln!("actual expired Stop {kind} registry value_name index={index} status={status} length={length} name={text:?}");
-                    }
                     let observing = std::time::Instant::now();
-                    let mut sample = 0;
-                    while observing.elapsed()
-                        < std::time::Duration::from_secs(
-                            if crate::windows::member_carrier_factory_test_os::apipa_probe_mode() {
-                                15
-                            } else {
-                                60
-                            },
-                        )
-                    {
-                        if sample == 4
-                            && !crate::windows::member_carrier_factory_test_os::apipa_probe_mode()
-                        {
-                            let result =
-                                crate::windows::member_carrier_factory_test_os::diagnostic_withdraw_original_blocks(&record.scope);
-                            eprintln!("actual expired Stop {kind} WFP-only barrier sample={sample} diagnostic_only=true result={result:?}");
-                            if observing.elapsed() >= std::time::Duration::from_secs(60) {
-                                break;
-                            }
-                        }
+                    while observing.elapsed() < std::time::Duration::from_secs(15) {
                         let mut row = MIB_IF_ROW2 {
                             InterfaceLuid: NET_LUID_LH { Value: proof.luid },
                             ..Default::default()
@@ -959,12 +708,11 @@ fn carrier_factory_actual_cold_child() {
                             ),
                         }
                         if observing.elapsed() + std::time::Duration::from_secs(5)
-                            >= std::time::Duration::from_secs(60)
+                            >= std::time::Duration::from_secs(15)
                         {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_secs(5));
-                        sample += 1;
                     }
                 }
             }
