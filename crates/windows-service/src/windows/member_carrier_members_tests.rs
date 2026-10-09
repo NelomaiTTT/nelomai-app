@@ -519,6 +519,7 @@ struct HistoryState {
     absence_reads: usize,
     original_error: bool,
     original_panic: bool,
+    fail_after_stop: bool,
     observed: Option<NativeProof>,
     lost_running_ack: bool,
     panic_running_ack: bool,
@@ -647,9 +648,11 @@ impl crate::member_owner::MemberIo for HistoryIo {
         _: Option<&NativeProof>,
         _: &crate::member_owner::Observation,
     ) -> crate::member_owner::Result<()> {
-        self.0.borrow_mut().running = false;
-        self.0.borrow_mut().original = false;
-        self.0.borrow_mut().original_created = false;
+        let mut state = self.0.borrow_mut();
+        state.running = false;
+        state.original = false;
+        state.original_created = false;
+        state.absence_error = state.fail_after_stop;
         Ok(())
     }
     fn rebind(
@@ -692,6 +695,8 @@ fn pending_fixture() -> PendingFixture {
         source: std::rc::Rc::new(()),
         original: controller.pending_read().unwrap(),
         captured: None,
+        #[cfg(windows)]
+        partial: None,
         closed: None,
     };
     (context, pending, state, controller)
@@ -711,9 +716,24 @@ fn partial_pending_inventory_separates_unknown_service_from_live_providers() {
             &context,
             &mut entries,
             [false; 2],
-            (true, false, Some(0)),
+            (true, false, &[0][..]),
             |_, _| Ok(()),
             |_, _| panic!("partial metadata must never become a live SDK provider")
+        ),
+        Ok(vec![])
+    );
+    let (published, state_b, mut owner_b, running_b) =
+        actual_live_entry(TunnelSlot::B, TunnelTransport::AmneziaWg3);
+    state_b.borrow_mut().fail_after_stop = true;
+    assert!(owner_b.stop(&running_b).is_err());
+    assert_eq!(
+        read_closing_members_with(
+            &context,
+            &mut [None, Some(published)],
+            &[1],
+            |_, _| Ok(()),
+            |_, _| panic!("stopped SDK reader"),
+            |original| original.read_for_cleanup()
         ),
         Ok(vec![])
     );
@@ -739,11 +759,11 @@ fn partial_pending_inventory_cannot_exclude_live_history_wrong_slot_or_forward_c
         state.borrow_mut().lost_running_ack = true;
         assert!(owner.start_with_prior(None).is_err());
         let mut registered = [false; 2];
-        let mut channel = (true, false, Some(0));
+        let mut channel = (true, false, &[0][..]);
         match fault {
             0 => channel.0 = false,
             1 => channel.1 = true,
-            2 => channel.2 = Some(2),
+            2 => channel.2 = &[2],
             3 => registered[0] = true,
             _ => entry.captured = Some(fixture(TunnelSlot::A, TunnelTransport::WireGuard).3),
         }
@@ -1139,6 +1159,29 @@ fn mixed_closing_exact_a_history_and_live_b_query_only_live_on_both_sides() {
     )
     .unwrap();
     assert_eq!(queries.get(), 2);
+    let (a, sa, mut oa, ra) = actual_live_entry(TunnelSlot::A, TunnelTransport::WireGuard);
+    let (b, sb, mut ob, rb) = actual_live_entry(TunnelSlot::B, TunnelTransport::AmneziaWg3);
+    for (state, owner, record) in [(&sa, &mut oa, &ra), (&sb, &mut ob, &rb)] {
+        state.borrow_mut().fail_after_stop = true;
+        assert!(owner.stop(record).is_err());
+        assert_eq!(
+            owner.snapshot().unwrap().unwrap().phase,
+            crate::member_owner::Phase::Stopping
+        );
+    }
+    // Both stopped SDK readers must stay out; native callers independently
+    // attest each retained opaque cleanup pin before selecting these slots.
+    assert_eq!(
+        read_closing_members_with(
+            &context,
+            &mut [Some(a), Some(b)],
+            &[0, 1],
+            |_, _| Ok(()),
+            |_, _| panic!("stopped SDK reader"),
+            |original| original.read_for_cleanup()
+        ),
+        Ok(vec![])
+    );
 }
 
 #[test]

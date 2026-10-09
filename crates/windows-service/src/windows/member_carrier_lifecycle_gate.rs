@@ -2673,8 +2673,8 @@ pub(crate) mod native {
                     &self.runtime,
                     self.image.read()?.as_ref(),
                     &carrier,
-                    |live, history, domains| {
-                        if !live.is_empty() || !domains.is_empty() {
+                    |live, history, domains, partials| {
+                        if !live.is_empty() || !domains.is_empty() || !partials.is_empty() {
                             return Err(crate::member_carrier::CarrierError::Conflict);
                         }
                         // Any captured row root MUST have a SAME closed original history.

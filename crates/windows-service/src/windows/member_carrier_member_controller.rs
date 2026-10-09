@@ -4930,6 +4930,11 @@ pub(crate) mod native {
                         owned.pending.partial_cleanup().map_err(owner_error)?,
                     ));
                 } // Keep SAME native cleanup pin before retirement's actual Stop/Delete.
+                owned.inventory.register_partial_cleanup(
+                    &owned.source,
+                    &owned.pending,
+                    owned.partial_cleanup.as_ref().ok_or(Error::Pending)?,
+                )?;
             }
             let mut inventory = owned.inventory.read_pin();
             let supervisor = owned.supervisor.clone();
@@ -5402,6 +5407,11 @@ pub(crate) mod native {
                     self.pending.partial_cleanup().map_err(owner_error)?,
                 ));
             } // Retain actual original BEFORE any fallible native/G/Source read.
+            self.inventory.register_partial_cleanup(
+                &self.source,
+                &self.pending,
+                self.partial_cleanup.as_ref().ok_or(Error::Pending)?,
+            )?;
             let original = self.partial_cleanup.as_ref().ok_or(Error::Pending)?;
             original
                 .verify_pending_original(&self.pending)

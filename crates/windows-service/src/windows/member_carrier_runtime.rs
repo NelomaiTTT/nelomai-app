@@ -3042,17 +3042,27 @@ pub(crate) mod native {
                 } else {
                     false
                 };
+                let partial = match &window.origin {
+                    WindowOrigin::Closing(_, sample)
+                    | WindowOrigin::PartialClosing(_, _, sample) => {
+                        sample.partial.iter().find(|(intent, _, _, _)| {
+                            intent.scope == identity.scope
+                                && intent.slot
+                                    == if i == 1 {
+                                        nelomai_contracts::dispatcher::TunnelSlot::A
+                                    } else {
+                                        nelomai_contracts::dispatcher::TunnelSlot::B
+                                    }
+                        })
+                    }
+                    WindowOrigin::Source(..) => None,
+                };
                 let partial_deleted = i != 0
                     && cleanup
-                    && matches!(&window.origin,
-                    WindowOrigin::PartialClosing(_, partial, sample)
-                        if partial.intent().scope == identity.scope
-                            && partial.intent().slot == if i == 1 { nelomai_contracts::dispatcher::TunnelSlot::A } else { nelomai_contracts::dispatcher::TunnelSlot::B }
-                            && sample.partial.as_ref().is_some_and(|(observation, _)|
-                                observation.service_deleted() && observation.process.is_some()));
-                let partial_absent = partial_deleted
-                    && matches!(&window.origin, WindowOrigin::PartialClosing(_, _, sample)
-                        if sample.partial.as_ref().is_some_and(|(_, present)| !present));
+                    && partial
+                        .is_some_and(|(_, process, deleted, _)| *deleted && process.is_some());
+                let partial_absent =
+                    partial_deleted && partial.is_some_and(|(_, _, _, present)| !present);
                 let read = |ack: rows::RowRecordFacts<'_>| {
                     let protected =
                         rows::Record::decode(before[n].as_ref().ok_or(rows::Error::Journal)?)?;
@@ -3151,7 +3161,7 @@ pub(crate) mod native {
         Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
         Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
         Vec<crate::member_owner::ServiceDomain>,
-        Option<bool>,
+        Vec<crate::windows::member_carrier_members::native::PartialMemberFact>,
     );
     #[derive(PartialEq, Eq)]
     struct ClosingSample {
@@ -3162,7 +3172,7 @@ pub(crate) mod native {
         // The partial target and stopped histories never grant live SDK inputs.
         members: Vec<crate::windows::member_carrier_provider::ExpectedProvider>,
         history: Vec<crate::windows::member_carrier_members::ClosedMemberBinding>,
-        partial: Option<(crate::member_owner::PartialServiceObservation, bool)>,
+        partial: Vec<crate::windows::member_carrier_members::native::PartialMemberFact>,
     }
     /// Independent SAME-original closed C reader for the final static-base
     /// read/removal gate. No current NIC/source-readiness or live row authority
@@ -3925,12 +3935,12 @@ pub(crate) mod native {
                         &self.image,
                         &[c],
                         partial,
-                        |live, history, domains, present| {
+                        |live, history, domains, partials| {
                             Ok((
                                 live.to_vec(),
                                 history.to_vec(),
                                 domains.to_vec(),
-                                Some(present),
+                                partials.to_vec(),
                             ))
                         },
                     )
@@ -3942,8 +3952,13 @@ pub(crate) mod native {
                     &self.runtime,
                     &self.image,
                     &[c],
-                    |live, history, domains| {
-                        Ok((live.to_vec(), history.to_vec(), domains.to_vec(), None))
+                    |live, history, domains, partials| {
+                        Ok((
+                            live.to_vec(),
+                            history.to_vec(),
+                            domains.to_vec(),
+                            partials.to_vec(),
+                        ))
                     },
                 )
                 .map_err(denied)
@@ -3964,37 +3979,15 @@ pub(crate) mod native {
             >,
         ) -> Result<ClosingSample> {
             let before = self.revision()?;
-            let partial_observation = partial
-                .map(|original| original.inspect().map_err(denied))
-                .transpose()?;
-            let (original, members, history, service_domains, present) =
-                if let Some(partial) = partial {
-                    self.originals
-                        .inspect_live_carrier_identity(&self.scope, true, |actual| {
-                            let (members, history, domains, present) = self
-                                .members(&actual.identity, Some(partial))
-                                .map_err(|_| creators::Error::Conflict)?;
-                            Ok((actual.identity.clone(), members, history, domains, present))
-                        })
-                        .map_err(denied)?
-                } else {
-                    let all = self
-                        .originals
-                        .observe_all_for_cleanup(&self.scope.context)
-                        .map_err(denied)?;
-                    if all.originals.len() != 1 || all.originals[0].scope != self.scope {
-                        return Err(Error::Conflict);
-                    }
-                    let (members, history, domains, present) =
-                        self.members(&all.originals[0].identity, None)?;
-                    (
-                        all.originals[0].identity.clone(),
-                        members,
-                        history,
-                        domains,
-                        present,
-                    )
-                };
+            let (original, members, history, service_domains, partials) = self
+                .originals
+                .inspect_live_carrier_identity(&self.scope, true, |actual| {
+                    let (members, history, domains, partials) = self
+                        .members(&actual.identity, partial)
+                        .map_err(|_| creators::Error::Conflict)?;
+                    Ok((actual.identity.clone(), members, history, domains, partials))
+                })
+                .map_err(denied)?;
             // Matching rows still grant no native ACK. Protected full-row
             // binding must agree with this actual retained original C.
             let rows = crate::member_carrier_rows::Record::decode(&before.1).map_err(denied)?;
@@ -4012,7 +4005,7 @@ pub(crate) mod native {
                 original,
                 members,
                 history,
-                partial: partial_observation.zip(present),
+                partial: partials,
             })
         }
         /// Only SAME retained partial SCM cleanup, never a live Source window.

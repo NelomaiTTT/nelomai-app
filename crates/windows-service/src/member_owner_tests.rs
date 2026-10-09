@@ -3416,7 +3416,9 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
             };
         }
         pin.inspect(&mut self.boundary, || {
-            Ok(self.base.0.borrow().observation.config_sha256)
+            let mut state = self.base.0.borrow_mut();
+            read_boundary(&mut state, OwnerError::Native)?;
+            Ok(state.observation.config_sha256)
         })
     }
     fn stop_partial_original(
@@ -3538,6 +3540,57 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
         assert!(retained
             .stop_partial_original(&stopped, &capability)
             .is_err());
+    }
+    for unwind in [false, true] {
+        let mut roots = Vec::new();
+        for (slot, transport) in [(A, WireGuard), (B, AmneziaWg3)] {
+            let (owner, state) = origin_owner_for(slot, transport);
+            let service_closes = owner.io.boundary.service_closes.clone();
+            let process_closes = owner.io.boundary.process_closes.clone();
+            let mut owner = crate::member_original::RetainedMember::new(owner);
+            let pending = owner.pending_read().unwrap();
+            let running = owner.start_with_prior(None).unwrap();
+            let partial = Rc::new(pending.partial_cleanup().unwrap());
+            state.borrow_mut().fail_stop = true;
+            assert!(owner.stop_partial_original(&running, &partial).is_err());
+            assert!(partial.inspect().unwrap().service_deleted());
+            roots.push((
+                owner,
+                pending,
+                partial,
+                state,
+                service_closes,
+                process_closes,
+            ));
+        }
+        assert!(roots[0].2.verify_pending_original(&roots[1].1).is_err());
+        let (foreign, _) = origin_owner_for(A, WireGuard);
+        let foreign = crate::member_original::RetainedMember::new(foreign);
+        let foreign_pending = foreign.pending_read().unwrap();
+        assert_eq!(roots[0].1.intent(), foreign_pending.intent());
+        assert!(roots[0]
+            .2
+            .verify_pending_original(&foreign_pending)
+            .is_err());
+        {
+            let mut state = roots[1].3.borrow_mut();
+            state.read_step = 0;
+            if unwind {
+                state.panic_read_step = Some(1);
+            } else {
+                state.fail_read_step = Some(1);
+            }
+        }
+        let failed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| roots[1].2.inspect()));
+        assert!(failed.is_err() || failed.unwrap().is_err());
+        assert!(roots[0].2.inspect().unwrap().service_deleted());
+        for (owner, pending, partial, _, services, processes) in &mut roots {
+            partial.verify_pending_original(pending).unwrap();
+            assert_eq!(services.get(), 1);
+            assert_eq!(processes.get(), 0);
+            assert!(owner.original_read().is_err());
+        }
     }
 }
 

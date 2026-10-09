@@ -472,26 +472,38 @@ fn inspect_mixed_absent_queries(
     // Keep the actual mixed validator's exact universe, independent per-key
     // lookups, complete tables, stack and double reads. Target absence is an
     // additional factual predicate on those SAME reads, never a filtered set.
-    inspect_mixed_queries(wants, None, &mut MixedAbsenceQueries { target, query })
+    inspect_mixed_queries(
+        wants,
+        &[],
+        &mut MixedAbsenceQueries {
+            targets: std::slice::from_ref(target),
+            query,
+        },
+    )
 }
 struct MixedAbsenceQueries<'a, Q> {
-    target: &'a AbsenceTarget,
+    targets: &'a [AbsenceTarget],
     query: &'a mut Q,
 }
 impl<Q: Queries> Queries for MixedAbsenceQueries<'_, Q> {
     fn interfaces(&mut self, want: &Expected) -> Result<Observed> {
         let seen = self.query.interfaces(want)?;
-        validate_absence_table(std::slice::from_ref(self.target), &seen.interfaces)?;
+        validate_absence_table(self.targets, &seen.interfaces)?;
         Ok(seen)
     }
     fn device_snapshot(&mut self, targets: &[AbsenceTarget]) -> Result<DeviceSnapshot> {
         // Include the absent target in native ALLCLASSES retention so a
         // target-related non-Net node cannot disappear from the full snapshot.
         let mut scan_targets = targets.to_vec();
-        scan_targets.push(self.target.clone());
+        scan_targets.extend_from_slice(self.targets);
         let snapshot = self.query.device_snapshot(&scan_targets)?;
         for device in &snapshot.nodes {
-            if pnp_collision(self.target, device, parse_guid(&device.netcfg_instance_id)?) {
+            let guid = parse_guid(&device.netcfg_instance_id)?;
+            if self
+                .targets
+                .iter()
+                .any(|target| pnp_collision(target, device, guid))
+            {
                 return Err(Error::Conflict("name/GUID present in PnP"));
             }
         }
@@ -499,7 +511,7 @@ impl<Q: Queries> Queries for MixedAbsenceQueries<'_, Q> {
     }
     fn table(&mut self) -> Result<Vec<Interface>> {
         let rows = self.query.table()?;
-        validate_absence_table(std::slice::from_ref(self.target), &rows)?;
+        validate_absence_table(self.targets, &rows)?;
         Ok(rows)
     }
     fn stack(&mut self) -> Result<Vec<StackEdge>> {
@@ -730,7 +742,7 @@ fn explain_filters(rows: &[Interface], edges: &[StackEdge], foreign: &mut Vec<u3
 }
 fn validate_snapshot(
     wants: Option<&[ExpectedProvider]>,
-    rundown: Option<&ExpectedProvider>,
+    rundown: &[ExpectedProvider],
     targets: &[AbsenceTarget],
     rows: &[Interface],
     snapshot: &DeviceSnapshot,
@@ -850,7 +862,7 @@ fn validate_snapshot(
                 kind: ProviderKind::Wintun,
             })
             .collect::<Vec<_>>();
-        bind_devices(&strict, &related, None)?;
+        bind_devices(&strict, &related, &[])?;
         owned
     };
     explain_filters(rows, edges, &mut foreign)?;
@@ -954,11 +966,11 @@ fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) 
     })?;
     let devices_before = query.device_snapshot(targets)?;
     let stack_before = query.stack()?;
-    validate_snapshot(None, None, targets, &before, &devices_before, &stack_before)?;
+    validate_snapshot(None, &[], targets, &before, &devices_before, &stack_before)?;
     let devices_after = query.device_snapshot(targets)?;
     let after = query.table()?;
     let stack_after = query.stack()?;
-    validate_snapshot(None, None, targets, &after, &devices_after, &stack_after)?;
+    validate_snapshot(None, &[], targets, &after, &devices_after, &stack_after)?;
     if devices_before != devices_after || stack_before != stack_after {
         return Err(Error::Changed);
     }
@@ -999,7 +1011,7 @@ fn related_targets(
 }
 fn inspect_mixed_queries(
     wants: &[ExpectedProvider],
-    rundown: Option<&ExpectedProvider>,
+    rundown: &[ExpectedProvider],
     query: &mut impl Queries,
 ) -> Result<Vec<Observation>> {
     if wants.len() > 3 {
@@ -1093,7 +1105,8 @@ fn inspect_mixed_queries(
             return Err(Error::Changed);
         }
         if bound_before[i].is_none() || bound_after[i].is_none() {
-            if bound_before[i].is_some() != bound_after[i].is_some() || rundown != Some(expected) {
+            if bound_before[i].is_some() != bound_after[i].is_some() || !rundown.contains(expected)
+            {
                 return Err(Error::Changed);
             }
             validate_interfaces(want, after)?;
@@ -1111,74 +1124,98 @@ fn inspect_mixed_queries(
 /// Only stable factual presence is returned, with full pre/post SDK reads.
 fn inspect_mixed_partial_queries(
     wants: &[ExpectedProvider],
-    target: &AbsenceTarget,
-    kind: ProviderKind,
-    original: Option<&ExpectedProvider>,
-    deleted: bool,
+    partials: &[(
+        &AbsenceTarget,
+        ProviderKind,
+        Option<&ExpectedProvider>,
+        bool,
+    )],
     query: &mut impl Queries,
-) -> Result<bool> {
-    validate_target_parts(target.guid, &target.name)?;
-    if wants.len() > 2
-        || wants.iter().any(|w| {
+) -> Result<Vec<bool>> {
+    if partials.is_empty() {
+        return inspect_mixed_queries(wants, &[], query).map(|_| Vec::new());
+    }
+    if partials.len() > 2 || wants.len() + partials.len() > 3 {
+        return Err(Error::Invalid("partial universe bound"));
+    }
+    for (i, (target, kind, original, _)) in partials.iter().enumerate() {
+        validate_target(target)?;
+        if wants.iter().any(|w| {
             w.identity.guid == target.guid || w.identity.name.eq_ignore_ascii_case(&target.name)
-        })
-    {
-        return Err(Error::Conflict("partial namespace aliases original"));
+        }) || partials[..i].iter().any(|(other, _, _, _)| {
+            other.guid == target.guid || other.name.eq_ignore_ascii_case(&target.name)
+        }) || original.is_some_and(|p| {
+            p.kind != *kind || p.identity.guid != target.guid || p.identity.name != target.name
+        }) {
+            return Err(Error::Conflict("partial original binding/alias"));
+        }
     }
-    if original.is_some_and(|p| {
-        p.kind != kind || p.identity.guid != target.guid || p.identity.name != target.name
-    }) {
-        return Err(Error::Conflict("partial original binding"));
-    }
-    let select = |rows: &[Interface]| -> Result<Option<ExpectedProvider>> {
+    let select = |rows: &[Interface]| -> Result<Vec<Option<ExpectedProvider>>> {
         validate_table(rows)?;
-        let candidates = rows
+        partials
             .iter()
-            .filter(|row| {
-                row.identity.guid == target.guid
-                    || row.identity.name.eq_ignore_ascii_case(&target.name)
-                    || original.is_some_and(|p| {
-                        row.identity.index == p.identity.index
-                            || row.identity.luid == p.identity.luid
+            .map(|(target, kind, original, _)| {
+                let candidates = rows
+                    .iter()
+                    .filter(|row| {
+                        row.identity.guid == target.guid
+                            || row.identity.name.eq_ignore_ascii_case(&target.name)
+                            || original.is_some_and(|p| {
+                                row.identity.index == p.identity.index
+                                    || row.identity.luid == p.identity.luid
+                            })
                     })
+                    .collect::<Vec<_>>();
+                if candidates.len() > 1 {
+                    return Err(Error::Conflict("partial namespace collision"));
+                }
+                let Some(row) = candidates.first() else {
+                    return Ok(None);
+                };
+                if row.identity.guid != target.guid || row.identity.name != target.name {
+                    return Err(Error::Conflict("partial namespace collision"));
+                }
+                validate_expected(&row.identity)?;
+                validate_row(&row.identity, row)?;
+                let candidate = ExpectedProvider {
+                    identity: row.identity.clone(),
+                    kind: *kind,
+                };
+                if original.is_some_and(|p| p != &candidate) {
+                    return Err(Error::Conflict("partial original changed"));
+                }
+                Ok(Some(candidate))
             })
-            .collect::<Vec<_>>();
-        if candidates.len() > 1 {
-            return Err(Error::Conflict("partial namespace collision"));
-        }
-        let Some(row) = candidates.first() else {
-            return Ok(None);
-        };
-        if row.identity.guid != target.guid || row.identity.name != target.name {
-            return Err(Error::Conflict("partial namespace collision"));
-        }
-        validate_expected(&row.identity)?;
-        validate_row(&row.identity, row)?;
-        let candidate = ExpectedProvider {
-            identity: row.identity.clone(),
-            kind,
-        };
-        if original.is_some_and(|p| p != &candidate) {
-            return Err(Error::Conflict("partial original changed"));
-        }
-        Ok(Some(candidate))
+            .collect()
     };
     let observed = select(&query.table()?)?;
-    if let Some(partial) = &observed {
-        let mut comparison = wants.to_vec();
-        comparison.push(partial.clone());
-        // Strict full MIB/PnP/stack validation, including all original live
-        // providers and aliases. The partial candidate remains LOCAL DATA.
-        inspect_mixed_queries(&comparison, deleted.then_some(original).flatten(), query)?;
-    } else {
-        // A missing MIB row alone is not absence: independently scan both PnP
-        // universes with the exact target included, even when wants is empty.
-        inspect_mixed_absent_queries(wants, target, query)?;
+    let mut comparison = wants.to_vec();
+    let mut rundown = Vec::new();
+    let mut absent = Vec::new();
+    for ((target, _, original, deleted), observed) in partials.iter().zip(&observed) {
+        if let Some(observed) = observed {
+            comparison.push(observed.clone());
+            if *deleted {
+                if let Some(original) = original {
+                    rundown.push((*original).clone());
+                }
+            }
+        } else {
+            absent.push((*target).clone());
+        }
     }
+    inspect_mixed_queries(
+        &comparison,
+        &rundown,
+        &mut MixedAbsenceQueries {
+            targets: &absent,
+            query,
+        },
+    )?;
     if select(&query.table()?)? != observed {
         return Err(Error::Changed);
     }
-    Ok(observed.is_some())
+    Ok(observed.iter().map(Option::is_some).collect())
 }
 fn inspect_all_queries(wants: &[Expected], query: &mut impl Queries) -> Result<Vec<Observation>> {
     if wants.len() > 3 {
@@ -1192,20 +1229,30 @@ fn inspect_all_queries(wants: &[Expected], query: &mut impl Queries) -> Result<V
             kind: ProviderKind::Wintun,
         })
         .collect::<Vec<_>>();
-    inspect_mixed_queries(&strict, None, query)
+    inspect_mixed_queries(&strict, &[], query)
 }
 fn bind_devices(
     wants: &[ExpectedProvider],
     devices: &[Device],
-    rundown: Option<&ExpectedProvider>,
+    rundown: &[ExpectedProvider],
 ) -> Result<Vec<Option<Device>>> {
-    let missing = rundown.is_some_and(|original| {
-        wants.contains(original)
-            && !devices.iter().any(|device| {
+    if rundown.len() > 2
+        || rundown
+            .iter()
+            .enumerate()
+            .any(|(i, original)| !wants.contains(original) || rundown[..i].contains(original))
+    {
+        return Err(Error::Conflict("partial rundown original universe"));
+    }
+    let missing = rundown
+        .iter()
+        .filter(|original| {
+            !devices.iter().any(|device| {
                 parse_guid(&device.netcfg_instance_id).ok() == Some(original.identity.guid)
             })
-    });
-    if devices.len() != wants.len() - usize::from(missing) {
+        })
+        .count();
+    if devices.len() != wants.len() - missing {
         return Err(Error::Conflict("incomplete/extra device universe"));
     }
     let mut bound = Vec::with_capacity(wants.len());
@@ -1217,7 +1264,7 @@ fn bind_devices(
                 matches.push(device.clone());
             }
         }
-        if matches.is_empty() && rundown == Some(expected) {
+        if matches.is_empty() && rundown.contains(expected) {
             bound.push(None);
             continue;
         }
@@ -1225,10 +1272,14 @@ fn bind_devices(
         bound.push(Some(matches.remove(0)));
     }
     #[cfg(all(windows, test))]
-    if let Some(original) = rundown.filter(|original| wants.contains(original)) {
+    for original in rundown {
         eprintln!(
             "actual native partial rundown target PnP guid={:?} present={}",
-            original.identity.guid, !missing
+            original.identity.guid,
+            devices
+                .iter()
+                .any(|device| parse_guid(&device.netcfg_instance_id).ok()
+                    == Some(original.identity.guid))
         );
     }
     Ok(bound)
@@ -1319,7 +1370,7 @@ pub(crate) mod native {
     /// Returns all concrete observations in caller order, with the same full
     /// PnP/MIB/stack reads as the strict Wintun entry point. No factory selection.
     pub(crate) fn inspect_mixed(wants: &[ExpectedProvider]) -> Result<Vec<Observation>> {
-        let result = inspect_mixed_queries(wants, None, &mut NativeQueries);
+        let result = inspect_mixed_queries(wants, &[], &mut NativeQueries);
         #[cfg(test)]
         if crate::windows::member_carrier_factory_test_os::state().is_some() {
             if let Err(error) = &result {
@@ -1329,28 +1380,34 @@ pub(crate) mod native {
         result
     }
 
+    type PartialComparison<'a> = (
+        [u8; 16],
+        &'a str,
+        ProviderKind,
+        Option<&'a ExpectedProvider>,
+        bool,
+    );
+
     /// Service-only cleanup comparison, never a provider/Running proof. Caller
     /// supplies the exact immutable binding from its SAME original partial SCM
     /// owner; all MIB/PnP/stack reads remain independent and strictly bounded.
     pub(crate) fn inspect_mixed_partial(
         wants: &[ExpectedProvider],
-        guid: [u8; 16],
-        name: &str,
-        kind: ProviderKind,
-        original: Option<&ExpectedProvider>,
-        deleted: bool,
-    ) -> Result<bool> {
-        inspect_mixed_partial_queries(
-            wants,
-            &AbsenceTarget {
-                guid,
-                name: name.into(),
-            },
-            kind,
-            original,
-            deleted,
-            &mut NativeQueries,
-        )
+        partials: &[PartialComparison<'_>],
+    ) -> Result<Vec<bool>> {
+        let targets = partials
+            .iter()
+            .map(|(guid, name, _, _, _)| AbsenceTarget {
+                guid: *guid,
+                name: (*name).into(),
+            })
+            .collect::<Vec<_>>();
+        let inputs = partials
+            .iter()
+            .zip(&targets)
+            .map(|((_, _, kind, original, deleted), target)| (target, *kind, *original, *deleted))
+            .collect::<Vec<_>>();
+        inspect_mixed_partial_queries(wants, &inputs, &mut NativeQueries)
     }
 
     /// Fresh name/GUID absence alongside an exact explicit mixed live universe.

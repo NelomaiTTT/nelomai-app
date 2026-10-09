@@ -302,6 +302,8 @@ struct PendingEntry<J, I, S> {
     source: S,
     original: crate::member_original::PendingMemberRead<J, I>,
     captured: Option<ExpectedProvider>,
+    #[cfg(windows)]
+    partial: Option<std::rc::Rc<super::member_carrier_member_controller::native::PartialCleanup>>,
     closed: Option<std::rc::Rc<crate::member_original::ClosedMemberReceipt<J, I>>>,
 }
 
@@ -604,6 +606,8 @@ fn retain_pending<J: crate::member_owner::Journal, I: crate::member_owner::Membe
             source,
             original,
             captured: None,
+            #[cfg(windows)]
+            partial: None,
             closed: None,
         });
     }
@@ -671,7 +675,7 @@ fn read_pending_members<J: crate::member_owner::Journal, I: crate::member_owner:
         context,
         entries,
         registered,
-        (cleanup, history, None),
+        (cleanup, history, &[]),
         verify,
         identity,
     )
@@ -687,12 +691,12 @@ fn read_pending_members_excluding<
     context: &Context,
     entries: &mut [Option<PendingEntry<J, I, S>>; 2],
     registered: [bool; 2],
-    channel: (bool, bool, Option<usize>),
+    channel: (bool, bool, &[usize]),
     mut verify: impl FnMut(&S, &Intent) -> Result<()>,
     mut identity: impl FnMut(&S, &NativeProof) -> Result<ExpectedProvider>,
 ) -> Result<Vec<ExpectedProvider>> {
     let (cleanup, history, excluded) = channel;
-    if let Some(index) = excluded {
+    for &index in excluded {
         let entry = entries
             .get(index)
             .and_then(Option::as_ref)
@@ -717,7 +721,7 @@ fn read_pending_members_excluding<
             return Err(Error::Conflict);
         }
         verify(&entry.source, entry.original.intent())?;
-        if excluded == Some(index) {
+        if excluded.contains(&index) {
             // Only a separate actual SCM pin permits the native caller to
             // select this branch; no partial observation becomes a provider.
             continue;
@@ -798,7 +802,7 @@ fn read_closing_members<J: crate::member_owner::Journal, I: crate::member_owner:
     read_closing_members_with(
         context,
         entries,
-        None,
+        &[],
         verify_source,
         native_identity,
         |original| original.read_for_cleanup(),
@@ -811,14 +815,14 @@ fn read_closing_members_with<
 >(
     context: &Context,
     entries: &mut [Option<RetainedEntry<J, I, S>>; 2],
-    excluded: Option<usize>,
+    excluded: &[usize],
     mut verify_source: impl FnMut(&S, Option<&Intent>) -> Result<()>,
     mut native_identity: impl FnMut(&S, &NativeProof) -> Result<ExpectedProvider>,
     mut read: impl FnMut(
         &mut crate::member_original::OriginalMemberRead<J, I>,
     ) -> crate::member_owner::Result<(Intent, NativeProof)>,
 ) -> Result<Vec<ExpectedProvider>> {
-    if excluded.is_some_and(|index| {
+    if excluded.iter().any(|&index| {
         entries
             .get(index)
             .and_then(Option::as_ref)
@@ -833,7 +837,7 @@ fn read_closing_members_with<
     for (index, entry) in entries.iter_mut().enumerate() {
         let Some(entry) = entry else { continue };
         verify_source(&entry.source, None)?;
-        if excluded == Some(index) {
+        if excluded.contains(&index) {
             continue; // Native caller independently verifies SAME pending/live original and partial pin.
         }
         if let Some(receipt) = &entry.closed {
@@ -882,6 +886,14 @@ fn inspect_closing_with<T>(
 
 #[cfg(windows)]
 pub(crate) mod native {
+    /// Actual per-slot cleanup comparison only; never a Closed/effect receipt.
+    pub(crate) type PartialMemberFact = (
+        Intent,
+        Option<crate::member_owner::ProcessProof>,
+        bool,
+        bool,
+    );
+
     use super::*;
     use crate::member_carrier_native_ownership::{Phase, Record};
     use crate::member_original::{ClosedMemberReceipt, OriginalMemberRead, PendingMemberRead};
@@ -1202,6 +1214,58 @@ pub(crate) mod native {
                     .register_pending_inner(source, original)
             })
         }
+        /// Retain the controller's actual SAME pin before native Stop/Delete.
+        pub(crate) fn register_partial_cleanup(
+            &self,
+            source: &Rc<MemberSource>,
+            original: &Pending,
+            partial: &Rc<super::super::member_carrier_member_controller::native::PartialCleanup>,
+        ) -> Result<()> {
+            let retained = (|| {
+                let mut inventory = self
+                    .inventory
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?;
+                let index = pending_index(&inventory.context, original.intent())?;
+                let entry = inventory.pending[index].as_mut().ok_or(Error::Pending)?;
+                if entry.closed.is_some()
+                    || !Rc::ptr_eq(source, &entry.source)
+                    || !original.same_original(&entry.original)
+                    || entry
+                        .partial
+                        .as_ref()
+                        .is_some_and(|old| !Rc::ptr_eq(old, partial))
+                {
+                    return Err(Error::Conflict);
+                }
+                entry.partial.get_or_insert_with(|| partial.clone());
+                Ok(())
+            })();
+            if retained.is_err() {
+                self.health.revoked.set(true);
+            }
+            retained?;
+            self.health.observe(
+                || self.closing(),
+                |_| {
+                    let inventory = self.inventory.try_borrow().map_err(|_| Error::Conflict)?;
+                    let before = inventory.revision()?;
+                    partial
+                        .verify_pending_original(original)
+                        .map_err(|_| Error::Conflict)?;
+                    inventory.runtime.verify_member_intent(
+                        &inventory.context,
+                        source,
+                        original.intent(),
+                    )?;
+                    if before != inventory.revision()? {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                },
+            )
+        }
+
         pub(crate) fn verify_pending_cleanup(
             &self,
             source: &Rc<MemberSource>,
@@ -1349,6 +1413,7 @@ pub(crate) mod native {
                 &[ExpectedProvider],
                 &[ClosedMemberBinding],
                 &[crate::member_owner::ServiceDomain],
+                &[PartialMemberFact],
             ) -> Result<T>,
         ) -> Result<T> {
             self.health.cleanup(|| {
@@ -1373,60 +1438,26 @@ pub(crate) mod native {
                 &[ExpectedProvider],
                 &[ClosedMemberBinding],
                 &[crate::member_owner::ServiceDomain],
-                bool,
+                &[PartialMemberFact],
             ) -> Result<T>,
         ) -> Result<T> {
             self.health.cleanup(|| {
-                if carrier.len() != 1 {
-                    return Err(Error::Conflict);
-                }
                 let mut inventory = self
                     .inventory
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?;
-                let target = pending_index(context, partial.intent())?;
-                let binding = &context.bindings[target + 1];
-                let kind = match partial.intent().transport {
-                    TunnelTransport::WireGuard => ProviderKind::WireGuardNt,
-                    TunnelTransport::AmneziaWg3 => ProviderKind::Wintun,
-                };
-                inspect_mixed_closing_with(
-                    || {
-                        inventory
-                            .partial_closing_bindings_revision(context, runtime, image, partial)
-                    },
-                    |live| {
-                        let original = live.iter().find(|p| p.identity.guid == binding.guid);
-                        let others = live
-                            .iter()
-                            .filter(|p| p.identity.guid != binding.guid)
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let wants = complete_provider_inputs(context, carrier, &others)?;
-                        let before = partial.inspect().map_err(|_| Error::Conflict)?;
-                        let present =
-                            super::super::member_carrier_provider::native::inspect_mixed_partial(
-                                &wants,
-                                binding.guid,
-                                &binding.name,
-                                kind,
-                                original,
-                                before.service_deleted() && before.process.is_some(),
-                            )
-                            .inspect_err(|_error| {
-                                #[cfg(all(windows, test))]
-                                eprintln!("actual partial member provider census: {_error:?}");
-                            })
-                            .map_err(|_| Error::Pending)?;
-                        if partial.inspect().map_err(|_| Error::Conflict)? != before {
-                            return Err(Error::Conflict);
-                        }
-                        Ok((before, present))
-                    },
-                    |live, facts, present| {
-                        inspect(live, &facts.history, &facts.service_domains, present.1)
-                    },
-                )
+                let index = pending_index(context, partial.intent())?;
+                let entry = inventory.pending[index].as_ref().ok_or(Error::Pending)?;
+                if entry.closed.is_some()
+                    || entry
+                        .partial
+                        .as_ref()
+                        .is_none_or(|original| !std::ptr::eq(original.as_ref(), partial))
+                {
+                    return Err(Error::Conflict);
+                }
+                inventory
+                    .inspect_closing_bindings_full_inner(context, runtime, image, carrier, inspect)
             })
         }
 
@@ -1891,6 +1922,57 @@ pub(crate) mod native {
             Ok(wants)
         }
 
+        fn closing_partials(
+            &self,
+        ) -> Result<
+            Vec<(
+                Rc<super::super::member_carrier_member_controller::native::PartialCleanup>,
+                Option<ExpectedProvider>,
+            )>,
+        > {
+            let mut partials = Vec::new();
+            for (index, entry) in self.pending.iter().enumerate() {
+                let Some(entry) = entry else { continue };
+                if entry.closed.is_some() {
+                    continue;
+                }
+                let Some(partial) = &entry.partial else {
+                    continue;
+                };
+                if pending_index(&self.context, partial.intent())? != index {
+                    return Err(Error::Conflict);
+                }
+                partial
+                    .verify_pending_original(&entry.original)
+                    .map_err(|_| Error::Conflict)?;
+                self.runtime.verify_member_intent(
+                    &self.context,
+                    &entry.source,
+                    partial.intent(),
+                )?;
+                let captured = if let Some(live) = &self.entries[index] {
+                    if live.closed.is_some()
+                        || !Rc::ptr_eq(&entry.source, &live.source)
+                        || !entry.original.matches_live(&live.original)
+                        || entry
+                            .captured
+                            .as_ref()
+                            .is_some_and(|old| old != &live.provider)
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    Some(live.provider.clone())
+                } else {
+                    if entry.captured.is_some() {
+                        return Err(Error::Conflict);
+                    }
+                    None
+                };
+                partials.push((partial.clone(), captured));
+            }
+            Ok(partials)
+        }
+
         fn closing_live_revision(
             &mut self,
             context: &Context,
@@ -1909,10 +1991,25 @@ pub(crate) mod native {
             if record.context != self.context || record.phase != Phase::Closing {
                 return Err(Error::Conflict);
             }
+            let partials = self.closing_partials()?;
+            let observations = partials
+                .iter()
+                .map(|(partial, _)| partial.inspect().map_err(|_| Error::Conflict))
+                .collect::<Result<Vec<_>>>()?;
+            let excluded = partials
+                .iter()
+                .map(|(partial, _)| pending_index(context, partial.intent()))
+                .collect::<Result<Vec<_>>>()?;
+            let registered = self.entries.each_ref().map(Option::is_some);
+            let published = excluded
+                .iter()
+                .copied()
+                .filter(|index| registered[*index])
+                .collect::<Vec<_>>();
             let mut members = read_closing_members_with(
                 &self.context,
                 &mut self.entries,
-                None,
+                &published,
                 |source, intent| {
                     if let Some(intent) = intent {
                         self.runtime
@@ -1927,7 +2024,27 @@ pub(crate) mod native {
                     None => original.read_for_cleanup(),
                 },
             )?;
-            members.extend(self.pending_members(true, false)?);
+            let unpublished = excluded
+                .iter()
+                .copied()
+                .filter(|index| !registered[*index])
+                .collect::<Vec<_>>();
+            members.extend(read_pending_members_excluding(
+                context,
+                &mut self.pending,
+                registered,
+                (true, false, &unpublished),
+                |source, intent| self.runtime.verify_member_intent(context, source, intent),
+                |source, proof| native_identity(proof, source.transport()),
+            )?);
+            for ((partial, captured), before) in partials.iter().zip(observations) {
+                if partial.inspect().map_err(|_| Error::Conflict)? != before {
+                    return Err(Error::Conflict);
+                }
+                if let Some(captured) = captured {
+                    members.push(captured.clone());
+                }
+            }
             self.matches_original_runtime_image(runtime, image)?;
             if self
                 .runtime
@@ -2051,101 +2168,6 @@ pub(crate) mod native {
             ))
         }
 
-        fn partial_closing_bindings_revision(
-            &mut self,
-            context: &Context,
-            runtime: &RuntimeRead,
-            image: &OriginalImage,
-            partial: &super::super::member_carrier_member_controller::native::PartialCleanup,
-        ) -> Result<MixedClosingSample> {
-            if context != &self.context {
-                return Err(Error::Conflict);
-            }
-            self.matches_original_runtime_image(runtime, image)?;
-            let before = self.revision()?;
-            if Record::decode(&before)?.phase != Phase::Closing {
-                return Err(Error::Conflict);
-            }
-            let index = pending_index(context, partial.intent())?;
-            let entry = self.pending[index].as_ref().ok_or(Error::Pending)?;
-            if entry.closed.is_some() {
-                return Err(Error::Conflict);
-            }
-            let captured = if let Some(live) = &self.entries[index] {
-                if live.closed.is_some()
-                    || !Rc::ptr_eq(&entry.source, &live.source)
-                    || !entry.original.matches_live(&live.original)
-                    || entry.captured.as_ref().is_some_and(|p| p != &live.provider)
-                {
-                    return Err(Error::Conflict);
-                }
-                Some(live.provider.clone())
-            } else {
-                if entry.captured.is_some() {
-                    return Err(Error::Conflict);
-                }
-                None
-            };
-            partial
-                .verify_pending_original(&entry.original)
-                .map_err(|_| Error::Conflict)?;
-            self.runtime
-                .verify_member_intent(context, &entry.source, partial.intent())?;
-            let observed = partial.inspect().map_err(|_| Error::Conflict)?;
-            let mut service_domains = Vec::new();
-            let mut live = read_closing_members_with(
-                context,
-                &mut self.entries,
-                captured.as_ref().map(|_| index),
-                |source, intent| match intent {
-                    Some(intent) => self.runtime.verify_member_intent(context, source, intent),
-                    None => self.runtime.verify_member_source(context, source),
-                },
-                |source, proof| native_identity(proof, source.transport()),
-                |original| read_service_binding(original, true, &mut service_domains),
-            )?;
-            let registered = self.entries.each_ref().map(Option::is_some);
-            live.extend(read_pending_members_excluding(
-                context,
-                &mut self.pending,
-                registered,
-                (true, false, captured.is_none().then_some(index)),
-                |source, intent| self.runtime.verify_member_intent(context, source, intent),
-                |source, proof| native_identity(proof, source.transport()),
-            )?);
-            if let Some(captured) = captured {
-                live.push(captured);
-            }
-            let history = read_mixed_closed_bindings(
-                context,
-                &mut self.entries,
-                &mut self.pending,
-                |source, intent| match intent {
-                    Some(intent) => self.runtime.verify_member_intent(context, source, intent),
-                    None => self.runtime.verify_member_source(context, source),
-                },
-            )?;
-            let entry = self.pending[index].as_ref().ok_or(Error::Pending)?;
-            partial
-                .verify_pending_original(&entry.original)
-                .map_err(|_| Error::Conflict)?;
-            self.runtime
-                .verify_member_intent(context, &entry.source, partial.intent())?;
-            if partial.inspect().map_err(|_| Error::Conflict)? != observed
-                || self.revision()? != before
-            {
-                return Err(Error::Conflict);
-            }
-            self.matches_original_runtime_image(runtime, image)?;
-            Ok((
-                before,
-                live,
-                MemberBindingFacts {
-                    history,
-                    service_domains,
-                },
-            ))
-        }
         fn inspect_closing_bindings_full_inner<T>(
             &mut self,
             context: &Context,
@@ -2156,6 +2178,7 @@ pub(crate) mod native {
                 &[ExpectedProvider],
                 &[ClosedMemberBinding],
                 &[crate::member_owner::ServiceDomain],
+                &[PartialMemberFact],
             ) -> Result<T>,
         ) -> Result<T> {
             for entry in self.entries.iter().flatten() {
@@ -2167,15 +2190,74 @@ pub(crate) mod native {
             if carrier.len() != 1 {
                 return Err(Error::Conflict);
             }
+            let partials = self.closing_partials()?;
             inspect_mixed_closing_with(
                 || self.closing_bindings_revision(context, runtime, image),
-                |live| {
-                    let wants = complete_provider_inputs(context, carrier, live)?;
-                    super::super::member_carrier_provider::native::inspect_mixed(&wants)
-                        .map(|_| ())
-                        .map_err(|_| Error::Pending)
+                |members| {
+                    let live = members
+                        .iter()
+                        .filter(|provider| {
+                            !partials
+                                .iter()
+                                .any(|(_, captured)| captured.as_ref() == Some(*provider))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let wants = complete_provider_inputs(context, carrier, &live)?;
+                    let targets = partials
+                        .iter()
+                        .map(|(partial, captured)| {
+                            let index = pending_index(context, partial.intent())?;
+                            let binding = &context.bindings[index + 1];
+                            let kind = match partial.intent().transport {
+                                TunnelTransport::WireGuard => {
+                                    super::super::member_carrier_provider::ProviderKind::WireGuardNt
+                                }
+                                TunnelTransport::AmneziaWg3 => {
+                                    super::super::member_carrier_provider::ProviderKind::Wintun
+                                }
+                            };
+                            let observed = partial.inspect().map_err(|_| Error::Conflict)?;
+                            Ok((binding, kind, captured, observed))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let inputs = targets
+                        .iter()
+                        .map(|(binding, kind, captured, observed)| {
+                            (
+                                binding.guid,
+                                binding.name.as_str(),
+                                *kind,
+                                captured.as_ref(),
+                                observed.service_deleted() && observed.process.is_some(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let present =
+                        super::super::member_carrier_provider::native::inspect_mixed_partial(
+                            &wants, &inputs,
+                        )
+                        .map_err(|_| Error::Pending)?;
+                    partials
+                        .iter()
+                        .zip(targets)
+                        .zip(present)
+                        .map(|(((partial, _), (_, _, _, before)), present)| {
+                            if partial.inspect().map_err(|_| Error::Conflict)? != before {
+                                return Err(Error::Conflict);
+                            }
+                            Ok((
+                                partial.intent().clone(),
+                                before.process,
+                                before.service_deleted(),
+                                present,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()
                 },
-                |live, facts, _| inspect(live, &facts.history, &facts.service_domains),
+                |live, facts, partials| {
+                    inspect(live, &facts.history, &facts.service_domains, partials)
+                },
             )
         }
 
