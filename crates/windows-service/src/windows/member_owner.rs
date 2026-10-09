@@ -600,6 +600,11 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             if std::time::Instant::now() >= deadline {
                 #[cfg(all(windows, test))]
                 eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
+                #[cfg(all(windows, test))]
+                super::member_carrier_factory_test_os::note_partial_pending(
+                    last_pending_reason,
+                    retained,
+                );
                 return Err(OwnerError::Pending);
             }
             let before = match self.inspect_partial_cleanup(pin) {
@@ -613,6 +618,11 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
                     if remaining.is_zero() {
                         #[cfg(all(windows, test))]
                         eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
+                        #[cfg(all(windows, test))]
+                        super::member_carrier_factory_test_os::note_partial_pending(
+                            last_pending_reason,
+                            retained,
+                        );
                         return Err(OwnerError::Pending);
                     }
                     std::thread::sleep(remaining.min(std::time::Duration::from_millis(100)));
@@ -663,6 +673,11 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             if remaining.is_zero() {
                 #[cfg(all(windows, test))]
                 eprintln!("actual original partial rundown Pending reason={last_pending_reason} retained={retained:?} last_rows={last_pending_rows:?}");
+                #[cfg(all(windows, test))]
+                super::member_carrier_factory_test_os::note_partial_pending(
+                    last_pending_reason,
+                    retained,
+                );
                 return Err(OwnerError::Pending);
             }
             if actual.interface.is_none() && actual.retained_interfaces.is_empty() {

@@ -757,6 +757,7 @@ fn carrier_factory_actual_cold_child() {
     {
         let retry_started = std::time::Instant::now();
         while stopped.is_err()
+            && !crate::windows::member_carrier_factory_test_os::apipa_probe_mode()
             && original.snapshot().cleanup_pending
             && retry_started.elapsed() <= std::time::Duration::from_secs(30)
         {
@@ -780,7 +781,10 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        if stopped.is_err() && retry_started.elapsed() > std::time::Duration::from_secs(30) {
+        if stopped.is_err()
+            && (retry_started.elapsed() > std::time::Duration::from_secs(30)
+                || crate::windows::member_carrier_factory_test_os::apipa_probe_mode())
+        {
             if let Some(record) = fixture
                 .trace_pair_stage()
                 .filter(|r| r.phase == crate::member_carrier_pair::Phase::Closing)
@@ -891,8 +895,18 @@ fn carrier_factory_actual_cold_child() {
                     }
                     let observing = std::time::Instant::now();
                     let mut sample = 0;
-                    while observing.elapsed() < std::time::Duration::from_secs(60) {
-                        if sample == 4 {
+                    while observing.elapsed()
+                        < std::time::Duration::from_secs(
+                            if crate::windows::member_carrier_factory_test_os::apipa_probe_mode() {
+                                15
+                            } else {
+                                60
+                            },
+                        )
+                    {
+                        if sample == 4
+                            && !crate::windows::member_carrier_factory_test_os::apipa_probe_mode()
+                        {
                             let result =
                                 crate::windows::member_carrier_factory_test_os::diagnostic_withdraw_original_blocks(&record.scope);
                             eprintln!("actual expired Stop {kind} WFP-only barrier sample={sample} diagnostic_only=true result={result:?}");
@@ -955,6 +969,10 @@ fn carrier_factory_actual_cold_child() {
                 }
             }
         }
+        assert!(
+            !crate::windows::member_carrier_factory_test_os::apipa_probe_mode(),
+            "diagnostic APIPA probe completed first Stop observation; original result={stopped:?}"
+        );
         assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);

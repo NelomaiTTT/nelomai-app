@@ -26,6 +26,7 @@ struct Inputs {
     native_fault_reached: Option<NativePublication>,
     native_originals: Vec<(&'static str, Weak<dyn Any>)>,
     original_guard: Option<Weak<RefCell<super::member_carrier_pair_io::native::Guard>>>,
+    diagnostic_mib_pending: Option<crate::member_owner::NativeProof>,
     health_input: Option<(
         Option<nelomai_client_tunnel::redundancy::Slot>,
         [[u64; 2]; 2],
@@ -62,6 +63,22 @@ thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
     static RUNTIME_CURRENT_CHECKS: Cell<u64> = const { Cell::new(0) };
     static SOURCE_CURRENT_CHECKS: Cell<u64> = const { Cell::new(0) };
+}
+pub(crate) fn apipa_probe_mode() -> bool {
+    std::env::var("NELOMAI_FACTORY_DIAGNOSTIC_APIPA_VALUE").as_deref() == Ok("1")
+        && std::env::var("NELOMAI_FACTORY_OS_CASE").as_deref() == Ok("primary")
+}
+pub(crate) fn note_partial_pending(reason: &str, proof: Option<&crate::member_owner::NativeProof>) {
+    INPUTS.with(|i| {
+        if let Some(i) = i.borrow_mut().as_mut() {
+            i.diagnostic_mib_pending = (apipa_probe_mode() && reason == "exact_mib")
+                .then_some(proof.copied())
+                .flatten();
+        }
+    });
+}
+pub(crate) fn take_partial_pending() -> Option<crate::member_owner::NativeProof> {
+    INPUTS.with(|i| i.borrow_mut().as_mut()?.diagnostic_mib_pending.take())
 }
 pub(crate) fn installation(root: &Path) -> Option<Installation> {
     INPUTS.with(|inputs| {
@@ -626,6 +643,7 @@ impl Fixture {
                 native_fault_reached: None,
                 native_originals: vec![],
                 original_guard: None,
+                diagnostic_mib_pending: None,
                 health_input: None,
                 package_source_reads: 0,
                 package_paths: None,
