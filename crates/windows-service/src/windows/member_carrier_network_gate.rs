@@ -3355,7 +3355,11 @@ pub(crate) mod native {
                         fact.as_ref()
                             .map(|r| (&r.binding, &r.acknowledged, r.observed.as_ref()))
                     });
-                    let metrics = if record.pending == Some(pair::Effect::Guard) {
+                    let metrics = if record.phase == pair::Phase::Closing {
+                        // Actual row/root/protected reads above remain mandatory;
+                        // cleanup never computes a new forward route/permit plan.
+                        Ok(Vec::new())
+                    } else if record.pending == Some(pair::Effect::Guard) {
                         compare_guard_resource_rows(&self.context, record, values, closed)
                     } else if closed.iter().any(Option::is_some) {
                         Err(conflict())

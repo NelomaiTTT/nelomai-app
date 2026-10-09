@@ -1139,6 +1139,11 @@ pub(crate) mod native {
                 let metrics = self
                     .rows
                     .inspect_in_window(window, |facts| {
+                        // Cleanup withdraws/releases; the original row reader
+                        // still verifies ACKs, protected bytes and native facts.
+                        if purpose == Purpose::Closing {
+                            return Ok(Vec::new());
+                        }
                         let borrowed = std::array::from_fn(|i| {
                             facts.rows[i]
                                 .as_ref()
@@ -1435,6 +1440,9 @@ pub(crate) mod native {
             let metrics = self
                 .rows
                 .inspect_in_window(window, |facts| {
+                    if purpose == Purpose::Closing {
+                        return Ok(Vec::new());
+                    }
                     let borrowed = std::array::from_fn(|i| {
                         facts.rows[i].as_ref().and_then(|r| {
                             r.observed
@@ -1469,6 +1477,11 @@ pub(crate) mod native {
                 })?;
             let network_read =
                 |facts: &crate::windows::member_carrier_network::native::NativeNetworkFacts| {
+                    // Withdraw/release retains the original network factual
+                    // bracket; forward physical/plan readiness grants nothing here.
+                    if purpose == Purpose::Closing {
+                        return Ok(());
+                    }
                     let physical = self
                         .physical(window, &facts.routes)
                         .inspect_err(|_error| {

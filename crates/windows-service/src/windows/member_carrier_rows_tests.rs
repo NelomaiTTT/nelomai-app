@@ -392,6 +392,24 @@ fn partial_capture_stopped_drain_retains_same_owner_without_old_sdk_reentry() {
     let queries = fake.0.borrow().queries;
     let writes = fake.0.borrow().journal_writes;
     fake.0.borrow_mut().identity_error = true; // C already closed, old SDK forbidden
+    slot.verify_stopped_original(&original).unwrap();
+    let stopped_ack =
+        original.with_cleanup_record(&binding().scope, binding().network_epoch, |facts| {
+            assert_eq!(facts.acknowledged.phase, Phase::Stopped);
+            Err::<(), _>(Error::Journal)
+        });
+    assert!(stopped_ack.is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = original.with_cleanup_record(
+            &binding().scope,
+            binding().network_epoch,
+            |_| -> Result<()> { panic!("cleanup read unwind") },
+        );
+    }))
+    .is_err());
+    slot.verify_stopped_original(&original).unwrap();
+    assert_eq!(fake.0.borrow().queries, queries);
+    assert_eq!(fake.0.borrow().journal_writes, writes);
     let mut destination = None;
     slot.drain_stopped_into(&original, &mut destination)
         .unwrap();
@@ -447,6 +465,7 @@ fn stopped_capture_drain_denies_unknown_lost_ack_foreign_original_and_pending_at
         }
         let foreign = Fake::new().owner().record_read_pin().unwrap();
         let supplied = if failure == 2 { &foreign } else { &original };
+        assert!(slot.verify_stopped_original(supplied).is_err());
         let mut destination = None;
         assert!(slot.drain_stopped_into(supplied, &mut destination).is_err());
         assert!(destination.is_none());

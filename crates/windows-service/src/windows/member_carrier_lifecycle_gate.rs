@@ -2205,6 +2205,7 @@ pub(crate) mod native {
         fn closing_rows_observe(
             &self,
             record: &pair::Record,
+            selected_role: rows::Role,
             window: &NativeBindingsWindow<'_>,
         ) -> io::Result<()> {
             let closing = self.closing.read()?;
@@ -2289,8 +2290,77 @@ pub(crate) mod native {
                                 )
                                 .map_err(native_denied)?;
                             } else {
-                                let actual = read_original_snapshot(&baseline.binding)
+                                // A sibling's real partial Delete/held-exit facts
+                                // permit only factual stopped-row comparison.
+                                // The selected row still needs its live effect read.
+                                let partial = if i != 0 && role != selected_role {
+                                    window
+                                        .partial_member(
+                                            [
+                                                nelomai_contracts::dispatcher::TunnelSlot::A,
+                                                nelomai_contracts::dispatcher::TunnelSlot::B,
+                                            ][i - 1],
+                                        )
+                                        .filter(|(intent, process, deleted, _)| {
+                                            *deleted
+                                                && process.is_some()
+                                                && record.members[i - 1].as_ref().is_some_and(|m| {
+                                                    m.owner.intent == *intent
+                                                        && m.owner
+                                                            .proof
+                                                            .or(m.owner.retired_proof)
+                                                            .is_some_and(|p| {
+                                                                Some(p.process) == *process
+                                                            })
+                                                })
+                                        })
+                                } else {
+                                    None
+                                };
+                                let (actual, interface_absent) = if partial
+                                    .is_some_and(|(_, _, _, present)| !present)
+                                {
+                                    (None, false)
+                                } else {
+                                    match read_original_snapshot(&baseline.binding) {
+                                        Ok(actual) => (Some(actual), false),
+                                        Err(rows::Error::InterfaceAbsent) if partial.is_some() => {
+                                            (None, true)
+                                        }
+                                        Err(error) => return Err(native_denied(error)),
+                                    }
+                                };
+                                if actual.is_none() {
+                                    compare_row_binding(&self.context, record, &baseline.binding)
+                                        .map_err(native_denied)?;
+                                    if ack.acknowledged != &protected {
+                                        return Err(wintun::Error::Conflict);
+                                    }
+                                    compare_closed_member_ack(
+                                        &baseline.binding,
+                                        &baseline.baseline,
+                                        ack.acknowledged,
+                                    )
                                     .map_err(native_denied)?;
+                                    if interface_absent
+                                        && !matches!(
+                                            read_original_snapshot(&baseline.binding),
+                                            Err(rows::Error::InterfaceAbsent)
+                                        )
+                                    {
+                                        return Err(wintun::Error::Conflict);
+                                    }
+                                    if self
+                                        .runtime
+                                        .record(&self.context, kind)
+                                        .map_err(native_denied)?
+                                        != bytes
+                                    {
+                                        return Err(wintun::Error::Conflict);
+                                    }
+                                    return Ok(());
+                                }
+                                let actual = actual.ok_or(wintun::Error::Conflict)?;
                                 if ack.acknowledged == &protected {
                                     compare_closing_row_observation(ClosingRowObservation {
                                         context: &self.context,
@@ -2798,7 +2868,7 @@ pub(crate) mod native {
                             // Factual unresolved sibling observations must not
                             // become effect ACKs for the selected target below.
                             shared
-                                .closing_rows_observe(&record, window)
+                                .closing_rows_observe(&record, binding.role, window)
                                 .inspect_err(|_error| {
                                     #[cfg(test)]
                                     trace_step(&format!(
@@ -2998,7 +3068,7 @@ pub(crate) mod native {
                                 )
                             {
                                 shared
-                                    .closing_rows_observe(&record, window)
+                                    .closing_rows_observe(&record, rows::Role::Carrier, window)
                                     .map_err(native_denied)?;
                             }
                             Ok(())

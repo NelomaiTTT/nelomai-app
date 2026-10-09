@@ -8322,6 +8322,49 @@ pub(crate) mod native {
                         .ok_or_else(|| conflict())?
                         .select_pair_intent(pin.clone(), record)
                         .map_err(|error| denied(error))?;
+                    // Retire may already have stopped this SAME row while its
+                    // member still awaits native rundown. Reattest that actual
+                    // ACK and fresh protected/native facts without stopping twice.
+                    let original = this.row_pins[i].clone().ok_or_else(conflict)?;
+                    let acknowledged = original
+                        .with_cleanup_record(
+                            &record.scope,
+                            record.provenance.network_epoch,
+                            |facts| Ok(facts.acknowledged.clone()),
+                        )
+                        .map_err(denied)?;
+                    if acknowledged.phase == rows::Phase::Stopped {
+                        this.row_owners[i]
+                            .as_ref()
+                            .ok_or_else(conflict)?
+                            .verify_stopped_original(&original)
+                            .map_err(denied)?;
+                        let role = if slot == Slot::A {
+                            rows::Role::MemberA
+                        } else {
+                            rows::Role::MemberB
+                        };
+                        let r = this.roots()?;
+                        if !r.rows.matches_row_original(role, &original) {
+                            return Err(conflict());
+                        }
+                        this.closing
+                            .as_ref()
+                            .ok_or_else(conflict)?
+                            .inspect_window(|window| {
+                                r.rows.inspect_in_window(window, |facts| {
+                                    let target = facts.rows[i + 1]
+                                        .as_ref()
+                                        .ok_or_else(|| native_denied(()))?;
+                                    if target.acknowledged != acknowledged {
+                                        return Err(native_denied(()));
+                                    }
+                                    Ok(())
+                                })
+                            })
+                            .map_err(denied)?;
+                        return Ok(());
+                    }
                     // Addressless member owners may reach Stopped now. C must
                     // NOT: its SAME VIP is retained for later stage6 deletion.
                     this.row_owners[i]

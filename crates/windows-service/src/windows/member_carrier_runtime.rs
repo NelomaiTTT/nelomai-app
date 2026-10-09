@@ -1594,6 +1594,20 @@ pub(crate) mod native {
             };
             history.iter().find(|closed| closed.intent.slot == slot)
         }
+        /// Comparison-only facts from actual retained partial cleanup pins.
+        /// These never grant member closure, native absence or Stop effects.
+        pub(crate) fn partial_member(
+            &self,
+            slot: nelomai_contracts::dispatcher::TunnelSlot,
+        ) -> Option<&crate::windows::member_carrier_members::native::PartialMemberFact> {
+            let partial = match &self.origin {
+                WindowOrigin::Source(..) => return None,
+                WindowOrigin::Closing(_, sample) | WindowOrigin::PartialClosing(_, _, sample) => {
+                    &sample.partial
+                }
+            };
+            partial.iter().find(|(intent, _, _, _)| intent.slot == slot)
+        }
         /// Read-only join under the SAME active outer full pre/post bracket,
         /// not a lifecycle/native mutation grant.
         /// Callback must be read-only and must not open another Source callback
@@ -3042,20 +3056,16 @@ pub(crate) mod native {
                 } else {
                     false
                 };
-                let partial = match &window.origin {
-                    WindowOrigin::Closing(_, sample)
-                    | WindowOrigin::PartialClosing(_, _, sample) => {
-                        sample.partial.iter().find(|(intent, _, _, _)| {
-                            intent.scope == identity.scope
-                                && intent.slot
-                                    == if i == 1 {
-                                        nelomai_contracts::dispatcher::TunnelSlot::A
-                                    } else {
-                                        nelomai_contracts::dispatcher::TunnelSlot::B
-                                    }
+                let partial = if i == 0 {
+                    None
+                } else {
+                    window
+                        .partial_member(if i == 1 {
+                            nelomai_contracts::dispatcher::TunnelSlot::A
+                        } else {
+                            nelomai_contracts::dispatcher::TunnelSlot::B
                         })
-                    }
-                    WindowOrigin::Source(..) => None,
+                        .filter(|(intent, _, _, _)| intent.scope == identity.scope)
                 };
                 let partial_deleted = i != 0
                     && cleanup
