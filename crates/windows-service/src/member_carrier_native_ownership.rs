@@ -988,35 +988,6 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<InitializedJournal<J>, I>
 }
 
 impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
-    #[cfg(all(windows, test))]
-    pub(crate) fn diagnostic_borrow_original_a<T>(
-        &mut self,
-        lock: &mut I::MutationLock,
-        call: impl FnOnce(&mut I, &Record, &NewKeyAck<I::Key>) -> Result<T>,
-    ) -> Result<T> {
-        self.cleanup_only = true;
-        self.consumed = [true; 3];
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        let record = self.current.clone().ok_or(Error::Pending)?;
-        self.require_current(&record)?;
-        let key = &record.keys[1];
-        let original = self.retained.keys[1].as_ref().ok_or(Error::Pending)?;
-        if record.phase != Phase::Closing
-            || key.phase != KeyPhase::Disabled
-            || !key.new_key_ack
-            || key.baseline != Value::Absent
-            || key.current != Value::DwordZero
-            || key.pending.is_some()
-            || original.context != self.context
-            || original.binding != self.context.bindings[1]
-        {
-            return Err(Error::Conflict);
-        }
-        let result = call(&mut self.io, &record, &original.ack);
-        self.io.assert_serialized_lock(lock, &self.context)?;
-        self.require_current(&record)?;
-        result
-    }
     pub(crate) fn new(context: Context, journal: J, io: I) -> Result<Self> {
         validate_context(&context)?;
         Ok(Self {

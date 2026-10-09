@@ -1586,58 +1586,6 @@ pub(crate) fn parent_valid(name: &str) -> bool {
         && parts[5..] == ["services", "tcpip", "parameters", "interfaces"]
 }
 impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
-    #[cfg(all(windows, test))]
-    pub(crate) fn diagnostic_delete_original_a_value(
-        &mut self,
-        record: &Record,
-        ack: &NewKeyAck<Held<K::Handle>>,
-    ) -> Result<()> {
-        let held = ack.retained_handle();
-        let root = &held.handle;
-        if !crate::windows::member_carrier_factory_test_os::apipa_probe_mode()
-            || held.context != record.context
-            || held.binding != record.context.bindings[1]
-            || root.classification() != KeyRootObligationKind::CreatedKeyRootRetained
-        {
-            return Err(Error::Conflict);
-        }
-        self.poisoned = true;
-        root.kind
-            .set(KeyRootObligationKind::UncertainOriginalKeyRoot);
-        let mut attempt = root.sampling.begin()?;
-        root.check_health()?;
-        let birth = root
-            .birth_metadata
-            .try_borrow()
-            .map_err(|_| Error::Conflict)?;
-        let birth = birth
-            .as_ref()
-            .ok_or(Error::Pending)?
-            .present_data()
-            .map_err(|_| Error::Pending)?;
-        let expected = format!("{}\\{}", held.parent, held.child);
-        if !birth.name.eq_ignore_ascii_case(&expected)
-            || !self
-                .kernel
-                .name(held.handle())?
-                .eq_ignore_ascii_case(&expected)
-            || !self
-                .kernel
-                .name(root.parent_handle())?
-                .eq_ignore_ascii_case(&held.parent)
-            || self.kernel.value(held.handle())? != NativeValue::Dword(0)
-        {
-            return Err(Error::Conflict);
-        }
-        self.kernel.delete_value(held.handle())?;
-        self.kernel.flush(held.handle())?;
-        if self.kernel.value(held.handle())? != NativeValue::Absent {
-            return Err(Error::Conflict);
-        }
-        attempt.complete = true;
-        eprintln!("actual APIPA-value probe SAME original value deleted flush/readback ACK HKEY retained diagnostic_only=true");
-        Ok(())
-    }
     pub(crate) fn new(kernel: K, authority: A, context: Context) -> Self {
         Self {
             kernel,

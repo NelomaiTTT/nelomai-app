@@ -6690,29 +6690,13 @@ pub(crate) mod native {
                     .map_err(denied)?;
                 let c = r.controllers[i].as_mut().ok_or_else(conflict)?;
                 if record.phase == pair::Phase::Closing {
-                    let stopped = c.stop(
-                        pin, record, closing.as_deref().ok_or_else(conflict)?, &mut r.lock,
-                    );
-                    #[cfg(test)]
-                    if super::super::member_carrier_factory_test_os::apipa_probe_mode()
-                        && slot == Slot::A && record.stop_stage == 4
-                        && matches!(&stopped, Err(crate::member_carrier::CarrierError::Pending))
-                    {
-                        let observed = super::super::member_carrier_factory_test_os::take_partial_pending();
-                        let diagnostic = (|| {
-                            if observed.is_none() || observed != record.members[0].as_ref().and_then(|m| m.owner.proof) {
-                                return Err(crate::member_carrier::CarrierError::Conflict);
-                            }
-                            c.verify(pin, record, closing.as_deref(), &mut r.lock)?;
-                            let (owner, _) = r.assembly.retained_parts();
-                            owner.as_mut().ok_or(crate::member_carrier::CarrierError::Pending)?
-                                .diagnostic_borrow_original_a(&mut r.lock, |io, record, ack| {
-                                    io.diagnostic_delete_original_a_value(record, ack)
-                                })
-                        })();
-                        eprintln!("actual APIPA-value probe existing partial cleanup gate and borrowed original result={diagnostic:?} diagnostic_only=true original_failure_preserved=true");
-                    }
-                    stopped.map_err(denied)?;
+                    c.stop(
+                        pin,
+                        record,
+                        closing.as_deref().ok_or_else(conflict)?,
+                        &mut r.lock,
+                    )
+                    .map_err(denied)?;
                 } else {
                     c.retire(pin, record, &mut r.lock).map_err(denied)?;
                 }
