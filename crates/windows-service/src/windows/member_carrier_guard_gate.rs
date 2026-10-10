@@ -428,13 +428,17 @@ pub(crate) mod native {
                                         // SAME original Source window attests the closed
                                         // target; row sampler authenticates its exact
                                         // Stopped ACK without querying a historical NIC.
+                                        // Stop restores owned fields; its final readonly
+                                        // observations may differ from the captured baseline.
                                         if retired != Some(i.saturating_sub(1))
                                             || i == 0
                                             || fact.acknowledged.phase
                                                 != crate::member_carrier_rows::Phase::Stopped
                                             || fact.acknowledged.pending.is_some()
-                                            || fact.acknowledged.current
-                                                != fact.acknowledged.baseline
+                                            || !crate::member_carrier_rows::same_owned(
+                                                &fact.acknowledged.current,
+                                                &fact.acknowledged.baseline,
+                                            )
                                             || fact.acknowledged.current.address.is_some()
                                         {
                                             return Err(native_denied(()));
