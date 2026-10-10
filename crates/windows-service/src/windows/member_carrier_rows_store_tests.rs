@@ -519,6 +519,14 @@ fn inject_generation_pair(d: &Disk, next: &Record) {
             peer: [3; 32],
         })
     });
+    let target = if next.binding.role == Role::MemberA {
+        Slot::A
+    } else {
+        Slot::B
+    };
+    let active = if target == Slot::A { Slot::B } else { Slot::A };
+    // New original is committed before its additive Base; the current installed
+    // deny-only guard still represents only the surviving active member.
     let base = guard::Model::new(
         scope(),
         guard::Carrier {
@@ -529,15 +537,16 @@ fn inject_generation_pair(d: &Disk, next: &Record) {
             sources: vec!["10.7.0.2".parse().unwrap()],
         },
         members.clone().map(|m| {
-            m.map(|m| guard::Member {
-                identity: guard::Identity {
-                    scope: scope(),
-                    proof: m.owner.proof.unwrap().interface,
-                },
-                probes: vec![],
-            })
+            m.filter(|m| m.owner.intent.slot != crate::member_pair::slot_native(target))
+                .map(|m| guard::Member {
+                    identity: guard::Identity {
+                        scope: scope(),
+                        proof: m.owner.proof.unwrap().interface,
+                    },
+                    probes: vec![],
+                })
         }),
-        None,
+        Some(active),
     )
     .unwrap()
     .without_permits()
@@ -547,11 +556,6 @@ fn inject_generation_pair(d: &Disk, next: &Record) {
     let base = base
         .readback_after(&guard::Model::empty(scope()).unwrap(), &actual)
         .unwrap();
-    let target = if next.binding.role == Role::MemberA {
-        Slot::A
-    } else {
-        Slot::B
-    };
     let record = pair::Record {
         version: 2,
         scope: scope(),
@@ -566,11 +570,11 @@ fn inject_generation_pair(d: &Disk, next: &Record) {
         dns: vec!["1.1.1.1".parse().unwrap()],
         carrier: Some(carrier),
         members,
-        active: Some(if target == Slot::A { Slot::B } else { Slot::A }),
+        active: Some(active),
         options: Some(nelomai_client_tunnel::DesktopTunnelOptions::default()),
         guard: base,
         pending_guard: None,
-        pending: Some(pair::Effect::WeakRows),
+        pending: None,
         network: None,
         stop_stage: 0,
         operation: Some(pair::Operation::Attach(target)),
@@ -718,13 +722,45 @@ fn generation_raw_lost_ack_never_refreshes_original_fresh_permission_or_reuses_t
 }
 
 // Break: a different Backend over equal disk/JSON inherits the token, or a
-// current Pair change bypasses its captured original pending-WeakRows ACK.
+// current Pair change bypasses its captured original committed Attach ACK.
 #[test]
 fn generation_raw_foreign_backend_and_stale_pair_never_write() {
-    for stale_pair in [false, true] {
+    for fault in 0..12 {
         let (d, mut f, old, next) = generation_fixture(Role::MemberA);
+        if fault >= 2 {
+            let mut saved: SavedRecord =
+                serde_json::from_slice(&d.0.borrow().bytes[&PrivateFile::Pair]).unwrap();
+            let mut pair = carrier_pair_payload(&scope(), saved.data.as_bytes())
+                .unwrap()
+                .unwrap();
+            match fault {
+                2 => pair.pending = Some(crate::member_carrier_pair::Effect::WeakRows),
+                3 => pair.phase = crate::member_carrier_pair::Phase::Starting,
+                4 => pair.operation = Some(crate::member_carrier_pair::Operation::Start(Slot::A)),
+                5 => pair.operation = Some(crate::member_carrier_pair::Operation::Rebind),
+                6 => pair.active = Some(Slot::A),
+                7 => {
+                    let owner = &mut pair.members[0].as_mut().unwrap().owner;
+                    owner.phase = crate::member_owner::Phase::Prepared;
+                    owner.proof = None;
+                }
+                8 => pair.members[0] = None,
+                9 => pair.guard = crate::member_carrier_guard::Model::empty(scope()).unwrap(),
+                10 => pair.stop_stage = 1,
+                _ => pair.operation = None,
+            }
+            // Capture each structurally valid foreign frame in the boundary:
+            // exact bytes alone cannot grant generation-write permission.
+            pair.validate().unwrap();
+            saved.data =
+                String::from_utf8(carrier_pair_store::encode_carrier_payload(&pair).unwrap())
+                    .unwrap();
+            d.0.borrow_mut()
+                .bytes
+                .insert(PrivateFile::Pair, serde_json::to_vec(&saved).unwrap());
+        }
         let token = GenerationBoundary::new(&d, &f, &old, &next);
-        if stale_pair {
+        if fault == 1 {
             let mut saved: SavedRecord =
                 serde_json::from_slice(&d.0.borrow().bytes[&PrivateFile::Pair]).unwrap();
             let mut p = carrier_pair_payload(&scope(), saved.data.as_bytes())
@@ -736,7 +772,7 @@ fn generation_raw_foreign_backend_and_stale_pair_never_write() {
             d.0.borrow_mut()
                 .bytes
                 .insert(PrivateFile::Pair, serde_json::to_vec(&saved).unwrap());
-        } else {
+        } else if fault == 0 {
             f = files(&d);
         }
         let attempts = d.0.borrow().attempts;

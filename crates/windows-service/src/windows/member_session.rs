@@ -199,7 +199,7 @@ pub(crate) unsafe trait OriginalInitialRowCaptureCleanupWrite {
 /// must consume one attempt before any IO; failure/reentry/unwind cannot reset
 /// it. verify_write must PURELY authenticate that same original scope, role,
 /// old exact payload and new exact payload against retained receipt/root facts,
-/// including the actual live replacement and pending WeakRows selection. No
+/// including the actual live replacement and committed pre-base Attach ACK. No
 /// SDK, Session/backend or Runtime inspection/reentry is allowed in callbacks.
 /// verify_backend is called BEFORE begin_write and before the backend lock;
 /// it must compare the retained canonical files' original identity. verify_pair
@@ -4902,16 +4902,26 @@ fn row_generation_pair(
         .ok_or_else(failed)?;
     let bytes = saved.data.as_bytes();
     let pair = carrier_pair_payload(&identity.scope, bytes)?.ok_or_else(failed)?;
-    use crate::member_carrier_pair::{Effect, Operation, Phase};
-    if !matches!(pair.phase, Phase::Starting | Phase::Running)
-        || pair.pending != Some(Effect::WeakRows)
+    use crate::member_carrier_pair::{Operation, Phase};
+    use nelomai_client_tunnel::redundancy::Slot;
+    let target = match pair.operation {
+        Some(Operation::Attach(target)) => target,
+        _ => return Err(failed()),
+    };
+    if pair.phase != Phase::Running
+        || pair.pending.is_some()
+        || pair.active != Some(if target == Slot::A { Slot::B } else { Slot::A })
+        || pair.members[usize::from(target == Slot::B)]
+            .as_ref()
+            .is_none_or(|member| {
+                member.owner.phase != crate::member_owner::Phase::Running
+                    || member.owner.proof.is_none()
+            })
         || pair.pending_guard.is_some()
+        || !pair.guard.installed
         || pair.guard.permits
+        || pair.guard.assigned_sublayer_weight.is_none()
         || pair.stop_stage != 0
-        || !matches!(
-            pair.operation,
-            Some(Operation::Start(_) | Operation::Attach(_) | Operation::Rebind)
-        )
         || pair.provenance.boot_id != identity.boot_id
         || pair.provenance.runtime != identity.runtime
     {
