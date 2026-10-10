@@ -1572,7 +1572,8 @@ fn compare_closed_resource_row(
     ack: &rows::Record,
     observed: Option<&rows::Snapshot>,
 ) -> io::Result<()> {
-    compare_guard_resource_stage(context, record)?;
+    // The caller authenticates its actual Guard/Network stage before this
+    // comparison-only SAME closed-row history read.
     let slot = match history.intent.slot {
         nelomai_contracts::dispatcher::TunnelSlot::A => Slot::A,
         nelomai_contracts::dispatcher::TunnelSlot::B => Slot::B,
@@ -1582,8 +1583,7 @@ fn compare_closed_resource_row(
     binding.validate().map_err(denied)?;
     ack.validate().map_err(denied)?;
     let p = &ack.baseline.interface.policy;
-    if record.operation != Some(pair::Operation::Retire(slot))
-        || record.active == Some(slot)
+    if record.active == Some(slot)
         || observed.is_some()
         || binding.scope != record.scope
         || binding.boot_id != context.provenance.boot_id
@@ -1624,12 +1624,21 @@ fn compare_closed_resource_row(
         return Err(conflict());
     }
     if let Some(member) = &record.members[i - 1] {
-        if member.owner.intent != history.intent
+        if record.operation != Some(pair::Operation::Retire(slot))
+            || member.owner.intent != history.intent
             || member.owner.proof != Some(history.proof)
             || member.owner.phase != crate::member_owner::Phase::Running
         {
             return Err(conflict());
         }
+    } else if record.guard.members[i - 1].is_some()
+        || record.pending_guard.as_ref().is_some_and(|plan| {
+            [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired]
+                .iter()
+                .any(|model| model.members[i - 1].is_some())
+        })
+    {
+        return Err(conflict());
     }
     Ok(())
 }
@@ -2194,7 +2203,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 self.resource_read_continuity(record, GuardResourceKind::StaticBase)?;
-                self.verify_bindings(record, false, window)?;
+                self.verify_bindings(record, false, window, Some(GuardResourceKind::StaticBase))?;
                 let pair_bytes = self.protected_pair(record)?;
                 let ack = self.ack_pin()?;
                 let (attempts, dns_acks) = ack.acknowledgements()?;
@@ -2251,7 +2260,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 self.resource_read_continuity(record, GuardResourceKind::StaticBase)?;
-                self.verify_bindings(record, false, window)
+                self.verify_bindings(record, false, window, Some(GuardResourceKind::StaticBase))
             })
         }
         /// Called ONLY inside the actual SAME Retired full-native-EMPTY bracket.
@@ -2496,7 +2505,7 @@ pub(crate) mod native {
         ) -> io::Result<()> {
             self.fence.run(true, || {
                 self.lifecycle_continuity(record, baseline, false)?;
-                self.verify_bindings(record, true, window)?;
+                self.verify_bindings(record, true, window, None)?;
                 let pair = self.protected_pair(record)?;
                 let ack = self.ack_pin()?;
                 let before_acks = ack.acknowledgements()?;
@@ -2542,7 +2551,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 self.lifecycle_journal(record, baseline, facts.protected_record.as_deref(), &ack)?;
-                self.verify_bindings(record, true, window)?;
+                self.verify_bindings(record, true, window, None)?;
                 self.lifecycle_continuity(record, baseline, false)
             })
         }
@@ -2904,7 +2913,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 self.guard_continuity(record)?;
-                self.verify_bindings(record, false, window)?;
+                self.verify_bindings(record, false, window, Some(GuardResourceKind::Install))?;
                 let pair_bytes = self.protected_pair(record)?;
                 let ack = self.ack_pin()?;
                 let (attempts, dns_acks) = ack.acknowledgements()?;
@@ -2966,7 +2975,7 @@ pub(crate) mod native {
                     return Err(conflict());
                 }
                 self.guard_continuity(record)?;
-                self.verify_bindings(record, false, window)
+                self.verify_bindings(record, false, window, Some(GuardResourceKind::Install))
             })
         }
         fn continuity(&self, selected: &Selected, cleanup: bool) -> io::Result<()> {
@@ -3077,6 +3086,7 @@ pub(crate) mod native {
             r: &pair::Record,
             cleanup: bool,
             window: &NativeBindingsWindow<'_>,
+            kind: Option<GuardResourceKind>,
         ) -> io::Result<()> {
             let channel = if cleanup {
                 self.closing
@@ -3116,29 +3126,28 @@ pub(crate) mod native {
                                 | (8, Some(pair::Effect::CarrierClose))
                         );
                     if !lifecycle {
-                        if r.pending_guard
-                            .as_ref()
-                            .is_some_and(|plan| plan.desired.permits)
-                        {
-                            compare_guard_resource_stage(&self.context, r)?;
-                        } else {
-                            // Read-only static Base facts. Main's concrete
-                            // Guard G separately proves exact closed receipts
-                            // and stopped rows for removal; never an Install.
-                            compare_static_base_resource_stage(&self.context, r)?;
-                        }
-                        if r.operation != Some(pair::Operation::Retire(slot)) {
-                            return Err(conflict());
+                        match kind {
+                            Some(GuardResourceKind::Install) => {
+                                compare_guard_resource_stage(&self.context, r)?;
+                            }
+                            Some(GuardResourceKind::StaticBase) => {
+                                compare_static_base_resource_stage(&self.context, r)?;
+                            }
+                            None => (), // Ordinary Network caller already verified its stage.
+                            Some(GuardResourceKind::Retired) => return Err(conflict()),
                         }
                     }
-                    let old = self.selected.try_borrow().map_err(denied)?;
-                    let original = if lifecycle {
-                        r.members[i].as_ref()
-                    } else {
-                        old.record.members[i].as_ref()
-                    };
-                    if let Some(original) = original {
-                        if (!lifecycle && old.record.operation != r.operation)
+                    if r.members[i].is_some() {
+                        let old = self.selected.try_borrow().map_err(denied)?;
+                        let original = if lifecycle {
+                            r.members[i].as_ref()
+                        } else {
+                            old.record.members[i].as_ref()
+                        }
+                        .ok_or_else(conflict)?;
+                        if (!lifecycle
+                            && (r.operation != Some(pair::Operation::Retire(slot))
+                                || old.record.operation != r.operation))
                             || original.owner.intent != history.intent
                             || original.owner.proof != Some(history.proof)
                             || original.owner.phase != crate::member_owner::Phase::Running
@@ -3146,7 +3155,14 @@ pub(crate) mod native {
                         {
                             return Err(conflict());
                         }
-                    } else if !lifecycle || r.members[i].is_some() {
+                    } else if r.guard.members[i].is_some()
+                        || r.pending_guard.as_ref().is_some_and(|plan| {
+                            [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired]
+                                .iter()
+                                .any(|model| model.members[i].is_some())
+                        })
+                    {
+                        // Excluded SAME closed history is factual, never a live member.
                         return Err(conflict());
                     }
                     let provider = history.comparison_provider(&self.context).map_err(denied)?;
@@ -3363,10 +3379,8 @@ pub(crate) mod native {
                         Ok(Vec::new())
                     } else if record.pending == Some(pair::Effect::Guard) {
                         compare_guard_resource_rows(&self.context, record, values, closed)
-                    } else if closed.iter().any(Option::is_some) {
-                        Err(conflict())
                     } else {
-                        compare_sampled_resource_rows(&self.context, record, values, [None, None])
+                        compare_sampled_resource_rows(&self.context, record, values, closed)
                     }
                     .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)?;
                     if closed.iter().any(Option::is_some) {
@@ -3515,7 +3529,7 @@ pub(crate) mod native {
             capture: Option<&mut NativePhysicalPlanCapture<'_>>,
         ) -> io::Result<()> {
             let selected = self.selected.try_borrow().map_err(denied)?;
-            self.verify_bindings(&selected.record, cleanup, window)?;
+            self.verify_bindings(&selected.record, cleanup, window, None)?;
             self.verify_pair(&selected, cleanup)?;
             let ack = self.ack_pin()?;
             let (attempts, dns_acks) = ack.acknowledgements()?;
@@ -3704,7 +3718,7 @@ pub(crate) mod native {
                 return Err(conflict());
             }
             self.verify_pair(&selected, cleanup)?;
-            self.verify_bindings(&selected.record, cleanup, window)
+            self.verify_bindings(&selected.record, cleanup, window, None)
         }
     }
     // SAFETY: exact Wfp specialization, retained SAME original runtime/files,

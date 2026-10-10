@@ -190,11 +190,13 @@ struct RowFact<'a> {
     acknowledged: &'a rows::Record,
     observed: Option<&'a rows::Snapshot>,
 }
+#[cfg(any(windows, test))]
 fn resource_rows(
     context: &Context,
     record: &pair::Record,
     usage: Use,
     facts: [Option<RowFact<'_>>; 3],
+    history: [Option<&super::member_carrier_members::ClosedMemberBinding>; 2],
 ) -> Result<()> {
     let proofs = [
         record.carrier,
@@ -206,7 +208,22 @@ fn resource_rows(
             .and_then(|m| m.owner.proof.map(|p| p.interface)),
     ];
     for (n, (proof, fact)) in proofs.iter().zip(facts).enumerate() {
-        let Some(proof) = proof else {
+        let closed = if cleanup_use(usage)
+            && record.phase == pair::Phase::Closing
+            && n != 0
+            && record.members[n - 1].is_none()
+        {
+            history[n - 1]
+        } else {
+            None
+        };
+        if let Some(closed) = closed {
+            closed.comparison_provider(context)?;
+            if index(&closed.intent) != n - 1 || closed.intent.scope != record.scope {
+                return Err(Error::Conflict);
+            }
+        }
+        let Some(proof) = proof.or_else(|| closed.map(|c| c.proof.interface)) else {
             if fact.is_some() {
                 return Err(Error::Conflict);
             }
@@ -240,6 +257,13 @@ fn resource_rows(
                     std::net::IpAddr::V4(ip) => ip.octets(),
                     _ => return Err(Error::Conflict),
                 }
+        {
+            return Err(Error::Conflict);
+        }
+        if closed.is_some()
+            && (observed.is_some()
+                || ack.phase != rows::Phase::Stopped
+                || !rows::same_owned(&ack.current, &ack.baseline))
         {
             return Err(Error::Conflict);
         }
@@ -299,6 +323,7 @@ fn resource_rows(
     }
     Ok(())
 }
+#[cfg(any(windows, test))]
 fn original_bindings(
     context: &Context,
     record: &pair::Record,
@@ -306,8 +331,12 @@ fn original_bindings(
     usage: Use,
     carrier: &policy::Carrier,
     egress: &[Option<policy::Identity>; 2],
-    partial: Option<NativeProof>,
+    originals: (
+        Option<NativeProof>,
+        [Option<&super::member_carrier_members::ClosedMemberBinding>; 2],
+    ),
 ) -> Result<()> {
+    let (partial, history) = originals;
     if carrier.identity.scope != record.scope
         || Some(carrier.identity.proof) != record.carrier
         || carrier.identity.proof.guid != context.bindings[0].guid
@@ -331,6 +360,17 @@ fn original_bindings(
             None
         } else if n == index(intent) && partial.is_some() {
             partial.map(|p| p.interface)
+        } else if cleanup_use(usage)
+            && record.phase == pair::Phase::Closing
+            && record.members[n].is_none()
+            && history[n].is_some()
+        {
+            let closed = history[n].ok_or(Error::Conflict)?;
+            closed.comparison_provider(context)?;
+            if index(&closed.intent) != n || closed.intent.scope != record.scope {
+                return Err(Error::Conflict);
+            }
+            Some(closed.proof.interface)
         } else {
             record.members[n]
                 .as_ref()
@@ -945,6 +985,10 @@ pub(crate) mod native {
             }
             let bindings = window.bindings();
             let c = bindings.carrier.as_ref().ok_or(Error::Conflict)?;
+            let history = [
+                window.closed_member(TunnelSlot::A),
+                window.closed_member(TunnelSlot::B),
+            ];
             original_bindings(
                 &self.context,
                 record,
@@ -952,7 +996,7 @@ pub(crate) mod native {
                 usage,
                 c,
                 &bindings.egress,
-                partial,
+                (partial, history),
             )?;
             if matches!(usage, Use::Retire(_))
                 && [TunnelSlot::A, TunnelSlot::B]
@@ -1010,6 +1054,7 @@ pub(crate) mod native {
                                 observed: f.observed.as_ref(),
                             })
                         }),
+                        history,
                     )
                     .map_err(window_denied)
                 };

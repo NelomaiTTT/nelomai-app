@@ -256,7 +256,16 @@ fn retirement_stage_denies_wrong_target_active_generation_and_pending_effect() {
 fn member_stage_accepts_primary_reserve_and_each_exact_stop() {
     let (c, r, i) = fixture();
     assert_eq!(stage(&c, &r, &i, false).unwrap(), Use::Primary);
-    original_bindings(&c, &r, &i, Use::Primary, &carrier(&r), &[None, None], None).unwrap();
+    original_bindings(
+        &c,
+        &r,
+        &i,
+        Use::Primary,
+        &carrier(&r),
+        &[None, None],
+        (None, [None, None]),
+    )
+    .unwrap();
     let (c, r, i) = reserve();
     assert_eq!(stage(&c, &r, &i, false).unwrap(), Use::Reserve);
     for slot in [Slot::A, Slot::B] {
@@ -329,7 +338,7 @@ fn start_bindings_reject_target_presence_and_stop_compares_exact_retired_history
         Use::Reserve,
         &carrier(&r),
         &[Some(a.clone()), None],
-        None,
+        (None, [None, None]),
     )
     .unwrap();
     assert!(original_bindings(
@@ -345,7 +354,7 @@ fn start_bindings_reject_target_presence_and_stop_compares_exact_retired_history
                 proof: proof(1).interface
             })
         ],
-        None
+        (None, [None, None])
     )
     .is_err());
     let (c, r, i) = closing(Slot::B);
@@ -355,7 +364,16 @@ fn start_bindings_reject_target_presence_and_stop_compares_exact_retired_history
             proof: proof(n).interface,
         })
     });
-    original_bindings(&c, &r, &i, Use::Stop, &carrier(&r), &history, None).unwrap();
+    original_bindings(
+        &c,
+        &r,
+        &i,
+        Use::Stop,
+        &carrier(&r),
+        &history,
+        (None, [None, None]),
+    )
+    .unwrap();
     for fault in 0..3 {
         let mut wrong = history.clone();
         match fault {
@@ -363,7 +381,69 @@ fn start_bindings_reject_target_presence_and_stop_compares_exact_retired_history
             1 => wrong[0].as_mut().unwrap().proof.luid += 1,
             _ => wrong[0].as_mut().unwrap().scope.connection_generation += 1,
         }
-        assert!(original_bindings(&c, &r, &i, Use::Stop, &carrier(&r), &wrong, None).is_err());
+        assert!(original_bindings(
+            &c,
+            &r,
+            &i,
+            Use::Stop,
+            &carrier(&r),
+            &wrong,
+            (None, [None, None])
+        )
+        .is_err());
+    }
+
+    let (c, r, i) = closing(Slot::A);
+    let closed = super::super::member_carrier_members::ClosedMemberBinding {
+        intent: closing(Slot::B).2,
+        proof: proof(1),
+    };
+    let actual = std::array::from_fn(|n| {
+        Some(policy::Identity {
+            scope: r.scope.clone(),
+            proof: proof(n).interface,
+        })
+    });
+    for usage in [Use::Stop, Use::ServiceStop(0)] {
+        original_bindings(
+            &c,
+            &r,
+            &i,
+            usage,
+            &carrier(&r),
+            &actual,
+            (None, [None, Some(&closed)]),
+        )
+        .unwrap();
+    }
+    for fault in 0..8 {
+        let mut wrong = closed.clone();
+        let mut egress = actual.clone();
+        let mut usage = Use::Stop;
+        let mut history = true;
+        match fault {
+            0 => history = false,
+            1 => wrong.intent.scope.connection_generation += 1,
+            2 => wrong.intent.slot = TunnelSlot::A,
+            3 => wrong.proof.interface.guid = [9; 16],
+            4 => wrong.proof.interface.index += 1,
+            5 => wrong.proof.interface.luid += 1,
+            6 => egress[1] = None,
+            _ => usage = Use::Reserve,
+        }
+        assert!(
+            original_bindings(
+                &c,
+                &r,
+                &i,
+                usage,
+                &carrier(&r),
+                &egress,
+                (None, [None, history.then_some(&wrong)])
+            )
+            .is_err(),
+            "excluded history fault {fault}"
+        );
     }
 }
 fn row(c: &Context, r: &pair::Record, n: usize, usage: Use) -> rows::Record {
@@ -498,7 +578,7 @@ fn resource_rows_require_original_ack_ready_c_and_exact_weak_baseline_before_sto
     acknowledged.creation.as_mut().unwrap().observed.dad_state = 1;
     let mut facts = rowfacts(&records);
     facts[0].as_mut().unwrap().observed = Some(&actual);
-    resource_rows(&c, &r, Use::Primary, facts).unwrap();
+    resource_rows(&c, &r, Use::Primary, facts, [None, None]).unwrap();
     for fault in 0..3 {
         let mut unready = actual.clone();
         let observed = &mut unready.address.as_mut().unwrap().observed;
@@ -509,7 +589,7 @@ fn resource_rows_require_original_ack_ready_c_and_exact_weak_baseline_before_sto
         }
         let mut facts = rowfacts(&records);
         facts[0].as_mut().unwrap().observed = Some(&unready);
-        assert!(resource_rows(&c, &r, Use::Primary, facts).is_err());
+        assert!(resource_rows(&c, &r, Use::Primary, facts, [None, None]).is_err());
     }
     let (c, r, _) = reserve();
     let records = [
@@ -517,13 +597,13 @@ fn resource_rows_require_original_ack_ready_c_and_exact_weak_baseline_before_sto
         Some(row(&c, &r, 1, Use::Reserve)),
         None,
     ];
-    resource_rows(&c, &r, Use::Reserve, rowfacts(&records)).unwrap();
+    resource_rows(&c, &r, Use::Reserve, rowfacts(&records), [None, None]).unwrap();
     let (c, r, _) = closing(Slot::B);
     let records = std::array::from_fn(|n| Some(row(&c, &r, n, Use::Stop)));
-    resource_rows(&c, &r, Use::Stop, rowfacts(&records)).unwrap();
+    resource_rows(&c, &r, Use::Stop, rowfacts(&records), [None, None]).unwrap();
     let mut facts = rowfacts(&records);
     facts[1].as_mut().unwrap().observed = None;
-    resource_rows(&c, &r, Use::Stop, facts).unwrap(); // Exact closed-row ACK, no removed SDK row.
+    resource_rows(&c, &r, Use::Stop, facts, [None, None]).unwrap(); // Exact closed-row ACK, no removed SDK row.
     for fault in 0..6 {
         let mut wrong = records.clone();
         let a = wrong[1].as_mut().unwrap();
@@ -541,8 +621,62 @@ fn resource_rows_require_original_ack_ready_c_and_exact_weak_baseline_before_sto
             _ => wrong[2] = None,
         }
         assert!(
-            resource_rows(&c, &r, Use::Stop, rowfacts(&wrong)).is_err(),
+            resource_rows(&c, &r, Use::Stop, rowfacts(&wrong), [None, None]).is_err(),
             "fault {fault}"
+        );
+    }
+
+    let (c, r, _) = closing(Slot::A);
+    let closed = super::super::member_carrier_members::ClosedMemberBinding {
+        intent: closing(Slot::B).2,
+        proof: proof(1),
+    };
+    let mut records = std::array::from_fn(|n| Some(row(&c, &r, n, Use::Stop)));
+    records[2].as_mut().unwrap().phase = rows::Phase::Stopped;
+    records[2]
+        .as_mut()
+        .unwrap()
+        .current
+        .interface
+        .observed
+        .reachable_time += 1;
+    for usage in [Use::Stop, Use::ServiceStop(0)] {
+        let mut facts = rowfacts(&records);
+        facts[2].as_mut().unwrap().observed = None;
+        resource_rows(&c, &r, usage, facts, [None, Some(&closed)]).unwrap();
+    }
+    for fault in 0..10 {
+        let mut wrong = records.clone();
+        let mut usage = Use::Stop;
+        let mut history = true;
+        let mut live = false;
+        let b = wrong[2].as_mut().unwrap();
+        match fault {
+            0 => history = false,
+            1 => b.phase = rows::Phase::Closing,
+            2 => b.current.interface.policy.metric += 1,
+            3 => b.binding.key.luid += 1,
+            4 => b.binding.guid = [9; 16],
+            5 => {
+                b.pending = Some(rows::Pending {
+                    before: b.current.clone(),
+                    target: rows::Target::Interface(b.baseline.interface.policy.clone()),
+                })
+            }
+            6 => live = true,
+            7 => usage = Use::Retired(1),
+            8 => b.binding.role = rows::Role::MemberA,
+            _ => wrong[2] = None,
+        }
+        let mut facts = rowfacts(&wrong);
+        if let Some(b) = &mut facts[2] {
+            if !live {
+                b.observed = None;
+            }
+        }
+        assert!(
+            resource_rows(&c, &r, usage, facts, [None, history.then_some(&closed)]).is_err(),
+            "excluded row fault {fault}"
         );
     }
 }
@@ -988,7 +1122,7 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
         Use::Stop,
         &carrier(&record),
         &[Some(live_target.clone()), None],
-        None
+        (None, [None, None])
     )
     .is_err());
     for cut in 0..8 {
@@ -1063,7 +1197,7 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
         Use::Stop,
         &carrier(&published),
         &[Some(live_target), None],
-        None,
+        (None, [None, None]),
     )
     .unwrap();
     assert!(original_bindings(
@@ -1073,7 +1207,7 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
         Use::Stop,
         &carrier(&published),
         &[None, None],
-        None
+        (None, [None, None])
     )
     .is_err());
     let rows = [
@@ -1081,10 +1215,17 @@ fn service_only_gate_is_disjoint_exact_closing_with_no_target_native_grant() {
         Some(row(&context, &published, 1, Use::Stop)),
         None,
     ];
-    resource_rows(&context, &published, Use::Stop, rowfacts(&rows)).unwrap();
+    resource_rows(
+        &context,
+        &published,
+        Use::Stop,
+        rowfacts(&rows),
+        [None, None],
+    )
+    .unwrap();
     let mut missing_rows = rowfacts(&rows);
     missing_rows[1] = None;
-    assert!(resource_rows(&context, &published, Use::Stop, missing_rows).is_err());
+    assert!(resource_rows(&context, &published, Use::Stop, missing_rows, [None, None]).is_err());
     network(
         &published,
         Use::Stop,
@@ -1301,7 +1442,7 @@ fn retirement_rows_restore_only_target_and_keep_c_other_weak_and_original() {
         Some(row(&c, &r, 2, Use::Stop)),
     ];
     records[2].as_mut().unwrap().phase = rows::Phase::Stopped;
-    resource_rows(&c, &r, Use::Retire(1), rowfacts(&records)).unwrap();
+    resource_rows(&c, &r, Use::Retire(1), rowfacts(&records), [None, None]).unwrap();
     for fault in 0..5 {
         let mut wrong = records.clone();
         match fault {
@@ -1335,15 +1476,15 @@ fn retirement_rows_restore_only_target_and_keep_c_other_weak_and_original() {
             3 => wrong[2].as_mut().unwrap().phase = rows::Phase::Closing,
             _ => wrong[2] = None,
         }
-        assert!(resource_rows(&c, &r, Use::Retire(1), rowfacts(&wrong)).is_err());
+        assert!(resource_rows(&c, &r, Use::Retire(1), rowfacts(&wrong), [None, None]).is_err());
     }
     // Retire preflight needs live native target rows; only actual window history
     // can justify the later stopped-target row projection.
     let mut facts = rowfacts(&records);
     facts[2].as_mut().unwrap().observed = None;
-    assert!(resource_rows(&c, &r, Use::Retire(1), facts).is_err());
+    assert!(resource_rows(&c, &r, Use::Retire(1), facts, [None, None]).is_err());
     records[2].as_mut().unwrap().binding.key.luid += 1;
-    assert!(resource_rows(&c, &r, Use::Retire(1), rowfacts(&records)).is_err());
+    assert!(resource_rows(&c, &r, Use::Retire(1), rowfacts(&records), [None, None]).is_err());
 }
 
 #[test]
@@ -1357,10 +1498,10 @@ fn retirement_postflight_uses_original_closed_target_rows_without_old_nic_query(
     records[2].as_mut().unwrap().phase = rows::Phase::Stopped;
     let mut facts = rowfacts(&records);
     facts[2].as_mut().unwrap().observed = None;
-    resource_rows(&c, &r, Use::Retired(1), facts).unwrap();
+    resource_rows(&c, &r, Use::Retired(1), facts, [None, None]).unwrap();
     let mut facts = rowfacts(&records);
     facts[1].as_mut().unwrap().observed = None;
-    assert!(resource_rows(&c, &r, Use::Retired(1), facts).is_err());
+    assert!(resource_rows(&c, &r, Use::Retired(1), facts, [None, None]).is_err());
     records[2]
         .as_mut()
         .unwrap()
@@ -1370,7 +1511,7 @@ fn retirement_postflight_uses_original_closed_target_rows_without_old_nic_query(
         .weak_host_receive = true;
     let mut facts = rowfacts(&records);
     facts[2].as_mut().unwrap().observed = None;
-    assert!(resource_rows(&c, &r, Use::Retired(1), facts).is_err());
+    assert!(resource_rows(&c, &r, Use::Retired(1), facts, [None, None]).is_err());
 }
 
 #[test]

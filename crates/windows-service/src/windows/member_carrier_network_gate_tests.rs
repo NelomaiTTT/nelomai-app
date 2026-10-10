@@ -2584,6 +2584,40 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 9);
     assert!(compare_guard_resource_rows(&c, &r, data, [None, None]).is_err());
+    let mut static_base = r.clone();
+    let plan = static_base.pending_guard.as_ref().unwrap();
+    let expected = plan.expected.without_permits().unwrap();
+    static_base.pending_guard = Some(policy::ExchangePlan::new(&expected, &plan.desired).unwrap());
+    static_base.guard = expected;
+    assert_eq!(
+        static_base.guard,
+        static_base.pending_guard.as_ref().unwrap().withdrawn
+    );
+    assert_ne!(
+        static_base.guard,
+        static_base.pending_guard.as_ref().unwrap().base
+    );
+    compare_static_base_resource_stage(&c, &static_base).unwrap();
+    assert!(compare_guard_resource_stage(&c, &static_base).is_err());
+    let metrics =
+        compare_sampled_resource_rows(&c, &static_base, data, [Some(&closed), None]).unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].interface, 9);
+    for fault in 0..5 {
+        let mut wrong = static_base.clone();
+        let target = old.guard.members[0].clone();
+        match fault {
+            0 => wrong.guard.members[0] = target,
+            1 => wrong.pending_guard.as_mut().unwrap().expected.members[0] = target,
+            2 => wrong.pending_guard.as_mut().unwrap().withdrawn.members[0] = target,
+            3 => wrong.pending_guard.as_mut().unwrap().base.members[0] = target,
+            _ => wrong.pending_guard.as_mut().unwrap().desired.members[0] = target,
+        }
+        assert!(
+            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None]).is_err(),
+            "excluded Guard history fault {fault}"
+        );
+    }
     r.members[0] = old.members[0].clone();
     assert_eq!(
         compare_guard_resource_rows(&c, &r, data, [Some(&closed), None]).unwrap()[0].interface,
@@ -2708,6 +2742,45 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
         [None, None]
     )
     .is_err());
+
+    let (c, old, mut r, resources, closed) = normal_retire_fixture();
+    r.pending_guard = None;
+    r.operation = Some(pair::Operation::Rebind);
+    r.pending = Some(pair::Effect::Network);
+    r.network.as_mut().unwrap().pending = Some(r.network.as_ref().unwrap().current.clone());
+    compare_stage(&c, &r, false).unwrap();
+    let data = resources.each_ref().map(|row| {
+        row.as_ref().map(|row| {
+            (
+                &row.binding,
+                row,
+                (row.binding.role != rows::Role::MemberA).then_some(&row.current),
+            )
+        })
+    });
+    let metrics = compare_sampled_resource_rows(&c, &r, data, [Some(&closed), None]).unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].interface, 9);
+    for fault in 0..3 {
+        let mut wrong = r.clone();
+        match fault {
+            0 => wrong.members[0] = old.members[0].clone(),
+            1 => wrong.guard.members[0] = old.guard.members[0].clone(),
+            _ => {
+                wrong
+                    .network
+                    .as_mut()
+                    .unwrap()
+                    .current
+                    .routes
+                    .push(route("0.0.0.0/0", 8, 10, None))
+            }
+        }
+        assert!(
+            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None]).is_err(),
+            "excluded Network history fault {fault}"
+        );
+    }
 }
 // Break: permitting DNS SDK writes before the exact child pending state and actual current snapshot are covered.
 #[test]
