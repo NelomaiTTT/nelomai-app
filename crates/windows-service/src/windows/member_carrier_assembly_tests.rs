@@ -1826,7 +1826,10 @@ fn live_member_key_restore_requires_original_closed_target_and_completed_retire_
             scope: record.scope.clone(),
             proof: proof(2).interface,
         }),
-        None,
+        Some(g::Identity {
+            scope: record.scope.clone(),
+            proof: proof(3).interface,
+        }),
     ];
     record.guard = g::Model::new(
         record.scope.clone(),
@@ -1865,7 +1868,7 @@ fn live_member_key_restore_requires_original_closed_target_and_completed_retire_
         (&closed_intent, proof(3)),
     )
     .unwrap();
-    for fault in 0..14 {
+    for fault in 0..16 {
         let mut current = record.clone();
         let mut c = carrier.clone();
         let mut e = egress.clone();
@@ -1878,12 +1881,7 @@ fn live_member_key_restore_requires_original_closed_target_and_completed_retire_
             2 => current.pending = Some(p::Effect::MemberStop(Slot::B)),
             3 => current.operation = Some(p::Operation::Rebind),
             4 => current.provenance.network_epoch += 1,
-            5 => {
-                e[1] = Some(g::Identity {
-                    scope: current.scope.clone(),
-                    proof: stopped.interface,
-                })
-            }
+            5 => e[1] = None,
             6 => stopped.process.creation_time += 1,
             7 => intent.config_sha256 = [9; 32],
             8 => {
@@ -1909,6 +1907,8 @@ fn live_member_key_restore_requires_original_closed_target_and_completed_retire_
             }
             12 => current.stop_stage = 1,
             13 => current.network = None,
+            14 => e[1].as_mut().unwrap().scope.connection_generation += 1,
+            15 => e[1].as_mut().unwrap().proof.luid += 1,
             _ => unreachable!(),
         }
         assert!(

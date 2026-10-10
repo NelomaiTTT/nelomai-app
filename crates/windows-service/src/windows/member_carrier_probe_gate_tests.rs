@@ -1155,6 +1155,48 @@ fn closing_registration_retains_normal_stop_and_withdrawn_lost_ack_without_rearm
     r.guard.validate().unwrap();
     assert!(compare_closing_registration(&c, &r).is_err());
     assert!(compare_stage(&c, &r, Purpose::Closing).is_err());
+
+    // Interrupted Retire: the closed B original remains in Pair until key
+    // restoration succeeds, while its DENY-only base has already been removed.
+    let (c, mut interrupted, _, _) = retire_fixture();
+    interrupted.guard = interrupted.pending_guard.take().unwrap().base;
+    interrupted.phase = pair::Phase::Closing;
+    interrupted.operation = None;
+    interrupted.active = None;
+    assert!(interrupted.members[1].is_some());
+    assert!(interrupted.guard.members[1].is_none());
+    for stage in [0, 1] {
+        interrupted.stop_stage = stage;
+        interrupted.pending = Some(if stage == 0 {
+            pair::Effect::Guard
+        } else {
+            pair::Effect::ReleaseProbes
+        });
+        interrupted.validate().unwrap();
+        assert_eq!(compare_stage(&c, &interrupted, Purpose::Closing), Ok(()));
+        assert_eq!(
+            compare_guard(&interrupted, Purpose::Closing, &interrupted.guard.expected),
+            Ok(())
+        );
+        for purpose in [
+            Purpose::Preparing,
+            Purpose::Open(Slot::A),
+            Purpose::Use(Slot::A),
+        ] {
+            assert!(compare_guard(&interrupted, purpose, &interrupted.guard.expected).is_err());
+        }
+        let mut foreign = interrupted.clone();
+        foreign.members[0]
+            .as_mut()
+            .unwrap()
+            .owner
+            .proof
+            .as_mut()
+            .unwrap()
+            .interface
+            .luid += 1;
+        assert!(compare_guard(&foreign, Purpose::Closing, &foreign.guard.expected).is_err());
+    }
 }
 // Break: giving data permits with no actual canonical original/ACK, or from an
 // equal-shaped provided tuple alone. Production joins supply both real facts.

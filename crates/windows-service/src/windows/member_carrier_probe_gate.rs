@@ -407,8 +407,9 @@ fn compare_guard(r: &pair::Record, purpose: Purpose, actual: &Snapshot) -> Resul
         return Err(GuardError::Conflict);
     }
     for (i, m) in r.members.iter().enumerate() {
-        if actual.egress[i].as_ref().map(|e| e.proof)
-            != m.as_ref().and_then(|m| m.owner.proof.map(|p| p.interface))
+        if (purpose != Purpose::Closing || actual.egress[i].is_some())
+            && actual.egress[i].as_ref().map(|e| e.proof)
+                != m.as_ref().and_then(|m| m.owner.proof.map(|p| p.interface))
         {
             return Err(GuardError::Conflict);
         }

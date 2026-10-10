@@ -867,7 +867,9 @@ fn validate_member_restore_window(
         || member.owner.intent != *closed.0
         || member.owner.proof != Some(closed.1)
         || closed.1.interface.guid != context.bindings[index + 1].guid
-        || egress[index].is_some()
+        || egress[index]
+            .as_ref()
+            .is_none_or(|e| e.scope != record.scope || e.proof != closed.1.interface)
         || record.guard.members[index].is_some()
         || record.guard.permits
         || !record.guard.installed
