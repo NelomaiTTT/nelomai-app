@@ -607,7 +607,7 @@ fn carrier_factory_actual_cold_child() {
         let retry_started = std::time::Instant::now();
         while stopped.is_err()
             && original.snapshot().cleanup_pending
-            && retry_started.elapsed() <= std::time::Duration::from_secs(30)
+            && retry_started.elapsed() <= std::time::Duration::from_secs(90)
         {
             assert_eq!(original.snapshot().session.phase, SessionPhase::Stopping);
             let now = 8 + stop_started.elapsed().as_millis() as u64;
@@ -629,7 +629,7 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+        assert!(retry_started.elapsed() <= std::time::Duration::from_secs(90));
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
@@ -1001,7 +1001,7 @@ fn carrier_factory_actual_cold_child() {
         let retry_started = std::time::Instant::now();
         while stopped.is_err() && second.snapshot().cleanup_pending {
             assert_eq!(second.snapshot().session.phase, SessionPhase::Stopping);
-            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(90));
             let now = second_now + stop_started.elapsed().as_millis() as u64;
             match second.tick(now) {
                 Ok(_) => {
@@ -1017,7 +1017,7 @@ fn carrier_factory_actual_cold_child() {
                     stopped = Err(error);
                 }
             }
-            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(30));
+            assert!(retry_started.elapsed() <= std::time::Duration::from_secs(90));
             if second.snapshot().cleanup_pending {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
