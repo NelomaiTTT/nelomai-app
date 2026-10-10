@@ -2019,6 +2019,20 @@ pub struct LeaseCommandRequest {
 }
 
 #[cfg(any(target_os = "android", test))]
+fn android_start_dispatch_error(rejection_code: Option<&str>) -> CommandError {
+    match rejection_code {
+        Some("connection_cleanup_pending") => CommandError::new(
+            "connection_cleanup_pending",
+            "Завершается очистка предыдущей попытки подключения. Повторите запуск позже",
+        ),
+        _ => CommandError::new(
+            "android_service_dispatch_unavailable",
+            "Не удалось передать намерение службе подключения",
+        ),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
 fn record_start_preflight_failure(diagnostics: &AppDiagnostics, stage: &str, error: &CommandError) {
     let event = match stage {
         "status" => "connection.start.status_failed",
@@ -2031,6 +2045,7 @@ fn record_start_preflight_failure(diagnostics: &AppDiagnostics, stage: &str, err
         "temporarily_unavailable"
         | "android_service_status_unavailable"
         | "android_service_dispatch_unavailable"
+        | "connection_cleanup_pending"
         | "auth_recovery_required"
         | "storage_unavailable"
         | "access_expired"
@@ -3448,14 +3463,11 @@ pub async fn app_start(
                     let current_bootstrap = if current_intent.lease_phase.is_some() {
                         None
                     } else {
-                        let bootstrap = rust_application
-                            .bootstrap(now)
-                            .await
-                            .map_err(|error| {
-                                let error = CommandError::from(error);
-                                record_start_preflight_failure(&start_diagnostics, "bootstrap", &error);
-                                error
-                            })?;
+                        let bootstrap = rust_application.bootstrap(now).await.map_err(|error| {
+                            let error = CommandError::from(error);
+                            record_start_preflight_failure(&start_diagnostics, "bootstrap", &error);
+                            error
+                        })?;
                         if bootstrap.device.id != device_id {
                             return Err(CommandError::new(
                                 "device_mismatch",
@@ -3467,14 +3479,14 @@ pub async fn app_start(
                     let recovery_capability = current_bootstrap
                         .as_ref()
                         .and_then(|bootstrap| bootstrap.capabilities.as_ref());
-                    let use_recovery_v2 = android_recovery_v2_connection_eligible(
-                        request.tic_connection_mode,
-                    ) && should_use_android_recovery_v2(
-                        current_intent.lease_phase.as_deref(),
-                        recovery_capability,
-                        now,
-                        reserve_enabled,
-                    );
+                    let use_recovery_v2 =
+                        android_recovery_v2_connection_eligible(request.tic_connection_mode)
+                            && should_use_android_recovery_v2(
+                                current_intent.lease_phase.as_deref(),
+                                recovery_capability,
+                                now,
+                                reserve_enabled,
+                            );
                     if use_recovery_v2 {
                         return ANDROID_UI_START_STOP_COORDINATOR
                             .run_start_side_effect(android_start_ticket, async move {
@@ -3523,7 +3535,11 @@ pub async fn app_start(
                                 .map(tauri_plugin_tunnel_android::connection_intent_tunnel_options)
                                 .map_err(|error| {
                                     let error = CommandError::from(error);
-                                    record_start_preflight_failure(&policy_diagnostics, "policy", &error);
+                                    record_start_preflight_failure(
+                                        &policy_diagnostics,
+                                        "policy",
+                                        &error,
+                                    );
                                     error
                                 })?;
                             Ok(tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
@@ -3569,12 +3585,15 @@ pub async fn app_start(
                                                 .tunnel_android()
                                                 .begin_connection_intent_async(request)
                                                 .await
-                                                .map_err(|_| {
-                                                    let error = CommandError::new(
-                                                        "android_service_dispatch_unavailable",
-                                                        "Не удалось передать намерение службе подключения",
+                                                .map_err(|rejection| {
+                                                    let error = android_start_dispatch_error(
+                                                        rejection.rejection_code(),
                                                     );
-                                                    record_start_preflight_failure(&start_diagnostics, "dispatch", &error);
+                                                    record_start_preflight_failure(
+                                                        &start_diagnostics,
+                                                        "dispatch",
+                                                        &error,
+                                                    );
                                                     error
                                                 })
                                         },
@@ -4843,6 +4862,29 @@ mod tests {
     }
 
     #[test]
+    fn android_start_dispatch_preserves_only_the_known_cleanup_rejection() {
+        let pending = super::android_start_dispatch_error(Some("connection_cleanup_pending"));
+        assert_eq!(pending.code(), "connection_cleanup_pending");
+        assert_eq!(
+            pending.message,
+            "Завершается очистка предыдущей попытки подключения. Повторите запуск позже"
+        );
+        for unknown in [
+            None,
+            Some(""),
+            Some("private-token"),
+            Some("connection_cleanup_pending: secret"),
+        ] {
+            let error = super::android_start_dispatch_error(unknown);
+            assert_eq!(error.code(), "android_service_dispatch_unavailable");
+            assert_eq!(
+                error.message,
+                "Не удалось передать намерение службе подключения"
+            );
+        }
+    }
+
+    #[test]
     fn start_preflight_failure_records_stage_and_safe_code_not_error_message() {
         let directory = tempfile::tempdir().unwrap();
         let diagnostics = crate::diagnostics::AppDiagnostics::new(
@@ -4860,6 +4902,11 @@ mod tests {
             "status",
             &super::CommandError::new("private-token", "secret response"),
         );
+        super::record_start_preflight_failure(
+            &diagnostics,
+            "dispatch",
+            &super::CommandError::new("connection_cleanup_pending", "secret response"),
+        );
         let logs: String = std::fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -4869,6 +4916,8 @@ mod tests {
         assert!(logs.contains("connection.start.bootstrap_failed"));
         assert!(logs.contains("temporarily_unavailable"));
         assert!(logs.contains("connection.start.status_failed"));
+        assert!(logs.contains("connection.start.dispatch_failed"));
+        assert!(logs.contains("connection_cleanup_pending"));
         assert!(!logs.contains("secret response"));
         assert!(!logs.contains("private-token"));
     }

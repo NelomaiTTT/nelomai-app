@@ -16,6 +16,28 @@ import kotlin.concurrent.thread
 @org.robolectric.annotation.Config(sdk = [34], manifest = org.robolectric.annotation.Config.NONE,
     shadows = [DiagnosticMemoryShadow::class])
 class AutomaticDiagnosticsIdentityBuildersTest {
+    @Test fun actualStartFailureReportPreservesCleanupPendingButSanitizesDecoratedCodes() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val builder = AutomaticDiagnostics.javaClass.declaredMethods.single {
+            it.name == "buildStartFailureReport"
+        }.apply { isAccessible = true }
+        for ((code, expected) in listOf(
+            "connection_cleanup_pending" to "connection_cleanup_pending",
+            "connection_cleanup_pending: private-token" to "other",
+            " connection_cleanup_pending" to "other",
+            "https://private.invalid/?access_token=private-token" to "other",
+        )) {
+            val report = builder.invoke(
+                AutomaticDiagnostics, context, "report", 20L, code, null,
+                "connection_start_failed", null,
+            ) as JSONObject
+            val event = JSONObject(report.getString("helper_log").lineSequence().last { it.isNotBlank() })
+            assertEquals("diagnostics.connection_start_failed", event.getString("event"))
+            assertEquals(expected, event.getString("code"))
+            if (expected == "other") assertFalse(report.toString().contains(code))
+        }
+    }
+
     @Test fun actualAutomaticBuildersUseFrozenIdentityWithoutRelabelingLegacyReports() {
         val context = org.robolectric.RuntimeEnvironment.getApplication()
         val identity = JSONObject().put("container_version", "0.3.3")
@@ -127,6 +149,28 @@ class AutomaticDiagnosticsTest {
         }
         assertEquals("other", StartFailureRequest.fromJson(request.copy(errorCode = "secret-token-private").toJson()).errorCode)
         assertFalse(request.copy(errorCode = "secret-token-private").toJson().contains("secret-token-private"))
+    }
+
+    @Test fun cleanupPendingCodeSurvivesMarkerWriteAndIndependentRestoreWithoutAdmittingArbitraryText() {
+        val request = StartFailureRequest("33333333-3333-4333-8333-333333333333",
+            "11111111-1111-4111-8111-111111111111", "connection_cleanup_pending", 100, false)
+        val encoded = request.toJson()
+        assertEquals("connection_cleanup_pending", JSONObject(encoded).getString("error_code"))
+        val restored = StartFailureRequest.fromJson(encoded)
+        assertEquals("connection_cleanup_pending", restored.errorCode)
+        assertEquals("connection_cleanup_pending", JSONObject(restored.toJson()).getString("error_code"))
+
+        for (code in listOf("connection_cleanup_pending: private-token", " connection_cleanup_pending",
+                "https://private.invalid/?access_token=private-token", "secret-token-private")) {
+            val persisted = request.copy(errorCode = code).toJson()
+            assertEquals("other", JSONObject(persisted).getString("error_code"))
+            assertFalse(persisted.contains(code))
+            // A restored marker must sanitize independently of its writer.
+            val untrustedMarker = JSONObject(encoded).put("error_code", code).toString()
+            val sanitized = StartFailureRequest.fromJson(untrustedMarker)
+            assertEquals("other", sanitized.errorCode)
+            assertFalse(sanitized.toJson().contains(code))
+        }
     }
 
     @Test

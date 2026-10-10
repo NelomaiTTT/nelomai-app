@@ -5312,6 +5312,350 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun initialV2TerminalWithoutLeaseClearsOnlyAfterAuthoritativeCancellation() {
+        for (reserveEnabled in listOf(false, true)) {
+            for (authoritativeState in listOf("not_found", "terminal", "cancelled")) {
+                val backend = ServiceRecoveryBackend()
+                val store = recoveryStore(backend)
+                val selected = template().copy(reserveEnabled = reserveEnabled)
+                val first = coordinator(store)
+                first.begin(selected)
+                val terminal = ServicePanelFake().apply {
+                    reconcileResults += reconcile("not_found")
+                    startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+                }
+                assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+                val failed = store.load()
+                val exactOperation = requireNotNull(failed.leaseTransaction).startOperationId
+                assertFalse(failed.intent.desiredActive)
+                assertEquals(LeasePhase.START_PENDING, failed.leaseTransaction.phase)
+                assertNull(failed.leaseTransaction.leaseId)
+                assertTrue(failed.intent.retry.terminalDiagnosticPending)
+
+                // Recreate the service before and after its one diagnostic handoff.
+                coordinator(recoveryStore(backend)).acknowledgeInitialTerminalDiagnostic()
+                val restored = coordinator(recoveryStore(backend))
+                val cancelled = ServicePanelFake().apply {
+                    reconcileResults += reconcile(authoritativeState)
+                }
+                assertEquals("reserve=$reserveEnabled state=$authoritativeState",
+                    AndroidCoordinatorStep.IDLE, restored.runOnce(cancelled, ServiceRuntimeFake()))
+                val idle = recoveryStore(backend).load()
+                assertNull(idle.leaseTransaction)
+                assertNull(idle.intent.template)
+                assertNull(idle.intent.retry.lastErrorCode)
+                assertEquals(0, idle.intent.retry.attempt)
+                assertEquals(listOf(exactOperation), cancelled.reconcileOperationIds)
+                assertEquals(listOf(true), cancelled.cancelIfAbsent)
+                assertTrue(cancelled.startOperationIds.isEmpty())
+                assertTrue(cancelled.stopLeaseIds.isEmpty())
+                assertTrue(restored.begin(selected) is AndroidCoordinatorResult.Accepted)
+            }
+        }
+    }
+
+    @Test
+    fun initialV2TerminalWithoutLeaseKeepsTheBarrierWhileCancellationIsUnconfirmed() {
+        for (unconfirmedState in listOf("pending", "applying", "compensating", "applied")) {
+            val backend = ServiceRecoveryBackend()
+            val store = recoveryStore(backend)
+            val selected = template().copy(reserveEnabled = true)
+            val first = coordinator(store)
+            first.begin(selected)
+            val terminal = ServicePanelFake().apply {
+                reconcileResults += reconcile("not_found")
+                startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+            }
+            assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+            first.acknowledgeInitialTerminalDiagnostic()
+            val exactOperation = store.load().leaseTransaction!!.startOperationId
+            val unfinished = ServicePanelFake().apply { reconcileResults += reconcile(unconfirmedState) }
+            assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(unfinished, ServiceRuntimeFake()))
+            assertEquals(exactOperation, store.load().leaseTransaction?.startOperationId)
+            assertEquals("connection_cleanup_pending", (first.begin(selected) as AndroidCoordinatorResult.Failure).code)
+            val unavailable = ServicePanelFake().apply {
+                onReconcile = { throw BackgroundConnectionException("transport_error") }
+            }
+            assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(unavailable, ServiceRuntimeFake()))
+            assertEquals(exactOperation, store.load().leaseTransaction?.startOperationId)
+        }
+    }
+
+    @Test
+    fun staleV2InitialTerminalCompletionWithoutReserveKeepsTheReplacementIntent() {
+        assertV2InitialTerminalReplacementSurvives(reserveEnabled = false, afterFailedWrite = false)
+    }
+
+    @Test
+    fun staleV2InitialTerminalCompletionWithReserveKeepsTheReplacementIntent() {
+        assertV2InitialTerminalReplacementSurvives(reserveEnabled = true, afterFailedWrite = false)
+    }
+
+    @Test
+    fun failedV2InitialTerminalWriteWithoutReserveKeepsTheReplacementIntent() {
+        assertV2InitialTerminalReplacementSurvives(reserveEnabled = false, afterFailedWrite = true)
+    }
+
+    @Test
+    fun failedV2InitialTerminalWriteWithReserveKeepsTheReplacementIntent() {
+        assertV2InitialTerminalReplacementSurvives(reserveEnabled = true, afterFailedWrite = true)
+    }
+
+    @Test
+    fun initialV2TerminalCompletionRetriesAWriteFailureAfterRecreation() {
+        for (reserveEnabled in listOf(false, true)) {
+            for (authoritativeState in listOf("not_found", "terminal", "cancelled")) {
+                val backend = ServiceRecoveryBackend()
+                val first = coordinator(recoveryStore(backend))
+                val selected = template().copy(reserveEnabled = reserveEnabled)
+                assertTrue(first.begin(selected) is AndroidCoordinatorResult.Accepted)
+                val terminal = ServicePanelFake().apply {
+                    reconcileResults += reconcile("not_found")
+                    startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+                }
+                assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+                assertTrue(first.acknowledgeInitialTerminalDiagnostic() is RecoveryStoreResult.Success)
+                val before = recoveryStore(backend).load()
+                val exactOperation = requireNotNull(before.leaseTransaction).startOperationId
+                val restored = coordinator(recoveryStore(backend))
+                val cancelled = ServicePanelFake().apply {
+                    reconcileResults += reconcile(authoritativeState)
+                }
+
+                backend.failNextWrites = 1
+                assertEquals(AndroidCoordinatorStep.RETRY, restored.runOnce(cancelled, ServiceRuntimeFake()))
+                val retry = recoveryStore(backend).load()
+                assertEquals(before.intent.generation, retry.intent.generation)
+                assertEquals(before.intent.diagnosticsEpisodeId, retry.intent.diagnosticsEpisodeId)
+                assertEquals(exactOperation, retry.leaseTransaction?.startOperationId)
+                assertFalse(retry.intent.desiredActive)
+                assertFalse(retry.intent.retry.terminalDiagnosticPending)
+                assertEquals("initial_terminal_after_cleanup", retry.intent.retry.pendingAction)
+                assertEquals("recovery_record_write_failed", retry.intent.retry.lastErrorCode)
+                assertTrue(retry.intent.retry.nextRetryAtUnix != null)
+
+                val retried = coordinator(recoveryStore(backend))
+                assertEquals("connection_cleanup_pending",
+                    (retried.begin(selected) as AndroidCoordinatorResult.Failure).code)
+                val confirmed = ServicePanelFake().apply {
+                    reconcileResults += reconcile(authoritativeState)
+                }
+                assertEquals(AndroidCoordinatorStep.IDLE, retried.runOnce(confirmed, ServiceRuntimeFake()))
+                val idle = recoveryStore(backend).load()
+                assertEquals(before.intent.generation, idle.intent.generation)
+                assertEquals(before.intent.diagnosticsEpisodeId, idle.intent.diagnosticsEpisodeId)
+                assertNull(idle.leaseTransaction)
+                assertNull(idle.intent.template)
+                assertNull(idle.intent.retry.lastErrorCode)
+                assertEquals(listOf(exactOperation), cancelled.reconcileOperationIds)
+                assertEquals(listOf(exactOperation), confirmed.reconcileOperationIds)
+                assertEquals(listOf(true), cancelled.cancelIfAbsent)
+                assertEquals(listOf(true), confirmed.cancelIfAbsent)
+                assertTrue(cancelled.startOperationIds.isEmpty())
+                assertTrue(confirmed.startOperationIds.isEmpty())
+                assertTrue(cancelled.stopLeaseIds.isEmpty())
+                assertTrue(confirmed.stopLeaseIds.isEmpty())
+                assertTrue(retried.begin(selected) is AndroidCoordinatorResult.Accepted)
+            }
+        }
+    }
+
+    @Test
+    fun initialV2TerminalCompletionDoesNotPretendToRetryWhenRetryPersistenceAlsoFails() {
+        for (reserveEnabled in listOf(false, true)) {
+            val backend = ServiceRecoveryBackend()
+            val first = coordinator(recoveryStore(backend))
+            val selected = template().copy(reserveEnabled = reserveEnabled)
+            assertTrue(first.begin(selected) is AndroidCoordinatorResult.Accepted)
+            val terminal = ServicePanelFake().apply {
+                reconcileResults += reconcile("not_found")
+                startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+            }
+            assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+            assertTrue(first.acknowledgeInitialTerminalDiagnostic() is RecoveryStoreResult.Success)
+            val before = backend.snapshotRecord()
+            val cancelled = ServicePanelFake().apply {
+                reconcileResults += reconcile("cancelled")
+            }
+
+            backend.failNextWrites = 2
+            assertEquals(AndroidCoordinatorStep.TERMINAL, first.runOnce(cancelled, ServiceRuntimeFake()))
+            assertTrue(before.contentEquals(backend.snapshotRecord()))
+            val restored = coordinator(recoveryStore(backend))
+            assertEquals("connection_cleanup_pending",
+                (restored.begin(selected) as AndroidCoordinatorResult.Failure).code)
+            val confirmed = ServicePanelFake().apply {
+                reconcileResults += reconcile("cancelled")
+            }
+            assertEquals(AndroidCoordinatorStep.IDLE, restored.runOnce(confirmed, ServiceRuntimeFake()))
+            assertTrue(restored.begin(selected) is AndroidCoordinatorResult.Accepted)
+        }
+    }
+
+    @Test
+    fun failedV1CancellationWriteDoesNotApplyItsErrorToAReplacementIntent() {
+        val backend = ServiceRecoveryBackend()
+        val stale = coordinator(recoveryStore(backend))
+        val selected = template()
+        stale.begin(selected)
+        val terminal = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+        }
+        assertEquals(AndroidCoordinatorStep.RETRY, stale.runOnce(terminal, ServiceRuntimeFake()))
+        stale.acknowledgeInitialTerminalDiagnostic()
+        val oldGeneration = recoveryStore(backend).load().intent.generation
+        val replacement = coordinator(recoveryStore(backend))
+        var replacementRecord: ByteArray? = null
+        backend.onFailedWrite = {
+            val completed = ServicePanelFake().apply {
+                reconcileResults += reconcile("cancelled")
+            }
+            assertEquals(AndroidCoordinatorStep.IDLE,
+                replacement.runOnce(completed, ServiceRuntimeFake()))
+            val accepted = replacement.begin(selected) as AndroidCoordinatorResult.Accepted
+            assertTrue(accepted.envelope.intent.generation > oldGeneration)
+            replacementRecord = backend.snapshotRecord()
+        }
+        val delayed = ServicePanelFake().apply {
+            reconcileResults += reconcile("cancelled")
+        }
+
+        backend.failNextWrites = 1
+        val step = stale.runOnce(delayed, ServiceRuntimeFake())
+        assertTrue(requireNotNull(replacementRecord).contentEquals(backend.snapshotRecord()))
+        val current = recoveryStore(backend).load()
+        assertTrue(current.intent.desiredActive)
+        assertFalse(current.intent.retry.terminalDiagnosticPending)
+        assertEquals(AndroidCoordinatorStep.BUSY, step)
+    }
+
+    @Test
+    fun cancelledV1StartDoesNotPretendToRetryWhenRetryPersistenceAlsoFails() {
+        val backend = ServiceRecoveryBackend()
+        val first = coordinator(recoveryStore(backend))
+        val selected = template()
+        first.begin(selected)
+        val terminal = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+        }
+        assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+        first.acknowledgeInitialTerminalDiagnostic()
+        val before = backend.snapshotRecord()
+        val cancelled = ServicePanelFake().apply {
+            reconcileResults += reconcile("cancelled")
+        }
+
+        backend.failNextWrites = 2
+        assertEquals(AndroidCoordinatorStep.TERMINAL, first.runOnce(cancelled, ServiceRuntimeFake()))
+        assertTrue(before.contentEquals(backend.snapshotRecord()))
+        val restored = coordinator(recoveryStore(backend))
+        assertEquals("connection_cleanup_pending",
+            (restored.begin(selected) as AndroidCoordinatorResult.Failure).code)
+        val confirmed = ServicePanelFake().apply {
+            reconcileResults += reconcile("cancelled")
+        }
+        assertEquals(AndroidCoordinatorStep.IDLE, restored.runOnce(confirmed, ServiceRuntimeFake()))
+        assertTrue(restored.begin(selected) is AndroidCoordinatorResult.Accepted)
+    }
+
+    @Test
+    fun staleV1CancelledStartCompletionDoesNotDisarmAReplacementIntent() {
+        val backend = ServiceRecoveryBackend()
+        val stale = coordinator(recoveryStore(backend))
+        val selected = template()
+        assertTrue(stale.begin(selected) is AndroidCoordinatorResult.Accepted)
+        val terminal = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+        }
+        assertEquals(AndroidCoordinatorStep.RETRY, stale.runOnce(terminal, ServiceRuntimeFake()))
+        stale.acknowledgeInitialTerminalDiagnostic()
+        val oldGeneration = recoveryStore(backend).load().intent.generation
+        val replacement = coordinator(recoveryStore(backend))
+        var replacementRecord: ByteArray? = null
+        val delayed = ServicePanelFake().apply {
+            reconcileResults += reconcile("cancelled")
+            onReconcile = {
+                val completed = ServicePanelFake().apply {
+                    reconcileResults += reconcile("cancelled")
+                }
+                assertEquals(AndroidCoordinatorStep.IDLE,
+                    replacement.runOnce(completed, ServiceRuntimeFake()))
+                val accepted = replacement.begin(selected) as AndroidCoordinatorResult.Accepted
+                assertTrue(accepted.envelope.intent.generation > oldGeneration)
+                replacementRecord = backend.snapshotRecord()
+            }
+        }
+
+        val step = stale.runOnce(delayed, ServiceRuntimeFake())
+        assertTrue(requireNotNull(replacementRecord).contentEquals(backend.snapshotRecord()))
+        val current = recoveryStore(backend).load()
+        assertTrue(current.intent.desiredActive)
+        assertFalse(current.intent.retry.terminalDiagnosticPending)
+        assertEquals(LeasePhase.START_PENDING, current.leaseTransaction?.phase)
+        assertEquals(AndroidCoordinatorStep.BUSY, step)
+    }
+
+    @Test
+    fun initialV1CancelledStartRetriesACompletionWriteFailureAfterRecreation() {
+        for (authoritativeState in listOf("not_found", "terminal", "cancelled")) {
+            val backend = ServiceRecoveryBackend()
+            val first = coordinator(recoveryStore(backend))
+            val selected = template()
+            assertTrue(first.begin(selected) is AndroidCoordinatorResult.Accepted)
+            val terminal = ServicePanelFake().apply {
+                reconcileResults += reconcile("not_found")
+                startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+            }
+            assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(terminal, ServiceRuntimeFake()))
+            assertTrue(first.acknowledgeInitialTerminalDiagnostic() is RecoveryStoreResult.Success)
+            val before = recoveryStore(backend).load()
+            val exactOperation = requireNotNull(before.leaseTransaction).startOperationId
+
+            val restored = coordinator(recoveryStore(backend))
+            val cancelled = ServicePanelFake().apply {
+                reconcileResults += reconcile(authoritativeState)
+            }
+            backend.failNextWrites = 1
+            assertEquals(authoritativeState, AndroidCoordinatorStep.RETRY,
+                restored.runOnce(cancelled, ServiceRuntimeFake()))
+            val retry = recoveryStore(backend).load()
+            assertEquals(before.intent.generation, retry.intent.generation)
+            assertEquals(before.intent.diagnosticsEpisodeId, retry.intent.diagnosticsEpisodeId)
+            assertEquals(exactOperation, retry.leaseTransaction?.startOperationId)
+            assertFalse(retry.intent.desiredActive)
+            assertFalse(retry.intent.retry.terminalDiagnosticPending)
+            assertEquals("recovery_record_write_failed", retry.intent.retry.lastErrorCode)
+            assertTrue(retry.intent.retry.nextRetryAtUnix != null)
+
+            val retried = coordinator(recoveryStore(backend))
+            assertEquals("connection_cleanup_pending",
+                (retried.begin(selected) as AndroidCoordinatorResult.Failure).code)
+            val confirmed = ServicePanelFake().apply {
+                reconcileResults += reconcile(authoritativeState)
+            }
+            assertEquals(AndroidCoordinatorStep.IDLE, retried.runOnce(confirmed, ServiceRuntimeFake()))
+            val idle = recoveryStore(backend).load()
+            assertEquals(before.intent.generation, idle.intent.generation)
+            assertEquals(before.intent.diagnosticsEpisodeId, idle.intent.diagnosticsEpisodeId)
+            assertNull(idle.leaseTransaction)
+            assertNull(idle.intent.template)
+            assertNull(idle.intent.retry.lastErrorCode)
+            assertEquals(listOf(exactOperation), cancelled.reconcileOperationIds)
+            assertEquals(listOf(exactOperation), confirmed.reconcileOperationIds)
+            assertEquals(listOf(true), cancelled.cancelIfAbsent)
+            assertEquals(listOf(true), confirmed.cancelIfAbsent)
+            assertTrue(cancelled.startOperationIds.isEmpty())
+            assertTrue(confirmed.startOperationIds.isEmpty())
+            assertTrue(cancelled.stopLeaseIds.isEmpty())
+            assertTrue(confirmed.stopLeaseIds.isEmpty())
+            assertTrue(retried.begin(selected) is AndroidCoordinatorResult.Accepted)
+        }
+    }
+
+    @Test
     fun initialTerminalWithoutLeaseHandsOffOneDiagnosticThenCleansToIdle() {
         val backend = ServiceRecoveryBackend()
         val first = coordinator(recoveryStore(backend))
@@ -7217,6 +7561,56 @@ class NelomaiVpnServiceTest {
         assertFalse(shouldCancelActiveClientStart("operation-a", null))
     }
 
+    private fun assertV2InitialTerminalReplacementSurvives(
+        reserveEnabled: Boolean,
+        afterFailedWrite: Boolean,
+    ) {
+        val backend = ServiceRecoveryBackend()
+        val stale = coordinator(recoveryStore(backend))
+        val selected = template().copy(reserveEnabled = reserveEnabled)
+        assertTrue(stale.begin(selected) is AndroidCoordinatorResult.Accepted)
+        val terminal = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.failure(BackgroundConnectionException("invalid_access_token"))
+        }
+        assertEquals(AndroidCoordinatorStep.RETRY, stale.runOnce(terminal, ServiceRuntimeFake()))
+        assertTrue(stale.acknowledgeInitialTerminalDiagnostic() is RecoveryStoreResult.Success)
+        val old = recoveryStore(backend).load()
+        val exactOperation = requireNotNull(old.leaseTransaction).startOperationId
+        val replacement = coordinator(recoveryStore(backend))
+        var replacementRecord: ByteArray? = null
+        val replaceIntent = {
+            val completed = ServicePanelFake().apply {
+                reconcileResults += reconcile("cancelled")
+            }
+            assertEquals(AndroidCoordinatorStep.IDLE,
+                replacement.runOnce(completed, ServiceRuntimeFake()))
+            val accepted = replacement.begin(selected) as AndroidCoordinatorResult.Accepted
+            assertTrue(accepted.envelope.intent.generation > old.intent.generation)
+            replacementRecord = backend.snapshotRecord()
+        }
+        val delayed = ServicePanelFake().apply {
+            reconcileResults += reconcile("cancelled")
+            if (!afterFailedWrite) onReconcile = replaceIntent
+        }
+        if (afterFailedWrite) {
+            backend.onFailedWrite = replaceIntent
+            backend.failNextWrites = 1
+        }
+
+        val step = stale.runOnce(delayed, ServiceRuntimeFake())
+        assertTrue(requireNotNull(replacementRecord).contentEquals(backend.snapshotRecord()))
+        val current = recoveryStore(backend).load()
+        assertTrue(current.intent.desiredActive)
+        assertFalse(current.intent.retry.terminalDiagnosticPending)
+        assertEquals(LeasePhase.START_PENDING, current.leaseTransaction?.phase)
+        assertEquals(AndroidCoordinatorStep.BUSY, step)
+        assertEquals(listOf(exactOperation), delayed.reconcileOperationIds)
+        assertEquals(listOf(true), delayed.cancelIfAbsent)
+        assertTrue(delayed.startOperationIds.isEmpty())
+        assertTrue(delayed.stopLeaseIds.isEmpty())
+    }
+
     private fun recoveryStore(
         backend: ServiceRecoveryBackend,
         bootCount: Long = 7,
@@ -7372,6 +7766,8 @@ private class ServiceRecoveryBackend : EncryptedRecordBackend {
     private var replacementRecord: ByteArray? = null
     var readCount: Int = 0
     var writeSucceeds: Boolean = true
+    var failNextWrites: Int = 0
+    var onFailedWrite: () -> Unit = {}
     var readFails: Boolean = false
 
     override fun read(): ByteArray? {
@@ -7388,6 +7784,11 @@ private class ServiceRecoveryBackend : EncryptedRecordBackend {
 
     override fun write(plaintext: ByteArray): Boolean {
         if (!writeSucceeds) return false
+        if (failNextWrites > 0) {
+            failNextWrites -= 1
+            onFailedWrite()
+            return false
+        }
         record = plaintext.copyOf()
         return true
     }

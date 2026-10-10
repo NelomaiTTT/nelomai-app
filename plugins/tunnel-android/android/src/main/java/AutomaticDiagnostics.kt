@@ -283,7 +283,7 @@ internal fun automaticDiagnosticsStartFailureCode(errorCode: String): String = w
     "temporarily_unavailable", "android_service_status_unavailable",
     "invalid_probe_results", "quick_action_plan_unavailable", "server_probes_unavailable",
     "transport_error", "android_service_dispatch_unavailable", "tunnel_start_timeout", "invalid_access_token",
-    "tunnel_handshake_timeout", "background_transport_unavailable", "connection_start_failed",
+    "tunnel_handshake_timeout", "background_transport_unavailable", "connection_start_failed", "connection_cleanup_pending",
     -> errorCode
     else -> automaticDiagnosticsConnectionIntentReasonClass(errorCode)
 }

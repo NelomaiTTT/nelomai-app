@@ -1904,9 +1904,13 @@ internal class AndroidRecoveryStore(
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
         val transaction = current.leaseTransaction
             ?: return@synchronized RecoveryStoreResult.Failure("connection_cleanup_not_pending")
+        // An initial failure before lease acquisition still owns a START_PENDING
+        // operation. The coordinator confirms its cancellation before this call.
+        val cancellablePhase = transaction.phase in setOf(LeasePhase.CLEANUP_PENDING, LeasePhase.STALE_CLEANUP) ||
+            (transaction.phase == LeasePhase.START_PENDING && transaction.leaseId == null)
         if (current.intent.desiredActive || current.intent.armedHistory ||
             current.intent.retry.pendingAction != "initial_terminal_after_cleanup" ||
-            transaction.phase !in setOf(LeasePhase.CLEANUP_PENDING, LeasePhase.STALE_CLEANUP)
+            !cancellablePhase
         ) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_not_pending")
         }

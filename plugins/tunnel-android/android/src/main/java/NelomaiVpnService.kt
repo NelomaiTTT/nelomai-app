@@ -6836,9 +6836,13 @@ internal class AndroidConnectionIntentCoordinator(
     private fun recordDirectRetry(
         code: String,
         pendingAction: String? = null,
+        expectedGeneration: Long? = null,
     ): AndroidCoordinatorStep {
         val envelope = store.read().coordinatorEnvelopeOrNull()
             ?: return AndroidCoordinatorStep.TERMINAL
+        if (expectedGeneration != null && envelope.intent.generation != expectedGeneration) {
+            return AndroidCoordinatorStep.BUSY
+        }
         val retry = envelope.intent.retry
         val delay = RETRY_DELAYS_SECONDS[
             retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)
@@ -6852,6 +6856,10 @@ internal class AndroidConnectionIntentCoordinator(
         )
         return if (result is RecoveryStoreResult.Success) {
             AndroidCoordinatorStep.RETRY
+        } else if (expectedGeneration != null && result is RecoveryStoreResult.Failure &&
+            result.code == "connection_intent_generation_conflict"
+        ) {
+            AndroidCoordinatorStep.BUSY
         } else {
             AndroidCoordinatorStep.TERMINAL
         }
@@ -6964,9 +6972,17 @@ internal class AndroidConnectionIntentCoordinator(
         if (cancelIfAbsent) {
             return when (reconciled.state) {
                 "not_found", "terminal", "cancelled" -> {
-                    store.completeCancelledStart(envelope.intent.generation)
-                        .coordinatorEnvelopeOrNull()
-                    AndroidCoordinatorStep.IDLE
+                    val completed = store.completeCancelledStart(envelope.intent.generation)
+                    when (completed) {
+                        is RecoveryStoreResult.Success -> AndroidCoordinatorStep.IDLE
+                        is RecoveryStoreResult.Failure -> if (
+                            completed.code == "connection_intent_generation_conflict"
+                        ) {
+                            AndroidCoordinatorStep.BUSY
+                        } else {
+                            recordDirectRetry(completed.code, expectedGeneration = envelope.intent.generation)
+                        }
+                    }
                 }
                 "applied" -> {
                     val leaseId = reconciled.leaseId
@@ -7251,9 +7267,18 @@ internal class AndroidConnectionIntentCoordinator(
                     } else if (envelope.intent.retry.pendingAction ==
                         "initial_terminal_after_cleanup"
                     ) {
-                        store.completeInitialTerminalCleanup(envelope.intent.generation)
-                            .coordinatorEnvelopeOrThrow()
-                        AndroidCoordinatorStep.IDLE
+                        val completed = store.completeInitialTerminalCleanup(envelope.intent.generation)
+                        // A delayed cancellation must never route its failure to a newer Start.
+                        return when (completed) {
+                            is RecoveryStoreResult.Success -> AndroidCoordinatorStep.IDLE
+                            is RecoveryStoreResult.Failure -> if (
+                                completed.code == "connection_intent_generation_conflict"
+                            ) {
+                                AndroidCoordinatorStep.BUSY
+                            } else {
+                                recordDirectRetry(completed.code, expectedGeneration = envelope.intent.generation)
+                            }
+                        }
                     } else if (transaction.phase == LeasePhase.START_PENDING) {
                         store.completeCancelledStart(envelope.intent.generation)
                     } else {

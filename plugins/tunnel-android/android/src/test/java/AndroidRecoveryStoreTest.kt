@@ -121,6 +121,31 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun initialTerminalPendingStartCompletionRetainsGenerationAndDiagnosticGuards() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        store.beginStart(0, template().copy(reserveEnabled = true),
+            replay().copy(contractVersion = 2)).success()
+        val initial = store.scheduleInitialTerminalReconcile(1, "invalid_access_token").success()
+        val beforeAck = requireNotNull(backend.record).copyOf()
+        assertTrue(store.completeInitialTerminalCleanup(initial.intent.generation) is RecoveryStoreResult.Failure)
+        assertTrue(beforeAck.contentEquals(backend.record))
+        store.acknowledgeInitialTerminalDiagnostic(initial.intent.generation).success()
+        val beforeCleanup = requireNotNull(backend.record).copyOf()
+        assertEquals("connection_intent_generation_conflict",
+            (store.completeInitialTerminalCleanup(initial.intent.generation - 1) as RecoveryStoreResult.Failure).code)
+        assertTrue(beforeCleanup.contentEquals(backend.record))
+        backend.failWrites = true
+        assertTrue(store.completeInitialTerminalCleanup(initial.intent.generation) is RecoveryStoreResult.Failure)
+        backend.failWrites = false
+        assertTrue(beforeCleanup.contentEquals(backend.record))
+        val idle = store.completeInitialTerminalCleanup(initial.intent.generation).success()
+        assertNull(idle.leaseTransaction)
+        assertFalse(idle.intent.desiredActive)
+        assertNull(idle.intent.template)
+    }
+
+    @Test
     fun initialTerminalAfterAcquiredLeaseDisarmsAndClearsEpisodeAfterExactCleanup() {
         val backend = FakeEncryptedRecordBackend()
         var store = store(backend)
