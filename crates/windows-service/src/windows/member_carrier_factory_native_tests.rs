@@ -122,6 +122,59 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let elapsed = started.elapsed();
+        if case == "primary" && !status.success() {
+            // SAME initial child scope; this read cannot attest cleanup.
+            let mut hash = Sha256::new();
+            hash.update(b"nelomai-native-factory-test-session/v1\0");
+            hash.update(case.as_bytes());
+            hash.update([0u8]);
+            let mut bytes: [u8; 16] = hash.finalize()[..16].try_into().unwrap();
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            let mut session_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            for index in [20, 16, 12, 8] {
+                session_id.insert(index, '-');
+            }
+            match crate::member_carrier::carrier_key(&SessionScope {
+                runtime: RuntimeSlot::Latest,
+                runtime_generation: 2,
+                session_id,
+                connection_generation: 3,
+            }) {
+                Ok(key) => match crate::windows::member_carrier_provider::native::table() {
+                    Ok(rows) => {
+                        let matching = rows
+                            .iter()
+                            .filter(|row| {
+                                row.identity.guid == key.guid
+                                    || row.identity.name.eq_ignore_ascii_case(&key.name)
+                            })
+                            .take(8)
+                            .map(|row| {
+                                (
+                                    &row.identity.guid,
+                                    row.identity.index,
+                                    row.identity.luid,
+                                    &row.identity.name,
+                                    row.identity.guid == key.guid,
+                                    row.identity.name.eq_ignore_ascii_case(&key.name),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        eprintln!(
+                            "actual post-child-exit initial C table related_present={} requested_guid={:?} requested_name={} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
+                            !matching.is_empty(), key.guid, key.name,
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("actual post-child-exit initial C table UNKNOWN: {error:?}")
+                    }
+                },
+                Err(error) => {
+                    eprintln!("actual post-child-exit initial C identity UNKNOWN: {error:?}")
+                }
+            }
+        }
         let stdout = std::fs::read_to_string(stdout_path).unwrap();
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
         let runtime_auth = stderr
