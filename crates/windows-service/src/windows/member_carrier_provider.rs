@@ -1271,17 +1271,6 @@ fn bind_devices(
         validate_provider_device(want, expected.kind, &matches)?;
         bound.push(Some(matches.remove(0)));
     }
-    #[cfg(all(windows, test))]
-    for original in rundown {
-        eprintln!(
-            "actual native partial rundown target PnP guid={:?} present={}",
-            original.identity.guid,
-            devices
-                .iter()
-                .any(|device| parse_guid(&device.netcfg_instance_id).ok()
-                    == Some(original.identity.guid))
-        );
-    }
     Ok(bound)
 }
 fn returned_bytes(mut bytes: Vec<u8>, required: u32) -> Result<Vec<u8>> {

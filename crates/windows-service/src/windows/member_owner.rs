@@ -1119,6 +1119,16 @@ impl OriginalMemberNative for NativeOriginalCalls<'_> {
         super::install::wait_until_running(service).map_err(|_| OwnerError::Native)
     }
     fn delete(&mut self, service: &Service) -> Result<()> {
+        #[cfg(all(windows, test))]
+        match service.query_status() {
+            Ok(status) => eprintln!(
+                "actual original SCM before Delete current_state={:?} process_id={:?} exit_code={:?}",
+                status.current_state, status.process_id, status.exit_code
+            ),
+            Err(error) => {
+                eprintln!("actual original SCM before Delete status=unknown error={error:?}");
+            }
+        }
         service.delete().map_err(|_| OwnerError::Native)
     }
 }
