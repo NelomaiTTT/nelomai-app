@@ -196,7 +196,9 @@ struct HeldKey<K> {
 }
 /// Can only be moved from an existing live owner, never decoded from a record.
 pub(crate) struct RetainedKeys<K> {
-    keys: [Option<HeldKey<K>>; 3],
+    keys: [Option<Rc<HeldKey<K>>>; 3],
+    // SAME old allocation survives replacement CAS and NEW-create failures.
+    history: Vec<Rc<HeldKey<K>>>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KeyPresence {
@@ -271,6 +273,8 @@ pub(crate) trait NativeKeyIo {
     /// Disable: absent -> REG_DWORD0 before any adapter create. Restore: only
     /// exact own REG_DWORD0 -> baseline absence after exact NIC absence.
     /// Flush the owned key/value and reread; never delete a key or subtree.
+    /// Sealed SDK-deleted member restore instead closes BOTH retained originals
+    /// under the same pending effect fence, with no value syscall.
     fn compare_exchange_value(
         &mut self,
         lock: &mut Self::MutationLock,
@@ -654,6 +658,7 @@ impl<J: NativeJournal> PendingNativeOwnership<J> {
             current: Some(record),
             retained: RetainedKeys {
                 keys: [None, None, None],
+                history: Vec::new(),
             },
             cleanup_only: false,
             attempted: [false; 3],
@@ -878,12 +883,17 @@ pub(crate) fn validate_transition(
                     | (KeyPhase::DisablePending, KeyPhase::Disabled)
             ) || (a.role != Role::RoleCarrier
                 && a.new_key_ack
-                && b.new_key_ack
-                && matches!(
-                    (a.phase, b.phase),
-                    (KeyPhase::Disabled, KeyPhase::RestorePending)
-                        | (KeyPhase::RestorePending, KeyPhase::Captured)
-                ))
+                && !b.new_key_ack
+                && a.phase == KeyPhase::Captured
+                && b.phase == KeyPhase::CreatePending)
+                || (a.role != Role::RoleCarrier
+                    && a.new_key_ack
+                    && b.new_key_ack
+                    && matches!(
+                        (a.phase, b.phase),
+                        (KeyPhase::Disabled, KeyPhase::RestorePending)
+                            | (KeyPhase::RestorePending, KeyPhase::Captured)
+                    ))
         }
         Phase::Closing => {
             a.new_key_ack == b.new_key_ack
@@ -997,6 +1007,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             current: None,
             retained: RetainedKeys {
                 keys: [None, None, None],
+                history: Vec::new(),
             },
             cleanup_only: false,
             attempted: [false; 3],
@@ -1028,6 +1039,14 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
                 return Err(Error::Conflict);
             }
         }
+        for held in &owner.retained.history {
+            if held.context != owner.context
+                || held.binding.role == Role::RoleCarrier
+                || held.binding != owner.context.bindings[held.binding.role.index()]
+            {
+                return Err(Error::Conflict);
+            }
+        }
         Ok(owner)
     }
     pub(crate) fn into_retained(self) -> RetainedKeys<I::Key> {
@@ -1048,7 +1067,11 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
     pub(crate) fn with_terminal_original_key_reads<T>(
         &mut self,
         lock: &mut I::MutationLock,
-        inspect: impl FnOnce(&Record, [Option<&NewKeyAck<I::Key>>; 3]) -> Result<T>,
+        inspect: impl FnOnce(
+            &Record,
+            [Option<&NewKeyAck<I::Key>>; 3],
+            Vec<&NewKeyAck<I::Key>>,
+        ) -> Result<T>,
     ) -> Result<T> {
         self.cleanup_only = true;
         self.io.assert_serialized_lock(lock, &self.context)?;
@@ -1075,7 +1098,16 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             .keys
             .each_ref()
             .map(|key| key.as_ref().map(|key| &key.ack));
-        let result = inspect(&record, keys);
+        for original in &self.retained.history {
+            if original.context != self.context
+                || original.binding.role == Role::RoleCarrier
+                || self.context.bindings[original.binding.role.index()] != original.binding
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let history = self.retained.history.iter().map(|key| &key.ack).collect();
+        let result = inspect(&record, keys, history);
         self.io.assert_serialized_lock(lock, &self.context)?;
         self.require_current(&record)?;
         result
@@ -1101,7 +1133,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         self.io.assert_serialized_lock(lock, &self.context)?;
         self.attempted[role.index()] = true;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.prepare_inner(role, lock, &mut run)
+            self.prepare_inner(role, lock, &mut run, None)
         }));
         match outcome {
             Ok(result) => {
@@ -1125,7 +1157,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         retirement: &mut Option<Rc<MemberKeyRetirement>>,
         lock: &mut I::MutationLock,
     ) -> Result<Record> {
-        let result = (|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let i = role.index();
             if self.cleanup_only
                 || role == Role::RoleCarrier
@@ -1152,8 +1184,12 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             }
             let facts = self.observe(expected, role, lock)?;
             require_nic_absent(&facts)?;
-            require_owned(&facts)?;
-            require_value(&facts, Value::DwordZero)?;
+            if facts.key == KeyPresence::OriginalSdkDeleted {
+                require_value(&facts, Value::Absent)?;
+            } else {
+                require_owned(&facts)?;
+                require_value(&facts, Value::DwordZero)?;
+            }
             let mut pending = next(expected)?;
             pending.keys[i].phase = KeyPhase::RestorePending;
             pending.keys[i].pending = Some(Value::Absent);
@@ -1175,10 +1211,19 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             *retirement = Some(token);
             let facts = self.observe(&restored, role, lock)?;
             require_nic_absent(&facts)?;
-            require_owned(&facts)?;
+            if facts.key != KeyPresence::OriginalSdkDeleted {
+                require_owned(&facts)?;
+            }
             require_value(&facts, Value::Absent)?;
             Ok(restored)
-        })();
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(unwind) => {
+                self.cleanup_only = true;
+                std::panic::resume_unwind(unwind)
+            }
+        };
         if result.is_err() {
             self.cleanup_only = true;
         }
@@ -1191,7 +1236,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         retirement: &MemberKeyRetirement,
         lock: &mut I::MutationLock,
     ) -> Result<Record> {
-        let result = (|| {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let i = role.index();
             if self.cleanup_only
                 || role == Role::RoleCarrier
@@ -1218,8 +1263,24 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             }
             let facts = self.observe(expected, role, lock)?;
             require_nic_absent(&facts)?;
-            require_owned(&facts)?;
             require_value(&facts, Value::Absent)?;
+            if facts.key == KeyPresence::OriginalSdkDeleted {
+                let original = self.retained.keys[i]
+                    .as_ref()
+                    .ok_or(Error::Pending)?
+                    .clone();
+                self.retained.history.push(original);
+                let mut pending = next(expected)?;
+                pending.keys[i].phase = KeyPhase::CreatePending;
+                pending.keys[i].new_key_ack = false;
+                self.persist(Some(expected), &pending, lock)?;
+                self.retained.keys[i] = None;
+                let disabled =
+                    self.prepare_inner(role, lock, &mut |call| call(), Some(retirement))?;
+                self.consumed[i] = false;
+                return Ok(disabled);
+            }
+            require_owned(&facts)?;
             let mut pending = next(expected)?;
             pending.keys[i].phase = KeyPhase::DisablePending;
             pending.keys[i].pending = Some(Value::DwordZero);
@@ -1238,7 +1299,14 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             // only after the actual restore/redisable cycle acknowledged above.
             self.consumed[i] = false;
             Ok(disabled)
-        })();
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(unwind) => {
+                self.cleanup_only = true;
+                std::panic::resume_unwind(unwind)
+            }
+        };
         if result.is_err() {
             self.cleanup_only = true;
         }
@@ -1249,6 +1317,7 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         role: Role,
         lock: &mut I::MutationLock,
         run: &mut impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<()>,
+        replacement: Option<&MemberKeyRetirement>,
     ) -> Result<Record> {
         let i = role.index();
         let mut original = None;
@@ -1269,7 +1338,28 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
                 }
             };
             self.require_current(&record)?;
-            if record.phase != Phase::Preparing || record.keys[i].phase != KeyPhase::Unstarted {
+            let phase = if let Some(retirement) = replacement {
+                if role == Role::RoleCarrier
+                    || !retirement.consumed.get()
+                    || retirement.context != self.context
+                    || retirement.role != role
+                    || record.generation <= retirement.generation
+                    || self.member_retirements[i]
+                        .as_ref()
+                        .is_none_or(|original| !std::ptr::eq(original.as_ref(), retirement))
+                    || self.retained.keys[i].is_some()
+                    || self.retained.history.last().is_none_or(|original| {
+                        original.context != self.context
+                            || original.binding != self.context.bindings[i]
+                    })
+                {
+                    return Err(Error::Retired);
+                }
+                KeyPhase::CreatePending
+            } else {
+                KeyPhase::Unstarted
+            };
+            if record.phase != Phase::Preparing || record.keys[i].phase != phase {
                 return Err(Error::Retired);
             }
             original = Some(record);
@@ -1277,6 +1367,9 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
         })?;
         let mut record = original.ok_or(Error::Pending)?;
         preparation_call(run, || {
+            if replacement.is_some() {
+                return Ok(());
+            } // Exact CreatePending already published above.
             #[cfg(all(windows, test))]
             crate::windows::member_carrier_factory_test_os::trace_step(
                 "key prepare initial absence begin",
@@ -1341,11 +1434,11 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
                     absence.as_ref().ok_or(Error::Pending)?,
                 )
                 .map_err(|_| Error::Pending)?;
-            self.retained.keys[i] = Some(HeldKey {
+            self.retained.keys[i] = Some(Rc::new(HeldKey {
                 context: self.context.clone(),
                 binding,
                 ack,
-            });
+            }));
             #[cfg(all(windows, test))]
             crate::windows::member_carrier_factory_test_os::trace_step(
                 "key prepare native NEW retained",
@@ -1683,8 +1776,18 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             next(record)?; // Confirmation must have a representable revision.
             let facts = self.observe(record, role, lock)?;
             require_nic_absent(&facts)?;
-            require_owned(&facts)?;
-            require_value(&facts, expected)?;
+            if facts.key == KeyPresence::OriginalSdkDeleted
+                && record.phase == Phase::Preparing
+                && role != Role::RoleCarrier
+                && record.keys[role.index()].phase == KeyPhase::RestorePending
+                && expected == Value::DwordZero
+                && desired == Value::Absent
+            {
+                require_value(&facts, Value::Absent)?;
+            } else {
+                require_owned(&facts)?;
+                require_value(&facts, expected)?;
+            }
             fresh = Some(facts);
             #[cfg(all(windows, test))]
             crate::windows::member_carrier_factory_test_os::trace_step(
@@ -1719,9 +1822,25 @@ impl<J: NativeJournal, I: NativeKeyIo> NativeOwnership<J, I> {
             Ok(())
         })?;
         preparation_call(run, || {
+            if fresh
+                .as_ref()
+                .is_some_and(|before| before.key == KeyPresence::OriginalSdkDeleted)
+            {
+                // Deleted-key absence alone cannot acknowledge BOTH original closes.
+                result.take().ok_or(Error::Pending)??;
+            }
             let after = self.observe(record, role, lock)?;
             require_nic_absent(&after)?;
-            require_owned(&after)?;
+            if fresh
+                .as_ref()
+                .is_some_and(|before| before.key == KeyPresence::OriginalSdkDeleted)
+            {
+                if after.key != KeyPresence::OriginalSdkDeleted {
+                    return Err(Error::Conflict);
+                }
+            } else {
+                require_owned(&after)?;
+            }
             if require_value(&after, desired).is_err() {
                 return Err(result
                     .take()

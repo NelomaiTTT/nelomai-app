@@ -1585,7 +1585,10 @@ pub(crate) fn parent_valid(name: &str) -> bool {
         && &parts[4][10..] != "000"
         && parts[5..] == ["services", "tcpip", "parameters", "interfaces"]
 }
-impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
+impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A>
+where
+    K::Handle: TerminalKeyHandle,
+{
     pub(crate) fn new(kernel: K, authority: A, context: Context) -> Self {
         Self {
             kernel,
@@ -1653,7 +1656,20 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
             return Err(Error::Pending);
         }
         let root = retained
-            .filter(|_| matches!(record.phase, Phase::Closing | Phase::Stopped))
+            .filter(|_| {
+                matches!(record.phase, Phase::Closing | Phase::Stopped)
+                    || record.phase == Phase::Preparing
+                        && binding.role != receipt::Role::RoleCarrier
+                        && Self::key_phase(record, binding).is_ok_and(|key| {
+                            key.new_key_ack
+                                && matches!(
+                                    key.phase,
+                                    KeyPhase::Disabled
+                                        | KeyPhase::RestorePending
+                                        | KeyPhase::Captured
+                                )
+                        })
+            })
             .map(terminal_original_key_obligation);
         let mut call = root.as_ref().map(|r| r.sampling.begin()).transpose()?;
         let facts = self.observed_inner(lock, record, binding, retained, challenge)?;
@@ -1676,7 +1692,29 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
         if challenge == 0 {
             return Err(Error::Pending);
         }
-        let (key, value) = self.registry_observed(lock, record, binding, retained)?;
+        #[cfg(all(windows, test))]
+        if record.phase == Phase::Preparing
+            && binding.role != receipt::Role::RoleCarrier
+            && Self::key_phase(record, binding).is_ok_and(|key| {
+                matches!(
+                    key.phase,
+                    KeyPhase::Disabled | KeyPhase::RestorePending | KeyPhase::Captured
+                )
+            })
+        {
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "member key original registry read begin",
+            );
+        }
+        let (key, value) = self
+            .registry_observed(lock, record, binding, retained)
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                    "key original registry read failed role={:?} phase={:?}: {_error:?}",
+                    binding.role, record.phase
+                ));
+            })?;
         let (name_absent, guid_absent, retained_nic_absent) =
             self.authority.nic_absence(lock, &self.context, binding)?;
         self.assert_serialized_lock(lock, &record.context)?;
@@ -1705,14 +1743,50 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
         self.assert_serialized_lock(lock, &record.context)?;
         self.binding(record, binding)?;
         let child = Self::child(binding)?;
-        let cleanup_original =
-            retained.filter(|_| matches!(record.phase, Phase::Closing | Phase::Stopped));
-        let fresh_parent = if cleanup_original.is_none() {
+        let cleanup_original = retained.filter(|_| {
+            matches!(record.phase, Phase::Closing | Phase::Stopped)
+                || record.phase == Phase::Preparing
+                    && binding.role != receipt::Role::RoleCarrier
+                    && Self::key_phase(record, binding).is_ok_and(|key| {
+                        key.new_key_ack
+                            && matches!(
+                                key.phase,
+                                KeyPhase::Disabled | KeyPhase::RestorePending | KeyPhase::Captured
+                            )
+                    })
+        });
+        if let Some(ack) = cleanup_original {
+            let held = ack.retained_handle();
+            if held.context != self.context
+                || held.binding != *binding
+                || held.child != child
+                || !parent_valid(&held.parent)
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        let root = cleanup_original.map(terminal_original_key_obligation);
+        let closed = if let Some(root) = &root {
+            root.check_health()?;
+            root.closed
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_some()
+        } else {
+            false
+        };
+        if closed {
+            let root = root.as_ref().ok_or(Error::Pending)?;
+            root.verify_original(cleanup_original.ok_or(Error::Pending)?)?;
+            root.verify_sdk_deleted_read(&root.sdk_deleted_read()?)?;
+            root.require_root_absent()?;
+        }
+        let fresh_parent = if cleanup_original.is_none() || closed {
             Some(self.parent()?)
         } else {
             None
         };
-        let (parent, parent_name) = if let Some(ack) = cleanup_original {
+        let (parent, parent_name) = if let Some(ack) = cleanup_original.filter(|_| !closed) {
             let held = ack.retained_handle();
             if held.context != self.context || held.binding != *binding || held.child != child {
                 return Err(Error::Conflict);
@@ -1726,6 +1800,11 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
             let (parent, name) = fresh_parent.as_ref().ok_or(Error::Conflict)?;
             (parent, name.clone())
         };
+        if let Some(ack) = cleanup_original.filter(|_| closed) {
+            if !parent_name.eq_ignore_ascii_case(&ack.retained_handle().parent) {
+                return Err(Error::Conflict);
+            }
+        }
         let expected = format!("{parent_name}\\{child}");
         let opened = self.kernel.open(parent, child)?;
         let (key, value) = match (opened, retained) {
@@ -1733,9 +1812,21 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
             (None, Some(ack)) if cleanup_original.is_some() => {
                 let root = terminal_original_key_obligation(ack);
                 let authority = &mut self.authority;
-                root.observe_sdk_deleted(ack, &mut self.kernel, || {
-                    authority.verify(lock, &self.context)
-                })?;
+                if !closed {
+                    root.observe_sdk_deleted(ack, &mut self.kernel, || {
+                        authority.verify(lock, &self.context)
+                    })
+                    .inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        crate::windows::member_carrier_factory_test_os::trace_step(
+                            "key original double1018/parent absence failed",
+                        );
+                    })?;
+                }
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "key original SDKDeleted factual read accepted",
+                );
                 (KeyPresence::OriginalSdkDeleted, NativeValue::Absent)
             }
             (None, Some(_)) => return Err(Error::Conflict),
@@ -1745,6 +1836,7 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
                 }
                 (KeyPresence::Foreign, self.kernel.value(&opened)?)
             }
+            (Some(_), Some(_)) if closed => return Err(Error::Conflict),
             (Some(opened), Some(ack)) => {
                 let held = ack.retained_handle();
                 if held.context != self.context
@@ -1796,7 +1888,10 @@ impl<K: RegistryKernel, A: NativeAuthority> Keys<K, A> {
             .ok_or(Error::Invalid)
     }
 }
-impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
+impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A>
+where
+    K::Handle: TerminalKeyHandle,
+{
     type Key = Held<K::Handle>;
     type MutationLock = A::Lock;
     fn assert_serialized_lock(&mut self, lock: &mut A::Lock, context: &Context) -> Result<()> {
@@ -1985,6 +2080,49 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             Value::Absent => NativeValue::Absent,
             Value::DwordZero => NativeValue::Dword(0),
         };
+        if fresh.key == KeyPresence::OriginalSdkDeleted
+            && fresh.value == NativeValue::Absent
+            && pending.phase == Phase::Preparing
+            && binding.role != receipt::Role::RoleCarrier
+            && key.phase == KeyPhase::RestorePending
+            && mutation.expected == Value::DwordZero
+            && mutation.desired == Value::Absent
+        {
+            let root = terminal_original_key_obligation(retained);
+            let current = self.registry_observed(lock, pending, binding, Some(retained))?;
+            if current != (KeyPresence::OriginalSdkDeleted, NativeValue::Absent) {
+                return Err(Error::Conflict);
+            }
+            self.authority
+                .authorize_effect(lock, pending, binding, Effect::Value(mutation))?;
+            self.poisoned = true;
+            let authority = std::cell::RefCell::new(&mut self.authority);
+            let lock = std::cell::RefCell::new(lock);
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "member SDKDeleted child+parent close begin",
+            );
+            root.close_sdk_deleted(
+                retained,
+                &mut self.kernel,
+                || {
+                    authority.borrow_mut().authorize_effect(
+                        &mut lock.borrow_mut(),
+                        pending,
+                        binding,
+                        Effect::Value(mutation),
+                    )
+                },
+                |_| Ok(()),
+            )?;
+            root.require_root_absent()?;
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "member SDKDeleted both close ACKs accepted",
+            );
+            self.poisoned = false;
+            return Ok(());
+        }
         if fresh.key != KeyPresence::ExactRetainedNewKey || fresh.value != expected {
             return Err(Error::Conflict);
         }

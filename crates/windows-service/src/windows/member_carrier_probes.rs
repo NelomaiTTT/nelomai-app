@@ -349,11 +349,20 @@ impl Expected {
     }
 }
 
-fn snapshot_matches(bindings: &Facts, snapshot: &Snapshot, no_allows: bool) -> Result<()> {
+fn snapshot_matches(
+    bindings: &Facts,
+    snapshot: &Snapshot,
+    no_allows: bool,
+    closing: bool,
+) -> Result<()> {
     if snapshot.version != 2
         || snapshot.scope != bindings.scope
         || snapshot.carrier != bindings.carrier
-        || snapshot.egress != bindings.egress
+        || snapshot
+            .egress
+            .iter()
+            .zip(&bindings.egress)
+            .any(|(actual, original)| (!closing || actual.is_some()) && actual != original)
         || (no_allows && snapshot.filters.iter().any(|f| f.action == Action::Permit))
     {
         return Err(GuardError::RemovalUnconfirmed);
@@ -362,7 +371,7 @@ fn snapshot_matches(bindings: &Facts, snapshot: &Snapshot, no_allows: bool) -> R
 }
 
 fn open_snapshot(bindings: &Facts, snapshot: &Snapshot) -> Result<()> {
-    snapshot_matches(bindings, snapshot, true)
+    snapshot_matches(bindings, snapshot, true, false)
 }
 
 #[cfg(windows)]
@@ -475,8 +484,13 @@ pub(crate) mod native {
             })
         }
     }
-    fn exact_snapshot(b: &Bindings, snapshot: &Snapshot, no_allows: bool) -> Result<()> {
-        snapshot_matches(&facts(b), snapshot, no_allows)
+    fn exact_snapshot(
+        b: &Bindings,
+        snapshot: &Snapshot,
+        no_allows: bool,
+        closing: bool,
+    ) -> Result<()> {
+        snapshot_matches(&facts(b), snapshot, no_allows, closing)
     }
     fn native_error(_: io::Error) -> GuardError {
         GuardError::Conflict
@@ -666,7 +680,7 @@ pub(crate) mod native {
         ) -> Result<()> {
             let inspect = |b: &Bindings| {
                 caps.expected.matches(b).map_err(denied)?;
-                exact_snapshot(b, snapshot, true).map_err(denied)
+                exact_snapshot(b, snapshot, true, matches!(self, Self::Closing(_))).map_err(denied)
             };
             match self {
                 Self::Closing(closing) => closing.inspect_bindings(inspect),

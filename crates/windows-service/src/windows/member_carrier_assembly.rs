@@ -1939,12 +1939,33 @@ pub(crate) mod native {
                     })
                     .map_err(|_| Error::Conflict)
             };
-            check()?;
+            check().inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "member key restore Assembly pre-read failed",
+                );
+            })?;
             // Do not enclose private journal CAS/registry effects in a Source
             // read bracket. Keys independently reattests actual native absence
             // and the SAME originally-created retained handle on every effect.
-            self.root.restore_member_key(role, lock)?;
-            check()
+            #[cfg(all(windows, test))]
+            crate::windows::member_carrier_factory_test_os::trace_step(
+                "member key restore owner entered",
+            );
+            self.root
+                .restore_member_key(role, lock)
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "member key restore owner failed: {_error:?}"
+                    ));
+                })?;
+            check().inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                crate::windows::member_carrier_factory_test_os::trace_step(
+                    "member key restore Assembly post-read failed",
+                );
+            })
         }
 
         /// SAME supervisor for each durable key step and the final native create.

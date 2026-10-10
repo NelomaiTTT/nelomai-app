@@ -145,6 +145,21 @@ fn equal_looking_foreign_retirement_and_recovery_never_rearm_original_key() {
         )
         .is_err());
     assert_eq!(state.borrow().events, before);
+    let mut retained = recovered.into_retained();
+    retained
+        .history
+        .push(retained.keys[0].as_ref().unwrap().clone());
+    assert!(
+        NativeOwnership::recover(
+            context(),
+            foreign_record,
+            Disk(state.clone()),
+            Io(state.clone()),
+            Some(retained),
+        )
+        .is_err(),
+        "carrier history is never a retired member origin"
+    );
 }
 
 #[test]
@@ -724,7 +739,7 @@ fn terminal_key_ack_read_uses_same_originals_without_querying_closed_handles() {
     let (mut owner, state, mut lock) = setup();
     let record = prepare_all(&mut owner, &mut lock);
     assert!(owner
-        .with_terminal_original_key_reads(&mut lock, |_, _| -> Result<()> {
+        .with_terminal_original_key_reads(&mut lock, |_, _, _| -> Result<()> {
             panic!("terminal callback before actual cleanup")
         })
         .is_err());
@@ -733,7 +748,7 @@ fn terminal_key_ack_read_uses_same_originals_without_querying_closed_handles() {
     let effects = state.borrow().events.len();
     state.borrow_mut().inspect_failure = Some(reads + 1);
     let originals = owner
-        .with_terminal_original_key_reads(&mut lock, |record, keys| {
+        .with_terminal_original_key_reads(&mut lock, |record, keys, _| {
             assert_eq!(record.phase, Phase::Stopped);
             Ok(keys.map(|key| key.map(|key| key.retained_handle().0)))
         })
@@ -745,23 +760,29 @@ fn terminal_key_ack_read_uses_same_originals_without_querying_closed_handles() {
     assert_eq!(owner.snapshot().unwrap(), Some(stopped));
     lock.held = false;
     assert!(owner
-        .with_terminal_original_key_reads(&mut lock, |_, _| -> Result<()> {
+        .with_terminal_original_key_reads(&mut lock, |_, _, _| -> Result<()> {
             panic!("terminal key ACK read ignored original serialized lock")
         })
         .is_err());
-    for fault in 0..3 {
+    for fault in 0..4 {
         let (mut owner, state, mut lock) = setup();
         let record = prepare_all(&mut owner, &mut lock);
         let stopped = owner.cleanup(&record, &mut lock).unwrap();
         match fault {
             0 => owner.retained.keys[1] = None,
             1 => {
-                owner.retained.keys[1].as_mut().unwrap().binding = owner.context.bindings[0].clone()
+                Rc::get_mut(owner.retained.keys[1].as_mut().unwrap())
+                    .unwrap()
+                    .binding = owner.context.bindings[0].clone()
             }
+            3 => owner
+                .retained
+                .history
+                .push(owner.retained.keys[0].as_ref().unwrap().clone()),
             _ => {}
         }
         let entered = Cell::new(false);
-        let result = owner.with_terminal_original_key_reads(&mut lock, |_, _| {
+        let result = owner.with_terminal_original_key_reads(&mut lock, |_, _, _| {
             entered.set(true);
             let mut changed = stopped.clone();
             changed.generation += 1;

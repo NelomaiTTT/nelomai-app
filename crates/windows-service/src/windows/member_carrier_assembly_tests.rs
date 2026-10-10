@@ -630,6 +630,19 @@ struct Handle {
     _original: Option<Resource>,
 }
 struct Kernel(Shared);
+impl keys::TerminalKeyHandle for Handle {
+    fn close_original(
+        &self,
+        _: impl FnOnce() -> Result<()>,
+        _: impl FnOnce(Rc<keys::KeyHandleClosed>) -> Result<()>,
+        _: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::Conflict)
+    }
+    fn verify_closed(&self, _: &Rc<keys::KeyHandleClosed>) -> Result<()> {
+        Err(Error::Conflict)
+    }
+}
 impl RegistryKernel for Kernel {
     type Handle = Handle;
     fn interfaces(&mut self) -> Result<Handle> {

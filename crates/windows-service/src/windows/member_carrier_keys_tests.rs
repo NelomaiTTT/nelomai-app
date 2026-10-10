@@ -316,6 +316,7 @@ struct State {
     parent_reads: usize,
     value_reads: usize,
     drift_parent_after: Option<usize>,
+    fresh_parent_name: Option<String>,
     drift_value_after: Option<usize>,
     original_info_status: Option<u32>,
     original_info_reads: usize,
@@ -362,6 +363,19 @@ impl NativeAuthority for Authority {
         Ok((absent, absent, absent))
     }
 }
+impl TerminalKeyHandle for u64 {
+    fn close_original(
+        &self,
+        _: impl FnOnce() -> Result<()>,
+        _: impl FnOnce(Rc<KeyHandleClosed>) -> Result<()>,
+        _: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::Conflict)
+    }
+    fn verify_closed(&self, _: &Rc<KeyHandleClosed>) -> Result<()> {
+        Err(Error::Conflict)
+    }
+}
 impl RegistryKernel for Kernel {
     type Handle = u64;
     fn capture_created_metadata(
@@ -374,7 +388,6 @@ impl RegistryKernel for Kernel {
         assert_eq!(state.path, Some(*handle));
         assert!(state.names.contains_key(handle));
         assert_eq!(state.values.get(handle), Some(&NativeValue::Absent));
-        assert_eq!(state.writes, 0, "birth capture precedes value/SDK effects");
         match state.created_metadata_fault {
             1 => Err(Error::Pending),
             2 => panic!("external birth metadata read unwound"),
@@ -455,6 +468,9 @@ impl RegistryKernel for Kernel {
         if *h == 1 {
             let mut state = self.0.borrow_mut();
             state.parent_reads += 1;
+            if let Some(name) = &state.fresh_parent_name {
+                return Ok(name.clone());
+            }
             if state
                 .drift_parent_after
                 .is_some_and(|n| state.parent_reads >= n)
@@ -1886,9 +1902,13 @@ fn sdk_deleted_cleanup_observation_is_not_a_value_mutation_or_foreign_adoption()
         .is_err());
 }
 
-struct ExactKeyJournal(Rc<RefCell<Option<Record>>>);
+struct ExactKeyJournal(Rc<RefCell<Option<Record>>>, Rc<std::cell::Cell<u8>>);
 impl receipt::NativeJournal for ExactKeyJournal {
     fn load(&mut self, expected: &Context) -> Result<Option<Record>> {
+        if self.1.get() == 9 {
+            self.1.set(0);
+            return Err(Error::Journal);
+        }
         let saved = self.0.borrow().clone();
         if saved.as_ref().is_some_and(|r| &r.context != expected) {
             return Err(Error::Conflict);
@@ -1904,7 +1924,26 @@ impl receipt::NativeJournal for ExactKeyJournal {
         if &desired.context != context || self.0.borrow().as_ref() != old {
             return Err(Error::Journal);
         }
+        let captured = desired.keys[2].phase == KeyPhase::Captured
+            && old.is_some_and(|old| old.keys[2].phase == KeyPhase::CreatePending);
+        let replacement = desired.keys[2].phase == KeyPhase::CreatePending
+            && old.is_some_and(|old| old.keys[2].phase == KeyPhase::Captured);
+        if captured && self.1.get() == 3 || replacement && self.1.get() == 6 {
+            self.1.set(0);
+            return Err(Error::Journal);
+        }
         *self.0.borrow_mut() = Some(desired.clone());
+        if captured && self.1.get() == 4 || replacement && self.1.get() == 7 {
+            self.1.set(0);
+            panic!("new generation CAS postflight unwind");
+        }
+        if captured && self.1.get() == 5 {
+            self.1.set(9);
+        }
+        if captured && self.1.get() == 8 {
+            self.1.set(0);
+            return Err(Error::Journal);
+        }
         Ok(())
     }
 }
@@ -1913,8 +1952,12 @@ impl receipt::NativeJournal for ExactKeyJournal {
 fn sdk_deleted_disabled_original_cleanup_preserves_real_owner_cas_and_never_writes_deleted_key() {
     let (io, shared) = setup();
     let journal = Rc::new(RefCell::new(None));
-    let mut owner =
-        receipt::NativeOwnership::new(context(), ExactKeyJournal(journal.clone()), io).unwrap();
+    let mut owner = receipt::NativeOwnership::new(
+        context(),
+        ExactKeyJournal(journal.clone(), Rc::new(std::cell::Cell::new(0))),
+        io,
+    )
+    .unwrap();
     let disabled = owner.prepare_role(Role::RoleCarrier, &mut true).unwrap();
     assert_eq!(disabled.keys[0].phase, KeyPhase::Disabled);
     assert_eq!(shared.borrow().writes, 1);
@@ -1929,7 +1972,8 @@ fn sdk_deleted_disabled_original_cleanup_preserves_real_owner_cas_and_never_writ
         "no DWORD write/delete to deleted original"
     );
     let original = owner
-        .with_terminal_original_key_reads(&mut true, |_, keys| {
+        .with_terminal_original_key_reads(&mut true, |_, keys, history| {
+            assert!(history.is_empty());
             Ok(terminal_original_key_obligation(keys[0].unwrap()))
         })
         .unwrap();
@@ -1941,6 +1985,191 @@ fn sdk_deleted_disabled_original_cleanup_preserves_real_owner_cas_and_never_writ
     assert!(owner
         .before_adapter_create(Role::RoleCarrier, &mut true)
         .is_err());
+
+    for (replacement, fault) in [
+        (false, 0),
+        (true, 0),
+        (true, 1),
+        (true, 2),
+        (true, 3),
+        (true, 4),
+        (true, 5),
+        (true, 6),
+        (true, 7),
+        (true, 8),
+        (true, 9),
+    ] {
+        let (_, shared) = setup();
+        let closes = Rc::new(std::cell::Cell::new(0));
+        let io = Keys::new(
+            DropTrackedKernel {
+                registry: Kernel(shared.clone()),
+                closes: closes.clone(),
+                track_created_parent: true,
+            },
+            Authority(shared.clone()),
+            context(),
+        );
+        let journal = Rc::new(RefCell::new(None));
+        let journal_fault = Rc::new(std::cell::Cell::new(0));
+        let mut owner = receipt::NativeOwnership::new(
+            context(),
+            ExactKeyJournal(journal.clone(), journal_fault.clone()),
+            io,
+        )
+        .unwrap();
+        let disabled = owner.prepare_role(Role::MemberB, &mut true).unwrap();
+        let old = {
+            let mut lock = true;
+            let receipt = owner
+                .before_adapter_create(Role::MemberB, &mut lock)
+                .unwrap();
+            Rc::downgrade(&receipt.new_key_ack.retained_handle().handle)
+        };
+        shared.borrow_mut().original_info_status = Some(1018);
+        shared.borrow_mut().path = None;
+        let writes = shared.borrow().writes;
+        let mut token = None;
+        if fault == 9 {
+            shared.borrow_mut().effect_denied = true;
+        }
+        let result = owner.restore_member_key(&disabled, Role::MemberB, &mut token, &mut true);
+        if fault == 9 {
+            assert!(
+                result.is_err(),
+                "denied original closes cannot publish retirement"
+            );
+            assert!(token.is_none());
+            assert_eq!(closes.get(), 0);
+            assert_eq!(shared.borrow().writes, writes);
+            assert_eq!(shared.borrow().next, 11, "no next generation");
+            assert!(old.upgrade().unwrap().require_root_absent().is_err());
+            assert!(owner
+                .before_adapter_create(Role::MemberB, &mut true)
+                .is_err());
+            let retained = owner.into_retained();
+            assert!(old.upgrade().is_some(), "denied original remains retained");
+            drop(retained);
+            assert_eq!(closes.get(), 0, "denied original must not Drop-close");
+            continue;
+        }
+        let restored = result.unwrap();
+        assert_eq!(restored.keys[2].phase, KeyPhase::Captured);
+        assert_eq!(
+            shared.borrow().writes,
+            writes,
+            "no VALUE syscall on deleted original"
+        );
+        assert_eq!(
+            closes.get(),
+            2,
+            "both original close ACKs before retirement return"
+        );
+        if fault != 0 {
+            if fault <= 2 {
+                shared.borrow_mut().created_metadata_fault = fault;
+            } else {
+                journal_fault.set(fault);
+            }
+        }
+        if (1..=7).contains(&fault) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.redisable_member_key(
+                    &restored,
+                    Role::MemberB,
+                    token.as_deref().unwrap(),
+                    &mut true,
+                )
+            }));
+            assert!(result.is_err() || result.unwrap().is_err(), "fault {fault}");
+            old.upgrade()
+                .expect("old original held through new CREATE/CAS/postflight")
+                .require_root_absent()
+                .unwrap();
+            assert_eq!(
+                shared.borrow().next,
+                if fault >= 6 { 11 } else { 12 },
+                "native CREATE count fault {fault}"
+            );
+            assert_eq!(
+                closes.get(),
+                2,
+                "new original/parent must not Drop-close on failure"
+            );
+            assert!(owner
+                .before_adapter_create(Role::MemberB, &mut true)
+                .is_err());
+            let retained = owner.into_retained();
+            assert!(
+                old.upgrade().is_some(),
+                "into_retained transfers old history"
+            );
+            drop(retained);
+            assert_eq!(
+                closes.get(),
+                2,
+                "unknown new originals remain retained on abandonment"
+            );
+            continue;
+        }
+        let current = if replacement {
+            let disabled = owner
+                .redisable_member_key(
+                    &restored,
+                    Role::MemberB,
+                    token.as_deref().unwrap(),
+                    &mut true,
+                )
+                .unwrap();
+            assert_eq!(disabled.keys[2].phase, KeyPhase::Disabled);
+            owner
+                .before_adapter_create(Role::MemberB, &mut true)
+                .unwrap();
+            assert_eq!(shared.borrow().next, 12, "actual new key generation");
+            assert!(
+                owner
+                    .redisable_member_key(
+                        &disabled,
+                        Role::MemberB,
+                        token.as_deref().unwrap(),
+                        &mut true,
+                    )
+                    .is_err(),
+                "one-shot retirement token"
+            );
+            disabled
+        } else {
+            restored
+        };
+        if replacement {
+            // A later SDK Stop deletes the NEW generation, not the retired original.
+            shared.borrow_mut().path = None;
+        }
+        let stopped = owner.cleanup(&current, &mut true).unwrap();
+        assert_eq!(stopped.phase, Phase::Stopped);
+        assert_eq!(closes.get(), 2, "cleanup does not reclose retired original");
+        owner
+            .with_terminal_original_key_reads(&mut true, |_, keys, history| {
+                assert_eq!(history.len(), usize::from(replacement));
+                for old in history {
+                    let root = terminal_original_key_obligation(old);
+                    root.verify_original(old)?;
+                    root.require_root_absent()?;
+                }
+                let original = terminal_original_key_obligation(keys[2].unwrap());
+                if replacement {
+                    assert!(original.sdk_deleted_read().is_ok());
+                    assert!(
+                        original.require_root_absent().is_err(),
+                        "NEW generation still needs terminal closes"
+                    );
+                } else {
+                    original.require_root_absent()?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
 }
 
 type TrackedKeyFixture = (
@@ -1975,7 +2204,7 @@ fn sdk_deleted_tracked_original() -> TrackedKeyFixture {
 
 #[test]
 fn sdk_deleted_original_requires_both_actual_close_acks_before_inert_disposition() {
-    let (mut io, _, ack, closes) = sdk_deleted_tracked_original();
+    let (mut io, shared, ack, closes) = sdk_deleted_tracked_original();
     let pin = terminal_original_key_obligation(&ack);
     let returned = RefCell::new(None);
     pin.close_sdk_deleted(
@@ -2007,6 +2236,24 @@ fn sdk_deleted_original_requires_both_actual_close_acks_before_inert_disposition
         .kernel
         .open(pin.parent_handle(), &ack.retained_handle().child)
         .is_err());
+    let mut record = pending();
+    record.phase = Phase::Closing;
+    record.keys[0].phase = KeyPhase::Captured;
+    record.keys[0].new_key_ack = true;
+    let other_parent = NATIVE_PARENT.replace("ControlSet001", "ControlSet002");
+    assert!(parent_valid(&other_parent));
+    shared.borrow_mut().fresh_parent_name = Some(other_parent);
+    assert!(
+        io.inspect(
+            &mut true,
+            &record,
+            &record.context.bindings[0],
+            Some(&ack),
+            73
+        )
+        .is_err(),
+        "another canonical ControlSet cannot confirm original absence"
+    );
     drop(ack);
     drop(pin);
     drop(io);

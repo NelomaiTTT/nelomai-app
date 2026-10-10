@@ -257,7 +257,7 @@ fn unknown_guard_snapshot_version_is_not_allow_absence() {
     .unwrap();
     let mut snapshot = model.expected;
     snapshot.version = 99;
-    assert!(snapshot_matches(&b, &snapshot, true).is_err());
+    assert!(snapshot_matches(&b, &snapshot, true, false).is_err());
 }
 
 #[test]
@@ -334,9 +334,9 @@ fn even_an_unrelated_remaining_allow_prevents_exclusive_port_release() {
         Some(Slot::A),
     )
     .unwrap();
-    assert!(snapshot_matches(&b, &model.expected, true).is_err());
+    assert!(snapshot_matches(&b, &model.expected, true, false).is_err());
     let clean = model.without_permits().unwrap().expected;
-    snapshot_matches(&b, &clean, true).unwrap();
+    snapshot_matches(&b, &clean, true, false).unwrap();
     for case in 0..5 {
         let mut snapshot = clean.clone();
         match case {
@@ -348,8 +348,54 @@ fn even_an_unrelated_remaining_allow_prevents_exclusive_port_release() {
             _ => unreachable!(),
         }
         assert!(
-            snapshot_matches(&b, &snapshot, true).is_err(),
+            snapshot_matches(&b, &snapshot, true, false).is_err(),
             "case {case}"
+        );
+    }
+
+    // Closing keeps the original B comparison identity after its guard removal.
+    let closing = Model::new(
+        b.scope.clone(),
+        b.carrier.clone().unwrap(),
+        [
+            Some(Member {
+                identity: b.egress[0].clone().unwrap(),
+                probes: vec![],
+            }),
+            None,
+        ],
+        None,
+    )
+    .unwrap()
+    .expected;
+    snapshot_matches(&b, &closing, true, true).unwrap();
+    assert!(snapshot_matches(&b, &closing, true, false).is_err());
+    assert!(open_snapshot(&b, &closing).is_err());
+    for case in 0..8 {
+        let mut snapshot = closing.clone();
+        match case {
+            0 => snapshot.filters.last_mut().unwrap().action = Action::Permit,
+            1 => snapshot.scope.connection_generation += 1,
+            2 => snapshot.carrier = None,
+            3 => snapshot.egress[0].as_mut().unwrap().proof.luid += 1,
+            4 => {
+                snapshot.egress[0]
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .runtime_generation += 1
+            }
+            5 => {
+                snapshot.egress[1] = b.egress[1].clone();
+                snapshot.egress[1].as_mut().unwrap().proof.guid[0] ^= 1;
+            }
+            6 => snapshot.version = 99,
+            7 => snapshot.carrier.as_mut().unwrap().identity.proof.guid[0] ^= 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            snapshot_matches(&b, &snapshot, true, true).is_err(),
+            "closing case {case}"
         );
     }
 }

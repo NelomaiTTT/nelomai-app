@@ -7740,7 +7740,14 @@ pub(crate) mod native {
                 if !this.roots()?.rows.matches_row_original(role, original) {
                     return Err(conflict());
                 }
-                Self::member_key_restore_facts(this.roots()?, record, slot)?;
+                Self::member_key_restore_facts(this.roots()?, record, slot).inspect_err(
+                    |_error| {
+                        #[cfg(all(windows, test))]
+                        crate::windows::member_carrier_factory_test_os::trace_step(
+                            "restore_member_keys pre-key facts failed",
+                        );
+                    },
+                )?;
                 {
                     let r = this.roots_mut()?;
                     let role = if slot == Slot::A {
@@ -7755,7 +7762,12 @@ pub(crate) mod native {
                         .restore_member_key_in_call(&mut r.lock, &r.pins, pin, record, role)
                         .map_err(denied)?;
                 }
-                Self::member_key_restore_facts(this.roots()?, record, slot)
+                Self::member_key_restore_facts(this.roots()?, record, slot).inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(
+                        "restore_member_keys post-key facts failed",
+                    );
+                })
             })
         }
 

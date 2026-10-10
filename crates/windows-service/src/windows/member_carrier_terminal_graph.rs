@@ -747,18 +747,31 @@ pub(crate) mod native {
                         {
                         let mut held_lock = raw.lock.try_borrow_mut().map_err(|_| native_wintun_conflict())?;
                         let lock = held_lock.as_mut().ok_or_else(native_wintun_conflict)?;
-                        assembly.with_terminal_original_key_owner(|owner| owner.with_terminal_original_key_reads(lock, |_, keys| {
+                        assembly.with_terminal_original_key_owner(|owner| owner.with_terminal_original_key_reads(lock, |_, keys, history| {
+                            for old in history {
+                                let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(old);
+                                root.verify_original(old)?;
+                                root.require_root_absent()?;
+                            }
                             for (slot, key) in keys.into_iter().enumerate() {
                                 if let Some(key) = key {
                                     if let Some(ack) = c.key_closes.try_borrow().map_err(|_| crate::member_carrier::CarrierError::Conflict)?[slot].as_ref() {
                                         crate::windows::member_carrier_keys::verify_terminal_original_key_closed(key, ack)?;
                                         continue;
                                     }
-                                    crate::windows::member_carrier_keys::close_terminal_original_key(key, &fence, |ack| {
+                                    let retain = |ack| {
                                         let mut retained = c.key_closes.try_borrow_mut().map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
                                         if retained[slot].is_some() { return Err(crate::member_carrier::CarrierError::Conflict); }
                                         retained[slot] = Some(ack); Ok(())
-                                    })?;
+                                    };
+                                    let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(key);
+                                    if let Ok(ack) = root.closed_handle_ack() {
+                                        root.verify_original(key)?;
+                                        root.require_root_absent()?;
+                                        retain(ack)?;
+                                    } else {
+                                        crate::windows::member_carrier_keys::close_terminal_original_key(key, &fence, retain)?;
+                                    }
                                 }
                             }
                             Ok(())
@@ -1012,7 +1025,12 @@ pub(crate) mod native {
         }
         let receipts = c.key_closes.try_borrow().map_err(|_| conflict())?;
         raw.assembly.as_ref().ok_or_else(conflict)?.with_terminal_original_key_owner(|owner| {
-            owner.with_terminal_original_key_reads(lock, |_, keys| {
+            owner.with_terminal_original_key_reads(lock, |_, keys, history| {
+                for old in history {
+                    let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(old);
+                    root.verify_original(old)?;
+                    root.require_root_absent()?;
+                }
                 for (slot, key) in keys.into_iter().enumerate() {
                     match (key, receipts[slot].as_ref()) {
                         (Some(key),Some(ack)) => crate::windows::member_carrier_keys::verify_terminal_original_key_closed(key,ack)?,
@@ -1042,7 +1060,15 @@ pub(crate) mod native {
             .as_ref()
             .ok_or_else(conflict)?
             .with_terminal_original_key_owner(|owner| {
-                owner.with_terminal_original_key_reads(lock, |_, keys| {
+                owner.with_terminal_original_key_reads(lock, |_, keys, history| {
+                    for old in history {
+                        let root =
+                            crate::windows::member_carrier_keys::terminal_original_key_obligation(
+                                old,
+                            );
+                        root.verify_original(old)?;
+                        root.require_root_absent()?;
+                    }
                     for original in keys.into_iter().flatten() {
                         let obligation =
                             crate::windows::member_carrier_keys::terminal_original_key_obligation(
@@ -1669,18 +1695,30 @@ pub(crate) mod native {
                                     let assembly = input.assembly.as_ref().ok_or(
                                         crate::windows::member_carrier_wintun::Error::Conflict)?;
                                     assembly.with_terminal_original_key_owner(|owner| {
-                                        owner.with_terminal_original_key_reads(&mut lock, |_, keys| {
+                                        owner.with_terminal_original_key_reads(&mut lock, |_, keys, history| {
+                                            for old in history {
+                                                let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(old);
+                                                root.verify_original(old)?;
+                                                root.require_root_absent()?;
+                                            }
                                             for (slot, original) in keys.into_iter().enumerate() {
                                                 if let Some(original) = original {
-                                                    crate::windows::member_carrier_keys::close_terminal_original_key(
-                                                        original, &fence, |ack| {
-                                                            let mut retained = c.key_closes.try_borrow_mut()
-                                                                .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
-                                                            let dest = &mut retained[index][slot];
-                                                            if dest.is_some() { return Err(crate::member_carrier::CarrierError::Conflict); }
-                                                            *dest = Some(ack);
-                                                            Ok(())
-                                                        })?;
+                                                    let retain = |ack| {
+                                                        let mut retained = c.key_closes.try_borrow_mut()
+                                                            .map_err(|_| crate::member_carrier::CarrierError::Conflict)?;
+                                                        let dest = &mut retained[index][slot];
+                                                        if dest.is_some() { return Err(crate::member_carrier::CarrierError::Conflict); }
+                                                        *dest = Some(ack);
+                                                        Ok(())
+                                                    };
+                                                    let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(original);
+                                                    if let Ok(ack) = root.closed_handle_ack() {
+                                                        root.verify_original(original)?;
+                                                        root.require_root_absent()?;
+                                                        retain(ack)?;
+                                                    } else {
+                                                        crate::windows::member_carrier_keys::close_terminal_original_key(original, &fence, retain)?;
+                                                    }
                                                 }
                                             }
                                             Ok(())
@@ -2128,7 +2166,12 @@ pub(crate) mod native {
             }
             input.assembly.as_ref().ok_or_else(conflict)?
                 .with_terminal_original_key_owner(|owner| {
-                    owner.with_terminal_original_key_reads(&mut lock, |_, keys| {
+                    owner.with_terminal_original_key_reads(&mut lock, |_, keys, history| {
+                        for old in history {
+                            let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(old);
+                            root.verify_original(old)?;
+                            root.require_root_absent()?;
+                        }
                         for (slot, key) in keys.into_iter().enumerate() {
                             match (key, &retained[index][slot]) {
                                 (Some(original), Some(ack)) => {
@@ -2164,7 +2207,12 @@ pub(crate) mod native {
                 .as_ref()
                 .ok_or_else(conflict)?
                 .with_terminal_original_key_owner(|owner| {
-                    owner.with_terminal_original_key_reads(&mut lock, |_, keys| {
+                    owner.with_terminal_original_key_reads(&mut lock, |_, keys, history| {
+                        for old in history {
+                            let root = crate::windows::member_carrier_keys::terminal_original_key_obligation(old);
+                            root.verify_original(old)?;
+                            root.require_root_absent()?;
+                        }
                         for original in keys.into_iter().flatten() {
                             let obligation = crate::windows::member_carrier_keys::terminal_original_key_obligation(original);
                             obligation.verify_original(original)?;
