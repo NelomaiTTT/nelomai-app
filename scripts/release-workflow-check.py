@@ -178,7 +178,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
             "path": "${{ runner.temp }}/carrier-factory-system-*/factory.log\n"
                     "${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout\n"
                     "${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr\n"
-                    "${{ runner.temp }}/carrier-factory-system-*/result.json\n",
+                    "${{ runner.temp }}/carrier-factory-system-*/result.json\n"
+                    "${{ runner.temp }}/carrier-factory-system-*/etw-*\n",
             "if-no-files-found": "warn", "retention-days": 1}},
         "Every native case must retain only actual SYSTEM outputs even on failure, uniquely bound to source/run/attempt/case for one day")
     require(aggregate.get("if") == "${{ always() && github.event_name != 'workflow_dispatch' }}"

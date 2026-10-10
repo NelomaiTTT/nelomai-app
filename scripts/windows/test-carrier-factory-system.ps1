@@ -83,7 +83,27 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 50)
 $taskName = "NelomaiFactory-$nonce"
 $registered = $false
+$trace = $null
 try {
+    # TEMPORARY CI-only evidence; remove after the exact-MIB cause is known.
+    if ($Case -ceq 'primary' -and $env:GITHUB_ACTIONS -eq 'true') {
+        $nativeLastExit = $LASTEXITCODE
+        $traceName = "NelomaiFactoryEtw-$nonce"
+        $providers = Join-Path $work 'etw-providers.txt'; $etl = Join-Path $work 'etw-kernel.etl'
+        $summary = Join-Path $work 'etw-summary.txt'
+        $trace = [ordered]@{
+            session = $traceName; source_sha = $env:SOURCE_SHA; native_case = $Case
+            started_utc = [DateTime]::UtcNow.ToString('o'); format = 'bin'; max_mb = 128
+            start_exit = $null; query_exit = $null; stop_exit = $null; summary_exit = $null
+            etl_bytes = $null; limit_reached = $null; events_lost = $null; loss_report = $null
+        }
+        try {
+            [IO.File]::WriteAllLines($providers, @('{cdead503-17f5-4a3e-b7ae-df8cc2902eb9} 0x415a 5', '{2f07e2ee-15db-40f1-90ef-9d7ba282188a} 0x10 5'), [Text.Encoding]::ASCII)
+            & logman.exe create trace $traceName -o $etl -f bin -max 128 -bs 64 -nb 16 64 -pf $providers -ets *> (Join-Path $work 'etw-start.log')
+            $trace.start_exit = $LASTEXITCODE
+        } catch { $trace.start_error = $_ | Out-String }
+        finally { $global:LASTEXITCODE = $nativeLastExit }
+    }
     Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
     $registered = $true
     $started = [DateTime]::UtcNow
@@ -111,8 +131,39 @@ try {
         throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     }
 } finally {
-    if ($registered) {
-        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    try {
+        if ($registered) {
+            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
+    } finally {
+        if ($null -ne $trace) {
+            $nativeLastExit = $LASTEXITCODE
+            try {
+                & logman.exe query $traceName -ets *> (Join-Path $work 'etw-query.log')
+                $trace.query_exit = $LASTEXITCODE
+            } catch { $trace.query_error = $_ | Out-String }
+            $trace.stop_attempt_utc = [DateTime]::UtcNow.ToString('o')
+            try {
+                & logman.exe stop $traceName -ets *> (Join-Path $work 'etw-stop.log')
+                $trace.stop_exit = $LASTEXITCODE
+            } catch { $trace.stop_error = $_ | Out-String }
+            try {
+                if (Test-Path -LiteralPath $etl -PathType Leaf) {
+                    $trace.etl_bytes = (Get-Item -LiteralPath $etl).Length
+                    & tracerpt.exe $etl -o NUL -summary $summary -y *> (Join-Path $work 'etw-decode.log')
+                    $trace.summary_exit = $LASTEXITCODE
+                    if (Test-Path -LiteralPath $summary -PathType Leaf) { $trace.loss_report = 'etw-summary.txt' }
+                }
+                if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+                    $trace.native_result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+                }
+            } catch { $trace.summary_error = $_ | Out-String }
+            $trace.finished_utc = [DateTime]::UtcNow.ToString('o')
+            try {
+                $trace | ConvertTo-Json -Depth 5 | Out-File -LiteralPath (Join-Path $work 'etw-result.json') -Encoding utf8
+            } catch { Write-Warning "ETW evidence write failed: $_" -WarningAction Continue }
+            $global:LASTEXITCODE = $nativeLastExit
+        }
     }
 }

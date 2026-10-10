@@ -345,6 +345,7 @@ jobs:
             ${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout
             ${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr
             ${{ runner.temp }}/carrier-factory-system-*/result.json
+            ${{ runner.temp }}/carrier-factory-system-*/etw-*
           if-no-files-found: warn
           retention-days: 1
 

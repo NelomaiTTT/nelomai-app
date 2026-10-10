@@ -123,7 +123,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 "path": "${{ runner.temp }}/carrier-factory-system-*/factory.log\n"
                         "${{ runner.temp }}/carrier-factory-system-*/factory.log.stdout\n"
                         "${{ runner.temp }}/carrier-factory-system-*/factory.log.stderr\n"
-                        "${{ runner.temp }}/carrier-factory-system-*/result.json\n",
+                        "${{ runner.temp }}/carrier-factory-system-*/result.json\n"
+                        "${{ runner.temp }}/carrier-factory-system-*/etw-*\n",
                 "if-no-files-found": "warn",
                 "retention-days": 1,
             },
