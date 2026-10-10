@@ -944,66 +944,7 @@ fn validate_table(rows: &[Interface]) -> Result<()> {
 fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) -> Result<()> {
     let before = query.table()?;
     // Validate the MIB before any later error can mask a direct collision.
-    validate_absence_table(targets, &before).inspect_err(|_error| {
-        #[cfg(all(windows, test))]
-        if crate::windows::member_carrier_factory_test_os::state().is_some() {
-            eprintln!(
-                "actual native MIB absence denied; matching rows (guid,name,luid,index,type,role_flags)={:?}",
-                before.iter().filter(|r| targets.iter().any(|t| r.identity.guid == t.guid || r.identity.name.eq_ignore_ascii_case(&t.name)))
-                    .take(8).map(|r| (&r.identity.guid, &r.identity.name, r.identity.luid,
-                        r.identity.index, r.identity.if_type, r.role_flags)).collect::<Vec<_>>()
-            );
-            for matched in before
-                .iter()
-                .filter(|row| targets.iter().any(|target| {
-                    row.identity.guid == target.guid
-                        || row.identity.name.eq_ignore_ascii_case(&target.name)
-                }))
-                .take(8)
-            {
-                use windows_sys::Win32::NetworkManagement::{
-                    IpHelper::{GetIfEntry2, MIB_IF_ROW2},
-                    Ndis::NET_LUID_LH,
-                };
-                for (selector, luid, index) in [
-                    ("LUID", matched.identity.luid, 0),
-                    ("index", 0, matched.identity.index),
-                ] {
-                    // Index lookup must have LUID=0: GetIfEntry2 prefers LUID.
-                    let mut direct = MIB_IF_ROW2 {
-                        InterfaceLuid: NET_LUID_LH { Value: luid },
-                        InterfaceIndex: index,
-                        ..Default::default()
-                    };
-                    let status = unsafe { GetIfEntry2(&mut direct) };
-                    if status == 0 {
-                        let mut guid = [0; 16];
-                        guid[..4].copy_from_slice(&direct.InterfaceGuid.data1.to_be_bytes());
-                        guid[4..6].copy_from_slice(&direct.InterfaceGuid.data2.to_be_bytes());
-                        guid[6..8].copy_from_slice(&direct.InterfaceGuid.data3.to_be_bytes());
-                        guid[8..].copy_from_slice(&direct.InterfaceGuid.data4);
-                        eprintln!(
-                            "actual native MIB absence denied; GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual_guid={guid:?} actual_index={} actual_luid={} oper_status={} media_connect_state={} flags={}",
-                            direct.InterfaceIndex, unsafe { direct.InterfaceLuid.Value },
-                            direct.OperStatus, direct.MediaConnectState,
-                            direct.InterfaceAndOperStatusFlags._bitfield,
-                        );
-                    } else {
-                        eprintln!("actual native MIB absence denied; GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual=UNKNOWN");
-                    }
-                }
-            }
-            match query.device_snapshot(targets) {
-                Ok(snapshot) => eprintln!(
-                    "actual native MIB absence denied; PnP (presence,status,problem,guid,name)={:?}",
-                    snapshot.nodes.iter().filter(|d| device_related(targets, d).unwrap_or(true))
-                        .take(8).map(|d| (&d.presence, d.status, d.problem, &d.netcfg_instance_id, &d.name))
-                        .collect::<Vec<_>>()
-                ),
-                Err(diagnostic) => eprintln!("actual native MIB absence denied; PnP query: {diagnostic:?}"),
-            }
-        }
-    })?;
+    validate_absence_table(targets, &before)?;
     let devices_before = query.device_snapshot(targets)?;
     let stack_before = query.stack()?;
     validate_snapshot(None, &[], targets, &before, &devices_before, &stack_before)?;
