@@ -641,12 +641,31 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             #[cfg(all(windows, test))]
             {
                 use windows_sys::Win32::{
-                    NetworkManagement::IpHelper::{
-                        GetIpPathTable, MIB_IPPATH_ROW, MIB_IPPATH_TABLE,
+                    NetworkManagement::{
+                        IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+                        Ndis::NET_LUID_LH,
                     },
-                    Networking::WinSock::AF_INET,
                     System::SystemInformation::GetTickCount64,
                 };
+                let direct = retained
+                    .filter(|_| {
+                        actual.interface.is_some() || !actual.retained_interfaces.is_empty()
+                    })
+                    .map(|proof| {
+                        [
+                            ("LUID", proof.interface.luid, 0),
+                            ("index", 0, proof.interface.index),
+                        ]
+                        .map(|(selector, luid, index)| {
+                            let mut row = MIB_IF_ROW2 {
+                                InterfaceLuid: NET_LUID_LH { Value: luid },
+                                InterfaceIndex: index,
+                                ..Default::default()
+                            };
+                            let status = unsafe { GetIfEntry2(&mut row) };
+                            (selector, luid, index, status, row)
+                        })
+                    });
                 let observation_after = (
                     unsafe { GetTickCount64() },
                     std::time::SystemTime::now()
@@ -658,70 +677,22 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
                     "partial rundown observation frame tick_before={} filetime_before={:?} tick_after={} filetime_after={:?} interface={:?} retained_interfaces={:?}",
                     observation_before.0, observation_before.1, observation_after.0, observation_after.1, actual.interface, actual.retained_interfaces,
                 ));
-                if let Some(proof) = retained.filter(|_| {
-                    actual.interface.is_some() || !actual.retained_interfaces.is_empty()
-                }) {
-                    let mut samples = Vec::with_capacity(64);
-                    let mut table: *mut MIB_IPPATH_TABLE = ptr::null_mut();
-                    let status = unsafe { GetIpPathTable(AF_INET, &mut table) };
-                    let count =
-                        (status == 0 && !table.is_null()).then(|| unsafe { (*table).NumEntries });
-                    let mut matching = 0u32;
-                    if let Some(count) = count.filter(|count| *count <= 32768) {
-                        let paths = unsafe {
-                            std::slice::from_raw_parts(
-                                ptr::addr_of!((*table).Table).cast::<MIB_IPPATH_ROW>(),
-                                count as usize,
-                            )
-                        };
-                        for row in paths {
-                            let luid = unsafe { row.InterfaceLuid.Value };
-                            if row.InterfaceIndex == proof.interface.index
-                                || luid == proof.interface.luid
-                            {
-                                matching += 1;
-                                if samples.len() < 64 {
-                                    let source = row.Source;
-                                    let destination = row.Destination;
-                                    let source = unsafe {
-                                        if source.si_family == AF_INET {
-                                            Some(source.Ipv4.sin_addr.S_un.S_addr)
-                                        } else {
-                                            None
-                                        }
-                                    };
-                                    let destination = unsafe {
-                                        if destination.si_family == AF_INET {
-                                            Some(destination.Ipv4.sin_addr.S_un.S_addr)
-                                        } else {
-                                            None
-                                        }
-                                    };
-                                    samples.push((
-                                        source,
-                                        destination,
-                                        row.InterfaceIndex,
-                                        luid,
-                                        row.IsReachable,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    // No MIB pointer or borrowed row survives into formatting/printing.
-                    if !table.is_null() {
-                        unsafe { FreeMibTable(table.cast()) };
-                    }
-                    if status != 0 || count.is_none_or(|count| count > 32768) {
-                        super::member_carrier_factory_test_os::trace_step(&format!("partial rundown IPv4 path query UNKNOWN status={status} count={count:?} cap=32768"));
-                    } else {
-                        super::member_carrier_factory_test_os::trace_step(&format!("partial rundown IPv4 path query success status={status} count={count:?} matching={matching} sampled={} sample_cap=64", samples.len()));
-                        for (source, destination, index, luid, reachable) in samples {
-                            let source =
-                                source.map(|addr| std::net::Ipv4Addr::from(addr.to_ne_bytes()));
-                            let destination = destination
-                                .map(|addr| std::net::Ipv4Addr::from(addr.to_ne_bytes()));
-                            super::member_carrier_factory_test_os::trace_step(&format!("partial rundown IPv4 path Source={source:?} Dest={destination:?} index={index} LUID={luid} reachable={reachable}"));
+                if let Some(direct) = direct {
+                    for (selector, luid, index, status, row) in direct {
+                        if status == 0 {
+                            let mut guid = [0; 16];
+                            guid[..4].copy_from_slice(&row.InterfaceGuid.data1.to_be_bytes());
+                            guid[4..6].copy_from_slice(&row.InterfaceGuid.data2.to_be_bytes());
+                            guid[6..8].copy_from_slice(&row.InterfaceGuid.data3.to_be_bytes());
+                            guid[8..].copy_from_slice(&row.InterfaceGuid.data4);
+                            super::member_carrier_factory_test_os::trace_step(&format!(
+                                "partial rundown GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual_guid={guid:?} actual_index={} actual_luid={} oper_status={} media_connect_state={} flags={}",
+                                row.InterfaceIndex, unsafe { row.InterfaceLuid.Value },
+                                row.OperStatus, row.MediaConnectState,
+                                row.InterfaceAndOperStatusFlags._bitfield,
+                            ));
+                        } else {
+                            super::member_carrier_factory_test_os::trace_step(&format!("partial rundown GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual=UNKNOWN"));
                         }
                     }
                 }
