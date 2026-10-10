@@ -525,7 +525,7 @@ fn carrier_factory_actual_cold_child() {
         eprintln!("actual factory {case}: primary Start");
         let started = original.start_primary(primary, options);
         if started.is_err() {
-            fixture.trace_pair_stage();
+            fixture.trace_pair_stage(false);
         }
         let running = started.expect("actual native primary Start");
         assert_eq!(running.session.scope, scope);
@@ -586,7 +586,7 @@ fn carrier_factory_actual_cold_child() {
     );
     if let Err(error) = &stopped {
         eprintln!("actual factory {case}: Stop error {error:?}");
-        fixture.trace_pair_stage();
+        fixture.trace_pair_stage(true);
     }
     if case == "module-load-read-unwind" {
         // Native supervisor permanently revokes uncertain unwind timing.
@@ -621,7 +621,7 @@ fn carrier_factory_actual_cold_child() {
                 Err(error) => {
                     eprintln!("actual factory {case}: Stop tick error {error:?}");
                     assert!(original.snapshot().cleanup_pending);
-                    fixture.trace_pair_stage();
+                    fixture.trace_pair_stage(false);
                     stopped = Err(error);
                 }
             }
@@ -700,7 +700,9 @@ fn carrier_factory_actual_cold_child() {
             // samples and DNS datagram replies are inputs; native owners,
             // selection, WFP, routes and generation transitions remain real.
             fixture.external_health(None);
-            let initial = fixture.trace_pair_stage().expect("repeat primary Pair");
+            let initial = fixture
+                .trace_pair_stage(false)
+                .expect("repeat primary Pair");
             let carrier = initial.carrier.expect("repeat original C");
             let addresses = initial.addresses;
             let mut reserve_lease = "33333333-3333-4333-8333-333333333333".to_string();
@@ -732,7 +734,9 @@ fn carrier_factory_actual_cold_child() {
                 )
                 .expect("actual reserve Attach B");
             assert_eq!(attached.session.membership_generation, 2);
-            let paired = fixture.trace_pair_stage().expect("actual attached Pair");
+            let paired = fixture
+                .trace_pair_stage(false)
+                .expect("actual attached Pair");
             let a = paired.members[0]
                 .as_ref()
                 .unwrap()
@@ -814,7 +818,9 @@ fn carrier_factory_actual_cold_child() {
                         .expect("actual role generation ACK");
                     assert!(confirmed.session.role_confirmed);
                 }
-                let pair = fixture.trace_pair_stage().expect("actual switched Pair");
+                let pair = fixture
+                    .trace_pair_stage(false)
+                    .expect("actual switched Pair");
                 assert_eq!(pair.carrier, Some(carrier));
                 assert_eq!(pair.addresses, addresses);
                 assert_eq!(
@@ -902,7 +908,9 @@ fn carrier_factory_actual_cold_child() {
                 .expect("actual replacement CommitCandidate");
             assert_eq!(committed.session.membership_generation, 3);
             assert_eq!(committed.session.active, Slot::A);
-            let replacement = fixture.trace_pair_stage().expect("actual replacement Pair");
+            let replacement = fixture
+                .trace_pair_stage(false)
+                .expect("actual replacement Pair");
             assert_eq!(replacement.carrier, Some(carrier));
             assert_eq!(replacement.addresses, addresses);
             assert_eq!(
@@ -958,7 +966,9 @@ fn carrier_factory_actual_cold_child() {
             assert_eq!(rebound.session.active, Slot::A);
             assert_eq!(rebound.session.membership_generation, 3);
             assert!(!rebound.cleanup_pending);
-            let rebound = fixture.trace_pair_stage().expect("actual rebound Pair");
+            let rebound = fixture
+                .trace_pair_stage(false)
+                .expect("actual rebound Pair");
             assert_eq!(rebound.carrier, replacement.carrier);
             assert_eq!(rebound.addresses, replacement.addresses);
             for slot in 0..2 {
@@ -986,7 +996,7 @@ fn carrier_factory_actual_cold_child() {
         );
         if let Err(error) = &stopped {
             eprintln!("actual factory {case}: repeat Stop error {error:?}");
-            fixture.trace_pair_stage();
+            fixture.trace_pair_stage(true);
         }
         let retry_started = std::time::Instant::now();
         while stopped.is_err() && second.snapshot().cleanup_pending {
@@ -1003,7 +1013,7 @@ fn carrier_factory_actual_cold_child() {
                 Err(error) => {
                     eprintln!("actual factory {case}: repeat Stop tick error {error:?}");
                     assert!(second.snapshot().cleanup_pending);
-                    fixture.trace_pair_stage();
+                    fixture.trace_pair_stage(false);
                     stopped = Err(error);
                 }
             }

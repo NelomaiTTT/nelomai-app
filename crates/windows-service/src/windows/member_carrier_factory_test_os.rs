@@ -970,7 +970,10 @@ impl Fixture {
             "primary did not reach the actual carrier package source read"
         );
     }
-    pub(crate) fn trace_pair_stage(&self) -> Option<crate::member_carrier_pair::Record> {
+    pub(crate) fn trace_pair_stage(
+        &self,
+        sdk_trace: bool,
+    ) -> Option<crate::member_carrier_pair::Record> {
         use member_files::SessionFileIo;
         let result = (|| -> io::Result<crate::member_carrier_pair::Record> {
             let mut files = member_files::MemberFiles::new().map_err(io::Error::other)?;
@@ -992,6 +995,55 @@ impl Fixture {
             );
             serde_json::from_value(pair.clone()).map_err(io::Error::other)
         })();
+        if sdk_trace {
+            let sdk_log = (|| -> io::Result<()> {
+                use std::io::Read;
+                let size = 8 + 2048 * 520;
+                let mut raw = Vec::with_capacity(size + 1);
+                std::fs::File::open(self.state.join("log.bin"))?
+                    .take((size + 1) as u64)
+                    .read_to_end(&mut raw)?;
+                if raw.len() != size
+                    || u32::from_le_bytes(raw[..4].try_into().map_err(io::Error::other)?)
+                        != 0x0badbabe
+                {
+                    return Err(io::Error::other("SDK ring size/magic mismatch"));
+                }
+                let next = u32::from_le_bytes(raw[4..8].try_into().map_err(io::Error::other)?);
+                let mut entries = Vec::with_capacity(2048);
+                for offset in 0..2048 {
+                    let slot = (next as usize % 2048 + offset) % 2048;
+                    let line = &raw[8 + slot * 520..8 + (slot + 1) * 520];
+                    let time_ns =
+                        i64::from_le_bytes(line[..8].try_into().map_err(io::Error::other)?);
+                    if time_ns == 0 {
+                        continue;
+                    }
+                    let text = &line[8..];
+                    let end = text
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .ok_or_else(|| io::Error::other("SDK ring line missing NUL"))?;
+                    let message = std::str::from_utf8(&text[..end]).map_err(io::Error::other)?;
+                    if !message.is_empty() {
+                        entries.push((time_ns, message));
+                    }
+                }
+                eprintln!(
+                    "actual SDK log bytes={} next_index={next} completed={} displayed={}",
+                    raw.len(),
+                    entries.len(),
+                    entries.len().min(96)
+                );
+                for (time_ns, message) in entries.iter().skip(entries.len().saturating_sub(96)) {
+                    eprintln!("actual SDK log time_ns={time_ns} message={message}");
+                }
+                Ok(())
+            })();
+            if let Err(error) = sdk_log {
+                eprintln!("actual SDK log UNKNOWN: {error}");
+            }
+        }
         match result {
             Ok(record) => Some(record),
             Err(error) => {

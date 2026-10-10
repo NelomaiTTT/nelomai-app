@@ -640,34 +640,8 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
             let actual = self.observe_once(retained)?;
             #[cfg(all(windows, test))]
             {
-                use windows_sys::Win32::{
-                    NetworkManagement::{
-                        IpHelper::{GetIfEntry2, MIB_IF_ROW2},
-                        Ndis::NET_LUID_LH,
-                    },
-                    System::SystemInformation::GetTickCount64,
-                };
-                let direct = retained
-                    .filter(|_| {
-                        actual.interface.is_some() || !actual.retained_interfaces.is_empty()
-                    })
-                    .map(|proof| {
-                        [
-                            ("LUID", proof.interface.luid, 0),
-                            ("index", 0, proof.interface.index),
-                        ]
-                        .map(|(selector, luid, index)| {
-                            let mut row = MIB_IF_ROW2 {
-                                InterfaceLuid: NET_LUID_LH { Value: luid },
-                                InterfaceIndex: index,
-                                ..Default::default()
-                            };
-                            let status = unsafe { GetIfEntry2(&mut row) };
-                            (selector, luid, index, status, row)
-                        })
-                    });
                 let observation_after = (
-                    unsafe { GetTickCount64() },
+                    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() },
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .ok()
@@ -677,25 +651,6 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
                     "partial rundown observation frame tick_before={} filetime_before={:?} tick_after={} filetime_after={:?} interface={:?} retained_interfaces={:?}",
                     observation_before.0, observation_before.1, observation_after.0, observation_after.1, actual.interface, actual.retained_interfaces,
                 ));
-                if let Some(direct) = direct {
-                    for (selector, luid, index, status, row) in direct {
-                        if status == 0 {
-                            let mut guid = [0; 16];
-                            guid[..4].copy_from_slice(&row.InterfaceGuid.data1.to_be_bytes());
-                            guid[4..6].copy_from_slice(&row.InterfaceGuid.data2.to_be_bytes());
-                            guid[6..8].copy_from_slice(&row.InterfaceGuid.data3.to_be_bytes());
-                            guid[8..].copy_from_slice(&row.InterfaceGuid.data4);
-                            super::member_carrier_factory_test_os::trace_step(&format!(
-                                "partial rundown GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual_guid={guid:?} actual_index={} actual_luid={} oper_status={} media_connect_state={} flags={}",
-                                row.InterfaceIndex, unsafe { row.InterfaceLuid.Value },
-                                row.OperStatus, row.MediaConnectState,
-                                row.InterfaceAndOperStatusFlags._bitfield,
-                            ));
-                        } else {
-                            super::member_carrier_factory_test_os::trace_step(&format!("partial rundown GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual=UNKNOWN"));
-                        }
-                    }
-                }
             }
             if self.inspect_partial_cleanup(pin)? != before
                 || actual.config_sha256 != config
