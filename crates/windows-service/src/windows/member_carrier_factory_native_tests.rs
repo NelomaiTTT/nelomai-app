@@ -757,9 +757,16 @@ fn carrier_factory_actual_cold_child() {
             ] {
                 eprintln!("actual reserve health phase begin failed={failed:?} expected_active={expected:?}");
                 fixture.external_health(failed);
-                for _ in 0..100 {
-                    second_now += 1000;
+                for _ in 0..if failed.is_none() { 20 } else { 100 } {
+                    second_now += if failed.is_none() { 5000 } else { 1000 };
                     second.tick(second_now).expect("actual reserve health tick");
+                    if failed.is_none() {
+                        // Fixture replies are synchronous. Read them before the
+                        // 2s ticket expires; three batches still need 15s dwell.
+                        second
+                            .tick(second_now)
+                            .expect("actual reserve ready probe completion tick");
+                    }
                     let current = second.snapshot();
                     if current.session.active == expected
                         && current.primary_ready

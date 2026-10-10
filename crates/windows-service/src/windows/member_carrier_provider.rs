@@ -953,6 +953,46 @@ fn inspect_absence_queries(targets: &[AbsenceTarget], query: &mut impl Queries) 
                     .take(8).map(|r| (&r.identity.guid, &r.identity.name, r.identity.luid,
                         r.identity.index, r.identity.if_type, r.role_flags)).collect::<Vec<_>>()
             );
+            for matched in before
+                .iter()
+                .filter(|row| targets.iter().any(|target| {
+                    row.identity.guid == target.guid
+                        || row.identity.name.eq_ignore_ascii_case(&target.name)
+                }))
+                .take(8)
+            {
+                use windows_sys::Win32::NetworkManagement::{
+                    IpHelper::{GetIfEntry2, MIB_IF_ROW2},
+                    Ndis::NET_LUID_LH,
+                };
+                for (selector, luid, index) in [
+                    ("LUID", matched.identity.luid, 0),
+                    ("index", 0, matched.identity.index),
+                ] {
+                    // Index lookup must have LUID=0: GetIfEntry2 prefers LUID.
+                    let mut direct = MIB_IF_ROW2 {
+                        InterfaceLuid: NET_LUID_LH { Value: luid },
+                        InterfaceIndex: index,
+                        ..Default::default()
+                    };
+                    let status = unsafe { GetIfEntry2(&mut direct) };
+                    if status == 0 {
+                        let mut guid = [0; 16];
+                        guid[..4].copy_from_slice(&direct.InterfaceGuid.data1.to_be_bytes());
+                        guid[4..6].copy_from_slice(&direct.InterfaceGuid.data2.to_be_bytes());
+                        guid[6..8].copy_from_slice(&direct.InterfaceGuid.data3.to_be_bytes());
+                        guid[8..].copy_from_slice(&direct.InterfaceGuid.data4);
+                        eprintln!(
+                            "actual native MIB absence denied; GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual_guid={guid:?} actual_index={} actual_luid={} oper_status={} media_connect_state={} flags={}",
+                            direct.InterfaceIndex, unsafe { direct.InterfaceLuid.Value },
+                            direct.OperStatus, direct.MediaConnectState,
+                            direct.InterfaceAndOperStatusFlags._bitfield,
+                        );
+                    } else {
+                        eprintln!("actual native MIB absence denied; GetIfEntry2 selector={selector} requested_luid={luid} requested_index={index} status={status} actual=UNKNOWN");
+                    }
+                }
+            }
             match query.device_snapshot(targets) {
                 Ok(snapshot) => eprintln!(
                     "actual native MIB absence denied; PnP (presence,status,problem,guid,name)={:?}",

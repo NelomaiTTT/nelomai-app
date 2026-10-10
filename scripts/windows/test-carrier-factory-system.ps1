@@ -98,7 +98,7 @@ try {
             etl_bytes = $null; limit_reached = $null; events_lost = $null; loss_report = $null
         }
         try {
-            [IO.File]::WriteAllLines($providers, @('{cdead503-17f5-4a3e-b7ae-df8cc2902eb9} 0x415a 5', '{2f07e2ee-15db-40f1-90ef-9d7ba282188a} 0x10 5'), [Text.Encoding]::ASCII)
+            [IO.File]::WriteAllLines($providers, @('{cdead503-17f5-4a3e-b7ae-df8cc2902eb9} 0x415a 5', '{2f07e2ee-15db-40f1-90ef-9d7ba282188a} 0x19 5'), [Text.Encoding]::ASCII)
             & logman.exe create trace $traceName -o $etl -f bin -max 128 -bs 64 -nb 16 64 -pf $providers -ets *> (Join-Path $work 'etw-start.log')
             $trace.start_exit = $LASTEXITCODE
         } catch { $trace.start_error = $_ | Out-String }
