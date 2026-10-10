@@ -2575,6 +2575,7 @@ fn stop_unwind_preserves_same_receipt_before_postflight() {
 }
 #[test]
 fn completed_stop_releases_pins_only_after_ack_registration_and_postflight() {
+    use crate::member_carrier::CarrierError;
     let (mut root, drops) = root();
     start(&mut root, None).unwrap();
     let outcome = root.stop(
@@ -2583,6 +2584,59 @@ fn completed_stop_releases_pins_only_after_ack_registration_and_postflight() {
         |_, _, _| Ok::<_, Fault>(()),
     );
     assert!(outcome.is_ok());
+    let original = root.closed.as_ref().unwrap().clone();
+    for unwind in [false, true] {
+        // Successful Retire followed by later Closing must reauthenticate the
+        // SAME receipt, without repeating native Stop/Delete or rearming Start.
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            root.stop(
+                |_| panic!("completed Retire must never Stop twice"),
+                |receipt| {
+                    assert!(Rc::ptr_eq(&original, receipt));
+                    Ok(())
+                },
+                |stopped, receipt, (owner, reader)| {
+                    assert_eq!(*stopped, 42);
+                    assert!(Rc::ptr_eq(&original, receipt));
+                    assert!(Rc::ptr_eq(&original.0, &owner.0));
+                    assert!(Rc::ptr_eq(&original.0, &reader.unwrap().0));
+                    if unwind {
+                        panic!("later Closing postflight unwind");
+                    }
+                    Err(Fault::Postflight)
+                },
+            )
+        }));
+        if unwind {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                Err(RootError::Operation(Fault::Postflight))
+            );
+        }
+        assert!(!root.completed);
+        assert_eq!(root.verify_terminal_inert(), Err(CarrierError::Pending));
+        assert_eq!(start(&mut root, None), Err(RootError::Retired));
+        assert_eq!(drops.get(), 0);
+        root.stop(
+            |_| panic!("reconciliation must never Stop twice"),
+            |receipt| {
+                assert!(Rc::ptr_eq(&original, receipt));
+                Ok(())
+            },
+            |stopped, receipt, (owner, reader)| {
+                assert_eq!(*stopped, 42);
+                assert!(Rc::ptr_eq(&original, receipt));
+                assert!(Rc::ptr_eq(&original.0, &owner.0));
+                assert!(Rc::ptr_eq(&original.0, &reader.unwrap().0));
+                Ok::<_, Fault>(())
+            },
+        )
+        .unwrap();
+        root.verify_terminal_inert().unwrap();
+    }
+    drop(original);
     drop(root);
     assert_eq!(drops.get(), 3);
 }

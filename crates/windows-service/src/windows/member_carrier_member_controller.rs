@@ -1360,9 +1360,10 @@ impl<O, R, P, C> OperationRoot<O, R, P, C> {
         register: impl FnOnce(&Rc<C>) -> Result<(), E>,
         postflight: impl FnOnce(&R, &Rc<C>, (&mut O, Option<&mut P>)) -> Result<(), E>,
     ) -> Result<(), RootError<E>> {
-        if !self.attempted || self.completed {
+        if !self.attempted {
             return Err(RootError::Retired);
         }
+        self.completed = false;
         if self.closed.is_none() {
             let (record, receipt) = stop(self.owner.as_mut().ok_or(RootError::Retired)?)
                 .map_err(RootError::Operation)?;

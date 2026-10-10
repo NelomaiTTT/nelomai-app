@@ -456,11 +456,34 @@ fn check_locked(
     mut gate: impl FnMut() -> Result<()>,
 ) -> Result<()> {
     expected.validate()?;
-    if read()? != expected.expected {
+    if read().inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard inner pre-read: {_error:?}"
+        ));
+    })? != expected.expected
+    {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step("guard inner pre-read mismatch");
         return Err(GuardError::Conflict);
     }
-    gate()?;
-    if read()? != expected.expected {
+    gate().inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard inner G: {_error:?}"
+        ));
+    })?;
+    if read().inspect_err(|_error| {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+            "guard inner post-read: {_error:?}"
+        ));
+    })? != expected.expected
+    {
+        #[cfg(all(windows, test))]
+        crate::windows::member_carrier_factory_test_os::trace_step(
+            "guard inner post-read mismatch",
+        );
         return Err(GuardError::Conflict);
     }
     Ok(())
@@ -1039,7 +1062,13 @@ pub(crate) mod native {
                     kind,
                     expected,
                     desired,
-                )?;
+                )
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "guard inner plan: {_error:?}"
+                    ));
+                })?;
                 if edge == ExchangeEdge::RemoveBase {
                     compare_retired_removal(
                         &self.originals.context,
@@ -1070,7 +1099,7 @@ pub(crate) mod native {
                         });
                 }
                 let gate = &mut self.gate;
-                self.originals.inspect_window(&selected, true, |window| {
+                let result = self.originals.inspect_window(&selected, true, |window| {
                     gate.verify_original_window(
                         &self.originals.runtime,
                         &self.originals.context,
@@ -1114,6 +1143,12 @@ pub(crate) mod native {
                         },
                     )
                     .map_err(native_denied)
+                });
+                result.inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    crate::windows::member_carrier_factory_test_os::trace_step(&format!(
+                        "guard inner window: {_error:?}"
+                    ));
                 })
             })
         }

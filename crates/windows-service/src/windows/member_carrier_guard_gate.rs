@@ -407,7 +407,13 @@ pub(crate) mod native {
                         } else {
                             Some(
                                 self.shared
-                                    .retired_standby(record, expected, desired, window)?,
+                                    .retired_standby(record, expected, desired, window)
+                                    .inspect_err(|_error| {
+                                        #[cfg(all(windows, test))]
+                                        crate::windows::member_carrier_factory_test_os::trace_step(
+                                            &format!("guard inner retired_standby: {_error:?}"),
+                                        );
+                                    })?,
                             )
                         };
                         self.shared
@@ -448,12 +454,26 @@ pub(crate) mod native {
                                 }
                                 Ok(())
                             })
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                crate::windows::member_carrier_factory_test_os::trace_step(
+                                    &format!("guard inner rows.inspect_in_window: {_error:?}"),
+                                );
+                            })
                             .map_err(denied)?;
                         if record.network.is_some() {
                             self.shared
                                 .network
                                 .read()?
                                 .verify_ack_for_static_base(record, window)
+                                .inspect_err(|_error| {
+                                    #[cfg(all(windows, test))]
+                                    crate::windows::member_carrier_factory_test_os::trace_step(
+                                        &format!(
+                                            "guard inner network.verify_ack_for_static_base: {_error:?}"
+                                        ),
+                                    );
+                                })
                                 .map_err(denied)?;
                         } else {
                             self.shared
@@ -481,7 +501,15 @@ pub(crate) mod native {
                         self.shared
                             .probes
                             .read()?
-                            .verify_guard_resources(record, window, desired)?;
+                            .verify_guard_resources(record, window, desired)
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                crate::windows::member_carrier_factory_test_os::trace_step(
+                                    &format!(
+                                        "guard inner probes.verify_guard_resources: {_error:?}"
+                                    ),
+                                );
+                            })?;
                     }
                     ExchangeEdge::Install
                         if kind == SessionKind::DynamicPermits && desired.permits =>
