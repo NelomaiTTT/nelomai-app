@@ -405,7 +405,7 @@ fn retire_fixture() -> (
                 probes: vec![],
             }),
         ],
-        None,
+        Some(Slot::A),
     )
     .unwrap()
     .without_permits()

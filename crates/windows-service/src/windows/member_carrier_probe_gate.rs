@@ -504,7 +504,7 @@ fn compare_guard_rows(
                 || member.owner.proof != Some(closed.proof)
                 || plan.expected != r.guard
                 || plan.expected.permits
-                || plan.expected.active.is_some()
+                || plan.expected.active == Some(slot)
                 || plan.expected.members[i].as_ref().is_none_or(|m| {
                     m.identity.scope != closed.intent.scope
                         || m.identity.proof != closed.proof.interface

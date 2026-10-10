@@ -47,7 +47,7 @@ fn compare_retirement_base(
         || desired.permits
         || !expected.installed
         || !desired.installed
-        || expected.active.is_some()
+        || expected.active == Some(retired)
         || desired.active.is_some()
         || expected.carrier != desired.carrier
         || expected.carrier.is_none()
@@ -637,9 +637,21 @@ mod tests {
     #[test]
     fn retirement_removes_only_exact_closed_standby_base_and_keeps_original_priority() {
         use nelomai_client_tunnel::redundancy::Slot;
-        let mut snapshot = base(true).expected;
+        // Actual withdrawal preserves the surviving active selection while
+        // removing permits, before the stopped standby's base is removed.
+        let both = base(true);
+        let withdrawn = policy::Model::new(
+            both.scope.clone(),
+            both.carrier.clone().unwrap(),
+            both.members.clone(),
+            Some(Slot::A),
+        )
+        .unwrap()
+        .without_permits()
+        .unwrap();
+        let mut snapshot = withdrawn.expected.clone();
         snapshot.sublayer.as_mut().unwrap().weight = 41;
-        let expected = base(true)
+        let expected = withdrawn
             .readback_after(
                 &policy::Model::empty(snapshot.scope.clone()).unwrap(),
                 &snapshot,
@@ -648,6 +660,9 @@ mod tests {
         let desired = base(false).inherit_sublayer_weight(&expected).unwrap();
         let closed = expected.members[1].as_ref().unwrap().identity.clone();
         compare_retirement_base(&expected, &desired, Slot::B, &closed).unwrap();
+        let mut selected_closed = expected.clone();
+        selected_closed.active = Some(Slot::B);
+        assert!(compare_retirement_base(&selected_closed, &desired, Slot::B, &closed).is_err());
         assert!(compare_additive_base(&expected, &desired).is_err());
         for fault in 0..7 {
             let mut wrong = desired.clone();

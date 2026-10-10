@@ -3102,13 +3102,15 @@ pub(crate) mod native {
                     nelomai_contracts::dispatcher::TunnelSlot::B
                 });
                 if let Some(history) = history {
-                    // Stage2 Network/RestoreNetwork always precedes Stop. A
-                    // factual closed original never grants one of those effects.
+                    // Closing may follow an already completed standby Retire.
+                    // SAME closed history supplies its binding; RestoreNetwork
+                    // still requires the exact stage2 Pair/Network and full G.
                     let lifecycle = cleanup
                         && r.phase == pair::Phase::Closing
                         && matches!(
                             (r.stop_stage, r.pending),
-                            (3, Some(pair::Effect::RestoreWeak))
+                            (2, Some(pair::Effect::RestoreNetwork))
+                                | (3, Some(pair::Effect::RestoreWeak))
                                 | (6, Some(pair::Effect::CarrierAddressDelete))
                                 | (7, Some(pair::Effect::CarrierSessionEnd))
                                 | (8, Some(pair::Effect::CarrierClose))
