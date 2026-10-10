@@ -430,8 +430,35 @@ pub(crate) mod native {
                                         // Stopped ACK without querying a historical NIC.
                                         // Stop restores owned fields; its final readonly
                                         // observations may differ from the captured baseline.
-                                        if retired != Some(i.saturating_sub(1))
-                                            || i == 0
+                                        let member = i.saturating_sub(1);
+                                        // RestoreKeys removes Pair membership before the
+                                        // next capture replaces this SAME closed row owner.
+                                        let excluded = record.members[member].is_none()
+                                            && expected.members[member].is_none()
+                                            && desired.members[member].is_none();
+                                        if i == 0
+                                            || (retired != Some(member) && !excluded)
+                                            || fact.binding.role
+                                                != if i == 1 {
+                                                    crate::member_carrier_rows::Role::MemberA
+                                                } else {
+                                                    crate::member_carrier_rows::Role::MemberB
+                                                }
+                                            || window
+                                                .closed_member(if i == 1 {
+                                                    nelomai_contracts::dispatcher::TunnelSlot::A
+                                                } else {
+                                                    nelomai_contracts::dispatcher::TunnelSlot::B
+                                                })
+                                                .is_none_or(|closed| {
+                                                    closed.intent.scope != fact.binding.scope
+                                                        || closed.proof.interface.index
+                                                            != fact.binding.key.index
+                                                        || closed.proof.interface.luid
+                                                            != fact.binding.key.luid
+                                                        || closed.proof.interface.guid
+                                                            != fact.binding.guid
+                                                })
                                             || fact.acknowledged.phase
                                                 != crate::member_carrier_rows::Phase::Stopped
                                             || fact.acknowledged.pending.is_some()
