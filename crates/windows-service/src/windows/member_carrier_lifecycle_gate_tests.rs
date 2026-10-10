@@ -1079,6 +1079,44 @@ fn member_capture_frame_is_target_exact_and_baseline_only() {
     wrong.operation = Some(pair::Operation::Start(Slot::B));
     assert!(compare_member_capture_frame(&c, &wrong, &row.binding, false).is_err());
     assert!(compare_member_capture_frame(&c, &r, &row.binding, true).is_err());
+    // Replacement Start is already committed before additive Base. Only the
+    // typed capture supplies its new row; the old active A base stays factual.
+    let mut attached = r.clone();
+    attached.phase = pair::Phase::Running;
+    attached.operation = Some(pair::Operation::Attach(Slot::B));
+    attached.active = Some(Slot::A);
+    attached.pending = None;
+    let mut member = attached.members[0].clone().unwrap();
+    member.owner.intent.slot = TunnelSlot::B;
+    member.owner.proof.as_mut().unwrap().interface = owner::InterfaceProof {
+        index: 9,
+        luid: 92,
+        guid: [3; 16],
+    };
+    attached.members[1] = Some(member);
+    attached.validate().unwrap();
+    let replacement = row_fixture(&c, &attached, rows::Role::MemberB);
+    compare_member_capture_frame(&c, &attached, &replacement.binding, true).unwrap();
+    assert!(compare_guard_blocks(&attached, &attached.guard.expected).is_err());
+    for fault in 0..10 {
+        let mut wrong = attached.clone();
+        match fault {
+            0 => wrong.pending = Some(pair::Effect::Guard),
+            1 => wrong.pending = Some(pair::Effect::Network),
+            2 => wrong.pending = Some(pair::Effect::HoldProbe(Slot::B)),
+            3 => wrong.phase = pair::Phase::Starting,
+            4 => wrong.guard = policy::Model::empty(wrong.scope.clone()).unwrap(),
+            5 => wrong.guard.permits = true,
+            6 => wrong.active = Some(Slot::B),
+            7 => wrong.operation = Some(pair::Operation::Attach(Slot::A)),
+            8 => wrong.members[1].as_mut().unwrap().owner.phase = owner::Phase::Prepared,
+            _ => wrong.pending = Some(pair::Effect::WeakRows),
+        }
+        assert!(
+            compare_member_capture_frame(&c, &wrong, &replacement.binding, true).is_err(),
+            "replacement capture fault {fault}"
+        );
+    }
     let mut foreign = row.binding.clone();
     foreign.key.index += 1;
     assert!(compare_member_capture_frame(&c, &r, &foreign, false).is_err());

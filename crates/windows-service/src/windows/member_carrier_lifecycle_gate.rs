@@ -670,7 +670,15 @@ fn compare_member_capture_frame(
         rows::Role::Carrier => return Err(conflict()),
     };
     let initial_prebase = !replacement && record.pending.is_none();
-    if (record.pending != Some(pair::Effect::WeakRows) && !initial_prebase)
+    let replacement_prebase = replacement
+        && record.pending.is_none()
+        && record.phase == pair::Phase::Running
+        && record.operation == Some(pair::Operation::Attach(slot))
+        && record.guard.installed;
+    if (replacement && !replacement_prebase)
+        || (record.pending != Some(pair::Effect::WeakRows)
+            && !initial_prebase
+            && !replacement_prebase)
         || record.pending_guard.is_some()
         || record.stop_stage != 0
         || (!record.guard.installed
@@ -1485,6 +1493,10 @@ pub(crate) mod native {
                         return Err(conflict());
                     }
                     self.shared.verify_capture_origin(&selected)?;
+                    // This SAME replacement token selects only its committed
+                    // read frame; ordinary lifecycle selection stays effect-only.
+                    self.shared
+                        .retain_selection(input.pair.clone(), input.record)?;
                     self.shared.current(input.record)?;
                     let (registered, baseline) = self.shared.row_original(i, false)?;
                     if !registered.same_original(old_pin) {
@@ -1953,12 +1965,10 @@ pub(crate) mod native {
             selected: &MemberCapture,
             window: &NativeBindingsWindow<'_>,
         ) -> io::Result<policy::Snapshot> {
-            if matches!(&selected.origin, CaptureOrigin::Replacement { .. }) {
-                return self.blocks(&selected.record, window);
-            }
-            // Original first Start may precede base publication. This compares
-            // the complete actual current WFP state; it does not authorize a
-            // guard exchange or infer the new member's ownership from a model.
+            // Committed capture precedes additive base publication, so the
+            // original base may exclude this newly started member. Compare the
+            // complete actual WFP state without granting a guard exchange or
+            // deriving the new original's ownership from base membership.
             self.window(&selected.record, window)?;
             let guard = self.guard.read()?;
             let snapshot = guard
@@ -2985,7 +2995,7 @@ pub(crate) mod native {
                     };
                     if capture.is_none() {
                         // Ordinary Observe remains effect-only. Only the
-                        // exact private first-Start aperture can observe the
+                        // exact typed member capture can observe its
                         // pendingNone committed pre-base frame.
                         compare_lifecycle_stage(&shared.context, &record, stage)?;
                     }

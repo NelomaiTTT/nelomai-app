@@ -6713,7 +6713,8 @@ pub(crate) mod native {
                 let i = idx(slot);
                 // First committed Start/Attach captures the addressless baseline
                 // before static base or WeakRows can enter ordinary Observe G.
-                // Replacement generations keep their later typed capture path.
+                // Replacement uses its retained stopped-generation token here,
+                // before Base can sample the new original interface.
                 let initial_frame = this.stopped_row_generations[i].is_none()
                     && !this
                         .member_generation_originals
@@ -6738,8 +6739,12 @@ pub(crate) mod native {
                         })
                         .map_err(denied)?;
                 }
-                if initial_frame {
-                    if this.row_owners[i].is_none() {
+                let replacement_frame = this.stopped_row_generations[i].is_some()
+                    && record.pending.is_none()
+                    && record.phase == pair::Phase::Running
+                    && record.operation == Some(pair::Operation::Attach(slot));
+                if initial_frame || replacement_frame {
+                    if replacement_frame || this.row_owners[i].is_none() {
                         this.capture_member_rows(pin, record, slot)
                             .inspect_err(|_error| {
                                 #[cfg(test)]
@@ -8027,6 +8032,7 @@ pub(crate) mod native {
             old_seal
                 .inspect_original(&old_pin, |_| Ok(()))
                 .map_err(denied)?;
+            self.select_guard(pin, record)?;
             let old = HistoricalMemberRows {
                 pin: old_pin,
                 _authority: self.row_authorities[i]

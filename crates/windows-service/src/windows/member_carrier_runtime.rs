@@ -2070,39 +2070,31 @@ pub(crate) mod native {
             .map_err(denied)?;
             input
                 .pair
-                .inspect_effect(
-                    &self.runtime,
-                    input.supervisor,
-                    input.record,
-                    pair::Effect::WeakRows,
-                    |actual| {
-                        if actual != input.record
-                            || actual.scope != self.context.intent.scope
-                            || actual.provenance != self.context.provenance
-                            || actual.phase != pair::Phase::Running
-                            || actual.operation != Some(pair::Operation::Attach(slot))
-                            || actual.active
-                                != Some(if slot == Slot::A { Slot::B } else { Slot::A })
-                            || actual.pending_guard.is_some()
-                            || !actual.guard.installed
-                            || actual.guard.permits
-                            || actual.guard.assigned_sublayer_weight.is_none()
-                            || actual.members[index].as_ref().is_none_or(|m| {
-                                m.owner.phase != owner::Phase::Running
-                                    || m.owner.proof != Some(proof)
-                            })
-                            || input.binding.role
-                                != [rows::Role::MemberA, rows::Role::MemberB][index]
-                            || input.binding.guid != proof.interface.guid
-                            || input.binding.key.index != proof.interface.index
-                            || input.binding.key.luid != proof.interface.luid
-                            || input.binding.name != self.context.bindings[index + 1].name
-                        {
-                            return Err(std::io::Error::other("carrier_row_generation_conflict"));
-                        }
-                        Ok(())
-                    },
-                )
+                .inspect(&self.runtime, input.supervisor, |actual| {
+                    if actual != input.record
+                        || actual.pending.is_some()
+                        || actual.scope != self.context.intent.scope
+                        || actual.provenance != self.context.provenance
+                        || actual.phase != pair::Phase::Running
+                        || actual.operation != Some(pair::Operation::Attach(slot))
+                        || actual.active != Some(if slot == Slot::A { Slot::B } else { Slot::A })
+                        || actual.pending_guard.is_some()
+                        || !actual.guard.installed
+                        || actual.guard.permits
+                        || actual.guard.assigned_sublayer_weight.is_none()
+                        || actual.members[index].as_ref().is_none_or(|m| {
+                            m.owner.phase != owner::Phase::Running || m.owner.proof != Some(proof)
+                        })
+                        || input.binding.role != [rows::Role::MemberA, rows::Role::MemberB][index]
+                        || input.binding.guid != proof.interface.guid
+                        || input.binding.key.index != proof.interface.index
+                        || input.binding.key.luid != proof.interface.luid
+                        || input.binding.name != self.context.bindings[index + 1].name
+                    {
+                        return Err(std::io::Error::other("carrier_row_generation_conflict"));
+                    }
+                    Ok(())
+                })
                 .map_err(denied)?;
             let payload = self
                 .runtime
