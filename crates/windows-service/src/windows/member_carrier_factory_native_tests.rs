@@ -122,7 +122,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let elapsed = started.elapsed();
-        if case == "primary" && !status.success() {
+        if matches!(case, "primary" | "network-route-postflight") && !status.success() {
             // SAME initial child scope; this read cannot attest cleanup.
             let mut hash = Sha256::new();
             hash.update(b"nelomai-native-factory-test-session/v1\0");
@@ -141,35 +141,46 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 session_id,
                 connection_generation: 3,
             }) {
-                Ok(key) => match crate::windows::member_carrier_provider::native::table() {
-                    Ok(rows) => {
-                        let matching = rows
-                            .iter()
-                            .filter(|row| {
-                                row.identity.guid == key.guid
-                                    || row.identity.name.eq_ignore_ascii_case(&key.name)
-                            })
-                            .take(8)
-                            .map(|row| {
-                                (
-                                    &row.identity.guid,
-                                    row.identity.index,
-                                    row.identity.luid,
-                                    &row.identity.name,
-                                    row.identity.guid == key.guid,
-                                    row.identity.name.eq_ignore_ascii_case(&key.name),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        eprintln!(
-                            "actual post-child-exit initial C table related_present={} requested_guid={:?} requested_name={} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
-                            !matching.is_empty(), key.guid, key.name,
-                        );
+                Ok(key) => {
+                    match crate::windows::member_carrier_provider::native::table() {
+                        Ok(rows) => {
+                            // Observed original primary A GUID; name match alone is not provenance.
+                            let a_guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
+                            let a_identity =
+                                (case == "primary").then_some(("A", a_guid, "nelomai-a"));
+                            for (member, guid, name) in a_identity
+                                .into_iter()
+                                .chain(std::iter::once(("C", key.guid, key.name.as_str())))
+                            {
+                                let matching = rows
+                                    .iter()
+                                    .filter(|row| {
+                                        row.identity.guid == guid
+                                            || row.identity.name.eq_ignore_ascii_case(name)
+                                    })
+                                    .take(8)
+                                    .map(|row| {
+                                        (
+                                            &row.identity.guid,
+                                            row.identity.index,
+                                            row.identity.luid,
+                                            &row.identity.name,
+                                            row.identity.guid == guid,
+                                            row.identity.name.eq_ignore_ascii_case(name),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                eprintln!(
+                                "actual post-child-exit initial {member} table case={case} related_present={} requested_guid={guid:?} requested_name={name} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
+                                !matching.is_empty(),
+                            );
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("actual post-child-exit initial table case={case} UNKNOWN: {error:?}")
+                        }
                     }
-                    Err(error) => {
-                        eprintln!("actual post-child-exit initial C table UNKNOWN: {error:?}")
-                    }
-                },
+                }
                 Err(error) => {
                     eprintln!("actual post-child-exit initial C identity UNKNOWN: {error:?}")
                 }
