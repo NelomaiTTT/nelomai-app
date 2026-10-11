@@ -2876,9 +2876,21 @@ pub(crate) mod native {
                     .map_err(denied)?
                     .load(&self.context.intent.scope)?
                     .ok_or_else(conflict)?;
+                let retiring = if let Some(pair::Operation::Retire(target)) = record.operation {
+                    record.pending == Some(pair::Effect::MemberStop(target))
+                        && record.active == Some(target.other())
+                        && record.pending_guard.is_none()
+                        && record.guard.installed
+                        && record.guard.permits
+                        && record.guard.active == record.active
+                        && record.guard.members[idx(target)]
+                            .as_ref()
+                            .is_some_and(|member| member.probes.is_empty())
+                } else {
+                    false
+                };
                 if record.phase != pair::Phase::Running
-                    || record.pending.is_some()
-                    || record.operation.is_some()
+                    || (record.pending.is_some() || record.operation.is_some()) && !retiring
                 {
                     return Err(conflict());
                 }
