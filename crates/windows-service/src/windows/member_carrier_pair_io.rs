@@ -8781,6 +8781,13 @@ pub(crate) mod native {
                 r.pins
                     .source
                     .inspect_running_window(|window| {
+                        if !r
+                            .network_ack
+                            .matches_origin(&r.pins.source, &r.network_gate)
+                        {
+                            return Err(native_denied(()));
+                        }
+                        let ack = r.network_ack.acknowledgements().map_err(native_denied)?;
                         let bindings = window.bindings();
                         let c = bindings.carrier.as_ref().ok_or_else(|| native_denied(()))?;
                         let owned = std::iter::once(&c.identity)
@@ -8793,7 +8800,28 @@ pub(crate) mod native {
                             .collect::<Vec<_>>();
                         let before = crate::windows::member_physical::capture(&owned)
                             .map_err(native_denied)?;
+                        let physical_owned = ack
+                            .0
+                            .iter()
+                            .filter(|attempt| {
+                                before.proofs().contains_key(&(
+                                    crate::member_physical::Family::of(
+                                        attempt.row.route.destination.addr(),
+                                    ),
+                                    attempt.row.route.interface,
+                                ))
+                            })
+                            .map(|attempt| attempt.row.clone())
+                            .collect::<Vec<_>>();
+                        // Physical endpoint bypasses are SAME original route
+                        // attempts. Exclude exact ACK rows, never foreign rows
+                        // or duplicates at their keys, from network discovery.
+                        let before = before
+                            .without_owned_rows(&physical_owned)
+                            .map_err(native_denied)?;
                         let after = crate::windows::member_physical::capture(&owned)
+                            .map_err(native_denied)?
+                            .without_owned_rows(&physical_owned)
                             .map_err(native_denied)?;
                         let visible_before = before
                             .rows()
@@ -8815,7 +8843,10 @@ pub(crate) mod native {
                                 })
                             })
                             .collect::<Vec<_>>();
-                        if visible_before != visible_after || before.proofs() != after.proofs() {
+                        if visible_before != visible_after
+                            || before.proofs() != after.proofs()
+                            || r.network_ack.acknowledgements().map_err(native_denied)? != ack
+                        {
                             return Err(native_denied(()));
                         }
                         // A fresh physical SDK comparison fingerprint only; it
