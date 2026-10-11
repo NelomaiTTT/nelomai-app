@@ -276,6 +276,46 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             eprintln!(
                 "actual post-child-exit PnP case={case} identity={member} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_instance={instance} presence={presence} normal_code={normal} normal_node={normal_node} phantom_code={phantom} phantom_node={phantom_node} id_code={id_code:?} actual_instance={actual_instance:?} identity_match={identity_match:?} status_code={status_code:?} status_flags={flags:?} problem={problem:?} phantom_recheck_normal_code={phantom_recheck_code:?} phantom_recheck_normal_node={phantom_recheck_node}"
             );
+            if case == "primary" {
+                // TEMPORARY observations only; these never alter the cleanup result.
+                let guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
+                let name = "nelomai-a";
+                for requested_after_exit_secs in [5, 30] {
+                    std::thread::sleep(
+                        std::time::Duration::from_secs(requested_after_exit_secs)
+                            .saturating_sub(started.elapsed().saturating_sub(elapsed)),
+                    );
+                    let observed_after_exit_ms =
+                        started.elapsed().saturating_sub(elapsed).as_millis();
+                    let observed_utc_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|time| time.as_millis());
+                    match crate::windows::member_carrier_provider::native::table() {
+                        Ok(rows) => {
+                            let matching = rows.iter().filter(|row| {
+                                row.identity.guid == guid || row.identity.name.eq_ignore_ascii_case(name)
+                            }).take(9).map(|row| (
+                                &row.identity.guid, row.identity.index, row.identity.luid, &row.identity.name,
+                                row.identity.guid == guid, row.identity.name.eq_ignore_ascii_case(name),
+                            )).collect::<Vec<_>>();
+                            if matching.len() > 8 {
+                                eprintln!("actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_guid={guid:?} requested_name={name} UNKNOWN: matching-row bound exceeded");
+                            } else {
+                                let exact_guid_present = matching.iter().any(|row| row.4);
+                                eprintln!(
+                                    "actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} related_present={} exact_guid_present={exact_guid_present} requested_guid={guid:?} requested_name={name} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
+                                    !matching.is_empty(),
+                                );
+                                if requested_after_exit_secs == 5 && !exact_guid_present {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(error) => eprintln!("actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_guid={guid:?} requested_name={name} UNKNOWN: {error:?}"),
+                    }
+                }
+            }
         }
         let stdout = std::fs::read_to_string(stdout_path).unwrap();
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
