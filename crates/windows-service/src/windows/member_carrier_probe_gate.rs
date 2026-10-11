@@ -1204,7 +1204,10 @@ pub(crate) mod native {
                 Purpose::Guard
             };
             self.fence.inspect(purpose, || {
-                compare_guard_target(&self.context, record, desired)?;
+                compare_guard_target(&self.context, record, desired).inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual probe guard target: {_error:?}");
+                })?;
                 let selected = self.selected.try_borrow().map_err(denied)?;
                 if selected.record != *record {
                     return Err(GuardError::Conflict);
@@ -1225,7 +1228,10 @@ pub(crate) mod native {
                         let slot = if i == 0 { Slot::A } else { Slot::B };
                         let original = originals[i].as_ref().ok_or(GuardError::Conflict)?;
                         inventory.verify_member_slot(slot, original)?;
-                        original.retired()?;
+                        original.retired().inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual probe guard Closed slot={slot:?}: {_error:?}");
+                        })?;
                     }
                 }
                 let metrics = self
@@ -1273,7 +1279,15 @@ pub(crate) mod native {
                             history,
                             rundown,
                         )
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual probe guard compare rows Closed={:?} rundown={}: {_error:?}", history.map(|entry| entry.is_some()), rundown.is_some());
+                        })
                         .map_err(native_denied)
+                    })
+                    .inspect_err(|_error| {
+                        #[cfg(all(windows, test))]
+                        eprintln!("actual probe guard rows reader: {_error:?}");
                     })
                     .map_err(denied)?;
                 if desired.permits {
@@ -1363,7 +1377,11 @@ pub(crate) mod native {
                                     }
                                     continue;
                                 }
-                                let tuple = original.inspect_tuple_in_window(window)?;
+                                let tuple = original.inspect_tuple_in_window(window)
+                                    .inspect_err(|_error| {
+                                        #[cfg(all(windows, test))]
+                                        eprintln!("actual probe guard live tuple slot={slot:?}: {_error:?}");
+                                    })?;
                                 let registration =
                                     self.held[i].value.try_borrow().map_err(denied)?;
                                 let ack = registration
@@ -1376,7 +1394,11 @@ pub(crate) mod native {
                                     slot,
                                     Some(&tuple),
                                     ack.as_ref().and_then(|a| a.as_ref()),
-                                )?;
+                                )
+                                .inspect_err(|_error| {
+                                    #[cfg(all(windows, test))]
+                                    eprintln!("actual probe guard compare probe slot={slot:?}: {_error:?}");
+                                })?;
                             }
                             None => compare_guard_probe(record, desired, slot, None, None)?,
                         }
