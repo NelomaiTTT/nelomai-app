@@ -44,8 +44,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let cases = [
         "primary",
         "network-route-postflight",
-        "probe-before-open-ack",
-        "probe-after-open-ack",
+        "data-before-verify-ack",
         "module-load-read-error",
         "module-load-read-unwind",
         "resolver-reference-error",
@@ -125,7 +124,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         };
         let elapsed = started.elapsed();
         if (matches!(case, "primary" | "network-route-postflight") && !status.success())
-            || matches!(case, "probe-before-open-ack" | "probe-after-open-ack")
+            || case == "data-before-verify-ack"
         {
             // SAME initial child scope; this read cannot attest cleanup.
             let mut hash = Sha256::new();
@@ -441,10 +440,7 @@ fn carrier_factory_actual_cold_child() {
     );
     let full_primary = case == "primary";
     let route_partial = case == "network-route-postflight";
-    let probe_partial = matches!(
-        case.as_str(),
-        "probe-before-open-ack" | "probe-after-open-ack"
-    );
+    let data_partial = case == "data-before-verify-ack";
     let resolver_partial = matches!(
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
@@ -464,8 +460,7 @@ fn carrier_factory_actual_cold_child() {
         "member-unwind" => Some((NativePublication::Member, true)),
         "running-ack" => Some((NativePublication::Running, false)),
         "running-unwind" => Some((NativePublication::Running, true)),
-        "probe-before-open-ack" => Some((NativePublication::ProbeBeforeOpen, false)),
-        "probe-after-open-ack" => Some((NativePublication::ProbeAfterOpen, false)),
+        "data-before-verify-ack" => Some((NativePublication::DataBeforeVerify, false)),
         _ => None,
     };
     let native_path = module_partial
@@ -811,7 +806,7 @@ fn carrier_factory_actual_cold_child() {
         || module_partial
         || full_primary
         || route_partial
-        || probe_partial
+        || data_partial
     {
         let retry_started = std::time::Instant::now();
         while stopped.is_err()
@@ -838,7 +833,7 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        if probe_partial {
+        if data_partial {
             // The same retained owner has attempted real Stop. A later C failure
             // must not hide A's outcome or turn cleanup_pending into completion.
             let pair = fixture.trace_pair_stage(false);
@@ -850,9 +845,8 @@ fn carrier_factory_actual_cold_child() {
                 ) && record.stop_stage >= 2
             });
             eprintln!(
-                "actual probe boundary cleanup case={case} stop_result={stopped:?} cleanup_pending={} release_probes_completed={release_probes_completed} held_probe_close_ack={:?}",
+                "actual data boundary cleanup case={case} stop_result={stopped:?} cleanup_pending={} release_probes_completed={release_probes_completed} held_probe_close_ack={release_probes_completed}",
                 original.snapshot().cleanup_pending,
-                (case == "probe-after-open-ack").then_some(release_probes_completed),
             );
             let guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
             let a_absent = match crate::windows::member_carrier_provider::native::table() {
@@ -876,16 +870,16 @@ fn carrier_factory_actual_cold_child() {
                         })
                         .collect::<Vec<_>>();
                     if matching.len() > 8 {
-                        eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} UNKNOWN: matching-row bound exceeded");
+                        eprintln!("actual data boundary A table case={case} requested_guid={guid:?} UNKNOWN: matching-row bound exceeded");
                         None
                     } else {
                         let exact_guid_present = matching.iter().any(|row| row.4);
-                        eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} exact_guid_present={exact_guid_present} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}");
+                        eprintln!("actual data boundary A table case={case} requested_guid={guid:?} exact_guid_present={exact_guid_present} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}");
                         Some(matching.is_empty())
                     }
                 }
                 Err(error) => {
-                    eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} UNKNOWN: {error:?}");
+                    eprintln!("actual data boundary A table case={case} requested_guid={guid:?} UNKNOWN: {error:?}");
                     None
                 }
             };
@@ -897,14 +891,12 @@ fn carrier_factory_actual_cold_child() {
                 std::mem::forget(original);
                 std::mem::forget(factory);
             }
-            if case == "probe-after-open-ack" {
-                // Real ReleaseProbes completion follows same-original
-                // RetiredProbeRead verification and native closesocket ACK.
-                assert!(
-                    release_probes_completed,
-                    "held native socket close not acknowledged"
-                );
-            }
+            // Real ReleaseProbes completion follows same-original
+            // RetiredProbeRead verification and native closesocket ACK.
+            assert!(
+                release_probes_completed,
+                "held native socket close not acknowledged"
+            );
             assert_eq!(a_absent, Some(true), "exact A absence not confirmed");
             assert!(completed, "actual retained Stop remains incomplete");
             return;

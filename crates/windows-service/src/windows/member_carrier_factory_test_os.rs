@@ -24,7 +24,6 @@ struct Inputs {
     fault: Option<(member_files::PrivateFile, bool)>,
     native_fault: Option<(NativePublication, bool)>,
     native_fault_reached: Option<NativePublication>,
-    probe_hold_begin_revision: Option<u64>,
     native_originals: Vec<(&'static str, Weak<dyn Any>)>,
     health_input: Option<(
         Option<nelomai_client_tunnel::redundancy::Slot>,
@@ -57,8 +56,7 @@ pub(crate) enum NativePublication {
     Carrier,
     Member,
     Running,
-    ProbeBeforeOpen,
-    ProbeAfterOpen,
+    DataBeforeVerify,
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
@@ -99,8 +97,7 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
             file == match target {
                 NativePublication::Carrier
                 | NativePublication::Member
-                | NativePublication::ProbeBeforeOpen
-                | NativePublication::ProbeAfterOpen => member_files::PrivateFile::Pair,
+                | NativePublication::DataBeforeVerify => member_files::PrivateFile::Pair,
                 NativePublication::Running => member_files::PrivateFile::Session,
             }
         }) {
@@ -145,14 +142,11 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                 (NativePublication::Running, member_files::PrivateFile::Session) => {
                     payload["phase"] == "Running"
                 }
-                (
-                    NativePublication::ProbeBeforeOpen | NativePublication::ProbeAfterOpen,
-                    member_files::PrivateFile::Pair,
-                ) => {
+                (NativePublication::DataBeforeVerify, member_files::PrivateFile::Pair) => {
                     use crate::member_carrier_pair::{Effect, Operation, Phase, Record};
                     use nelomai_client_tunnel::redundancy::Slot;
                     let record: Record = serde_json::from_value(payload.clone())?;
-                    let selected = record.phase == Phase::Starting
+                    record.phase == Phase::Starting
                         && record.operation == Some(Operation::Start(Slot::A))
                         && record.stop_stage == 0
                         && record.carrier.is_some()
@@ -162,22 +156,12 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                         })
                         && record.members[1].is_none()
                         && record.guard.installed
-                        && !record.guard.permits
+                        && record.guard.permits
                         && record.pending_guard.is_none()
                         && record.network.as_ref().is_some_and(|network| {
                             network.pending.is_none() && network.current != network.baseline
-                        });
-                    if selected && record.pending == Some(Effect::HoldProbe(Slot::A)) {
-                        inputs.probe_hold_begin_revision = Some(record.revision);
-                        target == NativePublication::ProbeBeforeOpen
-                    } else {
-                        selected
-                            && target == NativePublication::ProbeAfterOpen
-                            && record.pending.is_none()
-                            && inputs.probe_hold_begin_revision.is_some_and(|revision| {
-                                revision.checked_add(1) == Some(record.revision)
-                            })
-                    }
+                        })
+                        && record.pending == Some(Effect::Data(Slot::A))
                 }
                 _ => false,
             };
@@ -635,7 +619,6 @@ impl Fixture {
                 fault: None,
                 native_fault: None,
                 native_fault_reached: None,
-                probe_hold_begin_revision: None,
                 native_originals: vec![],
                 health_input: None,
                 package_source_reads: 0,

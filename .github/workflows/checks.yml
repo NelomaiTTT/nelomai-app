@@ -291,8 +291,7 @@ jobs:
         case:
           - primary
           - network-route-postflight
-          - probe-before-open-ack
-          - probe-after-open-ack
+          - data-before-verify-ack
           - module-load-read-error
           - module-load-read-unwind
           - resolver-reference-error
