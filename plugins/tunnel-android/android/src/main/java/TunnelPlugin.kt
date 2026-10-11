@@ -854,9 +854,11 @@ internal object TunnelRuntime {
                 logStage("start.configuration_parsed", parseStartedAt)
                 startMemoryDiagnostics.record(applicationContext, "after_configuration_parse")
                 val optionsStartedAt = System.nanoTime()
-                val options = AndroidSplitTunnel.resolveOptions(
+                val options = AndroidSplitTunnel.resolveConfigurationOptions(
                     Build.VERSION.SDK_INT,
                     args.options,
+                    args.quickConnection?.egressMode ?: "ipv4",
+                    originalConfig,
                 )
                 val config = AndroidSplitTunnel.applyOptions(
                     originalConfig,

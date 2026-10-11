@@ -12,6 +12,11 @@ import java.util.concurrent.atomic.AtomicReference
 private const val MAX_APPLICATION_RULES = 512
 private const val MAX_EXCLUDED_ROUTES = 16_384
 private const val MAX_DNS_SERVERS = 4
+// A virtual destination, reached only through the VPN. DNS46 redirects this
+// peer's UDP/TCP 53 to its resolver on either Tak; no address is assigned here.
+// Advertising a public DoT resolver lets Android's automatic Private DNS bypass
+// that synthesis and return IPv6 addresses to an IPv4-only tunnel.
+private val DNS46_TUNNEL_RESOLVERS = listOf("10.255.255.53", "10.255.255.54")
 private val PACKAGE_ID = Regex("^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$")
 
 internal class AndroidSplitTunnelException(
@@ -59,11 +64,32 @@ internal data class AndroidVpnRoutes(
 internal object AndroidSplitTunnel {
     private val currentVpnRoutes = AtomicReference(AndroidVpnRoutes())
 
+    fun resolveConfigurationOptions(
+        androidApiLevel: Int,
+        args: TunnelOptionsArgs,
+        egressMode: String,
+        config: Config,
+    ): EffectiveAndroidTunnelOptions = resolveOptions(
+        androidApiLevel,
+        args,
+        egressMode,
+        config.getInterface().addresses.mapNotNull { it.address.hostAddress },
+    )
+
     fun resolveOptions(
         androidApiLevel: Int,
         args: TunnelOptionsArgs,
+        egressMode: String = "ipv4",
+        tunnelAddresses: List<String> = emptyList(),
     ): EffectiveAndroidTunnelOptions {
-        val dnsServers = normalizeDnsServers(args.dnsServers)
+        val requestedDnsServers = normalizeDnsServers(args.dnsServers)
+        val dnsServers = if (egressMode == "prefer_ipv6") {
+            val resolver = DNS46_TUNNEL_RESOLVERS.firstOrNull { it !in tunnelAddresses }
+                ?: throw AndroidSplitTunnelException("dns46_resolver_address_conflict")
+            normalizeDnsServers(listOf(resolver))
+        } else {
+            requestedDnsServers
+        }
         if (androidApiLevel < 33 || !args.splitActive) {
             return EffectiveAndroidTunnelOptions(dnsServers = dnsServers)
         }
@@ -97,6 +123,11 @@ internal object AndroidSplitTunnel {
         controlPackageName: String,
     ): Config {
         val source = config.getInterface()
+        val dns46Resolvers = options.dnsServers.mapNotNull { it.hostAddress }
+            .filter { it in DNS46_TUNNEL_RESOLVERS }
+        if (source.addresses.mapNotNull { it.address.hostAddress }.any { it in dns46Resolvers }) {
+            throw AndroidSplitTunnelException("dns46_resolver_address_conflict")
+        }
         val includedPackages = if (options.splitSupported) {
             options.includedPackages.filterNot { it == controlPackageName }
         } else {

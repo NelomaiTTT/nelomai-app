@@ -5,15 +5,16 @@ use nelomai_client_api::TokenResponse;
 use nelomai_client_core::{
     split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError,
     CoreLogEvent, CoreLogger, EffectiveSplitTunnelPolicy, Phase, PhysicalNetworkPollOutcome,
-    SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
+    SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome, StalledDataPlaneRecovery,
+    StalledDataPlaneRecoveryOutcome,
 };
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StorageError, StoredAuth,
     StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
-    TunnelCapabilities, TunnelController, TunnelError, TunnelOptions, TunnelPlatform,
-    TunnelStartRequest, TunnelStatus,
+    QuickConnection, QuickReconnect, TunnelCapabilities, TunnelController, TunnelError,
+    TunnelOptions, TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
@@ -662,6 +663,173 @@ async fn force_revision_fetches_immediately_and_offline_cache_never_blocks() {
         Some("split_tunnel_cached_offline")
     );
     assert!(fixture.split_store.load().unwrap().cached_policy.is_some());
+}
+
+#[tokio::test]
+async fn policy_restart_preserves_dns46_connection_metadata() {
+    check_policy_restart_metadata(false).await;
+}
+
+#[tokio::test]
+async fn policy_rollback_preserves_dns46_connection_metadata() {
+    check_policy_restart_metadata(true).await;
+}
+
+async fn check_policy_restart_metadata(fail_new_policy: bool) {
+    for mode in [EgressMode::PreferIpv6, EgressMode::Ipv4] {
+        let fixture = restart_metadata_fixture(mode).await;
+        let connection = fixture.core.state().await.connection.unwrap();
+        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+        changed.revision = 9;
+        changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        changed.selected_packages = vec!["com.example.chat".into()];
+        fixture.api.set_policy(changed);
+        fixture.api.set_revision(9, 2);
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(usize::from(fail_new_policy), Ordering::SeqCst);
+        assert!(matches!(
+            fixture
+                .core
+                .synchronize_split_tunnel(1_600, false)
+                .await
+                .unwrap(),
+            SplitTunnelSyncOutcome::Updated { reconnected: true }
+        ));
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .status,
+            if fail_new_policy {
+                SplitTunnelApplyStatus::RolledBack
+            } else {
+                SplitTunnelApplyStatus::Applied
+            }
+        );
+        let starts = fixture.tunnel.start_metadata.lock().unwrap();
+        assert_eq!(starts.len(), if fail_new_policy { 3 } else { 2 });
+        // Check rollback first so its missing metadata has a separate RED regression.
+        assert_local_restart_metadata(starts.last().unwrap(), &connection);
+        assert_local_restart_metadata(&starts[1], &connection);
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn network_restart_and_retry_preserve_dns46_connection_metadata() {
+    for failed_starts in [0, 1] {
+        let fixture = restart_metadata_fixture(EgressMode::PreferIpv6).await;
+        let connection = fixture.core.state().await.connection.unwrap();
+        fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+        assert_eq!(
+            fixture.core.poll_physical_network(1_100).await.unwrap(),
+            PhysicalNetworkPollOutcome::ChangePending
+        );
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+        assert_eq!(
+            fixture.core.poll_physical_network(1_130).await.unwrap(),
+            PhysicalNetworkPollOutcome::Reconnected
+        );
+        let starts = fixture.tunnel.start_metadata.lock().unwrap();
+        assert_eq!(starts.len(), 2 + failed_starts);
+        for start in &starts[1..] {
+            assert_local_restart_metadata(start, &connection);
+        }
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn stalled_restart_and_retry_preserve_dns46_connection_metadata() {
+    for failed_starts in [0, 1] {
+        let fixture = restart_metadata_fixture(EgressMode::PreferIpv6).await;
+        let connection = fixture.core.state().await.connection.unwrap();
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+        assert_eq!(
+            fixture
+                .core
+                .recover_stalled_data_plane(
+                    &connection.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel
+                )
+                .await
+                .unwrap(),
+            StalledDataPlaneRecoveryOutcome::Reconnected
+        );
+        let starts = fixture.tunnel.start_metadata.lock().unwrap();
+        assert_eq!(starts.len(), 2 + failed_starts);
+        for start in &starts[1..] {
+            assert_local_restart_metadata(start, &connection);
+        }
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+async fn restart_metadata_fixture(mode: EgressMode) -> CoordinatorFixture {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    let mut options = ConnectOptions::android_default();
+    options.egress_mode = mode;
+    fixture.core.start(options, 1_010).await.unwrap();
+    assert_eq!(
+        fixture.core.state().await.connection.unwrap().egress_mode,
+        mode
+    );
+    // Establish that the normal Start already carries this server-accepted mode.
+    assert_eq!(
+        fixture.tunnel.start_metadata.lock().unwrap()[0]
+            .0
+            .as_ref()
+            .unwrap()
+            .egress_mode,
+        mode
+    );
+    fixture
+}
+
+fn assert_local_restart_metadata(
+    start: &(Option<QuickConnection>, QuickReconnect),
+    connection: &Connection,
+) {
+    let metadata = start
+        .0
+        .as_ref()
+        .expect("local restart must retain the current connection's DNS mode");
+    assert_eq!(metadata.lease_id, connection.lease_id);
+    assert_eq!(metadata.layer, connection.layer);
+    assert_eq!(metadata.tic_connection_mode, connection.tic_connection_mode);
+    assert_eq!(metadata.route_mode, connection.route_mode);
+    assert_eq!(metadata.egress_mode, connection.egress_mode);
+    assert!(
+        !metadata.allow_alternate,
+        "local restart must not select another lease"
+    );
+    assert_eq!(
+        start.1,
+        QuickReconnect::Disabled,
+        "metadata must not enable quick caching"
+    );
 }
 
 #[tokio::test]
@@ -2645,6 +2813,7 @@ struct CoordinatorTunnel {
     fail_next_stops: AtomicUsize,
     keep_running_on_stop_failure: AtomicBool,
     options: Mutex<Vec<TunnelOptions>>,
+    start_metadata: Mutex<Vec<(Option<QuickConnection>, QuickReconnect)>>,
     status: Mutex<TunnelStatus>,
     fail_next_status: AtomicBool,
     fingerprints: Mutex<VecDeque<String>>,
@@ -2673,6 +2842,10 @@ impl CoordinatorTunnel {
 impl TunnelController for CoordinatorTunnel {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        self.start_metadata
+            .lock()
+            .unwrap()
+            .push((request.quick_connection.clone(), request.quick_reconnect));
         if self
             .fail_next_starts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -2882,7 +3055,7 @@ impl CoreApi for CoordinatorApi {
                 transport_protocol: Default::default(),
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
-                egress_mode: EgressMode::Ipv4,
+                egress_mode: request.egress_mode,
                 probe_url: Some("https://1a.example.test/probe".to_string()),
                 status: LeaseStatus::Connected,
                 pinned: false,

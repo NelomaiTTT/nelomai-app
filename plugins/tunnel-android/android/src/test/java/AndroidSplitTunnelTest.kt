@@ -226,6 +226,156 @@ class AndroidSplitTunnelTest {
     }
 
     @Test
+    fun dns46UsesTheTunnelResolverWithoutChangingTheProviderPreference() {
+        val original = dns46Config()
+        val args = TunnelOptionsArgs().apply {
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+
+        for (api in listOf(24, 32, 36)) {
+            val updated = AndroidSplitTunnel.applyOptions(
+                original,
+                AndroidSplitTunnel.resolveOptions(api, args, "prefer_ipv6"),
+                "ru.nelomai.client",
+            )
+
+            assertEquals(
+                listOf("10.255.255.53"),
+                updated.getInterface().dnsServers.map { it.hostAddress },
+            )
+            assertEquals(original.getInterface().addresses, updated.getInterface().addresses)
+            assertEquals(original.getInterface().keyPair, updated.getInterface().keyPair)
+            assertEquals(original.peers, updated.peers)
+        }
+        assertEquals(listOf("9.9.9.9", "149.112.112.112"), args.dnsServers)
+        assertEquals(listOf("8.8.8.8"), original.getInterface().dnsServers.map { it.hostAddress })
+    }
+
+    @Test
+    fun dns46DoesNotFallBackToTheConfigurationPublicResolverWhenOptionsAreEmpty() {
+        val updated = AndroidSplitTunnel.applyOptions(
+            dns46Config(),
+            AndroidSplitTunnel.resolveOptions(36, TunnelOptionsArgs(), "prefer_ipv6"),
+            "ru.nelomai.client",
+        )
+
+        assertEquals(listOf("10.255.255.53"), updated.getInterface().dnsServers.map { it.hostAddress })
+    }
+
+    @Test
+    fun dns46ResolverRemainsInTheTunnelWhenLocalNetworksAreExcluded() {
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            excludeLocalNetworks = true
+            splitTunnelRoutes = arrayListOf("10.0.0.0/8")
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+        val options = AndroidSplitTunnel.resolveOptions(36, args, "prefer_ipv6")
+        val excluded = AndroidSplitTunnel.mergeExcludedRoutes(
+            options.excludedRoutes,
+            listOf(prefix("192.168.3.0/24")),
+        )
+        val routes = AndroidSplitTunnel.planVpnRoutes(excluded, options.dnsServers)
+
+        assertEquals(listOf("10.0.0.0/8", "192.168.3.0/24"), routes.excludedRoutes.map { it.canonical })
+        assertEquals(listOf("10.255.255.53/32"), routes.forcedTunnelRoutes.map { it.canonical })
+    }
+
+    @Test
+    fun switchingBackToIpv4KeepsTheSelectedPublicResolvers() {
+        val args = TunnelOptionsArgs().apply {
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+        AndroidSplitTunnel.resolveOptions(36, args, "prefer_ipv6")
+
+        val options = AndroidSplitTunnel.resolveOptions(36, args, "ipv4")
+
+        assertEquals(listOf("9.9.9.9", "149.112.112.112"), options.dnsServers.map { it.hostAddress })
+    }
+
+    @Test
+    fun dns46StillValidatesTheRequestedDnsOptions() {
+        val args = TunnelOptionsArgs().apply { dnsServers = arrayListOf("not-an-address") }
+
+        val error = runCatching {
+            AndroidSplitTunnel.resolveOptions(36, args, "prefer_ipv6")
+        }.exceptionOrNull() as AndroidSplitTunnelException
+
+        assertEquals("invalid_dns_server", error.code)
+    }
+
+    @Test
+    fun dns46AvoidsTheAssignedTunnelAddressAndForcesTheAlternativeRoute() {
+        val original = dns46Config("10.255.255.53/32")
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            splitTunnelRoutes = arrayListOf("10.0.0.0/8", "10.255.255.54/32")
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+        val options = AndroidSplitTunnel.resolveOptions(
+            36, args, "prefer_ipv6", listOf("10.255.255.53"),
+        )
+        val config = AndroidSplitTunnel.applyOptions(original, options, "ru.nelomai.client")
+        val routes = AndroidSplitTunnel.planVpnRoutes(options.excludedRoutes, options.dnsServers)
+
+        assertEquals(listOf("10.255.255.54"), config.getInterface().dnsServers.map { it.hostAddress })
+        assertEquals(listOf("10.255.255.54/32"), routes.forcedTunnelRoutes.map { it.canonical })
+        assertEquals(original.getInterface().addresses, config.getInterface().addresses)
+        assertEquals(listOf("9.9.9.9", "149.112.112.112"), args.dnsServers)
+    }
+
+    @Test
+    fun dns46RefusesAConfigurationThatOwnsEveryResolverAlias() {
+        val error = runCatching {
+            AndroidSplitTunnel.resolveOptions(
+                36, TunnelOptionsArgs(), "prefer_ipv6",
+                listOf("10.255.255.53", "10.255.255.54"),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(error is AndroidSplitTunnelException)
+        assertEquals("dns46_resolver_address_conflict", (error as AndroidSplitTunnelException).code)
+    }
+
+    @Test
+    fun dns46FreshRedundantConfigurationChoosesAnUnassignedResolver() {
+        val config = dns46Config("10.255.255.53/32")
+        val options = AndroidSplitTunnel.resolveConfigurationOptions(
+            36, TunnelOptionsArgs(), "prefer_ipv6", config,
+        )
+        val prepared = AndroidSplitTunnel.applyOptions(config, options, "ru.nelomai.client")
+
+        assertEquals(listOf("10.255.255.54"), prepared.getInterface().dnsServers.map { it.hostAddress })
+        assertEquals(config.getInterface().addresses, prepared.getInterface().addresses)
+    }
+
+    @Test
+    fun dns46ColdRecoveryUsesTheLateConfigurationForItsDnsAndRoute() {
+        val args = TunnelOptionsArgs().apply { dnsServers = arrayListOf("9.9.9.9") }
+        val initial = AndroidSplitTunnel.resolveOptions(36, args, "prefer_ipv6")
+        assertEquals(listOf("10.255.255.53"), initial.dnsServers.map { it.hostAddress })
+        val recovered = dns46Config("10.255.255.53/32")
+        val options = AndroidSplitTunnel.resolveConfigurationOptions(36, args, "prefer_ipv6", recovered)
+        val prepared = AndroidSplitTunnel.applyOptions(recovered, options, "ru.nelomai.client")
+        val routes = AndroidSplitTunnel.planVpnRoutes(initial.excludedRoutes, prepared.getInterface().dnsServers.toList())
+        assertEquals(listOf("10.255.255.54/32"), routes.forcedTunnelRoutes.map { it.canonical })
+        assertEquals(listOf("9.9.9.9"), args.dnsServers)
+    }
+
+    @Test
+    fun dns46PreparationRefusesAResolverThatBecameAnInterfaceAddress() {
+        val options = AndroidSplitTunnel.resolveOptions(36, TunnelOptionsArgs(), "prefer_ipv6")
+        val error = runCatching {
+            AndroidSplitTunnel.applyOptions(
+                dns46Config("10.255.255.53/32"), options, "ru.nelomai.client",
+            )
+        }.exceptionOrNull()
+
+        assertTrue(error is AndroidSplitTunnelException)
+        assertEquals("dns46_resolver_address_conflict", (error as AndroidSplitTunnelException).code)
+    }
+
+    @Test
     fun splitTunnelRebuildPreservesAmneziaWg3Parameters() {
         val original = parseConfig(
             """
@@ -327,6 +477,20 @@ class AndroidSplitTunnelTest {
 
     private fun parseConfig(value: String): Config =
         Config.parse(ByteArrayInputStream(value.encodeToByteArray()))
+
+    private fun dns46Config(address: String = "10.241.0.3/32"): Config = parseConfig(
+        """
+        [Interface]
+        PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        Address = $address
+        DNS = 8.8.8.8
+
+        [Peer]
+        PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+        AllowedIPs = 0.0.0.0/0
+        Endpoint = 127.0.0.1:10001
+        """.trimIndent(),
+    )
 
     private fun prefix(value: String): Ipv4Prefix {
         val args = TunnelOptionsArgs().apply {

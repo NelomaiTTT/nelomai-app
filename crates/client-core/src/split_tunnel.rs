@@ -7,10 +7,10 @@ use nelomai_client_storage::{
     RuntimeStateStore, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, TunnelCapabilities, TunnelOptions, TunnelPlatform,
+    DesktopTunnelOptions, QuickConnection, TunnelCapabilities, TunnelOptions, TunnelPlatform,
 };
 use nelomai_contracts::{
-    Layer, RouteMode, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
+    Connection, Layer, RouteMode, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
 };
@@ -42,6 +42,19 @@ const FULL_SYNC_SECONDS: i64 = 24 * 60 * 60;
 const FAILED_POLICY_RETRY_SECONDS: i64 = 60 * 60;
 const PHYSICAL_NETWORK_RETRY_SECONDS: i64 = 5 * 60;
 const UNKNOWN_PHYSICAL_NETWORK: &str = "restore_requires_network_revalidation";
+
+// Local restarts keep the accepted connection context (including Android's
+// DNS46 mode), but neither cache a quick action nor select another lease.
+fn local_restart_connection(connection: &Connection) -> QuickConnection {
+    QuickConnection {
+        lease_id: connection.lease_id.clone(),
+        layer: connection.layer,
+        tic_connection_mode: connection.tic_connection_mode,
+        route_mode: connection.route_mode,
+        egress_mode: connection.egress_mode,
+        allow_alternate: false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalNetworkPollOutcome {
@@ -894,7 +907,7 @@ where
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options,
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: None,
+                    quick_connection: Some(local_restart_connection(&connection)),
                     redundancy: None,
                 })
         };
@@ -1043,7 +1056,7 @@ where
                     ),
                     options: options.clone(),
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: None,
+                    quick_connection: Some(local_restart_connection(&connection)),
                     redundancy: None,
                 })
         };
@@ -1853,7 +1866,7 @@ where
                 ),
                 options: new_options.clone(),
                 quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                quick_connection: None,
+                quick_connection: Some(local_restart_connection(&connection)),
                 redundancy: None,
             })
             .await;
@@ -1886,7 +1899,7 @@ where
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options: previous_options.clone(),
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: None,
+                    quick_connection: Some(local_restart_connection(&connection)),
                     redundancy: None,
                 })
                 .await;

@@ -1387,6 +1387,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         val options = AndroidSplitTunnel.resolveOptions(
             Build.VERSION.SDK_INT,
             transaction.template.options.toTunnelOptionsArgs(),
+            transaction.template.egressMode,
         )
         val localRoutes = if (options.splitSupported && options.excludeLocalNetworks) {
             physicalState.localRoutes
@@ -1399,14 +1400,28 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 JniRedundantNativeApi(applicationContext),
                 protectSocket = ::protect,
             ),
-            establishTun = ::establishRedundantTun,
+            establishTun = { config ->
+                // Recovery gets its interface address only with the recovered
+                // configuration. Install the DNS route chosen from that actual
+                // address immediately before constructing the shared TUN.
+                AndroidSplitTunnel.replaceVpnRoutes(
+                    AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
+                    config.getInterface().dnsServers.toList(),
+                )
+                establishRedundantTun(config)
+            },
             prepare = { configuration ->
                 val config = TunnelPayload.consume(configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }.let { parsed ->
                     AndroidSplitTunnel.applyOptions(
                         parsed,
-                        options,
+                        AndroidSplitTunnel.resolveConfigurationOptions(
+                            Build.VERSION.SDK_INT,
+                            transaction.template.options.toTunnelOptionsArgs(),
+                            transaction.template.egressMode,
+                            parsed,
+                        ),
                         applicationContext.packageName,
                     )
                 }
