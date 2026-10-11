@@ -5095,6 +5095,12 @@ pub(crate) mod native {
                     } else if let Some(effect) = record.pending {
                         supervisor
                             .run_intent(&context, &pin, record, effect, || {
+                                let r = self.roots().map_err(carrier_denied)?;
+                                if let Some(slot) = r.pins.source.retirement_slot().map_err(|_| CarrierError::Conflict)? {
+                                    let original = r.controllers[idx(slot)].as_ref().ok_or_else(|| carrier_denied(conflict()))?
+                                        .retirement_original()?;
+                                    r.pins.source.select_retirement(original, pin.clone(), record).map_err(|_| CarrierError::Conflict)?;
+                                }
                                 if effect != pair::Effect::CarrierReady {
                                     // The full upgrade immediately observes actual
                                     // siblings. Select THIS opaque Pair before that
@@ -5169,6 +5175,12 @@ pub(crate) mod native {
                     } else {
                         supervisor
                             .run(&context, || {
+                                let r = self.roots().map_err(carrier_denied)?;
+                                if let Some(slot) = r.pins.source.retirement_slot().map_err(|_| CarrierError::Conflict)? {
+                                    let original = r.controllers[idx(slot)].as_ref().ok_or_else(|| carrier_denied(conflict()))?
+                                        .retirement_original()?;
+                                    r.pins.source.select_retirement(original, pin.clone(), record).map_err(|_| CarrierError::Conflict)?;
+                                }
                                 let runtime = &self.roots().map_err(carrier_denied)?.runtime;
                                 pin.inspect(runtime, &supervisor, |actual| {
                                     if actual != record {
@@ -5658,7 +5670,7 @@ pub(crate) mod native {
                                 .inspect_window(|_| Ok(())).map_err(denied)?;
                         }
                     } else {
-                        r.pins.source.inspect_window(|_| Ok(())).map_err(|error| denied(error))?;
+                        r.pins.source.inspect_running_window(|_| Ok(())).map_err(|error| denied(error))?;
                     }
                 }
                 let r = this.roots()?;
@@ -6294,7 +6306,12 @@ pub(crate) mod native {
                 let r = this.roots()?;
                 r.pins
                     .source
-                    .inspect(|actual| {
+                    .inspect_running_window(|window| {
+                        let actual = window
+                            .bindings()
+                            .carrier
+                            .as_ref()
+                            .ok_or(crate::windows::member_carrier_wintun::Error::Conflict)?;
                         if Some(actual.identity.proof) != record.carrier
                             || actual.identity.scope != record.scope
                             || actual.sources
@@ -6704,6 +6721,102 @@ pub(crate) mod native {
             })
         }
 
+        pub(crate) fn retire_member(
+            &mut self,
+            record: &pair::Record,
+            slot: Slot,
+        ) -> io::Result<nelomai_client_tunnel::redundancy::control::RetirementProgress> {
+            use nelomai_client_tunnel::redundancy::control::RetirementProgress;
+            if record.phase != pair::Phase::Running
+                || record.operation != Some(pair::Operation::Retire(slot))
+                || record.pending != Some(pair::Effect::MemberStop(slot))
+                || record.active != Some(slot.other())
+            {
+                return Err(conflict());
+            }
+            self.in_call(record, |this, pin| {
+                let progress = {
+                    let r = this.roots_mut()?;
+                    r.member_gates[idx(slot)]
+                        .as_ref()
+                        .ok_or_else(conflict)?
+                        .try_borrow_mut()
+                        .map_err(denied)?
+                        .select_pair(pin.clone())
+                        .map_err(denied)?;
+                    r.controllers[idx(slot)]
+                        .as_mut()
+                        .ok_or_else(conflict)?
+                        .retire_progress(pin, record, &mut r.lock)
+                        .map_err(denied)?
+                };
+                if progress == RetirementProgress::ExactRundown {
+                    let r = this.roots()?;
+                    let original = r.controllers[idx(slot)]
+                        .as_ref()
+                        .ok_or_else(conflict)?
+                        .retirement_original()
+                        .map_err(denied)?;
+                    r.pins
+                        .source
+                        .select_retirement(original, pin.clone(), record)
+                        .map_err(denied)?;
+                } else {
+                    let r = this.roots()?;
+                    if r.pins.source.retirement_slot().map_err(denied)?.is_some() {
+                        r.pins.source.complete_retirement().map_err(denied)?;
+                    }
+                }
+                this.select_guard(pin, record)?;
+                let r = this.roots_mut()?;
+                r.probe_state
+                    .select(pin.clone(), record.clone())
+                    .map_err(denied)?;
+                let controller = r.controllers[idx(slot)].as_mut().ok_or_else(conflict)?;
+                if progress == RetirementProgress::ExactRundown {
+                    controller
+                        .attest_rundown(pin, record, &mut r.lock)
+                        .map_err(denied)?;
+                } else {
+                    controller
+                        .retire(pin, record, &mut r.lock)
+                        .map_err(denied)?;
+                }
+                Ok(progress)
+            })
+        }
+        pub(crate) fn attest_retirement(
+            &mut self,
+            record: &pair::Record,
+            slot: Slot,
+        ) -> io::Result<()> {
+            self.in_call(record, |this, pin| {
+                if this
+                    .roots()?
+                    .pins
+                    .source
+                    .retirement_slot()
+                    .map_err(denied)?
+                    != Some(slot)
+                {
+                    return Err(conflict());
+                }
+                this.select_guard(pin, record)?;
+                let r = this.roots_mut()?;
+                r.member_gates[idx(slot)]
+                    .as_ref()
+                    .ok_or_else(conflict)?
+                    .try_borrow_mut()
+                    .map_err(denied)?
+                    .select_pair(pin.clone())
+                    .map_err(denied)?;
+                r.controllers[idx(slot)]
+                    .as_mut()
+                    .ok_or_else(conflict)?
+                    .attest_rundown(pin, record, &mut r.lock)
+                    .map_err(denied)
+            })
+        }
         pub(crate) fn verify_member(
             &mut self,
             record: &pair::Record,
@@ -7112,7 +7225,7 @@ pub(crate) mod native {
                 let expected = network.pending.as_ref().unwrap_or(&network.current);
                 r.pins
                     .source
-                    .inspect_window(|window| {
+                    .inspect_running_window(|window| {
                         let before = r
                             .guard
                             .try_borrow_mut()
@@ -7190,7 +7303,14 @@ pub(crate) mod native {
             use crate::member_plan::{InterfaceMetric, MAX_ROUTES};
             use nelomai_client_tunnel::redundancy::route_plan::MemberRoutes;
             if record.phase == pair::Phase::Closing
-                || !window.matches_source(&r.pins.source)
+                || if let Some(slot) = window.retirement_slot() {
+                    record.phase != pair::Phase::Running
+                        || record.operation != Some(pair::Operation::Retire(slot))
+                        || record.active != Some(slot.other())
+                        || !window.matches_running_channel(&r.pins.source)
+                } else {
+                    !window.matches_source(&r.pins.source)
+                }
                 || !r
                     .network_ack
                     .matches_origin(&r.pins.source, &r.network_gate)
@@ -8660,7 +8780,7 @@ pub(crate) mod native {
                 let r = this.roots()?;
                 r.pins
                     .source
-                    .inspect_window(|window| {
+                    .inspect_running_window(|window| {
                         let bindings = window.bindings();
                         let c = bindings.carrier.as_ref().ok_or_else(|| native_denied(()))?;
                         let owned = std::iter::once(&c.identity)
@@ -8675,14 +8795,33 @@ pub(crate) mod native {
                             .map_err(native_denied)?;
                         let after = crate::windows::member_physical::capture(&owned)
                             .map_err(native_denied)?;
-                        if before.rows() != after.rows() || before.proofs() != after.proofs() {
+                        let visible_before = before
+                            .rows()
+                            .iter()
+                            .filter(|row| {
+                                !owned.iter().any(|identity| {
+                                    identity.index == row.route.interface
+                                        && identity.luid == row.luid
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let visible_after = after
+                            .rows()
+                            .iter()
+                            .filter(|row| {
+                                !owned.iter().any(|identity| {
+                                    identity.index == row.route.interface
+                                        && identity.luid == row.luid
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        if visible_before != visible_after || before.proofs() != after.proofs() {
                             return Err(native_denied(()));
                         }
                         // A fresh physical SDK comparison fingerprint only; it
                         // imports no route owner, path lease or effect permission.
-                        let mut rows = before
-                            .rows()
-                            .iter()
+                        let mut rows = visible_before
+                            .into_iter()
                             .map(|r| format!("{r:?}"))
                             .collect::<Vec<_>>();
                         rows.sort();
@@ -8744,6 +8883,16 @@ pub(crate) mod native {
         }
         fn stop_member(&mut self, record: &pair::Record, slot: Slot) -> io::Result<()> {
             NativeCarrierPairIo::stop_member(self, record, slot)
+        }
+        fn retire_member(
+            &mut self,
+            record: &pair::Record,
+            slot: Slot,
+        ) -> io::Result<nelomai_client_tunnel::redundancy::control::RetirementProgress> {
+            NativeCarrierPairIo::retire_member(self, record, slot)
+        }
+        fn attest_retirement(&mut self, record: &pair::Record, slot: Slot) -> io::Result<()> {
+            NativeCarrierPairIo::attest_retirement(self, record, slot)
         }
         fn verify_member_absent(&mut self, record: &pair::Record, slot: Slot) -> io::Result<()> {
             NativeCarrierPairIo::verify_member_absent(self, record, slot)

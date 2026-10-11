@@ -359,7 +359,17 @@ pub(crate) mod native {
                 if !closing.matches_source_origin(&source) || !window.matches_closing(&closing) {
                     return Err(GuardError::Conflict);
                 }
-            } else if !window.matches_source(&source) {
+            } else if let Some(slot) = window.retirement_slot() {
+                if record.phase != pair::Phase::Running
+                    || record.operation != Some(pair::Operation::Retire(slot))
+                    || record.active != Some(slot.other())
+                    || !window.matches_running_channel(&source)
+                {
+                    return Err(GuardError::Conflict);
+                }
+            } else if source.retirement_slot().map_err(denied)?.is_some()
+                || !window.matches_source(&source)
+            {
                 return Err(GuardError::Conflict);
             }
             Ok(())
@@ -431,34 +441,83 @@ pub(crate) mod native {
                                         // Stop restores owned fields; its final readonly
                                         // observations may differ from the captured baseline.
                                         let member = i.saturating_sub(1);
+                                        let slot = if i == 1 {
+                                            nelomai_client_tunnel::redundancy::Slot::A
+                                        } else {
+                                            nelomai_client_tunnel::redundancy::Slot::B
+                                        };
+                                        let rundown = i != 0
+                                            && window.retirement_slot() == Some(slot)
+                                            && record.operation
+                                                == Some(pair::Operation::Retire(slot))
+                                            && record.active == Some(slot.other())
+                                            && record.members[member].as_ref().is_some_and(
+                                                |owner| {
+                                                    let Some(proof) = owner.owner.proof else {
+                                                        return false;
+                                                    };
+                                                    window
+                                                        .partial_member(owner.owner.intent.slot)
+                                                        .is_some_and(|partial| {
+                                                            partial.0 == owner.owner.intent
+                                                                && partial.1 == Some(proof.process)
+                                                                && partial.2
+                                                                && proof.interface.guid
+                                                                    == fact.binding.guid
+                                                                && proof.interface.index
+                                                                    == fact.binding.key.index
+                                                                && proof.interface.luid
+                                                                    == fact.binding.key.luid
+                                                        })
+                                                        && [
+                                                            &expected.members[member],
+                                                            &desired.members[member],
+                                                        ]
+                                                        .into_iter()
+                                                        .all(|target| {
+                                                            target.as_ref().is_some_and(|target| {
+                                                                target.identity.proof
+                                                                    == proof.interface
+                                                                    && target.identity.scope
+                                                                        == record.scope
+                                                            })
+                                                        })
+                                                        && desired.members[member]
+                                                            .as_ref()
+                                                            .is_some_and(|target| {
+                                                                target.probes.is_empty()
+                                                            })
+                                                },
+                                            );
                                         // RestoreKeys removes Pair membership before the
                                         // next capture replaces this SAME closed row owner.
                                         let excluded = record.members[member].is_none()
                                             && expected.members[member].is_none()
                                             && desired.members[member].is_none();
                                         if i == 0
-                                            || (retired != Some(member) && !excluded)
+                                            || (retired != Some(member) && !excluded && !rundown)
                                             || fact.binding.role
                                                 != if i == 1 {
                                                     crate::member_carrier_rows::Role::MemberA
                                                 } else {
                                                     crate::member_carrier_rows::Role::MemberB
                                                 }
-                                            || window
-                                                .closed_member(if i == 1 {
-                                                    nelomai_contracts::dispatcher::TunnelSlot::A
-                                                } else {
-                                                    nelomai_contracts::dispatcher::TunnelSlot::B
-                                                })
-                                                .is_none_or(|closed| {
-                                                    closed.intent.scope != fact.binding.scope
-                                                        || closed.proof.interface.index
-                                                            != fact.binding.key.index
-                                                        || closed.proof.interface.luid
-                                                            != fact.binding.key.luid
-                                                        || closed.proof.interface.guid
-                                                            != fact.binding.guid
-                                                })
+                                            || !rundown
+                                                && window
+                                                    .closed_member(if i == 1 {
+                                                        nelomai_contracts::dispatcher::TunnelSlot::A
+                                                    } else {
+                                                        nelomai_contracts::dispatcher::TunnelSlot::B
+                                                    })
+                                                    .is_none_or(|closed| {
+                                                        closed.intent.scope != fact.binding.scope
+                                                            || closed.proof.interface.index
+                                                                != fact.binding.key.index
+                                                            || closed.proof.interface.luid
+                                                                != fact.binding.key.luid
+                                                            || closed.proof.interface.guid
+                                                                != fact.binding.guid
+                                                    })
                                             || fact.acknowledged.phase
                                                 != crate::member_carrier_rows::Phase::Stopped
                                             || fact.acknowledged.pending.is_some()

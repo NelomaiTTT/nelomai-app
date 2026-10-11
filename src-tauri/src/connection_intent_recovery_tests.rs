@@ -280,6 +280,7 @@ fn fixture(lose_ack: bool) -> Fixture {
         standby_failed: true,
         stalled: true,
         cleanup_pending: false,
+        retirement_pending: false,
         warm_stop_v1: false,
     };
     let helper = Arc::new(Helper {

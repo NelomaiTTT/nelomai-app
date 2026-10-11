@@ -1648,15 +1648,23 @@ fn compare_guard_resource_rows(
     record: &pair::Record,
     resources: GuardResourceRows<'_>,
     closed: ClosedResources<'_>,
+    rundown: Option<(
+        &crate::member_owner::Intent,
+        crate::member_owner::ProcessProof,
+    )>,
 ) -> io::Result<Vec<InterfaceMetric>> {
     compare_guard_resource_stage(context, record)?;
-    compare_sampled_resource_rows(context, record, resources, closed)
+    compare_sampled_resource_rows(context, record, resources, closed, rundown)
 }
 fn compare_sampled_resource_rows(
     context: &Context,
     record: &pair::Record,
     resources: GuardResourceRows<'_>,
     closed: ClosedResources<'_>,
+    rundown: Option<(
+        &crate::member_owner::Intent,
+        crate::member_owner::ProcessProof,
+    )>,
 ) -> io::Result<Vec<InterfaceMetric>> {
     let c = record.carrier.ok_or_else(conflict)?;
     let proofs = [
@@ -1691,6 +1699,59 @@ fn compare_sampled_resource_rows(
             continue;
         };
         let (binding, ack, actual) = resource.ok_or_else(conflict)?;
+        if let Some((intent, process)) = rundown.filter(|(intent, _)| {
+            i == 1 + usize::from(intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B)
+        }) {
+            let slot = if i == 1 { Slot::A } else { Slot::B };
+            let owner = &record.members[i - 1].as_ref().ok_or_else(conflict)?.owner;
+            binding.validate().map_err(denied)?;
+            ack.validate().map_err(denied)?;
+            if record.phase != pair::Phase::Running
+                || record.operation != Some(pair::Operation::Retire(slot))
+                || record.active != Some(slot.other())
+                || owner.intent != *intent
+                || owner.proof.map(|proof| proof.process) != Some(process)
+                || binding.scope != record.scope
+                || binding.boot_id != context.provenance.boot_id
+                || binding.runtime != context.provenance.runtime
+                || binding.network_epoch != context.provenance.network_epoch
+                || binding.role != [rows::Role::MemberA, rows::Role::MemberB][i - 1]
+                || binding.name != context.bindings[i].name
+                || binding.guid != proof.guid
+                || binding.key.index != proof.index
+                || binding.key.luid != proof.luid
+                || record.addresses.as_slice()
+                    != [ipnet::IpNet::from(std::net::IpAddr::V4(
+                        binding.address.into(),
+                    ))]
+                || ack.binding != *binding
+                || ack.phase != rows::Phase::Stopped
+                || ack.pending.is_some()
+                || ack.creation.is_some()
+                || ack.baseline.address.is_some()
+                || !rows::same_owned(&ack.current, &ack.baseline)
+                || ack.baseline.interface.policy.weak_host_send
+                || ack.baseline.interface.policy.weak_host_receive
+                || ack.baseline.interface.policy.forwarding
+                || ack.baseline.interface.policy.advertising
+                || actual.is_some_and(|actual| !rows::same_owned(actual, &ack.baseline))
+                || !record.guard.installed
+                || record.guard.members[i - 1].as_ref().is_none_or(|member| {
+                    member.identity.scope != record.scope || member.identity.proof != *proof
+                })
+                || record.network.as_ref().is_none_or(|network| {
+                    network.pending.is_some()
+                        || network
+                            .current
+                            .routes
+                            .iter()
+                            .any(|route| route.interface == proof.index)
+                })
+            {
+                return Err(conflict());
+            }
+            continue; // Comparison only: no target metric, route or Closed.
+        }
         let actual = actual.ok_or_else(conflict)?;
         binding.validate().map_err(denied)?;
         ack.validate().map_err(denied)?;
@@ -3097,7 +3158,14 @@ pub(crate) mod native {
                         c.matches_source_origin(&self.source) && window.matches_closing(c)
                     })
             } else {
-                window.matches_source(&self.source)
+                self.source.retirement_slot().map_err(denied)?.is_none()
+                    && window.matches_source(&self.source)
+                    || window.retirement_slot().is_some_and(|slot| {
+                        r.phase == pair::Phase::Running
+                            && r.operation == Some(pair::Operation::Retire(slot))
+                            && r.active == Some(slot.other())
+                            && window.matches_running_channel(&self.source)
+                    })
             };
             if !channel || !window.matches_runtime(&self.runtime) {
                 return Err(conflict());
@@ -3373,17 +3441,47 @@ pub(crate) mod native {
                         fact.as_ref()
                             .map(|r| (&r.binding, &r.acknowledged, r.observed.as_ref()))
                     });
+                    let rundown = window
+                        .retirement_slot()
+                        .map(|slot| {
+                            let owner = &record.members[usize::from(slot == Slot::B)]
+                                .as_ref()
+                                .ok_or_else(conflict)?
+                                .owner;
+                            let proof = owner.proof.ok_or_else(conflict)?;
+                            let partial = window
+                                .partial_member(owner.intent.slot)
+                                .ok_or_else(conflict)?;
+                            if record.phase != pair::Phase::Running
+                                || record.operation != Some(pair::Operation::Retire(slot))
+                                || record.active != Some(slot.other())
+                                || partial.0 != owner.intent
+                                || partial.1 != Some(proof.process)
+                                || !partial.2
+                            {
+                                return Err(conflict());
+                            }
+                            Ok((&owner.intent, proof.process))
+                        })
+                        .transpose()
+                        .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)?;
                     let metrics = if record.phase == pair::Phase::Closing {
                         // Actual row/root/protected reads above remain mandatory;
                         // cleanup never computes a new forward route/permit plan.
                         Ok(Vec::new())
                     } else if record.pending == Some(pair::Effect::Guard) {
-                        compare_guard_resource_rows(&self.context, record, values, closed)
+                        compare_guard_resource_rows(&self.context, record, values, closed, rundown)
                     } else {
-                        compare_sampled_resource_rows(&self.context, record, values, closed)
+                        compare_sampled_resource_rows(
+                            &self.context,
+                            record,
+                            values,
+                            closed,
+                            rundown,
+                        )
                     }
                     .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)?;
-                    if closed.iter().any(Option::is_some) {
+                    if closed.iter().any(Option::is_some) || rundown.is_some() {
                         // Actual full native table, both families; not an old NIC
                         // lookup. Stopped receipt/row history never licenses a
                         // remaining target route (including foreign metadata).
@@ -3393,6 +3491,15 @@ pub(crate) mod native {
                             closed.iter().flatten().any(|h| {
                                 row.route.interface == h.proof.interface.index
                                     || row.luid == h.proof.interface.luid
+                            }) || rundown.is_some_and(|(intent, _)| {
+                                let owner = &record.members[usize::from(
+                                    intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B,
+                                )]
+                                .as_ref()
+                                .expect("checked rundown owner")
+                                .owner;
+                                let proof = owner.proof.expect("checked rundown proof").interface;
+                                row.route.interface == proof.index || row.luid == proof.luid
                             })
                         }) || full_route_table()
                             .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)?

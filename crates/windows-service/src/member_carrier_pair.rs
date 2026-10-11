@@ -1932,7 +1932,11 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
         self.read_original(|io| io.observe(&self.record, slot).map(|(m, _)| m))
     }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
-        self.read_original(|io| io.fingerprint(&self.record))
+        if self.retirement_pending.is_some() {
+            self.read_original(|io| io.fingerprint(&self.record))
+        } else {
+            self.read_live(|io| io.fingerprint(&self.record))
+        }
     }
     fn start_primary(
         &mut self,

@@ -1783,6 +1783,7 @@ mod tests {
             standby_failed: true,
             stalled: true,
             cleanup_pending: false,
+            retirement_pending: false,
             warm_stop_v1: true,
         };
         (state, current, snapshot)

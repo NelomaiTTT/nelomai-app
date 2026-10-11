@@ -1936,6 +1936,7 @@ mod tests {
             primary_ready: true,
             standby_ready: false,
             cleanup_pending: false,
+            retirement_pending: false,
             warm_stop_v1: false,
         };
         let mut schedule = DesktopCoordinationSchedule::default();

@@ -916,7 +916,10 @@ fn carrier_factory_actual_cold_child() {
             fixture.external_health(None);
             let current = second.snapshot();
             assert_eq!(current.session.role_generation, 3);
-            let retired = second
+            let physical_before = second
+                .physical_network_fingerprint()
+                .expect("actual physical fingerprint before B retirement");
+            let mut retired = second
                 .execute(
                     Command::RetireInactive {
                         scope: next.clone(),
@@ -928,7 +931,143 @@ fn carrier_factory_actual_cold_child() {
                     },
                     second_now,
                 )
-                .expect("actual retired inactive B");
+                .expect("actual inactive B retirement acknowledged");
+            if retired.retirement_pending {
+                assert!(!retired.cleanup_pending);
+                assert_eq!(retired.session.phase, SessionPhase::Running);
+                assert_eq!(retired.session.active, Slot::A);
+                assert!(retired.primary_ready);
+                assert!(!retired.standby_ready);
+                assert_eq!(retired.leases, current.leases);
+                assert_eq!(retired.current_leases, current.current_leases);
+                assert_eq!(retired.session.installed, current.session.installed);
+                assert_eq!(retired.session.committed, current.session.committed);
+                assert_eq!(
+                    second.physical_network_fingerprint().unwrap(),
+                    physical_before,
+                    "owned B rundown is not a physical network change"
+                );
+                let pending_pair = fixture
+                    .trace_pair_stage()
+                    .expect("actual pending Retire Pair");
+                assert_eq!(
+                    pending_pair.operation,
+                    Some(crate::member_carrier_pair::Operation::Retire(Slot::B))
+                );
+                assert_eq!(
+                    pending_pair.pending,
+                    Some(crate::member_carrier_pair::Effect::MemberStop(Slot::B))
+                );
+                assert_eq!(pending_pair.carrier, Some(carrier));
+                assert!(
+                    pending_pair.members == paired.members,
+                    "pending preserves both original Pair owners"
+                );
+                assert!(pending_pair.guard.permits);
+                assert_eq!(pending_pair.guard.active, Some(Slot::A));
+                assert!(pending_pair.guard.members[1]
+                    .as_ref()
+                    .unwrap()
+                    .probes
+                    .is_empty());
+                assert_eq!(
+                    pending_pair.guard.members[1]
+                        .as_ref()
+                        .unwrap()
+                        .identity
+                        .proof,
+                    b
+                );
+                let mut files = MemberFiles::new().expect("actual retirement member files");
+                let stopping = files
+                    .load(TunnelSlot::B)
+                    .unwrap()
+                    .expect("actual original B journal");
+                assert_eq!(stopping.phase, crate::member_owner::Phase::Stopping);
+                assert_eq!(
+                    stopping.intent,
+                    paired.members[1].as_ref().unwrap().owner.intent
+                );
+                assert_eq!(
+                    stopping.proof,
+                    paired.members[1].as_ref().unwrap().owner.proof
+                );
+                assert!(stopping.retired_proof.is_none(), "pending is not Closed");
+                // This is a test aperture, not a native completion deadline or an
+                // assumed upper bound on MIB rundown. Each original Calling keeps
+                // the production 30s limit and must authenticate C/A and exact B.
+                let rundown_started = std::time::Instant::now();
+                let rundown_now = second_now;
+                let mut checked_lingering = false;
+                while retired.retirement_pending {
+                    assert!(
+                        rundown_started.elapsed() < std::time::Duration::from_secs(300),
+                        "native rundown did not complete in the factory test aperture"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    second_now = rundown_now + rundown_started.elapsed().as_millis() as u64;
+                    second
+                        .tick(second_now)
+                        .expect("actual same-owner retirement continuation tick");
+                    retired = second.snapshot();
+                    if retired.retirement_pending
+                        && !checked_lingering
+                        && rundown_started.elapsed() >= std::time::Duration::from_secs(30)
+                    {
+                        assert_eq!(retired.session.phase, SessionPhase::Running);
+                        assert_eq!(retired.session.active, Slot::A);
+                        assert_eq!(retired.leases, current.leases);
+                        assert!(retired.primary_ready);
+                        assert!(!retired.cleanup_pending);
+                        assert_eq!(
+                            second.physical_network_fingerprint().unwrap(),
+                            physical_before
+                        );
+                        checked_lingering = true;
+                    }
+                }
+                eprintln!(
+                    "actual original B rundown completed after {:?}",
+                    rundown_started.elapsed()
+                );
+            }
+            assert!(!retired.cleanup_pending);
+            assert_eq!(retired.session.phase, SessionPhase::Running);
+            assert_eq!(retired.session.active, Slot::A);
+            assert_eq!(retired.leases[1], None);
+            assert_eq!(retired.current_leases, current.current_leases);
+            assert!(!retired.session.installed[1]);
+            assert!(!retired.session.committed[1]);
+            let mut files = MemberFiles::new().expect("actual retirement member files");
+            let closed = files
+                .load(TunnelSlot::B)
+                .unwrap()
+                .expect("actual SAME B stopped journal");
+            assert_eq!(closed.phase, crate::member_owner::Phase::Stopped);
+            assert_eq!(
+                closed.intent,
+                paired.members[1].as_ref().unwrap().owner.intent
+            );
+            assert!(closed.proof.is_none());
+            assert_eq!(
+                closed.retired_proof,
+                paired.members[1].as_ref().unwrap().owner.proof
+            );
+            assert_eq!(
+                second.physical_network_fingerprint().unwrap(),
+                physical_before,
+                "exact owned B absence preserves the physical fingerprint"
+            );
+            crate::windows::member_owner::require_reboot_guids_absent(TunnelSlot::B, &[b.guid])
+                .expect("actual old B MIB GUID/alias absent before replacement");
+            let completed = fixture
+                .trace_pair_stage()
+                .expect("actual completed retirement Pair");
+            assert!(completed.members[1].is_none());
+            assert!(completed.operation.is_none());
+            assert!(completed.pending.is_none());
+            assert!(completed.guard.permits);
+            assert_eq!(completed.guard.active, Some(Slot::A));
             reserve_lease = "44444444-4444-4444-8444-444444444444".into();
             let stale = second.execute(
                 Command::StageCandidate {

@@ -23,7 +23,7 @@ use crate::member_owner::{
 };
 use crate::member_owner::{
     OriginalMemberPartialCleanupIo, OriginalServiceCleanup, OriginalServiceCleanupNative,
-    PartialServiceObservation, ServiceCleanupFacts, ServiceCleanupState,
+    PartialServiceObservation, PartialStopProgress, ServiceCleanupFacts, ServiceCleanupState,
 };
 use crate::redundancy::{slot_service_name, slot_service_spec};
 use nelomai_client_tunnel::TunnelTransport;
@@ -568,6 +568,51 @@ impl<F: PrivateConfig> OriginalMemberPartialCleanupIo for NativeMemberIo<F> {
                 eprintln!("actual original partial config read: {_error:?}");
             })
         })
+    }
+    fn retire_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: &NativeProof,
+    ) -> Result<PartialStopProgress> {
+        if self.cleanup_only || !pin.matches_origin(&self.original) {
+            return Err(OwnerError::Retired);
+        }
+        // One SAME retained SCM effect; later calls only read its retained ACK.
+        // The existing supervisor still bounds this entire observation to 30s.
+        let files = &mut self.files;
+        let path = &self.config_path;
+        pin.stop_delete(&mut NativeOriginalCalls { files: None }, || {
+            files.read_digest(path)
+        })?;
+        let before = self.inspect_partial_cleanup(pin)?;
+        if !before.service_deleted() || before.process != Some(retained.process) {
+            return Err(OwnerError::Conflict);
+        }
+        let config = self.files.read_digest(&self.config_path)?;
+        let actual = self.observe_once(Some(retained))?;
+        if self.inspect_partial_cleanup(pin)? != before
+            || actual.config_sha256 != config
+            || config.is_none()
+            || actual.alternative_service_present
+            || actual.service.is_some()
+            || actual.retained_interfaces.len() > 1
+            || actual
+                .interface
+                .is_some_and(|interface| interface != retained.interface)
+            || actual
+                .retained_interfaces
+                .iter()
+                .any(|interface| *interface != retained.interface)
+        {
+            return Err(OwnerError::Conflict);
+        }
+        Ok(
+            if actual.interface.is_none() && actual.retained_interfaces.is_empty() {
+                PartialStopProgress::Complete
+            } else {
+                PartialStopProgress::ExactRundown
+            },
+        )
     }
     fn stop_partial_original(
         &mut self,

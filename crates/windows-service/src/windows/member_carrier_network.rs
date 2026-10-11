@@ -343,7 +343,11 @@ pub(crate) mod native {
             window: &NativeBindingsWindow<'_>,
             inspect: impl FnOnce(&NativeNetworkFacts) -> io::Result<T>,
         ) -> io::Result<T> {
-            if !window.matches_source(&self.source) {
+            if window.retirement_slot() != self.source.retirement_slot().map_err(|_| failed())?
+                || !(window.matches_source(&self.source)
+                    || window.retirement_slot().is_some()
+                        && window.matches_running_channel(&self.source))
+            {
                 return Err(failed());
             }
             window

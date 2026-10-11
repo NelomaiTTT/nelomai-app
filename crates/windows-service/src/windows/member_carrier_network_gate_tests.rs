@@ -2580,10 +2580,10 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
             )
         })
     });
-    let metrics = compare_guard_resource_rows(&c, &r, data, [Some(&closed), None]).unwrap();
+    let metrics = compare_guard_resource_rows(&c, &r, data, [Some(&closed), None], None).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 9);
-    assert!(compare_guard_resource_rows(&c, &r, data, [None, None]).is_err());
+    assert!(compare_guard_resource_rows(&c, &r, data, [None, None], None).is_err());
     let mut static_base = r.clone();
     let plan = static_base.pending_guard.as_ref().unwrap();
     let expected = plan.expected.without_permits().unwrap();
@@ -2600,7 +2600,7 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
     compare_static_base_resource_stage(&c, &static_base).unwrap();
     assert!(compare_guard_resource_stage(&c, &static_base).is_err());
     let metrics =
-        compare_sampled_resource_rows(&c, &static_base, data, [Some(&closed), None]).unwrap();
+        compare_sampled_resource_rows(&c, &static_base, data, [Some(&closed), None], None).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 9);
     for fault in 0..5 {
@@ -2614,19 +2614,20 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
             _ => wrong.pending_guard.as_mut().unwrap().desired.members[0] = target,
         }
         assert!(
-            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None]).is_err(),
+            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None], None).is_err(),
             "excluded Guard history fault {fault}"
         );
     }
     r.members[0] = old.members[0].clone();
     assert_eq!(
-        compare_guard_resource_rows(&c, &r, data, [Some(&closed), None]).unwrap()[0].interface,
+        compare_guard_resource_rows(&c, &r, data, [Some(&closed), None], None).unwrap()[0]
+            .interface,
         9
     );
     let mut wrong = closed.clone();
     wrong.proof.process.creation_time += 1;
-    assert!(compare_guard_resource_rows(&c, &r, data, [Some(&wrong), None]).is_err());
-    assert!(compare_guard_resource_rows(&c, &old, data, [Some(&closed), None]).is_err());
+    assert!(compare_guard_resource_rows(&c, &r, data, [Some(&wrong), None], None).is_err());
+    assert!(compare_guard_resource_rows(&c, &old, data, [Some(&closed), None], None).is_err());
     let mut bad = resources.clone();
     bad[1].as_mut().unwrap().phase = rows::Phase::Captured;
     let bad_data = bad.each_ref().map(|row| {
@@ -2638,7 +2639,7 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
             )
         })
     });
-    assert!(compare_guard_resource_rows(&c, &r, bad_data, [Some(&closed), None]).is_err());
+    assert!(compare_guard_resource_rows(&c, &r, bad_data, [Some(&closed), None], None).is_err());
     bad = resources.clone();
     bad[1].as_mut().unwrap().current.interface.policy.metric += 1;
     let bad_data = bad.each_ref().map(|row| {
@@ -2650,7 +2651,17 @@ fn normal_retire_guard_rows_require_typed_original_stopped_history() {
             )
         })
     });
-    assert!(compare_guard_resource_rows(&c, &r, bad_data, [Some(&closed), None]).is_err());
+    assert!(compare_guard_resource_rows(&c, &r, bad_data, [Some(&closed), None], None).is_err());
+    // A retained Delete/held-process exit comparison is distinct from Closed:
+    // both Pair members/static denies remain, but only B supplies a metric.
+    let mut pending = old.clone();
+    pending.network = static_base.network.clone();
+    let target = pending.members[0].as_ref().unwrap();
+    let exact = Some((&target.owner.intent, target.owner.proof.unwrap().process));
+    assert!(compare_sampled_resource_rows(&c, &pending, data, [None, None], None).is_err());
+    let metrics = compare_sampled_resource_rows(&c, &pending, data, [None, None], exact).unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].interface, 9);
 }
 
 // Break: Retire lineage becomes arbitrary membership removal/replacement or
@@ -2691,7 +2702,8 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
     let (c, r) = fixture();
     let resources = resource_records(&c, &r);
     let metrics =
-        compare_sampled_resource_rows(&c, &r, resource_facts(&resources), [None, None]).unwrap();
+        compare_sampled_resource_rows(&c, &r, resource_facts(&resources), [None, None], None)
+            .unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 8);
     assert_eq!(metrics[0].metric, 5);
@@ -2723,7 +2735,8 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
             _ => carrier.creation = None,
         }
         assert!(
-            compare_sampled_resource_rows(&c, &r, resource_facts(&wrong), [None, None]).is_err(),
+            compare_sampled_resource_rows(&c, &r, resource_facts(&wrong), [None, None], None)
+                .is_err(),
             "fault {fault}"
         );
     }
@@ -2739,7 +2752,8 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
             Some((&member.binding, member, Some(&member.current))),
             None
         ],
-        [None, None]
+        [None, None],
+        None
     )
     .is_err());
 
@@ -2758,7 +2772,7 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
             )
         })
     });
-    let metrics = compare_sampled_resource_rows(&c, &r, data, [Some(&closed), None]).unwrap();
+    let metrics = compare_sampled_resource_rows(&c, &r, data, [Some(&closed), None], None).unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0].interface, 9);
     for fault in 0..3 {
@@ -2777,7 +2791,7 @@ fn resource_rows_require_ready_c_addressless_members_and_exact_weak_delta() {
             }
         }
         assert!(
-            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None]).is_err(),
+            compare_sampled_resource_rows(&c, &wrong, data, [Some(&closed), None], None).is_err(),
             "excluded Network history fault {fault}"
         );
     }

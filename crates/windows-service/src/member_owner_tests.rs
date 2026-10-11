@@ -503,6 +503,7 @@ struct State {
     fail_start: bool,
     fail_capture: bool,
     fail_stop: bool,
+    retire_read_then_absent: bool,
     fail_rebind: bool,
     changed_after_capture: bool,
     next_proof: NativeProof,
@@ -720,6 +721,7 @@ fn setup() -> (MemberOwner<Disk, Io>, Shared) {
         fail_start: false,
         fail_capture: false,
         fail_stop: false,
+        retire_read_then_absent: false,
         fail_rebind: false,
         changed_after_capture: false,
         next_proof: proof(),
@@ -3451,6 +3453,29 @@ impl OriginalMemberPartialCleanupIo for OriginIo {
         } // External NIC rundown may lag SAME successful Stop/Delete ACK.
         Ok(())
     }
+    fn retire_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: &NativeProof,
+    ) -> Result<PartialStopProgress> {
+        self.stop_partial_original(pin, Some(retained))?;
+        let original = self.inspect_partial_cleanup(pin)?;
+        if !original.service_deleted() || original.process != Some(retained.process) {
+            return Err(OwnerError::Conflict);
+        }
+        let observation = self.base.0.borrow().observation.clone();
+        if observation.interface.is_some() || !observation.retained_interfaces.is_empty() {
+            if std::mem::take(&mut self.base.0.borrow_mut().retire_read_then_absent) {
+                let mut state = self.base.0.borrow_mut();
+                state.observation.interface = None;
+                state.observation.retained_interfaces.clear();
+                state.fail_stop = false;
+            }
+            Ok(PartialStopProgress::ExactRundown)
+        } else {
+            Ok(PartialStopProgress::Complete)
+        }
+    }
 }
 
 #[test]
@@ -3474,7 +3499,7 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
         owner.io.boundary.image_unavailable_after_exit = true;
         let service_closes = owner.io.boundary.service_closes.clone();
         let mut retained = crate::member_original::RetainedMember::new(owner);
-        let pending = retained.pending_read().unwrap();
+        let mut pending = retained.pending_read().unwrap();
         if published {
             retained.start_with_prior(None).unwrap();
         } else if lost {
@@ -3519,16 +3544,64 @@ fn partial_member_cleanup_lost_running_cas_closes_same_owner_without_live_reader
             assert_eq!(stopping.phase, Phase::Stopping);
             assert_eq!(stopping.proof, obligation.proof);
             assert!(capability.inspect().unwrap().service_deleted());
+            if direct_partial_stop {
+                // Explicit factual rundown retains this SAME owner and Delete
+                // ACK without issuing a Closed receipt while its MIB survives.
+                assert!(
+                    matches!(retained.retire_partial_original(&stopping, &capability).unwrap(),
+                    crate::member_original::PartialMemberRetirement::ExactRundown(record)
+                        if record == stopping)
+                );
+                assert_eq!(service_closes.get(), 1);
+                assert!(retained.original_read().is_err());
+                assert_eq!(retained.snapshot().unwrap().unwrap(), stopping);
+                if slot == B {
+                    state.borrow_mut().retire_read_then_absent = true;
+                    let crate::member_original::PartialMemberRetirement::Complete(stopped, closed) =
+                        retained
+                            .retire_partial_original(&stopping, &capability)
+                            .unwrap()
+                    else {
+                        panic!("natural absence must complete the original")
+                    };
+                    assert_eq!(stopped.retired_proof, obligation.proof);
+                    retained.verify_closed(&closed).unwrap();
+                    capability.verify_closed(&closed).unwrap();
+                    assert_eq!(capability.inspect(), Err(OwnerError::Retired));
+                    assert_eq!(service_closes.get(), 1);
+                    continue;
+                }
+            }
             assert!(retained
                 .stop_partial_original(&stopping, &capability)
                 .is_err());
             assert_eq!(service_closes.get(), 1);
             state.borrow_mut().fail_stop = false;
-            let (stopped, closed) = retained
-                .stop_partial_original(&stopping, &capability)
-                .unwrap();
+            let (stopped, closed) = if direct_partial_stop {
+                match retained
+                    .retire_partial_original(&stopping, &capability)
+                    .unwrap()
+                {
+                    crate::member_original::PartialMemberRetirement::Complete(stopped, closed) => {
+                        (stopped, *closed)
+                    }
+                    crate::member_original::PartialMemberRetirement::ExactRundown(_) => {
+                        panic!("absence must complete this original")
+                    }
+                }
+            } else {
+                retained
+                    .stop_partial_original(&stopping, &capability)
+                    .unwrap()
+            };
             assert_eq!(stopped.retired_proof, obligation.proof);
             retained.verify_closed(&closed).unwrap();
+            capability.verify_closed(&closed).unwrap();
+            assert_eq!(service_closes.get(), 1);
+            assert_eq!(
+                pending.read_closed_proof(&closed).unwrap(),
+                Some((obligation.intent.clone(), obligation.proof.unwrap()))
+            );
             continue;
         }
         let (stopped, closed) = retained

@@ -5,7 +5,9 @@ use crate::member_owner::{
     Intent, Journal, MemberIo, MemberOwner, NativeProof, OriginalMemberRebindIo, OriginalRebindAck,
     OwnerError, Phase, Record, Result,
 };
-use crate::member_owner::{OriginalMemberPartialCleanupIo, PartialServiceObservation};
+use crate::member_owner::{
+    OriginalMemberPartialCleanupIo, PartialServiceObservation, PartialStopProgress,
+};
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
@@ -340,6 +342,14 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> PartialMemberCleanup<J, I> {
     pub(crate) fn intent(&self) -> &Intent {
         &self.intent
     }
+    pub(crate) fn verify_closed(&self, receipt: &ClosedMemberReceipt<J, I>) -> Result<()> {
+        if self.generation != self.shared.read_generation.get()
+            || self.generation != receipt.generation
+        {
+            return Err(OwnerError::Conflict);
+        }
+        verify_original_closed(&self.shared, &self.intent, receipt)
+    }
     pub(crate) fn verify_pending_original(&self, pending: &PendingMemberRead<J, I>) -> Result<()> {
         if !Rc::ptr_eq(&self.shared, &pending.shared)
             || self.intent != pending.intent
@@ -389,6 +399,50 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> PartialMemberCleanup<J, I> {
     }
 }
 impl<J: Journal, I: OriginalMemberPartialCleanupIo> RetainedMember<J, I> {
+    pub(crate) fn retire_partial_original(
+        &mut self,
+        expected: &Record,
+        original: &PartialMemberCleanup<J, I>,
+    ) -> Result<PartialMemberRetirement<J, I>> {
+        original.verify_current()?;
+        if !Rc::ptr_eq(&self.shared, &original.shared) {
+            return Err(OwnerError::Conflict);
+        }
+        self.shared.revoked.set(true);
+        self.shared.deny_cleanup_reentry()?;
+        self.shared.cleanup_busy.set(true);
+        self.shared.cleanup_tainted.set(false);
+        let _attempt = CleanupAttempt {
+            shared: &self.shared,
+        };
+        let mut owner = self
+            .shared
+            .owner
+            .try_borrow_mut()
+            .map_err(|_| OwnerError::Conflict)?;
+        *self.shared.stop_attempt.borrow_mut() = Some(expected.clone());
+        let (record, progress) = owner.retire_partial_original(expected, &original.pin)?;
+        if self.shared.cleanup_tainted.get() {
+            return Err(OwnerError::Conflict);
+        }
+        if progress == PartialStopProgress::ExactRundown {
+            return Ok(PartialMemberRetirement::ExactRundown(record));
+        }
+        *self.shared.completed.borrow_mut() = Some(record.clone());
+        verify_absent(&mut owner, &record)?;
+        if self.shared.cleanup_tainted.get() {
+            return Err(OwnerError::Conflict);
+        }
+        self.shared.receipt_issued.set(true);
+        Ok(PartialMemberRetirement::Complete(
+            record.clone(),
+            Box::new(ClosedMemberReceipt {
+                shared: self.shared.clone(),
+                stopped: record,
+                generation: self.shared.read_generation.get(),
+            }),
+        ))
+    }
     pub(crate) fn stop_partial_original(
         &mut self,
         expected: &Record,
@@ -438,6 +492,10 @@ impl<J: Journal, I: OriginalMemberPartialCleanupIo> RetainedMember<J, I> {
             },
         ))
     }
+}
+pub(crate) enum PartialMemberRetirement<J, I> {
+    Complete(Record, Box<ClosedMemberReceipt<J, I>>),
+    ExactRundown(Record),
 }
 struct PendingReadAttempt<'a, J, I> {
     shared: &'a Shared<J, I>,

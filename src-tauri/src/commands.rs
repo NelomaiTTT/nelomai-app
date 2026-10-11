@@ -1860,6 +1860,7 @@ fn desktop_pair_ui_uses_exact_active_and_committed_readiness_without_private_pay
         primary_ready: true,
         standby_ready: false,
         cleanup_pending: false,
+        retirement_pending: false,
         warm_stop_v1: false,
     };
     assert_eq!(

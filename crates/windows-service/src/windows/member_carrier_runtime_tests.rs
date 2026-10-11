@@ -407,6 +407,41 @@ fn source_callback_fence_retains_the_same_failure_signal_and_brackets_all_facts(
     assert_eq!(calls.get(), 2);
     assert!(!revoked.get());
     assert!(!fence.busy.get());
+    // A selected retirement bracket may observe exact B presence retiring
+    // between samples. Returned facts remain the real before-read; C/A and
+    // immutable partial facts cannot change, and absence cannot become live.
+    for (before_present, after_present, after_original, succeeds) in [
+        (true, false, [1, 2], true),
+        (false, true, [1, 2], false),
+        (true, false, [1, 3], false),
+    ] {
+        let revoked = Rc::new(Cell::new(false));
+        let fence = SourceFence::new(revoked.clone());
+        let calls = Cell::new(0);
+        let result = fence.inspect_inner(
+            false,
+            || {
+                calls.set(calls.get() + 1);
+                Ok::<_, CarrierError>(if calls.get() == 1 {
+                    ([1, 2], before_present)
+                } else {
+                    (after_original, after_present)
+                })
+            },
+            |facts| Ok(facts.1),
+            || CarrierError::Conflict,
+            |before, after| before.0 == after.0 && (before.1 || !after.1),
+        );
+        assert_eq!(
+            result,
+            if succeeds {
+                Ok(before_present)
+            } else {
+                Err(CarrierError::Conflict)
+            }
+        );
+        assert_eq!(revoked.get(), !succeeds);
+    }
     for fault in 0..4 {
         let revoked = Rc::new(Cell::new(false));
         let fence = SourceFence::new(revoked.clone());
@@ -1136,6 +1171,18 @@ fn retiring_member_rows_require_stopped_original_ack_and_still_live_sdk() {
         ResourceRowChannel::Retiring
     )
     .is_err());
+    // A fresh second read may observe exact absence after the selected target's
+    // Stopped baseline was validated; it remains comparison data, never Closed.
+    assert!(compare_resource_rows(
+        &context,
+        &identity,
+        &ack.binding,
+        &ack,
+        &ack,
+        None,
+        ResourceRowChannel::RetiringAbsent
+    )
+    .is_ok());
     assert!(compare_resource_rows(
         &context,
         &identity,
@@ -1181,19 +1228,24 @@ fn retiring_member_rows_require_stopped_original_ack_and_still_live_sdk() {
             3 => target.proof.index += 1,
             _ => target.proof.luid += 1,
         }
-        assert!(
-            compare_resource_rows(
-                &context,
-                &target,
-                &changed.binding,
-                &changed,
-                &protected,
-                None,
-                ResourceRowChannel::Closing
-            )
-            .is_err(),
-            "partial row fault {fault}"
-        );
+        for channel in [
+            ResourceRowChannel::Closing,
+            ResourceRowChannel::RetiringAbsent,
+        ] {
+            assert!(
+                compare_resource_rows(
+                    &context,
+                    &target,
+                    &changed.binding,
+                    &changed,
+                    &protected,
+                    None,
+                    channel
+                )
+                .is_err(),
+                "partial row fault {fault} in {channel:?}"
+            );
+        }
     }
 }
 

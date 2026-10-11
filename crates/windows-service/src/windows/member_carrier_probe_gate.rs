@@ -110,6 +110,18 @@ fn compare_stage(context: &Context, r: &pair::Record, purpose: Purpose) -> Resul
                     Some(pair::Effect::Data(data)),
                 ) => active == data && r.guard.active == Some(data),
                 (pair::Phase::Running, None, None) => r.guard.active == r.active,
+                (pair::Phase::Running, Some(pair::Operation::Retire(target)), pending)
+                    if target != s
+                        && r.active == Some(s)
+                        && r.guard.active == Some(s)
+                        && r.members[idx(target)].is_some()
+                        && r.guard.members[idx(target)]
+                            .as_ref()
+                            .is_some_and(|member| member.probes.is_empty()) =>
+                {
+                    pending == Some(pair::Effect::MemberStop(target))
+                        || pending == Some(pair::Effect::Data(s))
+                }
                 (
                     pair::Phase::Running,
                     Some(
@@ -440,9 +452,88 @@ fn compare_guard_rows(
     desired: &policy::Model,
     facts: GuardRowFacts<'_>,
     history: [Option<&super::member_carrier_members::ClosedMemberBinding>; 2],
+    rundown: Option<(
+        &crate::member_owner::Intent,
+        crate::member_owner::ProcessProof,
+    )>,
 ) -> Result<Vec<InterfaceMetric>> {
-    compare_guard_target(context, r, desired)?;
+    if rundown.is_some() && *desired == r.guard && r.pending_guard.is_none() {
+        compare_identity(context, r)?;
+        desired.validate()?;
+        let intent = rundown.expect("checked rundown").0;
+        let slot = if intent.slot == nelomai_contracts::dispatcher::TunnelSlot::A {
+            Slot::A
+        } else {
+            Slot::B
+        };
+        if r.pending != Some(pair::Effect::MemberStop(slot))
+            && r.pending != Some(pair::Effect::Data(slot.other()))
+        {
+            return Err(GuardError::Conflict);
+        }
+    } else {
+        compare_guard_target(context, r, desired)?;
+    }
     let mut closed_rows = [false; 3];
+    if let Some((intent, process)) = rundown {
+        let i = usize::from(intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B);
+        let slot = if i == 0 { Slot::A } else { Slot::B };
+        let owner = &r.members[i].as_ref().ok_or(GuardError::Conflict)?.owner;
+        let proof = owner.proof.ok_or(GuardError::Conflict)?;
+        let (binding, ack, actual) = facts[i + 1].ok_or(GuardError::Conflict)?;
+        binding.validate().map_err(denied)?;
+        ack.validate().map_err(denied)?;
+        if history[i].is_some()
+            || r.phase != pair::Phase::Running
+            || r.operation != Some(pair::Operation::Retire(slot))
+            || r.active != Some(slot.other())
+            || owner.intent != *intent
+            || proof.process != process
+            || binding.scope != r.scope
+            || binding.boot_id != context.provenance.boot_id
+            || binding.runtime != context.provenance.runtime
+            || binding.network_epoch != context.provenance.network_epoch
+            || binding.role != [rows::Role::MemberA, rows::Role::MemberB][i]
+            || binding.name != context.bindings[i + 1].name
+            || binding.guid != proof.interface.guid
+            || binding.key.index != proof.interface.index
+            || binding.key.luid != proof.interface.luid
+            || r.addresses.as_slice()
+                != [ipnet::IpNet::from(std::net::IpAddr::V4(
+                    binding.address.into(),
+                ))]
+            || ack.binding != *binding
+            || ack.phase != rows::Phase::Stopped
+            || ack.pending.is_some()
+            || ack.creation.is_some()
+            || ack.baseline.address.is_some()
+            || !rows::same_owned(&ack.current, &ack.baseline)
+            || ack.baseline.interface.policy.weak_host_send
+            || ack.baseline.interface.policy.weak_host_receive
+            || ack.baseline.interface.policy.forwarding
+            || ack.baseline.interface.policy.advertising
+            || actual.is_some_and(|actual| !rows::same_owned(actual, &ack.baseline))
+            || !desired.installed
+            || desired.members[i].as_ref().is_none_or(|member| {
+                !member.probes.is_empty()
+                    || member.identity.scope != r.scope
+                    || member.identity.proof != proof.interface
+            })
+            || desired.permits && desired.active != r.active
+            || !desired.permits && desired.active.is_some()
+            || r.network.as_ref().is_none_or(|network| {
+                network.pending.is_some()
+                    || network
+                        .current
+                        .routes
+                        .iter()
+                        .any(|route| route.interface == proof.interface.index)
+            })
+        {
+            return Err(GuardError::Conflict);
+        }
+        closed_rows[i + 1] = true; // Original rundown, never a Closed receipt.
+    }
     for (i, closed) in history.into_iter().enumerate() {
         let Some(closed) = closed else { continue };
         closed.comparison_provider(context).map_err(denied)?;
@@ -1150,8 +1241,39 @@ pub(crate) mod native {
                                 .as_ref()
                                 .map(|r| (&r.binding, &r.acknowledged, r.observed.as_ref()))
                         });
-                        compare_guard_rows(&self.context, record, desired, borrowed, history)
-                            .map_err(native_denied)
+                        let rundown = window
+                            .retirement_slot()
+                            .map(|slot| {
+                                let owner = &record.members[idx(slot)]
+                                    .as_ref()
+                                    .ok_or(GuardError::Conflict)?
+                                    .owner;
+                                let proof = owner.proof.ok_or(GuardError::Conflict)?;
+                                let partial = window
+                                    .partial_member(owner.intent.slot)
+                                    .ok_or(GuardError::Conflict)?;
+                                if record.phase != pair::Phase::Running
+                                    || record.operation != Some(pair::Operation::Retire(slot))
+                                    || record.active != Some(slot.other())
+                                    || partial.0 != owner.intent
+                                    || partial.1 != Some(proof.process)
+                                    || !partial.2
+                                {
+                                    return Err(GuardError::Conflict);
+                                }
+                                Ok((&owner.intent, proof.process))
+                            })
+                            .transpose()
+                            .map_err(native_denied)?;
+                        compare_guard_rows(
+                            &self.context,
+                            record,
+                            desired,
+                            borrowed,
+                            history,
+                            rundown,
+                        )
+                        .map_err(native_denied)
                     })
                     .map_err(denied)?;
                 if desired.permits {
@@ -1194,12 +1316,61 @@ pub(crate) mod native {
                         match original {
                             Some(original) => {
                                 inventory.verify_member_slot(slot, original)?;
-                                if desired.members[i].is_none() {
+                                let retirement = window.retirement_slot() == Some(slot);
+                                if retirement {
+                                    let owner = &record.members[i]
+                                        .as_ref()
+                                        .ok_or(GuardError::Conflict)?
+                                        .owner;
+                                    let partial = window
+                                        .partial_member(owner.intent.slot)
+                                        .ok_or(GuardError::Conflict)?;
+                                    if record.phase != pair::Phase::Running
+                                        || record.operation != Some(pair::Operation::Retire(slot))
+                                        || record.active
+                                            != Some(if slot == Slot::A { Slot::B } else { Slot::A })
+                                        || partial.0 != owner.intent
+                                        || partial.1 != owner.proof.map(|proof| proof.process)
+                                        || !partial.2
+                                        || desired.permits && desired.active != record.active
+                                        || !desired.permits && desired.active.is_some()
+                                        || desired.members[i].as_ref().is_none_or(|member| {
+                                            !member.probes.is_empty()
+                                                || Some(member.identity.proof)
+                                                    != owner.proof.map(|proof| proof.interface)
+                                        })
+                                    {
+                                        return Err(GuardError::Conflict);
+                                    }
+                                }
+                                if desired.members[i].is_none() || retirement {
+                                    if desired.members[i]
+                                        .as_ref()
+                                        .is_some_and(|member| !member.probes.is_empty())
+                                    {
+                                        return Err(GuardError::Conflict);
+                                    }
                                     // Canonical entries retain real close ACKs
                                     // after standby retirement. Never sample a
                                     // closed original through live Source.
                                     original.retired()?;
-                                    compare_guard_probe(record, desired, slot, None, None)?;
+                                    if self.held[i]
+                                        .value
+                                        .try_borrow()
+                                        .map_err(denied)?
+                                        .as_ref()
+                                        .is_some_and(|registration| {
+                                            registration
+                                                .tuple
+                                                .try_borrow()
+                                                .map_or(true, |tuple| tuple.is_some())
+                                        })
+                                    {
+                                        return Err(GuardError::Conflict);
+                                    }
+                                    if !retirement {
+                                        compare_guard_probe(record, desired, slot, None, None)?;
+                                    }
                                     continue;
                                 }
                                 let tuple = original.inspect_tuple_in_window(window)?;
@@ -1362,7 +1533,21 @@ pub(crate) mod native {
                 {
                     return Err(GuardError::Conflict);
                 }
-            } else if self.closing.attempted.get() || !window.matches_source(&self.source) {
+            } else if let Some(slot) = window.retirement_slot() {
+                let selected = self.selected.try_borrow().map_err(denied)?;
+                if self.closing.attempted.get()
+                    || selected.record.phase != pair::Phase::Running
+                    || selected.record.operation != Some(pair::Operation::Retire(slot))
+                    || selected.record.active
+                        != Some(if slot == Slot::A { Slot::B } else { Slot::A })
+                    || !window.matches_running_channel(&self.source)
+                {
+                    return Err(GuardError::Conflict);
+                }
+            } else if self.closing.attempted.get()
+                || self.source.retirement_slot().map_err(denied)?.is_some()
+                || !window.matches_source(&self.source)
+            {
                 return Err(GuardError::Conflict);
             }
             Ok(())
@@ -1443,6 +1628,20 @@ pub(crate) mod native {
                 .inspect_in_window(window, |facts| {
                     if purpose == Purpose::Closing {
                         return Ok(Vec::new());
+                    }
+                    if let Some(slot) = window.retirement_slot() {
+                        if purpose != Purpose::Use(slot.other()) { return Err(native_denied(())); }
+                        let owner = &selected.record.members[idx(slot)].as_ref().ok_or_else(|| native_denied(()))?.owner;
+                        let proof = owner.proof.ok_or_else(|| native_denied(()))?;
+                        let partial = window.partial_member(owner.intent.slot).ok_or_else(|| native_denied(()))?;
+                        if partial.0 != owner.intent || partial.1 != Some(proof.process) || !partial.2 {
+                            return Err(native_denied(()));
+                        }
+                        let borrowed = std::array::from_fn(|i| {
+                            facts.rows[i].as_ref().map(|row| (&row.binding, &row.acknowledged, row.observed.as_ref()))
+                        });
+                        return compare_guard_rows(&self.context, &selected.record, &selected.record.guard,
+                            borrowed, [None, None], Some((&owner.intent, proof.process))).map_err(native_denied);
                     }
                     let borrowed = std::array::from_fn(|i| {
                         facts.rows[i].as_ref().and_then(|r| {
@@ -1873,7 +2072,7 @@ pub(crate) mod native {
                 compare_tuple(&selected.record, slot, tuple)?;
                 root.current(&selected, Some(Purpose::Use(slot)))?;
                 root.source
-                    .inspect_window(|window| {
+                    .inspect_running_window(|window| {
                         root.sample(&selected, Purpose::Use(slot), window)
                             .map_err(native_denied)
                     })

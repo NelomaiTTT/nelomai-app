@@ -603,7 +603,9 @@ impl SourceFence {
         inspect: impl FnOnce(&F) -> std::result::Result<T, E>,
         conflict: impl Fn() -> E,
     ) -> std::result::Result<T, E> {
-        self.inspect_inner(false, sample, inspect, conflict)
+        self.inspect_inner(false, sample, inspect, conflict, |before, after| {
+            before == after
+        })
     }
     fn inspect_cleanup<F: Eq, T, E>(
         &self,
@@ -611,14 +613,17 @@ impl SourceFence {
         inspect: impl FnOnce(&F) -> std::result::Result<T, E>,
         conflict: impl Fn() -> E,
     ) -> std::result::Result<T, E> {
-        self.inspect_inner(true, sample, inspect, conflict)
+        self.inspect_inner(true, sample, inspect, conflict, |before, after| {
+            before == after
+        })
     }
-    fn inspect_inner<F: Eq, T, E>(
+    fn inspect_inner<F, T, E>(
         &self,
         cleanup: bool,
         mut sample: impl FnMut() -> std::result::Result<F, E>,
         inspect: impl FnOnce(&F) -> std::result::Result<T, E>,
         conflict: impl Fn() -> E,
+        stable: impl FnOnce(&F, &F) -> bool,
     ) -> std::result::Result<T, E> {
         if self.busy.get() {
             self.revoked.set(true);
@@ -645,7 +650,7 @@ impl SourceFence {
         let result = inspect(&before)?;
         if self.tainted.get()
             || (!cleanup && self.revoked.get())
-            || sample()? != before
+            || !stable(&before, &sample()?)
             || self.tainted.get()
             || (!cleanup && self.revoked.get())
         {
@@ -1083,6 +1088,7 @@ enum Use {
 enum ResourceRowChannel {
     Source,
     Retiring,
+    RetiringAbsent,
     Closing,
     Closed,
     Retired,
@@ -1187,10 +1193,13 @@ fn compare_resource_rows(
     }
     if matches!(
         channel,
-        ResourceRowChannel::Closed | ResourceRowChannel::Retired
+        ResourceRowChannel::Closed
+            | ResourceRowChannel::Retired
+            | ResourceRowChannel::RetiringAbsent
     ) {
-        // This is usable ONLY when the native window independently carries the
-        // SAME original member's Closed ACK and FULL SDK absence. No old NIC query.
+        // Closed/Retired require their actual receipt and FULL SDK absence.
+        // RetiringAbsent requires SAME partial Delete/exit plus exact missing
+        // native rows in the explicit retirement window; it grants no Closed.
         return if (role != 0 || channel == ResourceRowChannel::Retired)
             && ack.phase == rows::Phase::Stopped
             && observed.is_none()
@@ -1522,6 +1531,18 @@ pub(crate) mod native {
         supervisor: Rc<NativeDeadline>,
         deadline: NativeDeadlineReadPin,
         fence: Rc<super::SourceFence>,
+        retirement: RefCell<Option<Rc<RetirementSelection>>>,
+    }
+    struct RetirementSelection {
+        partial: Rc<crate::windows::member_carrier_member_controller::native::PartialCleanup>,
+        pair: Rc<crate::windows::member_carrier_pair_store::native_store::NativePairIntentRead>,
+        record: crate::member_carrier_pair::Record,
+        slot: nelomai_client_tunnel::redundancy::Slot,
+    }
+    #[derive(PartialEq, Eq)]
+    struct RetirementSample {
+        source: SourceSample,
+        partial: crate::windows::member_carrier_members::native::PartialMemberFact,
     }
     type SourceRevision = (Vec<u8>, Vec<u8>);
     #[derive(PartialEq, Eq)]
@@ -1546,6 +1567,11 @@ pub(crate) mod native {
     }
     enum WindowOrigin<'a> {
         Source(&'a NativeSourceRead, &'a SourceSample),
+        Retirement(
+            &'a NativeSourceRead,
+            &'a Rc<RetirementSelection>,
+            &'a RetirementSample,
+        ),
         Closing(&'a NativeClosingRead, &'a ClosingSample),
         PartialClosing(
             &'a NativeClosingRead,
@@ -1560,6 +1586,21 @@ pub(crate) mod native {
         pub(crate) fn matches_source(&self, source: &NativeSourceRead) -> bool {
             matches!(&self.origin, WindowOrigin::Source(original, _) if std::ptr::eq(*original, source))
         }
+        pub(crate) fn matches_running_channel(&self, source: &NativeSourceRead) -> bool {
+            if self.matches_source(source) {
+                return true;
+            }
+            matches!(&self.origin, WindowOrigin::Retirement(original, selection, _)
+                if std::ptr::eq(*original, source)
+                && source.retirement.try_borrow().ok().is_some_and(|current|
+                    current.as_ref().is_some_and(|current| Rc::ptr_eq(current, selection))))
+        }
+        pub(crate) fn retirement_slot(&self) -> Option<nelomai_client_tunnel::redundancy::Slot> {
+            match &self.origin {
+                WindowOrigin::Retirement(_, selection, _) => Some(selection.slot),
+                _ => None,
+            }
+        }
         pub(crate) fn matches_closing(&self, closing: &NativeClosingRead) -> bool {
             matches!(&self.origin, WindowOrigin::Closing(original, _) | WindowOrigin::PartialClosing(original, _, _) if std::ptr::eq(*original, closing))
         }
@@ -1568,6 +1609,7 @@ pub(crate) mod native {
             partial: &Rc<crate::windows::member_carrier_member_controller::native::PartialCleanup>,
         ) -> bool {
             matches!(&self.origin, WindowOrigin::PartialClosing(_, original, _) if std::ptr::eq(*original, partial.as_ref()))
+                || matches!(&self.origin, WindowOrigin::Retirement(_, original, _) if Rc::ptr_eq(&original.partial, partial))
         }
         pub(crate) fn is_partial_member_cleanup(&self) -> bool {
             matches!(&self.origin, WindowOrigin::PartialClosing(..))
@@ -1575,6 +1617,9 @@ pub(crate) mod native {
         pub(crate) fn matches_runtime(&self, runtime: &RuntimeRead) -> bool {
             match &self.origin {
                 WindowOrigin::Source(source, _) => source.runtime.same_original_runtime(runtime),
+                WindowOrigin::Retirement(source, _, _) => {
+                    source.runtime.same_original_runtime(runtime)
+                }
                 WindowOrigin::Closing(closing, _) => closing.runtime.same_original_runtime(runtime),
                 WindowOrigin::PartialClosing(closing, _, _) => {
                     closing.runtime.same_original_runtime(runtime)
@@ -1589,6 +1634,7 @@ pub(crate) mod native {
         ) -> Option<&crate::windows::member_carrier_members::ClosedMemberBinding> {
             let history = match &self.origin {
                 WindowOrigin::Source(_, sample) => &sample.history,
+                WindowOrigin::Retirement(_, _, sample) => &sample.source.history,
                 WindowOrigin::Closing(_, sample) => &sample.history,
                 WindowOrigin::PartialClosing(_, _, sample) => &sample.history,
             };
@@ -1602,6 +1648,9 @@ pub(crate) mod native {
         ) -> Option<&crate::windows::member_carrier_members::native::PartialMemberFact> {
             let partial = match &self.origin {
                 WindowOrigin::Source(..) => return None,
+                WindowOrigin::Retirement(_, _, sample) => {
+                    return (sample.partial.0.slot == slot).then_some(&sample.partial);
+                }
                 WindowOrigin::Closing(_, sample) | WindowOrigin::PartialClosing(_, _, sample) => {
                     &sample.partial
                 }
@@ -1617,11 +1666,9 @@ pub(crate) mod native {
             read: impl FnOnce(&crate::windows::member_carrier_guard::Bindings) -> Result<T>,
         ) -> Result<T> {
             match &self.origin {
-                WindowOrigin::Source(source, _) => {
-                    source
-                        .fence
-                        .joined_read(false, || read(&self.bindings), || Error::Conflict)
-                }
+                WindowOrigin::Source(source, _) | WindowOrigin::Retirement(source, _, _) => source
+                    .fence
+                    .joined_read(false, || read(&self.bindings), || Error::Conflict),
                 WindowOrigin::Closing(closing, _) => {
                     closing
                         .fence
@@ -2819,8 +2866,9 @@ pub(crate) mod native {
             inspect: impl FnOnce(&NativeResourceRowsFacts) -> Result<T>,
         ) -> Result<T> {
             let cleanup = match &window.origin {
-                WindowOrigin::Source(..)
-                    if window.matches_source(&self.source)
+                WindowOrigin::Source(..) | WindowOrigin::Retirement(..)
+                    if window.matches_running_channel(&self.source)
+                        && window.retirement_slot() == self.source.retirement_slot()?
                         && !self.closing_attempted.get()
                         && !self.generation_pending.get()
                         && !self.revoked.get() =>
@@ -2849,9 +2897,26 @@ pub(crate) mod native {
                 return Err(Error::Conflict);
             }
             let result = window.inspect(|_| {
-                let before = self.sample(window, cleanup, None)?;
+                let retiring = window.retirement_slot().map(|slot| {
+                    1 + usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)
+                });
+                let before = self.sample(window, cleanup, retiring)?;
                 let value = inspect(&before);
-                if self.sample(window, cleanup, None)? != before {
+                let mut after = self.sample(window, cleanup, retiring)?;
+                if let Some(target) = retiring {
+                    if let (Some(original), Some(current)) =
+                        (&before.rows[target], &mut after.rows[target])
+                    {
+                        if original.observed.is_some() && current.observed.is_none() {
+                            // Comparison only: both samplers independently proved
+                            // SAME Stopped baseline/partial Delete+exit. Permit the
+                            // target's one-way rundown without changing returned
+                            // facts or treating absence as a Closed receipt.
+                            current.observed = original.observed.clone();
+                        }
+                    }
+                }
+                if after != before {
                     return Err(Error::Conflict);
                 }
                 value
@@ -3060,7 +3125,7 @@ pub(crate) mod native {
                         .filter(|(intent, _, _, _)| intent.scope == identity.scope)
                 };
                 let partial_deleted = i != 0
-                    && cleanup
+                    && (cleanup || retiring == Some(i))
                     && partial
                         .is_some_and(|(_, process, deleted, _)| *deleted && process.is_some());
                 let partial_absent =
@@ -3068,7 +3133,7 @@ pub(crate) mod native {
                 let read = |ack: rows::RowRecordFacts<'_>| {
                     let protected =
                         rows::Record::decode(before[n].as_ref().ok_or(rows::Error::Journal)?)?;
-                    let (observed, interface_absent) = if closed || partial_absent {
+                    let (mut observed, interface_absent) = if closed || partial_absent {
                         (None, false)
                     } else {
                         match rows::native::read_original_snapshot(ack.binding) {
@@ -3094,7 +3159,11 @@ pub(crate) mod native {
                         &protected,
                         observed.as_ref(),
                         if retiring == Some(i) {
-                            super::ResourceRowChannel::Retiring
+                            if partial_deleted && observed.is_none() {
+                                super::ResourceRowChannel::RetiringAbsent
+                            } else {
+                                super::ResourceRowChannel::Retiring
+                            }
                         } else {
                             super::resource_row_channel(cleanup, closed)
                         },
@@ -3106,12 +3175,20 @@ pub(crate) mod native {
                         {
                             return Err(rows::Error::Conflict);
                         }
-                    } else if !closed
-                        && !partial_absent
-                        && rows::native::read_original_snapshot(ack.binding)?
-                            != *observed.as_ref().unwrap()
-                    {
-                        return Err(rows::Error::Conflict);
+                    } else if !closed && !partial_absent {
+                        match rows::native::read_original_snapshot(ack.binding) {
+                            Ok(after) if Some(&after) == observed.as_ref() => {}
+                            // The first read already authenticated this SAME
+                            // original Stopped baseline. Only the selected,
+                            // Delete/exit-attested target can retire in-bracket.
+                            Err(rows::Error::InterfaceAbsent)
+                                if retiring == Some(i) && partial_deleted =>
+                            {
+                                observed = None;
+                            }
+                            Ok(_) => return Err(rows::Error::Conflict),
+                            Err(error) => return Err(error),
+                        }
                     }
                     Ok(NativeResourceRowFact {
                         binding: ack.binding.clone(),
@@ -3525,6 +3602,7 @@ pub(crate) mod native {
                 supervisor: owner.gate.supervisor().clone(),
                 deadline: owner.gate.supervisor().read_pin().map_err(denied)?,
                 fence: owner.source_fence.clone(),
+                retirement: RefCell::new(None),
             };
             source.inspect(|_| Ok(()))?;
             same_record(&before, owner.current(Use::Live)?).map_err(denied)?;
@@ -3620,6 +3698,304 @@ pub(crate) mod native {
         }
     }
     impl NativeSourceRead {
+        /// Metadata only. The actual window independently proves the protected
+        /// intent, SAME partial pin, fresh C/active originals and full mixed SDK.
+        pub(crate) fn retirement_slot(
+            &self,
+        ) -> Result<Option<nelomai_client_tunnel::redundancy::Slot>> {
+            Ok(self
+                .retirement
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .map(|selection| selection.slot))
+        }
+        pub(crate) fn select_retirement(
+            &self,
+            partial: Rc<crate::windows::member_carrier_member_controller::native::PartialCleanup>,
+            pair: Rc<crate::windows::member_carrier_pair_store::native_store::NativePairIntentRead>,
+            record: &crate::member_carrier_pair::Record,
+        ) -> Result<()> {
+            use crate::member_carrier_pair::{Effect, Operation, Phase};
+            use nelomai_client_tunnel::redundancy::Slot;
+            let slot = match partial.intent().slot {
+                nelomai_contracts::dispatcher::TunnelSlot::A => Slot::A,
+                nelomai_contracts::dispatcher::TunnelSlot::B => Slot::B,
+            };
+            let index = usize::from(slot == Slot::B);
+            record.validate().map_err(denied)?;
+            if record.phase != Phase::Running
+                || record.operation != Some(Operation::Retire(slot))
+                || record.active != Some(slot.other())
+                || record.scope != self.scope.context.intent.scope
+                || record.provenance != self.scope.context.provenance
+                || !matches!(record.pending, None | Some(Effect::Guard))
+                    && record.pending != Some(Effect::MemberStop(slot))
+                    && record.pending != Some(Effect::Data(slot.other()))
+                || !pair.matches_runtime(&self.runtime)
+                || record.members[index]
+                    .as_ref()
+                    .is_none_or(|member| member.owner.intent != *partial.intent())
+            {
+                return Err(Error::Conflict);
+            }
+            pair.inspect(&self.runtime, &self.supervisor, |actual| {
+                if actual != record {
+                    return Err(std::io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(())
+            })
+            .map_err(denied)?;
+            let facts = partial.inspect().map_err(denied)?;
+            if !facts.service_deleted()
+                || facts.process
+                    != record.members[index]
+                        .as_ref()
+                        .and_then(|member| member.owner.proof.map(|proof| proof.process))
+            {
+                return Err(Error::Conflict);
+            }
+            let mut selected = self
+                .retirement
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            if let Some(previous) = selected.as_ref() {
+                if !Rc::ptr_eq(&previous.partial, &partial)
+                    || previous.slot != slot
+                    || previous.record.members != record.members
+                    || previous.record.carrier != record.carrier
+                    || previous.record.provenance != record.provenance
+                    || previous.record.scope != record.scope
+                    || previous.record.revision > record.revision
+                {
+                    return Err(Error::Conflict);
+                }
+            } else if record.pending != Some(Effect::MemberStop(slot)) || record.guard.permits {
+                return Err(Error::Conflict);
+            }
+            *selected = Some(Rc::new(RetirementSelection {
+                partial,
+                pair,
+                record: record.clone(),
+                slot,
+            }));
+            Ok(())
+        }
+        /// Only actual Closed history and fresh full absence can retire this
+        /// comparison channel. Equal MIB absence alone cannot clear it.
+        pub(crate) fn complete_retirement(&self) -> Result<()> {
+            let selection = self
+                .retirement
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .clone()
+                .ok_or(Error::Conflict)?;
+            self.inspect_window(|window| {
+                let closed = window
+                    .closed_member(selection.partial.intent().slot)
+                    .ok_or(Error::Conflict)?;
+                let index =
+                    usize::from(selection.slot == nelomai_client_tunnel::redundancy::Slot::B);
+                if closed.intent != *selection.partial.intent()
+                    || Some(closed.proof)
+                        != selection.record.members[index]
+                            .as_ref()
+                            .and_then(|member| member.owner.proof)
+                {
+                    return Err(Error::Conflict);
+                }
+                Ok(())
+            })?;
+            let mut current = self
+                .retirement
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            if current
+                .as_ref()
+                .is_none_or(|current| !Rc::ptr_eq(current, &selection))
+            {
+                return Err(Error::Conflict);
+            }
+            *current = None;
+            Ok(())
+        }
+        /// Explicit Running retirement channel. Normal Source entry points keep
+        /// their original full-live contract and never mint this window.
+        pub(crate) fn inspect_running_window<T>(
+            &self,
+            inspect: impl FnOnce(&NativeBindingsWindow<'_>) -> Result<T>,
+        ) -> Result<T> {
+            let selection = self
+                .retirement
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .clone();
+            let Some(selection) = selection else {
+                return self.inspect_window(inspect);
+            };
+            self.fence.inspect_inner(
+                false,
+                || self.sample_retirement(&selection),
+                |facts| {
+                    let projected = super::closing_comparison_bindings(
+                        &self.scope.context,
+                        &facts.source.original,
+                        &facts.source.members,
+                        &[],
+                    )
+                    .map_err(denied)?;
+                    if projected.carrier.as_ref() != Some(&facts.source.carrier) {
+                        return Err(Error::Conflict);
+                    }
+                    let window = NativeBindingsWindow {
+                        origin: WindowOrigin::Retirement(self, &selection, facts),
+                        bindings: crate::windows::member_carrier_guard::Bindings {
+                            service_domains: facts.source.service_domains.clone(),
+                            scope: projected.scope,
+                            carrier: projected.carrier,
+                            egress: projected.egress,
+                        },
+                    };
+                    inspect(&window)
+                },
+                || Error::Conflict,
+                |before, after| {
+                    before.source == after.source
+                        && before.partial.0 == after.partial.0
+                        && before.partial.1 == after.partial.1
+                        && before.partial.2 == after.partial.2
+                        // Both samples independently authenticate the exact
+                        // original Delete/exit and full C/A + mixed SDK census.
+                        // Native presence may only retire, never reappear.
+                        && (before.partial.3 || !after.partial.3)
+                },
+            )
+        }
+        fn sample_retirement(
+            &self,
+            selection: &Rc<RetirementSelection>,
+        ) -> Result<RetirementSample> {
+            if self
+                .retirement
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .is_none_or(|current| !Rc::ptr_eq(current, selection))
+            {
+                return Err(Error::Conflict);
+            }
+            selection
+                .pair
+                .inspect(&self.runtime, &self.supervisor, |actual| {
+                    if actual != &selection.record {
+                        return Err(std::io::ErrorKind::PermissionDenied.into());
+                    }
+                    Ok(())
+                })
+                .map_err(denied)?;
+            let revision = self.revision()?;
+            let captured = self
+                .address
+                .read(
+                    &self.scope.context.intent.scope,
+                    self.scope.context.provenance.network_epoch,
+                )
+                .map_err(denied)?;
+            let (original, members, domains, partial) = self
+                .originals
+                .inspect_carrier_identity(&self.scope, false, |actual, live| {
+                    use crate::windows::member_carrier_provider::{
+                        Expected, ExpectedProvider, ProviderKind,
+                    };
+                    if live != Some(actual) {
+                        return Err(creators::Error::Conflict);
+                    }
+                    let identity = &actual.identity;
+                    let carrier = ExpectedProvider {
+                        identity: Expected {
+                            guid: identity.guid,
+                            luid: identity.luid,
+                            index: identity.index,
+                            name: identity.name.clone(),
+                            description: identity.description.clone(),
+                            if_type: identity.if_type,
+                            tunnel_type: identity.tunnel_type,
+                        },
+                        kind: ProviderKind::Wintun,
+                    };
+                    let (members, domains, partial, active) = self
+                        .members
+                        .read_retirement_bindings(
+                            &self.scope.context,
+                            &self.runtime,
+                            &self.image,
+                            &carrier,
+                            &selection.partial,
+                        )
+                        .map_err(|_| creators::Error::Conflict)?;
+                    let active_index =
+                        usize::from(selection.slot == nelomai_client_tunnel::redundancy::Slot::A);
+                    if selection.record.members[active_index]
+                        .as_ref()
+                        .is_none_or(|member| {
+                            member.owner.intent != active.0 || member.owner.proof != Some(active.1)
+                        })
+                    {
+                        return Err(creators::Error::Conflict);
+                    }
+                    Ok((identity.clone(), members, domains, partial))
+                })
+                .map_err(denied)?;
+            let index = usize::from(selection.slot == nelomai_client_tunnel::redundancy::Slot::B);
+            let proof = selection.record.members[index]
+                .as_ref()
+                .and_then(|member| member.owner.proof)
+                .ok_or(Error::Conflict)?;
+            if partial.0 != *selection.partial.intent()
+                || partial.1 != Some(proof.process)
+                || !partial.2
+                || members.len() != 2
+                || members[index].identity.guid != proof.interface.guid
+                || members[index].identity.index != proof.interface.index
+                || members[index].identity.luid != proof.interface.luid
+            {
+                return Err(Error::Conflict);
+            }
+            let rows = source_sdk_snapshot(captured.binding)?;
+            let carrier = super::ready_source_comparison(
+                &self.scope.context,
+                &original,
+                captured.binding,
+                captured.captured,
+                &crate::member_carrier_rows::Record::decode(&revision.1).map_err(denied)?,
+                &rows,
+            )
+            .map_err(denied)?;
+            if revision != self.revision()? {
+                return Err(Error::Conflict);
+            }
+            selection
+                .pair
+                .inspect(&self.runtime, &self.supervisor, |actual| {
+                    if actual != &selection.record {
+                        return Err(std::io::ErrorKind::PermissionDenied.into());
+                    }
+                    Ok(())
+                })
+                .map_err(denied)?;
+            Ok(RetirementSample {
+                source: SourceSample {
+                    service_domains: domains,
+                    revision,
+                    rows,
+                    original,
+                    carrier,
+                    members,
+                    history: Vec::new(),
+                },
+                partial,
+            })
+        }
         /// Original inventory identity only. No read, mutation or SDK authority
         /// is inferred from this comparison; generation changes still require
         /// independent whole Source windows before and after the transition.

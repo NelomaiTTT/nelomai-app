@@ -191,6 +191,13 @@ pub(crate) trait OriginalMemberRebindIo: MemberIo {
 
 /// Separate SAME retained NEW-service cleanup boundary. No live/NIC grant and
 /// no fallback to name/PID lookup or committed Running metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PartialStopProgress {
+    Complete,
+    /// SAME Stop/Delete and held-process exit, with only the exact retained MIB.
+    /// This is comparison evidence only, never a Closed receipt or an allow grant.
+    ExactRundown,
+}
 pub(crate) trait OriginalMemberPartialCleanupIo: MemberIo {
     type CleanupPin;
     fn partial_cleanup_pin(&mut self, intent: &Intent) -> Result<Self::CleanupPin>;
@@ -203,6 +210,14 @@ pub(crate) trait OriginalMemberPartialCleanupIo: MemberIo {
         pin: &Self::CleanupPin,
         retained: Option<&NativeProof>,
     ) -> Result<()>;
+    fn retire_partial_original(
+        &mut self,
+        pin: &Self::CleanupPin,
+        retained: &NativeProof,
+    ) -> Result<PartialStopProgress> {
+        self.stop_partial_original(pin, Some(retained))?;
+        Ok(PartialStopProgress::Complete)
+    }
 }
 pub(crate) trait OriginalServiceCleanupNative: OriginalMemberNative {
     fn service_cleanup_facts(
@@ -1593,6 +1608,83 @@ pub(crate) struct MemberOwner<J, I> {
 }
 
 impl<J: Journal, I: OriginalMemberPartialCleanupIo> MemberOwner<J, I> {
+    /// Normal retirement only. The caller must independently authenticate the
+    /// protected Pair intent, full mixed SDK inventory and all WFP/network roots.
+    /// Ordinary cleanup keeps its existing synchronous stop/Closed contract.
+    pub(crate) fn retire_partial_original(
+        &mut self,
+        expected: &Record,
+        pin: &I::CleanupPin,
+    ) -> Result<(Record, PartialStopProgress)> {
+        self.original_read_revoked = true;
+        self.io.revoke_original();
+        if self.cleanup_only
+            || !matches!(expected.phase, Phase::Running | Phase::Stopping)
+            || expected.previous_config_sha256.is_some()
+            || self.original_run.as_ref().is_none_or(|original| {
+                original.running.intent != expected.intent
+                    || original.running.proof != expected.proof
+            })
+        {
+            return Err(OwnerError::Retired);
+        }
+        self.require_current(expected)?;
+        let proof = expected.proof.ok_or(OwnerError::Pending)?;
+        self.io.inspect_partial_cleanup(pin)?;
+        self.require_current(expected)?;
+        let mut stopping = expected.clone();
+        stopping.phase = Phase::Stopping;
+        if &stopping != expected {
+            self.journal
+                .compare_exchange(self.intent.slot, Some(expected), &stopping)?;
+        }
+        self.require_current(&stopping)?;
+        if self.io.retire_partial_original(pin, &proof)? == PartialStopProgress::Complete {
+            return self
+                .stop_partial_original(&stopping, pin)
+                .map(|stopped| (stopped, PartialStopProgress::Complete));
+        }
+        let original = self.io.inspect_partial_cleanup(pin)?;
+        if !original.service_deleted() || original.process != Some(proof.process) {
+            return Err(OwnerError::Conflict);
+        }
+        self.require_current(&stopping)?;
+        let before = self.io.inspect(&self.intent, Some(&proof))?;
+        if before.config_sha256 != Some(self.intent.config_sha256)
+            || before.service.is_some()
+            || before.alternative_service_present
+            || before.retained_interfaces.len() > 1
+            || before
+                .interface
+                .is_some_and(|interface| interface != proof.interface)
+            || before
+                .retained_interfaces
+                .iter()
+                .any(|interface| *interface != proof.interface)
+        {
+            return Err(OwnerError::Conflict);
+        }
+        if before.interface.is_none() && before.retained_interfaces.is_empty() {
+            return self
+                .stop_partial_original(&stopping, pin)
+                .map(|stopped| (stopped, PartialStopProgress::Complete));
+        }
+        self.require_current(&stopping)?;
+        let after = self.io.inspect(&self.intent, Some(&proof))?;
+        if self.io.inspect_partial_cleanup(pin)? != original {
+            return Err(OwnerError::Conflict);
+        }
+        if after.config_sha256 == before.config_sha256 && require_no_native(&after).is_ok() {
+            return self
+                .stop_partial_original(&stopping, pin)
+                .map(|stopped| (stopped, PartialStopProgress::Complete));
+        }
+        if after != before {
+            return Err(OwnerError::Conflict);
+        }
+        self.require_current(&stopping)?;
+        Ok((stopping, PartialStopProgress::ExactRundown))
+    }
     pub(crate) fn partial_cleanup_pin(&mut self) -> Result<I::CleanupPin> {
         self.original_read_revoked = true;
         self.io.revoke_original();

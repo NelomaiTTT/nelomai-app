@@ -240,7 +240,7 @@ fn legacy_responses_omit_redundancy_and_new_snapshots_roundtrip() {
             "role_generation":3,"membership_generation":4,"role_confirmed":true},
         "leases":["22222222-2222-4222-8222-222222222222",null],
         "current_leases":["22222222-2222-4222-8222-222222222222",null],"standby_failed":false,"stalled":false,
-        "primary_ready":false,"standby_ready":false,"cleanup_pending":false,"warm_stop_v1":true});
+        "primary_ready":false,"standby_ready":false,"cleanup_pending":false,"retirement_pending":false,"warm_stop_v1":true});
     let restored = decode_response(&frame(&with_snapshot)).unwrap();
     assert_eq!(serde_json::to_value(restored).unwrap(), with_snapshot);
 }
@@ -252,7 +252,7 @@ fn snapshot(phase: SessionPhase, primary_ready: bool, cleanup_pending: bool) -> 
             "role_generation":3,"membership_generation":4,"role_confirmed":true},
         "leases":["22222222-2222-4222-8222-222222222222",null],
         "current_leases":["22222222-2222-4222-8222-222222222222",null],"standby_failed":false,"stalled":false,
-        "primary_ready":primary_ready,"standby_ready":false,"cleanup_pending":cleanup_pending,"warm_stop_v1":true})).unwrap()
+        "primary_ready":primary_ready,"standby_ready":false,"cleanup_pending":cleanup_pending,"retirement_pending":false,"warm_stop_v1":true})).unwrap()
 }
 
 struct Backend {

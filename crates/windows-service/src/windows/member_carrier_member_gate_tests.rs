@@ -1489,7 +1489,34 @@ fn retirement_rows_restore_only_target_and_keep_c_other_weak_and_original() {
 
 #[test]
 fn retirement_postflight_uses_original_closed_target_rows_without_old_nic_query() {
-    let (c, r, _) = retirement(Slot::B);
+    let (c, mut r, _) = retirement(Slot::B);
+    let mut members = r.guard.members.clone();
+    members[1].as_mut().unwrap().probes.clear();
+    r.guard = policy::Model::new(
+        r.scope.clone(),
+        r.guard.carrier.clone().unwrap(),
+        members,
+        Some(Slot::A),
+    )
+    .unwrap()
+    .inherit_sublayer_weight(&r.guard)
+    .unwrap();
+    assert!(guard(&r, Use::Retired(1), &r.guard.expected).is_err());
+    guard(&r, Use::Rundown(1), &r.guard.expected).unwrap();
+    let mut transition = r.clone();
+    transition.guard = r.guard.without_permits().unwrap();
+    transition.pending = Some(pair::Effect::Guard);
+    transition.pending_guard =
+        Some(policy::ExchangePlan::new(&transition.guard, &r.guard).unwrap());
+    transition.validate().unwrap();
+    assert!(guard(&transition, Use::Retired(1), &transition.guard.expected).is_err());
+    guard(&transition, Use::Rundown(1), &transition.guard.expected).unwrap();
+    assert!(guard(&transition, Use::Rundown(1), &r.guard.expected).is_err());
+    transition.guard = r.guard.clone();
+    transition.pending = Some(pair::Effect::Data(Slot::A));
+    transition.pending_guard = None;
+    transition.validate().unwrap();
+    guard(&transition, Use::Rundown(1), &transition.guard.expected).unwrap();
     let mut records = [
         Some(row(&c, &r, 0, Use::Reserve)),
         Some(row(&c, &r, 1, Use::Reserve)),

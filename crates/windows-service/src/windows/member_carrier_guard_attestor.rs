@@ -23,6 +23,7 @@ struct BindingFacts<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowChannel {
     Source,
+    Retirement,
     Closing,
     Retired,
 }
@@ -715,6 +716,27 @@ pub(crate) mod native {
         .map(|slot| window.closed_member(slot))
     }
     impl Originals {
+        fn selected_channel(&self, selected: &Selected) -> Result<WindowChannel> {
+            let channel = window_channel(&selected.record)?;
+            if channel == WindowChannel::Source {
+                if let Some(slot) = self
+                    .source
+                    .as_ref()
+                    .ok_or(GuardError::Conflict)?
+                    .retirement_slot()
+                    .map_err(denied)?
+                {
+                    if selected.record.phase != pair::Phase::Running
+                        || selected.record.operation != Some(pair::Operation::Retire(slot))
+                        || selected.record.active != Some(slot.other())
+                    {
+                        return Err(GuardError::Conflict);
+                    }
+                    return Ok(WindowChannel::Retirement);
+                }
+            }
+            Ok(channel)
+        }
         fn continuity(&self, selected: &Selected) -> Result<()> {
             compare_pair(&self.context, &selected.record)?;
             cancellation(&selected.record, self.cancelled.load(Ordering::Acquire))?;
@@ -737,7 +759,7 @@ pub(crate) mod native {
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()> {
             self.continuity(selected)?;
-            let original = match window_channel(&selected.record)? {
+            let original = match self.selected_channel(selected)? {
                 WindowChannel::Closing => self
                     .closing
                     .value
@@ -755,10 +777,38 @@ pub(crate) mod native {
                     .source
                     .as_ref()
                     .is_some_and(|s| window.matches_source(s)),
+                WindowChannel::Retirement => self.source.as_ref().is_some_and(|source| {
+                    window.retirement_slot().is_some() && window.matches_running_channel(source)
+                }),
                 WindowChannel::Retired => false,
             };
             if !original || !window.matches_runtime(&self.runtime) {
                 return Err(GuardError::Conflict);
+            }
+            if let Some(slot) = window.retirement_slot() {
+                let index = usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B);
+                let saved = selected.record.members[index]
+                    .as_ref()
+                    .ok_or(GuardError::Conflict)?;
+                let proof = saved.owner.proof.ok_or(GuardError::Conflict)?;
+                let partial = window
+                    .partial_member(saved.owner.intent.slot)
+                    .ok_or(GuardError::Conflict)?;
+                if selected.record.operation != Some(pair::Operation::Retire(slot))
+                    || selected.record.active != Some(slot.other())
+                    || partial.0 != saved.owner.intent
+                    || partial.1 != Some(proof.process)
+                    || !partial.2
+                    || window.bindings().egress[index]
+                        .as_ref()
+                        .is_none_or(|actual| actual.proof != proof.interface)
+                    || selected.record.guard.permits
+                        && selected.record.guard.members[index]
+                            .as_ref()
+                            .is_none_or(|member| !member.probes.is_empty())
+                {
+                    return Err(GuardError::Conflict);
+                }
             }
             compare_bindings_with_history(
                 &self.context,
@@ -817,7 +867,7 @@ pub(crate) mod native {
             call: impl FnOnce(&NativeBindingsWindow<'_>) -> wintun::Result<T>,
         ) -> Result<T> {
             // No live-C window is a retired C/full SDK EMPTY capability.
-            let channel = window_channel(&selected.record)?;
+            let channel = self.selected_channel(selected)?;
             if channel == WindowChannel::Retired {
                 return Err(GuardError::Conflict);
             }
@@ -835,6 +885,12 @@ pub(crate) mod native {
                         .as_ref()
                         .ok_or_else(|| io_denied(()))?
                         .inspect_window(checked)
+                        .map_err(io_denied)
+                } else if channel == WindowChannel::Retirement {
+                    self.source
+                        .as_ref()
+                        .ok_or_else(|| io_denied(()))?
+                        .inspect_running_window(checked)
                         .map_err(io_denied)
                 } else {
                     self.source

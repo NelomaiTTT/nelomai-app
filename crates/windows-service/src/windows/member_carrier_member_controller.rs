@@ -1450,7 +1450,7 @@ pub(crate) mod native {
     type Member = RetainedMember<MemberFiles, NativeMemberIo<MemberFiles>>;
     pub(crate) type NativeMemberRead = OriginalMemberRead<MemberFiles, NativeMemberIo<MemberFiles>>;
     type Reader = NativeMemberRead;
-    type Closed = ClosedMemberReceipt<MemberFiles, NativeMemberIo<MemberFiles>>;
+    pub(crate) type Closed = ClosedMemberReceipt<MemberFiles, NativeMemberIo<MemberFiles>>;
     pub(crate) type RetiredOriginal =
         RetiredMemberGeneration<MemberFiles, NativeMemberIo<MemberFiles>>;
     pub(crate) type Pending = PendingMemberRead<MemberFiles, NativeMemberIo<MemberFiles>>;
@@ -4333,6 +4333,7 @@ pub(crate) mod native {
                             member: state.retained.take().expect("SAME prepared retained owner"),
                             pending: state.pending.take().expect("SAME pending original"),
                             partial_cleanup: None,
+                            retirement_pending: false,
                             context: origin.context.clone(),
                             intent: origin.intent.clone(),
                             runtime,
@@ -4411,6 +4412,17 @@ pub(crate) mod native {
             intent: &Intent,
             window: &NativeBindingsWindow<'_>,
         ) -> Result<()>;
+        /// Read-only same-owner rundown/Closed comparison. A-only DATA may
+        /// remain installed; target static deny and original resources persist.
+        fn authorize_rundown(
+            &mut self,
+            context: &Context,
+            pair: &PairRecord,
+            intent: &Intent,
+            original: &Rc<PartialCleanup>,
+            closed: Option<&Closed>,
+            window: &NativeBindingsWindow<'_>,
+        ) -> Result<()>;
         /// Mandatory separate cleanup authorization for an actual enrolled
         /// owner whose Start/read/registration did not return a usable live
         /// reader. No old-live Source window or inferred SDK identity exists.
@@ -4435,6 +4447,7 @@ pub(crate) mod native {
         member: Member,
         pending: Pending,
         partial_cleanup: Option<Rc<PartialCleanup>>,
+        retirement_pending: bool,
         context: Context,
         intent: Intent,
         runtime: RuntimeRead,
@@ -4509,9 +4522,15 @@ pub(crate) mod native {
             validate_original_observation(&owned.context, expected, running, &actual)?;
             owned
                 .original_source
-                .inspect_window(|window| {
+                .inspect_running_window(|window| {
                     let index = slot_index(owned.intent.slot);
-                    if !window.matches_source(&owned.original_source)
+                    if !window.matches_running_channel(&owned.original_source)
+                        || window.retirement_slot().is_some_and(|slot| {
+                            expected.phase != pair::Phase::Running
+                                || expected.operation != Some(pair::Operation::Retire(slot))
+                                || expected.active != Some(slot.other())
+                                || slot == shared_slot(owned.intent.slot)
+                        })
                         || !window.matches_runtime(&owned.runtime)
                         || window.closed_member(owned.intent.slot).is_some()
                         || window.bindings().egress[index].as_ref().is_none_or(|i| {
@@ -4912,6 +4931,145 @@ pub(crate) mod native {
             self.retire_inner(pair_read, expected, lock)
                 .map_err(pending_unknown)
         }
+        pub(crate) fn retirement_original(&self) -> Result<Rc<PartialCleanup>> {
+            let owned = self.root.owner.as_ref().ok_or(Error::Retired)?;
+            if !self.root.registered || !owned.retirement_pending {
+                return Err(Error::Conflict);
+            }
+            let original = owned.partial_cleanup.as_ref().ok_or(Error::Pending)?;
+            original
+                .verify_pending_original(&owned.pending)
+                .map_err(owner_error)?;
+            Ok(original.clone())
+        }
+        pub(crate) fn attest_rundown(
+            &mut self,
+            pair: &NativePairIntentRead,
+            expected: &PairRecord,
+            lock: &mut KeyLock,
+        ) -> Result<()> {
+            let original = self.retirement_original()?;
+            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
+            owned.retirement_envelope(pair, expected, lock)?;
+            owned
+                .original_source
+                .inspect_running_window(|window| {
+                    owned
+                        .gate
+                        .try_borrow_mut()
+                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)?
+                        .authorize_rundown(
+                            &owned.context,
+                            expected,
+                            &owned.intent,
+                            &original,
+                            None,
+                            window,
+                        )
+                        .map_err(|_| super::super::member_carrier_wintun::Error::Conflict)
+                })
+                .map_err(|_| Error::Conflict)?;
+            owned.retirement_envelope(pair, expected, lock)
+        }
+        /// Factual same-owner result only. Caller must select the typed Source
+        /// on ExactRundown, or reselect full Closed Source and run retire's
+        /// independent postflight before returning completed retirement.
+        pub(crate) fn retire_progress(
+            &mut self,
+            pair: &NativePairIntentRead,
+            expected: &PairRecord,
+            lock: &mut KeyLock,
+        ) -> Result<nelomai_client_tunnel::redundancy::control::RetirementProgress> {
+            use crate::member_original::PartialMemberRetirement;
+            use nelomai_client_tunnel::redundancy::control::RetirementProgress;
+            if !self.root.registered {
+                return Err(Error::Pending);
+            }
+            if self.root.closed.is_some() {
+                return Ok(RetirementProgress::Complete);
+            }
+            if self
+                .root
+                .owner
+                .as_ref()
+                .ok_or(Error::Retired)?
+                .retirement_pending
+            {
+                self.attest_rundown(pair, expected, lock)?;
+            }
+            let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
+            owned.retirement_envelope(pair, expected, lock)?;
+            if !owned.retirement_pending {
+                owned.retirement_preflight(pair, expected, lock)?;
+                if owned.partial_cleanup.is_some() {
+                    return Err(Error::Conflict);
+                }
+                owned.partial_cleanup = Some(Rc::new(
+                    owned.pending.partial_cleanup().map_err(owner_error)?,
+                ));
+                owned.inventory.register_partial_cleanup(
+                    &owned.source,
+                    &owned.pending,
+                    owned.partial_cleanup.as_ref().ok_or(Error::Pending)?,
+                )?;
+            }
+            let original = owned.partial_cleanup.as_ref().ok_or(Error::Pending)?;
+            original
+                .verify_pending_original(&owned.pending)
+                .map_err(owner_error)?;
+            let current = owned
+                .member
+                .snapshot()
+                .map_err(owner_error)?
+                .ok_or(Error::Pending)?;
+            let saved = &expected.members[slot_index(owned.intent.slot)]
+                .as_ref()
+                .ok_or(Error::Conflict)?
+                .owner;
+            if current.intent != saved.intent
+                || current.proof != saved.proof
+                || current.phase
+                    != if owned.retirement_pending {
+                        MemberPhase::Stopping
+                    } else {
+                        MemberPhase::Running
+                    }
+            {
+                return Err(Error::Conflict);
+            }
+            match owned
+                .member
+                .retire_partial_original(&current, original)
+                .map_err(owner_error)?
+            {
+                PartialMemberRetirement::ExactRundown(stopping) => {
+                    if stopping.phase != MemberPhase::Stopping
+                        || stopping.intent != current.intent
+                        || stopping.proof != current.proof
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    owned.retirement_pending = true;
+                    Ok(RetirementProgress::ExactRundown)
+                }
+                PartialMemberRetirement::Complete(stopped, receipt) => {
+                    // Root the sole actual Closed before any fallible registration.
+                    self.root.completed = false;
+                    self.root.stopped = Some(stopped);
+                    self.root.closed = Some(Rc::new(*receipt));
+                    owned.inventory.read_pin().closed_retirement(
+                        slot_index(owned.intent.slot),
+                        self.root.closed.as_ref().ok_or(Error::Pending)?,
+                        pair,
+                        expected,
+                        &owned.supervisor,
+                        owned.retirement_pending.then_some(original),
+                    )?;
+                    self.root.closed_registered = true;
+                    Ok(RetirementProgress::Complete)
+                }
+            }
+        }
         fn retire_inner(
             &mut self,
             pair_read: &NativePairIntentRead,
@@ -4940,6 +5098,10 @@ pub(crate) mod native {
             let mut inventory = owned.inventory.read_pin();
             let supervisor = owned.supervisor.clone();
             let index = slot_index(owned.intent.slot);
+            let rundown = owned
+                .retirement_pending
+                .then(|| owned.partial_cleanup.clone())
+                .flatten();
             self.root
                 .stop(
                     |owned| {
@@ -4969,6 +5131,7 @@ pub(crate) mod native {
                             pair_read,
                             expected,
                             &supervisor,
+                            rundown.as_ref(),
                         )
                     },
                     |stopped, receipt, (owned, reader)| {
@@ -5000,15 +5163,17 @@ pub(crate) mod native {
                                 let history = window
                                     .closed_member(owned.intent.slot)
                                     .ok_or(super::super::member_carrier_wintun::Error::Conflict)?;
-                                validate_retirement_history(
-                                    &owned.context,
-                                    expected,
-                                    &owned.intent,
-                                    history,
-                                )
-                                .map_err(|_| {
-                                    super::super::member_carrier_wintun::Error::Conflict
-                                })?;
+                                if !owned.retirement_pending {
+                                    validate_retirement_history(
+                                        &owned.context,
+                                        expected,
+                                        &owned.intent,
+                                        history,
+                                    )
+                                    .map_err(|_| {
+                                        super::super::member_carrier_wintun::Error::Conflict
+                                    })?;
+                                }
                                 if history.proof != actual_proof
                                     || window
                                         .closed_member(if index == 0 {
@@ -5035,21 +5200,31 @@ pub(crate) mod native {
                                         super::super::member_carrier_wintun::Error::Conflict,
                                     );
                                 }
-                                owned
-                                    .gate
-                                    .try_borrow_mut()
-                                    .map_err(|_| {
-                                        super::super::member_carrier_wintun::Error::Conflict
-                                    })?
-                                    .authorize_retire(
+                                let mut gate = owned.gate.try_borrow_mut().map_err(|_| {
+                                    super::super::member_carrier_wintun::Error::Conflict
+                                })?;
+                                let authorized = if owned.retirement_pending {
+                                    gate.authorize_rundown(
+                                        &owned.context,
+                                        expected,
+                                        &owned.intent,
+                                        owned.partial_cleanup.as_ref().ok_or(
+                                            super::super::member_carrier_wintun::Error::Conflict,
+                                        )?,
+                                        Some(receipt.as_ref()),
+                                        window,
+                                    )
+                                } else {
+                                    gate.authorize_retire(
                                         &owned.context,
                                         expected,
                                         &owned.intent,
                                         window,
                                     )
-                                    .map_err(|_| {
-                                        super::super::member_carrier_wintun::Error::Conflict
-                                    })
+                                };
+                                authorized.map_err(|_| {
+                                    super::super::member_carrier_wintun::Error::Conflict
+                                })
                             })
                             .map_err(|_| Error::Conflict)?;
                         owned.retirement_envelope(pair_read, expected, lock)
@@ -5319,12 +5494,48 @@ pub(crate) mod native {
             lock: &mut KeyLock,
         ) -> Result<()> {
             self.verify_sources()?;
-            validate_member_operation(
-                &self.context,
-                expected,
-                &self.intent,
-                MemberOperation::Retire,
-            )?;
+            if self.retirement_pending {
+                expected.validate().map_err(|_| Error::Conflict)?;
+                let slot = shared_slot(self.intent.slot);
+                if !matches!(expected.pending, None | Some(pair::Effect::Guard))
+                    && expected.pending != Some(pair::Effect::MemberStop(slot))
+                    && expected.pending != Some(pair::Effect::Data(slot.other()))
+                    || (expected.pending == Some(pair::Effect::Guard))
+                        != expected.pending_guard.is_some()
+                {
+                    return Err(Error::Conflict);
+                }
+                if expected.guard.permits && expected.guard.active != expected.active
+                    || expected.guard.members[slot_index(self.intent.slot)]
+                        .as_ref()
+                        .is_none_or(|member| expected.guard.permits && !member.probes.is_empty())
+                {
+                    return Err(Error::Conflict);
+                }
+                // Current Pair remains original. This comparison projection
+                // preserves initial frame checks; separate rundown G verifies
+                // the real A-only WFP and SAME partial/Closed before any result.
+                let mut denied = expected.clone();
+                denied.guard = denied
+                    .guard
+                    .without_permits()
+                    .map_err(|_| Error::Conflict)?;
+                denied.pending = Some(pair::Effect::MemberStop(slot));
+                denied.pending_guard = None;
+                validate_member_operation(
+                    &self.context,
+                    &denied,
+                    &self.intent,
+                    MemberOperation::Retire,
+                )?;
+            } else {
+                validate_member_operation(
+                    &self.context,
+                    expected,
+                    &self.intent,
+                    MemberOperation::Retire,
+                )?;
+            }
             let bytes = self
                 .runtime
                 .record(&self.context, RecordKind::NativeCarrierReceipts)?;
@@ -5339,13 +5550,12 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
-            pair.inspect_effect(
-                &self.runtime,
-                &self.supervisor,
-                expected,
-                pair::Effect::MemberStop(shared_slot(self.intent.slot)),
-                |_| Ok(()),
-            )
+            pair.inspect(&self.runtime, &self.supervisor, |actual| {
+                if actual != expected {
+                    return Err(io::Error::other("retirement Pair changed"));
+                }
+                Ok(())
+            })
             .map_err(|_| Error::Conflict)?;
             if !self.runtime.matches_lock(lock)
                 || self

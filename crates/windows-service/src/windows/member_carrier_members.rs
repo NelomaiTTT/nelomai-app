@@ -894,6 +894,13 @@ pub(crate) mod native {
         bool,
     );
 
+    type RetirementBindings = (
+        Vec<ExpectedProvider>,
+        Vec<crate::member_owner::ServiceDomain>,
+        PartialMemberFact,
+        (Intent, NativeProof),
+    );
+
     use super::*;
     use crate::member_carrier_native_ownership::{Phase, Record};
     use crate::member_original::{ClosedMemberReceipt, OriginalMemberRead, PendingMemberRead};
@@ -1321,6 +1328,9 @@ pub(crate) mod native {
             pair: &super::super::member_carrier_pair_store::native_store::NativePairIntentRead,
             expected: &crate::member_carrier_pair::Record,
             supervisor: &super::super::member_native_deadline::NativeDeadline,
+            rundown: Option<
+                &Rc<super::super::member_carrier_member_controller::native::PartialCleanup>,
+            >,
         ) -> Result<()> {
             self.health.forward(|| {
                 let runtime = self
@@ -1335,7 +1345,7 @@ pub(crate) mod native {
                 self.inventory
                     .try_borrow_mut()
                     .map_err(|_| Error::Conflict)?
-                    .closed_inner(index, receipt, Some(expected))?;
+                    .closed_inner(index, receipt, Some((expected, rundown)))?;
                 pair.inspect_effect(&runtime, supervisor, expected, effect, |_| Ok(()))
                     .map_err(|_| Error::Conflict)?;
                 Ok(())
@@ -1458,6 +1468,120 @@ pub(crate) mod native {
                 }
                 inventory
                     .inspect_closing_bindings_full_inner(context, runtime, image, carrier, inspect)
+            })
+        }
+
+        /// Separate Running retirement census. Only the exact retained partial
+        /// target is excluded from live SDK inputs; its captured identity is
+        /// comparison data. The other member keeps its ORIGINAL live reader.
+        pub(crate) fn read_retirement_bindings(
+            &self,
+            context: &Context,
+            runtime: &RuntimeRead,
+            image: &OriginalImage,
+            carrier: &ExpectedProvider,
+            partial: &Rc<super::super::member_carrier_member_controller::native::PartialCleanup>,
+        ) -> Result<RetirementBindings> {
+            self.health.forward(|| {
+                let mut inventory = self
+                    .inventory
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?;
+                if context != &inventory.context || !runtime.fresh(context)? {
+                    return Err(Error::Conflict);
+                }
+                inventory.matches_original_runtime_image(runtime, image)?;
+                let revision = inventory.revision()?;
+                let native = Record::decode(&revision)?;
+                if native.phase != Phase::Preparing || native.context != *context {
+                    return Err(Error::Conflict);
+                }
+                let index = pending_index(context, partial.intent())?;
+                let partials = inventory.closing_partials()?;
+                if partials.len() != 1
+                    || !Rc::ptr_eq(&partials[0].0, partial)
+                    || inventory
+                        .entries
+                        .iter()
+                        .any(|entry| entry.as_ref().is_none_or(|entry| entry.closed.is_some()))
+                    || inventory
+                        .pending
+                        .iter()
+                        .any(|entry| entry.as_ref().is_none_or(|entry| entry.closed.is_some()))
+                {
+                    return Err(Error::Conflict);
+                }
+                let captured = partials[0].1.as_ref().ok_or(Error::Conflict)?.clone();
+                let original = partial.inspect().map_err(|_| Error::Conflict)?;
+                if !original.service_deleted() || original.process.is_none() {
+                    return Err(Error::Conflict);
+                }
+                let active = index ^ 1;
+                let entry = inventory.entries[active].as_mut().ok_or(Error::Conflict)?;
+                let mut domains = Vec::new();
+                let (intent, proof) =
+                    read_service_binding(&mut entry.original, false, &mut domains)
+                        .map_err(|_| Error::Conflict)?;
+                let provider = native_identity(&proof, entry.source.transport())?;
+                if provider != entry.provider
+                    || validate_member_binding(context, &intent, &proof, &provider)? != active
+                    || entry.original.read().map_err(|_| Error::Conflict)?
+                        != (intent.clone(), proof)
+                {
+                    return Err(Error::Conflict);
+                }
+                let source = entry.source.clone();
+                inventory
+                    .runtime
+                    .verify_member_intent(context, &source, &intent)?;
+                let wants = complete_provider_inputs(
+                    context,
+                    std::slice::from_ref(carrier),
+                    std::slice::from_ref(&provider),
+                )?;
+                let binding = &context.bindings[index + 1];
+                let present = super::super::member_carrier_provider::native::inspect_mixed_partial(
+                    &wants,
+                    &[(
+                        binding.guid,
+                        binding.name.as_str(),
+                        captured.kind,
+                        Some(&captured),
+                        true,
+                    )],
+                )
+                .map_err(|_| Error::Conflict)?;
+                if present.len() != 1 || partial.inspect().map_err(|_| Error::Conflict)? != original
+                {
+                    return Err(Error::Conflict);
+                }
+                let entry = inventory.entries[active].as_mut().ok_or(Error::Conflict)?;
+                let mut after_domains = Vec::new();
+                if read_service_binding(&mut entry.original, false, &mut after_domains)
+                    .map_err(|_| Error::Conflict)?
+                    != (intent.clone(), proof)
+                    || domains != after_domains
+                {
+                    return Err(Error::Conflict);
+                }
+                inventory
+                    .runtime
+                    .verify_member_intent(context, &source, &intent)?;
+                inventory.matches_original_runtime_image(runtime, image)?;
+                if inventory.revision()? != revision || !runtime.fresh(context)? {
+                    return Err(Error::Conflict);
+                }
+                let members = if index == 0 {
+                    vec![captured, provider]
+                } else {
+                    vec![provider, captured]
+                };
+                Ok((
+                    members,
+                    domains,
+                    (partial.intent().clone(), original.process, true, present[0]),
+                    (intent, proof),
+                ))
             })
         }
 
@@ -1787,12 +1911,55 @@ pub(crate) mod native {
             &mut self,
             index: usize,
             receipt: &Rc<Closed>,
-            retirement: Option<&crate::member_carrier_pair::Record>,
+            retirement: Option<(
+                &crate::member_carrier_pair::Record,
+                Option<&Rc<super::super::member_carrier_member_controller::native::PartialCleanup>>,
+            )>,
         ) -> Result<()> {
             let before = self.revision()?;
             let phase = Record::decode(&before)?.phase;
-            if let Some(pair) = retirement {
-                retirement_registration(&self.context, phase, pair, index)?;
+            if let Some((pair, rundown)) = retirement {
+                if let Some(original) = rundown {
+                    let pending = self.pending[index].as_ref().ok_or(Error::Conflict)?;
+                    let owner = &pair.members[index].as_ref().ok_or(Error::Conflict)?.owner;
+                    let proof = owner.proof.ok_or(Error::Conflict)?;
+                    if pending
+                        .partial
+                        .as_ref()
+                        .is_none_or(|same| !Rc::ptr_eq(same, original))
+                        || original.intent() != &owner.intent
+                        || pair.guard.permits && pair.guard.active != pair.active
+                        || pair.guard.members[index].as_ref().is_none_or(|member| {
+                            !member.probes.is_empty() || member.identity.proof != proof.interface
+                        })
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    original
+                        .verify_closed(receipt)
+                        .map_err(|_| Error::Conflict)?;
+                    if pending
+                        .original
+                        .read_pin()
+                        .read_closed_proof(receipt)
+                        .map_err(|_| Error::Conflict)?
+                        != Some((owner.intent.clone(), proof))
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    pair.validate().map_err(|_| Error::Conflict)?;
+                    // Comparison projection only. Actual Pair/Calling and the
+                    // opaque SAME Closed receipt stay required before/after;
+                    // independent rundown G checks the original A-only WFP.
+                    let mut denied = pair.clone();
+                    denied.guard = denied
+                        .guard
+                        .without_permits()
+                        .map_err(|_| Error::Conflict)?;
+                    retirement_registration(&self.context, phase, &denied, index)?;
+                } else {
+                    retirement_registration(&self.context, phase, pair, index)?;
+                }
             } else if phase != Phase::Closing {
                 return Err(Error::Conflict);
             }

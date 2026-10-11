@@ -450,6 +450,43 @@ fn retire_base_accepts_exact_closed_target_without_metric_or_probe_permission() 
     let (c, r, stopped, closed) = retire_fixture();
     let carrier = row(&c, 0);
     let active = row(&c, 1);
+    let mut pending = r.clone();
+    let mut live_members = pending.guard.members.clone();
+    live_members[0].as_mut().unwrap().probes = vec![tuple()];
+    let permitted = policy::Model::new(
+        pending.scope.clone(),
+        pending.guard.carrier.clone().unwrap(),
+        live_members,
+        Some(Slot::A),
+    )
+    .unwrap()
+    .inherit_sublayer_weight(&pending.guard)
+    .unwrap();
+    pending.guard = permitted.without_permits().unwrap();
+    pending.pending_guard = Some(policy::ExchangePlan::new(&pending.guard, &permitted).unwrap());
+    let exact = Some((&closed.intent, closed.proof.process));
+    let facts = guard_resources(&carrier, &active, &stopped);
+    assert!(compare_guard_rows(&c, &pending, &permitted, facts, [None, None], None).is_err());
+    let metrics = compare_guard_rows(&c, &pending, &permitted, facts, [None, None], exact).unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].interface, 8);
+    let mut foreign = closed.proof.process;
+    foreign.creation_time += 1;
+    assert!(compare_guard_rows(
+        &c,
+        &pending,
+        &permitted,
+        facts,
+        [None, None],
+        Some((&closed.intent, foreign))
+    )
+    .is_err());
+    pending.guard = permitted.clone();
+    pending.pending_guard = None;
+    pending.pending = Some(pair::Effect::MemberStop(Slot::B));
+    compare_stage(&c, &pending, Purpose::Use(Slot::A)).unwrap();
+    assert!(compare_stage(&c, &pending, Purpose::Use(Slot::B)).is_err());
+    compare_guard_rows(&c, &pending, &permitted, facts, [None, None], exact).unwrap();
     let desired = &r.pending_guard.as_ref().unwrap().base;
     assert_eq!(compare_guard_target(&c, &r, desired), Ok(()));
     let metrics = compare_guard_rows(
@@ -458,6 +495,7 @@ fn retire_base_accepts_exact_closed_target_without_metric_or_probe_permission() 
         desired,
         guard_resources(&carrier, &active, &stopped),
         [None, Some(&closed)],
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -499,6 +537,7 @@ fn removed_member_history_remains_factual_during_active_other_reinstall() {
             &target,
             guard_resources(&carrier, &active, &stopped),
             [None, Some(&closed)],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -513,7 +552,8 @@ fn removed_member_history_remains_factual_during_active_other_reinstall() {
             &r,
             &target,
             guard_resources(&carrier, &active, &stopped),
-            [None, None]
+            [None, None],
+            None
         )
         .is_err());
         let mut foreign = closed.clone();
@@ -523,7 +563,8 @@ fn removed_member_history_remains_factual_during_active_other_reinstall() {
             &r,
             &target,
             guard_resources(&carrier, &active, &stopped),
-            [None, Some(&foreign)]
+            [None, Some(&foreign)],
+            None
         )
         .is_err());
         let mut drift = stopped.clone();
@@ -533,12 +574,13 @@ fn removed_member_history_remains_factual_during_active_other_reinstall() {
             &r,
             &target,
             guard_resources(&carrier, &active, &drift),
-            [None, Some(&closed)]
+            [None, Some(&closed)],
+            None
         )
         .is_err());
         let mut no_ack = guard_resources(&carrier, &active, &stopped);
         no_ack[2] = None;
-        assert!(compare_guard_rows(&c, &r, &target, no_ack, [None, Some(&closed)]).is_err());
+        assert!(compare_guard_rows(&c, &r, &target, no_ack, [None, Some(&closed)], None).is_err());
     }
 }
 
@@ -555,7 +597,8 @@ fn closed_guard_rows_deny_missing_cap_foreign_original_and_partial_retirement() 
         &r,
         desired,
         guard_resources(&carrier, &active, &stopped),
-        [None, None]
+        [None, None],
+        None
     )
     .is_err());
     for fault in 0..18 {
@@ -594,7 +637,8 @@ fn closed_guard_rows_deny_missing_cap_foreign_original_and_partial_retirement() 
                 &x,
                 desired,
                 guard_resources(&carrier, &active, &ack),
-                [None, Some(&history)]
+                [None, Some(&history)],
+                None
             )
             .is_err(),
             "fault {fault}"
@@ -602,14 +646,15 @@ fn closed_guard_rows_deny_missing_cap_foreign_original_and_partial_retirement() 
     }
     let mut facts = guard_resources(&carrier, &active, &stopped);
     facts[2] = Some((&stopped.binding, &stopped, Some(&stopped.current)));
-    assert!(compare_guard_rows(&c, &r, desired, facts, [None, Some(&closed)]).is_err());
+    assert!(compare_guard_rows(&c, &r, desired, facts, [None, Some(&closed)], None).is_err());
     let empty = policy::Model::empty(r.scope.clone()).unwrap();
     assert!(compare_guard_rows(
         &c,
         &r,
         &empty,
         guard_resources(&carrier, &active, &stopped),
-        [None, Some(&closed)]
+        [None, Some(&closed)],
+        None
     )
     .is_err());
 }

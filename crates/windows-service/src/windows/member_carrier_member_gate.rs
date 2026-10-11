@@ -20,6 +20,7 @@ enum Use {
     ServiceStop(usize),
     Retire(usize),
     Retired(usize),
+    Rundown(usize),
 }
 fn cleanup_use(usage: Use) -> bool {
     matches!(usage, Use::Stop | Use::ServiceStop(_))
@@ -37,7 +38,7 @@ fn service_stop_stage(context: &Context, record: &pair::Record, intent: &Intent)
 }
 fn retirement_target(usage: Use) -> Option<usize> {
     match usage {
-        Use::Retire(target) | Use::Retired(target) => Some(target),
+        Use::Retire(target) | Use::Retired(target) | Use::Rundown(target) => Some(target),
         _ => None,
     }
 }
@@ -149,13 +150,30 @@ fn retirement_stage(context: &Context, record: &pair::Record, intent: &Intent) -
 }
 fn guard(record: &pair::Record, usage: Use, actual: &policy::Snapshot) -> Result<()> {
     record.guard.validate().map_err(|_| Error::Conflict)?;
-    if record.pending_guard.is_some()
-        || record.guard.permits
+    if let Use::Rundown(target) = usage {
+        let slot = if target == 0 { Slot::A } else { Slot::B };
+        if record.phase != pair::Phase::Running
+            || record.operation != Some(pair::Operation::Retire(slot))
+            || record.active != Some(slot.other())
+            || record.guard.permits && record.guard.active != record.active
+            || !record.guard.permits
+                && record
+                    .guard
+                    .active
+                    .is_some_and(|active| Some(active) != record.active)
+            || record.guard.members[target]
+                .as_ref()
+                .is_none_or(|member| record.guard.permits && !member.probes.is_empty())
+        {
+            return Err(Error::Conflict);
+        }
+    }
+    if (record.pending_guard.is_some() || record.guard.permits) && !matches!(usage, Use::Rundown(_))
         || actual != &record.guard.expected
         || actual
             .filters
             .iter()
-            .any(|f| f.action != policy::Action::Block)
+            .any(|f| f.action != policy::Action::Block && !matches!(usage, Use::Rundown(_)))
     {
         return Err(Error::Conflict);
     }
@@ -299,7 +317,7 @@ fn resource_rows(
                 return Err(Error::Conflict);
             }
         } else if (!cleanup_use(usage) || n == 0)
-            && !matches!(usage, Use::Retired(target) if n == target + 1)
+            && !matches!(usage, Use::Retired(target) | Use::Rundown(target) if n == target + 1)
         {
             return Err(Error::Pending);
         }
@@ -908,7 +926,7 @@ pub(crate) mod native {
         fn verify_pair(&mut self) -> Result<()> {
             let selected = self.selected.as_ref().ok_or(Error::Pending)?;
             let cleanup = selected.record.phase == pair::Phase::Closing;
-            let effect = selected.record.pending.ok_or(Error::Conflict)?;
+            let effect = selected.record.pending;
             if !selected.original.matches_runtime(&self.runtime) {
                 return Err(Error::Conflict);
             }
@@ -931,7 +949,7 @@ pub(crate) mod native {
                         check,
                     )
                     .map_err(denied)?;
-            } else {
+            } else if let Some(effect) = effect {
                 selected
                     .original
                     .inspect_effect(
@@ -942,6 +960,16 @@ pub(crate) mod native {
                         check,
                     )
                     .map_err(denied)?;
+            } else if selected.record.phase == pair::Phase::Running
+                && matches!(selected.record.operation, Some(pair::Operation::Retire(_)))
+                && selected.record.pending_guard.is_none()
+            {
+                selected
+                    .original
+                    .inspect(&self.runtime, &self.supervisor, check)
+                    .map_err(denied)?;
+            } else {
+                return Err(Error::Conflict);
             }
             Ok(())
         }
@@ -978,7 +1006,18 @@ pub(crate) mod native {
                 || if cleanup {
                     !window.matches_closing(self.closing.get()?.as_ref())
                 } else {
-                    !window.matches_source(upgrade(&self.source)?.as_ref())
+                    let source = upgrade(&self.source)?;
+                    if let Use::Rundown(target) = usage {
+                        if window.retirement_slot().is_some() {
+                            window.retirement_slot()
+                                != Some(if target == 0 { Slot::A } else { Slot::B })
+                                || !window.matches_running_channel(&source)
+                        } else {
+                            !window.matches_source(&source)
+                        }
+                    } else {
+                        !window.matches_source(&source)
+                    }
                 }
             {
                 return Err(Error::Conflict);
@@ -1231,6 +1270,95 @@ pub(crate) mod native {
                     usage = Use::Retired(target);
                 }
                 state.authorize(record, usage, window, None)
+            })
+        }
+        fn authorize_rundown(
+            &mut self,
+            context: &Context,
+            record: &pair::Record,
+            intent: &Intent,
+            original: &Rc<PartialCleanup>,
+            closed: Option<&super::super::member_carrier_member_controller::native::Closed>,
+            window: &NativeBindingsWindow<'_>,
+        ) -> Result<()> {
+            let state = &mut self.state;
+            self.fence.run(false, || {
+                record.validate().map_err(denied)?;
+                let target = index(intent);
+                let slot = shared_slot(intent);
+                let owner = &record.members[target]
+                    .as_ref()
+                    .ok_or(Error::Conflict)?
+                    .owner;
+                let proof = owner.proof.ok_or(Error::Conflict)?;
+                if context != &state.context
+                    || intent != &state.intent
+                    || state
+                        .selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.record != *record)
+                    || record.scope != context.intent.scope
+                    || record.provenance != context.provenance
+                    || record.addresses != context.intent.addresses
+                    || record
+                        .carrier
+                        .is_none_or(|proof| proof.guid != context.bindings[0].guid)
+                    || record.phase != pair::Phase::Running
+                    || record.operation != Some(pair::Operation::Retire(slot))
+                    || record.active != Some(slot.other())
+                    || record.stop_stage != 0
+                    || !matches!(record.pending, None | Some(pair::Effect::Guard))
+                        && record.pending != Some(pair::Effect::MemberStop(slot))
+                        && record.pending != Some(pair::Effect::Data(slot.other()))
+                    || (record.pending == Some(pair::Effect::Guard))
+                        != record.pending_guard.is_some()
+                    || owner.intent != *intent
+                    || original.intent() != intent
+                    || record.members.iter().any(|member| {
+                        member.as_ref().is_none_or(|member| {
+                            member.owner.phase != crate::member_owner::Phase::Running
+                                || member.owner.proof.is_none()
+                        })
+                    })
+                    || window
+                        .closed_member(if target == 0 {
+                            TunnelSlot::B
+                        } else {
+                            TunnelSlot::A
+                        })
+                        .is_some()
+                {
+                    return Err(Error::Conflict);
+                }
+                if let Some(history) = window.closed_member(intent.slot) {
+                    original
+                        .verify_closed(closed.ok_or(Error::Conflict)?)
+                        .map_err(denied)?;
+                    if history.intent != *intent
+                        || history.proof != proof
+                        || !window.matches_source(upgrade(&state.source)?.as_ref())
+                    {
+                        return Err(Error::Conflict);
+                    }
+                } else {
+                    if closed.is_some() {
+                        return Err(Error::Conflict);
+                    }
+                    let partial = original.inspect().map_err(denied)?;
+                    if !partial.service_deleted() || partial.process != Some(proof.process) {
+                        return Err(Error::Conflict);
+                    }
+                    let facts = window.partial_member(intent.slot).ok_or(Error::Conflict)?;
+                    if window.retirement_slot() != Some(slot)
+                        || !window.matches_partial_member(original)
+                        || facts.0 != *intent
+                        || facts.1 != Some(proof.process)
+                        || !facts.2
+                    {
+                        return Err(Error::Conflict);
+                    }
+                }
+                state.authorize(record, Use::Rundown(target), window, None)
             })
         }
         fn authorize_partial_stop(

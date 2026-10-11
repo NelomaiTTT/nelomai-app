@@ -548,7 +548,10 @@ pub(crate) mod native {
             // its outer actor if a joined read fails, even when G catches it.
             let tuple = window
                 .inspect(|b| {
-                    if !window.matches_source(&caps.source) {
+                    if !window.matches_running_channel(&caps.source)
+                        || window.retirement_slot() != caps.source.retirement_slot()?
+                        || window.retirement_slot() == Some(caps.expected.slot)
+                    {
                         return Err(SourceError::Conflict);
                     }
                     caps.expected
@@ -577,7 +580,8 @@ pub(crate) mod native {
             caps.gate.verify_original(&caps.source, &caps.guard)?;
             let tuple = caps
                 .source
-                .inspect_bindings(|b| {
+                .inspect_running_window(|window| {
+                    let b = window.bindings();
                     caps.expected.matches(b).map_err(denied)?;
                     let socket = match clone {
                         None => held.socket.as_ref(),
@@ -939,7 +943,11 @@ pub(crate) mod native {
             let id = next_clone.checked_add(1).ok_or(GuardError::Conflict)?;
             let live = Rc::new(Cell::new(false));
             caps.source
-                .inspect_bindings(|b| {
+                .inspect_running_window(|window| {
+                    if window.retirement_slot() == Some(caps.expected.slot) {
+                        return Err(SourceError::Conflict);
+                    }
+                    let b = window.bindings();
                     caps.expected.matches(b).map_err(denied)?;
                     let clone = socket
                         .as_ref()
@@ -1296,7 +1304,11 @@ pub(crate) mod native {
             caps.gate.authorize_use(&read, &tuple).map_err(error)?;
             let mut io_result = None;
             caps.source
-                .inspect_bindings(|b| {
+                .inspect_running_window(|window| {
+                    if window.retirement_slot() == Some(caps.expected.slot) {
+                        return Err(SourceError::Conflict);
+                    }
+                    let b = window.bindings();
                     caps.expected.matches(b).map_err(denied)?;
                     let socket = &mut clones
                         .get_mut(&self.id)
