@@ -280,7 +280,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     needs: [windows-build]
     name: windows-native (${{ matrix.case }})
-    runs-on: windows-latest
+    runs-on: windows-2022
     env:
       SOURCE_SHA: ${{ github.sha }}
       MANIFEST_SHA256: ${{ needs.windows-build.outputs.manifest_sha256 }}
