@@ -44,7 +44,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let cases = [
         "primary",
         "network-route-postflight",
-        "data-before-verify-ack",
+        "metrics-post-read-error",
         "module-load-read-error",
         "module-load-read-unwind",
         "resolver-reference-error",
@@ -124,7 +124,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         };
         let elapsed = started.elapsed();
         if (matches!(case, "primary" | "network-route-postflight") && !status.success())
-            || case == "data-before-verify-ack"
+            || case == "metrics-post-read-error"
         {
             // SAME initial child scope; this read cannot attest cleanup.
             let mut hash = Sha256::new();
@@ -440,7 +440,7 @@ fn carrier_factory_actual_cold_child() {
     );
     let full_primary = case == "primary";
     let route_partial = case == "network-route-postflight";
-    let data_partial = case == "data-before-verify-ack";
+    let metrics_partial = case == "metrics-post-read-error";
     let resolver_partial = matches!(
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
@@ -460,7 +460,7 @@ fn carrier_factory_actual_cold_child() {
         "member-unwind" => Some((NativePublication::Member, true)),
         "running-ack" => Some((NativePublication::Running, false)),
         "running-unwind" => Some((NativePublication::Running, true)),
-        "data-before-verify-ack" => Some((NativePublication::DataBeforeVerify, false)),
+        "metrics-post-read-error" => Some((NativePublication::MetricsPostRead, false)),
         _ => None,
     };
     let native_path = module_partial
@@ -669,17 +669,20 @@ fn carrier_factory_actual_cold_child() {
         else {
             unreachable!()
         };
-        eprintln!("actual factory {case}: primary through {target:?} publication");
+        eprintln!("actual factory {case}: primary through {target:?} boundary");
         let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             original.start_primary(primary, options)
         }));
+        if metrics_partial {
+            assert!(started.is_ok(), "ordinary metrics error must not unwind");
+        }
         assert!(
             started.is_err() || started.unwrap().is_err(),
-            "lost native publication ACK accepted"
+            "external native boundary fault accepted"
         );
         let snapshot = original.snapshot();
         eprintln!(
-            "actual native publication fault {target:?} unwind={unwind} phase={:?} cleanup_pending={}",
+            "actual native boundary fault {target:?} unwind={unwind} phase={:?} cleanup_pending={}",
             snapshot.session.phase, snapshot.cleanup_pending
         );
         // SAME control reaches Stopped only after actual native terminal close;
@@ -806,7 +809,7 @@ fn carrier_factory_actual_cold_child() {
         || module_partial
         || full_primary
         || route_partial
-        || data_partial
+        || metrics_partial
     {
         let retry_started = std::time::Instant::now();
         while stopped.is_err()
@@ -833,7 +836,7 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-        if data_partial {
+        if metrics_partial {
             // The same retained owner has attempted real Stop. A later C failure
             // must not hide A's outcome or turn cleanup_pending into completion.
             let pair = fixture.trace_pair_stage(false);
@@ -845,7 +848,7 @@ fn carrier_factory_actual_cold_child() {
                 ) && record.stop_stage >= 2
             });
             eprintln!(
-                "actual data boundary cleanup case={case} stop_result={stopped:?} cleanup_pending={} release_probes_completed={release_probes_completed} held_probe_close_ack={release_probes_completed}",
+                "actual metrics boundary cleanup case={case} stop_result={stopped:?} cleanup_pending={} release_probes_completed={release_probes_completed} held_probe_close_ack={release_probes_completed}",
                 original.snapshot().cleanup_pending,
             );
             let guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
@@ -870,16 +873,16 @@ fn carrier_factory_actual_cold_child() {
                         })
                         .collect::<Vec<_>>();
                     if matching.len() > 8 {
-                        eprintln!("actual data boundary A table case={case} requested_guid={guid:?} UNKNOWN: matching-row bound exceeded");
+                        eprintln!("actual metrics boundary A table case={case} requested_guid={guid:?} UNKNOWN: matching-row bound exceeded");
                         None
                     } else {
                         let exact_guid_present = matching.iter().any(|row| row.4);
-                        eprintln!("actual data boundary A table case={case} requested_guid={guid:?} exact_guid_present={exact_guid_present} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}");
+                        eprintln!("actual metrics boundary A table case={case} requested_guid={guid:?} exact_guid_present={exact_guid_present} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}");
                         Some(matching.is_empty())
                     }
                 }
                 Err(error) => {
-                    eprintln!("actual data boundary A table case={case} requested_guid={guid:?} UNKNOWN: {error:?}");
+                    eprintln!("actual metrics boundary A table case={case} requested_guid={guid:?} UNKNOWN: {error:?}");
                     None
                 }
             };

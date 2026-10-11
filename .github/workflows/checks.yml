@@ -291,7 +291,7 @@ jobs:
         case:
           - primary
           - network-route-postflight
-          - data-before-verify-ack
+          - metrics-post-read-error
           - module-load-read-error
           - module-load-read-unwind
           - resolver-reference-error

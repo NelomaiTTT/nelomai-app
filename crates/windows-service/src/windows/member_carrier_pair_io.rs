@@ -8597,7 +8597,7 @@ pub(crate) mod native {
                 let sampled = {
                     let mut sampled = sampled;
                     if let Some((healthy, sent, received)) =
-                        super::super::member_carrier_factory_test_os::metric_input(slot)
+                        super::super::member_carrier_factory_test_os::metric_input(record, slot)?
                     {
                         sampled.transport.latest_handshake_epoch_millis = healthy.then_some(now);
                         sampled.sent_unicast_packets = sent;

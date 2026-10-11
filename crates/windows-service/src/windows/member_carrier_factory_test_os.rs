@@ -56,7 +56,7 @@ pub(crate) enum NativePublication {
     Carrier,
     Member,
     Running,
-    DataBeforeVerify,
+    MetricsPostRead,
 }
 thread_local! {
     static INPUTS: RefCell<Option<Inputs>> = const { RefCell::new(None) };
@@ -95,10 +95,11 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
         };
         if let Some((target, unwind)) = inputs.native_fault.filter(|(target, _)| {
             file == match target {
-                NativePublication::Carrier
-                | NativePublication::Member
-                | NativePublication::DataBeforeVerify => member_files::PrivateFile::Pair,
+                NativePublication::Carrier | NativePublication::Member => {
+                    member_files::PrivateFile::Pair
+                }
                 NativePublication::Running => member_files::PrivateFile::Session,
+                NativePublication::MetricsPostRead => return false,
             }
         }) {
             // Only external filesystem ACK selection. These published DATA
@@ -141,27 +142,6 @@ pub(crate) fn publication_ack(file: member_files::PrivateFile, desired: &[u8]) -
                 }
                 (NativePublication::Running, member_files::PrivateFile::Session) => {
                     payload["phase"] == "Running"
-                }
-                (NativePublication::DataBeforeVerify, member_files::PrivateFile::Pair) => {
-                    use crate::member_carrier_pair::{Effect, Operation, Phase, Record};
-                    use nelomai_client_tunnel::redundancy::Slot;
-                    let record: Record = serde_json::from_value(payload.clone())?;
-                    record.phase == Phase::Starting
-                        && record.operation == Some(Operation::Start(Slot::A))
-                        && record.stop_stage == 0
-                        && record.carrier.is_some()
-                        && record.members[0].as_ref().is_some_and(|member| {
-                            member.owner.phase == crate::member_owner::Phase::Running
-                                && member.owner.proof.is_some()
-                        })
-                        && record.members[1].is_none()
-                        && record.guard.installed
-                        && record.guard.permits
-                        && record.pending_guard.is_none()
-                        && record.network.as_ref().is_some_and(|network| {
-                            network.pending.is_none() && network.current != network.baseline
-                        })
-                        && record.pending == Some(Effect::Data(Slot::A))
                 }
                 _ => false,
             };
@@ -282,19 +262,57 @@ pub(crate) fn probe_io_input(slot: nelomai_client_tunnel::redundancy::Slot) -> O
     })
 }
 pub(crate) fn metric_input(
+    record: &crate::member_carrier_pair::Record,
     slot: nelomai_client_tunnel::redundancy::Slot,
-) -> Option<(bool, u64, u64)> {
+) -> io::Result<Option<(bool, u64, u64)>> {
     INPUTS.with(|inputs| {
+        use crate::member_carrier_pair::{Effect, Operation, Phase};
+        use nelomai_client_tunnel::redundancy::Slot;
         let mut inputs = inputs.borrow_mut();
-        let (failed, counters) = inputs.as_mut()?.health_input.as_mut()?;
-        let counter =
-            &mut counters[usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)];
+        let Some(inputs) = inputs.as_mut() else {
+            return Ok(None);
+        };
+        if inputs.native_fault == Some((NativePublication::MetricsPostRead, false))
+            && slot == Slot::A
+            && record.phase == Phase::Starting
+            && record.operation == Some(Operation::Start(Slot::A))
+            && record.stop_stage == 0
+            && record.carrier.is_some()
+            && record.members[0].as_ref().is_some_and(|member| {
+                member.owner.phase == crate::member_owner::Phase::Running
+                    && member.owner.proof.is_some()
+            })
+            && record.members[1].is_none()
+            && record.guard.installed
+            && record.guard.permits
+            && record.guard.active == Some(Slot::A)
+            && record.pending_guard.is_none()
+            && record.network.as_ref().is_some_and(|network| {
+                network.pending.is_none() && network.current != network.baseline
+            })
+            && record.pending == Some(Effect::Data(Slot::A))
+        {
+            // Called only after the genuine metrics read and SAME controller's
+            // postflight. Consume this one-shot external fault before returning Err.
+            require_native_originals(inputs, NativePublication::MetricsPostRead);
+            inputs.native_fault = None;
+            inputs.native_fault_reached = Some(NativePublication::MetricsPostRead);
+            eprintln!(
+                "actual metrics post-read error reached slot={slot:?} session_id={} pending={:?} original_controller_postflight=true",
+                record.scope.session_id, record.pending,
+            );
+            return Err(io::Error::other("fixture metrics post-read error"));
+        }
+        let Some((failed, counters)) = inputs.health_input.as_mut() else {
+            return Ok(None);
+        };
+        let counter = &mut counters[usize::from(slot == Slot::B)];
         let healthy = *failed != Some(slot);
         if healthy {
             counter[0] += 1;
             counter[1] += 1;
         }
-        Some((healthy, counter[0], counter[1]))
+        Ok(Some((healthy, counter[0], counter[1])))
     })
 }
 pub(crate) fn accepted_datagram_send(slot: nelomai_client_tunnel::redundancy::Slot) {
