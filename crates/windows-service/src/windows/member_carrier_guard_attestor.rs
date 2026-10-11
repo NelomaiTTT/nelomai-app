@@ -23,6 +23,7 @@ struct BindingFacts<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowChannel {
     Source,
+    #[cfg(windows)]
     Retirement,
     Closing,
     Retired,
