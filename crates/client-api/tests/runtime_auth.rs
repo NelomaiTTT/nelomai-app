@@ -93,6 +93,51 @@ fn token_response() -> Value {
 }
 
 #[tokio::test]
+async fn foreground_reconcile_uses_exact_operation_and_captured_runtime_authority() {
+    let (url, requests, handle) = server(json!({
+        "api_version":"1", "request_id":"cleanup", "state":"cancelled",
+        "cancel_requested":true, "lease_id":null, "lease_status":null,
+        "retry_count":0, "next_attempt_at":null,
+    }));
+    let snapshot = AccessSnapshot::new(
+        "synthetic-access".into(),
+        identity(),
+        4,
+        "synthetic-family".into(),
+    )
+    .unwrap();
+    let operation = nelomai_contracts::OperationReconcileRequest {
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        kind: nelomai_contracts::OperationKind::RedundantStart,
+        contract_version: 2,
+        request_fingerprint: "a".repeat(64),
+        cancel_if_absent: true,
+    };
+    let result = ClientApi::new(&url)
+        .unwrap()
+        .with_access_snapshot(&snapshot)
+        .unwrap()
+        .reconcile_operation(snapshot.access_token(), &operation)
+        .await
+        .unwrap();
+    assert_eq!(result.state, nelomai_contracts::OperationState::Cancelled);
+    assert!(result.cancel_requested);
+    let raw = requests.recv().unwrap();
+    let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+    let headers = headers.to_lowercase();
+    assert!(headers.starts_with("post /api/client/v1/operations/reconcile "));
+    for (name, value) in snapshot.bearer_headers() {
+        assert!(headers.contains(&format!("{name}: {value}").to_lowercase()));
+    }
+    assert!(!headers.contains("authorization: device "));
+    assert_eq!(
+        serde_json::from_str::<Value>(body).unwrap(),
+        serde_json::to_value(operation).unwrap()
+    );
+    handle.join().unwrap();
+}
+
+#[tokio::test]
 async fn release_history_is_public_and_keeps_notes_without_authentication() {
     let (url, requests, handle) = server(json!({"api_version":"1","entries":[
         {"version":"0.2.18","notes":"Первая строка\n<script>literal</script>"}

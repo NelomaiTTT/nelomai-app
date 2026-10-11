@@ -1535,6 +1535,20 @@ impl ClientApi {
         .await
     }
 
+    pub async fn reconcile_operation(
+        &self,
+        access_token: &str,
+        request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("operations/reconcile")?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
     pub async fn reconcile_background_operation(
         &self,
         background_token: &str,
