@@ -4272,8 +4272,14 @@ pub(crate) mod native {
             if slot.is_some() {
                 return Err(Error::Retired);
             }
-            self.origin.verify(lock)?;
-            self.verify_replacement_prior(lock)?;
+            self.origin.verify(lock).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual prepared attach origin: {_error:?}");
+            })?;
+            self.verify_replacement_prior(lock).inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual prepared attach replacement prior: {_error:?}");
+            })?;
             if let Some(ticket) = &self.origin.replacement {
                 ticket.verify_source(&input.original_source)?;
             }
@@ -4282,7 +4288,11 @@ pub(crate) mod native {
                 expected,
                 &self.origin.intent,
                 MemberOperation::Start,
-            )?;
+            )
+            .inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual prepared attach operation: {_error:?}");
+            })?;
             if expected.phase == pair::Phase::Running {
                 validate_live_preparation_attachment(
                     &self.origin.context,
@@ -4302,8 +4312,16 @@ pub(crate) mod native {
             }
             let state = self.root.owner.as_mut().ok_or(Error::Retired)?;
             if let Some(raw) = state.raw.as_mut() {
-                let actual_prior = raw.prior_stopped().map_err(owner_error)?;
+                let actual_prior =
+                    raw.prior_stopped()
+                        .map_err(owner_error)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach prior read: {_error:?}");
+                        })?;
                 if state.prior.as_ref().is_some_and(|p| p != &actual_prior) {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual prepared attach prior comparison: Conflict");
                     return Err(Error::Conflict);
                 }
                 state.prior = Some(actual_prior);
@@ -4318,13 +4336,20 @@ pub(crate) mod native {
                         .as_ref()
                         .ok_or(Error::Retired)?
                         .pending_read()
-                        .map_err(owner_error)?,
+                        .map_err(owner_error)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach pending pin: {_error:?}");
+                        })?,
                 );
             }
             let origin = self.origin.clone();
             // Fallible pin acquisition must precede the infallible transfer;
             // an Err leaves the actual owner rooted in this preparation.
-            let runtime = origin.runtime.read_pin()?;
+            let runtime = origin.runtime.read_pin().inspect_err(|_error| {
+                #[cfg(all(windows, test))]
+                eprintln!("actual prepared attach runtime pin: {_error:?}");
+            })?;
             self.root
                 .attach(
                     slot,
@@ -4354,12 +4379,24 @@ pub(crate) mod native {
                     },
                     |controller| {
                         let owned = controller.root.owner.as_ref().ok_or(Error::Retired)?;
-                        owned.verify_sources()?;
+                        owned.verify_sources().inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach owned sources: {_error:?}");
+                        })?;
                         owned
                             .inventory
                             .read_pin()
-                            .register_pending(owned.source.clone(), owned.pending.read_pin())?;
-                        owned.prepared_origin.verify(lock)?;
+                            .register_pending(owned.source.clone(), owned.pending.read_pin())
+                            .inspect_err(|_error| {
+                                #[cfg(all(windows, test))]
+                                eprintln!(
+                                    "actual prepared attach pending registration: {_error:?}"
+                                );
+                            })?;
+                        owned.prepared_origin.verify(lock).inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach rooted origin: {_error:?}");
+                        })?;
                         pair.inspect_effect(
                             &owned.runtime,
                             &owned.supervisor,
@@ -4367,11 +4404,22 @@ pub(crate) mod native {
                             pair::Effect::MemberStart(shared_slot(owned.intent.slot)),
                             |_| Ok(()),
                         )
-                        .map_err(|_| Error::Conflict)?;
-                        owned.prepared_origin.verify(lock)
+                        .map_err(|_| Error::Conflict)
+                        .inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach Pair postflight: {_error:?}");
+                        })?;
+                        owned.prepared_origin.verify(lock).inspect_err(|_error| {
+                            #[cfg(all(windows, test))]
+                            eprintln!("actual prepared attach final origin: {_error:?}");
+                        })
                     },
                 )
                 .map_err(root_error)
+                .inspect_err(|_error| {
+                    #[cfg(all(windows, test))]
+                    eprintln!("actual prepared attach root: {_error:?}");
+                })
         }
     }
 
