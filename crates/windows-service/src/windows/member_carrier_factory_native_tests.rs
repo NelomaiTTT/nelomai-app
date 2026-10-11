@@ -185,6 +185,97 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                     eprintln!("actual post-child-exit initial C identity UNKNOWN: {error:?}")
                 }
             }
+            use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+                CM_Get_DevNode_Status, CM_Get_Device_IDW, CM_Locate_DevNodeW,
+                CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CR_NO_SUCH_DEVNODE,
+                CR_SUCCESS, MAX_DEVICE_ID_LEN,
+            };
+            let (member, instance) = if case == "primary" {
+                ("A", r"SWD\WIREGUARD\{B75141B9-108E-4BF9-5A47-7AF4A3DDCD39}")
+            } else {
+                (
+                    "route-C",
+                    r"SWD\WINTUN\{919EF6AF-EE00-83AA-8C9E-B1F711D03CA8}",
+                )
+            };
+            let observed_utc_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|time| time.as_millis());
+            let wide_instance = instance.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let (mut normal_node, mut phantom_node) = (0, 0);
+            let normal = unsafe {
+                CM_Locate_DevNodeW(
+                    &mut normal_node,
+                    wide_instance.as_ptr(),
+                    CM_LOCATE_DEVNODE_NORMAL,
+                )
+            };
+            let phantom = unsafe {
+                CM_Locate_DevNodeW(
+                    &mut phantom_node,
+                    wide_instance.as_ptr(),
+                    CM_LOCATE_DEVNODE_PHANTOM,
+                )
+            };
+            let (mut presence, node) = match (normal, phantom) {
+                (CR_SUCCESS, CR_SUCCESS) if normal_node != 0 && normal_node == phantom_node => {
+                    ("present", normal_node)
+                }
+                (CR_NO_SUCH_DEVNODE, CR_SUCCESS) if phantom_node != 0 => ("phantom", phantom_node),
+                (CR_NO_SUCH_DEVNODE, CR_NO_SUCH_DEVNODE) => ("absent", 0),
+                _ => ("UNKNOWN", 0),
+            };
+            let (mut id_code, mut status_code, mut flags, mut problem) = (None, None, None, None);
+            let (mut actual_instance, mut identity_match) = (None, None);
+            let (mut phantom_recheck_code, mut phantom_recheck_node) = (None, 0);
+            if node != 0 {
+                let mut buffer = [0u16; MAX_DEVICE_ID_LEN as usize];
+                let code =
+                    unsafe { CM_Get_Device_IDW(node, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+                id_code = Some(code);
+                if code == CR_SUCCESS {
+                    actual_instance = buffer
+                        .iter()
+                        .position(|word| *word == 0)
+                        .and_then(|end| String::from_utf16(&buffer[..end]).ok());
+                    identity_match = actual_instance
+                        .as_ref()
+                        .map(|id| id.eq_ignore_ascii_case(instance));
+                }
+                if identity_match != Some(true) {
+                    presence = "UNKNOWN";
+                }
+                let (mut observed_flags, mut observed_problem) = (0, 0);
+                let code = unsafe {
+                    CM_Get_DevNode_Status(&mut observed_flags, &mut observed_problem, node, 0)
+                };
+                status_code = Some(code);
+                if code == CR_SUCCESS {
+                    flags = Some(observed_flags);
+                    problem = Some(observed_problem);
+                    if presence == "phantom" {
+                        presence = "UNKNOWN";
+                    }
+                } else if presence == "phantom" && code == CR_NO_SUCH_DEVNODE {
+                    let code = unsafe {
+                        CM_Locate_DevNodeW(
+                            &mut phantom_recheck_node,
+                            wide_instance.as_ptr(),
+                            CM_LOCATE_DEVNODE_NORMAL,
+                        )
+                    };
+                    phantom_recheck_code = Some(code);
+                    if code != CR_NO_SUCH_DEVNODE {
+                        presence = "UNKNOWN";
+                    }
+                } else {
+                    presence = "UNKNOWN";
+                }
+            }
+            eprintln!(
+                "actual post-child-exit PnP case={case} identity={member} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_instance={instance} presence={presence} normal_code={normal} normal_node={normal_node} phantom_code={phantom} phantom_node={phantom_node} id_code={id_code:?} actual_instance={actual_instance:?} identity_match={identity_match:?} status_code={status_code:?} status_flags={flags:?} problem={problem:?} phantom_recheck_normal_code={phantom_recheck_code:?} phantom_recheck_normal_node={phantom_recheck_node}"
+            );
         }
         let stdout = std::fs::read_to_string(stdout_path).unwrap();
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
