@@ -105,13 +105,23 @@ impl<T: TunnelController> CoreLocalStop<T> {
     pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
         self.stop_local_with_success_phase(Phase::Ready).await
     }
+    /// A lost owner channel closes admission without revoking persisted auth.
+    /// Error does not grant Start or assert that operational cleanup completed.
+    pub async fn stop_local_on_disconnect(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Error).await
+    }
     async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-        self.wake.notify_waiters();
-        *self.state.lock().await = CoreState {
-            phase: Phase::Stopping,
-            connection: None,
-        };
+        {
+            let mut state = self.state.lock().await;
+            // Publish the owner stop with its cancellation epoch so a retired
+            // Start cannot mistake it for a signal-only user cancellation.
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            self.wake.notify_waiters();
+            *state = CoreState {
+                phase: Phase::Stopping,
+                connection: None,
+            };
+        }
         let result = self.tunnel.stop().await;
         let mut state = self.state.lock().await;
         if result.is_ok() {
@@ -1185,6 +1195,7 @@ struct FailedStartContext<'a> {
     request_id: &'a str,
     operation_id: &'a str,
     redundant_session_id: Option<&'a str>,
+    cancel_epoch: StartCancellationEpoch,
 }
 
 impl FailedStartStage {
@@ -2494,9 +2505,21 @@ where
         let mut response = match start_result {
             Ok(response) => response,
             Err(error) => {
+                // The independent owner-channel stop may have cancelled this
+                // wait. Its phase and unresolved journal belong to cleanup,
+                // not to the late outcome of the retired Start.
+                let mut state = self.state.lock().await;
+                if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                    if state.phase == Phase::Connecting {
+                        state.phase = Phase::Ready;
+                    }
+                    return Err(CoreError::StartCancelled);
+                }
                 if !start_error_preserves_operation(&error) {
                     let _ = self.clear_pending_start(&operation_id);
                 }
+                state.phase = phase_for_start_error(&error);
+                drop(state);
                 self.logger.record_timed(
                     CoreLogEvent {
                         kind: "connection.start_failed",
@@ -2506,7 +2529,6 @@ where
                     },
                     elapsed_millis(panel_started),
                 );
-                self.set_phase(phase_for_start_error(&error)).await;
                 return Err(error);
             }
         };
@@ -2528,6 +2550,7 @@ where
             request_id: &response.request_id,
             operation_id: &operation_id,
             redundant_session_id,
+            cancel_epoch,
         };
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
@@ -3302,7 +3325,10 @@ where
             return Err(CoreError::Storage);
         }
         let access_token = self.access_snapshot().await?;
-        let response = match self.retry_compensation_stop(&access_token, &pending).await {
+        let response = match self
+            .retry_compensation_stop(&access_token, &pending, true)
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 // A transient panel outage does not undo the confirmed local stop.
@@ -3665,6 +3691,7 @@ where
                 ConnectionOperation::Stop,
                 scope,
                 auth_refresh_used,
+                true,
             )
             .await
         {
@@ -4542,7 +4569,9 @@ where
         )?;
         self.set_phase(Phase::Stopping).await;
         let access = self.access_snapshot().await?;
-        let response = self.retry_compensation_stop(&access, &pending).await?;
+        let response = self
+            .retry_compensation_stop(&access, &pending, true)
+            .await?;
         require_compensation_stop_finished(None, pending.accept_warm, response.connection.status)?;
         self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
         *self.state.lock().await = CoreState {
@@ -4554,6 +4583,17 @@ where
 
     async fn set_phase(&self, phase: Phase) {
         self.state.lock().await.phase = phase;
+    }
+
+    async fn set_start_phase(
+        &self,
+        phase: Phase,
+        epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().await;
+        self.ensure_start_not_cancelled(epoch)?;
+        state.phase = phase;
+        Ok(())
     }
 
     fn clear_pending_start(&self, operation_id: &str) -> Result<(), CoreError> {
@@ -5133,6 +5173,16 @@ where
         stage: FailedStartStage,
         error: &CoreError,
     ) -> Result<(), CoreError> {
+        let presentation_epoch = {
+            let state = self.state.lock().await;
+            // A signal-only manual cancellation still owns Connecting and its
+            // cleanup presentation. An independent owner Stop owns its state.
+            (self
+                .ensure_start_not_cancelled(context.cancel_epoch)
+                .is_ok()
+                || state.phase == Phase::Connecting)
+                .then(|| StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst)))
+        };
         if stage.local_start_may_be_incomplete() && self.tunnel.owns_redundant_session().await? {
             // Native recovery owns its whole session, including a prepared or
             // promoted replacement. An old Start reply is not user Stop and
@@ -5145,6 +5195,7 @@ where
             request_id,
             operation_id,
             redundant_session_id,
+            cancel_epoch: _,
         } = context;
         self.physical_network_change.lock().await.reset();
         let failure_code = match error {
@@ -5167,10 +5218,14 @@ where
                 {
                     phase = Phase::Stopping;
                 }
-                *self.state.lock().await = CoreState {
-                    phase,
-                    connection: Some(connection.clone()),
-                };
+                self.set_compensation_state(
+                    CoreState {
+                        phase,
+                        connection: Some(connection.clone()),
+                    },
+                    presentation_epoch,
+                )
+                .await;
                 self.logger.record(CoreLogEvent {
                     kind: stage.log_kind(),
                     operation_id: Some(operation_id.to_string()),
@@ -5198,10 +5253,14 @@ where
                     // failure which replaces the original Start outcome.
                     return Ok(());
                 }
-                *self.state.lock().await = CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection.clone()),
-                };
+                self.set_compensation_state(
+                    CoreState {
+                        phase: Phase::Stopping,
+                        connection: Some(connection.clone()),
+                    },
+                    presentation_epoch,
+                )
+                .await;
                 if matches!(error, CoreError::StartCancelled) {
                     self.logger.record(CoreLogEvent {
                         kind: "connection.cancelled_start_cleanup_failed",
@@ -5233,7 +5292,7 @@ where
             return Ok(());
         }
         let (connection, mut phase) = match self
-            .retry_compensation_stop(access_token, &durable_compensation)
+            .retry_compensation_stop(access_token, &durable_compensation, false)
             .await
         {
             Ok(compensation) => {
@@ -5244,10 +5303,14 @@ where
                 );
                 if !authoritative {
                     let compensation_error = compensation_stop_not_terminal_error();
-                    *self.state.lock().await = CoreState {
-                        phase: Phase::Stopping,
-                        connection: Some(compensation.connection),
-                    };
+                    self.set_compensation_state(
+                        CoreState {
+                            phase: Phase::Stopping,
+                            connection: Some(compensation.connection),
+                        },
+                        presentation_epoch,
+                    )
+                    .await;
                     self.logger.record(CoreLogEvent {
                         kind: "connection.start_compensation_failed",
                         operation_id: Some(durable_compensation.operation_id.clone()),
@@ -5303,10 +5366,14 @@ where
         {
             phase = Phase::Stopping;
         }
-        *self.state.lock().await = CoreState {
-            phase,
-            connection: Some(connection),
-        };
+        self.set_compensation_state(
+            CoreState {
+                phase,
+                connection: Some(connection),
+            },
+            presentation_epoch,
+        )
+        .await;
         self.logger.record(CoreLogEvent {
             kind: stage.log_kind(),
             operation_id: Some(operation_id.to_string()),
@@ -5323,6 +5390,13 @@ where
             return Err(storage_error);
         }
         Ok(())
+    }
+
+    async fn set_compensation_state(&self, next: CoreState, epoch: Option<StartCancellationEpoch>) {
+        let mut state = self.state.lock().await;
+        if epoch.is_some_and(|epoch| self.ensure_start_not_cancelled(epoch).is_ok()) {
+            *state = next;
+        }
     }
 
     async fn compensate_cancelled_start(
@@ -5398,7 +5472,8 @@ where
                 }
                 Err(error) if allow_internal_retry && retry_index < delays.len() => {
                     let Some(server_delay) = structured_retry_delay_millis(&error) else {
-                        self.set_phase(phase_for_api_error(&error)).await;
+                        self.set_start_phase(phase_for_api_error(&error), cancel_epoch)
+                            .await?;
                         return Err(error.into());
                     };
                     let delay = delays[retry_index].max(server_delay);
@@ -5406,7 +5481,8 @@ where
                     self.wait_for_start_retry(delay, cancel_epoch).await?;
                 }
                 Err(error) => {
-                    self.set_phase(phase_for_api_error(&error)).await;
+                    self.set_start_phase(phase_for_api_error(&error), cancel_epoch)
+                        .await?;
                     return Err(error.into());
                 }
             }
@@ -5451,6 +5527,7 @@ where
             operation,
             None,
             &mut auth_refresh_used,
+            true,
         )
         .await
     }
@@ -5462,6 +5539,7 @@ where
         operation: ConnectionOperation,
         cleanup_scope: Option<(&StoredPendingStart, StartCancellationEpoch)>,
         auth_refresh_used: &mut bool,
+        present_error: bool,
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
@@ -5505,7 +5583,7 @@ where
                     }
                 }
                 Err(error) => {
-                    if matches!(operation, ConnectionOperation::Stop) {
+                    if present_error && matches!(operation, ConnectionOperation::Stop) {
                         self.set_phase(phase_for_api_error(&error)).await;
                     }
                     return Err(error.into());
@@ -5518,10 +5596,12 @@ where
         &self,
         access_token: &AccessSnapshot,
         pending: &StoredPendingCompensationStop,
+        present_error: bool,
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let Some(session_id) = pending_compensation_redundant_session(pending)? else {
+            let mut auth_refresh_used = false;
             return self
-                .retry_operation(
+                .retry_operation_scoped(
                     access_token,
                     &ConnectionOperationRequest {
                         operation_id: pending.operation_id.clone(),
@@ -5529,6 +5609,9 @@ where
                         failure_code: pending.failure_code.clone(),
                     },
                     ConnectionOperation::Stop,
+                    None,
+                    &mut auth_refresh_used,
+                    present_error,
                 )
                 .await;
         };
@@ -5570,7 +5653,11 @@ where
                     }
                 }
                 Err(error) => {
-                    self.set_phase(phase_for_api_error(&error)).await;
+                    // Failed-Start compensation owns presentation only through
+                    // its captured epoch. Normal Stop retains its old behavior.
+                    if present_error {
+                        self.set_phase(phase_for_api_error(&error)).await;
+                    }
                     return Err(error.into());
                 }
             }

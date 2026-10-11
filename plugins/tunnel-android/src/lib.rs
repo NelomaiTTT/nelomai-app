@@ -99,9 +99,12 @@ pub fn connection_intent_tunnel_options(
     plugin_options
 }
 
-#[async_trait]
-impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
-    async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {
+impl<R: Runtime> AndroidTunnelController<R> {
+    fn start_request(
+        &self,
+        request: TunnelStartRequest,
+        local_restart: bool,
+    ) -> std::result::Result<(), TunnelError> {
         request
             .options
             .validate()
@@ -109,6 +112,9 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 code: error.stable_code(),
             })?;
         let mut plugin_request = StartTunnelRequest::new(request.configuration.as_bytes());
+        if local_restart {
+            plugin_request.start_source = "local_restart".into();
+        }
         plugin_request.options.split_active = request.options.policy_hash.is_some();
         plugin_request.options.policy_hash = request.options.policy_hash.clone();
         match request.options.application_mode {
@@ -175,6 +181,26 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
             .start_tunnel(plugin_request)
             .map_err(to_tunnel_error)?;
         require_state(response, "running")
+    }
+}
+
+#[async_trait]
+impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
+    async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {
+        self.start_request(request, false)
+    }
+
+    async fn stop_for_restart(&self) -> std::result::Result<(), TunnelError> {
+        // The fenced native Start performs DOWN/UP as one replacement. Sending
+        // CLIENT_STOP here would disarm the intent and schedule lease cleanup.
+        Ok(())
+    }
+
+    async fn start_for_restart(
+        &self,
+        request: TunnelStartRequest,
+    ) -> std::result::Result<(), TunnelError> {
+        self.start_request(request, true)
     }
 
     async fn stop(&self) -> std::result::Result<(), TunnelError> {

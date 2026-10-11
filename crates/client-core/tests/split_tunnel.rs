@@ -671,6 +671,55 @@ async fn policy_restart_preserves_dns46_connection_metadata() {
 }
 
 #[tokio::test]
+async fn android_policy_restart_does_not_dispatch_user_stop() {
+    for fail_new_policy in [false, true] {
+        let fixture = restart_metadata_fixture(EgressMode::PreferIpv6).await;
+        let lease = fixture.core.state().await.connection.unwrap().lease_id;
+        fixture
+            .tunnel
+            .preserve_restart_intent
+            .store(true, Ordering::SeqCst);
+        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+        changed.revision = 9;
+        changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        changed.selected_packages = vec!["com.example.chat".into()];
+        fixture.api.set_policy(changed);
+        fixture.api.set_revision(9, 2);
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(usize::from(fail_new_policy), Ordering::SeqCst);
+        fixture
+            .core
+            .synchronize_split_tunnel(1_600, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.stops.load(Ordering::SeqCst),
+            0,
+            "a policy replacement must not cancel the durable Android intent"
+        );
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture.core.state().await.connection.unwrap().lease_id,
+            lease
+        );
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.tunnel.restart_starts.load(Ordering::SeqCst),
+            1 + usize::from(fail_new_policy)
+        );
+        fixture.core.stop_locally().await.unwrap();
+        assert_eq!(
+            fixture.tunnel.stops.load(Ordering::SeqCst),
+            1,
+            "explicit Stop must still close the native tunnel"
+        );
+    }
+}
+
+#[tokio::test]
 async fn policy_rollback_preserves_dns46_connection_metadata() {
     check_policy_restart_metadata(true).await;
 }
@@ -727,6 +776,10 @@ async fn check_policy_restart_metadata(fail_new_policy: bool) {
 async fn network_restart_and_retry_preserve_dns46_connection_metadata() {
     for failed_starts in [0, 1] {
         let fixture = restart_metadata_fixture(EgressMode::PreferIpv6).await;
+        fixture
+            .tunnel
+            .preserve_restart_intent
+            .store(true, Ordering::SeqCst);
         let connection = fixture.core.state().await.connection.unwrap();
         fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
         assert_eq!(
@@ -748,6 +801,11 @@ async fn network_restart_and_retry_preserve_dns46_connection_metadata() {
         }
         assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.tunnel.restart_starts.load(Ordering::SeqCst),
+            1 + failed_starts
+        );
     }
 }
 
@@ -755,6 +813,10 @@ async fn network_restart_and_retry_preserve_dns46_connection_metadata() {
 async fn stalled_restart_and_retry_preserve_dns46_connection_metadata() {
     for failed_starts in [0, 1] {
         let fixture = restart_metadata_fixture(EgressMode::PreferIpv6).await;
+        fixture
+            .tunnel
+            .preserve_restart_intent
+            .store(true, Ordering::SeqCst);
         let connection = fixture.core.state().await.connection.unwrap();
         fixture
             .tunnel
@@ -778,7 +840,116 @@ async fn stalled_restart_and_retry_preserve_dns46_connection_metadata() {
         }
         assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.tunnel.restart_starts.load(Ordering::SeqCst),
+            1 + failed_starts
+        );
     }
+}
+
+#[tokio::test]
+async fn nlm071_network_restart_completion_cannot_replace_disconnect_or_logout() {
+    for logout in [false, true] {
+        for fail in [false, true] {
+            let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+            fixture
+                .tunnel
+                .preserve_restart_intent
+                .store(true, Ordering::SeqCst);
+            fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+            assert_eq!(
+                fixture.core.poll_physical_network(1_100).await.unwrap(),
+                PhysicalNetworkPollOutcome::ChangePending
+            );
+            fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+            fixture
+                .tunnel
+                .fail_next_starts
+                .store(if fail { 2 } else { 0 }, Ordering::SeqCst);
+            let recovery = tokio::spawn({
+                let fixture = fixture.clone();
+                async move { fixture.core.poll_physical_network(1_130).await }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if logout {
+                fixture.local.stop_local().await.unwrap();
+            } else {
+                fixture.local.stop_local_on_disconnect().await.unwrap();
+            }
+            let expected = if logout {
+                Phase::SignedOut
+            } else {
+                Phase::Error
+            };
+            let stored_after_stop = fixture.secret_store.load().unwrap();
+            fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+            fixture.tunnel.restart_release.notify_one();
+            let result = recovery.await.unwrap();
+            assert_eq!(fixture.core.state().await.phase, expected);
+            assert!(fixture.core.state().await.connection.is_none());
+            assert_eq!(
+                fixture.tunnel.status().await.unwrap(),
+                TunnelStatus::Stopped
+            );
+            assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+            assert!(
+                matches!(result, Err(CoreError::StartCancelled)),
+                "{result:?}"
+            );
+            assert_eq!(fixture.secret_store.load().unwrap(), stored_after_stop);
+        }
+    }
+}
+
+#[tokio::test]
+async fn nlm071_network_detection_after_disconnect_never_dispatches_restart() {
+    let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+    fixture
+        .tunnel
+        .preserve_restart_intent
+        .store(true, Ordering::SeqCst);
+    fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+    fixture.core.poll_physical_network(1_100).await.unwrap();
+    let previous_probes = fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.poll_physical_network(1_130).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == previous_probes {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.local.stop_local_on_disconnect().await.unwrap();
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.fingerprint_release.notify_one();
+    assert!(matches!(
+        recovery.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.core.state().await.phase, Phase::Error);
+    assert!(fixture.core.state().await.connection.is_none());
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Stopped
+    );
 }
 
 async fn restart_metadata_fixture(mode: EgressMode) -> CoordinatorFixture {
@@ -2671,6 +2842,7 @@ struct CoordinatorFixture {
     split_store: Arc<MemorySplitTunnelStore>,
     logger: Arc<TestLogger>,
     secret_store: Arc<TestSecretStore>,
+    local: Arc<nelomai_client_core::CoreLocalStop<CoordinatorTunnel>>,
 }
 
 fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
@@ -2692,11 +2864,17 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
     });
     let split_store = Arc::new(MemorySplitTunnelStore::default());
     let logger = Arc::new(TestLogger::default());
-    let core = support::core_with_split(
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let core = ClientCore::with_split_tunnel_store(
         api.clone(),
-        secret_store.clone(),
+        Arc::new(support::LegacyRuntime::new(secret_store.clone())),
         split_store.clone(),
-        tunnel.clone(),
+        Arc::new(support::TestOwner::new(
+            api.clone(),
+            secret_store.clone(),
+            local.clone(),
+        )),
+        local.clone(),
         logger.clone(),
     );
     core.set_split_tunnel_installed_packages(installed());
@@ -2707,6 +2885,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
         split_store,
         logger,
         secret_store,
+        local,
     }
 }
 
@@ -2812,6 +2991,10 @@ struct CoordinatorTunnel {
     fail_next_starts: AtomicUsize,
     fail_next_stops: AtomicUsize,
     keep_running_on_stop_failure: AtomicBool,
+    preserve_restart_intent: AtomicBool,
+    restart_starts: AtomicUsize,
+    block_restart: AtomicBool,
+    restart_release: Notify,
     options: Mutex<Vec<TunnelOptions>>,
     start_metadata: Mutex<Vec<(Option<QuickConnection>, QuickReconnect)>>,
     status: Mutex<TunnelStatus>,
@@ -2840,6 +3023,22 @@ impl CoordinatorTunnel {
 
 #[async_trait]
 impl TunnelController for CoordinatorTunnel {
+    async fn start_for_restart(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
+        self.restart_starts.fetch_add(1, Ordering::SeqCst);
+        if self.block_restart.load(Ordering::SeqCst) {
+            self.restart_release.notified().await;
+        }
+        self.start(request).await
+    }
+
+    async fn stop_for_restart(&self) -> Result<(), TunnelError> {
+        if self.preserve_restart_intent.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            self.stop().await
+        }
+    }
+
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         self.start_metadata

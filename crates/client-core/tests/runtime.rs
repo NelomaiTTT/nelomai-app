@@ -1059,6 +1059,10 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.clone());
+        self.stop_seen.notify_one();
+        if self.hold_stop.load(Ordering::SeqCst) {
+            self.release_stop.notified().await;
+        }
         if let Some(result) = self.redundant_stop_responses.lock().unwrap().pop_front() {
             return result.map(|connection| ConnectionOperationResponse {
                 api_version: ApiVersion::V1,
@@ -5859,6 +5863,442 @@ async fn logout_fences_configuration_restore_started_by_bootstrap() {
     ));
     assert_eq!(store.load().unwrap(), after);
     assert_eq!(core.state().await.phase, Phase::SignedOut);
+}
+
+#[tokio::test]
+async fn nlm071_disconnect_fences_late_panel_start_presentation_and_keeps_cleanup() {
+    let api = Arc::new(MockApi::new(0));
+    api.hold_start.store(true, Ordering::SeqCst);
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Retryable);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(support::TestOwner::new(
+        api.clone(),
+        store.clone(),
+        local.clone(),
+    ));
+    let core = Arc::new(
+        nelomai_client_core::ClientCore::new(
+            api.clone(),
+            Arc::new(support::LegacyRuntime::new(store.clone())),
+            owner,
+            local.clone(),
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(Vec::new())),
+    );
+    let start = tokio::spawn({
+        let core = core.clone();
+        async move { core.start(options(), 1_700_000_000).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), api.start_seen.notified())
+        .await
+        .unwrap();
+    let before = store.load().unwrap();
+    assert!(before.as_ref().unwrap().pending_start.is_some());
+    // A real owner-channel stop shares Core's cancellation epoch and state,
+    // and must run despite the Start holding the connection writer gate.
+    local.stop_local_on_disconnect().await.unwrap();
+    api.release_start.notify_one();
+    assert!(matches!(
+        start.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(core.state().await.phase, Phase::Error);
+}
+
+#[tokio::test]
+async fn nlm071_late_success_after_disconnect_cleans_up_without_replacing_error() {
+    nlm071_late_success_cleanup(false, false).await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nlm071_stalled_retry_after_disconnect_does_not_restart_or_replace_error() {
+    nlm071_cancelled_stalled_restart(false, "retry").await;
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nlm071_late_stalled_restart_failure_preserves_disconnect_and_logout() {
+    for logout in [false, true] {
+        nlm071_cancelled_stalled_restart(logout, "failure").await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn nlm071_late_stalled_restart_success_closes_native_without_replacing_stop() {
+    for logout in [false, true] {
+        nlm071_cancelled_stalled_restart(logout, "success").await;
+    }
+}
+
+async fn nlm071_cancelled_stalled_restart(logout: bool, stage: &str) {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let core = Arc::new(nelomai_client_core::ClientCore::new(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store.clone())),
+        Arc::new(support::TestOwner::new(api, store.clone(), local.clone())),
+        local.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let connected = core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel
+        .fail_next_starts
+        .store(if stage == "success" { 0 } else { 2 }, Ordering::SeqCst);
+    tunnel.block_start.store(stage != "retry", Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let core = core.clone();
+        async move {
+            core.recover_stalled_data_plane(
+                &connected.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+            )
+            .await
+        }
+    });
+    for _ in 0..1_000 {
+        if tunnel.starts.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        tunnel.starts.load(Ordering::SeqCst),
+        2,
+        "replacement did not reach native Start"
+    );
+    if logout {
+        local.stop_local().await.unwrap();
+    } else {
+        local.stop_local_on_disconnect().await.unwrap();
+    }
+    let expected = if logout {
+        Phase::SignedOut
+    } else {
+        Phase::Error
+    };
+    assert_eq!(core.state().await.phase, expected);
+    let stored_after_stop = store.load().unwrap();
+    tunnel.block_start.store(false, Ordering::SeqCst);
+    tunnel.start_release.notify_one();
+    tokio::time::advance(Duration::from_millis(250)).await;
+    let result = recovery.await.unwrap();
+    assert_eq!(
+        core.state().await.phase,
+        expected,
+        "retired {stage} overwrote stop"
+    );
+    assert!(core.state().await.connection.is_none());
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(
+        tunnel.starts.load(Ordering::SeqCst),
+        2,
+        "no post-cancel retry"
+    );
+    assert!(
+        matches!(result, Err(CoreError::StartCancelled)),
+        "{result:?}"
+    );
+    assert_eq!(store.load().unwrap(), stored_after_stop);
+}
+
+#[tokio::test]
+async fn nlm071_stalled_handshake_after_owner_stop_cannot_publish_connected() {
+    for logout in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        api.awg3_start.store(true, Ordering::SeqCst);
+        let store = Arc::new(MemoryStore::new(auth()));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        tunnel.metrics_supported.store(true, Ordering::SeqCst);
+        tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let core = Arc::new(nelomai_client_core::ClientCore::new(
+            api.clone(),
+            Arc::new(support::LegacyRuntime::new(store.clone())),
+            Arc::new(support::TestOwner::new(api, store, local.clone())),
+            local.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let connected = core.start(options(), 1_700_000_000).await.unwrap();
+        tunnel.block_metrics.store(true, Ordering::SeqCst);
+        let recovery = tokio::spawn({
+            let core = core.clone();
+            async move {
+                core.recover_stalled_data_plane(
+                    &connected.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tunnel.blocked_metrics_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if logout {
+            local.stop_local().await.unwrap();
+        } else {
+            local.stop_local_on_disconnect().await.unwrap();
+        }
+        tunnel.block_metrics.store(false, Ordering::SeqCst);
+        tunnel.metrics_release.notify_one();
+        let result = recovery.await.unwrap();
+        assert_eq!(
+            core.state().await.phase,
+            if logout {
+                Phase::SignedOut
+            } else {
+                Phase::Error
+            }
+        );
+        assert!(core.state().await.connection.is_none());
+        assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+        assert!(
+            matches!(result, Err(CoreError::StartCancelled)),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nlm071_late_success_after_logout_cleans_up_without_replacing_signed_out() {
+    nlm071_late_success_cleanup(true, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_disconnect_during_compensation_stop_fences_cleanup_presentation() {
+    nlm071_late_success_cleanup(false, true).await;
+}
+
+async fn nlm071_late_success_cleanup(logout: bool, disconnect_during_cleanup: bool) {
+    let api = Arc::new(MockApi::new(0));
+    api.hold_start
+        .store(!disconnect_during_cleanup, Ordering::SeqCst);
+    api.hold_stop.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    if disconnect_during_cleanup {
+        tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    }
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let core = Arc::new(nelomai_client_core::ClientCore::new(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store.clone())),
+        Arc::new(support::TestOwner::new(
+            api.clone(),
+            store.clone(),
+            local.clone(),
+        )),
+        local.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let start = tokio::spawn({
+        let core = core.clone();
+        async move { core.start(options(), 1_700_000_000).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), api.start_seen.notified())
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_some());
+    if disconnect_during_cleanup {
+        tokio::time::timeout(Duration::from_secs(1), api.stop_seen.notified())
+            .await
+            .unwrap();
+    }
+    if logout {
+        core.sign_out().await.unwrap();
+    } else {
+        local.stop_local_on_disconnect().await.unwrap();
+    }
+    let phase = if logout {
+        Phase::SignedOut
+    } else {
+        Phase::Error
+    };
+    assert_eq!(core.state().await.phase, phase);
+    let auth_after_stop = store.load().unwrap().unwrap();
+    api.release_start.notify_one();
+    if !disconnect_during_cleanup {
+        tokio::time::timeout(Duration::from_secs(1), api.stop_seen.notified())
+            .await
+            .unwrap();
+    }
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    assert_eq!(pending.lease_id, api.operation_ids.lock().unwrap()[0]);
+    assert_eq!(
+        pending.operation_id,
+        api.stop_operation_ids.lock().unwrap()[0]
+    );
+    api.release_stop.notify_one();
+    assert!(start.await.unwrap().is_err());
+    let after = store.load().unwrap().unwrap();
+    assert!(after.pending_start.is_none());
+    assert!(after.pending_compensation_stop.is_none());
+    assert_eq!(after.access_token, auth_after_stop.access_token);
+    assert_eq!(after.refresh_token, auth_after_stop.refresh_token);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    let state = core.state().await;
+    assert_eq!(state.phase, phase);
+    assert!(state.connection.is_none());
+}
+
+#[tokio::test]
+async fn nlm071_failed_ordinary_compensation_after_disconnect_preserves_error_and_journal() {
+    nlm071_failed_compensation(false, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_failed_ordinary_compensation_after_logout_preserves_signed_out_and_journal() {
+    nlm071_failed_compensation(false, true).await;
+}
+
+#[tokio::test]
+async fn nlm071_failed_redundant_compensation_after_disconnect_preserves_error_and_journal() {
+    nlm071_failed_compensation(true, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_failed_redundant_compensation_after_logout_preserves_signed_out_and_journal() {
+    nlm071_failed_compensation(true, true).await;
+}
+
+async fn nlm071_failed_compensation(redundant: bool, logout: bool) {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(redundant, Ordering::SeqCst);
+    api.hold_stop.store(true, Ordering::SeqCst);
+    if redundant {
+        api.redundant_stop_responses
+            .lock()
+            .unwrap()
+            .extend([Err(CoreApiError::Retryable), Err(CoreApiError::Retryable)]);
+    } else {
+        api.stop_errors
+            .lock()
+            .unwrap()
+            .extend([CoreApiError::Retryable, CoreApiError::Retryable]);
+    }
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let core = Arc::new(
+        nelomai_client_core::ClientCore::new(
+            api.clone(),
+            Arc::new(support::LegacyRuntime::new(store.clone())),
+            Arc::new(support::TestOwner::new(
+                api.clone(),
+                store.clone(),
+                local.clone(),
+            )),
+            local.clone(),
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(vec![0])),
+    );
+    let start = tokio::spawn({
+        let core = core.clone();
+        async move {
+            if redundant {
+                core.start_recovery_v2(options(), 1_700_000_000, true).await
+            } else {
+                core.start(options(), 1_700_000_000).await
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), api.stop_seen.notified())
+        .await
+        .unwrap();
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_some());
+    if logout {
+        core.sign_out().await.unwrap();
+    } else {
+        local.stop_local_on_disconnect().await.unwrap();
+    }
+    let before = store.load().unwrap();
+    api.hold_stop.store(false, Ordering::SeqCst);
+    api.release_stop.notify_one();
+    assert!(start.await.unwrap().is_err());
+    assert_eq!(
+        store.load().unwrap(),
+        before,
+        "failed cleanup must retain its exact durable journal"
+    );
+    let pending = before.unwrap().pending_compensation_stop.unwrap();
+    if redundant {
+        let requests = api.redundant_stop_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0].operation_id, pending.operation_id);
+        assert_eq!(requests[0].lease_id, pending.lease_id);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    } else {
+        let ids = api.stop_operation_ids.lock().unwrap();
+        assert_eq!(
+            ids.as_slice(),
+            &[pending.operation_id.clone(), pending.operation_id]
+        );
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    }
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    let state = core.state().await;
+    assert_eq!(
+        state.phase,
+        if logout {
+            Phase::SignedOut
+        } else {
+            Phase::Error
+        }
+    );
+    assert!(state.connection.is_none());
+}
+
+#[tokio::test]
+async fn nlm071_disconnect_stop_failure_preserves_auth_and_cleanup() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let core = nelomai_client_core::ClientCore::new(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store.clone())),
+        Arc::new(support::TestOwner::new(api, store.clone(), local.clone())),
+        local.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    let before = store.load().unwrap();
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    assert!(local.stop_local_on_disconnect().await.is_err());
+    assert_eq!(core.state().await.phase, Phase::Error);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+    assert_eq!(store.load().unwrap(), before);
+    // A later confirmed logout keeps its original SignedOut presentation.
+    local.stop_local().await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
 }
 
 #[tokio::test(flavor = "current_thread")]

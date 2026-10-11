@@ -451,6 +451,14 @@ pub enum TunnelError {
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
+    /// Prepare a same-lease local restart, not a user cancellation. Android
+    /// replaces the transport at Start so its durable intent stays armed.
+    async fn stop_for_restart(&self) -> Result<(), TunnelError> {
+        self.stop().await
+    }
+    async fn start_for_restart(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
+        self.start(request).await
+    }
     /// Core cleanup must not cancel an independent native session. Native
     /// owners enforce this at command execution, not just at a prior status read.
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {

@@ -212,6 +212,11 @@ pub trait LocalAuthStop: Send + Sync {
     /// they must not await I/O or suppress subsequent physical/remote cleanup.
     fn revoke_runtime(&self) {}
     async fn stop_local(&self) -> Result<(), BrokerError>;
+    /// Channel loss is not evidence of logout. Always stop physically, while
+    /// adapters with shared presentation keep authorization unavailable.
+    async fn stop_local_on_disconnect(&self) -> Result<(), BrokerError> {
+        self.stop_local().await
+    }
     async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
         self.stop_local().await
     }

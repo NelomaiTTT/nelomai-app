@@ -826,6 +826,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private lateinit var backgroundLogoutLifecycle: BackgroundLogoutServiceLifecycle
     private lateinit var redundantTotalLossLifecycle: RedundantTotalLossLifecycle
     private val connectionIntentDispatch = AndroidConnectionIntentDispatchState()
+    @Volatile
+    private var failedLocalRestartAuthority: FailedLocalRestartAuthority? = null
     private val connectionIntentAdmission = AndroidConnectionIntentAdmission()
     private val connectionIntentRuntimeFence = AndroidRuntimeStartDispatchFence()
     private val serviceCallbackGate = AndroidServiceCallbackGate()
@@ -1111,6 +1113,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             stopIfIdle()
             return
         }
+        if (args.apiVersion != TUNNEL_API_VERSION) {
+            args.clearSensitiveConfigurations()
+            receiver.sendError("unsupported_api_version")
+            return
+        }
         backgroundLogoutClientStartFailure(backgroundLogoutState())?.let { code ->
             args.clearSensitiveConfigurations()
             receiver.sendError(code)
@@ -1138,45 +1145,120 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             stopIfIdle()
             return
         }
-        QuickTunnelController.updateState(
-            applicationContext,
-            SessionState.STARTING,
-            desiredActive = true,
-        )
-        if (args.redundancy != null) {
-            redundantWork.execute { startRedundantClient(args, receiver) }
+        val localRestart = args.startSource == "local_restart"
+        if (localRestart && (args.redundancy != null || args.cacheQuickAction ||
+                args.quickConnection == null || args.quickConnection?.allowAlternate != false)
+        ) {
+            args.clearSensitiveConfigurations()
+            redundantStartOperation.completeFailure(requireNotNull(args.clientOperationId)) {}
+            receiver.sendError("invalid_tunnel_request")
             return
         }
-        TunnelRuntime.start(
-            applicationContext,
-            args,
-            { state, duration ->
-                val durableDesiredActive = QuickTunnelController.desiredActive(applicationContext)
-                QuickTunnelController.updateState(
-                    applicationContext,
-                    state,
-                    desiredActive = legacyStartCallbackDesiredActive(
-                        durableDesiredActive,
-                        state,
-                    ),
+        if (localRestart && !connectionIntentCoordinator.beginLocalRestart()) {
+            args.clearSensitiveConfigurations()
+            receiver.sendError("tunnel_operation_in_progress")
+            return
+        }
+        fun nativeOwnerPending() = redundantStartOperation.hasPending() ||
+            redundantVpnOwnerSlot.snapshot() != null || pendingRedundantStop != null ||
+            connectionIntentDispatch.hasPendingWork()
+        val restartAdmission = connectionIntentAdmission.snapshot()
+        val restartReleased = AtomicBoolean(false)
+        fun releaseRestart() {
+            if (localRestart && restartReleased.compareAndSet(false, true)) {
+                connectionIntentCoordinator.completeLocalRestart()
+            }
+        }
+        val authority = if (localRestart) localRestartAuthority(
+            recoveryStore.read(), args.quickConnection?.leaseId,
+            TunnelRuntime.activeLeaseId(), nativeOwnerPending(),
+            failedRestart = failedLocalRestartAuthority, admissionTicket = restartAdmission,
+        ) else null
+        val ownerCurrent = {
+            !localRestart || (authority != null && !serviceDestroyed &&
+                serviceCallbackGate.isOpen() &&
+                serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get() &&
+                connectionIntentAdmission.isCurrent(restartAdmission) &&
+                !redundantStartBlocked() &&
+                !nativeOwnerPending() &&
+                (recoveryStore.read() as? RecoveryStoreResult.Success)?.value == authority &&
+                (TunnelRuntime.activeLeaseId() == null ||
+                    TunnelRuntime.activeLeaseId() == args.quickConnection?.leaseId))
+        }
+        val dispatched = try { dispatchLegacyClientStart(
+            admit = {
+                ownerCurrent() && QuickTunnelController.updateState(
+                    applicationContext, SessionState.STARTING,
+                    desiredActive = if (localRestart) null else true,
                 )
-                receiver.sendOperation(state, duration)
             },
-            { code ->
-                val state = TunnelRuntime.state()
-                val durableDesiredActive = QuickTunnelController.desiredActive(applicationContext)
-                QuickTunnelController.updateState(
+            start = {
+                if (args.redundancy != null) {
+                    redundantWork.execute { startRedundantClient(args, receiver) }
+                } else TunnelRuntime.start(
                     applicationContext,
-                    state,
-                    desiredActive = legacyStartCallbackDesiredActive(
-                        durableDesiredActive,
-                        state,
-                    ),
+                    args,
+                    { state, duration ->
+                        try {
+                            if (!ownerCurrent()) {
+                                // Still on the native executor: its catch closes
+                                // this rejected replacement before the error reply.
+                                throw TunnelOperationException("tunnel_start_cancelled")
+                            } else {
+                                QuickTunnelController.updateState(
+                                    applicationContext, state,
+                                    desiredActive = if (localRestart) null else legacyStartCallbackDesiredActive(
+                                        QuickTunnelController.desiredActive(applicationContext), state,
+                                    ),
+                                )
+                                if (!ownerCurrent()) throw TunnelOperationException("tunnel_start_cancelled")
+                                if (localRestart) failedLocalRestartAuthority = null
+                                releaseRestart()
+                                receiver.sendOperation(state, duration)
+                            }
+                        } finally {
+                            releaseRestart()
+                        }
+                    },
+                    { code ->
+                        try {
+                            val state = TunnelRuntime.state()
+                            QuickTunnelController.updateState(
+                                applicationContext, state,
+                                desiredActive = if (localRestart) null else legacyStartCallbackDesiredActive(
+                                    QuickTunnelController.desiredActive(applicationContext), state,
+                                ),
+                            )
+                            if (localRestart && ownerCurrent()) {
+                                failedLocalRestartAuthority = FailedLocalRestartAuthority(
+                                    requireNotNull(args.quickConnection).leaseId,
+                                    requireNotNull(authority), restartAdmission,
+                                )
+                            }
+                            releaseRestart()
+                            stopIfIdle()
+                            receiver.sendError(code)
+                        } finally {
+                            releaseRestart()
+                        }
+                    },
+                    keepForegroundServiceOnFailure = localRestart,
+                    ownerCurrent = ownerCurrent,
                 )
-                receiver.sendError(code)
-                stopIfIdle()
             },
-        )
+        ) } catch (_: Throwable) {
+            releaseRestart()
+            args.clearSensitiveConfigurations()
+            receiver.sendError("tunnel_backend_error")
+            return
+        }
+        if (!dispatched) {
+            releaseRestart()
+            args.clearSensitiveConfigurations()
+            redundantStartOperation.completeFailure(requireNotNull(args.clientOperationId)) {}
+            receiver.sendError("connection_start_admission_failed")
+            stopIfIdle()
+        }
     }
 
     private fun startRedundantClient(args: StartTunnelArgs, receiver: ResultReceiver?) {
@@ -4085,6 +4167,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun invalidateConnectionIntentStarts() {
+        failedLocalRestartAuthority = null
         connectionIntentAdmission.invalidate()
         connectionIntentDispatch.invalidate()
         connectionIntentRuntimeFence.cancelActive()
@@ -6226,6 +6309,11 @@ internal class AndroidConnectionIntentCoordinator(
         AndroidConnectionIntentDiagnosticsObserver {},
 ) {
     private val operationGate = AtomicBoolean(false)
+
+    // Serialize local replacement with replay/cleanup, without disarming the
+    // intent. Explicit cancellation still advances the durable generation.
+    fun beginLocalRestart(): Boolean = operationGate.compareAndSet(false, true)
+    fun completeLocalRestart() { operationGate.set(false) }
 
     fun begin(
         template: AndroidIntentTemplate,

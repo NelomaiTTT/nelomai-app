@@ -764,15 +764,28 @@ internal object TunnelRuntime {
 
     fun state(): SessionState = stateGate.current()
 
+    fun activeLeaseId(): String? = activeSession?.connectionLeaseId
+
     fun start(
         context: Context,
         args: StartTunnelArgs,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
         keepForegroundServiceOnFailure: Boolean = false,
+        ownerCurrent: () -> Boolean = { true },
     ) {
         val applicationContext = context.applicationContext
         val quickPlan = args.copyForQuickPlan()
+        if (!ownerCurrent()) {
+            args.clearSensitiveConfigurations()
+            quickPlan?.clearSensitiveConfigurations()
+            onError("tunnel_start_cancelled")
+            return
+        }
+        fun requireCurrentStart() {
+            requireClientStartNotCancelled(args.clientOperationId)
+            if (!ownerCurrent()) throw TunnelOperationException("tunnel_start_cancelled")
+        }
         val serviceReady = try {
             validateVersion(args.apiVersion)
             NelomaiVpnService.ensureStarted(applicationContext)
@@ -809,10 +822,10 @@ internal object TunnelRuntime {
                 ),
             )
             try {
-                requireClientStartNotCancelled(args.clientOperationId)
+                requireCurrentStart()
                 val serviceStartedAt = System.nanoTime()
                 serviceReady.get(5, TimeUnit.SECONDS)
-                requireClientStartNotCancelled(args.clientOperationId)
+                requireCurrentStart()
                 logStage("start.service_ready", serviceStartedAt)
                 if (replaceExisting) {
                     val replaceStartedAt = System.nanoTime()
@@ -939,7 +952,7 @@ internal object TunnelRuntime {
                     transport,
                 )
 
-                requireClientStartNotCancelled(args.clientOperationId)
+                requireCurrentStart()
                 val backendStartedAt = System.nanoTime()
                 var activeBackend = requireBackend()
                 startMemoryDiagnostics.record(
@@ -1006,7 +1019,9 @@ internal object TunnelRuntime {
                         )
                     }
                 }
-                if (state == Tunnel.State.UP && isClientStartCancelled(args.clientOperationId)) {
+                if (state == Tunnel.State.UP &&
+                    (isClientStartCancelled(args.clientOperationId) || !ownerCurrent())
+                ) {
                     suppressBackendStateChanges.set(true)
                     try {
                         requireState(
@@ -1134,6 +1149,18 @@ internal object TunnelRuntime {
             } catch (error: Throwable) {
                 args.clearSensitiveConfigurations()
                 quickPlan?.clearSensitiveConfigurations()
+                if (args.startSource == "local_restart") {
+                    // A Stop may have invalidated the generation after native
+                    // UP. Do not leave a rejected replacement physically open.
+                    clearActiveSession()
+                    suppressBackendStateChanges.set(true)
+                    try {
+                        runCatching { requireBackend().setState(tunnel, Tunnel.State.DOWN, null) }
+                            .onFailure { TunnelLog.warning("start.cancel_cleanup_failed", error = it) }
+                    } finally {
+                        suppressBackendStateChanges.set(false)
+                    }
+                }
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 if (!keepForegroundServiceOnFailure) {
@@ -2691,7 +2718,7 @@ internal fun shouldRecycleIdleVpnProcess(
     pendingRuntimeDispatch: Boolean = false,
 ): Boolean = state == SessionState.STOPPED && !desiredActive && !pendingRuntimeDispatch
 
-private class TunnelOperationException(val code: String) : RuntimeException()
+internal class TunnelOperationException(val code: String) : RuntimeException()
 
 internal fun shouldCancelActiveClientStart(
     requestedOperationId: String,

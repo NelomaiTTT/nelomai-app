@@ -762,6 +762,10 @@ where
         now_unix: i64,
         allowed: impl Fn() -> bool + Send,
     ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        let cancel_epoch = crate::StartCancellationEpoch(
+            self.start_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
             return Ok(PhysicalNetworkPollOutcome::Busy);
         };
@@ -770,6 +774,7 @@ where
         };
         let current = {
             let state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             (state.phase == Phase::Connected)
                 .then(|| state.connection.clone())
                 .flatten()
@@ -786,6 +791,7 @@ where
             return Ok(PhysicalNetworkPollOutcome::Skipped);
         }
         let fingerprint_result = self.tunnel.physical_network_fingerprint().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         if !allowed() {
             return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
         }
@@ -866,17 +872,18 @@ where
         if !allowed() {
             return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
         }
-        if let Err(error) = self.tunnel.stop().await {
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let stop_result = self.tunnel.stop_for_restart().await;
+        self.ensure_offline_start_current(cancel_epoch).await?;
+        if let Err(error) = stop_result {
             let tunnel_stopped = self
                 .tunnel
                 .status()
                 .await
                 .is_ok_and(|status| status != nelomai_client_tunnel::TunnelStatus::Running);
             let should_report = if tunnel_stopped {
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                    .await?;
                 self.physical_network_change.lock().await.reset();
                 true
             } else {
@@ -900,10 +907,11 @@ where
             }
             return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
         }
-        self.set_phase(Phase::Connecting).await;
+        self.publish_local_start_state(cancel_epoch, Phase::Connecting, connection.clone())
+            .await?;
         let start = |configuration: String, options: TunnelOptions| {
             self.tunnel
-                .start(nelomai_client_tunnel::TunnelStartRequest {
+                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options,
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
@@ -912,13 +920,13 @@ where
                 })
         };
         let first = start(configuration.clone(), options.clone()).await;
+        self.ensure_offline_start_current(cancel_epoch).await?;
         if first.is_err() {
             let second = start(configuration, options).await;
+            self.ensure_offline_start_current(cancel_epoch).await?;
             if let Err(error) = second {
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                    .await?;
                 self.set_split_tunnel_warning(
                     SplitTunnelWarningKind::Operation,
                     "split_tunnel_network_reconnect_failed",
@@ -934,10 +942,8 @@ where
                 return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
             }
         }
-        *self.state.lock().await = crate::CoreState {
-            phase: Phase::Connected,
-            connection: Some(connection),
-        };
+        self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+            .await?;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
             .await;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
@@ -979,6 +985,10 @@ where
         lease_id: &str,
         recovery: crate::StalledDataPlaneRecovery,
     ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
+        let cancel_epoch = crate::StartCancellationEpoch(
+            self.start_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         let Ok(_intent_recovery_guard) = self.intent_recovery_gate.try_lock() else {
             return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
         };
@@ -990,6 +1000,7 @@ where
         };
         let connection = {
             let state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             (state.phase == Phase::Connected)
                 .then(|| state.connection.clone())
                 .flatten()
@@ -1003,6 +1014,7 @@ where
                 tokio::time::timeout(std::time::Duration::from_secs(3), self.tunnel.rebind_udp())
                     .await
                     .map_err(|_| CoreError::Tunnel("udp_rebind_timeout".to_string()))??;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             return Ok(if rebound {
                 crate::StalledDataPlaneRecoveryOutcome::Rebound
             } else {
@@ -1038,7 +1050,10 @@ where
         let transport =
             nelomai_client_tunnel::TunnelConfiguration::new(configuration.clone()).transport();
         let options = self.split_tunnel_options.lock().await.clone();
-        if let Err(error) = self.tunnel.stop().await {
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let stop_result = self.tunnel.stop_for_restart().await;
+        self.ensure_offline_start_current(cancel_epoch).await?;
+        if let Err(error) = stop_result {
             if !matches!(
                 self.tunnel.status().await,
                 Ok(nelomai_client_tunnel::TunnelStatus::Stopped
@@ -1047,10 +1062,11 @@ where
                 return Err(error.into());
             }
         }
-        self.set_phase(Phase::Connecting).await;
+        self.publish_local_start_state(cancel_epoch, Phase::Connecting, connection.clone())
+            .await?;
         let start = || {
             self.tunnel
-                .start(nelomai_client_tunnel::TunnelStartRequest {
+                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(
                         configuration.clone(),
                     ),
@@ -1061,6 +1077,7 @@ where
                 })
         };
         let first_start_result = start().await;
+        self.ensure_offline_start_current(cancel_epoch).await?;
         let start_result = if first_start_result.is_err() {
             self.logger.record(crate::CoreLogEvent {
                 kind: "tunnel.stall.local_start_retry",
@@ -1069,31 +1086,31 @@ where
                 code: first_start_result.as_ref().err().map(ToString::to_string),
             });
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             start().await
         } else {
             first_start_result
         };
+        self.ensure_offline_start_current(cancel_epoch).await?;
         if let Err(error) = start_result {
-            *self.state.lock().await = crate::CoreState {
-                phase: Phase::Stopping,
-                connection: Some(connection),
-            };
+            self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                .await?;
             return Err(error.into());
         }
         if transport == nelomai_client_tunnel::TunnelTransport::AmneziaWg3 {
-            if let Err(error) = self.ensure_awg3_handshake(lease_id, None, None).await {
+            if let Err(error) = self
+                .ensure_awg3_handshake(lease_id, None, Some(cancel_epoch))
+                .await
+            {
+                self.ensure_start_not_cancelled(cancel_epoch)?;
                 let cleanup_error = self.tunnel.stop().await.err().map(CoreError::from);
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                    .await?;
                 return Err(cleanup_error.unwrap_or(error));
             }
         }
-        *self.state.lock().await = crate::CoreState {
-            phase: Phase::Connected,
-            connection: Some(connection),
-        };
+        self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+            .await?;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
         *self.active_recovery_episode.lock().await = None;
@@ -1806,7 +1823,7 @@ where
             .await;
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         }
-        if self.tunnel.stop().await.is_err() {
+        if self.tunnel.stop_for_restart().await.is_err() {
             mark_policy_failure(state, policy, now_unix);
             let phase = match self.tunnel.status().await {
                 Ok(
@@ -1860,7 +1877,7 @@ where
         }
         let start_new = self
             .tunnel
-            .start(nelomai_client_tunnel::TunnelStartRequest {
+            .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
                 configuration: nelomai_client_tunnel::TunnelConfiguration::new(
                     configuration.clone(),
                 ),
@@ -1895,7 +1912,7 @@ where
             self.ensure_start_not_cancelled(cancel_epoch)?;
             let rollback = self
                 .tunnel
-                .start(nelomai_client_tunnel::TunnelStartRequest {
+                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options: previous_options.clone(),
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
