@@ -135,6 +135,64 @@ try {
         if ($registered) {
             Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+            # TEMPORARY read-only CI evidence: only exact C delete sections, never the whole log.
+            if ($Case -ceq 'primary' -and $env:GITHUB_ACTIONS -eq 'true' -and
+                (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+                $setupapiEvidence = 'status=UNKNOWN reason=read-failed'
+                $setupapiStream = $null; $setupapiReader = $null
+                try {
+                    $setupapiStream = [IO.File]::Open('C:\Windows\INF\setupapi.dev.log', [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                    $setupapiLength = $setupapiStream.Length
+                    if ($setupapiLength -gt 64MB) { throw 'input-oversize' }
+                    $setupapiBytes = New-Object byte[] ($setupapiLength + 1)
+                    $setupapiRead = 0
+                    while ($setupapiRead -lt $setupapiBytes.Length) {
+                        $setupapiChunk = $setupapiStream.Read($setupapiBytes, $setupapiRead, $setupapiBytes.Length - $setupapiRead)
+                        if ($setupapiChunk -eq 0) { break }
+                        $setupapiRead += $setupapiChunk
+                    }
+                    if ($setupapiRead -ne $setupapiLength) { throw 'input-changed' }
+                    $setupapiReader = [IO.StreamReader]::new([IO.MemoryStream]::new($setupapiBytes, 0, $setupapiRead, $false), $true)
+                    $setupapiSections = [Collections.Generic.Queue[string]]::new()
+                    $setupapiSection = $null; $setupapiEnd = $false; $setupapiSectionBytes = 0
+                    while ($null -ne ($setupapiLine = $setupapiReader.ReadLine())) {
+                        if ($setupapiLine -match '^>>>[ \t]+\[Delete Device - SWD\\WINTUN\\\{80CD50AF-51B2-85D7-A00B-6D665A5C45D3\}\]$') {
+                            if ($null -ne $setupapiSection) { throw 'section-incomplete' }
+                            $setupapiSection = [Collections.Generic.List[string]]::new()
+                            $setupapiSectionBytes = 0; $setupapiEnd = $false
+                        } elseif ($null -ne $setupapiSection -and $setupapiLine -cmatch '^>>>[ \t]+\[') {
+                            throw 'section-incomplete'
+                        }
+                        if ($null -eq $setupapiSection) { continue }
+                        $setupapiSection.Add($setupapiLine)
+                        $setupapiSectionBytes += [Text.Encoding]::UTF8.GetByteCount($setupapiLine) + 2
+                        if ($setupapiSection.Count -gt 512 -or $setupapiSectionBytes -gt 128KB) { throw 'section-oversize' }
+                        if ($setupapiEnd) {
+                            if ($setupapiLine -cnotmatch '^<<<[ \t]+\[Exit status: [^\]]+\]$') { throw 'footer-missing' }
+                            if ($setupapiSections.Count -eq 4) { throw 'section-overflow' }
+                            $setupapiSections.Enqueue([string]::Join("`r`n", $setupapiSection))
+                            $setupapiSection = $null
+                        } elseif ($setupapiLine -cmatch '^<<<[ \t]+Section end(?:[ \t]+.*)?$') {
+                            $setupapiEnd = $true
+                        }
+                    }
+                    if ($null -ne $setupapiSection) { throw 'section-incomplete' }
+                    if ($setupapiSections.Count -eq 0) { throw 'section-absent' }
+                    $setupapiEvidence = "status=CAPTURED sections=$($setupapiSections.Count)`r`n`r`n" +
+                        [string]::Join("`r`n`r`n", $setupapiSections)
+                } catch {
+                    $setupapiReason = if ($_.Exception.Message -in @('input-oversize', 'input-changed', 'section-incomplete',
+                        'section-oversize', 'footer-missing', 'section-overflow', 'section-absent')) { $_.Exception.Message } else { 'read-failed' }
+                    $setupapiEvidence = "status=UNKNOWN reason=$setupapiReason"
+                }
+                finally {
+                    if ($null -ne $setupapiReader) { $setupapiReader.Dispose() }
+                    if ($null -ne $setupapiStream) { $setupapiStream.Dispose() }
+                }
+                try { [IO.File]::WriteAllText((Join-Path $work 'etw-setupapi-c-delete.txt'), $setupapiEvidence, [Text.Encoding]::UTF8) }
+                catch { Write-Warning 'SetupAPI evidence write failed; UNKNOWN' -WarningAction Continue }
+            }
         }
     } finally {
         if ($null -ne $trace) {
