@@ -1354,20 +1354,10 @@ pub(crate) mod native {
                                     // after standby retirement. Never sample a
                                     // closed original through live Source.
                                     original.retired()?;
-                                    if self.held[i]
-                                        .value
-                                        .try_borrow()
-                                        .map_err(denied)?
-                                        .as_ref()
-                                        .is_some_and(|registration| {
-                                            registration
-                                                .tuple
-                                                .try_borrow()
-                                                .map_or(true, |tuple| tuple.is_some())
-                                        })
-                                    {
-                                        return Err(GuardError::Conflict);
-                                    }
+                                    // The registration keeps its historical tuple
+                                    // ACK until SAME generation consumption. It
+                                    // is not a live socket; retired() proves the
+                                    // canonical original and every clone closed.
                                     if !retirement {
                                         compare_guard_probe(record, desired, slot, None, None)?;
                                     }
