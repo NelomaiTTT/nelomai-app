@@ -872,6 +872,23 @@ pub(crate) mod native {
             if channel == WindowChannel::Retired {
                 return Err(GuardError::Conflict);
             }
+            if channel == WindowChannel::Retirement {
+                // Retirement samples independently inspect this SAME Pair pin.
+                // Keep those Source pre/post samples outside the Pair bracket;
+                // its exact read/effect still spans the window and resource G.
+                return self
+                    .source
+                    .as_ref()
+                    .ok_or(GuardError::Conflict)?
+                    .inspect_running_window(|window| {
+                        self.inspect_pair(selected, effect, |_| {
+                            self.verify_window(selected, window).map_err(io_denied)?;
+                            call(window).map_err(io_denied)
+                        })
+                        .map_err(native_denied)
+                    })
+                    .map_err(denied);
+            }
             self.inspect_pair(selected, effect, |_| {
                 let checked = |window: &NativeBindingsWindow<'_>| {
                     self.verify_window(selected, window)
@@ -886,12 +903,6 @@ pub(crate) mod native {
                         .as_ref()
                         .ok_or_else(|| io_denied(()))?
                         .inspect_window(checked)
-                        .map_err(io_denied)
-                } else if channel == WindowChannel::Retirement {
-                    self.source
-                        .as_ref()
-                        .ok_or_else(|| io_denied(()))?
-                        .inspect_running_window(checked)
                         .map_err(io_denied)
                 } else {
                     self.source
