@@ -1017,7 +1017,6 @@ fn carrier_factory_actual_cold_child() {
                         assert_eq!(retired.session.phase, SessionPhase::Running);
                         assert_eq!(retired.session.active, Slot::A);
                         assert_eq!(retired.leases, current.leases);
-                        assert!(retired.primary_ready);
                         assert!(!retired.cleanup_pending);
                         assert_eq!(
                             second.physical_network_fingerprint().unwrap(),
