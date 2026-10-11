@@ -187,6 +187,7 @@ pub(crate) fn role_request(snapshot: &Snapshot) -> Result<RedundantRoleRequest, 
     if snapshot.session.phase != SessionPhase::Running
         || snapshot.session.role_confirmed
         || snapshot.cleanup_pending
+        || snapshot.retirement_pending
     {
         return Err(invalid());
     }
@@ -512,6 +513,7 @@ fn running(
     if pair.stop.is_some()
         || snapshot.session.phase != SessionPhase::Running
         || snapshot.cleanup_pending
+        || snapshot.retirement_pending
     {
         return Err(invalid());
     }
@@ -632,6 +634,12 @@ fn sane(snapshot: &Snapshot) -> Result<(), CoreError> {
         || snapshot.current_leases[0].is_some()
             && snapshot.current_leases[0] == snapshot.current_leases[1]
         || (snapshot.primary_ready || snapshot.standby_ready) && s.phase != SessionPhase::Running
+        || snapshot.retirement_pending
+            && (s.phase != SessionPhase::Running
+                || snapshot.cleanup_pending
+                || snapshot.standby_ready
+                || !s.installed[index(s.active.other())]
+                || !s.committed[index(s.active.other())])
     {
         return Err(invalid());
     }

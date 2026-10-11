@@ -36,6 +36,7 @@ fn snapshot(phase: SessionPhase) -> Snapshot {
         primary_ready: true,
         standby_ready: false,
         cleanup_pending: false,
+        retirement_pending: false,
         warm_stop_v1: false,
     }
 }

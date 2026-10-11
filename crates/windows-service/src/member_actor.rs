@@ -128,13 +128,23 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
             Err(error)
                 if error.kind() == io::ErrorKind::Unsupported
                     && self.physical_fingerprint.is_none()
-                    && pair.network_validated() =>
+                    && pair.network_validated()
+                    && !snapshot.retirement_pending =>
             {
                 // Match Unix's optional-hook behavior only before any working
                 // provider was observed. Losing an established provider fences.
                 Ok(())
             }
             Err(_) => {
+                if snapshot.retirement_pending {
+                    pair.execute(
+                        Command::Stop {
+                            scope: snapshot.session.scope,
+                        },
+                        now,
+                    )?;
+                    return Ok(());
+                }
                 // Failed discovery is not proof of the old network. Invalidate
                 // once, cancel old queries, and wait for a fresh sample to rebind.
                 if pair.network_validated() {
@@ -148,6 +158,15 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
                     .as_ref()
                     .is_some_and(|old| old != &value);
                 if changed || !pair.network_validated() {
+                    if snapshot.retirement_pending {
+                        pair.execute(
+                            Command::Stop {
+                                scope: snapshot.session.scope,
+                            },
+                            now,
+                        )?;
+                        return Ok(());
+                    }
                     if let Err(error) = pair.execute(
                         Command::NetworkChanged {
                             scope: snapshot.session.scope,

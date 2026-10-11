@@ -1817,6 +1817,7 @@ fn desktop_pair_presentation(
         0
     };
     let reserve = if snapshot.cleanup_pending
+        || snapshot.retirement_pending
         || snapshot.standby_failed
         || !snapshot.session.role_confirmed
     {

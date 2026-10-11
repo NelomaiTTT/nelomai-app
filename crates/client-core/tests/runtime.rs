@@ -1263,6 +1263,7 @@ impl TunnelController for DesktopPairTunnel {
                     primary_ready: false,
                     standby_ready: false,
                     cleanup_pending: false,
+                    retirement_pending: false,
                     warm_stop_v1,
                 });
                 if self.fail_primary_after_install.load(Ordering::SeqCst) {

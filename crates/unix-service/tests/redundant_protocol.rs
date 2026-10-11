@@ -50,6 +50,7 @@ fn snapshot(phase: SessionPhase, ready: bool, cleanup: bool) -> Snapshot {
         standby_failed: false,
         stalled: false,
         cleanup_pending: cleanup,
+        retirement_pending: false,
         warm_stop_v1: true,
     }
 }

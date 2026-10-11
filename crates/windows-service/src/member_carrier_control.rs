@@ -217,6 +217,13 @@ impl<I: CarrierPairIo, J: PairJournal, F: CarrierPairFinalizer<I, J>> PairContro
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
         self.live_mut()?.remove_standby(scope, slot)
     }
+    fn retire_inactive(
+        &mut self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> io::Result<nelomai_client_tunnel::redundancy::control::RetirementProgress> {
+        self.live_mut()?.retire_inactive(scope, slot)
+    }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.live_mut()?.rebind_pair(scope)
     }

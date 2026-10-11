@@ -78,6 +78,11 @@ struct State {
     require_cleanup_entry: bool,
     probe_replies: bool,
     health_dead: [bool; 2],
+    // Successful original Stop/Delete with this exact interface still in MIB.
+    // This is separate from all injected native/ACK failures above.
+    retirement_linger: Option<(Slot, NativeProof)>,
+    // Retained Stop/Delete acknowledgment only; never a Closed receipt.
+    retirement_delete_ack: Option<NativeProof>,
     tx: [u64; 2],
     rx: [u64; 2],
 }
@@ -438,6 +443,9 @@ impl CarrierPairIo for Io {
         });
         self.effect(&format!("start-{slot:?}"), |s| {
             assert!(s.carrier.is_some());
+            if slot == Slot::B {
+                s.retirement_delete_ack = None;
+            }
             s.members[idx(slot)] = Some(owner.clone())
         })?;
         Ok(owner)
@@ -462,8 +470,23 @@ impl CarrierPairIo for Io {
             Ok(())
         }
     }
-    fn stop_member(&mut self, _: &Record, slot: Slot) -> io::Result<()> {
-        self.effect(&format!("stop-{slot:?}"), |s| s.members[idx(slot)] = None)
+    fn stop_member(&mut self, r: &Record, slot: Slot) -> io::Result<()> {
+        self.effect(&format!("stop-{slot:?}"), |s| {
+            if let Some((target, original)) = s.retirement_linger {
+                if target == slot {
+                    assert_eq!(s.members[idx(slot)].as_ref().unwrap().proof, Some(original));
+                    assert_eq!(
+                        r.members[idx(slot)].as_ref().unwrap().owner.proof,
+                        Some(original)
+                    );
+                    assert!(!s.guard.permits);
+                    assert!(s.guard.installed);
+                    s.retirement_delete_ack = Some(original);
+                    return; // Sole Delete ACK does not remove the retained exact MIB row.
+                }
+            }
+            s.members[idx(slot)] = None;
+        })
     }
     fn verify_member_absent(&mut self, _: &Record, slot: Slot) -> io::Result<()> {
         if self.0.borrow().members[idx(slot)].is_some() {
@@ -471,6 +494,74 @@ impl CarrierPairIo for Io {
         } else {
             Ok(())
         }
+    }
+    fn retire_member(&mut self, r: &Record, slot: Slot) -> io::Result<RetirementProgress> {
+        if self.0.borrow().retirement_linger.is_none()
+            && self.0.borrow().retirement_delete_ack.is_none()
+        {
+            self.stop_member(r, slot)?;
+            self.verify_member_absent(r, slot)?;
+            return Ok(RetirementProgress::Complete);
+        }
+        let original = r.members[idx(slot)].as_ref().unwrap().owner.proof.unwrap();
+        if self.0.borrow().retirement_delete_ack == Some(original) {
+            self.attest_retirement(r, slot)?;
+        } else {
+            self.stop_member(r, slot)?;
+        }
+        if self.0.borrow().retirement_linger == Some((slot, original)) {
+            self.attest_retirement(r, slot)?;
+            Ok(RetirementProgress::ExactRundown)
+        } else {
+            self.verify_member_absent(r, slot)?;
+            // The high-level native boundary models completed retirement here.
+            // Actual Closed issuance is covered by SAME MemberOwner/SCM tests;
+            // neither the Delete ACK nor this fixture's MIB removal proves it.
+            Ok(RetirementProgress::Complete)
+        }
+    }
+    fn attest_retirement(&mut self, r: &Record, slot: Slot) -> io::Result<()> {
+        r.validate()?;
+        let actual = self.0.borrow();
+        let original = r.members[idx(slot)].as_ref().unwrap().owner.proof.unwrap();
+        if r.phase != Phase::Running
+            || r.operation != Some(Operation::Retire(slot))
+            || r.active != Some(slot.other())
+            || actual.disk.as_ref() != Some(r)
+            || actual.retirement_delete_ack != Some(original)
+            || actual.foreign
+            || actual.carrier != r.carrier
+            || actual.guard.expected != r.guard.expected
+            || actual.members[idx(slot.other())].as_ref()
+                != r.members[idx(slot.other())].as_ref().map(|m| &m.owner)
+            || actual.members[idx(slot)]
+                .as_ref()
+                .is_some_and(|m| m.proof != Some(original))
+            || actual.network != r.network.as_ref().unwrap().current
+            || actual
+                .network
+                .routes
+                .iter()
+                .any(|route| route.interface == original.interface.index)
+            || actual.held < 1 // Original A socket plus its active probe aliases.
+            || actual.unpublished != 0
+            || actual
+                .counts
+                .get("restore-member-weak")
+                .copied()
+                .unwrap_or(0)
+                == 0
+            || actual.guard.permits
+                && (actual.guard.active != Some(slot.other())
+                    || !actual.guard.members[idx(slot)]
+                        .as_ref()
+                        .unwrap()
+                        .probes
+                        .is_empty())
+        {
+            return Err(failed());
+        }
+        Ok(())
     }
     fn guard_snapshot(&mut self, _: &SessionScope) -> io::Result<guard::Snapshot> {
         self.effect("snapshot", |_| {})?;
@@ -782,6 +873,8 @@ fn fresh_state_for(scope: SessionScope) -> Shared {
         require_cleanup_entry: false,
         probe_replies: false,
         health_dead: [false; 2],
+        retirement_linger: None,
+        retirement_delete_ack: None,
         tx: [0; 2],
         rx: [0; 2],
     }))
@@ -2009,7 +2102,9 @@ mod terminal_control {
             confirm_role(&mut actor, Slot::A, 3);
             world.borrow_mut().health_dead = [false; 2];
             let before = actor.current_redundancy_snapshot().unwrap().session;
-            let retired = actor
+            let original_b = world.borrow().members[1].as_ref().unwrap().proof.unwrap();
+            world.borrow_mut().retirement_linger = Some((Slot::B, original_b));
+            let pending = actor
                 .redundant(Command::RetireInactive {
                     scope: scope(),
                     slot: Slot::B,
@@ -2018,7 +2113,138 @@ mod terminal_control {
                     expected_network_epoch: before.network_epoch,
                     expected_membership_generation: before.membership_generation,
                 })
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    let actual = world.borrow();
+                    panic!(
+                        "{error:?}; retirement events={:?}",
+                        &actual.events[actual.events.len().saturating_sub(30)..]
+                    );
+                });
+            assert_eq!(pending.session.phase, SessionPhase::Running);
+            assert_eq!(pending.session.installed, [true, true]);
+            assert_eq!(pending.session.committed, [true, true]);
+            assert_eq!(
+                pending.session.membership_generation,
+                before.membership_generation
+            );
+            assert_eq!(pending.session.role_generation, before.role_generation);
+            assert_eq!(pending.session.network_epoch, before.network_epoch);
+            assert_eq!(
+                pending.leases[1].as_deref(),
+                Some("33333333-3333-4333-8333-333333333333")
+            );
+            assert_eq!(pending.current_leases[1], pending.leases[1]);
+            assert!(!pending.cleanup_pending);
+            assert_eq!(
+                serde_json::to_value(&pending).unwrap()["retirement_pending"],
+                true
+            );
+            assert!(!pending.standby_ready);
+            assert_eq!(world.borrow().retirement_delete_ack, Some(original_b));
+            assert!(world.borrow().members[1].is_some());
+            let rx_a = world.borrow().rx[0];
+            let rx_b = world.borrow().rx[1];
+            let key_restores = world
+                .borrow()
+                .counts
+                .get("restore-member-keys")
+                .copied()
+                .unwrap_or(0);
+            // Exact MIB rundown has no known upper bound. A remains usable;
+            // neither timeout extension nor another SCM effect makes B absent.
+            for now in (7600..=117_600).step_by(500) {
+                actor.tick(now).unwrap_or_else(|error| {
+                    let actual = world.borrow();
+                    panic!(
+                        "tick {now}: {error:?}; events={:?}",
+                        &actual.events[actual.events.len().saturating_sub(30)..]
+                    );
+                });
+                if ![7600, 62_600, 117_600].contains(&now) {
+                    continue;
+                }
+                let status = actor.current_redundancy_snapshot().unwrap();
+                assert_eq!(status.session.phase, SessionPhase::Running);
+                assert_eq!(status.session.installed, [true, true]);
+                assert_eq!(status.leases[1], pending.leases[1]);
+                assert_eq!(status.current_leases, pending.current_leases);
+                assert_eq!(
+                    status.session.membership_generation,
+                    before.membership_generation
+                );
+                assert_eq!(status.session.network_epoch, before.network_epoch);
+                assert!(!status.cleanup_pending);
+                assert_eq!(
+                    serde_json::to_value(&status).unwrap()["retirement_pending"],
+                    true
+                );
+                assert_eq!(actor.status().unwrap(), ServiceTunnelState::Running);
+                let actual = world.borrow();
+                assert_eq!(actual.counts.get("stop-B"), Some(&1));
+                assert_eq!(
+                    actual
+                        .counts
+                        .get("restore-member-keys")
+                        .copied()
+                        .unwrap_or(0),
+                    key_restores
+                );
+                assert_eq!(actual.members[1].as_ref().unwrap().proof, Some(original_b));
+                assert_eq!(actual.carrier, c);
+                assert_eq!(actual.guard.active, Some(Slot::A));
+                assert!(actual.guard.permits);
+                assert!(actual.guard.members[1].as_ref().unwrap().probes.is_empty());
+                assert!(actual
+                    .network
+                    .routes
+                    .iter()
+                    .all(|route| route.interface != original_b.interface.index));
+                assert!(actual.guard.expected.filters.iter().any(|filter| {
+                    filter.action == guard::Action::Block
+                        && filter
+                            .conditions
+                            .contains(&guard::Condition::EgressIndex(original_b.interface.index))
+                }));
+                assert!(actual.guard.expected.filters.iter().all(|filter| {
+                    filter.action != guard::Action::Permit
+                        || !filter.conditions.iter().any(|condition| {
+                            matches!(condition,
+                            guard::Condition::EgressIndex(index)
+                            | guard::Condition::DestinationIndex(index)
+                            | guard::Condition::NextHopIndex(index)
+                                if *index == original_b.interface.index)
+                        })
+                }));
+            }
+            assert!(
+                world.borrow().rx[0] > rx_a,
+                "A DATA evidence must continue during B rundown"
+            );
+            assert_eq!(world.borrow().rx[1], rx_b, "retiring B cannot probe");
+            assert!(
+                world
+                    .borrow()
+                    .counts
+                    .get("fingerprint")
+                    .copied()
+                    .unwrap_or(0)
+                    > 10,
+                "physical discovery must keep running throughout retirement"
+            );
+            world.borrow_mut().retirement_linger = None;
+            world.borrow_mut().members[1] = None; // Native MIB finally disappears.
+            actor.tick(118_100).unwrap();
+            let retired = actor.current_redundancy_snapshot().unwrap();
+            assert_eq!(
+                serde_json::to_value(&retired).unwrap()["retirement_pending"],
+                false
+            );
+            assert_eq!(retired.session.phase, SessionPhase::Running);
+            assert_eq!(retired.session.installed, [true, false]);
+            assert_eq!(retired.session.committed, [true, false]);
+            assert!(retired.leases[1].is_none());
+            assert_eq!(retired.current_leases[1], pending.current_leases[1]);
+            assert_eq!(world.borrow().counts.get("stop-B"), Some(&1));
             assert!(world.borrow().members[1].is_none());
             let mut replacement = member(Slot::B);
             replacement.lease_id = "44444444-4444-4444-8444-444444444444".into();
@@ -2068,6 +2294,33 @@ mod terminal_control {
             assert_eq!(world.borrow().counts.get("carrier-ready"), Some(&1));
             assert_eq!(external.borrow().prepared[0].get(), 1);
             assert_eq!(single.get(), 0);
+            // Losing physical discovery during another exact rundown must
+            // withdraw A through scoped Stop, never hide it or attempt rebind.
+            let b = world.borrow().members[1].as_ref().unwrap().proof.unwrap();
+            world.borrow_mut().retirement_linger = Some((Slot::B, b));
+            actor
+                .redundant(Command::RetireInactive {
+                    scope: scope(),
+                    slot: Slot::B,
+                    lease_id: new_lease,
+                    expected_revision: replaced.session.local_revision,
+                    expected_network_epoch: replaced.session.network_epoch,
+                    expected_membership_generation: 3,
+                })
+                .unwrap();
+            let rebinds = world.borrow().counts.get("execution-begin").copied();
+            world.borrow_mut().fail = Some(("fingerprint".into(), false));
+            assert!(actor.tick(120_100).is_err());
+            assert_eq!(
+                actor.current_redundancy_snapshot().unwrap().session.phase,
+                SessionPhase::Stopping
+            );
+            assert!(!world.borrow().guard.permits);
+            assert_eq!(
+                world.borrow().counts.get("execution-begin").copied(),
+                rebinds
+            );
+            world.borrow_mut().retirement_linger = None;
             actor.redundant(Command::Stop { scope: scope() }).unwrap();
             assert_eq!(external.borrow().finalized[0].get(), 1);
             assert!(world.borrow().carrier.is_none());
@@ -2898,6 +3151,7 @@ fn unknown_version_extra_fields_and_guard_source_mismatch_fail_record_decode() {
 fn cleanup_only_recovery_cannot_sample_probe_start_attach_switch_or_rebind() {
     let (mut p, s) = running();
     p.stop(&scope()).unwrap();
+
     let saved = p.snapshot().clone();
     drop(p);
     let mut p = CarrierNativePair::recover_for_cleanup(
@@ -2921,6 +3175,38 @@ fn cleanup_only_recovery_cannot_sample_probe_start_attach_switch_or_rebind() {
     assert!(p.rebind_pair(&scope()).is_err());
     assert_eq!(s.borrow().events.len(), count);
     p.stop(&scope()).unwrap();
+    // A durable Retire/MemberStop with A permits is still cleanup-only after
+    // recovery. The ephemeral original rundown authority is never reconstructed.
+    let (mut live, s) = attached();
+    let b = live.snapshot().members[1]
+        .as_ref()
+        .unwrap()
+        .owner
+        .proof
+        .unwrap();
+    s.borrow_mut().retirement_linger = Some((Slot::B, b));
+    assert_eq!(
+        live.retire_inactive(&scope(), Slot::B).unwrap(),
+        RetirementProgress::ExactRundown
+    );
+    let saved = live.snapshot().clone();
+    assert_eq!(saved.pending, Some(Effect::MemberStop(Slot::B)));
+    assert!(saved.guard.permits);
+    drop(live);
+    let mut recovered = CarrierNativePair::recover_for_cleanup(
+        scope(),
+        provenance(),
+        saved,
+        Io(s.clone(), None),
+        Disk(s.clone()),
+    )
+    .unwrap();
+    let count = s.borrow().events.len();
+    assert!(recovered.sample(Slot::A).is_none());
+    assert!(recovered.open_probe(Slot::A).is_err());
+    assert!(recovered.retire_inactive(&scope(), Slot::B).is_err());
+    assert!(recovered.cleanup_pending());
+    assert_eq!(s.borrow().events.len(), count);
 }
 #[test]
 fn stale_scope_boot_runtime_epoch_and_foreign_native_resources_never_gain_mutation_authority() {
@@ -3292,6 +3578,48 @@ fn rebind_and_retirement_partial_failures_never_recreate_c_or_resume_after_clean
                 p.stop(&scope())
                     .unwrap_or_else(|e| panic!("rebind={rebind} {name} lost={lost}: {e}"));
             }
+        }
+    }
+
+    // Exercise each durable edge of the typed rundown, including lost ACKs
+    // while restoring A-only DATA and retaining the original MemberStop intent.
+    let (mut p, s) = attached();
+    let first = s.borrow().saves;
+    let b = p.snapshot().members[1]
+        .as_ref()
+        .unwrap()
+        .owner
+        .proof
+        .unwrap();
+    s.borrow_mut().retirement_linger = Some((Slot::B, b));
+    assert_eq!(
+        p.retire_inactive(&scope(), Slot::B).unwrap(),
+        RetirementProgress::ExactRundown
+    );
+    let last = s.borrow().saves;
+    for save in first + 1..=last {
+        for lost in [false, true] {
+            let (mut p, s) = attached();
+            let c = p.snapshot().carrier;
+            let b = p.snapshot().members[1]
+                .as_ref()
+                .unwrap()
+                .owner
+                .proof
+                .unwrap();
+            s.borrow_mut().retirement_linger = Some((Slot::B, b));
+            s.borrow_mut().fail_save = Some((save, lost));
+            assert!(
+                p.retire_inactive(&scope(), Slot::B).is_err(),
+                "rundown CAS={save} lost={lost}"
+            );
+            assert_eq!(p.snapshot().carrier, c);
+            assert!(p.cleanup_pending());
+            assert!(p.sample(Slot::A).is_none());
+            assert!(p.retire_inactive(&scope(), Slot::B).is_err());
+            s.borrow_mut().retirement_linger = None;
+            p.stop(&scope())
+                .unwrap_or_else(|e| panic!("rundown CAS={save} lost={lost}: {e}"));
         }
     }
 }

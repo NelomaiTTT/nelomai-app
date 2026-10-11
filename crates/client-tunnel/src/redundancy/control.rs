@@ -16,6 +16,14 @@ use nelomai_contracts::{
 };
 use std::io;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RetirementProgress {
+    Complete,
+    /// Original Stop/Delete and exited process acknowledged; the exact owned
+    /// interface still exists. No Closed receipt or native absence is implied.
+    ExactRundown,
+}
+
 pub trait PairControl: NativePair {
     /// Retained cold composition only, before initial Session publication.
     /// No member/adapter/traffic effect is allowed here. Providers requiring
@@ -43,6 +51,17 @@ pub trait PairControl: NativePair {
     fn attach(&mut self, scope: &SessionScope, member: &Member) -> io::Result<()>;
     /// Remove only this inactive member, including partial failed-start state.
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()>;
+    /// Begin or continue the SAME retained inactive retirement. Only an
+    /// independently authenticated exact rundown may return a pending value;
+    /// ambiguous native/ACK/deadline failures remain errors.
+    fn retire_inactive(
+        &mut self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> io::Result<RetirementProgress> {
+        self.remove_standby(scope, slot)?;
+        Ok(RetirementProgress::Complete)
+    }
     /// True only after the physical network and both members were validated.
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool>;
     /// Called immediately after the second, acknowledged Session epoch CAS,
@@ -62,6 +81,7 @@ pub struct SessionControl<N: PairControl, S> {
     standby_ready: bool,
     standby_failed: bool,
     stalled: bool,
+    retirement: Option<(Slot, String, SessionSnapshot)>,
 }
 
 impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
@@ -121,6 +141,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             standby_ready: false,
             standby_failed: false,
             stalled: false,
+            retirement: None,
         });
         destination
             .as_mut()
@@ -199,6 +220,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             standby_ready: false,
             standby_failed: false,
             stalled: false,
+            retirement: None,
         })
     }
     /// Validate the authenticated runtime and Start, then durably seal Starting.
@@ -264,6 +286,17 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
         if command.scope() != &state.scope {
             return Err(fenced());
         }
+        if self.retirement.is_some()
+            && !matches!(
+                &command,
+                Command::Status { .. }
+                    | Command::Stop { .. }
+                    | Command::PrepareStop { .. }
+                    | Command::PrepareRecoveryStop { .. }
+            )
+        {
+            return Err(fenced());
+        }
         if !matches!(
             &command,
             Command::Status { .. } | Command::Stop { .. } | Command::PrepareStop { .. }
@@ -327,6 +360,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             Command::Stop { scope } => {
                 self.clear_readiness();
                 self.driver.stop(&scope)?;
+                self.retirement = None;
             }
             Command::Attach {
                 scope,
@@ -372,19 +406,27 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
                 }
                 self.standby_ready = false;
                 self.standby_failed = false;
-                if let Err(error) = self.driver.retire_inactive(
+                let progress = match self.driver.retire_inactive(
                     &scope,
                     slot,
                     expected_revision,
                     expected_network_epoch,
                     expected_membership_generation,
                     now,
-                    |native| native.remove_standby(&scope, slot),
+                    |native| native.retire_inactive(&scope, slot),
                 ) {
-                    self.clear_readiness();
-                    return Err(error);
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        self.clear_readiness();
+                        return Err(error);
+                    }
+                };
+                if progress == RetirementProgress::ExactRundown {
+                    self.retirement = Some((slot, lease_id, state));
+                } else {
+                    self.retirement = None;
+                    self.leases[index(slot)] = None;
                 }
-                self.leases[index(slot)] = None;
                 // Keep CURRENT identity for panel role/replacement/Stop fences.
             }
             Command::RemoveStandby {
@@ -552,6 +594,25 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
     pub fn tick(&mut self, now: u64) -> io::Result<TickResult> {
         self.driver.require_preparation()?;
         let prior_phase = self.driver.state().snapshot().phase;
+        if prior_phase == SessionPhase::Running {
+            if let Some((slot, lease_id, original)) = self.retirement.clone() {
+                let command = Command::RetireInactive {
+                    scope: original.scope,
+                    slot,
+                    lease_id,
+                    expected_revision: original.local_revision,
+                    expected_network_epoch: original.network_epoch,
+                    expected_membership_generation: original.membership_generation,
+                };
+                if let Err(error) =
+                    self.execute_scoped(command, now, self.driver.state().snapshot())
+                {
+                    self.clear_readiness();
+                    self.latch_terminal_failure(prior_phase);
+                    return Err(error);
+                }
+            }
+        }
         match self.driver.tick(now) {
             Ok(result) => {
                 self.primary_ready = result.primary_ready;
@@ -603,6 +664,7 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
             primary_ready: running && self.primary_ready,
             standby_ready: running && self.standby_ready,
             cleanup_pending,
+            retirement_pending: running && self.retirement.is_some(),
             warm_stop_v1: self.warm_stop_v1,
         }
     }

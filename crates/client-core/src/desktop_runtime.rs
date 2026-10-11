@@ -112,7 +112,10 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 self.store.save(&stored).map_err(|_| CoreError::Storage)?;
             }
             desktop_redundancy::validate_snapshot(&pair, stored.slot, &snapshot)?;
-            if snapshot.session.phase != SessionPhase::Running || snapshot.cleanup_pending {
+            if snapshot.session.phase != SessionPhase::Running
+                || snapshot.cleanup_pending
+                || snapshot.retirement_pending
+            {
                 return Ok(Some(snapshot));
             }
             if pair.primary_reported

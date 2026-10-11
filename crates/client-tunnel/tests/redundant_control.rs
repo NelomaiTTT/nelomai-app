@@ -64,6 +64,7 @@ struct World {
     panic_complete_start: bool,
     fail_attach: bool,
     fail_remove: bool,
+    retirement_linger: bool,
     fail_close: bool,
     fail_select: bool,
     fail_save: bool,
@@ -230,6 +231,19 @@ impl PairControl for Pair {
         }
         world.native[ix(slot)] = false;
         Ok(())
+    }
+    fn retire_inactive(
+        &mut self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> io::Result<RetirementProgress> {
+        if self.0.borrow().retirement_linger {
+            assert_eq!(slot, Slot::B);
+            assert!(self.0.borrow().native[1]);
+            return Ok(RetirementProgress::ExactRundown);
+        }
+        self.remove_standby(scope, slot)?;
+        Ok(RetirementProgress::Complete)
     }
     fn rebind_pair(&mut self, _: &SessionScope) -> io::Result<bool> {
         let mut world = self.0.borrow_mut();
@@ -865,6 +879,49 @@ fn locally_retiring_inactive_preserves_server_membership_until_candidate_commit(
     assert_eq!(staged.leases[1].as_deref(), Some(FOREIGN));
     assert_eq!(staged.current_leases[1].as_deref(), Some(B));
     assert_eq!(staged.session.committed, [true, false]);
+
+    for completion in [false, true] {
+        let (mut owner, world) = running();
+        attach(&mut owner, false, 0).unwrap();
+        let before = owner.snapshot();
+        world.borrow_mut().retirement_linger = true;
+        owner
+            .execute(
+                Command::RetireInactive {
+                    scope: scope(),
+                    slot: Slot::B,
+                    lease_id: B.into(),
+                    expected_revision: before.session.local_revision,
+                    expected_network_epoch: before.session.network_epoch,
+                    expected_membership_generation: 0,
+                },
+                1,
+            )
+            .unwrap();
+        let pending = owner.snapshot();
+        assert!(pending.retirement_pending);
+        assert!(!pending.cleanup_pending);
+        assert_eq!(pending.leases, before.leases);
+        assert_eq!(pending.session, before.session);
+        if completion {
+            world.borrow_mut().retirement_linger = false;
+            world.borrow_mut().lose_save_ack_phase = Some(SessionPhase::Running);
+            assert!(owner.tick(2).is_err());
+            assert_eq!(owner.snapshot().leases[1].as_deref(), Some(B));
+            assert!(world.borrow().events.iter().any(|event| event == "close"));
+            world.borrow_mut().lose_save_ack_phase = None;
+        } else {
+            owner
+                .execute(Command::PrepareStop { scope: scope() }, 2)
+                .unwrap();
+            assert_eq!(owner.snapshot().session.phase, SessionPhase::Stopping);
+            assert!(!owner.snapshot().retirement_pending);
+            assert!(world.borrow().events.iter().all(|event| event != "close"));
+        }
+        owner.execute(Command::Stop { scope: scope() }, 3).unwrap();
+        assert!(!owner.snapshot().retirement_pending);
+        owner.execute(Command::Stop { scope: scope() }, 4).unwrap();
+    }
 }
 #[test]
 fn reinstated_current_member_requires_same_membership_and_fresh_probe_before_commit() {

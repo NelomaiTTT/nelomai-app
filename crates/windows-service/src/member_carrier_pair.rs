@@ -8,7 +8,9 @@ use crate::{
     member_pair::PairSocket,
 };
 use nelomai_client_tunnel::redundancy::{
-    control::PairControl, driver::NativePair, evidence::NativeHealthSample,
+    control::{PairControl, RetirementProgress},
+    driver::NativePair,
+    evidence::NativeHealthSample,
 };
 use nelomai_client_tunnel::{
     redundancy::{protocol::Member, SessionScope, Slot},
@@ -249,6 +251,17 @@ pub(crate) trait CarrierPairIo {
     fn verify_member(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
     fn stop_member(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
     fn verify_member_absent(&mut self, record: &Record, slot: Slot) -> io::Result<()>;
+    fn retire_member(&mut self, record: &Record, slot: Slot) -> io::Result<RetirementProgress> {
+        self.stop_member(record, slot)?;
+        self.verify_member_absent(record, slot)?;
+        Ok(RetirementProgress::Complete)
+    }
+    /// Fresh original C/active SDK, exact retained target Delete/process/MIB,
+    /// complete mixed universe, rows/network/socket ACKs and owned WFP state.
+    /// A pending value or serialized Pair alone cannot authorize this channel.
+    fn attest_retirement(&mut self, _record: &Record, _slot: Slot) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     fn guard_snapshot(&mut self, scope: &SessionScope) -> io::Result<guard::Snapshot>;
     /// Real split-engine transaction, lock-held original priority ACK, full
     /// snapshot/identity readback. No policy copied from journal as observation.
@@ -368,6 +381,7 @@ pub(crate) struct CarrierNativePair<I: CarrierPairIo, J: PairJournal> {
     journal: PairOriginal<J>,
     execution_epoch: Cell<u64>,
     execution_completion_pending: bool,
+    retirement_pending: Option<Slot>,
     startup_completion_attempted: bool,
     // Local original CAS acknowledgement, never recovered from Fresh DATA.
     // An unacknowledged retained construction remains rooted but cannot mint
@@ -638,6 +652,7 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             journal: PairOriginal::new(journal.take().ok_or_else(failed)?),
             execution_epoch: Cell::new(record.provenance.network_epoch),
             execution_completion_pending: false,
+            retirement_pending: None,
             startup_completion_attempted: false,
             initial_publication_acknowledged: false,
             record,
@@ -716,6 +731,7 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             journal: PairOriginal::new(journal),
             execution_epoch: Cell::new(saved.provenance.network_epoch),
             execution_completion_pending: false,
+            retirement_pending: None,
             startup_completion_attempted: false,
             initial_publication_acknowledged: true,
             record: saved,
@@ -822,7 +838,19 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
     /// Authenticate the current original data/clone read. Protected use and
     /// mutations independently require the complete live resource graph.
     fn read_original<T>(&self, read: impl FnOnce(&mut I) -> io::Result<T>) -> io::Result<T> {
-        self.check_live(&self.record.scope, self.fence())?;
+        if self.retirement_pending.is_none() {
+            self.check_live(&self.record.scope, self.fence())?;
+        } else if self.cleanup_only
+            || self.faulted.get()
+            || self.execution_completion_pending
+            || self.record.phase != Phase::Running
+            || self.uncertain_write.is_some()
+            || self.record.operation != self.retirement_pending.map(Operation::Retire)
+            || self.record.pending != self.retirement_pending.map(Effect::MemberStop)
+            || self.record.pending_guard.is_some()
+        {
+            return Err(failed());
+        }
         let mut flight = ReadFlight {
             faulted: self.faulted.clone(),
             finished: false,
@@ -831,7 +859,14 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             self.require_current()?;
             let value = {
                 let mut io = self.io.try_borrow_mut().map_err(|_| failed())?;
-                read(&mut io)?
+                if let Some(slot) = self.retirement_pending {
+                    io.attest_retirement(&self.record, slot)?;
+                }
+                let value = read(&mut io)?;
+                if let Some(slot) = self.retirement_pending {
+                    io.attest_retirement(&self.record, slot)?;
+                }
+                value
             };
             self.require_current()?;
             if self.faulted.get() {
@@ -1141,8 +1176,20 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
             return Err(failed());
         }
         let mut io = self.io.borrow_mut();
+        if let Some(retiring) = self.retirement_pending {
+            if slot != retiring.other()
+                || self.sockets[idx(retiring)].is_some()
+                || self.tuples[idx(retiring)].is_some()
+            {
+                return Err(failed());
+            }
+            io.attest_retirement(&self.record, retiring)?;
+        }
         io.verify_carrier_ready(&self.record)?;
         for s in [Slot::A, Slot::B] {
+            if self.retirement_pending == Some(s) {
+                continue;
+            }
             if self.record.members[idx(s)].is_some() {
                 io.verify_member(&self.record, s)?;
                 let tuple = self.tuples[idx(s)].as_ref().ok_or_else(failed)?;
@@ -1150,7 +1197,11 @@ impl<I: CarrierPairIo, J: PairJournal> CarrierNativePair<I, J> {
                 io.verify_held_probe(&self.record, s, socket, tuple)?;
             }
         }
-        io.verify_network_and_endpoints(&self.record, slot)
+        io.verify_network_and_endpoints(&self.record, slot)?;
+        if let Some(retiring) = self.retirement_pending {
+            io.attest_retirement(&self.record, retiring)?;
+        }
+        Ok(())
     }
     fn select_network(&mut self, slot: Slot) -> io::Result<()> {
         if self.record.guard.permits || !self.record.guard.installed {
@@ -1773,14 +1824,24 @@ impl Record {
 impl<I: CarrierPairIo, J: PairJournal> NativePair for CarrierNativePair<I, J> {
     type Socket = I::Socket;
     fn check_integrity(&mut self) -> io::Result<()> {
-        self.read_live(|_| Ok(()))
+        if self.retirement_pending.is_some() {
+            self.read_original(|_| Ok(()))
+        } else {
+            self.read_live(|_| Ok(()))
+        }
     }
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
+        if self.retirement_pending == Some(slot) {
+            return None;
+        }
         self.record.members[idx(slot)].as_ref()?;
         self.read_original(|io| io.observe(&self.record, slot).map(|(_, s)| s))
             .ok()
     }
     fn open_probe(&mut self, slot: Slot) -> io::Result<(Self::Socket, String)> {
+        if self.retirement_pending == Some(slot) {
+            return Err(failed());
+        }
         self.read_original(|io| {
             let member = self.record.members[idx(slot)].as_ref().ok_or_else(failed)?;
             let socket = self.sockets[idx(slot)].as_ref().ok_or_else(failed)?;
@@ -1865,14 +1926,13 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
         self.outcome(result)
     }
     fn metrics(&self, slot: Slot) -> io::Result<nelomai_client_tunnel::TunnelMetrics> {
-        self.check_live(&self.record.scope, self.fence())?;
         if self.record.active != Some(slot) {
             return Err(failed());
         }
         self.read_original(|io| io.observe(&self.record, slot).map(|(m, _)| m))
     }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
-        self.read_live(|io| io.fingerprint(&self.record))
+        self.read_original(|io| io.fingerprint(&self.record))
     }
     fn start_primary(
         &mut self,
@@ -1886,63 +1946,105 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
         self.attach_member(scope, self.fence(), member)
     }
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
-        self.check_live(scope, self.fence())?;
+        let result = self
+            .retire_inactive(scope, slot)
+            .and_then(|progress| match progress {
+                RetirementProgress::Complete => Ok(()),
+                RetirementProgress::ExactRundown => Err(failed()),
+            });
+        self.outcome(result)
+    }
+    fn retire_inactive(
+        &mut self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> io::Result<RetirementProgress> {
+        self.check_scope(scope)?;
+        if self.retirement_pending.is_none() {
+            self.check_live(scope, self.fence())?;
+        } else if self.retirement_pending != Some(slot) {
+            return Err(failed());
+        }
         if self.record.active == Some(slot) {
             return Err(failed());
         }
         if self.record.members[idx(slot)].is_none() {
-            return Ok(());
+            return Ok(RetirementProgress::Complete);
         }
         let active = self.record.active.ok_or_else(failed)?;
         let result = (|| {
-            self.check_integrity()?;
-            let mut next = self.record.clone();
-            next.operation = Some(Operation::Retire(slot));
-            self.save(next)?;
-            self.transition_guard(self.record.guard.without_permits().map_err(|_| failed())?)?;
-            let desired = self
-                .io
-                .borrow_mut()
-                .plan_retirement_network(&self.record, slot)?;
-            let retired = self.record.members[idx(slot)]
-                .as_ref()
-                .ok_or_else(failed)?
-                .owner
-                .proof
-                .ok_or_else(failed)?
-                .interface;
-            if desired.routes.iter().any(|r| r.interface == retired.index) {
-                return Err(failed());
-            }
-            self.select_network_value(active, desired)?;
-            // The original live member/carrier pins still exist here. Releasing
-            // after weak restoration or member Stop would require inventing
-            // live source authority from a retired identity. Keep all bases,
-            // independently verify no permits, and close the SAME held socket
-            // before retiring any source/member native rows.
-            self.begin(Effect::ReleaseProbes)?;
-            if self.io.borrow_mut().guard_snapshot(&self.record.scope)?
-                != self.record.guard.expected
-            {
-                return Err(failed());
-            }
-            if let Some(socket) = self.sockets[idx(slot)].take() {
+            if self.retirement_pending.is_none() {
+                self.check_integrity()?;
+                let mut next = self.record.clone();
+                next.operation = Some(Operation::Retire(slot));
+                self.save(next)?;
+                self.transition_guard(self.record.guard.without_permits().map_err(|_| failed())?)?;
+                let desired = self
+                    .io
+                    .borrow_mut()
+                    .plan_retirement_network(&self.record, slot)?;
+                let retired = self.record.members[idx(slot)]
+                    .as_ref()
+                    .ok_or_else(failed)?
+                    .owner
+                    .proof
+                    .ok_or_else(failed)?
+                    .interface;
+                if desired.routes.iter().any(|r| r.interface == retired.index) {
+                    return Err(failed());
+                }
+                self.select_network_value(active, desired)?;
+                // The original live member/carrier pins still exist here. Releasing
+                // after weak restoration or member Stop would require inventing
+                // live source authority from a retired identity. Keep all bases,
+                // independently verify no permits, and close the SAME held socket
+                // before retiring any source/member native rows.
+                self.begin(Effect::ReleaseProbes)?;
+                if self.io.borrow_mut().guard_snapshot(&self.record.scope)?
+                    != self.record.guard.expected
+                {
+                    return Err(failed());
+                }
+                if let Some(socket) = self.sockets[idx(slot)].take() {
+                    self.io
+                        .borrow_mut()
+                        .release_probe(&self.record, slot, socket)?;
+                }
+                self.tuples[idx(slot)] = None;
+                self.finish(Effect::ReleaseProbes, self.record.clone())?;
+                self.begin(Effect::RestoreWeak)?;
                 self.io
                     .borrow_mut()
-                    .release_probe(&self.record, slot, socket)?;
+                    .restore_member_weak_rows(&self.record, slot)?;
+                self.finish(Effect::RestoreWeak, self.record.clone())?;
+                self.begin(Effect::MemberStop(slot))?;
+            } else {
+                self.check_integrity()?;
+                self.before(Effect::MemberStop(slot))?;
             }
-            self.tuples[idx(slot)] = None;
-            self.finish(Effect::ReleaseProbes, self.record.clone())?;
-            self.begin(Effect::RestoreWeak)?;
-            self.io
-                .borrow_mut()
-                .restore_member_weak_rows(&self.record, slot)?;
-            self.finish(Effect::RestoreWeak, self.record.clone())?;
-            self.begin(Effect::MemberStop(slot))?;
-            self.io.borrow_mut().stop_member(&self.record, slot)?;
+            let progress = self.io.borrow_mut().retire_member(&self.record, slot)?;
+            if progress == RetirementProgress::ExactRundown {
+                if self.retirement_pending.is_none() {
+                    self.retirement_pending = Some(slot);
+                    self.io.borrow_mut().attest_retirement(&self.record, slot)?;
+                    self.finish(Effect::MemberStop(slot), self.record.clone())?;
+                    self.install_allows(active)?;
+                    self.begin(Effect::Data(active))?;
+                    self.io.borrow_mut().verify_data(&self.record, active)?;
+                    self.finish(Effect::Data(active), self.record.clone())?;
+                    self.begin(Effect::MemberStop(slot))?;
+                }
+                self.io.borrow_mut().attest_retirement(&self.record, slot)?;
+                return Ok(progress);
+            }
             self.io
                 .borrow_mut()
                 .verify_member_absent(&self.record, slot)?;
+            if self.record.guard.permits {
+                self.transition_guard(self.record.guard.without_permits().map_err(|_| failed())?)?;
+                self.begin(Effect::MemberStop(slot))?;
+            }
+            self.retirement_pending = None;
             self.finish(Effect::MemberStop(slot), self.record.clone())?;
             self.transition_guard(self.model_excluding(None, false, Some(slot))?)?;
             self.begin(Effect::RestoreKeys)?;
@@ -1958,7 +2060,8 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
             self.io.borrow_mut().verify_data(&self.record, active)?;
             let mut next = self.record.clone();
             next.operation = None;
-            self.finish(Effect::Data(active), next)
+            self.finish(Effect::Data(active), next)?;
+            Ok(RetirementProgress::Complete)
         })();
         self.outcome(result)
     }
@@ -2021,9 +2124,9 @@ impl<I: CarrierPairIo, J: PairJournal> PairControl for CarrierNativePair<I, J> {
                     || self.cleanup_only
                     || self.faulted.get()
                     || self.record.phase != Phase::Running
-                    || self.record.pending.is_some()
+                    || self.record.pending.is_some() && self.retirement_pending.is_none()
                     || self.record.pending_guard.is_some()
-                    || self.record.operation.is_some()))
+                    || self.record.operation.is_some() && self.retirement_pending.is_none()))
     }
 }
 impl<I: CarrierPairIo, J: PairJournal> Drop for CarrierNativePair<I, J> {

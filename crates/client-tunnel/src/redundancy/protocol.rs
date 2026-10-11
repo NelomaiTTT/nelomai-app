@@ -273,6 +273,10 @@ pub struct Snapshot {
     pub primary_ready: bool,
     pub standby_ready: bool,
     pub cleanup_pending: bool,
+    /// Authenticated inactive-member rundown. Membership and its lease remain
+    /// installed until native absence completes; this is not a whole-pair Stop.
+    #[serde(default)]
+    pub retirement_pending: bool,
     pub warm_stop_v1: bool,
 }
 pub(crate) fn uuid(s: &str) -> bool {

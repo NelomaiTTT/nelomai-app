@@ -393,6 +393,7 @@ mod desktop_reserve_probes {
             standby_failed: false,
             stalled: false,
             cleanup_pending: false,
+            retirement_pending: false,
             warm_stop_v1: pair.session.warm_stop_v1,
         })));
         let paths = RuntimePaths::new(

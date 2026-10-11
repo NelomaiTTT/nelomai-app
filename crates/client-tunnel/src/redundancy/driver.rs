@@ -53,6 +53,7 @@ pub struct SessionDriver<N: NativePair, S> {
     preparation_acknowledged: bool,
     preparation_attempted: bool,
     cleanup_acknowledged: bool,
+    retiring_slot: Option<Slot>,
 }
 impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
     /// Move SAME owning native/store into the caller slot BEFORE initial save.
@@ -131,6 +132,7 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
             preparation_acknowledged: false,
             preparation_attempted: false,
             cleanup_acknowledged: false,
+            retiring_slot: None,
         }
     }
     pub(super) fn persist_preparation(&mut self) -> io::Result<()> {
@@ -440,9 +442,44 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         epoch: u64,
         membership: u64,
         now: u64,
-        remove: impl FnOnce(&mut N) -> io::Result<()>,
-    ) -> io::Result<()> {
-        self.remove_inactive(scope, slot, revision, epoch, membership, now, true, remove)
+        remove: impl FnOnce(&mut N) -> io::Result<super::control::RetirementProgress>,
+    ) -> io::Result<super::control::RetirementProgress> {
+        use super::control::RetirementProgress;
+        self.require_preparation()?;
+        if now < self.last_tick || self.retiring_slot.is_some_and(|old| old != slot) {
+            let _ = self.stop(scope);
+            return Err(fenced());
+        }
+        let mut next = self.state.clone();
+        next.retire_inactive(scope, slot, revision, epoch, membership)
+            .map_err(|_| fenced())?;
+        let i = slot.index();
+        if let Some((ticket, _)) = self.probes[i].take() {
+            self.evidence[i].probe_cancelled(ticket);
+        }
+        self.schedule.set_standby_available(false);
+        self.evidence[i].reset(now);
+        self.samples[i] = None;
+        let progress = match remove(&mut self.native) {
+            Ok(progress) => progress,
+            Err(error) => {
+                let _ = self.stop(scope);
+                return Err(error);
+            }
+        };
+        if progress == RetirementProgress::ExactRundown {
+            self.retiring_slot = Some(slot);
+            return Ok(progress);
+        }
+        // The original Running publication/lease remains current throughout
+        // rundown. Publish retired membership only after native absence ACK.
+        if let Err(error) = self.store.save(&next.snapshot()) {
+            let _ = self.stop(scope);
+            return Err(error);
+        }
+        self.state = next;
+        self.retiring_slot = None;
+        Ok(progress)
     }
     #[allow(clippy::too_many_arguments)] // Same exact command fence for candidate/current removal.
     fn remove_inactive(
@@ -552,7 +589,13 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
     }
     pub fn tick(&mut self, now: u64) -> io::Result<TickResult> {
         self.require_preparation()?;
-        let snapshot = self.state.snapshot();
+        let mut snapshot = self.state.snapshot();
+        if let Some(slot) = self.retiring_slot {
+            // Health scheduling excludes B while the public membership and
+            // lease truthfully retain its unresolved native obligation.
+            snapshot.installed[slot.index()] = false;
+            snapshot.committed[slot.index()] = false;
+        }
         if now < self.last_tick {
             let _ = self.stop(&snapshot.scope);
             return Err(fenced());
