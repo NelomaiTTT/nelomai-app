@@ -44,6 +44,8 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let cases = [
         "primary",
         "network-route-postflight",
+        "probe-before-open-ack",
+        "probe-after-open-ack",
         "module-load-read-error",
         "module-load-read-unwind",
         "resolver-reference-error",
@@ -122,7 +124,9 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let elapsed = started.elapsed();
-        if matches!(case, "primary" | "network-route-postflight") && !status.success() {
+        if (matches!(case, "primary" | "network-route-postflight") && !status.success())
+            || matches!(case, "probe-before-open-ack" | "probe-after-open-ack")
+        {
             // SAME initial child scope; this read cannot attest cleanup.
             let mut hash = Sha256::new();
             hash.update(b"nelomai-native-factory-test-session/v1\0");
@@ -146,8 +150,11 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                         Ok(rows) => {
                             // Observed original primary A GUID; name match alone is not provenance.
                             let a_guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
-                            let a_identity =
-                                (case == "primary").then_some(("A", a_guid, "nelomai-a"));
+                            let a_identity = (case != "network-route-postflight").then_some((
+                                "A",
+                                a_guid,
+                                "nelomai-a",
+                            ));
                             for (member, guid, name) in a_identity
                                 .into_iter()
                                 .chain(std::iter::once(("C", key.guid, key.name.as_str())))
@@ -190,7 +197,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CR_NO_SUCH_DEVNODE,
                 CR_SUCCESS, MAX_DEVICE_ID_LEN,
             };
-            let (member, instance) = if case == "primary" {
+            let (member, instance) = if case != "network-route-postflight" {
                 ("A", r"SWD\WIREGUARD\{B75141B9-108E-4BF9-5A47-7AF4A3DDCD39}")
             } else {
                 (
@@ -434,6 +441,10 @@ fn carrier_factory_actual_cold_child() {
     );
     let full_primary = case == "primary";
     let route_partial = case == "network-route-postflight";
+    let probe_partial = matches!(
+        case.as_str(),
+        "probe-before-open-ack" | "probe-after-open-ack"
+    );
     let resolver_partial = matches!(
         case.as_str(),
         "resolver-reference-error" | "resolver-reference-unwind"
@@ -453,6 +464,8 @@ fn carrier_factory_actual_cold_child() {
         "member-unwind" => Some((NativePublication::Member, true)),
         "running-ack" => Some((NativePublication::Running, false)),
         "running-unwind" => Some((NativePublication::Running, true)),
+        "probe-before-open-ack" => Some((NativePublication::ProbeBeforeOpen, false)),
+        "probe-after-open-ack" => Some((NativePublication::ProbeAfterOpen, false)),
         _ => None,
     };
     let native_path = module_partial
@@ -798,6 +811,7 @@ fn carrier_factory_actual_cold_child() {
         || module_partial
         || full_primary
         || route_partial
+        || probe_partial
     {
         let retry_started = std::time::Instant::now();
         while stopped.is_err()
@@ -823,6 +837,77 @@ fn carrier_factory_actual_cold_child() {
             if original.snapshot().cleanup_pending {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+        }
+        if probe_partial {
+            // The same retained owner has attempted real Stop. A later C failure
+            // must not hide A's outcome or turn cleanup_pending into completion.
+            let pair = fixture.trace_pair_stage(false);
+            let release_probes_completed = pair.as_ref().is_some_and(|record| {
+                matches!(
+                    record.phase,
+                    crate::member_carrier_pair::Phase::Closing
+                        | crate::member_carrier_pair::Phase::Stopped
+                ) && record.stop_stage >= 2
+            });
+            eprintln!(
+                "actual probe boundary cleanup case={case} stop_result={stopped:?} cleanup_pending={} release_probes_completed={release_probes_completed} held_probe_close_ack={:?}",
+                original.snapshot().cleanup_pending,
+                (case == "probe-after-open-ack").then_some(release_probes_completed),
+            );
+            let guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
+            let a_absent = match crate::windows::member_carrier_provider::native::table() {
+                Ok(rows) => {
+                    let matching = rows
+                        .iter()
+                        .filter(|row| {
+                            row.identity.guid == guid
+                                || row.identity.name.eq_ignore_ascii_case("nelomai-a")
+                        })
+                        .take(9)
+                        .map(|row| {
+                            (
+                                &row.identity.guid,
+                                row.identity.index,
+                                row.identity.luid,
+                                &row.identity.name,
+                                row.identity.guid == guid,
+                                row.identity.name.eq_ignore_ascii_case("nelomai-a"),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if matching.len() > 8 {
+                        eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} UNKNOWN: matching-row bound exceeded");
+                        None
+                    } else {
+                        let exact_guid_present = matching.iter().any(|row| row.4);
+                        eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} exact_guid_present={exact_guid_present} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}");
+                        Some(matching.is_empty())
+                    }
+                }
+                Err(error) => {
+                    eprintln!("actual probe boundary A table case={case} requested_guid={guid:?} UNKNOWN: {error:?}");
+                    None
+                }
+            };
+            let completed = stopped.as_ref().is_ok_and(|snapshot| {
+                snapshot.session.phase == SessionPhase::Stopped && !snapshot.cleanup_pending
+            });
+            if !completed {
+                // Preserve original native owners on incomplete Stop until child exit.
+                std::mem::forget(original);
+                std::mem::forget(factory);
+            }
+            if case == "probe-after-open-ack" {
+                // Real ReleaseProbes completion follows same-original
+                // RetiredProbeRead verification and native closesocket ACK.
+                assert!(
+                    release_probes_completed,
+                    "held native socket close not acknowledged"
+                );
+            }
+            assert_eq!(a_absent, Some(true), "exact A absence not confirmed");
+            assert!(completed, "actual retained Stop remains incomplete");
+            return;
         }
         assert!(retry_started.elapsed() <= std::time::Duration::from_secs(90));
         let stopped = stopped.expect("actual retained native Stop");
