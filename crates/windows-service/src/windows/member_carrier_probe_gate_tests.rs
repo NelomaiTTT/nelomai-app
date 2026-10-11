@@ -466,6 +466,25 @@ fn retire_base_accepts_exact_closed_target_without_metric_or_probe_permission() 
     pending.pending_guard = Some(policy::ExchangePlan::new(&pending.guard, &permitted).unwrap());
     let exact = Some((&closed.intent, closed.proof.process));
     let facts = guard_resources(&carrier, &active, &stopped);
+    let mut installing = pending.clone();
+    installing.guard = r.guard.clone();
+    installing.pending_guard =
+        Some(policy::ExchangePlan::new(&installing.guard, &permitted).unwrap());
+    let base = &installing.pending_guard.as_ref().unwrap().base;
+    assert!(!base.permits);
+    assert_eq!(base.active, Some(Slot::A));
+    compare_guard_target(&c, &installing, base).unwrap();
+    compare_guard_rows(&c, &installing, base, facts, [None, None], exact)
+        .expect("deny-only exchange base retains the exact surviving active selection");
+    let mut wrong_active = base.clone();
+    wrong_active.active = Some(Slot::B);
+    wrong_active.validate().unwrap();
+    let mut wrong_plan = installing.clone();
+    wrong_plan.pending_guard =
+        Some(policy::ExchangePlan::new(&wrong_plan.guard, &wrong_active).unwrap());
+    assert!(
+        compare_guard_rows(&c, &wrong_plan, &wrong_active, facts, [None, None], exact).is_err()
+    );
     assert!(compare_guard_rows(&c, &pending, &permitted, facts, [None, None], None).is_err());
     let metrics = compare_guard_rows(&c, &pending, &permitted, facts, [None, None], exact).unwrap();
     assert_eq!(metrics.len(), 1);

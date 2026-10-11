@@ -5969,14 +5969,8 @@ pub(crate) mod native {
             destination: &mut Option<actor::Controller>,
             lock: &mut KeyLock,
         ) -> Result<()> {
-            self.continuity_runtime(original, expected)
-                .inspect_err(|_error| {
-                    #[cfg(all(windows, test))]
-                    eprintln!("actual member attach entry continuity: {_error:?}");
-                })?;
+            self.continuity_runtime(original, expected)?;
             if !self.runtime.matches_lock(lock) {
-                #[cfg(all(windows, test))]
-                eprintln!("actual member attach runtime lock: Conflict");
                 return Err(Error::Conflict);
             }
             self.prepared[usize::from(slot == nelomai_client_tunnel::redundancy::Slot::B)]
@@ -5984,10 +5978,6 @@ pub(crate) mod native {
                 .ok_or(Error::Pending)?
                 .attach(destination, attachment, original, expected, lock)?;
             self.continuity_runtime(original, expected)
-                .inspect_err(|_error| {
-                    #[cfg(all(windows, test))]
-                    eprintln!("actual member attach post continuity: {_error:?}");
-                })
         }
         fn verify_unstarted_member(
             &mut self,
