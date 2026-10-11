@@ -160,14 +160,22 @@ fn pending_star_source_flags_need_exact_audited_smss_not_any_windows_version() {
 }
 #[test]
 fn pending_install_layout_is_exact_and_unknown_unicode_cannot_panic() {
-    assert_eq!(
-        pending_installation_root(r"D:\custom\runtime\engines\latest\0.3.3\wintun.dll"),
-        Some(r"D:\custom")
-    );
+    for source in [
+        r"D:\custom\runtime\engines\latest\0.3.3\wintun.dll",
+        r"D:\custom\runtime\engines\latest\0.4.0\wintun.dll",
+        r"D:\custom\RUNTIME\ENGINES\LATEST\0.4.0\WINTUN.DLL",
+    ] {
+        assert_eq!(pending_installation_root(source), Some(r"D:\custom"));
+    }
     for source in [
         "界".repeat(51),
         "😀".repeat(21),
         r"C:\wrong\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.3.4\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.4.1\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.4.0-beta\wintun.dll".into(),
+        r"D:\custom\runtime\engines\stable\0.4.0\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.4.0\wintun.dll.extra".into(),
     ] {
         assert_eq!(pending_installation_root(&source), None);
     }

@@ -705,6 +705,7 @@ pub(crate) mod native {
                     .expect("signed installation registered for the fixture's original root");
             let initial = installation.load_engine(&executable).unwrap();
             let directory = &initial.directory;
+            let latest = format!("engines/latest/{}", env!("CARGO_PKG_VERSION"));
             // Stage a real signed second slot in our owned fixture. The expected
             // inventory below uses fixed fixture paths, not verifier enumeration.
             let names = [
@@ -717,11 +718,7 @@ pub(crate) mod native {
             let stable = directory.join("engines/stable/0.3.2");
             std::fs::create_dir_all(&stable).unwrap();
             for name in names {
-                std::fs::copy(
-                    directory.join("engines/latest/0.3.3").join(name),
-                    stable.join(name),
-                )
-                .unwrap();
+                std::fs::copy(directory.join(&latest).join(name), stable.join(name)).unwrap();
             }
             let mut manifest: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(directory.join(d::MANIFEST_NAME)).unwrap())
@@ -766,7 +763,7 @@ pub(crate) mod native {
                     .join("nelomai-windows-service.exe"),
                 policy.executable,
             ]);
-            for relative in ["engines/latest/0.3.3", "engines/stable/0.3.2"] {
+            for relative in [latest.as_str(), "engines/stable/0.3.2"] {
                 for name in names {
                     expected.insert(directory.join(relative).join(name));
                 }

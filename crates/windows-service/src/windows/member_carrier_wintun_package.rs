@@ -711,16 +711,22 @@ fn pending_retired_path(source: &str) -> Option<&str> {
     (name.ends_with(".tmp") || retired_dll).then_some(path)
 }
 fn pending_installation_root(source: &str) -> Option<&str> {
-    let suffix = r"\runtime\engines\latest\0.3.3\wintun.dll";
-    source
-        .len()
-        .checked_sub(suffix.len())
-        .filter(|n| {
-            source
-                .get(*n..)
-                .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
-        })
-        .map(|n| &source[..n])
+    [
+        r"\runtime\engines\latest\0.3.3\wintun.dll",
+        r"\runtime\engines\latest\0.4.0\wintun.dll",
+    ]
+    .into_iter()
+    .find_map(|suffix| {
+        source
+            .len()
+            .checked_sub(suffix.len())
+            .filter(|n| {
+                source
+                    .get(*n..)
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+            })
+            .map(|n| &source[..n])
+    })
 }
 fn package_link_set(
     path: &str,
@@ -2010,8 +2016,10 @@ pub(crate) mod native {
             );
             bytes.truncate(length as usize);
             if bytes != [0, 0, 0, 0] {
-                // This narrowed policy is valid only for the independently
-                // audited installed 0.3.3 layout; unknown layouts remain denied.
+                // Keep the independently audited 0.3.3 layout and constrain
+                // candidate 0.4.0 to the same exact, test-reviewed layout.
+                // Native installed/pending-rename acceptance for 0.4.0 is UNRUN;
+                // unknown layouts remain denied.
                 let source_path = final_path(source)?;
                 let source_text = source_path
                     .to_str()

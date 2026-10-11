@@ -123,206 +123,6 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let elapsed = started.elapsed();
-        if (matches!(case, "primary" | "network-route-postflight") && !status.success())
-            || case == "metrics-post-read-error"
-        {
-            // SAME initial child scope; this read cannot attest cleanup.
-            let mut hash = Sha256::new();
-            hash.update(b"nelomai-native-factory-test-session/v1\0");
-            hash.update(case.as_bytes());
-            hash.update([0u8]);
-            let mut bytes: [u8; 16] = hash.finalize()[..16].try_into().unwrap();
-            bytes[6] = (bytes[6] & 0x0f) | 0x40;
-            bytes[8] = (bytes[8] & 0x3f) | 0x80;
-            let mut session_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-            for index in [20, 16, 12, 8] {
-                session_id.insert(index, '-');
-            }
-            match crate::member_carrier::carrier_key(&SessionScope {
-                runtime: RuntimeSlot::Latest,
-                runtime_generation: 2,
-                session_id,
-                connection_generation: 3,
-            }) {
-                Ok(key) => {
-                    match crate::windows::member_carrier_provider::native::table() {
-                        Ok(rows) => {
-                            // Observed original primary A GUID; name match alone is not provenance.
-                            let a_guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
-                            let a_identity = (case != "network-route-postflight").then_some((
-                                "A",
-                                a_guid,
-                                "nelomai-a",
-                            ));
-                            for (member, guid, name) in a_identity
-                                .into_iter()
-                                .chain(std::iter::once(("C", key.guid, key.name.as_str())))
-                            {
-                                let matching = rows
-                                    .iter()
-                                    .filter(|row| {
-                                        row.identity.guid == guid
-                                            || row.identity.name.eq_ignore_ascii_case(name)
-                                    })
-                                    .take(8)
-                                    .map(|row| {
-                                        (
-                                            &row.identity.guid,
-                                            row.identity.index,
-                                            row.identity.luid,
-                                            &row.identity.name,
-                                            row.identity.guid == guid,
-                                            row.identity.name.eq_ignore_ascii_case(name),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>();
-                                eprintln!(
-                                "actual post-child-exit initial {member} table case={case} related_present={} requested_guid={guid:?} requested_name={name} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
-                                !matching.is_empty(),
-                            );
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("actual post-child-exit initial table case={case} UNKNOWN: {error:?}")
-                        }
-                    }
-                }
-                Err(error) => {
-                    eprintln!("actual post-child-exit initial C identity UNKNOWN: {error:?}")
-                }
-            }
-            use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, CM_Get_Device_IDW, CM_Locate_DevNodeW,
-                CM_LOCATE_DEVNODE_NORMAL, CM_LOCATE_DEVNODE_PHANTOM, CR_NO_SUCH_DEVNODE,
-                CR_SUCCESS, MAX_DEVICE_ID_LEN,
-            };
-            let (member, instance) = if case != "network-route-postflight" {
-                ("A", r"SWD\WIREGUARD\{B75141B9-108E-4BF9-5A47-7AF4A3DDCD39}")
-            } else {
-                (
-                    "route-C",
-                    r"SWD\WINTUN\{919EF6AF-EE00-83AA-8C9E-B1F711D03CA8}",
-                )
-            };
-            let observed_utc_unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|time| time.as_millis());
-            let wide_instance = instance.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-            let (mut normal_node, mut phantom_node) = (0, 0);
-            let normal = unsafe {
-                CM_Locate_DevNodeW(
-                    &mut normal_node,
-                    wide_instance.as_ptr(),
-                    CM_LOCATE_DEVNODE_NORMAL,
-                )
-            };
-            let phantom = unsafe {
-                CM_Locate_DevNodeW(
-                    &mut phantom_node,
-                    wide_instance.as_ptr(),
-                    CM_LOCATE_DEVNODE_PHANTOM,
-                )
-            };
-            let (mut presence, node) = match (normal, phantom) {
-                (CR_SUCCESS, CR_SUCCESS) if normal_node != 0 && normal_node == phantom_node => {
-                    ("present", normal_node)
-                }
-                (CR_NO_SUCH_DEVNODE, CR_SUCCESS) if phantom_node != 0 => ("phantom", phantom_node),
-                (CR_NO_SUCH_DEVNODE, CR_NO_SUCH_DEVNODE) => ("absent", 0),
-                _ => ("UNKNOWN", 0),
-            };
-            let (mut id_code, mut status_code, mut flags, mut problem) = (None, None, None, None);
-            let (mut actual_instance, mut identity_match) = (None, None);
-            let (mut phantom_recheck_code, mut phantom_recheck_node) = (None, 0);
-            if node != 0 {
-                let mut buffer = [0u16; MAX_DEVICE_ID_LEN as usize];
-                let code =
-                    unsafe { CM_Get_Device_IDW(node, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
-                id_code = Some(code);
-                if code == CR_SUCCESS {
-                    actual_instance = buffer
-                        .iter()
-                        .position(|word| *word == 0)
-                        .and_then(|end| String::from_utf16(&buffer[..end]).ok());
-                    identity_match = actual_instance
-                        .as_ref()
-                        .map(|id| id.eq_ignore_ascii_case(instance));
-                }
-                if identity_match != Some(true) {
-                    presence = "UNKNOWN";
-                }
-                let (mut observed_flags, mut observed_problem) = (0, 0);
-                let code = unsafe {
-                    CM_Get_DevNode_Status(&mut observed_flags, &mut observed_problem, node, 0)
-                };
-                status_code = Some(code);
-                if code == CR_SUCCESS {
-                    flags = Some(observed_flags);
-                    problem = Some(observed_problem);
-                    if presence == "phantom" {
-                        presence = "UNKNOWN";
-                    }
-                } else if presence == "phantom" && code == CR_NO_SUCH_DEVNODE {
-                    let code = unsafe {
-                        CM_Locate_DevNodeW(
-                            &mut phantom_recheck_node,
-                            wide_instance.as_ptr(),
-                            CM_LOCATE_DEVNODE_NORMAL,
-                        )
-                    };
-                    phantom_recheck_code = Some(code);
-                    if code != CR_NO_SUCH_DEVNODE {
-                        presence = "UNKNOWN";
-                    }
-                } else {
-                    presence = "UNKNOWN";
-                }
-            }
-            eprintln!(
-                "actual post-child-exit PnP case={case} identity={member} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_instance={instance} presence={presence} normal_code={normal} normal_node={normal_node} phantom_code={phantom} phantom_node={phantom_node} id_code={id_code:?} actual_instance={actual_instance:?} identity_match={identity_match:?} status_code={status_code:?} status_flags={flags:?} problem={problem:?} phantom_recheck_normal_code={phantom_recheck_code:?} phantom_recheck_normal_node={phantom_recheck_node}"
-            );
-            if case == "primary" {
-                // TEMPORARY observations only; these never alter the cleanup result.
-                let guid = 0xb75141b9_108e_4bf9_5a47_7af4a3ddcd39_u128.to_be_bytes();
-                let name = "nelomai-a";
-                for requested_after_exit_secs in [5, 30] {
-                    std::thread::sleep(
-                        std::time::Duration::from_secs(requested_after_exit_secs)
-                            .saturating_sub(started.elapsed().saturating_sub(elapsed)),
-                    );
-                    let observed_after_exit_ms =
-                        started.elapsed().saturating_sub(elapsed).as_millis();
-                    let observed_utc_unix_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|time| time.as_millis());
-                    match crate::windows::member_carrier_provider::native::table() {
-                        Ok(rows) => {
-                            let matching = rows.iter().filter(|row| {
-                                row.identity.guid == guid || row.identity.name.eq_ignore_ascii_case(name)
-                            }).take(9).map(|row| (
-                                &row.identity.guid, row.identity.index, row.identity.luid, &row.identity.name,
-                                row.identity.guid == guid, row.identity.name.eq_ignore_ascii_case(name),
-                            )).collect::<Vec<_>>();
-                            if matching.len() > 8 {
-                                eprintln!("actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_guid={guid:?} requested_name={name} UNKNOWN: matching-row bound exceeded");
-                            } else {
-                                let exact_guid_present = matching.iter().any(|row| row.4);
-                                eprintln!(
-                                    "actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} related_present={} exact_guid_present={exact_guid_present} requested_guid={guid:?} requested_name={name} matching_rows(guid,index,luid,name,guid_match,name_match)={matching:?}",
-                                    !matching.is_empty(),
-                                );
-                                if requested_after_exit_secs == 5 && !exact_guid_present {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(error) => eprintln!("actual post-child-exit delayed A table case={case} requested_after_exit_secs={requested_after_exit_secs} observed_after_exit_ms={observed_after_exit_ms} observed_utc_unix_ms={observed_utc_unix_ms:?} requested_guid={guid:?} requested_name={name} UNKNOWN: {error:?}"),
-                    }
-                }
-            }
-        }
         let stdout = std::fs::read_to_string(stdout_path).unwrap();
         let stderr = std::fs::read_to_string(stderr_path).unwrap();
         let runtime_auth = stderr
@@ -731,7 +531,7 @@ fn carrier_factory_actual_cold_child() {
         eprintln!("actual factory {case}: primary Start");
         let started = original.start_primary(primary, options);
         if started.is_err() {
-            fixture.trace_pair_stage(false);
+            fixture.trace_pair_stage();
         }
         let running = started.expect("actual native primary Start");
         assert_eq!(running.session.scope, scope);
@@ -792,7 +592,7 @@ fn carrier_factory_actual_cold_child() {
     );
     if let Err(error) = &stopped {
         eprintln!("actual factory {case}: Stop error {error:?}");
-        fixture.trace_pair_stage(true);
+        fixture.trace_pair_stage();
     }
     if case == "module-load-read-unwind" {
         // Native supervisor permanently revokes uncertain unwind timing.
@@ -828,7 +628,7 @@ fn carrier_factory_actual_cold_child() {
                 Err(error) => {
                     eprintln!("actual factory {case}: Stop tick error {error:?}");
                     assert!(original.snapshot().cleanup_pending);
-                    fixture.trace_pair_stage(false);
+                    fixture.trace_pair_stage();
                     stopped = Err(error);
                 }
             }
@@ -839,7 +639,7 @@ fn carrier_factory_actual_cold_child() {
         if metrics_partial {
             // The same retained owner has attempted real Stop. A later C failure
             // must not hide A's outcome or turn cleanup_pending into completion.
-            let pair = fixture.trace_pair_stage(false);
+            let pair = fixture.trace_pair_stage();
             let release_probes_completed = pair.as_ref().is_some_and(|record| {
                 matches!(
                     record.phase,
@@ -975,9 +775,7 @@ fn carrier_factory_actual_cold_child() {
             // samples and DNS datagram replies are inputs; native owners,
             // selection, WFP, routes and generation transitions remain real.
             fixture.external_health(None);
-            let initial = fixture
-                .trace_pair_stage(false)
-                .expect("repeat primary Pair");
+            let initial = fixture.trace_pair_stage().expect("repeat primary Pair");
             let carrier = initial.carrier.expect("repeat original C");
             let addresses = initial.addresses;
             let mut reserve_lease = "33333333-3333-4333-8333-333333333333".to_string();
@@ -1009,9 +807,7 @@ fn carrier_factory_actual_cold_child() {
                 )
                 .expect("actual reserve Attach B");
             assert_eq!(attached.session.membership_generation, 2);
-            let paired = fixture
-                .trace_pair_stage(false)
-                .expect("actual attached Pair");
+            let paired = fixture.trace_pair_stage().expect("actual attached Pair");
             let a = paired.members[0]
                 .as_ref()
                 .unwrap()
@@ -1093,9 +889,7 @@ fn carrier_factory_actual_cold_child() {
                         .expect("actual role generation ACK");
                     assert!(confirmed.session.role_confirmed);
                 }
-                let pair = fixture
-                    .trace_pair_stage(false)
-                    .expect("actual switched Pair");
+                let pair = fixture.trace_pair_stage().expect("actual switched Pair");
                 assert_eq!(pair.carrier, Some(carrier));
                 assert_eq!(pair.addresses, addresses);
                 assert_eq!(
@@ -1183,9 +977,7 @@ fn carrier_factory_actual_cold_child() {
                 .expect("actual replacement CommitCandidate");
             assert_eq!(committed.session.membership_generation, 3);
             assert_eq!(committed.session.active, Slot::A);
-            let replacement = fixture
-                .trace_pair_stage(false)
-                .expect("actual replacement Pair");
+            let replacement = fixture.trace_pair_stage().expect("actual replacement Pair");
             assert_eq!(replacement.carrier, Some(carrier));
             assert_eq!(replacement.addresses, addresses);
             assert_eq!(
@@ -1241,9 +1033,7 @@ fn carrier_factory_actual_cold_child() {
             assert_eq!(rebound.session.active, Slot::A);
             assert_eq!(rebound.session.membership_generation, 3);
             assert!(!rebound.cleanup_pending);
-            let rebound = fixture
-                .trace_pair_stage(false)
-                .expect("actual rebound Pair");
+            let rebound = fixture.trace_pair_stage().expect("actual rebound Pair");
             assert_eq!(rebound.carrier, replacement.carrier);
             assert_eq!(rebound.addresses, replacement.addresses);
             for slot in 0..2 {
@@ -1271,7 +1061,7 @@ fn carrier_factory_actual_cold_child() {
         );
         if let Err(error) = &stopped {
             eprintln!("actual factory {case}: repeat Stop error {error:?}");
-            fixture.trace_pair_stage(true);
+            fixture.trace_pair_stage();
         }
         let retry_started = std::time::Instant::now();
         while stopped.is_err() && second.snapshot().cleanup_pending {
@@ -1288,7 +1078,7 @@ fn carrier_factory_actual_cold_child() {
                 Err(error) => {
                     eprintln!("actual factory {case}: repeat Stop tick error {error:?}");
                     assert!(second.snapshot().cleanup_pending);
-                    fixture.trace_pair_stage(false);
+                    fixture.trace_pair_stage();
                     stopped = Err(error);
                 }
             }
