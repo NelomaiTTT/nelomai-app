@@ -413,12 +413,44 @@ func TestMain(m *testing.M) {
 			}
 			ready[slot] = map[string]string{"endpoint": net.JoinHostPort(ip.String(), port), "public_key": base64.StdEncoding.EncodeToString(remote.PublicKey().Bytes())}
 		}
+		// An authenticated test-only UDP request closes the REAL external A
+		// peer. Failure then traverses product DNS/metrics and actor promotion.
+		control, err := net.ListenUDP("udp4", &net.UDPAddr{})
+		if err != nil {
+			os.Exit(1)
+		}
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			os.Exit(1)
+		}
+		token := hex.EncodeToString(nonce[:])
+		ready[0]["control"] = net.JoinHostPort(ip.String(), fmt.Sprint(control.LocalAddr().(*net.UDPAddr).Port))
+		ready[0]["token"] = token
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var packet [128]byte
+			for {
+				n, address, err := control.ReadFromUDP(packet[:])
+				if err != nil {
+					return
+				}
+				if string(packet[:n]) != "close-a:"+token {
+					continue
+				}
+				peers[0].Close()
+				<-peers[0].Wait()
+				_, _ = control.WriteToUDP([]byte("closed-a:"+token), address)
+			}
+		}()
 		if json.NewEncoder(os.Stdout).Encode(ready) != nil {
 			os.Exit(1)
 		}
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 		} // bounded by the original parent pipe lifetime
+		control.Close()
+		<-done
 		for _, peer := range peers {
 			peer.Close()
 			<-peer.Wait()

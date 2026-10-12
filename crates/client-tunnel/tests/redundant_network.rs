@@ -49,13 +49,19 @@ impl NetworkSystem for System {
 struct Journal {
     saved: Option<NetworkJournal>,
     fail: bool,
+    saves: usize,
+    lose_ack_at: Option<usize>,
 }
 impl NetworkJournalStore for Journal {
     fn save(&mut self, value: &NetworkJournal) -> io::Result<()> {
+        self.saves += 1;
         if self.fail {
             return Err(io::Error::other("disk"));
         }
         self.saved = Some(value.clone());
+        if self.lose_ack_at == Some(self.saves) {
+            return Err(io::Error::other("lost disk ACK"));
+        }
         Ok(())
     }
 }
@@ -485,13 +491,42 @@ fn rollback_that_reports_success_without_reverting_stays_pending() {
 
 #[test]
 fn successful_stop_clears_pending_but_cannot_resurrect_same_owner() {
-    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
-    owner.select(Slot::A, pair(10)).unwrap();
-    owner.cleanup().unwrap();
-    assert!(!owner.cleanup_pending());
-    assert_eq!(owner.active(), None);
-    assert!(owner.select(Slot::B, pair(20)).is_err());
-    assert!(owner.system_mut().values.is_empty());
+    // Initial A consumes two saves. Lose the metadata pending or commit ACK,
+    // retaining the SAME owner for Stop; neither permits another Switch.
+    for lose_ack_at in [None, Some(3), Some(4)] {
+        let mut owner = NetworkOwner::fresh(
+            System::default(),
+            Journal {
+                lose_ack_at,
+                ..Default::default()
+            },
+        );
+        owner.select(Slot::A, pair(10)).unwrap();
+        let writes = owner.system_mut().writes;
+        let switched = std::cell::Cell::new(0);
+        let result = owner.select_metadata(Slot::A, Slot::B, || {
+            switched.set(switched.get() + 1);
+            Ok(())
+        });
+        assert_eq!(result.is_err(), lose_ack_at.is_some());
+        assert_eq!(switched.get(), usize::from(lose_ack_at != Some(3)));
+        assert_eq!(owner.system_mut().writes, writes);
+        assert_eq!(owner.cleanup_pending(), lose_ack_at.is_some());
+        if lose_ack_at.is_some() {
+            assert_eq!(owner.active(), None);
+            assert!(owner
+                .select_metadata(Slot::A, Slot::B, || panic!("ambiguous Switch retried"))
+                .is_err());
+        } else {
+            assert_eq!(owner.active(), Some(Slot::B));
+        }
+        owner.cleanup().unwrap();
+        assert!(!owner.cleanup_pending());
+        assert_eq!(owner.active(), None);
+        assert!(owner.select(Slot::B, pair(20)).is_err());
+        assert!(owner.system_mut().values.is_empty());
+        assert_eq!(owner.system_mut().writes, writes + 4); // Delete only.
+    }
 }
 
 #[test]

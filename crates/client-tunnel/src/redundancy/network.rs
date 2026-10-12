@@ -415,6 +415,50 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         self.transition(Some(active), values)
     }
 
+    /// Switch an independent crypto slot while retaining the exact shared
+    /// native resources. The callback runs once, only after durable pending ACK.
+    /// Any ambiguity retains pending for cleanup; it never restores the old role
+    /// or reconciles/recreates a missing route.
+    pub fn select_metadata(
+        &mut self,
+        expected: Slot,
+        active: Slot,
+        switch: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.journal.stopping
+            || self.journal.pending.is_some()
+            || self.journal.active != Some(expected)
+            || expected == active
+        {
+            return Err(io::Error::other("network_metadata_fenced"));
+        }
+        validate_entries(&self.journal.owned)?;
+        for entry in &self.journal.owned {
+            if self.system.read(&entry.current.key())?.as_ref() != Some(&entry.current) {
+                return Err(conflict());
+            }
+        }
+        // Retain the write attempt before persistence, including lost ACKs or
+        // unwind. Equality on subsequent readback is never an applied ACK.
+        self.journal.pending = Some(Pending {
+            target: self.journal.owned.clone(),
+            active: Some(active),
+        });
+        self.store.save(&self.journal)?;
+        switch()?;
+        for entry in &self.journal.owned {
+            if self.system.read(&entry.current.key())?.as_ref() != Some(&entry.current) {
+                return Err(conflict());
+            }
+        }
+        let mut committed = self.journal.clone();
+        committed.active = Some(active);
+        committed.pending = None;
+        self.store.save(&committed)?;
+        self.journal = committed;
+        Ok(())
+    }
+
     pub fn prepare(&mut self, values: Vec<NetworkValue>) -> io::Result<()> {
         if self.journal.active.is_some() || self.journal.stopping || self.journal.pending.is_some()
         {

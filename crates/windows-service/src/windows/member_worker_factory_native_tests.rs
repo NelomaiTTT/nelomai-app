@@ -133,6 +133,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             None
         };
         let mut readiness = None;
+        let mut promotion = None;
+        let mut before_network = None;
         if round == 0 && attached.as_ref().is_some_and(|result| result.is_ok()) {
             let clock = Instant::now();
             loop {
@@ -150,6 +152,66 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(25)); // actual actor cadence
+            }
+            if readiness.as_ref().is_some_and(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|state| state.primary_ready && state.standby_ready)
+            }) {
+                before_network =
+                    super::member_carrier_factory_test_os::state().and_then(|directory| {
+                        let value: serde_json::Value = serde_json::from_slice(
+                            &std::fs::read(directory.join("nelomai-redundant-worker.json")).ok()?,
+                        )
+                        .ok()?;
+                        let identity =
+                            serde_json::from_value::<crate::member_owner::InterfaceProof>(
+                                value.get("interface")?.clone(),
+                            )
+                            .ok()?;
+                        let network = serde_json::from_value::<
+                            nelomai_client_tunnel::redundancy::network::NetworkJournal,
+                        >(value.get("network")?.clone())
+                        .ok()?;
+                        Some((identity, network))
+                    });
+                promotion = Some((|| -> std::io::Result<_> {
+                    let address = peers[0]["control"]
+                        .as_str()
+                        .ok_or_else(|| std::io::Error::other("peer control missing"))?
+                        .parse::<std::net::SocketAddr>()
+                        .map_err(std::io::Error::other)?;
+                    let token = peers[0]["token"]
+                        .as_str()
+                        .ok_or_else(|| std::io::Error::other("peer token missing"))?;
+                    let control = std::net::UdpSocket::bind("0.0.0.0:0")?;
+                    control.connect(address)?;
+                    control.set_read_timeout(Some(Duration::from_secs(2)))?;
+                    control.send(format!("close-a:{token}").as_bytes())?;
+                    let mut reply = [0u8; 128];
+                    let n = control.recv(&mut reply)?;
+                    if &reply[..n] != format!("closed-a:{token}").as_bytes() {
+                        return Err(std::io::Error::other("peer close ACK mismatch"));
+                    }
+                    let failed_at = clock.elapsed();
+                    loop {
+                        actor
+                            .tick(clock.elapsed().as_millis() as u64)
+                            .map_err(|_| std::io::Error::other("promotion tick failed"))?;
+                        let status = actor
+                            .redundant(Command::Status {
+                                scope: scope.clone(),
+                            })
+                            .map_err(|_| std::io::Error::other("promotion status failed"))?;
+                        if status.session.active == Slot::B && status.primary_ready {
+                            return Ok(status);
+                        }
+                        if clock.elapsed().saturating_sub(failed_at) >= Duration::from_secs(15) {
+                            return Err(std::io::Error::other("genuine B promotion deadline"));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                })());
             }
         }
         let during = super::member_carrier_provider::native::table().unwrap();
@@ -200,11 +262,35 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                 "missing authentic per-slot sample/raw DNS readiness"
             );
             assert_eq!(readiness.session.active, Slot::A);
+            let promotion = promotion
+                .expect("external A outage after readiness")
+                .expect("production actor promoted B");
+            assert_eq!(promotion.session.active, Slot::B);
+            assert!(promotion.primary_ready);
+            assert_eq!(promotion.session.installed, [true, true]);
+            assert!(!promotion.cleanup_pending);
         }
         let (identity, network) = retained.expect("original worker interface/network");
         let network = network.read_view().unwrap();
         assert!(network.pending().is_none());
-        assert_eq!(network.recorded_active(), Some(Slot::A));
+        assert_eq!(
+            network.recorded_active(),
+            Some(if round == 0 { Slot::B } else { Slot::A })
+        );
+        if round == 0 {
+            let (before_identity, before) =
+                before_network.expect("exact pre-promotion interface/network facts");
+            assert_eq!(
+                identity, before_identity,
+                "promotion replaced original GUID/LUID/index"
+            );
+            let before = before.read_view().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&network.current().collect::<Vec<_>>()).unwrap(),
+                serde_json::to_vec(&before.current().collect::<Vec<_>>()).unwrap(),
+                "promotion mutated exact route bytes"
+            );
+        }
         let endpoints =
             endpoints.map(|endpoint| endpoint.parse::<std::net::SocketAddr>().unwrap().ip());
         let mut expected_routes = vec![

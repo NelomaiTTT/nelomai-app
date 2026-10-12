@@ -1454,10 +1454,33 @@ impl NativePair for Control {
             return Err(failed());
         }
         self.check_integrity()?;
-        self.call(
-            json!({"op":"switch","slot":slot_index(slot)}),
-            Duration::from_secs(1),
-        )?;
+        let active = self
+            .routes
+            .as_ref()
+            .and_then(NetworkOwner::active)
+            .ok_or_else(failed)?;
+        let original = self.original.clone();
+        let journal = self.journal.clone();
+        let guard = self.guard.as_ref().ok_or_else(failed)?.clone();
+        let rpc = self.rpc.clone();
+        self.fenced = true;
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .select_metadata(active, slot, || {
+                original.verify_live()?;
+                journal.borrow_mut().verify()?;
+                checked(guard.borrow_mut().verify(|| original.verify_live()))?;
+                rpc.borrow_mut().as_mut().ok_or_else(failed)?.call(
+                    json!({"op":"switch","slot":slot_index(slot)}),
+                    Duration::from_secs(1),
+                )?;
+                original.verify_live()?;
+                journal.borrow_mut().verify()?;
+                checked(guard.borrow_mut().verify(|| original.verify_live()))
+            })?;
+        self.check_integrity()?;
+        self.fenced = false;
         Ok(())
     }
     fn close(&mut self, scope: &SessionScope) -> io::Result<()> {
