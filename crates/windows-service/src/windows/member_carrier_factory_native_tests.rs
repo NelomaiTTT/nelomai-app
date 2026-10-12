@@ -44,6 +44,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
     let cases = [
         "primary",
         "standby",
+        "hot-pair-stop",
         "network-route-postflight",
         "metrics-post-read-error",
         "module-load-read-error",
@@ -189,7 +190,10 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 "surviving original key disposition was not acknowledged: {stderr}"
             );
         }
-        if matches!(case, "primary" | "standby" | "running-ack") {
+        if matches!(
+            case,
+            "primary" | "standby" | "hot-pair-stop" | "running-ack"
+        ) {
             let mut completed = 0;
             for after_dns in stderr.split("network DNS cleanup end").skip(1) {
                 let (boundary, _) = after_dns
@@ -239,7 +243,7 @@ fn carrier_factory_actual_cold_child() {
         case.as_str(),
         "module-load-read-error" | "module-load-read-unwind"
     );
-    let full_primary = matches!(case.as_str(), "primary" | "standby");
+    let full_primary = matches!(case.as_str(), "primary" | "standby" | "hot-pair-stop");
     let route_partial = case == "network-route-postflight";
     let metrics_partial = case == "metrics-post-read-error";
     let resolver_partial = matches!(
@@ -583,13 +587,127 @@ fn carrier_factory_actual_cold_child() {
             assert_eq!(snapshot.session.phase, SessionPhase::Stopped);
         }
     }
+    let mut original_now = 8;
+    let hot_pair = if case == "hot-pair-stop" {
+        // Attach through the SAME factory/control. Keep both native owners hot;
+        // no RetireInactive or replacement may remove B before full Stop.
+        fixture.external_health(None);
+        let Command::Start { primary, .. } = &command else {
+            unreachable!()
+        };
+        let before = original.snapshot();
+        let attached = original
+            .execute(
+                Command::Attach {
+                    scope: scope.clone(),
+                    member: Member {
+                        slot: Slot::B,
+                        lease_id: "33333333-3333-4333-8333-333333333333".into(),
+                        configuration: TunnelConfiguration::new(
+                            primary
+                                .configuration
+                                .expose()
+                                .replace("192.0.2.11", "192.0.2.12"),
+                        ),
+                        probe: primary.probe.clone(),
+                    },
+                    expected_revision: before.session.local_revision,
+                    expected_network_epoch: before.session.network_epoch,
+                    expected_membership_generation: 1,
+                    membership_generation: 2,
+                },
+                8,
+            )
+            .expect("actual full-Stop reserve Attach B");
+        assert_eq!(attached.session.membership_generation, 2);
+        for tick in 1..=20 {
+            let now = 8 + tick * 5000;
+            original_now = now;
+            original.tick(now).expect("actual hot pair health tick");
+            original.tick(now).expect("actual hot pair probe replies");
+            let current = original.snapshot();
+            if current.primary_ready && current.standby_ready {
+                break;
+            }
+        }
+        let current = original.snapshot();
+        assert_eq!(current.session.phase, SessionPhase::Running);
+        assert_eq!(current.session.active, Slot::A);
+        assert!(current.primary_ready && current.standby_ready);
+        assert!(!current.cleanup_pending && !current.retirement_pending);
+        let pair = fixture
+            .trace_pair_stage()
+            .expect("actual hot A+B Pair before Stop");
+        let identities = [0, 1].map(|slot| {
+            pair.members[slot]
+                .as_ref()
+                .unwrap()
+                .owner
+                .proof
+                .unwrap()
+                .interface
+        });
+        assert_ne!(identities[0].guid, identities[1].guid);
+        assert_ne!(identities[0].luid, identities[1].luid);
+        assert_ne!(identities[0].index, identities[1].index);
+        let rows = crate::windows::member_carrier_provider::native::table()
+            .expect("actual hot A+B MIB before Stop");
+        for identity in identities {
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.identity.guid == identity.guid
+                        && row.identity.luid == identity.luid
+                        && row.identity.index == identity.index)
+                    .count(),
+                1
+            );
+        }
+        Some(identities)
+    } else {
+        None
+    };
     eprintln!("actual factory {case}: original Stop");
     let stop_started = std::time::Instant::now();
+    let observe_done = Arc::new(AtomicBool::new(false));
+    let observer = hot_pair.map(|identities| {
+        let done = observe_done.clone();
+        std::thread::spawn(move || {
+            // Read GetIfTable2 only: the observer never opens adapter handles
+            // and cannot supply a cleanup ACK to the production owner.
+            let mut first_absent = [None; 2];
+            loop {
+                let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                let mut absent = [false; 2];
+                match crate::windows::member_carrier_provider::native::table() {
+                    Ok(rows) => {
+                        for (slot, (identity, alias)) in identities.iter().zip(["nelomai-a", "nelomai-b"]).enumerate() {
+                            absent[slot] = !rows.iter().any(|row| {
+                                row.identity.guid == identity.guid
+                                    || row.identity.luid == identity.luid
+                                    || row.identity.index == identity.index
+                                    || row.identity.name.eq_ignore_ascii_case(alias)
+                            });
+                            if absent[slot] && first_absent[slot].is_none() {
+                                let elapsed = stop_started.elapsed();
+                                first_absent[slot] = Some(elapsed);
+                                eprintln!("actual hot pair Stop slot={alias} identity={identity:?} first_mib_absent_ms={}", elapsed.as_millis());
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("actual hot pair Stop MIB read UNKNOWN: {error:?}"),
+                }
+                if finished {
+                    return (first_absent, absent);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    });
     let mut stopped = original.execute(
         Command::Stop {
             scope: scope.clone(),
         },
-        8,
+        original_now,
     );
     if let Err(error) = &stopped {
         eprintln!("actual factory {case}: Stop error {error:?}");
@@ -618,7 +736,7 @@ fn carrier_factory_actual_cold_child() {
             && retry_started.elapsed() <= std::time::Duration::from_secs(90)
         {
             assert_eq!(original.snapshot().session.phase, SessionPhase::Stopping);
-            let now = 8 + stop_started.elapsed().as_millis() as u64;
+            let now = original_now + stop_started.elapsed().as_millis() as u64;
             match original.tick(now) {
                 Ok(_) => {
                     let snapshot = original.snapshot();
@@ -636,6 +754,20 @@ fn carrier_factory_actual_cold_child() {
             if original.snapshot().cleanup_pending {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+        }
+        let stop_elapsed = stop_started.elapsed();
+        observe_done.store(true, std::sync::atomic::Ordering::Release);
+        let hot_pair_removal =
+            observer.map(|observer| observer.join().expect("actual MIB observer"));
+        if let Some((first_absent, absent)) = hot_pair_removal {
+            eprintln!("actual hot pair Stop complete elapsed_ms={} result={stopped:?} first_mib_absent_ms={:?} final_mib_absent={absent:?}", stop_elapsed.as_millis(), first_absent.map(|time| time.map(|time| time.as_millis())));
+            for (slot, identity) in hot_pair.unwrap().into_iter().enumerate() {
+                eprintln!("actual hot pair Stop slot={} identity={identity:?} first_mib_absent_ms={:?} final_mib_absent={}", ["nelomai-a", "nelomai-b"][slot], first_absent[slot].map(|time| time.as_millis()), absent[slot]);
+            }
+            assert_eq!(
+                absent, [true; 2],
+                "exact original A+B MIB absence not confirmed"
+            );
         }
         if metrics_partial {
             // The same retained owner has attempted real Stop. A later C failure
@@ -709,13 +841,27 @@ fn carrier_factory_actual_cold_child() {
         let stopped = stopped.expect("actual retained native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        if hot_pair.is_some() {
+            let pair = fixture
+                .trace_pair_stage()
+                .expect("actual hot pair terminal Stop");
+            pair.validate()
+                .expect("actual hot pair terminal invariants");
+            assert_eq!(pair.scope, scope);
+            assert_eq!(pair.phase, crate::member_carrier_pair::Phase::Stopped);
+            assert!(pair.pending.is_none());
+            assert_eq!(
+                pair.guard,
+                crate::member_carrier_guard::Model::empty(scope.clone()).unwrap()
+            );
+        }
         if full_primary {
             let repeated = original
                 .execute(
                     Command::Stop {
                         scope: scope.clone(),
                     },
-                    8,
+                    original_now,
                 )
                 .expect("actual native primary repeated Stop");
             assert_eq!(repeated, stopped);
@@ -1228,6 +1374,12 @@ fn carrier_factory_actual_cold_child() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        if hot_pair.is_some() {
+            eprintln!(
+                "actual hot pair repeat Stop complete elapsed_ms={} result={stopped:?}",
+                stop_started.elapsed().as_millis()
+            );
+        }
         let stopped = stopped.expect("actual repeat native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
@@ -1258,6 +1410,15 @@ fn carrier_factory_actual_cold_child() {
                     "cold repeat Stop changed its predecessor journal"
                 );
             }
+        }
+        if let Some((first_absent, _)) = hot_pair_removal {
+            // Collect full cleanup and repeat-Start evidence before the red
+            // acceptance gate. This is a test requirement, not a native ACK.
+            assert!(
+                first_absent.into_iter().all(|elapsed| elapsed
+                    .is_some_and(|elapsed| elapsed <= std::time::Duration::from_secs(5))),
+                "exact A+B MIB absence exceeded the 5-second full Stop budget"
+            );
         }
     } else {
         match stopped {
