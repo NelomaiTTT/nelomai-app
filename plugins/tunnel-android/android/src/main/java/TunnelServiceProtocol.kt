@@ -27,6 +27,10 @@ internal const val EXTRA_CACHE_QUICK_ACTION = "cache_quick_action"
 internal const val EXTRA_QUICK_ACTION_VALID_UNTIL = "quick_action_valid_until"
 internal const val EXTRA_QUICK_CONNECTION = "quick_connection"
 internal const val EXTRA_REDUNDANCY = "redundancy"
+internal const val EXTRA_POLICY_SESSION_ID = "policy_session_id"
+internal const val EXTRA_POLICY_OUTCOME = "policy_outcome"
+internal const val EXTRA_POLICY_DEADLINE = "policy_deadline"
+internal const val EXTRA_POLICY_REPLY_OWNER = "policy_reply_owner"
 internal const val EXTRA_RESERVE_PREFERENCE = "reserve_preference"
 internal const val EXTRA_PROBE = "probe"
 internal const val EXTRA_STATE = "state"
@@ -77,7 +81,7 @@ internal const val EXTRA_SYNC_BINDING_PREFERENCES = "sync_binding_preferences"
 private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
 private const val METRICS_REQUEST_TIMEOUT_MILLIS = 1_800L
 private const val UDP_REBIND_REQUEST_TIMEOUT_MILLIS = 3_250L
-private const val SERVICE_REQUEST_TIMEOUT_MILLIS = 30_000L
+private const val SERVICE_REQUEST_TIMEOUT_MILLIS = OWNED_POLICY_REQUEST_TIMEOUT_MILLIS
 private const val SERVICE_REQUEST_TIMEOUT_ERROR = "tunnel_service_timeout"
 private const val CREDENTIAL_MUTATION_NETWORK_STEPS = 3L
 private const val CREDENTIAL_MUTATION_COMPLETION_SLACK_MILLIS = 5_000L
@@ -126,6 +130,29 @@ internal fun cancelConnectionIntentServiceRequest(
 )
 
 internal object TunnelServiceClient {
+    fun applyOwnedRedundantPolicy(
+        context: Context,
+        args: OwnedRedundantPolicyArgs,
+        onSuccess: (String) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(context,
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_APPLY_OWNED_REDUNDANT_POLICY)
+            .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_CLIENT_OPERATION_ID, args.operationId)
+            .putExtra(EXTRA_POLICY_SESSION_ID, args.sessionId)
+            .putExtra(EXTRA_POLICY_REPLY_OWNER, Bundle().apply { putBinder("owner", android.os.Binder()) })
+            .putExtra(EXTRA_POLICY_DEADLINE, android.os.SystemClock.elapsedRealtime() + SERVICE_REQUEST_TIMEOUT_MILLIS)
+            .putExtra(EXTRA_QUICK_CONNECTION, args.connection.toBundle())
+            .putExtra(EXTRA_OPTIONS, args.options.toBundle()),
+        { onSuccess(it.getString(EXTRA_POLICY_OUTCOME) ?: "failed") }, onError,
+        onTimeout = { cancelOwnedRedundantPolicy(context, args.operationId) })
+
+    fun cancelOwnedRedundantPolicy(context: Context, operationId: String) = dispatch(context,
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY)
+            .putExtra(EXTRA_CLIENT_OPERATION_ID, operationId))
+
     fun toggleConnectionIntent(
         context: Context,
         onSuccess: (ConnectionIntentServiceStatus) -> Unit,

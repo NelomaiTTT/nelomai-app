@@ -34,6 +34,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
 private const val REDUNDANT_HEALTH_TICK_MILLIS = 1_000L
@@ -236,6 +237,7 @@ internal data class InstalledRedundantVpnOwner(
     val owner: RedundantVpnProcessOwner,
     val startOperationId: String,
     val routeBaseline: RedundantVpnRouteBaseline? = null,
+    val effectiveOptions: EffectiveAndroidTunnelOptions? = null,
 )
 
 internal class RedundantVpnOwnerSlot {
@@ -294,6 +296,14 @@ internal class RedundantVpnOwnerSlot {
         if (current.startOperationId != startOperationId || current.owner !== owner) return false
         action()
         return true
+    }
+
+    @Synchronized
+    fun updateRouteBaseline(owner: RedundantVpnProcessOwner, baseline: RedundantVpnRouteBaseline?,
+        options: EffectiveAndroidTunnelOptions) {
+        installed?.takeIf { it.owner === owner }?.let {
+            installed = it.copy(routeBaseline = baseline, effectiveOptions = options)
+        }
     }
 }
 
@@ -756,6 +766,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         Thread(task, "nelomai-redundant-control").apply { isDaemon = true }
     }
     private val redundantWork = RedundantVpnWorkDispatcher(redundantExecutor)
+    private val ownedPolicyCancelled = OwnedPolicyCancellationGate()
+    private val ownedPolicyInFlight = AtomicBoolean(false)
     private val redundantMutationFence = RedundantOperationMutationFence()
     private val redundantStartOperation = RedundantStartOperationGate()
     private val redundantRevokeLifecycle = RedundantRevokeLifecycleGate()
@@ -1044,6 +1056,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             intent?.action == ACTION_CLIENT_STATUS -> handleClientStatus(intent)
             intent?.action == ACTION_CLIENT_METRICS -> handleClientMetrics(intent)
             intent?.action == ACTION_CLIENT_REBIND_UDP -> handleClientRebindUdp(intent)
+            intent?.action == ACTION_APPLY_OWNED_REDUNDANT_POLICY -> handleOwnedRedundantPolicy(intent)
+            intent?.action == ACTION_CANCEL_OWNED_REDUNDANT_POLICY -> {
+                intent.getStringExtra(EXTRA_CLIENT_OPERATION_ID)?.takeIf { it.length in 1..128 }
+                    ?.let(ownedPolicyCancelled::cancel)
+            }
             intent?.action == ACTION_BEGIN_CONNECTION_INTENT -> handleBeginConnectionIntent(intent)
             intent?.action == ACTION_CANCEL_CONNECTION_INTENT -> handleCancelConnectionIntent(intent)
             intent?.action == ACTION_CANCEL_CURRENT_CONNECTION_INTENT -> {
@@ -1477,6 +1494,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             emptyList()
         }
         val routeBaseline = redundantVpnRouteBaseline(options, localRoutes)
+        val currentOptions = AtomicReference(options)
+        var preparingOptions = transaction.template.options
+        var coordinatorOwner: RedundantConnectionCoordinator? = null
         val native = ServiceRedundantConnectionNative(
             backend = RedundantNativeBackend(
                 JniRedundantNativeApi(applicationContext),
@@ -1486,38 +1506,50 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 // Recovery gets its interface address only with the recovered
                 // configuration. Install the DNS route chosen from that actual
                 // address immediately before constructing the shared TUN.
+                val effective = AndroidSplitTunnel.resolveConfigurationOptions(Build.VERSION.SDK_INT,
+                    preparingOptions.toTunnelOptionsArgs(), transaction.template.egressMode, config)
+                val routes = if (effective.splitSupported && effective.excludeLocalNetworks) {
+                    PhysicalNetworks(applicationContext).snapshotState().localRoutes
+                } else emptyList()
                 AndroidSplitTunnel.replaceVpnRoutes(
-                    AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
+                    AndroidSplitTunnel.mergeExcludedRoutes(effective.excludedRoutes, routes),
                     config.getInterface().dnsServers.toList(),
                 )
-                establishRedundantTun(config)
+                establishRedundantTun(config)?.also {
+                    redundantMutationFence.runSerializedIfActive(transaction.startOperationId) {
+                        currentOptions.set(effective)
+                        coordinatorOwner?.let { owner ->
+                            redundantVpnOwnerSlot.updateRouteBaseline(owner,
+                                redundantVpnRouteBaseline(effective, routes), effective)
+                        }
+                        true
+                    }
+                }
             },
             prepare = { configuration ->
-                val config = TunnelPayload.consume(configuration) { payload ->
+                val parsed = TunnelPayload.consume(configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
-                }.let { parsed ->
-                    AndroidSplitTunnel.applyOptions(
-                        parsed,
-                        AndroidSplitTunnel.resolveConfigurationOptions(
-                            Build.VERSION.SDK_INT,
-                            transaction.template.options.toTunnelOptionsArgs(),
-                            transaction.template.egressMode,
-                            parsed,
-                        ),
-                        applicationContext.packageName,
-                    )
                 }
-                resolveRedundantEndpoints(config)
-                PreparedRedundantConfiguration(
-                    config,
-                    config.toAwgUserspaceString().toByteArray(StandardCharsets.UTF_8),
-                )
+                resolveRedundantEndpoints(parsed)
+                prepareOwnedRedundantConfiguration(resolvedRedundantConfiguration(parsed)
+                    .toAwgQuickString().toByteArray(StandardCharsets.UTF_8), preparingOptions,
+                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName)
+            },
+            preparePolicy = { configuration, policy ->
+                preparingOptions = policy
+                prepareOwnedRedundantConfiguration(configuration, policy,
+                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName)
+            },
+            equivalentPolicy = { old, new ->
+                AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT, old.toTunnelOptionsArgs(),
+                    transaction.template.egressMode) ==
+                    AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT, new.toTunnelOptionsArgs(),
+                        transaction.template.egressMode)
             },
             probeSourceIpv4 = probeSourceIpv4,
             initialNetworkAvailable = physicalState.available,
         )
         val ownerServiceGeneration = serviceGeneration
-        var coordinatorOwner: RedundantConnectionCoordinator? = null
         val coordinator = RedundantConnectionCoordinator(
             recoveryStore,
             ServiceRedundantConnectionPanel(::serviceActiveCredential),
@@ -1540,7 +1572,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     native.diagnosticMetrics(),
                 )
                 restoreHandler.post {
-                    refreshConnectionNotification(redundantNotificationContent(state))
+                    refreshConnectionNotification(if (coordinatorOwner?.policyFailed() == true) {
+                        "VPN-подключение остановлено: ошибка применения настроек"
+                    } else redundantNotificationContent(state))
                 }
             },
             onDiagnosticEvent = { event ->
@@ -1583,7 +1617,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 monitor.start(initialState = physicalState) { state ->
                     applyRedundantPhysicalNetworks(
                         callbackIdentity,
-                        options,
+                        currentOptions.get(),
                         coordinator,
                         state,
                     )
@@ -1599,6 +1633,115 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         }
         restoreHandler.post(redundantHealthTick)
         return coordinator to native
+    }
+
+    private fun handleOwnedRedundantPolicy(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val operationId = intent.getStringExtra(EXTRA_CLIENT_OPERATION_ID)
+            ?.takeIf { it.length in 1..128 } ?: run {
+            receiver.sendError("invalid_tunnel_request"); return
+        }
+        val cancellation = ownedPolicyCancelled.begin(operationId) ?: run {
+            ownedPolicyCancelled.reject(operationId)
+            receiver.sendError("redundant_policy_preflight_rejected"); return
+        }
+        val installed = redundantVpnOwnerSlot.snapshot()
+        val owner = installed?.owner as? RedundantConnectionCoordinator
+        val admission = connectionIntentAdmission.snapshot()
+        val deadline = intent.getLongExtra(EXTRA_POLICY_DEADLINE, 0)
+        val replyOwner = runCatching {
+            requireNotNull(receiver)
+            OwnedPolicyReplyFence(requireNotNull(intent.getBundleExtra(EXTRA_POLICY_REPLY_OWNER)?.getBinder("owner")))
+        }.getOrNull() ?: run {
+            ownedPolicyCancelled.complete(cancellation)
+            receiver.sendError("redundant_policy_preflight_rejected"); return
+        }
+        fun ownerCurrent(): Boolean = serviceCallbackGate.isOpen() && !serviceDestroyed &&
+            serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get() &&
+            connectionIntentAdmission.isCurrent(admission) && !redundantStartBlocked() &&
+            !redundantStartOperation.hasPending() &&
+            backgroundLogoutState() == BackgroundLogoutReadState.NONE &&
+            owner != null && redundantVpnOwnerSlot.snapshot()?.owner === owner
+        fun current(): Boolean = ownerCurrent() && replyOwner.isCurrent() &&
+            !cancellation.isCancelled() && android.os.SystemClock.elapsedRealtime() < deadline
+        val request = runCatching {
+            require(intent.getIntExtra(EXTRA_API_VERSION, 0) == TUNNEL_API_VERSION)
+            val connection = requireNotNull(intent.getBundleExtra(EXTRA_QUICK_CONNECTION)).toQuickConnection()
+            require(!connection.allowAlternate)
+            val scope = OwnedRedundantPolicyScope(requireNotNull(intent.getStringExtra(EXTRA_POLICY_SESSION_ID)),
+                connection.leaseId, connection.layer, connection.ticConnectionMode,
+                connection.routeMode, connection.egressMode, connection.allowAlternate)
+            val options = normalizeAndroidTunnelOptions(Build.VERSION.SDK_INT,
+                requireNotNull(intent.getBundleExtra(EXTRA_OPTIONS)).toTunnelOptions())
+            scope to options
+        }.getOrNull()
+        if (request == null || !current() || !ownedPolicyInFlight.compareAndSet(false, true)) {
+            replyOwner.close()
+            ownedPolicyCancelled.complete(cancellation)
+            receiver.sendError("redundant_policy_preflight_rejected"); return
+        }
+        if (!connectionIntentCoordinator.beginLocalRestart()) {
+            replyOwner.close()
+            ownedPolicyCancelled.complete(cancellation)
+            ownedPolicyInFlight.set(false)
+            receiver.sendError("tunnel_operation_in_progress"); return
+        }
+        try {
+            redundantWork.execute {
+                var completedOutcome: OwnedRedundantPolicyOutcome? = null
+                try {
+                    if (!current()) throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+                    var outcome = requireNotNull(owner).applyOwnedPolicy(request.first, request.second) { !current() }
+                    completedOutcome = outcome
+                    if (!current()) {
+                        outcome = owner.failOwnedPolicy()
+                    }
+                    if (outcome == OwnedRedundantPolicyOutcome.FAILED && ownerCurrent()) {
+                        redundantMutationFence.runSerializedIfActive(installed.startOperationId) {
+                            if (!ownerCurrent()) false else QuickTunnelController.updateState(
+                                applicationContext, SessionState.FAILED, desiredActive = null)
+                        }
+                        restoreHandler.post {
+                            if (ownerCurrent()) refreshConnectionNotification(
+                                "VPN-подключение остановлено: ошибка применения настроек")
+                        }
+                    }
+                    receiver?.send(SERVICE_RESULT_OK, Bundle().apply {
+                        putString(EXTRA_POLICY_OUTCOME, outcome.wireName)
+                    })
+                } catch (error: Throwable) {
+                    if (completedOutcome != null && completedOutcome != OwnedRedundantPolicyOutcome.UNCHANGED) {
+                        owner?.failOwnedPolicy()
+                    }
+                    runCatching {
+                        receiver.sendError((error as? BackgroundConnectionException)?.code
+                            ?: "redundant_policy_preflight_rejected")
+                    }
+                } finally {
+                    replyOwner.close()
+                    ownedPolicyCancelled.complete(cancellation)
+                    ownedPolicyInFlight.set(false)
+                    connectionIntentCoordinator.completeLocalRestart()
+                    restoreHandler.post {
+                        if (ownerCurrent() && owner?.isRunning() == true) {
+                            val tx = owner.status()
+                            if (tx != null) applyRedundantPhysicalNetworks(
+                                RedundantPhysicalNetworkCallbackIdentity(serviceGeneration,
+                                    tx.startOperationId, owner),
+                                AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT,
+                                    tx.template.options.toTunnelOptionsArgs(), tx.template.egressMode),
+                                owner, PhysicalNetworks(applicationContext).snapshotState())
+                        }
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+            replyOwner.close()
+            ownedPolicyCancelled.complete(cancellation)
+            ownedPolicyInFlight.set(false)
+            connectionIntentCoordinator.completeLocalRestart()
+            receiver.sendError("android_service_dispatch_unavailable")
+        }
     }
 
     private fun handleRedundantTotalLoss(
@@ -1667,15 +1810,22 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         owner: RedundantConnectionCoordinator,
         state: PhysicalNetworkState,
     ) {
+        if (ownedPolicyInFlight.get() || owner.policyFailed()) return
         var routeRefreshRequired = false
+        var observedOwner: InstalledRedundantVpnOwner? = null
         identity.applyIfCurrent(
             mutationFence = redundantMutationFence,
             current = ::currentRedundantPhysicalNetworkCallbackState,
         ) {
+            if (ownedPolicyInFlight.get() || owner.policyFailed()) return@applyIfCurrent
             val installed = redundantVpnOwnerSlot.snapshot()
+            observedOwner = installed
+            // The callback may have been queued under an earlier policy of this
+            // SAME owner. Read the installed policy and baseline inside the gate.
+            val latestOptions = installed?.effectiveOptions ?: options
             if (redundantLocalRouteRefreshRequired(
                     installed?.routeBaseline,
-                    options,
+                    latestOptions,
                     state.localRoutes,
                 )
             ) {
@@ -1700,7 +1850,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 }
             }
         }
-        if (routeRefreshRequired) {
+        if (routeRefreshRequired && !ownedPolicyInFlight.get() &&
+            redundantVpnOwnerSlot.snapshot() === observedOwner
+        ) {
             handleRedundantTotalLoss(
                 ownerServiceGeneration = identity.serviceGeneration,
                 startOperationId = identity.startOperationId,
@@ -2633,6 +2785,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             val state = if (!redundant.desiredActive ||
                 redundant.retry.stopState != RedundantStopState.NONE
             ) SessionState.STOPPING else if (
+                (redundantOwnerForOperation(redundant.startOperationId) as? RedundantConnectionCoordinator)
+                    ?.policyFailed() == true
+            ) SessionState.FAILED else if (
                 redundantOwnerForOperation(redundant.startOperationId)?.isRunning() == true
             ) {
                 SessionState.RUNNING
@@ -5044,6 +5199,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         internal const val ACTION_CLIENT_STATUS = "ru.nelomai.tunnel.CLIENT_STATUS"
         internal const val ACTION_CLIENT_METRICS = "ru.nelomai.tunnel.CLIENT_METRICS"
         internal const val ACTION_CLIENT_REBIND_UDP = "ru.nelomai.tunnel.CLIENT_REBIND_UDP"
+        internal const val ACTION_APPLY_OWNED_REDUNDANT_POLICY = "ru.nelomai.tunnel.APPLY_OWNED_REDUNDANT_POLICY"
+        internal const val ACTION_CANCEL_OWNED_REDUNDANT_POLICY = "ru.nelomai.tunnel.CANCEL_OWNED_REDUNDANT_POLICY"
         internal const val ACTION_BEGIN_CONNECTION_INTENT =
             "ru.nelomai.tunnel.BEGIN_CONNECTION_INTENT"
         internal const val ACTION_CANCEL_CONNECTION_INTENT =

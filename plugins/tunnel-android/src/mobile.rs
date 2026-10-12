@@ -28,7 +28,50 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 /// Access to the tunnel-android APIs.
 pub struct TunnelAndroid<R: Runtime>(PluginHandle<R>);
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelOwnedPolicy {
+    operation_id: String,
+}
+
 impl<R: Runtime> TunnelAndroid<R> {
+    pub async fn apply_owned_redundant_policy_async(
+        &self,
+        mut request: OwnedRedundantPolicyCommand,
+    ) -> crate::Result<OwnedRedundantPolicyResponse> {
+        static NEXT_POLICY_OPERATION: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_POLICY_OPERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        request.operation_id = format!("policy-{epoch}-{sequence}");
+        let handle = self.0.clone();
+        let cancellation_handle = handle.clone();
+        let operation_id = request.operation_id.clone();
+        let reply = crate::reply_guard::await_plugin_reply_with_cancel(
+            async move {
+                handle
+                    .run_mobile_plugin_async("applyOwnedRedundantPolicy", request)
+                    .await
+            },
+            move || {
+                tauri::async_runtime::spawn(async move {
+                    // Both JNI replies keep their receivers through cancellation.
+                    let _ = cancellation_handle
+                        .run_mobile_plugin_async::<()>(
+                            "cancelOwnedRedundantPolicy",
+                            CancelOwnedPolicy { operation_id },
+                        )
+                        .await;
+                });
+            },
+        )
+        .await;
+        reply.map_err(Into::into)
+    }
+
     async fn run_mobile_plugin_async<T: DeserializeOwned + 'static>(
         &self,
         command: &'static str,

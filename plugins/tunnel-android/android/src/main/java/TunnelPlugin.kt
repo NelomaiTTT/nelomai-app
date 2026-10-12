@@ -101,6 +101,18 @@ class DnsServersArgs {
 }
 
 @InvokeArg
+class OwnedRedundantPolicyArgs {
+    var apiVersion: Int = 0
+    lateinit var operationId: String
+    lateinit var sessionId: String
+    lateinit var connection: QuickConnectionArgs
+    var options: TunnelOptionsArgs = TunnelOptionsArgs()
+}
+
+@InvokeArg
+class CancelOwnedRedundantPolicyArgs { lateinit var operationId: String }
+
+@InvokeArg
 class ReservePreferenceArgs { var enabled: Boolean? = null }
 
 @InvokeArg
@@ -2811,6 +2823,15 @@ private fun HealthStats.sumMeasurements(vararg keys: Int): Long? {
 
 @TauriPlugin
 class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
+    private val ownedPolicyRequests = ConcurrentHashMap.newKeySet<String>()
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onDestroy() {
+        ownedPolicyRequests.forEach {
+            TunnelServiceClient.cancelOwnedRedundantPolicy(activity.applicationContext, it)
+        }
+        ownedPolicyRequests.clear()
+    }
     private val quickStateChangeGate: QuickStateChangeGate
         get() = QuickStateChangeNotifications.gate
 
@@ -3137,6 +3158,26 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
+    }
+
+    @Command
+    fun applyOwnedRedundantPolicy(invoke: Invoke) {
+        val args = try { invoke.parseArgs(OwnedRedundantPolicyArgs::class.java) }
+        catch (_: Throwable) { invoke.reject("invalid_tunnel_request"); return }
+        ownedPolicyRequests.add(args.operationId)
+        TunnelServiceClient.applyOwnedRedundantPolicy(activity.applicationContext, args,
+            { outcome -> ownedPolicyRequests.remove(args.operationId); activity.runOnUiThread {
+                invoke.resolve(JSObject().put("outcome", outcome))
+            } },
+            { code -> ownedPolicyRequests.remove(args.operationId); activity.runOnUiThread { invoke.reject(code) } })
+    }
+
+    @Command
+    fun cancelOwnedRedundantPolicy(invoke: Invoke) {
+        val args = try { invoke.parseArgs(CancelOwnedRedundantPolicyArgs::class.java) }
+        catch (_: Throwable) { invoke.reject("invalid_tunnel_request"); return }
+        TunnelServiceClient.cancelOwnedRedundantPolicy(activity.applicationContext, args.operationId)
+        invoke.resolve()
     }
 
     @Command

@@ -17,6 +17,62 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
 class RedundantStartProtocolTest {
+    @Test fun deadIpcOwnerFencesPolicyAndReleasesDeathRecipient() {
+        val binder = DyingPolicyBinder()
+        val fence = OwnedPolicyReplyFence(binder)
+        org.junit.Assert.assertTrue(fence.isCurrent())
+        binder.die()
+        org.junit.Assert.assertFalse(fence.isCurrent())
+        fence.close()
+        assertNull(binder.recipient)
+    }
+
+    private class DyingPolicyBinder : android.os.IBinder by android.os.Binder() {
+        var recipient: android.os.IBinder.DeathRecipient? = null
+        private var dead = false
+        override fun isBinderAlive() = !dead
+        override fun linkToDeath(recipient: android.os.IBinder.DeathRecipient, flags: Int) { this.recipient = recipient }
+        override fun unlinkToDeath(recipient: android.os.IBinder.DeathRecipient, flags: Int): Boolean {
+            if (this.recipient !== recipient) return false
+            this.recipient = null
+            return true
+        }
+        fun die() { dead = true; recipient?.binderDied() }
+    }
+
+    @Test fun ownedPolicyTimeoutCancelsOnlyItsPolicyOperationAndIgnoresLateReply() {
+        val context = RuntimeEnvironment.getApplication()
+        val replies = mutableListOf<String>()
+        val errors = mutableListOf<String>()
+        val args = OwnedRedundantPolicyArgs().also {
+            it.apiVersion = TUNNEL_API_VERSION
+            it.operationId = "policy-operation"
+            it.sessionId = "session"
+            it.connection = QuickConnectionArgs().also { connection ->
+                connection.leaseId = "lease-b"
+                connection.layer = "stray"
+                connection.ticConnectionMode = "dynamic"
+                connection.routeMode = "standalone"
+            }
+        }
+        TunnelServiceClient.applyOwnedRedundantPolicy(context, args, replies::add, errors::add)
+        val apply = shadowOf(context).nextStartedService
+        assertEquals(NelomaiVpnService.ACTION_APPLY_OWNED_REDUNDANT_POLICY, apply.action)
+        assertEquals(setOf(EXTRA_API_VERSION, EXTRA_CLIENT_OPERATION_ID, EXTRA_POLICY_SESSION_ID,
+            EXTRA_POLICY_DEADLINE, EXTRA_POLICY_REPLY_OWNER, EXTRA_QUICK_CONNECTION, EXTRA_OPTIONS,
+            EXTRA_RESULT_RECEIVER), apply.extras!!.keySet())
+        @Suppress("DEPRECATION")
+        val receiver = requireNotNull(apply.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER))
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(30))
+        val cancel = shadowOf(context).nextStartedService
+        assertEquals(NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY, cancel.action)
+        assertEquals("policy-operation", cancel.getStringExtra(EXTRA_CLIENT_OPERATION_ID))
+        receiver.send(SERVICE_RESULT_OK, Bundle().also { it.putString(EXTRA_POLICY_OUTCOME, "applied") })
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(emptyList<String>(), replies)
+        assertEquals(listOf("tunnel_service_timeout"), errors)
+    }
+
     @Test fun coreStopScopeSurvivesServiceDispatchWhileExplicitStopRemainsUnscoped() {
         val context = RuntimeEnvironment.getApplication()
         for (legacyOnly in listOf(true, false)) {

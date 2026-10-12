@@ -13,8 +13,9 @@ use nelomai_client_storage::{
     StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
-    QuickConnection, QuickReconnect, TunnelCapabilities, TunnelController, TunnelError,
-    TunnelOptions, TunnelPlatform, TunnelStartRequest, TunnelStatus,
+    OwnedRedundantPolicyOutcome, OwnedRedundantPolicyRequest, QuickConnection, QuickReconnect,
+    TunnelCapabilities, TunnelController, TunnelError, TunnelOptions, TunnelPlatform,
+    TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
@@ -668,6 +669,566 @@ async fn force_revision_fetches_immediately_and_offline_cache_never_blocks() {
 #[tokio::test]
 async fn policy_restart_preserves_dns46_connection_metadata() {
     check_policy_restart_metadata(false).await;
+}
+
+#[tokio::test]
+async fn native_owned_pair_policy_does_not_require_legacy_saved_configuration() {
+    for layer in [Layer::Tic, Layer::Stray] {
+        let (fixture, running) = native_owned_policy_fixture(layer).await;
+        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+        changed.revision = 9;
+        changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        changed.exclude_local_networks = false;
+        fixture.api.set_policy(changed.clone());
+        fixture.api.set_revision(9, changed.force_revision);
+        assert_eq!(
+            fixture
+                .core
+                .synchronize_split_tunnel(1_100, true)
+                .await
+                .unwrap(),
+            SplitTunnelSyncOutcome::Updated { reconnected: true }
+        );
+        assert_eq!(fixture.core.state().await.connection, Some(running.clone()));
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(changed.policy_hash)
+        );
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .status,
+            SplitTunnelApplyStatus::Applied
+        );
+        let requests = fixture.tunnel.owned_policy_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].session_id,
+            "22222222-2222-4222-8222-222222222222"
+        );
+        assert_eq!(requests[0].connection.lease_id, running.lease_id);
+        assert_eq!(requests[0].connection.layer, layer);
+        assert_eq!(requests[0].connection.egress_mode, running.egress_mode);
+        assert!(!requests[0].connection.allow_alternate);
+        assert!(!requests[0].options.exclude_local_networks);
+    }
+}
+
+async fn native_owned_policy_fixture(layer: Layer) -> (CoordinatorFixture, Connection) {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let initial = policy(SplitTunnelMode::ExcludeSelected);
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(initial.clone()),
+            previous_working_policy: Some(initial.clone()),
+            working_policy_hash: Some(initial.policy_hash.clone()),
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    let running = Connection {
+        lease_id: "11111111-1111-4111-8111-111111111111".into(),
+        session_id: Some("22222222-2222-4222-8222-222222222222".into()),
+        pool_id: None,
+        layer,
+        transport_protocol: Default::default(),
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: if layer == Layer::Tic {
+            RouteMode::ViaTak
+        } else {
+            RouteMode::Standalone
+        },
+        egress_mode: if layer == Layer::Tic {
+            EgressMode::PreferIpv6
+        } else {
+            EgressMode::Ipv4
+        },
+        probe_url: None,
+        status: LeaseStatus::Connected,
+        pinned: false,
+        stopped_at: None,
+    };
+    fixture.api.set_bootstrap_connection(running.clone());
+    fixture
+        .tunnel
+        .independent_native_owner
+        .store(true, Ordering::SeqCst);
+    *fixture.tunnel.owned_session_scope.lock().unwrap() = running.session_id.clone();
+    *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    fixture.core.bootstrap(1_000).await.unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert!(fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .saved_connection
+        .is_none());
+    (fixture, running)
+}
+
+#[tokio::test]
+async fn native_owned_pair_unchanged_policy_is_confirmed_without_reconnect() {
+    let (fixture, running) = native_owned_policy_fixture(Layer::Tic).await;
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Ok(OwnedRedundantPolicyOutcome::Unchanged));
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_100, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    );
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Applied
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture.tunnel.owned_policy_requests.lock().unwrap().len(),
+        1
+    );
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_owned_pair_policy_does_not_probe_legacy_physical_network() {
+    let (fixture, _) = native_owned_policy_fixture(Layer::Tic).await;
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        fixture.core.synchronize_split_tunnel(1_100, true),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "the native session owns network tracking; policy apply must not wait for a legacy probe"
+    );
+    assert!(result.unwrap().is_ok());
+    assert_eq!(fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .applied_physical_network_fingerprint
+        .is_none());
+}
+
+#[tokio::test]
+async fn native_owned_pair_periodic_network_poll_does_not_enter_legacy_recovery() {
+    for has_session_scope in [true, false] {
+        let (fixture, mut connection) = native_owned_policy_fixture(Layer::Tic).await;
+        if !has_session_scope {
+            connection.session_id = None;
+            fixture.api.set_bootstrap_connection(connection);
+            fixture.core.bootstrap(1_010).await.unwrap();
+        }
+        fixture
+            .tunnel
+            .block_fingerprint
+            .store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.core.poll_physical_network(1_100),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "native-owned sessions have their own network monitor"
+        );
+        assert_eq!(
+            result.unwrap().unwrap(),
+            PhysicalNetworkPollOutcome::Skipped
+        );
+        assert_eq!(fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn native_owned_pair_rollback_keeps_old_policy_without_legacy_restart() {
+    let (fixture, running) = native_owned_policy_fixture(Layer::Tic).await;
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.exclude_local_networks = false;
+    fixture.api.set_policy(changed);
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Ok(OwnedRedundantPolicyOutcome::RolledBack));
+    let result = fixture
+        .core
+        .save_split_tunnel_settings(
+            &SplitTunnelSettingsUpdate {
+                mode: SplitTunnelMode::ExcludeSelected,
+                exclude_local_networks: false,
+                selected_packages: Vec::new(),
+            },
+            1_100,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_apply_failed")
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture.split_store.load().unwrap().working_policy_hash,
+        Some(format!("sha256:{}", "a".repeat(64)))
+    );
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::RolledBack
+    );
+    assert_eq!(
+        fixture.tunnel.owned_policy_requests.lock().unwrap().len(),
+        1
+    );
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_owned_pair_double_failure_does_not_publish_connected() {
+    let (fixture, _) = native_owned_policy_fixture(Layer::Tic).await;
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Ok(OwnedRedundantPolicyOutcome::Failed));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Failed
+    );
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_rollback_failed")
+    );
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_owned_pair_admission_error_preserves_live_transport() {
+    let (fixture, running) = native_owned_policy_fixture(Layer::Tic).await;
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err("native_policy_owner_changed"));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Running
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Failed
+    );
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_apply_failed")
+    );
+}
+
+#[tokio::test]
+async fn native_owned_pair_late_policy_reply_cannot_revive_stop_or_owner_eof() {
+    for owner_eof in [false, true] {
+        let (fixture, _) = native_owned_policy_fixture(Layer::Tic).await;
+        let fixture = Arc::new(fixture);
+        fixture
+            .tunnel
+            .block_owned_policy
+            .store(true, Ordering::SeqCst);
+        let apply = tokio::spawn({
+            let fixture = fixture.clone();
+            async move { fixture.core.synchronize_split_tunnel(1_100, true).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.tunnel.owned_policy_entered.notified(),
+        )
+        .await
+        .unwrap();
+        if owner_eof {
+            fixture.local.stop_local_on_disconnect().await.unwrap();
+        } else {
+            fixture.core.signal_start_cancellation();
+        }
+        let auth_after_cancel = fixture.secret_store.load().unwrap();
+        fixture.tunnel.owned_policy_release.notify_one();
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(CoreError::StartCancelled)
+        ));
+        if owner_eof {
+            assert_eq!(fixture.core.state().await.phase, Phase::Error);
+            assert!(fixture.core.state().await.connection.is_none());
+        } else {
+            fixture.core.stop_locally().await.unwrap();
+            assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+        }
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Stopped
+        );
+        if owner_eof {
+            assert_eq!(fixture.secret_store.load().unwrap(), auth_after_cancel);
+        }
+        assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn native_owned_pair_without_session_scope_never_falls_back_to_legacy() {
+    let (fixture, mut running) = native_owned_policy_fixture(Layer::Tic).await;
+    running.session_id = None;
+    fixture.api.set_bootstrap_connection(running.clone());
+    fixture.core.bootstrap(1_010).await.unwrap();
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_saved_connection_unavailable")
+    );
+    assert!(fixture
+        .tunnel
+        .owned_policy_requests
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_owned_pair_late_policy_reply_preserves_new_session_observation() {
+    let (fixture, mut observed) = native_owned_policy_fixture(Layer::Tic).await;
+    let fixture = Arc::new(fixture);
+    fixture
+        .tunnel
+        .block_owned_policy
+        .store(true, Ordering::SeqCst);
+    let apply = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.synchronize_split_tunnel(1_100, true).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        fixture.tunnel.owned_policy_entered.notified(),
+    )
+    .await
+    .unwrap();
+    observed.session_id = Some("33333333-3333-4333-8333-333333333333".into());
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, observed.clone()).await;
+    fixture.tunnel.owned_policy_release.notify_one();
+    assert!(matches!(
+        apply.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    bootstrap.await.unwrap().unwrap();
+    assert_eq!(fixture.core.state().await.connection, Some(observed));
+    assert_eq!(
+        fixture.tunnel.stops.load(Ordering::SeqCst),
+        0,
+        "a different native session must not be stopped as compensation for this retired policy"
+    );
+    assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_owned_pair_cancelled_reply_preserves_independent_handoff() {
+    for owner_eof in [false, true] {
+        let (fixture, _) = native_owned_policy_fixture(Layer::Tic).await;
+        let fixture = Arc::new(fixture);
+        fixture
+            .tunnel
+            .block_owned_policy
+            .store(true, Ordering::SeqCst);
+        let apply = tokio::spawn({
+            let fixture = fixture.clone();
+            async move { fixture.core.synchronize_split_tunnel(1_100, true).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.tunnel.owned_policy_entered.notified(),
+        )
+        .await
+        .unwrap();
+        if owner_eof {
+            fixture.local.stop_local_on_disconnect().await.unwrap();
+        } else {
+            fixture.local.stop_local_for_transition().await.unwrap();
+        }
+        let stops = fixture.tunnel.stops.load(Ordering::SeqCst);
+        // Another native owner has already started after S1's scoped close.
+        // S1's completed response is still waiting for delivery to its old Core.
+        *fixture.tunnel.owned_session_scope.lock().unwrap() =
+            Some("33333333-3333-4333-8333-333333333333".into());
+        *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        fixture.tunnel.owned_policy_release.notify_one();
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(CoreError::StartCancelled)
+        ));
+        assert_eq!(
+            fixture.tunnel.stops.load(Ordering::SeqCst),
+            stops,
+            "a cancelled owned-policy reply must never issue global Stop against S2"
+        );
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Running
+        );
+        assert_eq!(
+            fixture
+                .tunnel
+                .owned_session_scope
+                .lock()
+                .unwrap()
+                .as_deref(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(
+            fixture.core.state().await.phase,
+            if owner_eof {
+                Phase::Error
+            } else {
+                Phase::Ready
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_owned_pair_retired_terminal_reply_preserves_new_recovery_recipe() {
+    for outcome in [
+        OwnedRedundantPolicyOutcome::RolledBack,
+        OwnedRedundantPolicyOutcome::Failed,
+    ] {
+        let (fixture, mut observed) = native_owned_policy_fixture(Layer::Tic).await;
+        let fixture = Arc::new(fixture);
+        fixture
+            .tunnel
+            .owned_policy_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Ok(outcome));
+        fixture
+            .tunnel
+            .block_owned_policy
+            .store(true, Ordering::SeqCst);
+        let apply = tokio::spawn({
+            let fixture = fixture.clone();
+            async move { fixture.core.synchronize_split_tunnel(1_100, true).await }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.tunnel.owned_policy_entered.notified(),
+        )
+        .await
+        .unwrap();
+        let mut split = fixture.split_store.load().unwrap();
+        split.applied_physical_network_fingerprint = Some("network-a".into());
+        fixture.split_store.save(&split).unwrap();
+        // The independent replacement may be ordinary too. Its available
+        // recipe/baseline is observable through the existing legacy poller.
+        observed.session_id = None;
+        fixture
+            .tunnel
+            .independent_native_owner
+            .store(false, Ordering::SeqCst);
+        *fixture.tunnel.owned_session_scope.lock().unwrap() = None;
+        *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        let bootstrap =
+            bootstrap_observation_while_recovery_pending(&fixture, observed.clone()).await;
+        fixture.tunnel.owned_policy_release.notify_one();
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(CoreError::StartCancelled)
+        ));
+        bootstrap.await.unwrap().unwrap();
+        fixture.tunnel.set_fingerprints(["network-b"]);
+        assert_eq!(
+            fixture.core.poll_physical_network(1_200).await.unwrap(),
+            PhysicalNetworkPollOutcome::ChangePending,
+            "S2's restored available recipe and baseline must survive S1's {outcome:?} reply"
+        );
+        assert_eq!(fixture.core.state().await.connection, Some(observed));
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -5232,6 +5793,12 @@ struct CoordinatorTunnel {
     keep_running_on_stop_failure: AtomicBool,
     preserve_restart_intent: AtomicBool,
     independent_native_owner: AtomicBool,
+    owned_session_scope: Mutex<Option<String>>,
+    owned_policy_requests: Mutex<Vec<OwnedRedundantPolicyRequest>>,
+    owned_policy_outcomes: Mutex<VecDeque<Result<OwnedRedundantPolicyOutcome, &'static str>>>,
+    block_owned_policy: AtomicBool,
+    owned_policy_entered: Notify,
+    owned_policy_release: Notify,
     restart_starts: AtomicUsize,
     block_restart: AtomicBool,
     restart_release: Notify,
@@ -5274,6 +5841,38 @@ impl TunnelController for CoordinatorTunnel {
         Ok(self.independent_native_owner.load(Ordering::SeqCst))
     }
 
+    async fn apply_owned_redundant_policy(
+        &self,
+        request: OwnedRedundantPolicyRequest,
+    ) -> Result<OwnedRedundantPolicyOutcome, TunnelError> {
+        self.owned_policy_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        let outcome = self
+            .owned_policy_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(OwnedRedundantPolicyOutcome::Applied));
+        match outcome {
+            Ok(OwnedRedundantPolicyOutcome::Applied | OwnedRedundantPolicyOutcome::Unchanged) => {
+                self.options.lock().unwrap().push(request.options);
+            }
+            Ok(OwnedRedundantPolicyOutcome::Failed) => {
+                *self.status.lock().unwrap() = TunnelStatus::Stopped;
+            }
+            _ => {}
+        }
+        // Model a completed native operation whose IPC reply is delayed, not a
+        // native implementation that restarts after cancellation without fencing.
+        self.owned_policy_entered.notify_one();
+        if self.block_owned_policy.load(Ordering::SeqCst) {
+            self.owned_policy_release.notified().await;
+        }
+        outcome.map_err(|code| TunnelError::Backend(code.into()))
+    }
+
     async fn start_for_restart(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.restart_starts.fetch_add(1, Ordering::SeqCst);
         if self.block_restart.load(Ordering::SeqCst) {
@@ -5313,6 +5912,7 @@ impl TunnelController for CoordinatorTunnel {
 
     async fn stop(&self) -> Result<(), TunnelError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        self.owned_session_scope.lock().unwrap().take();
         if let Some(events) = self.operation_events.lock().unwrap().clone() {
             events.lock().unwrap().push("local_stop");
         }

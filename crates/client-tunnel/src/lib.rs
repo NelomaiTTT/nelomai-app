@@ -238,6 +238,23 @@ pub struct QuickConnection {
     pub allow_alternate: bool,
 }
 
+/// Non-secret scope for a local policy replacement owned by the native v2 session.
+/// The lease identifies a CURRENT member, not necessarily the active member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedRedundantPolicyRequest {
+    pub session_id: String,
+    pub connection: QuickConnection,
+    pub options: TunnelOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnedRedundantPolicyOutcome {
+    Applied,
+    Unchanged,
+    RolledBack,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QuickReconnect {
     #[default]
@@ -476,6 +493,16 @@ pub trait TunnelController: Send + Sync {
     /// UI bootstrap must not recover it through the legacy single-lease API.
     async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
         Ok(false)
+    }
+    /// Replace only the current native-owned pair's policy. Never issue a new
+    /// lease or pass the pair through the legacy single-tunnel restart path.
+    async fn apply_owned_redundant_policy(
+        &self,
+        _request: OwnedRedundantPolicyRequest,
+    ) -> Result<OwnedRedundantPolicyOutcome, TunnelError> {
+        Err(TunnelError::InvalidOptions {
+            code: "split_tunnel_native_policy_unsupported",
+        })
     }
     async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
         Ok(None)

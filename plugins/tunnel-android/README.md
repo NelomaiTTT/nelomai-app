@@ -30,7 +30,14 @@ library and native Go backend for Nelomai's application ID.
 - Tunnel mutations run on one dedicated executor.
 - The system VPN permission is requested only by an explicit user action.
 - WireGuard or AWG3 configuration is passed from Rust as bytes and wiped
-  immediately after native parsing.
+  immediately after native parsing. Native redundant slots retain a wipeable,
+  process-only copy with numeric endpoints for local shared-TUN policy replacement;
+  it is wiped when the slot is replaced, removed, or stopped.
+- Redundant policy IPC carries only session/member context, options, and cancellation
+  metadata. Replacement keeps the active slot and both current leases, rolls back
+  on native or durable-write failure, and fails closed if rollback fails. The exact
+  recovery CAS updates only options in both durable templates. Stop, IPC owner
+  death, future cancellation, and the command deadline fence replacement work.
 - JavaScript can request permission and read status, but cannot submit tunnel
   configuration or directly start and stop the VPN.
 - Android 13 and newer apply package and compact IPv4 split-tunnel rules

@@ -14,6 +14,17 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct TunnelAndroid<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> TunnelAndroid<R> {
+    pub async fn apply_owned_redundant_policy_async(
+        &self,
+        _request: OwnedRedundantPolicyCommand,
+    ) -> crate::Result<OwnedRedundantPolicyResponse> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "split_tunnel_native_policy_unsupported",
+        )
+        .into())
+    }
+
     pub fn probe(&self) -> crate::Result<ProbeResponse> {
         Ok(ProbeResponse {
             platform: std::env::consts::OS.to_string(),

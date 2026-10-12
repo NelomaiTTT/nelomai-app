@@ -18,6 +18,9 @@ internal interface RedundantConnectionNative {
     fun stop(): Boolean
     fun closeForStop(): Boolean = stop()
     fun isUsable(leaseId: String): Boolean
+    fun replacePolicy(options: AndroidTunnelOptions, shouldCancel: () -> Boolean): Boolean = false
+    fun policiesEquivalent(old: AndroidTunnelOptions, new: AndroidTunnelOptions): Boolean =
+        old.copy(policyHash = null) == new.copy(policyHash = null)
     fun setNetworkAvailable(available: Boolean) = Unit
     fun setProbeSourceIpv4(sourceIpv4: String) = Unit
     fun rebind(leaseId: String): Boolean = false
@@ -233,6 +236,7 @@ internal class RedundantConnectionCoordinator(
 ) : RedundantVpnProcessOwner {
     private val gate = Any()
     @Volatile private var recoveryStarted = false
+    @Volatile private var ownedPolicyFailed = false
     @Volatile private var candidateWarmupLeaseId: String? = null
     @Volatile private var publishedReserveState: RedundantReserveState? = null
     @Volatile private var failoverActive = false
@@ -328,6 +332,72 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun isRunning(): Boolean = recoveryStarted
+    fun policyFailed(): Boolean = ownedPolicyFailed
+
+    fun failOwnedPolicy(): OwnedRedundantPolicyOutcome = synchronized(gate) {
+        ownedPolicyFailed = true
+        recoveryStarted = false
+        totalLossCommandEmitted = true
+        runCatching(native::closeForStop)
+        publishReserveStateLocked(null, emptyList())
+        OwnedRedundantPolicyOutcome.FAILED
+    }
+
+    fun applyOwnedPolicy(
+        scope: OwnedRedundantPolicyScope,
+        options: AndroidTunnelOptions,
+        shouldCancel: () -> Boolean,
+    ): OwnedRedundantPolicyOutcome = synchronized(gate) {
+        val envelope = (store.read() as? RecoveryStoreResult.Success)?.value
+            ?: throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+        val expected = status() ?: throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+        val template = expected.template
+        if (!envelope.intent.desiredActive || envelope.intent.template == null || envelope.leaseTransaction != null ||
+            !expected.desiredActive || expected.stopOperationId != null ||
+            expected.retry != AndroidRedundantRetryState() || expected.candidateLeaseId != null ||
+            standbyWorkPending || candidateWarmupLeaseId != null || pendingPrimaryReadiness != null ||
+            totalLossCommandEmitted || !recoveryStarted || scope.allowAlternate ||
+            scope.sessionId != expected.sessionId || !expected.containsCurrentLease(scope.leaseId) ||
+            scope.layer != template.layer || scope.ticConnectionMode != template.ticConnectionMode ||
+            scope.routeMode != template.routeMode || scope.egressMode != template.egressMode ||
+            listOfNotNull(expected.slotALeaseId, expected.slotBLeaseId).any { !native.isUsable(it) } ||
+            shouldCancel()
+        ) throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+        fun cancelled(): Boolean = shouldCancel() ||
+            !mutationFence.runIfActive(expected.startOperationId) { true } ||
+            (store.read() as? RecoveryStoreResult.Success)?.value != envelope
+        fun replace(policy: AndroidTunnelOptions): Boolean = runCatching {
+            native.replacePolicy(policy, ::cancelled)
+        }.getOrDefault(false)
+        val updated = expected.copy(template = template.copy(options = options))
+        fun persistOptions(): Boolean {
+            if (cancelled()) return false
+            val result = store.updateRedundant(expected.startOperationId, envelope,
+                synchronizeIntentOptions = true) { current ->
+                if (current == expected) updated else current
+            }
+            return result is RecoveryStoreResult.Success && result.value.redundantTransaction == updated
+        }
+        if (native.policiesEquivalent(template.options, options)) {
+            if (!persistOptions()) throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+            return@synchronized OwnedRedundantPolicyOutcome.UNCHANGED
+        }
+        val applied = replace(options)
+        if (cancelled()) {
+            return@synchronized failOwnedPolicy()
+        }
+        if (applied && persistOptions()) {
+            if (shouldCancel()) {
+                return@synchronized failOwnedPolicy()
+            }
+            return@synchronized OwnedRedundantPolicyOutcome.APPLIED
+        }
+        // A durable Stop or any ownership change forbids resurrecting the old TUN.
+        if (!cancelled() && replace(template.options) && !cancelled()) {
+            return@synchronized OwnedRedundantPolicyOutcome.ROLLED_BACK
+        }
+        failOwnedPolicy()
+    }
 
     override fun reserveState(): RedundantReserveState? = publishedReserveState
 

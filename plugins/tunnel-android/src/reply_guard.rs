@@ -18,6 +18,27 @@ pub(crate) async fn await_plugin_reply<F: Future + Send + 'static>(future: F) ->
     .await
 }
 
+pub(crate) async fn await_plugin_reply_with_cancel<F, C>(future: F, cancel: C) -> F::Output
+where
+    F: Future + Send + 'static,
+    C: FnOnce() + Send + 'static,
+{
+    let mut guard = CancelOnDrop(Some(cancel));
+    let reply = await_plugin_reply(future).await;
+    guard.0 = None;
+    reply
+}
+
+struct CancelOnDrop<C: FnOnce()>(Option<C>);
+
+impl<C: FnOnce()> Drop for CancelOnDrop<C> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
+        }
+    }
+}
+
 struct PendingReply<F: Future + Send + 'static>(Option<Pin<Box<F>>>);
 
 impl<F: Future + Send + 'static> Drop for PendingReply<F> {
@@ -35,7 +56,7 @@ impl<F: Future + Send + 'static> Drop for PendingReply<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::await_plugin_reply;
+    use super::{await_plugin_reply, await_plugin_reply_with_cancel};
     use std::{
         future::{poll_fn, Future},
         sync::{
@@ -57,6 +78,47 @@ mod tests {
         let reply = rx.await.unwrap();
         let _ = consumed.send(());
         reply
+    }
+
+    #[test]
+    fn cancelled_policy_signals_native_and_still_drains_its_late_reply() {
+        tauri::async_runtime::block_on(async {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let observed = cancelled.clone();
+            let (tx, rx) = oneshot::channel();
+            let (consumed_tx, consumed_rx) = oneshot::channel();
+            let mut call = Box::pin(await_plugin_reply_with_cancel(
+                pending_reply(rx, consumed_tx),
+                move || {
+                    observed.store(true, Ordering::SeqCst);
+                },
+            ));
+            poll_fn(|cx| {
+                assert!(call.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(call);
+            assert!(cancelled.load(Ordering::SeqCst));
+            tx.send("applied").expect("JNI receiver was dropped");
+            tokio::time::timeout(Duration::from_secs(1), consumed_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn completed_policy_does_not_send_cancellation() {
+        tauri::async_runtime::block_on(async {
+            assert_eq!(
+                await_plugin_reply_with_cancel(async { "unchanged" }, || panic!(
+                    "completed policy cancelled"
+                ))
+                .await,
+                "unchanged"
+            );
+        });
     }
 
     #[test]

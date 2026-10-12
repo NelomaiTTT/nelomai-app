@@ -308,6 +308,37 @@ pub struct QuickConnectionRequest {
     pub allow_alternate: bool,
 }
 
+/// The native owner already has both configurations. Only non-secret scope and
+/// replacement options cross IPC; operation_id is a process-local cancellation key.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnedRedundantPolicyCommand {
+    pub api_version: u16,
+    pub operation_id: String,
+    pub session_id: String,
+    pub connection: QuickConnectionRequest,
+    pub options: TunnelOptions,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OwnedRedundantPolicyResponse {
+    #[serde(deserialize_with = "deserialize_owned_policy_outcome")]
+    pub outcome: nelomai_client_tunnel::OwnedRedundantPolicyOutcome,
+}
+
+fn deserialize_owned_policy_outcome<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<nelomai_client_tunnel::OwnedRedundantPolicyOutcome, D::Error> {
+    use nelomai_client_tunnel::OwnedRedundantPolicyOutcome;
+    match String::deserialize(deserializer)?.as_str() {
+        "applied" => Ok(OwnedRedundantPolicyOutcome::Applied),
+        "unchanged" => Ok(OwnedRedundantPolicyOutcome::Unchanged),
+        "rolled_back" => Ok(OwnedRedundantPolicyOutcome::RolledBack),
+        "failed" => Ok(OwnedRedundantPolicyOutcome::Failed),
+        _ => Err(serde::de::Error::custom("invalid owned policy outcome")),
+    }
+}
+
 impl StartTunnelRequest {
     pub fn new(configuration: &[u8]) -> Self {
         Self {

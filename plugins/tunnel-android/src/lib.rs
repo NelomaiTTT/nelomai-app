@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    QuickReconnect, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
-    TunnelPlatform, TunnelStartRequest, TunnelStatus,
+    OwnedRedundantPolicyOutcome, OwnedRedundantPolicyRequest, QuickReconnect, TunnelCapabilities,
+    TunnelController, TunnelError, TunnelMetrics, TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{EgressMode, Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use tauri::{
@@ -99,6 +99,53 @@ pub fn connection_intent_tunnel_options(
     plugin_options
 }
 
+fn owned_redundant_policy_request(
+    request: OwnedRedundantPolicyRequest,
+) -> std::result::Result<OwnedRedundantPolicyCommand, TunnelError> {
+    request
+        .options
+        .validate()
+        .map_err(|error| TunnelError::InvalidOptions {
+            code: error.stable_code(),
+        })?;
+    if request.connection.allow_alternate || request.session_id.is_empty() {
+        return Err(TunnelError::InvalidOptions {
+            code: "redundant_policy_preflight_rejected",
+        });
+    }
+    let connection = request.connection;
+    Ok(OwnedRedundantPolicyCommand {
+        api_version: TUNNEL_API_VERSION,
+        operation_id: String::new(),
+        session_id: request.session_id,
+        connection: QuickConnectionRequest {
+            lease_id: connection.lease_id,
+            layer: match connection.layer {
+                Layer::Tic => "tic",
+                Layer::Stray => "stray",
+            }
+            .into(),
+            tic_connection_mode: match connection.tic_connection_mode {
+                TicConnectionMode::Personal => "personal",
+                TicConnectionMode::Dynamic => "dynamic",
+            }
+            .into(),
+            route_mode: match connection.route_mode {
+                RouteMode::Standalone => "standalone",
+                RouteMode::ViaTak => "via_tak",
+            }
+            .into(),
+            egress_mode: match connection.egress_mode {
+                EgressMode::Ipv4 => "ipv4",
+                EgressMode::PreferIpv6 => "prefer_ipv6",
+            }
+            .into(),
+            allow_alternate: false,
+        },
+        options: connection_intent_tunnel_options(request.options),
+    })
+}
+
 impl<R: Runtime> AndroidTunnelController<R> {
     fn start_request(
         &self,
@@ -186,6 +233,19 @@ impl<R: Runtime> AndroidTunnelController<R> {
 
 #[async_trait]
 impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
+    async fn apply_owned_redundant_policy(
+        &self,
+        request: OwnedRedundantPolicyRequest,
+    ) -> std::result::Result<OwnedRedundantPolicyOutcome, TunnelError> {
+        let response = self
+            .app
+            .tunnel_android()
+            .apply_owned_redundant_policy_async(owned_redundant_policy_request(request)?)
+            .await
+            .map_err(to_tunnel_error)?;
+        Ok(response.outcome)
+    }
+
     async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {
         self.start_request(request, false)
     }
@@ -305,4 +365,61 @@ fn require_state(
 
 fn to_tunnel_error(error: Error) -> TunnelError {
     TunnelError::Backend(error.to_string())
+}
+
+#[cfg(test)]
+mod owned_policy_tests {
+    use super::*;
+    use nelomai_client_tunnel::{
+        OwnedRedundantPolicyRequest, QuickConnection, TunnelOptions as CoreOptions,
+    };
+
+    fn request() -> OwnedRedundantPolicyRequest {
+        OwnedRedundantPolicyRequest {
+            session_id: "session".into(),
+            connection: QuickConnection {
+                lease_id: "lease-b".into(),
+                layer: Layer::Stray,
+                tic_connection_mode: TicConnectionMode::Dynamic,
+                route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::PreferIpv6,
+                allow_alternate: false,
+            },
+            options: CoreOptions::default(),
+        }
+    }
+
+    #[test]
+    fn owned_policy_wire_is_only_scope_and_options() {
+        let wire = owned_redundant_policy_request(request()).unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["sessionId"], "session");
+        assert_eq!(json["connection"]["leaseId"], "lease-b");
+        assert_eq!(json["connection"]["allowAlternate"], false);
+        assert_eq!(json["connection"]["egressMode"], "prefer_ipv6");
+        assert_eq!(json.as_object().unwrap().len(), 5);
+        assert!(json.get("configuration").is_none());
+        assert!(json.get("credentials").is_none());
+    }
+
+    #[test]
+    fn alternate_lease_policy_is_rejected_before_dispatch() {
+        let mut request = request();
+        request.connection.allow_alternate = true;
+        assert!(owned_redundant_policy_request(request).is_err());
+    }
+
+    #[test]
+    fn unchanged_policy_reply_is_distinct_from_physical_replacement() {
+        let response: OwnedRedundantPolicyResponse =
+            serde_json::from_str("{\"outcome\":\"unchanged\"}").unwrap();
+        assert_eq!(
+            response.outcome,
+            nelomai_client_tunnel::OwnedRedundantPolicyOutcome::Unchanged
+        );
+        assert!(
+            serde_json::from_str::<OwnedRedundantPolicyResponse>("{\"outcome\":\"running\"}")
+                .is_err()
+        );
+    }
 }

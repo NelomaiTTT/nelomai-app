@@ -7,7 +7,8 @@ use nelomai_client_storage::{
     RuntimeStateStore, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, QuickConnection, TunnelCapabilities, TunnelOptions, TunnelPlatform,
+    DesktopTunnelOptions, OwnedRedundantPolicyOutcome, OwnedRedundantPolicyRequest,
+    QuickConnection, TunnelCapabilities, TunnelOptions, TunnelPlatform,
 };
 use nelomai_contracts::{
     Connection, Layer, RouteMode, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
@@ -748,6 +749,7 @@ enum ConnectedPolicyApplyOutcome {
     Applied,
     RolledBack,
     StopFailed,
+    ApplyFailed,
     Failed,
 }
 
@@ -762,6 +764,7 @@ impl ConnectedPolicyApplyOutcome {
             Self::ConfigurationUnavailable => Some("split_tunnel_saved_connection_unavailable"),
             Self::RolledBack => Some("split_tunnel_apply_failed"),
             Self::StopFailed => Some("split_tunnel_stop_failed"),
+            Self::ApplyFailed => Some("split_tunnel_apply_failed"),
             Self::Failed => Some("split_tunnel_rollback_failed"),
         }
     }
@@ -851,6 +854,11 @@ where
             self.physical_network_change.lock().await.reset();
             return Ok(PhysicalNetworkPollOutcome::Skipped);
         };
+        // The native v2 owner monitors and rebinds its entire pair. Its policy
+        // recipe must never enter legacy single-member network recovery.
+        if connection.session_id.is_some() || self.tunnel.owns_redundant_session().await? {
+            return Ok(PhysicalNetworkPollOutcome::Skipped);
+        }
         let options = {
             let running = self.split_tunnel_options.lock().await;
             running
@@ -2012,6 +2020,8 @@ where
             }
             Err(error) => return Err(error),
         };
+        let native_owned =
+            connection.session_id.is_some() || self.tunnel.owns_redundant_session().await?;
         let previous = self.split_tunnel_options.lock().await.clone();
         let mut previous_options = if previous.is_available_for(&connection.lease_id, cancel_epoch)
         {
@@ -2021,7 +2031,7 @@ where
         };
         // Owned default options are a real plan too. Only unavailable plans
         // may be reconstructed from persistent working-policy state.
-        if !previous.is_available_for(&connection.lease_id, cancel_epoch) {
+        if !native_owned && !previous.is_available_for(&connection.lease_id, cancel_epoch) {
             if let Some(working_policy) = working_policy(state).cloned() {
                 previous_options = match self
                     .effective_tunnel_options_with_state(
@@ -2064,12 +2074,13 @@ where
                 && current_state
                     .connection
                     .as_ref()
-                    .is_some_and(|current| current.lease_id == connection.lease_id)
+                    .is_some_and(|current| same_local_recovery_execution(current, &connection))
         };
         if !connection_is_still_current {
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         }
-        if new_options.has_same_effective_routes(&previous_options)
+        if !native_owned
+            && new_options.has_same_effective_routes(&previous_options)
             && (previous.is_confirmed_for(&connection.lease_id, cancel_epoch)
                 || inactive_android_split)
         {
@@ -2109,7 +2120,10 @@ where
         // A Windows connection started without policy is deliberately local-only.
         // Cache the downloaded policy, but don't recreate a working VPN behind
         // the user's back. The next explicit Start consumes the cache normally.
-        if previous_options.policy_hash.is_none() && previous_options.exclude_local_networks {
+        if !native_owned
+            && previous_options.policy_hash.is_none()
+            && previous_options.exclude_local_networks
+        {
             // Policy application is still pending even when runtime health is
             // good. Ordinary status polling must not dismiss this warning.
             self.set_split_tunnel_warning(
@@ -2118,6 +2132,154 @@ where
             )
             .await;
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+        }
+        if native_owned {
+            let Some(session_id) = connection.session_id.clone() else {
+                // An independently owned pair without an exact Core session scope
+                // must never fall through to a legacy single-member restart.
+                mark_policy_failure(state, policy, now_unix);
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_saved_connection_unavailable",
+                )
+                .await;
+                self.report_policy_apply_outcome(
+                    policy,
+                    state,
+                    access_token,
+                    now_unix,
+                    SplitTunnelApplyStatus::Failed,
+                    Some("split_tunnel_saved_connection_unavailable".into()),
+                )
+                .await?;
+                return Ok(ConnectedPolicyApplyOutcome::ConfigurationUnavailable);
+            };
+            self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+                .await?;
+            let result = self
+                .tunnel
+                .apply_owned_redundant_policy(OwnedRedundantPolicyRequest {
+                    session_id,
+                    connection: local_restart_connection(&connection),
+                    options: new_options.clone(),
+                })
+                .await;
+            // Native fences this operation to the captured pair. A late reply
+            // must not use legacy/global Stop compensation against a newer owner.
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            let (outcome, status) = match result {
+                Ok(
+                    native_outcome @ (OwnedRedundantPolicyOutcome::Applied
+                    | OwnedRedundantPolicyOutcome::Unchanged),
+                ) => {
+                    self.publish_owned_policy_state(
+                        cancel_epoch,
+                        &connection,
+                        Phase::Connected,
+                        Some(RunningSplitTunnelOptions::confirmed(
+                            new_options.clone(),
+                            &connection.lease_id,
+                            cancel_epoch,
+                        )),
+                    )
+                    .await?;
+                    // Native owns the pair's network tracking and current TUN.
+                    // Do not add a legacy network RPC after its apply reply.
+                    state.applied_physical_network_fingerprint = None;
+                    state.domain_resolutions = proposed_state.domain_resolutions;
+                    state.working_policy_hash = Some(policy.policy_hash.clone());
+                    clear_policy_failure(state);
+                    self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                        .await;
+                    self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+                        .await;
+                    (
+                        if native_outcome == OwnedRedundantPolicyOutcome::Applied {
+                            ConnectedPolicyApplyOutcome::Applied
+                        } else {
+                            ConnectedPolicyApplyOutcome::AppliedWithoutReconnect
+                        },
+                        SplitTunnelApplyStatus::Applied,
+                    )
+                }
+                Ok(OwnedRedundantPolicyOutcome::RolledBack) => {
+                    // Native rolls back its actual recipe, which may predate Core
+                    // bootstrap. Do not attest reconstructed cached options as live.
+                    self.publish_owned_policy_state(
+                        cancel_epoch,
+                        &connection,
+                        Phase::Connected,
+                        Some(RunningSplitTunnelOptions::default()),
+                    )
+                    .await?;
+                    state.domain_resolutions = previous_state.domain_resolutions;
+                    mark_policy_failure(state, policy, now_unix);
+                    (
+                        ConnectedPolicyApplyOutcome::RolledBack,
+                        SplitTunnelApplyStatus::RolledBack,
+                    )
+                }
+                Ok(OwnedRedundantPolicyOutcome::Failed) => {
+                    self.publish_owned_policy_state(
+                        cancel_epoch,
+                        &connection,
+                        Phase::Stopping,
+                        Some(RunningSplitTunnelOptions::default()),
+                    )
+                    .await?;
+                    state.applied_physical_network_fingerprint = None;
+                    mark_policy_failure(state, policy, now_unix);
+                    (
+                        ConnectedPolicyApplyOutcome::Failed,
+                        SplitTunnelApplyStatus::Failed,
+                    )
+                }
+                Err(_) => {
+                    // Admission/preparation can fail before any native replacement.
+                    // Inspect the real transport instead of treating an intact pair
+                    // as a failed rollback or issuing an ordinary Stop/Start.
+                    let phase = if matches!(
+                        self.tunnel.status().await,
+                        Ok(nelomai_client_tunnel::TunnelStatus::Running)
+                    ) {
+                        Phase::Connected
+                    } else {
+                        Phase::Stopping
+                    };
+                    self.publish_owned_policy_state(cancel_epoch, &connection, phase, None)
+                        .await?;
+                    mark_policy_failure(state, policy, now_unix);
+                    (
+                        ConnectedPolicyApplyOutcome::ApplyFailed,
+                        SplitTunnelApplyStatus::Failed,
+                    )
+                }
+            };
+            if let Some(code) = outcome.error_code() {
+                self.set_split_tunnel_warning(SplitTunnelWarningKind::Operation, code)
+                    .await;
+                self.logger.record(crate::CoreLogEvent {
+                    kind: "split_tunnel.apply_failed",
+                    operation_id: None,
+                    request_id: None,
+                    code: Some(code.into()),
+                });
+            }
+            self.report_policy_apply_outcome(
+                policy,
+                state,
+                access_token,
+                now_unix,
+                status,
+                outcome.error_code().map(str::to_owned),
+            )
+            .await?;
+            return Ok(outcome);
+        }
+        // An independent native owner may have appeared during policy/DNS I/O.
+        // The legacy backend must not replace it even with a matching old lease.
+        if self.tunnel.owns_redundant_session().await? {
+            return Err(CoreError::StartCancelled);
         }
         let Some(configuration) = configuration else {
             const ERROR_CODE: &str = "split_tunnel_saved_connection_unavailable";
@@ -2291,6 +2453,49 @@ where
                 )
             }
         };
+        self.report_policy_apply_outcome(policy, state, access_token, now_unix, status, error_code)
+            .await?;
+        Ok(outcome)
+    }
+
+    async fn publish_owned_policy_state(
+        &self,
+        cancel_epoch: crate::StartCancellationEpoch,
+        connection: &Connection,
+        phase: Phase,
+        options: Option<RunningSplitTunnelOptions>,
+    ) -> Result<(), CoreError> {
+        let mut current = self.state.lock().await;
+        let mut running = self.split_tunnel_options.lock().await;
+        let mut detector = self.physical_network_change.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        if !matches!(current.phase, Phase::Connected | Phase::Connecting)
+            || !current
+                .connection
+                .as_ref()
+                .is_some_and(|observed| same_local_recovery_execution(observed, connection))
+        {
+            return Err(CoreError::StartCancelled);
+        }
+        // Validate every fence under the same locks before retiring/confirming
+        // a recipe or resetting its detector. Rejected replies leave S2 intact.
+        if let Some(options) = options {
+            *running = options;
+            detector.reset();
+        }
+        current.phase = phase;
+        Ok(())
+    }
+
+    async fn report_policy_apply_outcome(
+        &self,
+        policy: &SplitTunnelPolicy,
+        state: &mut StoredSplitTunnelState,
+        access_token: &mut AccessSnapshot,
+        now_unix: i64,
+        status: SplitTunnelApplyStatus,
+        error_code: Option<String>,
+    ) -> Result<(), CoreError> {
         let result = SplitTunnelApplyResult {
             format_version: policy.format_version,
             revision: policy.revision,
@@ -2313,7 +2518,7 @@ where
         }
         self.report_or_queue_apply_result(access_token, state, result)
             .await;
-        Ok(outcome)
+        Ok(())
     }
 
     async fn request_split_tunnel_revision(

@@ -1,6 +1,7 @@
 package ru.nelomai.tunnel
 
 import org.amnezia.awg.config.Config
+import android.os.ParcelFileDescriptor
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -138,6 +139,7 @@ private fun canonicalRedundantDnsName(value: String): Boolean =
 internal data class PreparedRedundantConfiguration(
     val config: Config,
     val userspace: ByteArray,
+    val baseConfiguration: ByteArray? = null,
 )
 
 /** Fixed-slot adapter over the sole dispatcher/native session. */
@@ -151,12 +153,16 @@ internal class ServiceRedundantConnectionNative(
     private val elapsedNowMs: () -> Long = {
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime())
     },
+    private val preparePolicy: ((ByteArray, AndroidTunnelOptions) -> PreparedRedundantConfiguration)? = null,
+    private val equivalentPolicy: ((AndroidTunnelOptions, AndroidTunnelOptions) -> Boolean)? = null,
+    private val closeTunFd: (Int) -> Unit = { ParcelFileDescriptor.adoptFd(it).close() },
 ) : RedundantConnectionNative {
     private data class SlotRuntime(
         val leaseId: String,
         val slot: RedundantSlot,
         val probe: BackgroundRedundantHealthProbe?,
         val probeTarget: String?,
+        val configuration: ByteArray,
         var startedAtElapsedMs: Long,
         var probeToken: Long? = null,
         var probeDeadlineElapsedMs: Long? = null,
@@ -189,7 +195,7 @@ internal class ServiceRedundantConnectionNative(
 
     private val gate = Any()
     private var session: NativeSession? = null
-    private var closedForStop = false
+    @Volatile private var closedForStop = false
     private val slots = mutableMapOf<RedundantSlot, SlotRuntime>()
     private var activeSlot: RedundantSlot? = null
     private var networkAvailable = initialNetworkAvailable
@@ -223,9 +229,11 @@ internal class ServiceRedundantConnectionNative(
             configuration.fill(0)
             return@synchronized true
         }
+        val retained = configuration.copyOf()
         val prepared = try {
             prepare(configuration)
         } catch (_: Throwable) {
+            retained.fill(0)
             configuration.fill(0)
             return@synchronized false
         }
@@ -239,6 +247,7 @@ internal class ServiceRedundantConnectionNative(
             existing?.let {
                 recordTransportLocked("before_slot_replace")
                 if (!backend.stopSlot(nativeSession, slot.index)) return@synchronized false
+                existing.configuration.fill(0)
                 slots.remove(slot)
             }
             if (hadSession && !backend.startSlot(nativeSession, slot.index, prepared.userspace)) {
@@ -251,6 +260,7 @@ internal class ServiceRedundantConnectionNative(
                 slot,
                 healthProbe,
                 probeTarget,
+                (prepared.baseConfiguration ?: retained).copyOf(),
                 elapsedNowMs(),
             )
             transportDiagnostics.begin(elapsedNowMs())
@@ -259,6 +269,8 @@ internal class ServiceRedundantConnectionNative(
         } finally {
             configuration.fill(0)
             prepared.userspace.fill(0)
+            prepared.baseConfiguration?.fill(0)
+            retained.fill(0)
         }
     }
 
@@ -283,14 +295,20 @@ internal class ServiceRedundantConnectionNative(
             ?: return@synchronized true
         recordTransportLocked("before_slot_stop")
         backend.stopSlot(nativeSession, runtime.slot.index).also { stopped ->
-            if (stopped) slots.remove(runtime.slot)
+            if (stopped) {
+                runtime.configuration.fill(0)
+                slots.remove(runtime.slot)
+            }
         }
     }
 
     override fun stop(): Boolean = synchronized(gate) {
-        val nativeSession = session ?: return@synchronized true
-        recordTransportLocked("before_stop")
-        backend.close(nativeSession)
+        val nativeSession = session
+        if (nativeSession != null) {
+            recordTransportLocked("before_stop")
+            backend.close(nativeSession)
+        }
+        slots.values.forEach { it.configuration.fill(0) }
         slots.clear()
         session = null
         activeSlot = null
@@ -298,13 +316,76 @@ internal class ServiceRedundantConnectionNative(
         true
     }
 
-    override fun closeForStop(): Boolean = synchronized(gate) {
+    override fun replacePolicy(
+        options: AndroidTunnelOptions,
+        shouldCancel: () -> Boolean,
+    ): Boolean = synchronized(gate) {
+        val policyPrepare = preparePolicy ?: return@synchronized false
+        val active = activeSlot ?: return@synchronized false
+        if (closedForStop || shouldCancel() || slots[active] == null) {
+            return@synchronized false
+        }
+        // These copies live only during replacement and permit a coordinator rollback
+        // even if admission fails after the old shared TUN has closed.
+        val members = slots.values.sortedBy { if (it.slot == active) 0 else 1 }
+        val prepared = mutableListOf<Pair<SlotRuntime, PreparedRedundantConfiguration>>()
+        try {
+            for (member in members) {
+                if (closedForStop || shouldCancel()) return@synchronized false
+                val bytes = member.configuration.copyOf()
+                try { prepared += member to policyPrepare(bytes, options) }
+                finally { bytes.fill(0) }
+            }
+            if (closedForStop || shouldCancel()) return@synchronized false
+            session?.let(backend::close)
+            session = null
+            members.forEach { cancelProbeLocked(it) }
+            clearStandbyCheckLocked()
+            if (closedForStop || shouldCancel()) return@synchronized false
+            val fd = establishTun(prepared.first().second.config) ?: return@synchronized false
+            if (closedForStop || shouldCancel()) {
+                runCatching { closeTunFd(fd) }
+                return@synchronized false
+            }
+            val newSession = backend.start(fd, active.index, prepared.first().second.userspace)
+                ?: return@synchronized false
+            session = newSession
+            for ((member, config) in prepared.drop(1)) {
+                if (closedForStop || shouldCancel() ||
+                    !backend.startSlot(newSession, member.slot.index, config.userspace)
+                ) return@synchronized false
+            }
+            if (closedForStop || shouldCancel() || !backend.switchActive(newSession, active.index)) {
+                return@synchronized false
+            }
+            members.forEach { member ->
+                slots[member.slot] = SlotRuntime(member.leaseId, member.slot, member.probe,
+                    member.probeTarget, member.configuration.copyOf(), elapsedNowMs())
+                member.configuration.fill(0)
+            }
+            transportDiagnostics.begin(elapsedNowMs())
+            true
+        } catch (_: Throwable) {
+            false
+        } finally {
+            prepared.forEach { (_, config) ->
+                config.userspace.fill(0)
+                config.baseConfiguration?.fill(0)
+            }
+            if (closedForStop || shouldCancel()) closeForStop()
+        }
+    }
+
+    override fun policiesEquivalent(old: AndroidTunnelOptions, new: AndroidTunnelOptions): Boolean =
+        equivalentPolicy?.invoke(old, new) ?: super.policiesEquivalent(old, new)
+
+    override fun closeForStop(): Boolean {
         closedForStop = true
-        stop()
+        return synchronized(gate) { stop() }
     }
 
     override fun isUsable(leaseId: String): Boolean = synchronized(gate) {
-        slots.values.any { it.leaseId == leaseId }
+        session != null && slots.values.any { it.leaseId == leaseId }
     }
 
     override fun setNetworkAvailable(available: Boolean) = synchronized(gate) {

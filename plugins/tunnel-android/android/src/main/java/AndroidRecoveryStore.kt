@@ -846,11 +846,16 @@ internal class AndroidRecoveryStore(
     /** Persists only recovery-v2 control state; callers must never pass configuration bytes. */
     fun updateRedundant(
         expectedStartOperationId: String? = null,
+        expectedEnvelope: AndroidRecoveryEnvelope? = null,
+        synchronizeIntentOptions: Boolean = false,
         update: (AndroidRedundantTransaction) -> AndroidRedundantTransaction,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
+        if (expectedEnvelope != null && current != expectedEnvelope) {
+            return@synchronized RecoveryStoreResult.Failure("redundant_recovery_generation_conflict")
+        }
         val transaction = current.redundantTransaction
             ?: return@synchronized RecoveryStoreResult.Failure("redundant_recovery_not_found")
         if (expectedStartOperationId != null &&
@@ -861,7 +866,13 @@ internal class AndroidRecoveryStore(
             )
         }
         try {
-            persist(current.copy(redundantTransaction = update(transaction)))
+            val updated = update(transaction)
+            persist(current.copy(
+                redundantTransaction = updated,
+                intent = if (synchronizeIntentOptions) current.intent.copy(
+                    template = current.intent.template?.copy(options = updated.template.options),
+                ) else current.intent,
+            ))
         } catch (_: Throwable) {
             RecoveryStoreResult.Failure("redundant_recovery_invalid")
         }

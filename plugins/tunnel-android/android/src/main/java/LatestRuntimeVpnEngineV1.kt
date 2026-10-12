@@ -21,6 +21,7 @@ internal fun requiresVpnStartAdmission(context: android.content.Context, intent:
     when (intent?.action) {
         NelomaiVpnService.ACTION_QUICK_TOGGLE -> !QuickTunnelController.desiredActive(context)
         NelomaiVpnService.ACTION_CANCEL_CLIENT_START, NelomaiVpnService.ACTION_CLIENT_STOP,
+        NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY,
         NelomaiVpnService.ACTION_CLIENT_STATUS, NelomaiVpnService.ACTION_CLIENT_METRICS,
         NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT, NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT,
         NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS, NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT,
