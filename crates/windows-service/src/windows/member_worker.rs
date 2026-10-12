@@ -594,11 +594,12 @@ pub(crate) struct Control {
     files: Rc<RefCell<NativeSessionFiles>>,
     session: Rc<RefCell<Option<WindowsSessionStore<NativeSessionFiles>>>>,
     parameters: [Option<MemberParameters>; 2],
+    physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
     options: Option<DesktopTunnelOptions>,
 }
 struct WorkerIdentity {
     original: Rc<Original>,
-    physical: Vec<crate::member_physical::PhysicalRoute>,
+    physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
 }
 impl crate::member_routes::IdentityCheck for WorkerIdentity {
     fn verify(&mut self, index: u32) -> io::Result<crate::member_routes::NativeProof> {
@@ -611,11 +612,13 @@ impl crate::member_routes::IdentityCheck for WorkerIdentity {
         }
         let path = self
             .physical
+            .borrow()
             .iter()
             .find(|p| p.proof.identity.index == index)
+            .cloned()
             .ok_or_else(failed)?;
         super::member_physical::verify(
-            path,
+            &path,
             &self
                 .original
                 .interface
@@ -724,6 +727,7 @@ pub(crate) fn prepare(
             files: files.clone(),
             session: session.clone(),
             parameters: [None, None],
+            physical: Rc::new(RefCell::new(Vec::new())),
             options: None,
         },
         Store {
@@ -773,19 +777,16 @@ impl Control {
                 ),
         )
     }
-    fn attach_device(&mut self, member: &Member, params: MemberParameters) -> io::Result<()> {
+    fn attach_device(
+        &mut self,
+        member: &Member,
+        params: MemberParameters,
+        path: &crate::member_physical::PhysicalRoute,
+    ) -> io::Result<()> {
         let uapi = uapi(member.configuration.expose())?;
         let p = self.original.interface.get().ok_or_else(failed)?;
-        let path = super::member_physical::capture(&[crate::member_physical::InterfaceIdentity {
-            index: p.index,
-            luid: p.luid,
-            guid: p.guid,
-        }])?
-        .resolve_host(params.endpoint)
-        .map_err(|_| failed())?
-        .path;
         super::member_physical::verify(
-            &path,
+            path,
             &[crate::member_physical::InterfaceIdentity {
                 index: p.index,
                 luid: p.luid,
@@ -795,6 +796,14 @@ impl Control {
         self.authorize()?;
         self.call(json!({"op":"attach","slot":slot_index(member.slot),"configuration":uapi.as_str(),"physical":identity_value(InterfaceProof {index:path.proof.identity.index,luid:path.proof.identity.luid,guid:path.proof.identity.guid})}), Duration::from_secs(10))?;
         self.authorize()?;
+        super::member_physical::verify(
+            path,
+            &[crate::member_physical::InterfaceIdentity {
+                index: p.index,
+                luid: p.luid,
+                guid: p.guid,
+            }],
+        )?;
         self.members[slot_index(member.slot)] = Some((
             IpAddr::V4(params.source),
             IpAddr::V4(member.probe.target_ipv4),
@@ -1205,12 +1214,25 @@ impl PairControl for Control {
             self.set_dns(&params.dns)?;
         }
         let (values, physical) = self.route_values(&params, options)?;
+        let binding =
+            super::member_physical::capture(&[crate::member_physical::InterfaceIdentity {
+                index: p.index,
+                luid: p.luid,
+                guid: p.guid,
+            }])?
+            .resolve_host(params.endpoint)
+            .map_err(|_| failed())?
+            .path;
+        if physical.len() > crate::member_plan::MAX_ROUTES || !physical.contains(&binding) {
+            return Err(failed());
+        }
+        *self.physical.borrow_mut() = physical;
         self.routes = Some(NetworkOwner::fresh(
             crate::member_routes::MemberRoutes::new(
                 super::member_routes::NativeRowIo,
                 WorkerIdentity {
                     original: self.original.clone(),
-                    physical,
+                    physical: self.physical.clone(),
                 },
             ),
             RouteJournal(self.journal.clone()),
@@ -1222,7 +1244,7 @@ impl PairControl for Control {
         let mut admitted = deny;
         admitted.admitted = true;
         self.guard_transition(admitted, false)?;
-        self.attach_device(member, params)?;
+        self.attach_device(member, params, &binding)?;
         self.call(
             json!({"op":"switch","slot":slot_index(member.slot)}),
             Duration::from_secs(1),
@@ -1239,8 +1261,93 @@ impl PairControl for Control {
         self.fenced = false;
         Ok(())
     }
-    fn attach(&mut self, _: &SessionScope, _: &Member) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
+    fn attach(&mut self, scope: &SessionScope, member: &Member) -> io::Result<()> {
+        if scope != &self.scope
+            || !self.ready
+            || self.fenced
+            || self.stopped
+            || self.members[slot_index(member.slot)].is_some()
+        {
+            return Err(failed());
+        }
+        member.validate()?;
+        let params = MemberParameters::parse(member.configuration.expose())?;
+        let primary = self.parameters[slot_index(member.slot.other())]
+            .as_ref()
+            .ok_or_else(failed)?;
+        // One immutable OS dataplane: B changes only its crypto peer/endpoint.
+        if params.source != primary.source
+            || params.dns != primary.dns
+            || ipnet::IpNet::aggregate(&params.allowed) != ipnet::IpNet::aggregate(&primary.allowed)
+        {
+            return Err(failed());
+        }
+        let _validated = uapi(member.configuration.expose())?;
+        self.check_integrity()?;
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        let owned = [crate::member_physical::InterfaceIdentity {
+            index: p.index,
+            luid: p.luid,
+            guid: p.guid,
+        }];
+        let path = super::member_physical::capture(&owned)?
+            .resolve_host(params.endpoint)
+            .map_err(|_| failed())?
+            .path;
+        super::member_physical::verify(&path, &owned)?;
+        let (mut values, active) = {
+            let journal = self.journal.borrow();
+            let network = journal.current.network.read_view()?;
+            if network.pending().is_some() || network.stopping() {
+                return Err(failed());
+            }
+            (
+                network.current().cloned().collect::<Vec<_>>(),
+                network.recorded_active().ok_or_else(failed)?,
+            )
+        };
+        let desired = NetworkValue::Route(RouteValue {
+            destination: ipnet::IpNet::from(params.endpoint),
+            scope: RouteScope::WindowsInterface(path.proof.identity.index),
+            interface: path.proof.identity.index,
+            gateway: path.row.route.gateway,
+            metric: path.row.route.metric,
+        });
+        // Preserve A and all common routes. An existing exact physical row is
+        // evidence only; do not adopt it into our deletable owned set.
+        if desired != NetworkValue::Route(path.row.route.clone()) && !values.contains(&desired) {
+            if values.iter().any(|old| old.key() == desired.key()) {
+                return Err(failed());
+            }
+            values.push(desired);
+        }
+        {
+            let mut physical = self.physical.borrow_mut();
+            if physical.iter().any(|old| {
+                old.proof.identity.index == path.proof.identity.index
+                    && old.proof.identity != path.proof.identity
+            }) {
+                return Err(failed());
+            }
+            if !physical.contains(&path) {
+                if physical.len() >= crate::member_plan::MAX_ROUTES {
+                    return Err(failed());
+                }
+                physical.push(path.clone());
+            }
+        }
+        // Retain every new proof before effects, including ambiguous ACKs; an
+        // error is cleanup-only and the caller closes this SAME original pair.
+        self.fenced = true;
+        super::member_physical::verify(&path, &owned)?;
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .select(active, values)?;
+        self.attach_device(member, params, &path)?;
+        self.check_integrity()?;
+        self.fenced = false;
+        Ok(())
     }
     fn remove_standby(&mut self, _: &SessionScope, _: Slot) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
@@ -1274,7 +1381,11 @@ impl NativePair for Control {
         Err(io::ErrorKind::Unsupported.into())
     }
     fn select_active(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
-        if scope != &self.scope || !self.ready || self.members[slot_index(slot)].is_none() {
+        if scope != &self.scope
+            || !self.ready
+            || self.fenced
+            || self.members[slot_index(slot)].is_none()
+        {
             return Err(failed());
         }
         self.check_integrity()?;

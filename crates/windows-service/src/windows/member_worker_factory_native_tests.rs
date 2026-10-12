@@ -70,6 +70,25 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let primary = Member { slot: Slot::A, lease_id: format!("22222222-2222-4222-8222-{:012x}", round + 1),
             configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 198.51.100.0/24\nEndpoint = 192.0.2.11:51820\nPersistentKeepalive = 25\n".into()),
             probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "198.51.100.53".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
+        let standby = Member {
+            slot: Slot::B,
+            lease_id: format!("33333333-3333-4333-8333-{:012x}", round + 1),
+            configuration: TunnelConfiguration::new(
+                primary
+                    .configuration
+                    .expose()
+                    .replace(
+                        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                        "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+                    )
+                    .replace(
+                        "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                        "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
+                    )
+                    .replace("192.0.2.11:51820", "192.0.2.12:51821"),
+            ),
+            probe: primary.probe.clone(),
+        };
         let started = actor.redundant(Command::Start {
             scope: scope.clone(),
             primary,
@@ -78,16 +97,44 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             warm_stop_v1: true,
             options: DesktopTunnelOptions::default(),
         });
+        // Extend the same actual actor route; no direct private Native calls.
+        // These configured real Go devices need not be Healthy or handshaken.
+        let attached = if round == 0 {
+            Some(
+                started
+                    .as_ref()
+                    .map_err(|_| "Start A failed")
+                    .and_then(|state| {
+                        actor
+                            .redundant(Command::Attach {
+                                scope: scope.clone(),
+                                member: standby,
+                                expected_revision: state.session.local_revision,
+                                expected_network_epoch: state.session.network_epoch,
+                                expected_membership_generation: state.session.membership_generation,
+                                membership_generation: state.session.membership_generation + 1,
+                            })
+                            .map_err(|_| "actual worker factory Attach B failed")
+                    }),
+            )
+        } else {
+            None
+        };
         let during = super::member_carrier_provider::native::table().unwrap();
-        let identity = super::member_carrier_factory_test_os::state().and_then(|directory| {
+        let retained = super::member_carrier_factory_test_os::state().and_then(|directory| {
             let value: serde_json::Value = serde_json::from_slice(
                 &std::fs::read(directory.join("nelomai-redundant-worker.json")).ok()?,
             )
             .ok()?;
-            serde_json::from_value::<crate::member_owner::InterfaceProof>(
+            let identity = serde_json::from_value::<crate::member_owner::InterfaceProof>(
                 value.get("interface")?.clone(),
             )
-            .ok()
+            .ok()?;
+            let network = serde_json::from_value::<
+                nelomai_client_tunnel::redundancy::network::NetworkJournal,
+            >(value.get("network")?.clone())
+            .ok()?;
+            Some((identity, network))
         });
         // Read-only independent observer. This HANDLE cannot authorize cleanup;
         // production retains its OWN original Child HANDLE from process creation.
@@ -105,7 +152,26 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         assert_eq!(started.session.phase, SessionPhase::Running);
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
-        let identity = identity.expect("original worker interface identity");
+        if let Some(attached) = attached {
+            let attached = attached.expect("actual worker factory Attach B");
+            assert_eq!(attached.session.phase, SessionPhase::Running);
+            assert_eq!(attached.session.active, Slot::A);
+            assert_eq!(attached.session.installed, [true, true]);
+            assert_eq!(attached.session.membership_generation, 2);
+        }
+        let (identity, network) = retained.expect("original worker interface/network");
+        let network = network.read_view().unwrap();
+        assert!(network.pending().is_none());
+        assert_eq!(network.recorded_active(), Some(Slot::A));
+        let expected_routes = if round == 0 {
+            vec!["192.0.2.11/32", "192.0.2.12/32", "198.51.100.0/24"]
+        } else {
+            vec!["192.0.2.11/32", "198.51.100.0/24"]
+        };
+        for destination in expected_routes {
+            let destination = destination.parse::<ipnet::IpNet>().unwrap();
+            assert!(network.current().any(|value| matches!(value, nelomai_client_tunnel::redundancy::network::NetworkValue::Route(route) if route.destination==destination)), "original owned route disappeared: {destination}");
+        }
         assert_eq!(
             during
                 .iter()
