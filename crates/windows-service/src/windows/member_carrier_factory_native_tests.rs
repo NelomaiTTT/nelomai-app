@@ -43,6 +43,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
         std::time::Duration::from_millis(crate::member_native_deadline::HARD_BUDGET_MS * 96);
     let cases = [
         "primary",
+        "standby",
         "network-route-postflight",
         "metrics-post-read-error",
         "module-load-read-error",
@@ -188,7 +189,7 @@ fn carrier_factory_selects_new_path_for_supported_pair() {
                 "surviving original key disposition was not acknowledged: {stderr}"
             );
         }
-        if matches!(case, "primary" | "running-ack") {
+        if matches!(case, "primary" | "standby" | "running-ack") {
             let mut completed = 0;
             for after_dns in stderr.split("network DNS cleanup end").skip(1) {
                 let (boundary, _) = after_dns
@@ -238,7 +239,7 @@ fn carrier_factory_actual_cold_child() {
         case.as_str(),
         "module-load-read-error" | "module-load-read-unwind"
     );
-    let full_primary = case == "primary";
+    let full_primary = matches!(case.as_str(), "primary" | "standby");
     let route_partial = case == "network-route-postflight";
     let metrics_partial = case == "metrics-post-read-error";
     let resolver_partial = matches!(
@@ -757,13 +758,13 @@ fn carrier_factory_actual_cold_child() {
         assert_eq!(second.snapshot().session.scope, next);
         assert_eq!(second.snapshot().session.phase, SessionPhase::Starting);
         let mut second_now = 9;
+        let Command::Start {
+            primary, options, ..
+        } = &command
+        else {
+            unreachable!()
+        };
         if full_primary {
-            let Command::Start {
-                primary, options, ..
-            } = &command
-            else {
-                unreachable!()
-            };
             eprintln!("actual factory {case}: repeat primary Start");
             let running = second
                 .start_primary(primary, options)
@@ -771,6 +772,8 @@ fn carrier_factory_actual_cold_child() {
             assert_eq!(running.session.scope, next);
             assert_eq!(running.session.phase, SessionPhase::Running);
             assert!(!running.cleanup_pending);
+        }
+        if case == "standby" {
             // SAME production SessionControl/factory/C. Only external health
             // samples and DNS datagram replies are inputs; native owners,
             // selection, WFP, routes and generation transitions remain real.
@@ -1228,6 +1231,19 @@ fn carrier_factory_actual_cold_child() {
         let stopped = stopped.expect("actual repeat native Stop");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        if full_primary {
+            let pair = fixture
+                .trace_pair_stage()
+                .expect("actual protected final Stopped Pair");
+            pair.validate().expect("actual terminal Pair invariants");
+            assert_eq!(pair.scope, next);
+            assert_eq!(pair.phase, crate::member_carrier_pair::Phase::Stopped);
+            assert!(pair.pending.is_none());
+            assert_eq!(
+                pair.guard,
+                crate::member_carrier_guard::Model::empty(next.clone()).unwrap()
+            );
+        }
         let repeated = second
             .execute(Command::Stop { scope: next }, second_now)
             .expect("actual second repeated Stop");
