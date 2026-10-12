@@ -1317,7 +1317,7 @@ pub struct ClientCore<A, S, T, L> {
     split_tunnel_store: Arc<dyn SplitTunnelStore>,
     split_tunnel_gate: Arc<Mutex<()>>,
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
-    split_tunnel_options: Mutex<TunnelOptions>,
+    split_tunnel_options: Mutex<split_tunnel::RunningSplitTunnelOptions>,
     dns_servers: RwLock<Vec<IpAddr>>,
     split_tunnel_warning: Mutex<SplitTunnelWarnings>,
     physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
@@ -1383,7 +1383,7 @@ where
             split_tunnel_store,
             split_tunnel_gate: local.writers.split.clone(),
             split_tunnel_packages: RwLock::new(Vec::new()),
-            split_tunnel_options: Mutex::new(TunnelOptions::default()),
+            split_tunnel_options: Mutex::new(split_tunnel::RunningSplitTunnelOptions::default()),
             dns_servers: RwLock::new(Vec::new()),
             split_tunnel_warning: Mutex::new(SplitTunnelWarnings::default()),
             physical_network_change: Mutex::new(
@@ -2803,7 +2803,11 @@ where
             if let Err(record_error) = self
                 .record_started_split_tunnel_policy(
                     policy,
-                    tunnel_options,
+                    split_tunnel::RunningSplitTunnelOptions::confirmed(
+                        tunnel_options,
+                        &response.connection.lease_id,
+                        cancel_epoch,
+                    ),
                     applied_physical_network_fingerprint,
                     None,
                     now_unix,
@@ -2849,7 +2853,12 @@ where
                 )
                 .await;
             }
-            *self.split_tunnel_options.lock().await = tunnel_options;
+            *self.split_tunnel_options.lock().await =
+                split_tunnel::RunningSplitTunnelOptions::confirmed(
+                    tunnel_options,
+                    &response.connection.lease_id,
+                    cancel_epoch,
+                );
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record_timed(
@@ -4345,7 +4354,11 @@ where
             if let Err(record_error) = self
                 .record_started_split_tunnel_policy(
                     policy,
-                    tunnel_options,
+                    split_tunnel::RunningSplitTunnelOptions::confirmed(
+                        tunnel_options,
+                        &saved.lease_id,
+                        cancel_epoch,
+                    ),
                     applied_physical_network_fingerprint,
                     None,
                     now_unix,
@@ -4379,7 +4392,12 @@ where
                 )
                 .await;
             }
-            *self.split_tunnel_options.lock().await = tunnel_options;
+            *self.split_tunnel_options.lock().await =
+                split_tunnel::RunningSplitTunnelOptions::confirmed(
+                    tunnel_options,
+                    &saved.lease_id,
+                    cancel_epoch,
+                );
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record(CoreLogEvent {

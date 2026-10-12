@@ -10,7 +10,7 @@ use nelomai_client_core::{
 };
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StorageError, StoredAuth,
-    StoredSplitTunnelState,
+    StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, TunnelCapabilities, TunnelController, TunnelError,
@@ -807,6 +807,485 @@ async fn network_restart_and_retry_preserve_dns46_connection_metadata() {
             1 + failed_starts
         );
     }
+}
+
+async fn metadata_recovery_fixture() -> (Arc<CoordinatorFixture>, Connection) {
+    let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+    let mut original = fixture.core.state().await.connection.unwrap();
+    original.status = LeaseStatus::Issued;
+    fixture.api.set_bootstrap_connection(original.clone());
+    fixture.core.bootstrap(1_020).await.unwrap();
+    fixture
+        .tunnel
+        .preserve_restart_intent
+        .store(true, Ordering::SeqCst);
+    (fixture, original)
+}
+
+async fn bootstrap_observation_while_recovery_pending(
+    fixture: &Arc<CoordinatorFixture>,
+    updated: Connection,
+) -> tokio::task::JoinHandle<Result<Bootstrap, CoreError>> {
+    fixture.api.set_bootstrap_connection(updated.clone());
+    let count = fixture
+        .logger
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == "bootstrap.completed")
+        .count();
+    let bootstrap = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.bootstrap(1_030).await }
+    });
+    // The observation is published before bootstrap's final report flush,
+    // which is allowed to wait for recovery's split gate.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture
+            .logger
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "bootstrap.completed")
+            .count()
+            == count
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.core.state().await.connection, Some(updated));
+    bootstrap
+}
+
+#[tokio::test]
+async fn stalled_recovery_preserves_same_execution_bootstrap_metadata() {
+    let (fixture, original) = metadata_recovery_fixture().await;
+    fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        let lease_id = original.lease_id.clone();
+        async move {
+            fixture
+                .core
+                .recover_stalled_data_plane(&lease_id, StalledDataPlaneRecovery::RestartLocalTunnel)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut updated = original;
+    updated.status = LeaseStatus::Connected;
+    updated.probe_url = Some("https://probe.example/updated".into());
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, updated.clone()).await;
+    fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+    fixture.tunnel.restart_release.notify_one();
+    let result = recovery.await.unwrap();
+    bootstrap.await.unwrap().unwrap();
+    assert_eq!(
+        result.unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(updated));
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Running
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&same_split_settings())
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn network_recovery_preserves_metadata_refreshed_before_native_retirement() {
+    let (fixture, original) = metadata_recovery_fixture().await;
+    fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    let calls = fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.poll_physical_network(1_130).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == calls {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut updated = original;
+    updated.status = LeaseStatus::Connected;
+    updated.probe_url = Some("https://probe.example/updated".into());
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, updated.clone()).await;
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.fingerprint_release.notify_one();
+    let result = recovery.await.unwrap();
+    bootstrap.await.unwrap().unwrap();
+    assert_eq!(result.unwrap(), PhysicalNetworkPollOutcome::Reconnected);
+    assert_eq!(fixture.core.state().await.connection, Some(updated));
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&same_split_settings())
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn metadata_recovery_publication_rejects_changed_execution_or_retired_lease() {
+    for change in 0..12 {
+        let (fixture, original) = metadata_recovery_fixture().await;
+        fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+        let recovery = tokio::spawn({
+            let fixture = fixture.clone();
+            let lease_id = original.lease_id.clone();
+            async move {
+                fixture
+                    .core
+                    .recover_stalled_data_plane(
+                        &lease_id,
+                        StalledDataPlaneRecovery::RestartLocalTunnel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut updated = original.clone();
+        match change {
+            0 => updated.lease_id = "22222222-2222-4222-8222-222222222222".into(),
+            1 => updated.session_id = Some("33333333-3333-4333-8333-333333333333".into()),
+            2 => updated.pool_id = Some("another-pool".into()),
+            3 => updated.layer = Layer::Stray,
+            4 => updated.transport_protocol = nelomai_contracts::TransportProtocol::Amneziawg3,
+            5 => updated.tic_connection_mode = TicConnectionMode::Dynamic,
+            6 => updated.route_mode = RouteMode::Standalone,
+            7 => updated.egress_mode = EgressMode::Ipv4,
+            8 => updated.pinned = !updated.pinned,
+            9 => updated.status = LeaseStatus::Released,
+            10 => updated.status = LeaseStatus::Warm,
+            11 => updated.stopped_at = Some("2026-10-12T00:00:00Z".into()),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            updated, original,
+            "negative case {change} must change the observed execution"
+        );
+        let bootstrap =
+            bootstrap_observation_while_recovery_pending(&fixture, updated.clone()).await;
+        fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+        fixture.tunnel.restart_release.notify_one();
+        let result = recovery.await.unwrap();
+        bootstrap.await.unwrap().unwrap();
+        assert!(
+            matches!(result, Err(CoreError::StartCancelled)),
+            "changed execution case {change}: {result:?}"
+        );
+        assert_eq!(fixture.core.state().await.connection, Some(updated));
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Stopped,
+            "changed execution case {change} must compensate the dispatched restart"
+        );
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn network_recovery_rejects_changed_session_and_closes_dispatched_native_start() {
+    let (fixture, original) = metadata_recovery_fixture().await;
+    fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.poll_physical_network(1_130).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut updated = original;
+    updated.session_id = Some("33333333-3333-4333-8333-333333333333".into());
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, updated.clone()).await;
+    fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+    fixture.tunnel.restart_release.notify_one();
+    assert!(matches!(
+        recovery.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    bootstrap.await.unwrap().unwrap();
+    assert_eq!(fixture.core.state().await.connection, Some(updated));
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rejected_recovery_distinguishes_native_handoff_from_failed_cleanup() {
+    for native_handoff in [false, true] {
+        let (fixture, original) = metadata_recovery_fixture().await;
+        fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+        let recovery = tokio::spawn({
+            let fixture = fixture.clone();
+            let lease_id = original.lease_id.clone();
+            async move {
+                fixture
+                    .core
+                    .recover_stalled_data_plane(
+                        &lease_id,
+                        StalledDataPlaneRecovery::RestartLocalTunnel,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut updated = original;
+        updated.session_id = Some("33333333-3333-4333-8333-333333333333".into());
+        let bootstrap =
+            bootstrap_observation_while_recovery_pending(&fixture, updated.clone()).await;
+        fixture
+            .tunnel
+            .independent_native_owner
+            .store(native_handoff, Ordering::SeqCst);
+        fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+        fixture
+            .tunnel
+            .keep_running_on_stop_failure
+            .store(true, Ordering::SeqCst);
+        fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+        fixture.tunnel.restart_release.notify_one();
+        let result = recovery.await.unwrap();
+        bootstrap.await.unwrap().unwrap();
+        let current = fixture.core.state().await;
+        assert_eq!(current.connection, Some(updated));
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Running
+        );
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        if native_handoff {
+            assert!(matches!(result, Err(CoreError::StartCancelled)));
+            assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(current.phase, Phase::Connected);
+        } else {
+            assert!(
+                matches!(result, Err(CoreError::Tunnel(ref code)) if code == "test_stop_failed")
+            );
+            assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+            assert_eq!(current.phase, Phase::Error);
+        }
+    }
+}
+
+#[tokio::test]
+async fn policy_replacement_retires_confirmation_before_bootstrap_and_queued_save() {
+    let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+    let original = fixture.core.state().await.connection.unwrap();
+    fixture
+        .tunnel
+        .preserve_restart_intent
+        .store(true, Ordering::SeqCst);
+    fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 9;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.selected_packages = vec!["com.example.chat".into()];
+    fixture.api.set_policy(changed);
+    fixture.api.set_revision(9, 2);
+    let replacement = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.synchronize_split_tunnel(1_600, false).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Connecting);
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, original).await;
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    let request = same_split_settings();
+    let requires_confirmation = fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&request)
+        .await
+        .unwrap();
+    // The API fixture returns its policy instead of interpreting PUT fields;
+    // arrange policy A, the response to the requested old settings.
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    let save = tokio::spawn({
+        let fixture = fixture.clone();
+        async move {
+            fixture
+                .core
+                .save_split_tunnel_settings(&request, 1_700)
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+    fixture.tunnel.restart_release.notify_one();
+    assert!(matches!(
+        replacement.await.unwrap().unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    ));
+    save.await.unwrap().unwrap();
+    bootstrap.await.unwrap().unwrap();
+    let plans = fixture.tunnel.options.lock().unwrap();
+    assert_eq!(plans.len(), 3);
+    assert!(plans[0].package_ids.is_empty());
+    assert_eq!(plans[1].package_ids, vec!["com.example.chat"]);
+    assert!(plans[2].package_ids.is_empty());
+    assert!(
+        requires_confirmation,
+        "preflight must require confirmation before a queued Save replaces pending B with A"
+    );
+}
+
+async fn unchanged_warm_recovery_fixture() -> (Arc<CoordinatorFixture>, Connection) {
+    let (fixture, mut connection) = metadata_recovery_fixture().await;
+    connection.status = LeaseStatus::Warm;
+    fixture.api.set_bootstrap_connection(connection.clone());
+    fixture.core.bootstrap(1_040).await.unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.core.state().await.connection,
+        Some(connection.clone())
+    );
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Running
+    );
+    (fixture, connection)
+}
+
+#[tokio::test]
+async fn unchanged_warm_metadata_keeps_stalled_native_recovery_available() {
+    let (fixture, connection) = unchanged_warm_recovery_fixture().await;
+    assert_eq!(
+        fixture
+            .core
+            .recover_stalled_data_plane(
+                &connection.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+            )
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(connection));
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unchanged_warm_metadata_keeps_network_native_recovery_available() {
+    let (fixture, connection) = unchanged_warm_recovery_fixture().await;
+    fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_130).await.unwrap(),
+        PhysicalNetworkPollOutcome::Reconnected
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(connection));
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn metadata_recovery_refresh_does_not_bypass_explicit_disconnect() {
+    let (fixture, original) = metadata_recovery_fixture().await;
+    fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        let lease_id = original.lease_id.clone();
+        async move {
+            fixture
+                .core
+                .recover_stalled_data_plane(&lease_id, StalledDataPlaneRecovery::RestartLocalTunnel)
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut updated = original;
+    updated.status = LeaseStatus::Connected;
+    let bootstrap = bootstrap_observation_while_recovery_pending(&fixture, updated).await;
+    fixture.local.stop_local_on_disconnect().await.unwrap();
+    fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+    fixture.tunnel.restart_release.notify_one();
+    let result = recovery.await.unwrap();
+    assert!(matches!(
+        bootstrap.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert!(matches!(result, Err(CoreError::StartCancelled)));
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Error);
+    assert!(fixture.core.state().await.connection.is_none());
 }
 
 #[tokio::test]
@@ -2498,6 +2977,8 @@ async fn missing_saved_configuration_marks_policy_failure_and_reports_it() {
     let mut changed = policy(SplitTunnelMode::ExcludeSelected);
     changed.revision = 8;
     changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    // Configuration is required only for a real native route replacement.
+    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
     fixture.api.set_policy(changed.clone());
     fixture.api.set_revision(8, 2);
 
@@ -2537,6 +3018,1764 @@ async fn missing_saved_configuration_marks_policy_failure_and_reports_it() {
         event.kind == "split_tunnel.apply_failed"
             && event.code.as_deref() == Some("split_tunnel_saved_connection_unavailable")
     }));
+}
+
+#[tokio::test]
+async fn background_start_with_stale_working_policy_applies_first_settings_save() {
+    for cached_on in [true, false] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        let actual_on = policy(SplitTunnelMode::ExcludeSelected);
+        let mut recorded_off = actual_on.clone();
+        recorded_off.exclude_local_networks = false;
+        recorded_off.policy_hash = format!("sha256:{}", "b".repeat(64));
+        fixture
+            .split_store
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(if cached_on {
+                    actual_on.clone()
+                } else {
+                    recorded_off.clone()
+                }),
+                working_policy_hash: Some(recorded_off.policy_hash.clone()),
+                previous_working_policy: Some(recorded_off.clone()),
+                ..StoredSplitTunnelState::default()
+            })
+            .unwrap();
+        let running = Connection {
+            lease_id: "11111111-1111-4111-8111-111111111111".into(),
+            session_id: None,
+            pool_id: None,
+            layer: Layer::Tic,
+            transport_protocol: Default::default(),
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: Some("https://1a.example.test/probe".into()),
+            status: LeaseStatus::Connected,
+            pinned: false,
+            stopped_at: None,
+        };
+        fixture.api.set_bootstrap_connection(running.clone());
+        // The native Android owner started cached ON outside this Core instance.
+        let actual_options = EffectiveSplitTunnelPolicy::build(
+            &actual_on,
+            &installed(),
+            android_35_capabilities(),
+            Layer::Tic,
+            RouteMode::ViaTak,
+        )
+        .unwrap()
+        .options;
+        assert!(actual_options.exclude_local_networks);
+        fixture.tunnel.options.lock().unwrap().push(actual_options);
+        fixture.tunnel.starts.store(1, Ordering::SeqCst);
+        *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        fixture.core.bootstrap(1_000).await.unwrap();
+        let off_request = SplitTunnelSettingsUpdate {
+            mode: recorded_off.mode,
+            exclude_local_networks: false,
+            selected_packages: Vec::new(),
+        };
+        assert!(fixture
+            .core
+            .split_tunnel_settings_require_reconnect(&off_request)
+            .await
+            .unwrap());
+        fixture.api.set_policy(recorded_off.clone());
+        fixture
+            .core
+            .save_split_tunnel_settings(&off_request, 1_100)
+            .await
+            .unwrap();
+        assert!(
+            !fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .exclude_local_networks
+        );
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .status,
+            SplitTunnelApplyStatus::Applied
+        );
+    }
+}
+
+#[tokio::test]
+async fn confirmed_unchanged_save_needs_no_single_lease_configuration() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    // Service-owned v2 sessions intentionally do not retain a legacy config.
+    let mut stored = fixture.secret_store.load().unwrap().unwrap();
+    stored.saved_connection = None;
+    stored.pinned_connection = None;
+    fixture.secret_store.save(&stored).unwrap();
+    let initial = policy(SplitTunnelMode::ExcludeSelected);
+    fixture
+        .core
+        .save_split_tunnel_settings(
+            &SplitTunnelSettingsUpdate {
+                mode: initial.mode,
+                exclude_local_networks: initial.exclude_local_networks,
+                selected_packages: Vec::new(),
+            },
+            1_100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Applied
+    );
+}
+
+#[tokio::test]
+async fn unchanged_domain_routes_do_not_require_reconnect_confirmation() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let mut initial = policy(SplitTunnelMode::ExcludeSelected);
+    initial.format_version = 2;
+    initial.address_rules = vec![SplitTunnelAddressRule {
+        id: 1,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Domain,
+        value: "cached.example".into(),
+    }];
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(initial.clone()),
+            domain_resolutions: vec![StoredSplitTunnelDomainResolution {
+                domain: "cached.example".into(),
+                ipv4_cidrs: vec!["198.51.100.9/32".into()],
+                resolved_at_unix: 900,
+            }],
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .excluded_ipv4_cidrs
+        .contains(&"198.51.100.9/32".to_string()));
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&SplitTunnelSettingsUpdate {
+            mode: initial.mode,
+            exclude_local_networks: initial.exclude_local_networks,
+            selected_packages: Vec::new(),
+        })
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn settings_save_keeps_preflight_domain_addresses_without_restart() {
+    for retain_configuration in [true, false] {
+        let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        let mut initial = policy(SplitTunnelMode::ExcludeSelected);
+        initial.format_version = 2;
+        // Numeric lookup deterministically returns 127.0.0.1, unlike the
+        // last-good address used by the previous process and by preflight.
+        initial.address_rules = vec![SplitTunnelAddressRule {
+            id: 1,
+            scope: SplitTunnelAddressRuleScope::ThisDevice,
+            kind: SplitTunnelAddressRuleKind::Domain,
+            value: "127.0.0.1".into(),
+        }];
+        fixture.api.set_policy(initial.clone());
+        fixture
+            .split_store
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(initial.clone()),
+                working_policy_hash: Some(initial.policy_hash.clone()),
+                domain_resolutions: vec![StoredSplitTunnelDomainResolution {
+                    domain: "127.0.0.1".into(),
+                    ipv4_cidrs: vec!["198.51.100.9/32".into()],
+                    resolved_at_unix: 900,
+                }],
+                ..StoredSplitTunnelState::default()
+            })
+            .unwrap();
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .excluded_ipv4_cidrs
+            .push("198.51.100.9/32".into());
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        if !retain_configuration {
+            // Clear after bootstrap so legacy recovery cannot refill it.
+            let mut stored = fixture.secret_store.load().unwrap().unwrap();
+            stored.saved_connection = None;
+            stored.pinned_connection = None;
+            fixture.secret_store.save(&stored).unwrap();
+        }
+        let request = same_split_settings();
+        assert!(!restored
+            .split_tunnel_settings_require_reconnect(&request)
+            .await
+            .unwrap());
+        restored
+            .save_split_tunnel_settings(&request, 1_100)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            1,
+            "Save must use the same cached domain addresses as preflight"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.split_store.load().unwrap().domain_resolutions[0].ipv4_cidrs,
+            vec!["198.51.100.9/32"]
+        );
+        assert_eq!(restored.state().await.connection, Some(running));
+        if retain_configuration {
+            // Domain refresh is still intentional during policy sync, rather
+            // than being an unconfirmed side effect of settings Save.
+            assert_eq!(
+                restored
+                    .synchronize_split_tunnel(1_150, true)
+                    .await
+                    .unwrap(),
+                SplitTunnelSyncOutcome::Updated { reconnected: true }
+            );
+            assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+            assert!(fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .excluded_ipv4_cidrs
+                .contains(&"127.0.0.1/32".into()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn unchanged_settings_save_defers_pending_domain_without_cached_addresses() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    let working = policy(SplitTunnelMode::ExcludeSelected);
+    let mut pending = working.clone();
+    pending.format_version = 2;
+    pending.policy_hash = format!("sha256:{}", "b".repeat(64));
+    pending.address_rules = vec![SplitTunnelAddressRule {
+        id: 1,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Domain,
+        value: "127.0.0.1".into(),
+    }];
+    // Persisted state after a new domain's lookup failed: previous policy
+    // remains live. A fresh numeric lookup would now succeed deterministically.
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(pending.clone()),
+            working_policy_hash: Some(working.policy_hash.clone()),
+            previous_working_policy: Some(working.clone()),
+            failed_policy_hash: Some(pending.policy_hash.clone()),
+            failed_policy_retry_after_unix: Some(5_000),
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    fixture.api.set_policy(pending.clone());
+    let request = same_split_settings();
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&request)
+        .await
+        .unwrap());
+    let reports = fixture.api.apply_results.lock().unwrap().len();
+    fixture
+        .core
+        .save_split_tunnel_settings(&request, 1_100)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.starts.load(Ordering::SeqCst),
+        1,
+        "Save must not resolve a cache miss and replace unconfirmed routes"
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    let state = fixture.split_store.load().unwrap();
+    assert!(state.domain_resolutions.is_empty());
+    assert_eq!(state.working_policy_hash, Some(working.policy_hash));
+    assert_eq!(state.failed_policy_hash, Some(pending.policy_hash));
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_domain_resolution_unavailable")
+    );
+    assert_eq!(
+        fixture.api.apply_results.lock().unwrap().len(),
+        reports,
+        "a deferred policy must not be reported as applied"
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_150, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .excluded_ipv4_cidrs
+        .contains(&"127.0.0.1/32".into()));
+}
+
+#[tokio::test]
+async fn settings_save_defers_when_previous_domain_plan_cannot_be_reconstructed() {
+    for failed_starts in [0, 1] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+        previous.format_version = 2;
+        previous.address_rules = vec![SplitTunnelAddressRule {
+            id: 1,
+            scope: SplitTunnelAddressRuleScope::ThisDevice,
+            kind: SplitTunnelAddressRuleKind::Domain,
+            value: "missing-working-cache.invalid".into(),
+        }];
+        // An independently running owner retains the old domain route, but
+        // restoration cannot reconstruct it after the resolution cache is lost.
+        let mut native_previous = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        native_previous
+            .excluded_ipv4_cidrs
+            .push("198.51.100.9/32".into());
+        *fixture.tunnel.options.lock().unwrap().last_mut().unwrap() = native_previous.clone();
+        fixture
+            .split_store
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(previous.clone()),
+                working_policy_hash: Some(previous.policy_hash.clone()),
+                ..StoredSplitTunnelState::default()
+            })
+            .unwrap();
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        assert_eq!(restored.state().await.phase, Phase::Connected);
+        assert_eq!(
+            restored.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_domain_resolution_unavailable")
+        );
+        let mut proposed = policy(SplitTunnelMode::ExcludeSelected);
+        proposed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        proposed.exclude_local_networks = false;
+        fixture.api.set_policy(proposed.clone());
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+        let reports = fixture.api.apply_results.lock().unwrap().len();
+        let request = SplitTunnelSettingsUpdate {
+            mode: proposed.mode,
+            exclude_local_networks: false,
+            selected_packages: Vec::new(),
+        };
+        let result = restored.save_split_tunnel_settings(&request, 1_100).await;
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            1,
+            "missing rollback routes must defer replacement, not use default options"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(result.unwrap(), proposed);
+        assert_eq!(
+            fixture.tunnel.options.lock().unwrap().last(),
+            Some(&native_previous)
+        );
+        let stored = fixture.split_store.load().unwrap();
+        assert_eq!(stored.working_policy_hash, Some(previous.policy_hash));
+        assert_eq!(stored.cached_policy, Some(proposed.clone()));
+        assert_eq!(stored.failed_policy_hash, Some(proposed.policy_hash));
+        assert_eq!(
+            fixture.api.apply_results.lock().unwrap().len(),
+            reports,
+            "deferred replacement must not report Applied or RolledBack"
+        );
+        assert_eq!(
+            restored.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_domain_resolution_unavailable")
+        );
+        assert_eq!(restored.state().await.connection, Some(running));
+    }
+}
+
+#[tokio::test]
+async fn settings_noop_keeps_dispatched_dns_for_local_recovery() {
+    for capabilities in [
+        android_35_capabilities(),
+        capabilities(TunnelPlatform::Android, Some(32), true, true),
+        capabilities(TunnelPlatform::Linux, None, true, false),
+    ] {
+        let fixture = coordinator_fixture(capabilities);
+        let dns_a = vec!["9.9.9.9".parse().unwrap()];
+        fixture.core.set_dns_servers(dns_a.clone());
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        fixture
+            .core
+            .set_dns_servers(vec!["8.8.8.8".parse().unwrap()]);
+        let mut updated = policy(SplitTunnelMode::ExcludeSelected);
+        updated.policy_hash = format!("sha256:{}", "b".repeat(64));
+        fixture.api.set_policy(updated.clone());
+        let request = same_split_settings();
+        assert!(!fixture
+            .core
+            .split_tunnel_settings_require_reconnect(&request)
+            .await
+            .unwrap());
+        fixture
+            .core
+            .save_split_tunnel_settings(&request, 1_100)
+            .await
+            .unwrap();
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(updated.policy_hash)
+        );
+        assert_eq!(
+            fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .dns_servers,
+            dns_a
+        );
+        assert_eq!(
+            fixture
+                .core
+                .recover_stalled_data_plane(
+                    &running.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel,
+                )
+                .await
+                .unwrap(),
+            StalledDataPlaneRecoveryOutcome::Reconnected
+        );
+        assert_eq!(
+            fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .dns_servers,
+            dns_a,
+            "recovery must retain the DNS dispatched on Start, not an unapplied preference"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_noop_keeps_dispatched_options_for_rollback() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    let original = fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    fixture
+        .core
+        .set_dns_servers(vec!["8.8.8.8".parse().unwrap()]);
+    let mut same_routes = policy(SplitTunnelMode::ExcludeSelected);
+    same_routes.policy_hash = format!("sha256:{}", "b".repeat(64));
+    fixture.api.set_policy(same_routes);
+    fixture
+        .core
+        .save_split_tunnel_settings(&same_split_settings(), 1_100)
+        .await
+        .unwrap();
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    let mut replacement = policy(SplitTunnelMode::ExcludeSelected);
+    replacement.policy_hash = format!("sha256:{}", "c".repeat(64));
+    replacement.exclude_local_networks = false;
+    fixture.api.set_policy(replacement);
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    let request = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: false,
+        selected_packages: Vec::new(),
+    };
+    assert!(
+        matches!(fixture.core.save_split_tunnel_settings(&request, 1_200).await,
+        Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_apply_failed")
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&original),
+        "rollback must retain all dispatched options, including DNS and native policy hash"
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::RolledBack
+    );
+}
+
+#[tokio::test]
+async fn restored_api32_settings_save_does_not_replace_inactive_split_policy() {
+    for retain_configuration in [true, false] {
+        let fixture =
+            coordinator_fixture(capabilities(TunnelPlatform::Android, Some(32), true, true));
+        fixture
+            .core
+            .set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            *fixture.tunnel.options.lock().unwrap().last().unwrap(),
+            TunnelOptions {
+                dns_servers: vec!["9.9.9.9".parse().unwrap()],
+                ..TunnelOptions::default()
+            }
+        );
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+        restored.bootstrap(1_050).await.unwrap();
+        if !retain_configuration {
+            let mut stored = fixture.secret_store.load().unwrap().unwrap();
+            stored.saved_connection = None;
+            stored.pinned_connection = None;
+            fixture.secret_store.save(&stored).unwrap();
+        }
+        let mut request = same_split_settings();
+        request.exclude_local_networks = false;
+        assert!(
+            !restored
+                .split_tunnel_settings_require_reconnect(&request)
+                .await
+                .unwrap(),
+            "Android API32 ignores split options even after bootstrap"
+        );
+        let mut updated = policy(request.mode);
+        updated.exclude_local_networks = false;
+        updated.policy_hash = format!("sha256:{}", "b".repeat(64));
+        fixture.api.set_policy(updated.clone());
+        assert_eq!(
+            restored
+                .save_split_tunnel_settings(&request, 1_100)
+                .await
+                .unwrap(),
+            updated
+        );
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(restored.state().await.connection, Some(running));
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(updated.policy_hash)
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_stall_restart_and_retry_confirm_dispatched_split_options() {
+    for failed_starts in [0, 1] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        let request = same_split_settings();
+        assert!(restored
+            .split_tunnel_settings_require_reconnect(&request)
+            .await
+            .unwrap());
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+        assert_eq!(
+            restored
+                .recover_stalled_data_plane(
+                    &running.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel
+                )
+                .await
+                .unwrap(),
+            StalledDataPlaneRecoveryOutcome::Reconnected
+        );
+        assert!(
+            !restored
+                .split_tunnel_settings_require_reconnect(&request)
+                .await
+                .unwrap(),
+            "a successful exact-options restart must confirm the live plan"
+        );
+        restored
+            .save_split_tunnel_settings(&request, 1_100)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            2 + failed_starts
+        );
+    }
+}
+
+#[tokio::test]
+async fn restored_network_restart_and_retry_confirm_dispatched_split_options() {
+    for failed_starts in [0, 1] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        let request = same_split_settings();
+        assert!(restored
+            .split_tunnel_settings_require_reconnect(&request)
+            .await
+            .unwrap());
+        fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+        assert_eq!(
+            restored.poll_physical_network(1_100).await.unwrap(),
+            PhysicalNetworkPollOutcome::ChangePending
+        );
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+        assert_eq!(
+            restored.poll_physical_network(1_130).await.unwrap(),
+            PhysicalNetworkPollOutcome::Reconnected
+        );
+        assert!(
+            !restored
+                .split_tunnel_settings_require_reconnect(&request)
+                .await
+                .unwrap(),
+            "network recovery must confirm the options actually dispatched"
+        );
+        restored
+            .save_split_tunnel_settings(&request, 1_150)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            2 + failed_starts
+        );
+    }
+}
+
+#[tokio::test]
+async fn unsupported_rebind_does_not_confirm_restored_split_options() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    fixture.api.set_bootstrap_connection(running.clone());
+    let restored = support::core_with_split(
+        fixture.api.clone(),
+        fixture.secret_store.clone(),
+        fixture.split_store.clone(),
+        fixture.tunnel.clone(),
+        fixture.logger.clone(),
+    );
+    restored.bootstrap(1_050).await.unwrap();
+    assert_eq!(
+        restored
+            .recover_stalled_data_plane(&running.lease_id, StalledDataPlaneRecovery::RebindUdp)
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Unsupported
+    );
+    assert!(restored
+        .split_tunnel_settings_require_reconnect(&same_split_settings())
+        .await
+        .unwrap());
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+}
+
+fn same_split_settings() -> SplitTunnelSettingsUpdate {
+    let initial = policy(SplitTunnelMode::ExcludeSelected);
+    SplitTunnelSettingsUpdate {
+        mode: initial.mode,
+        exclude_local_networks: initial.exclude_local_networks,
+        selected_packages: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn restored_android33_or_unknown_api_still_requires_confirmed_native_plan() {
+    for api_level in [Some(33), None] {
+        let fixture =
+            coordinator_fixture(capabilities(TunnelPlatform::Android, api_level, true, true));
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        fixture.api.set_bootstrap_connection(running);
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        let mut stored = fixture.secret_store.load().unwrap().unwrap();
+        stored.saved_connection = None;
+        stored.pinned_connection = None;
+        fixture.secret_store.save(&stored).unwrap();
+        assert!(restored
+            .split_tunnel_settings_require_reconnect(&same_split_settings())
+            .await
+            .unwrap());
+        assert!(matches!(
+            restored
+                .save_split_tunnel_settings(&same_split_settings(), 1_100)
+                .await
+                .unwrap_err(),
+            CoreError::SplitTunnel(code) if code == "split_tunnel_saved_connection_unavailable"
+        ));
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn failed_recovery_does_not_confirm_restored_split_options() {
+    for network_recovery in [true, false] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        fixture.api.set_bootstrap_connection(running.clone());
+        let restored = support::core_with_split(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            fixture.split_store.clone(),
+            fixture.tunnel.clone(),
+            fixture.logger.clone(),
+        );
+        restored.bootstrap(1_050).await.unwrap();
+        fixture.tunnel.fail_next_starts.store(2, Ordering::SeqCst);
+        if network_recovery {
+            fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+            assert_eq!(
+                restored.poll_physical_network(1_100).await.unwrap(),
+                PhysicalNetworkPollOutcome::ChangePending
+            );
+            assert_eq!(
+                restored.poll_physical_network(1_130).await.unwrap(),
+                PhysicalNetworkPollOutcome::ReconnectFailed
+            );
+        } else {
+            assert!(restored
+                .recover_stalled_data_plane(
+                    &running.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel
+                )
+                .await
+                .is_err());
+        }
+        // An independently running owner can be rediscovered by bootstrap,
+        // but a failed local restart must not have attested its options.
+        *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        restored.bootstrap(1_150).await.unwrap();
+        assert!(restored
+            .split_tunnel_settings_require_reconnect(&same_split_settings())
+            .await
+            .unwrap());
+    }
+}
+
+#[tokio::test]
+async fn failed_recovery_retires_confirmation_of_the_previous_native_instance() {
+    for network_recovery in [true, false] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        assert!(!fixture
+            .core
+            .split_tunnel_settings_require_reconnect(&same_split_settings())
+            .await
+            .unwrap());
+        fixture.tunnel.fail_next_starts.store(2, Ordering::SeqCst);
+        if network_recovery {
+            fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+            assert_eq!(
+                fixture.core.poll_physical_network(1_100).await.unwrap(),
+                PhysicalNetworkPollOutcome::ChangePending
+            );
+            assert_eq!(
+                fixture.core.poll_physical_network(1_130).await.unwrap(),
+                PhysicalNetworkPollOutcome::ReconnectFailed
+            );
+        } else {
+            assert!(fixture
+                .core
+                .recover_stalled_data_plane(
+                    &running.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel
+                )
+                .await
+                .is_err());
+        }
+        // Bootstrap rediscovers an independently started owner with the same
+        // lease/epoch but different native routes. The old Start is no proof.
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .exclude_local_networks = false;
+        *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        fixture.api.set_bootstrap_connection(running.clone());
+        fixture.core.bootstrap(1_150).await.unwrap();
+        assert!(
+            fixture
+                .core
+                .split_tunnel_settings_require_reconnect(&same_split_settings())
+                .await
+                .unwrap(),
+            "a destroyed native instance must not retain confirmation after failed recovery"
+        );
+        let starts = fixture.tunnel.starts.load(Ordering::SeqCst);
+        fixture
+            .core
+            .save_split_tunnel_settings(&same_split_settings(), 1_200)
+            .await
+            .unwrap();
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), starts + 1);
+        assert!(
+            fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .exclude_local_networks
+        );
+    }
+}
+
+#[tokio::test]
+async fn failed_restoration_cannot_reuse_a_retired_owners_rollback_options() {
+    for changed_lease in [true, false] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let mut running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        if changed_lease {
+            running.lease_id = "22222222-2222-4222-8222-222222222222".into();
+        } else {
+            fixture.core.signal_start_cancellation();
+        }
+        let mut auth = fixture.secret_store.load().unwrap().unwrap();
+        auth.saved_connection.as_mut().unwrap().lease_id = running.lease_id.clone();
+        fixture.secret_store.save(&auth).unwrap();
+        let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+        previous.format_version = 2;
+        previous.policy_hash = format!("sha256:{}", "b".repeat(64));
+        previous.address_rules = vec![SplitTunnelAddressRule {
+            id: 1,
+            scope: SplitTunnelAddressRuleScope::ThisDevice,
+            kind: SplitTunnelAddressRuleKind::Domain,
+            value: "missing-current-owner.invalid".into(),
+        }];
+        fixture
+            .split_store
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(previous.clone()),
+                working_policy_hash: Some(previous.policy_hash.clone()),
+                ..StoredSplitTunnelState::default()
+            })
+            .unwrap();
+        // Model a different live native owner, not a new Core Start. Its old
+        // domain route cannot be inferred from the retired owner's options.
+        let mut native_current = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        native_current.excluded_ipv4_cidrs = vec!["198.51.100.9/32".into()];
+        native_current.dns_servers = vec!["8.8.8.8".parse().unwrap()];
+        *fixture.tunnel.options.lock().unwrap().last_mut().unwrap() = native_current.clone();
+        fixture.api.set_bootstrap_connection(running.clone());
+        fixture.core.bootstrap(1_050).await.unwrap();
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_domain_resolution_unavailable")
+        );
+        let mut proposed = policy(SplitTunnelMode::ExcludeSelected);
+        proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
+        proposed.exclude_local_networks = false;
+        fixture.api.set_policy(proposed.clone());
+        fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+        let reports = fixture.api.apply_results.lock().unwrap().len();
+        fixture
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: proposed.mode,
+                    exclude_local_networks: false,
+                    selected_packages: Vec::new(),
+                },
+                1_100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            1,
+            "unknown current-owner routes must not be replaced or rolled back from a retired owner"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.tunnel.options.lock().unwrap().last(),
+            Some(&native_current)
+        );
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(previous.policy_hash)
+        );
+        assert_eq!(fixture.api.apply_results.lock().unwrap().len(), reports);
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+    }
+}
+
+#[tokio::test]
+async fn recovery_plan_unavailable_after_restoration_defers_until_cache_is_repaired() {
+    for changed_lease in [true, false] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+        fixture
+            .core
+            .synchronize_split_tunnel(900, false)
+            .await
+            .unwrap();
+        let mut running = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_000)
+            .await
+            .unwrap();
+        if changed_lease {
+            running.lease_id = "22222222-2222-4222-8222-222222222222".into();
+        } else {
+            fixture.core.signal_start_cancellation();
+        }
+        let mut auth = fixture.secret_store.load().unwrap().unwrap();
+        auth.saved_connection.as_mut().unwrap().lease_id = running.lease_id.clone();
+        fixture.secret_store.save(&auth).unwrap();
+        let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+        previous.format_version = 2;
+        previous.policy_hash = format!("sha256:{}", "b".repeat(64));
+        previous.address_rules = vec![SplitTunnelAddressRule {
+            id: 1,
+            scope: SplitTunnelAddressRuleScope::ThisDevice,
+            kind: SplitTunnelAddressRuleKind::Domain,
+            value: "missing-current-owner.invalid".into(),
+        }];
+        fixture
+            .split_store
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(previous.clone()),
+                working_policy_hash: Some(previous.policy_hash.clone()),
+                ..StoredSplitTunnelState::default()
+            })
+            .unwrap();
+        let mut actual = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        actual.excluded_ipv4_cidrs = vec!["198.51.100.9/32".into()];
+        *fixture.tunnel.options.lock().unwrap().last_mut().unwrap() = actual.clone();
+        fixture.api.set_bootstrap_connection(running.clone());
+        fixture.core.bootstrap(1_050).await.unwrap();
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_domain_resolution_unavailable")
+        );
+        let outcome = fixture
+            .core
+            .recover_stalled_data_plane(
+                &running.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            1,
+            "unavailable current-owner options must not dispatch placeholder routes/DNS"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome, StalledDataPlaneRecoveryOutcome::Skipped);
+        assert_eq!(fixture.tunnel.options.lock().unwrap().last(), Some(&actual));
+        assert_eq!(fixture.core.state().await.connection, Some(running.clone()));
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_domain_resolution_unavailable")
+        );
+
+        // A later ordinary bootstrap can reconstruct a usable plan from a
+        // repaired cache; deferral must not disable all future local recovery.
+        let mut repaired = fixture.split_store.load().unwrap();
+        repaired.domain_resolutions = vec![StoredSplitTunnelDomainResolution {
+            domain: "missing-current-owner.invalid".into(),
+            ipv4_cidrs: vec!["198.51.100.9/32".into()],
+            resolved_at_unix: 1_100,
+        }];
+        fixture.split_store.save(&repaired).unwrap();
+        fixture.core.bootstrap(1_150).await.unwrap();
+        assert_eq!(
+            fixture
+                .core
+                .recover_stalled_data_plane(
+                    &running.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel,
+                )
+                .await
+                .unwrap(),
+            StalledDataPlaneRecoveryOutcome::Reconnected
+        );
+        let restored = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(restored
+            .excluded_ipv4_cidrs
+            .contains(&"198.51.100.9/32".into()));
+        assert_eq!(
+            restored.dns_servers,
+            vec!["9.9.9.9".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(restored.policy_hash, Some(previous.policy_hash));
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    }
+}
+
+async fn unavailable_domain_recipe_with_repaired_cache(
+) -> (CoordinatorFixture, Connection, SplitTunnelPolicy) {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .set_dns_servers(vec!["9.9.9.9".parse().unwrap()]);
+    let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+    previous.format_version = 2;
+    previous.policy_hash = format!("sha256:{}", "b".repeat(64));
+    previous.address_rules = vec![SplitTunnelAddressRule {
+        id: 1,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Domain,
+        value: "rollback-domain.invalid".into(),
+    }];
+    let cached_address = StoredSplitTunnelDomainResolution {
+        domain: "rollback-domain.invalid".into(),
+        ipv4_cidrs: vec!["198.51.100.9/32".into()],
+        resolved_at_unix: 900,
+    };
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(previous.clone()),
+            domain_resolutions: vec![cached_address.clone()],
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .excluded_ipv4_cidrs
+        .contains(&"198.51.100.9/32".into()));
+
+    // Restoration retires the old epoch's recipe, then fails because the
+    // persistent cache is temporarily missing. The native tunnel stays up.
+    fixture.core.signal_start_cancellation();
+    let mut state = fixture.split_store.load().unwrap();
+    state.domain_resolutions.clear();
+    fixture.split_store.save(&state).unwrap();
+    fixture.api.set_bootstrap_connection(running.clone());
+    fixture.core.bootstrap(1_050).await.unwrap();
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_domain_resolution_unavailable")
+    );
+
+    // Save, not another bootstrap, is the next consumer of repaired addresses.
+    let mut state = fixture.split_store.load().unwrap();
+    state.domain_resolutions = vec![cached_address];
+    fixture.split_store.save(&state).unwrap();
+    (fixture, running, previous)
+}
+
+#[tokio::test]
+async fn settings_save_preserves_rollback_cache_until_new_domain_plan_is_applied() {
+    for disable_split in [false, true] {
+        let (fixture, running, previous) = unavailable_domain_recipe_with_repaired_cache().await;
+        let mut proposed = previous;
+        proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
+        proposed.exclude_local_networks = false;
+        proposed.address_rules.clear();
+        proposed.enabled = !disable_split;
+        fixture.api.set_policy(proposed.clone());
+        let result = fixture
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: proposed.mode,
+                    exclude_local_networks: false,
+                    selected_packages: Vec::new(),
+                },
+                1_150,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture.tunnel.starts.load(Ordering::SeqCst),
+            2,
+            "proposed policy must not erase available rollback addresses before native apply"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(result, proposed);
+        let native = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert!(!native
+            .excluded_ipv4_cidrs
+            .contains(&"198.51.100.9/32".into()));
+        let state = fixture.split_store.load().unwrap();
+        assert!(
+            state.domain_resolutions.is_empty(),
+            "obsolete cache is pruned after successful apply"
+        );
+        assert_eq!(state.working_policy_hash, Some(proposed.policy_hash));
+        assert!(state.failed_policy_hash.is_none());
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .status,
+            SplitTunnelApplyStatus::Applied
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_save_restores_old_domain_cache_after_native_apply_rollback() {
+    for disable_split in [false, true] {
+        let (fixture, running, previous) = unavailable_domain_recipe_with_repaired_cache().await;
+        let old_native = fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let old_cache = fixture.split_store.load().unwrap().domain_resolutions;
+        let mut proposed = previous.clone();
+        proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
+        proposed.exclude_local_networks = false;
+        proposed.address_rules.clear();
+        proposed.enabled = !disable_split;
+        fixture.api.set_policy(proposed.clone());
+        fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+        let error = fixture
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: proposed.mode,
+                    exclude_local_networks: false,
+                    selected_packages: Vec::new(),
+                },
+                1_150,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CoreError::SplitTunnel(ref code) if code == "split_tunnel_apply_failed")
+        );
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 3);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.tunnel.options.lock().unwrap().last(),
+            Some(&old_native)
+        );
+        let state = fixture.split_store.load().unwrap();
+        assert_eq!(
+            state.domain_resolutions, old_cache,
+            "rollback must retain the restored working plan's cache"
+        );
+        assert_eq!(state.working_policy_hash, Some(previous.policy_hash));
+        assert_eq!(state.failed_policy_hash, Some(proposed.policy_hash));
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .status,
+            SplitTunnelApplyStatus::RolledBack
+        );
+    }
+}
+
+#[tokio::test]
+async fn settings_save_missing_new_domain_keeps_existing_rollback_cache() {
+    let (fixture, running, previous) = unavailable_domain_recipe_with_repaired_cache().await;
+    let old_native = fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    let old_cache = fixture.split_store.load().unwrap().domain_resolutions;
+    let mut proposed = previous.clone();
+    proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
+    proposed.address_rules[0].value = "new-domain-without-cache.invalid".into();
+    fixture.api.set_policy(proposed.clone());
+    fixture
+        .core
+        .save_split_tunnel_settings(
+            &SplitTunnelSettingsUpdate {
+                mode: proposed.mode,
+                exclude_local_networks: true,
+                selected_packages: Vec::new(),
+            },
+            1_150,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture.split_store.load().unwrap().domain_resolutions,
+        old_cache,
+        "failed proposed-plan preparation must not consume the working plan's cached addresses"
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&old_native)
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture.split_store.load().unwrap().working_policy_hash,
+        Some(previous.policy_hash)
+    );
+    assert_eq!(
+        fixture.split_store.load().unwrap().failed_policy_hash,
+        Some(proposed.policy_hash)
+    );
+}
+
+#[tokio::test]
+async fn recovery_plan_from_a_retired_epoch_is_not_reused_before_bootstrap() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    fixture.core.signal_start_cancellation();
+    let outcome = fixture
+        .core
+        .recover_stalled_data_plane(
+            &running.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.starts.load(Ordering::SeqCst),
+        1,
+        "a new cancellation epoch must not reuse the retired owner's plan"
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(outcome, StalledDataPlaneRecoveryOutcome::Skipped);
+}
+
+#[tokio::test]
+async fn recovery_plan_genuine_default_options_remain_recoverable_after_bootstrap() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Android, Some(32), true, true));
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default())
+    );
+    fixture.api.set_bootstrap_connection(running.clone());
+    let restored = support::core_with_split(
+        fixture.api.clone(),
+        fixture.secret_store.clone(),
+        fixture.split_store.clone(),
+        fixture.tunnel.clone(),
+        fixture.logger.clone(),
+    );
+    restored.bootstrap(1_050).await.unwrap();
+    assert_eq!(
+        restored
+            .recover_stalled_data_plane(
+                &running.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+            )
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default())
+    );
+}
+
+#[tokio::test]
+async fn owned_default_plan_save_does_not_reconstruct_a_stale_working_policy() {
+    let (fixture, running) = fixture_with_owned_default_and_stale_working_policy().await;
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&same_split_settings())
+        .await
+        .unwrap());
+    fixture
+        .core
+        .save_split_tunnel_settings(&same_split_settings(), 1_100)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.starts.load(Ordering::SeqCst),
+        1,
+        "a confirmed default plan is available, not a signal to reconstruct stale routes"
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default())
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+}
+
+#[tokio::test]
+async fn owned_default_plan_rollback_restores_the_actual_empty_recipe() {
+    let (fixture, running) = fixture_with_owned_default_and_stale_working_policy().await;
+    let mut enabled = policy(SplitTunnelMode::ExcludeSelected);
+    enabled.policy_hash = format!("sha256:{}", "c".repeat(64));
+    enabled.exclude_local_networks = false;
+    fixture.api.set_policy(enabled);
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    let request = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: false,
+        selected_packages: Vec::new(),
+    };
+    assert!(
+        matches!(fixture.core.save_split_tunnel_settings(&request, 1_100).await,
+        Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_apply_failed")
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default()),
+        "rollback must restore the dispatched default plan, not the old stored split policy"
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::RolledBack
+    );
+}
+
+async fn fixture_with_owned_default_and_stale_working_policy() -> (CoordinatorFixture, Connection) {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let old = policy(SplitTunnelMode::ExcludeSelected);
+    let mut disabled = old.clone();
+    disabled.enabled = false;
+    disabled.policy_hash = format!("sha256:{}", "b".repeat(64));
+    fixture.api.set_policy(disabled.clone());
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(disabled),
+            previous_working_policy: Some(old.clone()),
+            working_policy_hash: Some(old.policy_hash.clone()),
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default())
+    );
+    assert_eq!(
+        fixture.split_store.load().unwrap().working_policy_hash,
+        Some(old.policy_hash)
+    );
+    (fixture, running)
+}
+
+#[tokio::test]
+async fn settings_confirmation_uses_live_plan_instead_of_changed_cache() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, false)
+        .await
+        .unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .exclude_local_networks
+    );
+    let mut cached_off = policy(SplitTunnelMode::ExcludeSelected);
+    cached_off.exclude_local_networks = false;
+    cached_off.policy_hash = format!("sha256:{}", "b".repeat(64));
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(cached_off.clone()),
+            working_policy_hash: Some(cached_off.policy_hash.clone()),
+            ..StoredSplitTunnelState::default()
+        })
+        .unwrap();
+    fixture.api.set_bootstrap_connection(running);
+    fixture.core.bootstrap(1_050).await.unwrap();
+    let request = SplitTunnelSettingsUpdate {
+        mode: cached_off.mode,
+        exclude_local_networks: false,
+        selected_packages: Vec::new(),
+    };
+    assert!(fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&request)
+        .await
+        .unwrap());
+    fixture.api.set_policy(cached_off);
+    fixture
+        .core
+        .save_split_tunnel_settings(&request, 1_100)
+        .await
+        .unwrap();
+    assert!(
+        !fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .exclude_local_networks
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    fixture
+        .core
+        .save_split_tunnel_settings(&request, 1_200)
+        .await
+        .unwrap();
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -2992,6 +5231,7 @@ struct CoordinatorTunnel {
     fail_next_stops: AtomicUsize,
     keep_running_on_stop_failure: AtomicBool,
     preserve_restart_intent: AtomicBool,
+    independent_native_owner: AtomicBool,
     restart_starts: AtomicUsize,
     block_restart: AtomicBool,
     restart_release: Notify,
@@ -3023,6 +5263,17 @@ impl CoordinatorTunnel {
 
 #[async_trait]
 impl TunnelController for CoordinatorTunnel {
+    async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
+        if self.independent_native_owner.load(Ordering::SeqCst) {
+            return Err(TunnelError::Backend("runtime_v2_owned".into()));
+        }
+        self.stop().await
+    }
+
+    async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
+        Ok(self.independent_native_owner.load(Ordering::SeqCst))
+    }
+
     async fn start_for_restart(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.restart_starts.fetch_add(1, Ordering::SeqCst);
         if self.block_restart.load(Ordering::SeqCst) {
