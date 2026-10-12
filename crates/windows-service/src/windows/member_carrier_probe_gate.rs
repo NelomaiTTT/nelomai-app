@@ -1,5 +1,9 @@
 //! Concrete original-Wfp probe authorization. Factory remains disconnected.
 //! Portable comparisons confer no socket/resource permission.
+#[cfg(not(windows))]
+use crate::member_carrier_members as original_members;
+#[cfg(windows)]
+use crate::windows::member_carrier_members as original_members;
 use crate::{
     member_carrier_guard as policy,
     member_carrier_native_ownership::Context,
@@ -283,7 +287,8 @@ fn compare_retired_target(
     context: &Context,
     r: &pair::Record,
     carrier: &policy::Carrier,
-    egress: [Option<&policy::Identity>; 2],
+    mut egress: [Option<&policy::Identity>; 2],
+    history: &[original_members::ClosedMemberBinding],
 ) -> Result<()> {
     let empty = policy::Model::empty(r.scope.clone())?;
     compare_guard_target(context, r, &empty)?;
@@ -291,6 +296,40 @@ fn compare_retired_target(
         || r.stop_stage != 10
         || r.guard.permits
         || r.guard.carrier.as_ref() != Some(carrier)
+        || history.len() > 2
+    {
+        return Err(GuardError::Conflict);
+    }
+    // Facts come only from the SAME already active retired full-empty bracket.
+    // Completed Retire removes Pair/guard membership while that original Closed
+    // history remains retained. Project it out only after exact proof comparison;
+    // neither missing Pair data nor an unbound egress identity proves closure.
+    let mut seen = [false; 2];
+    for closed in history {
+        closed
+            .comparison_provider(context)
+            .map_err(|_| GuardError::Conflict)?;
+        let i = usize::from(closed.intent.slot == nelomai_contracts::dispatcher::TunnelSlot::B);
+        if seen[i]
+            || egress[i].is_none_or(|identity| {
+                identity.scope != closed.intent.scope || identity.proof != closed.proof.interface
+            })
+            || r.members[i].as_ref().is_some_and(|member| {
+                member.owner.intent != closed.intent
+                    || member.owner.proof.or(member.owner.retired_proof) != Some(closed.proof)
+            })
+        {
+            return Err(GuardError::Conflict);
+        }
+        seen[i] = true;
+        if r.members[i].is_none() {
+            egress[i] = None;
+        }
+    }
+    if egress
+        .iter()
+        .enumerate()
+        .any(|(i, identity)| identity.is_some() && !seen[i])
         || r.guard
             .members
             .iter()
@@ -1412,12 +1451,20 @@ pub(crate) mod native {
                     return Err(GuardError::Conflict);
                 }
                 self.continuity(&selected)?;
-                compare_retired_target(
-                    &self.context,
-                    record,
-                    bindings.carrier.as_ref().ok_or(GuardError::Conflict)?,
-                    bindings.egress.each_ref().map(Option::as_ref),
-                )?;
+                retired
+                    .inspect_history_in_bracket(|history| {
+                        compare_retired_target(
+                            &self.context,
+                            record,
+                            bindings.carrier.as_ref().ok_or_else(|| {
+                                crate::windows::member_carrier_wintun::Error::Conflict
+                            })?,
+                            bindings.egress.each_ref().map(Option::as_ref),
+                            history,
+                        )
+                        .map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
+                    })
+                    .map_err(denied)?;
                 // Actual original clone/base close ACKs for ALL canonical
                 // entries, including unpublished ACKs; never a forward sample.
                 self.inventory()?.inspect_retired()?;

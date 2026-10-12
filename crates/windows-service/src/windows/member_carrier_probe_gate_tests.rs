@@ -1321,19 +1321,106 @@ fn retired_guard_callback_compares_exact_original_history_and_only_stage_ten_rem
     );
     let carrier = r.guard.carrier.clone().unwrap();
     let identity = r.guard.members[0].as_ref().unwrap().identity.clone();
+    let history = [original_members::ClosedMemberBinding {
+        intent: r.members[0].as_ref().unwrap().owner.intent.clone(),
+        proof: r.members[0].as_ref().unwrap().owner.proof.unwrap(),
+    }];
     assert_eq!(
-        compare_retired_target(&c, &r, &carrier, [Some(&identity), None]),
+        compare_retired_target(&c, &r, &carrier, [Some(&identity), None], &history),
         Ok(())
     );
     for stage in [0, 1, 8, 9, 11, 12] {
         let mut x = r.clone();
         x.stop_stage = stage;
-        assert!(compare_retired_target(&c, &x, &carrier, [Some(&identity), None]).is_err());
+        assert!(
+            compare_retired_target(&c, &x, &carrier, [Some(&identity), None], &history).is_err()
+        );
     }
     let mut foreign = identity.clone();
     foreign.proof.luid += 1;
-    assert!(compare_retired_target(&c, &r, &carrier, [Some(&foreign), None]).is_err());
-    assert!(compare_retired_target(&c, &r, &carrier, [None, None]).is_err());
+    assert!(compare_retired_target(&c, &r, &carrier, [Some(&foreign), None], &history).is_err());
+    assert!(compare_retired_target(&c, &r, &carrier, [None, None], &history).is_err());
+    // A completed Retire removes Pair/guard membership, but the SAME original
+    // Closed identity remains in the retired full-empty bracket for either slot.
+    let mut other = r.members[0].clone().unwrap();
+    other.owner.intent.slot = nelomai_contracts::dispatcher::TunnelSlot::B;
+    let proof = other.owner.proof.as_mut().unwrap();
+    proof.interface.index += 1;
+    proof.interface.luid += 1;
+    proof.interface.guid = c.bindings[2].guid;
+    proof.process.pid += 1;
+    other.owner.retired_proof.as_mut().unwrap().interface = proof.interface;
+    let history = [
+        history[0].clone(),
+        original_members::ClosedMemberBinding {
+            intent: other.owner.intent.clone(),
+            proof: other.owner.proof.unwrap(),
+        },
+    ];
+    let identities = [
+        identity.clone(),
+        policy::Identity {
+            scope: r.scope.clone(),
+            proof: history[1].proof.interface,
+        },
+    ];
+    for retired_slot in 0..2 {
+        let mut retired = r.clone();
+        retired.members[1] = Some(other.clone());
+        retired.members[retired_slot] = None;
+        let mut members = r.guard.members.clone();
+        members[1] = Some(policy::Member {
+            identity: identities[1].clone(),
+            probes: vec![],
+        });
+        members[retired_slot] = None;
+        retired.guard = policy::Model::new(retired.scope.clone(), carrier.clone(), members, None)
+            .unwrap()
+            .without_permits()
+            .unwrap()
+            .inherit_sublayer_weight(&r.guard)
+            .unwrap();
+        retired.pending_guard = Some(
+            policy::ExchangePlan::new(
+                &retired.guard,
+                &policy::Model::empty(retired.scope.clone()).unwrap(),
+            )
+            .unwrap(),
+        );
+        retired.validate().unwrap();
+        compare_retired_target(
+            &c,
+            &retired,
+            &carrier,
+            identities.each_ref().map(Some),
+            &history,
+        )
+        .unwrap();
+        for fault in 0..8 {
+            let (mut p, mut h, mut ids) = (retired.clone(), history.to_vec(), identities.clone());
+            match fault {
+                0 => {
+                    h.remove(retired_slot);
+                }
+                1 => h.push(h[retired_slot].clone()),
+                2 => h[retired_slot].proof.interface.luid += 1,
+                3 => h[retired_slot].intent.scope.connection_generation += 1,
+                4 => ids[retired_slot].proof.index += 1,
+                5 => ids[retired_slot].proof.guid = [99; 16],
+                6 => h[1 - retired_slot].proof.process.creation_time += 1,
+                _ => {
+                    p.members[retired_slot] = Some(if retired_slot == 0 {
+                        r.members[0].clone().unwrap()
+                    } else {
+                        other.clone()
+                    })
+                }
+            }
+            assert!(
+                compare_retired_target(&c, &p, &carrier, ids.each_ref().map(Some), &h).is_err()
+            );
+        }
+    }
 }
 // Break: clearing enclosing serialization taint after a minimal capability check fails or unwinds.
 #[test]
