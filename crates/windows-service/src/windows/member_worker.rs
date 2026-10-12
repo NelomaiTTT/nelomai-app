@@ -11,6 +11,7 @@ use crate::{
     member_pair::{DnsRecord, MemberParameters},
     member_worker_guard::Model,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use nelomai_client_tunnel::{
     redundancy::{
         control::PairControl,
@@ -21,11 +22,14 @@ use nelomai_client_tunnel::{
         },
         protocol::Member,
         session::{SessionPhase, SessionSnapshot},
-        SessionScope, Slot,
+        ProbeDatagram, SessionScope, Slot,
     },
     DesktopTunnelOptions,
 };
-use nelomai_contracts::dispatcher::{EngineIdentity, MutationGuard};
+use nelomai_contracts::{
+    dispatcher::{EngineIdentity, MutationGuard},
+    RedundantHealthProbe,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -39,7 +43,7 @@ use std::{
     process::{Child, Command, Stdio},
     rc::Rc,
     sync::{mpsc, Arc},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
     Foundation::{
@@ -594,6 +598,8 @@ pub(crate) struct Control {
     files: Rc<RefCell<NativeSessionFiles>>,
     session: Rc<RefCell<Option<WindowsSessionStore<NativeSessionFiles>>>>,
     parameters: [Option<MemberParameters>; 2],
+    probes: [Option<RedundantHealthProbe>; 2],
+    generations: [Option<u64>; 2],
     physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
     options: Option<DesktopTunnelOptions>,
 }
@@ -727,6 +733,8 @@ pub(crate) fn prepare(
             files: files.clone(),
             session: session.clone(),
             parameters: [None, None],
+            probes: [None, None],
+            generations: [None, None],
             physical: Rc::new(RefCell::new(Vec::new())),
             options: None,
         },
@@ -794,7 +802,11 @@ impl Control {
             }],
         )?;
         self.authorize()?;
-        self.call(json!({"op":"attach","slot":slot_index(member.slot),"configuration":uapi.as_str(),"physical":identity_value(InterfaceProof {index:path.proof.identity.index,luid:path.proof.identity.luid,guid:path.proof.identity.guid})}), Duration::from_secs(10))?;
+        let reply=self.call(json!({"op":"attach","slot":slot_index(member.slot),"configuration":uapi.as_str(),"physical":identity_value(InterfaceProof {index:path.proof.identity.index,luid:path.proof.identity.luid,guid:path.proof.identity.guid})}), Duration::from_secs(10))?;
+        let generation = reply["slot_stats"][slot_index(member.slot)]["generation"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(failed)?;
         self.authorize()?;
         super::member_physical::verify(
             path,
@@ -809,6 +821,8 @@ impl Control {
             IpAddr::V4(member.probe.target_ipv4),
         ));
         self.parameters[slot_index(member.slot)] = Some(params);
+        self.probes[slot_index(member.slot)] = Some(member.probe.clone());
+        self.generations[slot_index(member.slot)] = Some(generation);
         Ok(())
     }
     fn create_address(&mut self, source: [u8; 4]) -> io::Result<()> {
@@ -1363,7 +1377,7 @@ impl PairControl for Control {
     }
 }
 impl NativePair for Control {
-    type Socket = nelomai_client_tunnel::redundancy::NativeProbeSocket;
+    type Socket = WorkerProbe;
     fn check_integrity(&mut self) -> io::Result<()> {
         self.authorize()?;
         checked(
@@ -1374,11 +1388,62 @@ impl NativePair for Control {
                 .verify(|| self.original.verify_live()),
         )
     }
-    fn sample(&mut self, _: Slot) -> Option<NativeHealthSample> {
-        None
+    fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
+        let index = slot_index(slot);
+        if !self.ready || self.fenced || self.members[index].is_none() {
+            return None;
+        }
+        self.check_integrity().ok()?;
+        let reply = self
+            .call(json!({"op":"sample","slot":index}), Duration::from_secs(1))
+            .ok()?;
+        self.authorize().ok()?;
+        let stats = &reply["slot_stats"][index];
+        let closed = stats["closed"].as_bool()?;
+        if !closed && stats["generation"].as_u64() != self.generations[index] {
+            return None;
+        }
+        let now = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis(),
+        )
+        .ok()?;
+        let handshake_fresh = reply["handshakes"][index]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .and_then(|value| now.checked_sub(value))
+            .is_some_and(|age| age <= 180_000);
+        Some(NativeHealthSample {
+            admitted: self.guard.as_ref()?.borrow().current.admitted,
+            closed,
+            handshake_fresh,
+            tx_packets: stats["tx_packets"].as_u64()?,
+            rx_data_packets: stats["rx_data_packets"].as_u64()?,
+        })
     }
-    fn open_probe(&mut self, _: Slot) -> io::Result<(Self::Socket, String)> {
-        Err(io::ErrorKind::Unsupported.into())
+    fn open_probe(&mut self, slot: Slot) -> io::Result<(Self::Socket, String)> {
+        if !self.ready || self.fenced || self.stopped {
+            return Err(failed());
+        }
+        self.check_integrity()?;
+        let index = slot_index(slot);
+        let params = self.parameters[index].as_ref().ok_or_else(failed)?;
+        let probe = self.probes[index].as_ref().ok_or_else(failed)?;
+        Ok((
+            WorkerProbe {
+                original: self.original.clone(),
+                journal: self.journal.clone(),
+                guard: self.guard.as_ref().ok_or_else(failed)?.clone(),
+                rpc: self.rpc.clone(),
+                slot,
+                source: params.source.to_string(),
+                target: probe.target_ipv4.to_string(),
+                probe: None,
+            },
+            probe.query_name.clone(),
+        ))
     }
     fn select_active(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
         if scope != &self.scope
@@ -1548,5 +1613,90 @@ impl NativePair for Control {
         *self.completed.borrow_mut() = Some(completed);
         self.stopped = true;
         Ok(())
+    }
+}
+
+// One real query handle over the original inherited worker pipe. The selected
+// member supplies its source, target and name; no caller-defined probe endpoint.
+pub(crate) struct WorkerProbe {
+    original: Rc<Original>,
+    journal: SharedJournal,
+    guard: Rc<RefCell<Guard>>,
+    rpc: Rc<RefCell<Option<Rpc>>>,
+    slot: Slot,
+    source: String,
+    target: String,
+    probe: Option<u64>,
+}
+impl WorkerProbe {
+    fn call(&mut self, request: Value) -> io::Result<Value> {
+        self.original.verify_live()?;
+        self.journal.borrow_mut().verify()?;
+        let reply = self
+            .rpc
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(failed)?
+            .call(request, Duration::from_secs(1))?;
+        self.original.verify_live()?;
+        self.journal.borrow_mut().verify()?;
+        Ok(reply)
+    }
+}
+impl ProbeDatagram for WorkerProbe {
+    fn send(&mut self, packet: &[u8]) -> io::Result<usize> {
+        if self.probe.is_some()
+            || packet.len() < 12
+            || packet.len() > 4096
+            || !self.guard.borrow().current.admitted
+        {
+            return Err(failed());
+        }
+        checked(
+            self.guard
+                .borrow_mut()
+                .verify(|| self.original.verify_live()),
+        )?;
+        let reply=self.call(json!({"op":"probe_send","slot":slot_index(self.slot),"source":self.source,"target":self.target,"dns":STANDARD.encode(packet)}))?;
+        self.probe = Some(
+            reply["probe"]
+                .as_u64()
+                .filter(|id| *id > 0)
+                .ok_or_else(failed)?,
+        );
+        Ok(packet.len())
+    }
+    fn receive(&mut self, packet: &mut [u8]) -> io::Result<usize> {
+        let probe = self.probe.ok_or_else(failed)?;
+        if !self.guard.borrow().current.admitted {
+            return Err(failed());
+        }
+        let reply = self.call(json!({"op":"probe_poll","probe":probe}))?;
+        if reply["probe"].as_u64() != Some(probe) {
+            return Err(failed());
+        }
+        let encoded = match reply.get("dns") {
+            None => return Err(io::ErrorKind::WouldBlock.into()),
+            Some(Value::String(value)) if value.len() <= 5464 => value,
+            _ => return Err(failed()),
+        };
+        let bytes = STANDARD.decode(encoded).map_err(|_| failed())?;
+        if bytes.is_empty() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        if bytes.len() > 4096 || bytes.len() > packet.len() {
+            return Err(failed());
+        }
+        packet[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+}
+impl Drop for WorkerProbe {
+    fn drop(&mut self) {
+        if let Some(probe) = self.probe.take() {
+            // Cancel a still-owned token on its SAME worker, including failure;
+            // no reconnect, replacement process, synthetic ACK or retry socket.
+            let _ = self.call(json!({"op":"probe_cancel","probe":probe}));
+        }
     }
 }

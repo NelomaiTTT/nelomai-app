@@ -48,6 +48,7 @@ type response struct {
 	Identity   identity                `json:"identity"`
 	Handshakes [2]int64                `json:"handshakes"`
 	Counters   RedundantTunnelCounters `json:"counters"`
+	SlotStats  [2]RedundantSlotStats   `json:"slot_stats"`
 	Probe      uint64                  `json:"probe,omitempty"`
 	DNS        []byte                  `json:"dns,omitempty"`
 	Absent     bool                    `json:"absent"`
@@ -144,6 +145,18 @@ func (w *worker) bounded(req request) (response, bool) {
 			}
 		}
 		if w.tunnel != nil {
+			reply.SlotStats = w.tunnel.SlotStats()
+			for index, slot := range w.slots {
+				if slot == nil {
+					reply.SlotStats[index].Closed = true
+					continue
+				}
+				select {
+				case <-slot.Wait():
+					reply.SlotStats[index].Closed = true
+				default:
+				}
+			}
 			reply.Counters = w.tunnel.Counters()
 			reply.Closed = w.tunnel.Closed()
 		}

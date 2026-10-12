@@ -8,7 +8,82 @@
  	expiresAt time.Time
  }
  
-@@ -605,36 +606,38 @@
+@@ -139,20 +140,22 @@
+ }
+ 
+ type channelTUN struct {
+-	owner        *RedundantTunnel
+-	index        uint32
+-	mtu          int
+-	name         string
+-	batchSize    int
+-	outbound     chan channelPacket
+-	inbound      chan channelInboundPacket
+-	events       chan tun.Event
+-	done         chan struct{}
+-	dispatchDone chan struct{}
+-	stateMu      sync.Mutex
+-	closedFlag   atomic.Bool
+-	generation   atomic.Uint64
+-	inflight     atomic.Int64
++	owner         *RedundantTunnel
++	index         uint32
++	mtu           int
++	name          string
++	batchSize     int
++	outbound      chan channelPacket
++	inbound       chan channelInboundPacket
++	events        chan tun.Event
++	done          chan struct{}
++	dispatchDone  chan struct{}
++	stateMu       sync.Mutex
++	closedFlag    atomic.Bool
++	generation    atomic.Uint64
++	inflight      atomic.Int64
++	txPackets     atomic.Uint64
++	rxDataPackets atomic.Uint64
+ }
+ 
+ // slotAttachmentTUN gives one cryptographic backend an independently
+@@ -284,6 +287,8 @@
+ 	if channel.closed() {
+ 		return nil, ErrRedundantSlotClosed
+ 	}
++	channel.txPackets.Store(0)
++	channel.rxDataPackets.Store(0)
+ 	attachment := &slotAttachmentTUN{
+ 		slot:       channel,
+ 		done:       make(chan struct{}),
+@@ -358,6 +363,9 @@
+ 	r.routeMu.RLock()
+ 	enqueued := !r.closed.Load() && !r.slots[slot].closed() &&
+ 		r.slots[slot].enqueueOutbound(packet, true, token)
++	if enqueued {
++		r.slots[slot].txPackets.Add(1)
++	}
+ 	r.routeMu.RUnlock()
+ 	if !enqueued {
+ 		r.probeMu.Lock()
+@@ -447,6 +455,8 @@
+ 	// Reset is itself an admission fence. Callers normally close the current
+ 	// attachment first, but incrementing here also protects direct/reset races.
+ 	r.slots[slot].generation.Add(1)
++	r.slots[slot].txPackets.Store(0)
++	r.slots[slot].rxDataPackets.Store(0)
+ 	droppedUser, droppedProbes, droppedInbound := r.slots[slot].dropAllQueuedPackets()
+ 	r.routeMu.Unlock()
+ 	r.probeMu.Lock()
+@@ -564,6 +574,9 @@
+ 				false,
+ 				ProbeToken{},
+ 			)
++			if enqueued {
++				slot.txPackets.Add(1)
++			}
+ 			r.routeMu.RUnlock()
+ 			if enqueued {
+ 				r.counters.outboundPackets.Add(1)
+@@ -605,36 +618,39 @@
  				r.counters.inactiveInboundDrops.Add(1)
  				continue
  			}
@@ -44,6 +119,7 @@
  	defer slot.inflight.Add(-1)
  	err := normalizeRedundantWriterError(r.writer.WritePacket(packet))
  	if err == nil {
++		slot.rxDataPackets.Add(1)
  		r.counters.inboundPackets.Add(1)
  		r.counters.inboundBytes.Add(uint64(len(packet)))
 -		return
@@ -64,22 +140,45 @@
  }
  
  func (r *RedundantTunnel) consumeProbeReply(slot uint32, packet []byte) bool {
-@@ -651,9 +654,11 @@
+@@ -651,10 +667,25 @@
  		r.probeMu.Unlock()
  		return false
  	}
 -	if state.status == probePending {
 -		state.status = probeSucceeded
 -		state.expiresAt = now.Add(redundantTunnelProbeRetention)
-+	// Retain actual DNS bytes; Rust remains responsible for answer validation.
++	// Cancelled matches are discarded, never new progress or a raw reply.
++	if state.status == probeCancelled || state.status == probeReported {
++		r.probeMu.Unlock()
++		return true
++	}
++	// parseDNSPacket established an IP/UDP/DNS packet; also fence slicing here.
 +	udpOffset := 40
-+	if packet[0]>>4 == 4 { udpOffset = int(packet[0]&0x0f) * 4 }
++	if len(packet) > 0 && packet[0]>>4 == 4 {
++		udpOffset = int(packet[0]&0x0f) * 4
++	}
++	if udpOffset < 20 || udpOffset+8 > len(packet) {
++		r.probeMu.Unlock()
++		return false
++	}
++	// Keep actual DNS bytes pending: only Rust validates answer success.
 +	if len(packet)-udpOffset-8 <= 4096 && len(state.replies) < 8 {
 +		state.replies = append(state.replies, append([]byte(nil), packet[udpOffset+8:]...))
  		r.probes[token] = state
++		r.slots[slot].rxDataPackets.Add(1)
  	}
  	r.probeMu.Unlock()
-@@ -1039,3 +1044,16 @@
+ 	r.counters.probeRepliesConsumed.Add(1)
+@@ -1034,8 +1065,45 @@
+ 	}
+ 	close(a.done)
+ 	close(a.events)
+-	a.slot.generation.CompareAndSwap(a.generation, a.generation+1)
+ 	a.slot.owner.routeMu.Lock()
++	if a.slot.generation.CompareAndSwap(a.generation, a.generation+1) {
++		a.slot.txPackets.Store(0)
++		a.slot.rxDataPackets.Store(0)
++	}
  	a.slot.owner.routeMu.Unlock()
  	return nil
  }
@@ -89,10 +188,31 @@
 +	r.probeMu.Lock()
 +	defer r.probeMu.Unlock()
 +	state, exists := r.probes[token]
-+	if !exists || len(state.replies) == 0 { return nil }
++	if !exists || len(state.replies) == 0 {
++		return nil
++	}
 +	reply := state.replies[0]
 +	state.replies[0] = nil
 +	state.replies = state.replies[1:]
 +	r.probes[token] = state
 +	return reply
++}
++
++// Per-generation IP packet facts. No encrypted handshake/keepalive bytes and
++// no progress from rejected, inactive or failed real-TUN writes.
++type RedundantSlotStats struct {
++	Generation    uint64 `json:"generation"`
++	Closed        bool   `json:"closed"`
++	TxPackets     uint64 `json:"tx_packets"`
++	RxDataPackets uint64 `json:"rx_data_packets"`
++}
++
++func (r *RedundantTunnel) SlotStats() [2]RedundantSlotStats {
++	r.routeMu.RLock()
++	defer r.routeMu.RUnlock()
++	var stats [2]RedundantSlotStats
++	for index, slot := range r.slots {
++		stats[index] = RedundantSlotStats{Generation: slot.generation.Load(), Closed: r.closed.Load() || slot.closed(), TxPackets: slot.txPackets.Load(), RxDataPackets: slot.rxDataPackets.Load()}
++	}
++	return stats
 +}

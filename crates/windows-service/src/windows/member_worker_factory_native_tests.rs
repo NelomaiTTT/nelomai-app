@@ -55,6 +55,21 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         fixture.worker_factory().unwrap(),
     )
     .unwrap();
+    // External OS double publishes only UDP endpoints and public keys. Keep
+    // crypto and raw DNS inside the actual production worker/actor path.
+    let peer_file =
+        std::env::var_os("NELOMAI_WORKER_PROOF_PEERS_JSON").expect("external peer ready JSON");
+    assert!(std::fs::metadata(&peer_file).unwrap().len() <= 4096);
+    let peers: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(peer_file).unwrap()).unwrap();
+    let endpoints = [
+        peers[0]["endpoint"].as_str().unwrap(),
+        peers[1]["endpoint"].as_str().unwrap(),
+    ];
+    let public = [
+        peers[0]["public_key"].as_str().unwrap(),
+        peers[1]["public_key"].as_str().unwrap(),
+    ];
     let mut previous_process = None;
     for round in 0..2 {
         let scope = SessionScope {
@@ -68,7 +83,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         };
 
         let primary = Member { slot: Slot::A, lease_id: format!("22222222-2222-4222-8222-{:012x}", round + 1),
-            configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 198.51.100.0/24\nEndpoint = 192.0.2.11:51820\nPersistentKeepalive = 25\n".into()),
+            configuration: TunnelConfiguration::new(format!("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {}\nAllowedIPs = 198.51.100.0/24\nEndpoint = {}\nPersistentKeepalive = 1\n",public[0],endpoints[0])),
             probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "198.51.100.53".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
         let standby = Member {
             slot: Slot::B,
@@ -81,11 +96,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                         "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
                         "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
                     )
-                    .replace(
-                        "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
-                        "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=",
-                    )
-                    .replace("192.0.2.11:51820", "192.0.2.12:51821"),
+                    .replace(public[0], public[1])
+                    .replace(endpoints[0], endpoints[1]),
             ),
             probe: primary.probe.clone(),
         };
@@ -120,6 +132,26 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         } else {
             None
         };
+        let mut readiness = None;
+        if round == 0 && attached.as_ref().is_some_and(|result| result.is_ok()) {
+            let clock = Instant::now();
+            loop {
+                if actor.tick(clock.elapsed().as_millis() as u64).is_err() {
+                    break;
+                }
+                let status = actor.redundant(Command::Status {
+                    scope: scope.clone(),
+                });
+                let ready = status
+                    .as_ref()
+                    .is_ok_and(|state| state.primary_ready && state.standby_ready);
+                readiness = Some(status);
+                if ready || clock.elapsed() >= Duration::from_secs(25) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25)); // actual actor cadence
+            }
+        }
         let during = super::member_carrier_provider::native::table().unwrap();
         let retained = super::member_carrier_factory_test_os::state().and_then(|directory| {
             let value: serde_json::Value = serde_json::from_slice(
@@ -159,17 +191,30 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             assert_eq!(attached.session.installed, [true, true]);
             assert_eq!(attached.session.membership_generation, 2);
         }
+        if round == 0 {
+            let readiness = readiness
+                .expect("health/probe tick completed")
+                .expect("production actor health tick");
+            assert!(
+                readiness.primary_ready && readiness.standby_ready,
+                "missing authentic per-slot sample/raw DNS readiness"
+            );
+            assert_eq!(readiness.session.active, Slot::A);
+        }
         let (identity, network) = retained.expect("original worker interface/network");
         let network = network.read_view().unwrap();
         assert!(network.pending().is_none());
         assert_eq!(network.recorded_active(), Some(Slot::A));
-        let expected_routes = if round == 0 {
-            vec!["192.0.2.11/32", "192.0.2.12/32", "198.51.100.0/24"]
-        } else {
-            vec!["192.0.2.11/32", "198.51.100.0/24"]
-        };
+        let endpoints =
+            endpoints.map(|endpoint| endpoint.parse::<std::net::SocketAddr>().unwrap().ip());
+        let mut expected_routes = vec![
+            ipnet::IpNet::from(endpoints[0]),
+            "198.51.100.0/24".parse().unwrap(),
+        ];
+        if round == 0 {
+            expected_routes.push(ipnet::IpNet::from(endpoints[1]));
+        }
         for destination in expected_routes {
-            let destination = destination.parse::<ipnet::IpNet>().unwrap();
             assert!(network.current().any(|value| matches!(value, nelomai_client_tunnel::redundancy::network::NetworkValue::Route(route) if route.destination==destination)), "original owned route disappeared: {destination}");
         }
         assert_eq!(

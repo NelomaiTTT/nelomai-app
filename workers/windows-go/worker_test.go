@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -184,6 +186,7 @@ func TestWorkerLifecycle(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Feed one bounded burst through A, then the SAME destination through B.
+	var previousStats [2]RedundantSlotStats
 	for slot := 0; slot < 2; slot++ {
 		if slot == 1 {
 			reply := call(request{Op: "switch", Slot: 1})
@@ -219,6 +222,22 @@ func TestWorkerLifecycle(t *testing.T) {
 			}
 			seen[payload] = true
 		}
+		until := time.Now().Add(time.Second)
+		for {
+			stats := call(request{Op: "sample"}).SlotStats
+			if stats[slot].TxPackets >= 24 && stats[slot].RxDataPackets >= 24 {
+				other := 1 - slot
+				if stats[other].TxPackets != previousStats[other].TxPackets || stats[other].RxDataPackets != previousStats[other].RxDataPackets {
+					t.Fatal("slot traffic/late drop leaked into reserve packet counters")
+				}
+				previousStats = stats
+				break
+			}
+			if time.Now().After(until) {
+				t.Fatal("real per-slot IP packet counters missing")
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 	// The worker must preserve the exact query ID/question, and return both real
 	// invalid and valid DNS replies. Only the caller may validate the answer.
@@ -249,6 +268,10 @@ func TestWorkerLifecycle(t *testing.T) {
 	valid = append(valid, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4, 203, 0, 113, 1)
 	if replies[0][3] != 0x83 || !bytes.Equal(replies[1], valid) {
 		t.Fatal("worker synthesized or rewrote DNS answer")
+	}
+	stats := call(request{Op: "sample"}).SlotStats
+	if stats[0].TxPackets != previousStats[0].TxPackets+1 || stats[0].RxDataPackets != previousStats[0].RxDataPackets+2 || stats[1].TxPackets != previousStats[1].TxPackets || stats[1].RxDataPackets != previousStats[1].RxDataPackets {
+		t.Fatal("genuine injected DNS IP packets were not counted only on their slot")
 	}
 	if cancelled := call(request{Op: "probe_cancel", Probe: sent.Probe}); !cancelled.OK {
 		t.Fatal(cancelled)
@@ -351,6 +374,60 @@ func TestWorkerLifecycle(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
+	// Disposable external network double: only memory TUNs and real AWG UDP.
+	// No worker/native interface effects; original devices die on stdin EOF.
+	if address := os.Getenv("NELOMAI_WORKER_TEST_PEERS"); address != "" {
+		ip := net.ParseIP(address)
+		if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			os.Exit(1)
+		}
+		var peers [2]*device.Device
+		ready := make([]map[string]string, 2)
+		for slot := range peers {
+			clientBytes, remoteBytes := bytes.Repeat([]byte{byte(1 + slot*2)}, 32), bytes.Repeat([]byte{byte(2 + slot*2)}, 32)
+			client, err := ecdh.X25519().NewPrivateKey(clientBytes)
+			if err != nil {
+				os.Exit(1)
+			}
+			remote, err := ecdh.X25519().NewPrivateKey(remoteBytes)
+			if err != nil {
+				os.Exit(1)
+			}
+			peers[slot] = device.NewDevice(newTestPeer(fmt.Sprint(slot)), conn.NewStdNetBind(), device.NewLogger(device.LogLevelSilent, ""))
+			configuration := fmt.Sprintf("private_key=%s\nlisten_port=0\npublic_key=%s\nallowed_ip=10.7.0.2/32\n\n", hex.EncodeToString(remote.Bytes()), hex.EncodeToString(client.PublicKey().Bytes()))
+			if peers[slot].IpcSet(configuration) != nil || peers[slot].Up() != nil {
+				os.Exit(1)
+			}
+			state, err := peers[slot].IpcGet()
+			if err != nil {
+				os.Exit(1)
+			}
+			port := ""
+			for _, line := range strings.Split(state, "\n") {
+				if value, ok := strings.CutPrefix(line, "listen_port="); ok {
+					port = value
+				}
+			}
+			if port == "" || port == "0" {
+				os.Exit(1)
+			}
+			ready[slot] = map[string]string{"endpoint": net.JoinHostPort(ip.String(), port), "public_key": base64.StdEncoding.EncodeToString(remote.PublicKey().Bytes())}
+		}
+		if json.NewEncoder(os.Stdout).Encode(ready) != nil {
+			os.Exit(1)
+		}
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+		} // bounded by the original parent pipe lifetime
+		for _, peer := range peers {
+			peer.Close()
+			<-peer.Wait()
+		}
+		if scanner.Err() != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if os.Getenv("NELOMAI_WORKER_TEST_CHILD") == "1" {
 		log.SetOutput(io.Discard)
 		installTestNativeFault()
