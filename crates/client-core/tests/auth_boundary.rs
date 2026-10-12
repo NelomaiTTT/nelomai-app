@@ -7,7 +7,7 @@ use nelomai_client_storage::{
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{RuntimeIdentity, RuntimeSlot};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -143,6 +143,94 @@ impl TunnelController for StoppedTunnel {
 }
 
 struct Provider(AtomicUsize);
+
+struct DisconnectingProvider {
+    closed: AtomicBool,
+}
+#[async_trait]
+impl RuntimeAuthProvider for DisconnectingProvider {
+    fn is_channel_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+    async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
+        if self.is_channel_closed() {
+            // A closed owner cannot service another auth RPC.
+            std::future::pending().await
+        } else {
+            Ok(RuntimeAuthState::Active)
+        }
+    }
+    async fn login(&self, _: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+        panic!("presentation cannot log in")
+    }
+    async fn access(&self, _: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+        panic!("presentation cannot refresh")
+    }
+    async fn logout(&self) -> Result<(), CoreError> {
+        panic!("channel loss cannot revoke login")
+    }
+}
+
+#[tokio::test]
+async fn nlm071_closed_owner_cannot_present_connected_or_wait_for_an_auth_rpc() {
+    use nelomai_client_core::{NativeConnectionIntent, Phase};
+    let provider = Arc::new(DisconnectingProvider {
+        closed: AtomicBool::new(false),
+    });
+    let local = CoreLocalStop::new(Arc::new(RunningTunnel));
+    local.stop_local_for_transition().await.unwrap();
+    let core = ClientCore::new(
+        Arc::new(nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap()),
+        Arc::new(ReadOnlyRuntime(
+            RuntimePaths::new(
+                "/synthetic-nlm071-closed-owner",
+                RuntimeSlot::Stable,
+                "0.2.16",
+            )
+            .unwrap(),
+        )),
+        provider.clone(),
+        local,
+        Arc::new(NoopLogger),
+    );
+    let connected = core
+        .foreground_state(
+            core.begin_foreground_observation().await,
+            Some(NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            }),
+        )
+        .await;
+    assert_eq!(connected.phase, Phase::Connected);
+    provider.closed.store(true, Ordering::SeqCst);
+    let state = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        core.foreground_state(
+            core.begin_foreground_observation().await,
+            Some(NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            }),
+        ),
+    )
+    .await
+    .expect("closed owner must not wait for an RPC");
+    assert_eq!(state.phase, Phase::Error);
+    assert!(state.connection.is_none());
+    assert_eq!(core.state().await.phase, Phase::Error);
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            core.reconcile_external_tunnel_state()
+        )
+        .await
+        .unwrap()
+        .phase,
+        Phase::Error
+    );
+}
+
 #[async_trait]
 impl RuntimeAuthProvider for Provider {
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {

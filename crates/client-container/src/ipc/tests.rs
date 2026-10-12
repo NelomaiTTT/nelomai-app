@@ -1080,6 +1080,7 @@ async fn nlm071_peer_eof_stops_real_core_without_claiming_logout_or_ready() {
         .await
         .unwrap();
     fixture.client.access(None).await.unwrap();
+    assert!(!fixture.client.is_channel_closed());
     let core = ClientCore::new(
         Arc::new(api),
         Arc::new(fixture.record.operational()),
@@ -1100,6 +1101,7 @@ async fn nlm071_peer_eof_stops_real_core_without_claiming_logout_or_ready() {
     })
     .await
     .expect("EOF must physically stop independent of writer gates");
+    assert!(fixture.client.is_channel_closed());
     assert!(fixture.client.check_start_barrier().is_err());
     assert!(core.access_snapshot().await.is_err());
     assert_eq!(fixture.auth.load().unwrap(), auth_before);

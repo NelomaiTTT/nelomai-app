@@ -41,6 +41,10 @@ mod split_tunnel;
 /// owner or an authenticated private-channel client, never in a runtime store.
 #[async_trait]
 pub trait RuntimeAuthProvider: Send + Sync {
+    /// Confirmed local channel closure, not a network timeout or revoked login.
+    fn is_channel_closed(&self) -> bool {
+        false
+    }
     async fn state(&self) -> Result<RuntimeAuthState, CoreError>;
     async fn login(&self, request: RuntimeLogin) -> Result<AccessSnapshot, CoreError>;
     async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError>;
@@ -1461,7 +1465,28 @@ where
         self.split_tunnel_warning.lock().await.clear_all();
     }
 
+    pub fn runtime_channel_closed(&self) -> bool {
+        self.auth.is_channel_closed()
+    }
+
+    async fn disconnected_presentation(&self) -> CoreState {
+        let mut state = self.state.lock().await.clone();
+        if matches!(
+            state.phase,
+            Phase::Ready | Phase::Connecting | Phase::Connected | Phase::Stopping
+        ) {
+            state.phase = Phase::Error;
+            state.connection = None;
+        }
+        // Presentation only: the private reader owns native Stop and retains
+        // all durable cleanup/auth records. Error does not grant a fresh Start.
+        state
+    }
+
     pub async fn state(&self) -> CoreState {
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
         let foreground_sequence = self.foreground_sequence.load(Ordering::SeqCst);
         let current = self.state.lock().await.clone();
@@ -1523,6 +1548,9 @@ where
             return current;
         }
         let status = self.tunnel.status().await;
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let mut state = self.state.lock().await;
         let mut warnings = self.split_tunnel_warning.lock().await;
         if *state != current
@@ -1673,8 +1701,17 @@ where
         intent: Option<NativeConnectionIntent>,
         allowed: impl Fn() -> bool,
     ) -> CoreState {
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let status = self.tunnel.status().await;
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let mut state = self.state.lock().await;
         let mut previous_intent = self.foreground_intent.lock().await;
         let mut warnings = self.split_tunnel_warning.lock().await;
@@ -1755,14 +1792,23 @@ where
     }
 
     async fn reconcile_tunnel_state(&self, expected: Option<&CoreState>) -> CoreState {
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
         let foreground_sequence = self.foreground_sequence.load(Ordering::SeqCst);
         let current = self.state.lock().await.clone();
         let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let status = match self.tunnel.status().await {
             Ok(status) => status,
             Err(_) => return self.state.lock().await.clone(),
         };
+        if self.runtime_channel_closed() {
+            return self.disconnected_presentation().await;
+        }
         let mut state = self.state.lock().await;
         if active
             && self

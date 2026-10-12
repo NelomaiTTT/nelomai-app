@@ -1470,6 +1470,10 @@ impl nelomai_client_core::RuntimeStartPreflight for PrivateRuntimeAuthClient {
 
 #[async_trait]
 impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
+    fn is_channel_closed(&self) -> bool {
+        self.outbox.is_closed()
+    }
+
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
         match self
             .request(AuthRequestV1::State, Instant::now() + REQUEST_BUDGET)

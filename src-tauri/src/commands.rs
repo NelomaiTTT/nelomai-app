@@ -2079,6 +2079,27 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
     }
 }
 
+async fn runtime_state_if_channel_open<T>(
+    is_closed: impl Fn() -> bool,
+    read: impl std::future::Future<Output = Result<T, CommandError>>,
+) -> Result<T, CommandError> {
+    let check = || {
+        if is_closed() {
+            Err(CommandError::new(
+                "runtime_channel_closed",
+                "Потеряна связь со службой подключения",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let result = read.await;
+    // Closure while an earlier poll was running also retires its green reply.
+    check()?;
+    result
+}
+
 #[tauri::command]
 pub async fn app_state(
     app: AppHandle,
@@ -2086,76 +2107,80 @@ pub async fn app_state(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        android_app_state(
-            app,
-            application.inner().clone(),
-            diagnostics.inner().clone(),
-            metrics.inner().clone(),
-        )
-        .await
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        if metrics_view_is_visible(&app) {
-            metrics.mark_observed().await;
+    runtime_state_if_channel_open(|| application.runtime_channel_closed(), async {
+        #[cfg(target_os = "android")]
+        {
+            android_app_state(
+                app,
+                application.inner().clone(),
+                diagnostics.inner().clone(),
+                metrics.inner().clone(),
+            )
+            .await
         }
-        let quick_state_change = app
-            .tunnel_android()
-            .take_quick_state_change()
-            .unwrap_or_default();
-        let quick_state_changed = quick_state_change.changed;
-        let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
-            match application.bootstrap(now_unix()).await {
-                Ok(response) => {
-                    #[cfg(desktop)]
-                    diagnostics.set_automatic_device(&response.device.id);
-                    provision_android_background_resilient(
-                        app.clone(),
-                        application.inner().clone(),
-                        diagnostics.inner().clone(),
-                        response,
-                    )
-                    .await;
-                    if app
-                        .tunnel_android()
-                        .acknowledge_quick_state_change(quick_state_change.revision)
-                        .is_ok()
-                    {
-                        clear_quick_reconcile_retry();
-                    } else {
-                        defer_quick_reconcile(now_unix());
-                    }
-                    application.state().await
-                }
-                Err(_) => {
-                    defer_quick_reconcile(now_unix());
-                    application.reconcile_external_tunnel_state().await
-                }
+        #[cfg(not(target_os = "android"))]
+        {
+            if metrics_view_is_visible(&app) {
+                metrics.mark_observed().await;
             }
-        } else if quick_state_changed {
-            application.reconcile_external_tunnel_state().await
-        } else {
-            application.state().await
-        };
-        let warning = application.split_tunnel_warning().await;
-        let metrics_context = application.connection_metrics_context().await;
-        let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-        let status_unavailable_fallback = android_status_unavailable_fallback();
-        let (intent_status, next_retry_at_unix, reserve_state) =
-            current_connection_intent(&app, status_unavailable_fallback).await;
-        let local_cleanup = application.local_stop_pending_cleanup().await;
-        Ok(AppStateResponse::new(
-            state,
-            warning,
-            current_metrics,
-            intent_status,
-            next_retry_at_unix,
-            reserve_state,
-        )
-        .with_local_stop_pending_cleanup(local_cleanup))
-    }
+            let quick_state_change = app
+                .tunnel_android()
+                .take_quick_state_change()
+                .unwrap_or_default();
+            let quick_state_changed = quick_state_change.changed;
+            let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
+                match application.bootstrap(now_unix()).await {
+                    Ok(response) => {
+                        #[cfg(desktop)]
+                        diagnostics.set_automatic_device(&response.device.id);
+                        provision_android_background_resilient(
+                            app.clone(),
+                            application.inner().clone(),
+                            diagnostics.inner().clone(),
+                            response,
+                        )
+                        .await;
+                        if app
+                            .tunnel_android()
+                            .acknowledge_quick_state_change(quick_state_change.revision)
+                            .is_ok()
+                        {
+                            clear_quick_reconcile_retry();
+                        } else {
+                            defer_quick_reconcile(now_unix());
+                        }
+                        application.state().await
+                    }
+                    Err(_) => {
+                        defer_quick_reconcile(now_unix());
+                        application.reconcile_external_tunnel_state().await
+                    }
+                }
+            } else if quick_state_changed {
+                application.reconcile_external_tunnel_state().await
+            } else {
+                application.state().await
+            };
+            let warning = application.split_tunnel_warning().await;
+            let metrics_context = application.connection_metrics_context().await;
+            let current_metrics =
+                current_connection_metrics(&metrics, metrics_context.as_ref()).await;
+            let status_unavailable_fallback = android_status_unavailable_fallback();
+            let (intent_status, next_retry_at_unix, reserve_state) =
+                current_connection_intent(&app, status_unavailable_fallback).await;
+            let local_cleanup = application.local_stop_pending_cleanup().await;
+            Ok(AppStateResponse::new(
+                state,
+                warning,
+                current_metrics,
+                intent_status,
+                next_retry_at_unix,
+                reserve_state,
+            )
+            .with_local_stop_pending_cleanup(local_cleanup))
+        }
+    })
+    .await
 }
 
 #[cfg(target_os = "android")]
@@ -5002,6 +5027,43 @@ mod tests {
     }
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
+
+    #[tokio::test]
+    async fn nlm071_state_command_rejects_closed_owner_before_and_after_polling() {
+        use std::cell::Cell;
+        let closed = Cell::new(true);
+        let polled = Cell::new(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            polled.set(true);
+            Ok(42)
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code, "runtime_channel_closed");
+        assert!(!polled.get(), "closed owner must not be polled again");
+
+        closed.set(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            closed.set(true);
+            Ok(42)
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "runtime_channel_closed",
+            "an in-flight green reply cannot survive owner closure"
+        );
+
+        closed.set(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            Err::<(), _>(CommandError::new("temporarily_unavailable", "network"))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code, "temporarily_unavailable");
+        assert!(matches!(
+            runtime_state_if_channel_open(|| false, async { Ok(42) }).await,
+            Ok(42)
+        ));
+    }
 
     #[cfg(desktop)]
     #[tokio::test]

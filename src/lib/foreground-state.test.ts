@@ -1,9 +1,12 @@
 import page from "../routes/+page.svelte?raw";
 import ts from "typescript";
+import { parse } from "svelte/compiler";
 import { describe, expect, it } from "vitest";
 import { beginConnectionStart, beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction,
-  beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction } from "./connection-action";
+  beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction, finishConnectionStart,
+  finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
+import { commandCode, commandMessage } from "./native-client";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -11,15 +14,43 @@ const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
-const executable = ts.transpile(callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
+const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen"].includes(node.name?.text ?? ""))
+  .map((node) => node.getText(ast)).join("\n");
+const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
+const toggleCallback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
+  && node.name?.text === "toggleConnection")!;
+const toggle = new Function("context", `with (context) { ${ts.transpile(sharedFunctions + toggleCallback.getText(ast),
+  { target: ts.ScriptTarget.ES2022 })}; return toggleConnection(); }`);
+function executePageFunction(name: string, context: unknown, ...args: unknown[]) {
+  const fn = ast.statements.find((node) => ts.isFunctionDeclaration(node) && node.name?.text === name)!;
+  return new Function("context", "args", `with (context) { ${ts.transpile(
+    sharedFunctions + fn.getText(ast), { target: ts.ScriptTarget.ES2022 })};
+    return ${name}(...args); }`)(context, args);
+}
+
+// Evaluate the real Svelte rendering condition, not a copied UI predicate.
+const template = parse(page, { modern: true });
+const modalBlock = template.fragment.nodes.filter((node) => node.type === "IfBlock")
+  .find((node) => node.consequent.nodes.some((child) => child.type === "Component"
+    && child.name === "SplitTunnelSettings"))!;
+// Svelte's Acorn nodes carry offsets omitted by the base ESTree declarations.
+const modalTest = modalBlock.test as typeof modalBlock.test & { start: number; end: number };
+const modalVisible = new Function("context",
+  `with (context) { return ${page.slice(modalTest.start, modalTest.end)}; }`);
 
 function fixture() {
   let reply!: (value: unknown) => void;
-  const response = new Promise((resolve) => { reply = resolve; });
+  let reject!: (reason: unknown) => void;
+  const response = new Promise((resolve, fail) => { reply = resolve; reject = fail; });
   const context = {
     busy: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
+    runtimeChannelClosed: false,
+    splitTunnelOpen: false, splitTunnelState: null,
+    splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],
+    pinnedStray: null, loadPeers: async () => {},
     connectionActionState: initialConnectionActionState(),
     localStopPendingCleanup: false, connectionMetrics: null, reserveState: null,
     desktopActiveSlot: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
@@ -27,14 +58,355 @@ function fixture() {
     nativeClient: { state: () => response, recordStartupStage: () => {} },
     readDesktopActiveSlot: () => null, viewForAppState: () => "connection",
     loadSplitTunnel: async () => {}, isCurrentConnectionAction, clearOwnedConnectionIntentNotice,
-    beginRuntimeStateSync, initialRuntimeStateSync,
+    beginRuntimeStateSync, initialRuntimeStateSync, commandCode, commandMessage,
   };
   const state = { phase: "connected", connection: null, warning: null, metrics: null,
     reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null };
-  return { context, reply, state };
+  return { context, reply, reject, state };
+}
+
+function logoutFixture() {
+  const result = fixture();
+  Object.assign(result.context, {
+    startupRetry: { cancel: () => {}, schedule: () => {} }, startupPending: false,
+    peers: [{ id: 1 }], selectedPeerId: "1", password: "test-password",
+    diagnosticsStatus: null, updateStatus: null, notifications: [],
+    notificationUnreadCount: 0, notificationNextCursor: null,
+    notificationHistoryExpanded: false, notificationsOpen: false, changelogOpen: false,
+    clearUpdateTimer: () => {},
+  });
+  return result;
 }
 
 describe("foreground native state callback", () => {
+  it("finishes an explicit logout without replacing the confirmed-closure screen with login", async () => {
+    const { context, reject } = logoutFixture();
+    context.phase = "connected";
+    let finishLogout!: () => void;
+    Object.assign(context.nativeClient, {
+      logout: () => new Promise<void>((resolve) => { finishLogout = resolve; }),
+    });
+    const sync = synchronize(context);
+    const logout = executePageFunction("logout", context);
+    reject({ code: "runtime_channel_closed" });
+    await sync;
+    expect(context.view).toBe("unavailable");
+    finishLogout();
+    await logout;
+    expect(context.bootstrap).toBeNull(); // Explicit owner-confirmed sign-out still completes.
+    expect(context.phase).toBe("error");
+    expect(context.view).toBe("unavailable");
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.runtimeWarning).toBe("runtime_channel_closed");
+    expect(context.error).toContain("службой подключения");
+    expect(context.busy).toBe(false);
+  });
+
+  it("still presents login after a normal successful logout on an open channel", async () => {
+    const { context } = logoutFixture();
+    Object.assign(context.nativeClient, { logout: async () => {} });
+    await executePageFunction("logout", context);
+    expect(context.bootstrap).toBeNull();
+    expect(context.phase).toBe("signed_out");
+    expect(context.view).toBe("sign_in");
+    expect(context.runtimeChannelClosed).toBe(false);
+    expect(context.busy).toBe(false);
+  });
+
+  it("ignores a queued login submission after closure without losing the recovery presentation", async () => {
+    const { context } = fixture();
+    let logins = 0;
+    Object.assign(context, {
+      diagnosticsStatus: null, login: "test", password: "test-password", deviceName: "test",
+      DEVICE_NAME_MAX_LENGTH: 100,
+    });
+    Object.assign(context.nativeClient, {
+      login: async () => { logins++; throw { code: "start_cancelled" }; },
+    });
+    executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+    const closureError = context.error;
+    await executePageFunction("submitLogin", context, { preventDefault: () => {} });
+    expect(logins).toBe(0);
+    expect(context.phase).toBe("error");
+    expect(context.view).toBe("unavailable");
+    expect(context.error).toBe(closureError);
+    expect(context.busy).toBe(false);
+  });
+
+  it("handles confirmed EOF during an unrelated busy action without losing the cleanup barrier", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    context.localStopPendingCleanup = true;
+    const account = context.bootstrap;
+    const pending = synchronize(context);
+    context.busy = true;
+    reject({ code: "runtime_channel_closed" });
+    await pending;
+    expect(context.phase).toBe("error");
+    expect(context.view).toBe("unavailable");
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.bootstrap).toBe(account);
+    expect(context.localStopPendingCleanup).toBe(true);
+  });
+
+  it("still discards a successful snapshot during an unrelated busy action", async () => {
+    const { context, reply, state } = fixture();
+    const pending = synchronize(context);
+    context.busy = true;
+    reply(state);
+    await pending;
+    expect(context.phase).toBe("ready");
+    expect(context.runtimeChannelClosed).toBe(false);
+  });
+
+  it("closes split settings on EOF and does not render them if history reopens the overlay", () => {
+    const { context } = fixture();
+    Object.assign(context, { splitTunnelOpen: true, splitTunnelState: { warning: null } });
+    expect(modalVisible(context)).toBeTruthy();
+    executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+    expect(context.splitTunnelOpen).toBe(false);
+    context.splitTunnelOpen = true; // A queued history event cannot expose the modal again.
+    expect(modalVisible(context)).toBeFalsy();
+  });
+
+  for (const [name, args] of [
+    ["saveSplitTunnel", [{}]],
+    ["loadSplitTunnel", [true]],
+    ["addSplitTunnelAddressRule", ["example.test", "this_device"]],
+    ["removeSplitTunnelAddressRule", [1, "this_device"]],
+  ] as const) {
+    it(`rejects ${name} without issuing a native request after confirmed closure`, async () => {
+      const { context } = fixture();
+      context.runtimeChannelClosed = true;
+      let requests = 0;
+      const nativeState = async () => { requests++; return { warning: null }; };
+      Object.assign(context.nativeClient, {
+        saveSplitTunnel: async () => { requests++; return { saved: true, state: { warning: null } }; },
+        splitTunnelInstalledApplications: async () => { requests++; return []; },
+        refreshSplitTunnel: nativeState, addSplitTunnelAddressRule: nativeState,
+        removeSplitTunnelAddressRule: nativeState,
+      });
+      await expect(executePageFunction(name, context, ...args)).rejects.toMatchObject({
+        code: "runtime_channel_closed",
+      });
+      expect(requests).toBe(0);
+    });
+  }
+
+  it("keeps the closure screen when an already queued unbind succeeds late", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    let stateRequested!: () => void;
+    const entered = new Promise<void>((resolve) => { stateRequested = resolve; });
+    const state = context.nativeClient.state;
+    let finishUnbind!: () => void;
+    Object.assign(context.nativeClient, {
+      saveSplitTunnel: async () => { throw { code: "temporarily_unavailable" }; },
+      state: () => { stateRequested(); return state(); },
+      unbindPeer: () => new Promise<void>((resolve) => { finishUnbind = resolve; }),
+    });
+    const account = context.bootstrap;
+    const split = executePageFunction("saveSplitTunnel", context, {}).catch(() => {});
+    await entered;
+    const unbind = executePageFunction("unbindPeer", context);
+    reject({ code: "runtime_channel_closed" });
+    await split;
+    expect(context.view).toBe("unavailable");
+    finishUnbind();
+    await unbind;
+    expect(context.phase).toBe("error");
+    expect(context.view).toBe("unavailable");
+    expect(context.bootstrap).toBe(account);
+    expect(context.runtimeChannelClosed).toBe(true);
+  });
+
+  it("does not confirm or resubmit a split restart when its first Save reply arrives after EOF", async () => {
+    const { context } = fixture();
+    let finish!: (value: unknown) => void;
+    let saves = 0;
+    let confirmations = 0;
+    Object.assign(context, { window: { confirm: () => { confirmations++; return true; } } });
+    Object.assign(context.nativeClient, {
+      saveSplitTunnel: () => { saves++; return new Promise((resolve) => { finish = resolve; }); },
+    });
+    const pending = executePageFunction("saveSplitTunnel", context, {});
+    executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+    finish({ saved: false, requiresReconnectConfirmation: true, state: { warning: null } });
+    await expect(pending).rejects.toMatchObject({ code: "runtime_channel_closed" });
+    expect(confirmations).toBe(0);
+    expect(saves).toBe(1);
+    expect(context.splitTunnelState).toBeNull();
+  });
+
+  it("does not issue forced synchronization after EOF arrives during the application-list read", async () => {
+    const { context } = fixture();
+    let finish!: (value: unknown) => void;
+    let refreshes = 0;
+    Object.assign(context.nativeClient, {
+      splitTunnelInstalledApplications: () => new Promise((resolve) => { finish = resolve; }),
+      refreshSplitTunnel: async () => { refreshes++; return { warning: null }; },
+    });
+    const pending = executePageFunction("loadSplitTunnel", context, true);
+    executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+    finish([{ packageName: "test.package" }]);
+    await pending;
+    expect(refreshes).toBe(0);
+    expect(context.splitTunnelApplications).toEqual([]);
+    expect(context.splitTunnelState).toBeNull();
+    expect(context.view).toBe("unavailable");
+  });
+  it("removes protected presentation on confirmed owner closure without losing the account or cleanup barrier", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    context.localStopPendingCleanup = true;
+    Object.assign(context, {
+      connection: { leaseId: "old" }, connectionMetrics: { bytes: 42 }, reserveState: "ready",
+    });
+    const account = context.bootstrap;
+    const pending = synchronize(context);
+    reject({ code: "runtime_channel_closed", message: "private detail" });
+    await pending;
+    expect(context.phase).toBe("error");
+    expect(context.view).toBe("unavailable");
+    expect(context.error).toContain("службой подключения");
+    expect(context.bootstrap).toBe(account);
+    expect(context.localStopPendingCleanup).toBe(true);
+    expect(context.connection).toBeNull();
+    expect(context.connectionMetrics).toBeNull();
+    expect(context.reserveState).toBeNull();
+    expect(context.runtimeStateSync.pending).toBe(false);
+  });
+
+  it("does not confuse a transient network error with closed IPC", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    const pending = synchronize(context);
+    reject({ code: "temporarily_unavailable" });
+    await pending;
+    expect(context.phase).toBe("connected");
+    expect(context.error).toBeNull();
+  });
+
+  it("ignores a closed-channel reply retired by a newer Stop", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    const pending = synchronize(context);
+    context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+    context.phase = "stopping";
+    reject({ code: "runtime_channel_closed" });
+    await pending;
+    expect(context.phase).toBe("stopping");
+    expect(context.error).toBeNull();
+  });
+
+  it("does not apply owner closure to a replaced account view", async () => {
+    const { context, reject } = fixture();
+    context.phase = "connected";
+    const pending = synchronize(context);
+    context.bootstrap = { binding: {} };
+    context.phase = "signed_out";
+    reject({ code: "runtime_channel_closed" });
+    await pending;
+    expect(context.phase).toBe("signed_out");
+    expect(context.error).toBeNull();
+  });
+
+  it("does not expose a fresh Start if EOF follows a successful Start", async () => {
+    const { context } = fixture();
+    let starts = 0;
+    Object.assign(context, {
+      bootstrap: { device: { id: "own-device", platform: "android" }, binding: {} },
+      connectionAction: "start", runtimeStatus: null, splitTunnelBlocksStart: false,
+      runtimeStartBlocked: () => false, selectedLayer: "tic", ticConnectionMode: "dynamic",
+      routeMode: "via_tak", selectedEgressMode: "ipv4", antivirusStartFailure: false,
+      prepareConnectionStartForPlatform, canBeginConnectionAction, beginConnectionStart,
+      beginConnectionStop, finishConnectionStart, finishConnectionStop,
+      pendingBindingPreferenceRequest: () => null,
+    });
+    Object.assign(context.nativeClient, {
+      prepareTunnel: async () => {},
+      start: async () => { starts++; return { status: "connected", connection: { leaseId: "own" } }; },
+      state: async () => { throw { code: "runtime_channel_closed" }; },
+    });
+    await toggle(context);
+    expect(context.view).toBe("unavailable");
+    expect(context.phase).toBe("error");
+    expect(context.connectionIntentStatus).toBe("blocked_terminal");
+    expect(context.error).toContain("службой подключения");
+    await toggle(context);
+    expect(starts).toBe(1);
+  });
+
+  it("does not advertise retry through the same permanently closed owner", async () => {
+    const { context } = fixture();
+    context.runtimeChannelClosed = true;
+    context.runtimeWarning = "runtime_channel_closed";
+    context.localStopPendingCleanup = true;
+    let bootstraps = 0;
+    Object.assign(context.nativeClient, { bootstrap: async () => { bootstraps++; } });
+    await executePageFunction("restore", context);
+    expect(bootstraps).toBe(0);
+    expect(context.localStopPendingCleanup).toBe(true);
+    expect(page).toContain("{#if !runtimeChannelClosed}");
+  });
+
+  it("removes protected presentation if the split-error state read discovers EOF", async () => {
+    const { context } = fixture();
+    context.phase = "connected";
+    const failure = { code: "temporarily_unavailable" };
+    Object.assign(context.nativeClient, {
+      saveSplitTunnel: async () => { throw failure; },
+      state: async () => { throw { code: "runtime_channel_closed" }; },
+    });
+    await expect(executePageFunction("saveSplitTunnel", context, {})).rejects.toBe(failure);
+    expect(context.view).toBe("unavailable");
+    expect(context.phase).toBe("error");
+    expect(context.connectionIntentStatus).toBe("blocked_terminal");
+  });
+
+  for (const first of ["periodic", "split"] as const) {
+    it(`discards a late successful ${first} reply after the other reader observes EOF`, async () => {
+      const { context, reply, state } = fixture();
+      context.phase = "connected";
+      const response = context.nativeClient.state();
+      let reads = 0;
+      Object.assign(context.nativeClient, {
+        state: () => ++reads === 1 ? response : Promise.reject({ code: "runtime_channel_closed" }),
+        saveSplitTunnel: async () => { throw { code: "temporarily_unavailable" }; },
+      });
+      const split = () => executePageFunction("saveSplitTunnel", context, {}).catch(() => {});
+      const pending = first === "periodic" ? synchronize(context) : split();
+      await Promise.resolve();
+      await (first === "periodic" ? split() : synchronize(context));
+      expect(context.phase).toBe("error");
+      reply(state);
+      await pending;
+      expect(context.phase).toBe("error");
+      expect(context.view).toBe("unavailable");
+      expect(context.runtimeChannelClosed).toBe(true);
+    });
+  }
+
+  it("keeps closure sticky when a late split warning update clears ordinary warnings", async () => {
+    const { context } = fixture();
+    executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+    context.runtimeWarning = null;
+    let bootstraps = 0;
+    Object.assign(context.nativeClient, { bootstrap: async () => { bootstraps++; } });
+    await executePageFunction("restore", context);
+    expect(bootstraps).toBe(0);
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.view).toBe("unavailable");
+  });
+
+  it("renders full-relaunch guidance from the closure latch, not a mutable action error", () => {
+    const closedView = page.match(/\{#if runtimeChannelClosed\}([\s\S]*?)\{:else if error\}/)?.[1];
+    expect(closedView).toBeDefined();
+    expect(closedView).toContain("Полностью завершите Nelomai");
+    expect(closedView).toContain("Данные очищать не нужно");
+    expect(closedView).not.toContain("{error}");
+  });
+
   it("does not expose a blocking state during a periodic poll", async () => {
     const { context, reply, state } = fixture();
     const pending = synchronize(context, false);

@@ -93,6 +93,9 @@
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
   let localStopPendingCleanup = $state(false);
+  // A private client cannot reopen a closed channel. Reset only on full launch,
+  // never through mutable split warnings or a delayed successful state reply.
+  let runtimeChannelClosed = $state(false);
   let bootstrap = $state<Bootstrap | null>(null);
   let peers = $state<PeerOption[]>([]);
   let selectedPeerId = $state("");
@@ -307,7 +310,7 @@
       const overlay = bootstrap
         ? overlayFromHistoryState(window.history.state)
         : null;
-      splitTunnelOpen = overlay === "split_tunnel" && splitTunnelState !== null;
+      splitTunnelOpen = !runtimeChannelClosed && overlay === "split_tunnel" && splitTunnelState !== null;
       notificationsOpen = overlay === "notifications";
       changelogOpen = overlay === "changelog";
     };
@@ -332,6 +335,7 @@
 
   function showOverlay(overlay: AppOverlay) {
     if (!bootstrap) return;
+    if (runtimeChannelClosed && overlay === "split_tunnel") return;
     if (overlayFromHistoryState(window.history.state) !== overlay) {
       window.history.pushState(
         historyStateForOverlay(window.history.state, overlay),
@@ -481,9 +485,37 @@
     }
   }
 
+  function applyRuntimeChannelClosure(reason: unknown): boolean {
+    if (commandCode(reason) !== "runtime_channel_closed") return false;
+    // Owner EOF is not logout, remote cleanup success, or a network timeout.
+    // Keep the account/cleanup barrier; only retire unverified presentation.
+    runtimeChannelClosed = true;
+    splitTunnelOpen = false;
+    phase = "error";
+    connection = null;
+    connectionMetrics = null;
+    reserveState = null;
+    runtimeWarning = "runtime_channel_closed";
+    connectionIntentStatus = "blocked_terminal";
+    nextRetryAtUnix = null;
+    ownedConnectionIntentNotice = null;
+    error = "Потеряна связь со службой подключения. Статус защиты неизвестен.";
+    view = "unavailable";
+    return true;
+  }
+
+  function requireRuntimeChannelOpen() {
+    if (runtimeChannelClosed) {
+      throw {
+        code: "runtime_channel_closed",
+        message: "Потеряна связь со службой подключения",
+      };
+    }
+  }
+
   async function synchronizeRuntimeState(foreground = true) {
     if (
-      busy ||
+      runtimeChannelClosed || busy ||
       !bootstrap?.binding ||
       !["ready", "connecting", "connected", "stopping"].includes(phase)
     ) {
@@ -496,9 +528,17 @@
       const previous = phase;
       const observedBootstrap = bootstrap;
       const actionEpoch = connectionActionState.epoch;
-      const current = await nativeClient.state().catch(() => null);
-      if (!current || busy || bootstrap !== observedBootstrap ||
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      // A confirmed EOF outranks unrelated UI busy work, unlike a successful
+      // snapshot. Account/action retirement still protects newer user intent.
+      if (applyRuntimeChannelClosure(stateError)) return;
+      if (busy || !current) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
@@ -540,6 +580,7 @@
   }
 
   async function restore() {
+    if (runtimeChannelClosed) return;
     startupRetry.cancel();
     startupPending = false;
     refreshPending = false;
@@ -557,6 +598,7 @@
       const response = await nativeClient.bootstrap();
       await applyBootstrap(response);
     } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
@@ -585,6 +627,7 @@
   }
 
   async function applyBootstrap(response: Bootstrap) {
+    if (runtimeChannelClosed) return;
     startupRetry.cancel();
     startupPending = false;
     localStopPendingCleanup = false;
@@ -614,6 +657,7 @@
     }
 
     const state = await nativeClient.state();
+    if (runtimeChannelClosed) return;
     phase = state.phase;
     localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
@@ -633,7 +677,7 @@
 
   async function submitLogin(event: SubmitEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (runtimeChannelClosed || busy) return;
     busy = true;
     error = null;
     diagnosticsStatus = null;
@@ -649,6 +693,7 @@
       password = "";
       await applyBootstrap(response);
     } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       phase = "signed_out";
       view = "sign_in";
       void nativeClient.recordStartupStage("sign_in_login_failed");
@@ -695,6 +740,7 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (runtimeChannelClosed && !forceStop) return;
     if (localStopPendingCleanup && !forceStop) return;
     if (
       !forceStop &&
@@ -724,6 +770,7 @@
     try {
       if (stopping) {
         connection = await nativeClient.stop();
+        if (runtimeChannelClosed) return;
         connectionMetrics = null;
         reserveState = null;
         connectionIntentStatus = "none";
@@ -750,7 +797,7 @@
           egressMode: selectedEgressMode,
           allowAlternate: true,
         });
-        if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+        if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
         connection = startResult.connection;
         connectionIntentStatus = startResult.status === "recovering" ? "recovering" : "none";
         nextRetryAtUnix = startResult.nextRetryAtUnix;
@@ -767,14 +814,15 @@
       }
       view = "connection";
       const current = await nativeClient.state();
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       phase = current.phase;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
     } catch (reason) {
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (applyRuntimeChannelClosure(reason)) return;
       const failureCode = commandCode(reason);
       if (shouldReportStartFailure && startDeviceId) {
         await waitForSettlement(
@@ -785,8 +833,13 @@
           START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS,
         );
       }
-      const current = await nativeClient.state().catch(() => null);
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (applyRuntimeChannelClosure(stateError)) return;
       localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
@@ -885,11 +938,12 @@
   }
 
   async function unbindPeer() {
-    if (busy) return;
+    if (runtimeChannelClosed || busy) return;
     busy = true;
     error = null;
     try {
       await nativeClient.unbindPeer();
+      if (runtimeChannelClosed) return;
       connection = null;
       reserveState = null;
       pinnedStray = null;
@@ -900,6 +954,7 @@
       view = "peer_selection";
       await loadPeers();
     } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       error = commandMessage(reason, "unbind_peer");
     } finally {
       busy = false;
@@ -979,8 +1034,14 @@
       notificationsOpen = false;
       changelogOpen = false;
       clearUpdateTimer();
-      phase = "signed_out";
-      view = "sign_in";
+      // The confirmed sign-out clears the account above, but cannot reopen a
+      // closed owner channel or replace its mandatory relaunch presentation.
+      if (runtimeChannelClosed) {
+        applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
+      } else {
+        phase = "signed_out";
+        view = "sign_in";
+      }
       void nativeClient.recordStartupStage("sign_in_logout_completed");
     } catch (reason) {
       error = commandMessage(reason, "logout");
@@ -1180,16 +1241,28 @@
   }
 
   async function loadSplitTunnel(force: boolean) {
+    if (runtimeChannelClosed) {
+      if (force) requireRuntimeChannelOpen();
+      return;
+    }
     if (splitTunnelBusy) return;
     splitTunnelBusy = true;
     try {
-      splitTunnelApplications =
+      const applications =
         await nativeClient.splitTunnelInstalledApplications();
-      splitTunnelState = force
+      if (runtimeChannelClosed) return;
+      const state = force
         ? await nativeClient.refreshSplitTunnel()
         : await nativeClient.splitTunnelState();
-      runtimeWarning = splitTunnelState.warning;
-    } catch {
+      if (runtimeChannelClosed) return;
+      splitTunnelApplications = applications;
+      splitTunnelState = state;
+      runtimeWarning = state.warning;
+    } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) {
+        if (force) throw reason;
+        return;
+      }
       if (force) throw new Error("split_tunnel_refresh_failed");
     } finally {
       splitTunnelLoaded = true;
@@ -1198,26 +1271,43 @@
   }
 
   async function openSplitTunnel() {
+    if (runtimeChannelClosed) return;
     await loadSplitTunnel(false);
+    if (runtimeChannelClosed) return;
     if (splitTunnelState) showOverlay("split_tunnel");
   }
 
   async function saveSplitTunnel(
     request: SplitTunnelSettingsUpdate,
   ): Promise<boolean> {
+    requireRuntimeChannelOpen();
+    const observedBootstrap = bootstrap;
+    const actionEpoch = connectionActionState.epoch;
     try {
       let response = await nativeClient.saveSplitTunnel(request, false);
+      requireRuntimeChannelOpen();
       if (response.requiresReconnectConfirmation) {
         const confirmed = window.confirm(
           "Чтобы применить настройки, текущее подключение будет кратковременно перезапущено. Продолжить?",
         );
         if (!confirmed) return false;
         response = await nativeClient.saveSplitTunnel(request, true);
+        requireRuntimeChannelOpen();
       }
       splitTunnelState = response.state;
       return response.saved;
     } catch (reason) {
-      const current = await nativeClient.state().catch(() => null);
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) throw reason;
+      if (applyRuntimeChannelClosure(reason)) throw reason;
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) throw reason;
+      if (applyRuntimeChannelClosure(stateError)) throw reason;
       if (current) {
         phase = current.phase;
         localStopPendingCleanup = current.localStopPendingCleanup === true;
@@ -1236,16 +1326,22 @@
     value: string,
     scope: SplitTunnelAddressRule["scope"],
   ): Promise<void> {
-    splitTunnelState = await nativeClient.addSplitTunnelAddressRule(value, scope);
-    runtimeWarning = splitTunnelState.warning;
+    requireRuntimeChannelOpen();
+    const state = await nativeClient.addSplitTunnelAddressRule(value, scope);
+    requireRuntimeChannelOpen();
+    splitTunnelState = state;
+    runtimeWarning = state.warning;
   }
 
   async function removeSplitTunnelAddressRule(
     ruleId: number,
     scope: SplitTunnelAddressRule["scope"],
   ): Promise<void> {
-    splitTunnelState = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
-    runtimeWarning = splitTunnelState.warning;
+    requireRuntimeChannelOpen();
+    const state = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
+    requireRuntimeChannelOpen();
+    splitTunnelState = state;
+    runtimeWarning = state.warning;
   }
 
   function updateProgress(status: UpdateStatus): string {
@@ -1911,18 +2007,25 @@
       </div>
     {:else}
       <div class="panel message-panel">
-        <p class="eyebrow">Подключение к панели</p>
+        <p class="eyebrow">{runtimeChannelClosed ? "Служба подключения" : "Подключение к панели"}</p>
         <h1>{startupPending ? (refreshPending ? "Восстанавливаем соединение с аккаунтом" : "Завершаем подготовку приложения") : "Сейчас сервис недоступен"}</h1>
-        {#if error}<p class="error-message">{error}</p>{/if}
-        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
-          {busy ? "Проверяем…" : "Повторить"}
-        </button>
+        {#if runtimeChannelClosed}
+          <p class="error-message">Потеряна связь со службой подключения. Статус защиты неизвестен.</p>
+          <p>Полностью завершите Nelomai и заново откройте приложение. На Android: Настройки → Приложения → Nelomai → Остановить. Данные очищать не нужно.</p>
+        {:else if error}
+          <p class="error-message">{error}</p>
+        {/if}
+        {#if !runtimeChannelClosed}
+          <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+            {busy ? "Проверяем…" : "Повторить"}
+          </button>
+        {/if}
       </div>
     {/if}
   </section>
 </main>
 
-{#if splitTunnelOpen && splitTunnelState}
+{#if !runtimeChannelClosed && splitTunnelOpen && splitTunnelState}
   <SplitTunnelSettings
     state={splitTunnelState}
     applications={splitTunnelApplications}

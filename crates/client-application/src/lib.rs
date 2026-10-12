@@ -810,6 +810,10 @@ where
         self.core.state().await
     }
 
+    pub fn runtime_channel_closed(&self) -> bool {
+        self.core.runtime_channel_closed()
+    }
+
     pub async fn begin_foreground_observation(&self) -> nelomai_client_core::ForegroundObservation {
         self.core.begin_foreground_observation().await
     }
