@@ -1132,9 +1132,10 @@ fn validate_unstarted_closing(
 }
 
 #[derive(Clone, Copy)]
-enum MemberOperation {
+enum MemberOperation<'a> {
     Start,
     Stop,
+    ClosedStop(&'a crate::member_owner::Record),
     Retire,
 }
 
@@ -1142,7 +1143,7 @@ fn validate_member_operation(
     context: &crate::member_carrier_native_ownership::Context,
     expected: &crate::member_carrier_pair::Record,
     intent: &crate::member_owner::Intent,
-    operation: MemberOperation,
+    operation: MemberOperation<'_>,
 ) -> crate::member_carrier::Result<()> {
     use crate::{member_carrier::CarrierError as Error, member_carrier_pair as pair};
     use nelomai_client_tunnel::redundancy::Slot;
@@ -1152,12 +1153,12 @@ fn validate_member_operation(
         TunnelSlot::A => (0, Slot::A),
         TunnelSlot::B => (1, Slot::B),
     };
-    let member = expected.members[index].as_ref().ok_or(Error::Conflict)?;
+    let member = expected.members[index].as_ref();
     if expected.scope != context.intent.scope
         || intent.scope != context.intent.scope
         || expected.provenance != context.provenance
         || expected.addresses != context.intent.addresses
-        || member.owner.intent != *intent
+        || member.is_some_and(|m| m.owner.intent != *intent)
     {
         return Err(Error::Conflict);
     }
@@ -1167,11 +1168,33 @@ fn validate_member_operation(
                 && expected.pending == Some(pair::Effect::MemberStart(slot))
                 && expected.stop_stage == 0
                 && expected.operation.is_some()
-                && member.owner.phase == crate::member_owner::Phase::Prepared
-                && member.owner.proof.is_none()
+                && member.is_some_and(|m| {
+                    m.owner.phase == crate::member_owner::Phase::Prepared && m.owner.proof.is_none()
+                })
         }
         MemberOperation::Stop => {
-            expected.phase == pair::Phase::Closing
+            member.is_some()
+                && expected.phase == pair::Phase::Closing
+                && expected.active.is_none()
+                && expected.operation.is_none()
+                && expected.stop_stage == 4 + index as u8
+                && expected.pending == Some(pair::Effect::MemberStop(slot))
+        }
+        // Comparison only: the caller must borrow THIS completed owner's opaque
+        // Closed ACK and reattest its history/native absence around this envelope.
+        MemberOperation::ClosedStop(stopped) => {
+            crate::member_owner::validate_record_shape(stopped).is_ok()
+                && stopped.intent == *intent
+                && stopped.phase == crate::member_owner::Phase::Stopped
+                && stopped.proof.is_none()
+                && stopped
+                    .retired_proof
+                    .is_some_and(|p| p.interface.guid == context.bindings[index + 1].guid)
+                && member.is_none()
+                && expected.guard.members[index].is_none()
+                && !expected.guard.permits
+                && expected.pending_guard.is_none()
+                && expected.phase == pair::Phase::Closing
                 && expected.active.is_none()
                 && expected.operation.is_none()
                 && expected.stop_stage == 4 + index as u8
@@ -4562,20 +4585,20 @@ pub(crate) mod native {
                 let closing = closing.ok_or(Error::Conflict)?;
                 if !self.root.attempted {
                     let owned = self.root.owner.as_ref().ok_or(Error::Retired)?;
-                    owned.cleanup_envelope(pair, expected, lock)?;
+                    owned.cleanup_envelope(pair, expected, lock, None)?;
                     closing
                         .inspect_window(|_| Ok(()))
                         .map_err(|_| Error::Conflict)?;
-                    return owned.cleanup_envelope(pair, expected, lock);
+                    return owned.cleanup_envelope(pair, expected, lock, None);
                 }
                 if self.root.closed_registered {
                     return self.verify_absent(pair, expected, Some(closing), lock);
                 }
                 let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
                 if let Some(receipt) = &self.root.closed {
-                    owned.cleanup_envelope(pair, expected, lock)?;
+                    owned.cleanup_envelope(pair, expected, lock, None)?;
                     owned.member.verify_closed(receipt).map_err(owner_error)?;
-                    return owned.cleanup_envelope(pair, expected, lock);
+                    return owned.cleanup_envelope(pair, expected, lock, None);
                 }
                 return owned.partial_stop_preflight(pair, expected, lock);
             }
@@ -4597,6 +4620,19 @@ pub(crate) mod native {
             if !self.root.closed_registered {
                 return Err(Error::Pending);
             }
+            let stopped = self.root.stopped.as_ref().ok_or(Error::Pending)?;
+            let previously_retired = expected.phase == pair::Phase::Closing
+                && expected.members[slot_index(stopped.intent.slot)].is_none();
+            // Missing Pair data only selects this lane. A partial/lost publish
+            // ACK cannot claim a completed Retire or skip the ordinary Stop path.
+            if previously_retired
+                && (!self.root.completed
+                    || !self.root.registered
+                    || self.root.running.is_none()
+                    || self.root.reader.is_none())
+            {
+                return Err(Error::Pending);
+            }
             let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
             let receipt = self.root.closed.as_ref().ok_or(Error::Pending)?;
             let envelope = |owned: &OwnedMember<G>, lock: &mut KeyLock| {
@@ -4604,7 +4640,12 @@ pub(crate) mod native {
                     if closing.is_none() {
                         return Err(Error::Conflict);
                     }
-                    owned.cleanup_envelope(pair, expected, lock)
+                    owned.cleanup_envelope(
+                        pair,
+                        expected,
+                        lock,
+                        previously_retired.then_some(stopped),
+                    )
                 } else {
                     if closing.is_some() {
                         return Err(Error::Conflict);
@@ -5240,6 +5281,14 @@ pub(crate) mod native {
             closing: &NativeClosingRead,
             lock: &mut KeyLock,
         ) -> Result<MemberRecord> {
+            let slot = self.root.owner.as_ref().ok_or(Error::Retired)?.intent.slot;
+            if expected.members[slot_index(slot)].is_none() {
+                // Completed Retire already published THIS original Closed ACK.
+                // No new Stop/register effect: independently prove that same
+                // owner and full fresh Closing absence before acknowledging.
+                self.verify_absent(pair_read, expected, Some(closing), lock)?;
+                return self.root.stopped.clone().ok_or(Error::Pending);
+            }
             let owned = self.root.owner.as_mut().ok_or(Error::Retired)?;
             let context = owned.context.clone();
             let runtime = owned.runtime.read_pin()?;
@@ -5252,7 +5301,7 @@ pub(crate) mod native {
                 // No new native effect: republish only our rooted SAME Stop ACK.
                 // A Closing full inventory cannot precede this republish: its
                 // old live entry may already be absent after a lost register ACK.
-                owned.cleanup_envelope(pair_read, expected, lock)
+                owned.cleanup_envelope(pair_read, expected, lock, None)
             } else {
                 owned.partial_stop_preflight(pair_read, expected, lock)
             };
@@ -5329,7 +5378,7 @@ pub(crate) mod native {
                                 eprintln!("actual native Stop source slot={index}: {_error:?}");
                             })?;
                         owned
-                            .cleanup_envelope(pair_read, expected, lock)
+                            .cleanup_envelope(pair_read, expected, lock, None)
                             .inspect_err(|_error| {
                                 #[cfg(all(windows, test))]
                                 eprintln!("actual native Stop cleanup slot={index}: {_error:?}");
@@ -5356,7 +5405,7 @@ pub(crate) mod native {
                                 );
                             })?;
                         owned
-                            .cleanup_envelope(pair_read, expected, lock)
+                            .cleanup_envelope(pair_read, expected, lock, None)
                             .inspect_err(|_error| {
                                 #[cfg(all(windows, test))]
                                 eprintln!(
@@ -5610,7 +5659,7 @@ pub(crate) mod native {
             expected: &PairRecord,
             lock: &mut KeyLock,
         ) -> Result<()> {
-            self.cleanup_envelope(pair, expected, lock)?;
+            self.cleanup_envelope(pair, expected, lock, None)?;
             self.inventory
                 .verify_pending_cleanup(&self.source, &self.pending)?;
             if self.partial_cleanup.is_none() {
@@ -5639,7 +5688,7 @@ pub(crate) mod native {
                 )?;
             self.inventory
                 .verify_pending_cleanup(&self.source, &self.pending)?;
-            self.cleanup_envelope(pair, expected, lock)
+            self.cleanup_envelope(pair, expected, lock, None)
         }
         fn verify_sources(&self) -> Result<()> {
             self.member
@@ -5842,13 +5891,14 @@ pub(crate) mod native {
             pair_read: &NativePairIntentRead,
             expected: &PairRecord,
             lock: &mut KeyLock,
+            closed: Option<&MemberRecord>,
         ) -> Result<()> {
             self.verify_sources()?;
             validate_member_operation(
                 &self.context,
                 expected,
                 &self.intent,
-                MemberOperation::Stop,
+                closed.map_or(MemberOperation::Stop, MemberOperation::ClosedStop),
             )?;
             let native = self
                 .runtime

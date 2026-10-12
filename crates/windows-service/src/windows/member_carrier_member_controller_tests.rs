@@ -1984,6 +1984,64 @@ fn closed_generation_receipt_precondition_requires_completed_retire_not_old_live
     retired.active = Some(nelomai_client_tunnel::redundancy::Slot::B);
     retired.validate().unwrap();
     validate_closed_generation_retirement(&context, &retired, &stopped).unwrap();
+    // Full Stop must reattest this completed Retire's original Closed history,
+    // symmetrically for A and B, without admitting ordinary unknown-member Stop.
+    for (index, slot, native_slot) in [
+        (
+            0,
+            nelomai_client_tunnel::redundancy::Slot::A,
+            nelomai_contracts::dispatcher::TunnelSlot::A,
+        ),
+        (
+            1,
+            nelomai_client_tunnel::redundancy::Slot::B,
+            nelomai_contracts::dispatcher::TunnelSlot::B,
+        ),
+    ] {
+        let mut closing = retired.clone();
+        closing.members = [None, None];
+        closing.phase = pair::Phase::Closing;
+        closing.active = None;
+        closing.stop_stage = 4 + index as u8;
+        closing.pending = Some(pair::Effect::MemberStop(slot));
+        let mut original = stopped.clone();
+        original.intent.slot = native_slot;
+        original.retired_proof.as_mut().unwrap().interface.guid = context.bindings[index + 1].guid;
+        closing.validate().unwrap();
+        assert!(validate_member_operation(
+            &context,
+            &closing,
+            &original.intent,
+            MemberOperation::Stop
+        )
+        .is_err());
+        validate_member_operation(
+            &context,
+            &closing,
+            &original.intent,
+            MemberOperation::ClosedStop(&original),
+        )
+        .unwrap();
+        for fault in 0..7 {
+            let (mut p, mut ack) = (closing.clone(), original.clone());
+            match fault {
+                0 => ack.retired_proof = None,
+                1 => ack.phase = owner::Phase::Prepared,
+                2 => ack.intent.config_sha256 = [99; 32],
+                3 => ack.retired_proof.as_mut().unwrap().interface.guid = [99; 16],
+                4 => p.stop_stage = 4 + (1 - index) as u8,
+                5 => p.pending = Some(pair::Effect::MemberStop(slot.other())),
+                _ => p.members[index] = current.members[0].clone(),
+            }
+            assert!(validate_member_operation(
+                &context,
+                &p,
+                &original.intent,
+                MemberOperation::ClosedStop(&ack)
+            )
+            .is_err());
+        }
+    }
     for fault in 0..7 {
         let (mut p, mut ack) = (retired.clone(), stopped.clone());
         match fault {
