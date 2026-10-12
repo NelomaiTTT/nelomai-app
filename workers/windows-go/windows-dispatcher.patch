@@ -1,0 +1,98 @@
+--- a/redundant_tun.go
++++ b/redundant_tun.go
+@@ -57,6 +57,7 @@
+ 	slot      uint32
+ 	identity  probeIdentity
+ 	status    probeStatus
++	replies   [][]byte
+ 	expiresAt time.Time
+ }
+ 
+@@ -605,36 +606,38 @@
+ 				r.counters.inactiveInboundDrops.Add(1)
+ 				continue
+ 			}
+-			if slot.inflight.Add(1) > redundantTunnelMaxInflightWritesPerSlot {
+-				slot.inflight.Add(-1)
+-				r.routeMu.RUnlock()
+-				r.counters.inboundWriteDropped.Add(1)
+-				continue
+-			}
++			// Windows: the existing per-slot inbound queue supplies backpressure.
++			// Hold routeMu across this single Write; Switch waits only this call.
++			slot.inflight.Add(1)
+ 			r.writeWait.Add(1)
++			err := r.writeInboundPacket(slot, packet.payload)
+ 			r.routeMu.RUnlock()
+-			go r.writeInboundPacket(slot, packet.payload)
+-		}
+-	}
+-}
+-
+-func (r *RedundantTunnel) writeInboundPacket(slot *channelTUN, packet []byte) {
++			if err != nil {
++				// Never enter closeWithError while owning routeMu.RLock.
++				r.closeWithError(fmt.Errorf("write real TUN: %w", err))
++				return
++			}
++		}
++	}
++}
++
++func (r *RedundantTunnel) writeInboundPacket(slot *channelTUN, packet []byte) error {
+ 	defer r.writeWait.Done()
+ 	defer slot.inflight.Add(-1)
+ 	err := normalizeRedundantWriterError(r.writer.WritePacket(packet))
+ 	if err == nil {
+ 		r.counters.inboundPackets.Add(1)
+ 		r.counters.inboundBytes.Add(uint64(len(packet)))
+-		return
++		return nil
+ 	}
+ 	if errors.Is(err, ErrRedundantWriterWouldBlock) {
+ 		r.counters.inboundWriteDropped.Add(1)
+-		return
++		return nil
+ 	}
+ 	if r.closed.Load() || errors.Is(err, os.ErrClosed) {
+-		return
+-	}
+-	r.closeWithError(fmt.Errorf("write real TUN: %w", err))
++		return nil
++	}
++	return err
+ }
+ 
+ func (r *RedundantTunnel) consumeProbeReply(slot uint32, packet []byte) bool {
+@@ -651,9 +654,11 @@
+ 		r.probeMu.Unlock()
+ 		return false
+ 	}
+-	if state.status == probePending {
+-		state.status = probeSucceeded
+-		state.expiresAt = now.Add(redundantTunnelProbeRetention)
++	// Retain actual DNS bytes; Rust remains responsible for answer validation.
++	udpOffset := 40
++	if packet[0]>>4 == 4 { udpOffset = int(packet[0]&0x0f) * 4 }
++	if len(packet)-udpOffset-8 <= 4096 && len(state.replies) < 8 {
++		state.replies = append(state.replies, append([]byte(nil), packet[udpOffset+8:]...))
+ 		r.probes[token] = state
+ 	}
+ 	r.probeMu.Unlock()
+@@ -1039,3 +1044,16 @@
+ 	a.slot.owner.routeMu.Unlock()
+ 	return nil
+ }
++
++// TakeProbeReply transfers one genuine matched DNS datagram, never a success flag.
++func (r *RedundantTunnel) TakeProbeReply(token ProbeToken) []byte {
++	r.probeMu.Lock()
++	defer r.probeMu.Unlock()
++	state, exists := r.probes[token]
++	if !exists || len(state.replies) == 0 { return nil }
++	reply := state.replies[0]
++	state.replies[0] = nil
++	state.replies = state.replies[1:]
++	r.probes[token] = state
++	return reply
++}

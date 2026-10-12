@@ -1,0 +1,48 @@
+--- a/conn/bind_windows.go
++++ b/conn/bind_windows.go
+@@ -517,6 +517,7 @@
+ func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if s.ipv4 == nil { return windows.WSAEAFNOSUPPORT }
+ 	sysconn, err := s.ipv4.SyscallConn()
+ 	if err != nil {
+ 		return err
+@@ -537,6 +538,7 @@
+ func (s *StdNetBind) BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	if s.ipv6 == nil { return windows.WSAEAFNOSUPPORT }
+ 	sysconn, err := s.ipv6.SyscallConn()
+ 	if err != nil {
+ 		return err
+@@ -584,18 +586,24 @@
+ 
+ func bindSocketToInterface4(handle windows.Handle, interfaceIndex uint32) error {
+ 	const IP_UNICAST_IF = 31
++	hostIndex := interfaceIndex
+ 	/* MSDN says for IPv4 this needs to be in net byte order, so that it's like an IP address with leading zeros. */
+ 	var bytes [4]byte
+ 	binary.BigEndian.PutUint32(bytes[:], interfaceIndex)
+ 	interfaceIndex = *(*uint32)(unsafe.Pointer(&bytes[0]))
+ 	err := windows.SetsockoptInt(handle, windows.IPPROTO_IP, IP_UNICAST_IF, int(interfaceIndex))
+-	if err != nil {
+-		return err
+-	}
++	if err != nil { return err }
++	actual, err := windows.GetsockoptInt(handle, windows.IPPROTO_IP, IP_UNICAST_IF)
++	if err != nil { return err }
++	if uint32(actual) != hostIndex { return windows.ERROR_INVALID_DATA }
+ 	return nil
+ }
+ 
+ func bindSocketToInterface6(handle windows.Handle, interfaceIndex uint32) error {
+ 	const IPV6_UNICAST_IF = 31
+-	return windows.SetsockoptInt(handle, windows.IPPROTO_IPV6, IPV6_UNICAST_IF, int(interfaceIndex))
+-}
++	if err := windows.SetsockoptInt(handle, windows.IPPROTO_IPV6, IPV6_UNICAST_IF, int(interfaceIndex)); err != nil { return err }
++	actual, err := windows.GetsockoptInt(handle, windows.IPPROTO_IPV6, IPV6_UNICAST_IF)
++	if err != nil { return err }
++	if uint32(actual) != interfaceIndex { return windows.ERROR_INVALID_DATA }
++	return nil
++}
