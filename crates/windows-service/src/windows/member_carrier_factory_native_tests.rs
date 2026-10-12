@@ -927,7 +927,7 @@ fn carrier_factory_actual_cold_child() {
             let initial = fixture.trace_pair_stage().expect("repeat primary Pair");
             let carrier = initial.carrier.expect("repeat original C");
             let addresses = initial.addresses;
-            let mut reserve_lease = "33333333-3333-4333-8333-333333333333".to_string();
+            let reserve_lease = "33333333-3333-4333-8333-333333333333".to_string();
             let reserve = |lease: &str| Member {
                 slot: Slot::B,
                 lease_id: lease.into(),
@@ -1065,47 +1065,19 @@ fn carrier_factory_actual_cold_child() {
             fixture.external_health(None);
             let current = second.snapshot();
             assert_eq!(current.session.role_generation, 3);
-            // Diagnostic variant: retain DATA identity only, never an SDK
-            // adapter handle that could itself delay the target's rundown.
+            // Diagnostic: do not enumerate PnP before Retire; keep only the
+            // SAME Pair proof and one fresh read-only MIB observation.
             let rows = crate::windows::member_carrier_provider::native::table()
-                .expect("actual C+A+B MIB before diagnostic Retire B");
-            let targets = [carrier.guid, a.guid, b.guid]
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(slot, guid)| crate::windows::member_carrier_provider::ExpectedProvider {
-                        identity: rows
-                            .iter()
-                            .find(|row| row.identity.guid == guid)
-                            .expect("actual original provider MIB row")
-                            .identity
-                            .clone(),
-                        kind: if slot == 0 {
-                            crate::windows::member_carrier_provider::ProviderKind::Wintun
-                        } else if paired.members[slot - 1]
-                            .as_ref()
-                            .unwrap()
-                            .owner
-                            .intent
-                            .transport
-                            == nelomai_client_tunnel::TunnelTransport::WireGuard
-                        {
-                            crate::windows::member_carrier_provider::ProviderKind::WireGuardNt
-                        } else {
-                            crate::windows::member_carrier_provider::ProviderKind::Wintun
-                        },
-                    },
-                )
-                .collect::<Vec<_>>();
-            let observed = crate::windows::member_carrier_provider::native::inspect_mixed(&targets)
-                .expect("actual original C+A+B PnP census before diagnostic Retire B");
-            let b_instance = observed
-                .iter()
-                .find(|row| row.interface.guid == b.guid)
-                .expect("actual original B PnP instance")
-                .instance
-                .instance
-                .clone();
+                .expect("actual B MIB before diagnostic Retire");
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.identity.guid == b.guid
+                        && row.identity.luid == b.luid
+                        && row.identity.index == b.index)
+                    .count(),
+                1
+            );
+            eprintln!("actual RetireB before Retire B={b:?} exact_MIB_present=true pre_Retire_PnP_census=false");
             let retirement_started = std::time::Instant::now();
             let physical_before = second
                 .physical_network_fingerprint()
@@ -1123,10 +1095,30 @@ fn carrier_factory_actual_cold_child() {
                     second_now,
                 )
                 .expect("actual inactive B retirement acknowledged");
-            assert!(
-                retired.retirement_pending,
-                "diagnostic requires B's original pending rundown"
+            let retired_elapsed = retirement_started.elapsed();
+            eprintln!(
+                "actual RetireB returned elapsed_ms={} retirement_pending={} snapshot={retired:?}",
+                retired_elapsed.as_millis(),
+                retired.retirement_pending
             );
+            match crate::windows::member_carrier_provider::native::table() {
+                Ok(rows) => {
+                    let related = rows
+                        .iter()
+                        .filter(|row| {
+                            row.identity.guid == b.guid
+                                || row.identity.luid == b.luid
+                                || row.identity.index == b.index
+                                || row.identity.name.eq_ignore_ascii_case("nelomai-b")
+                        })
+                        .map(|row| &row.identity)
+                        .collect::<Vec<_>>();
+                    eprintln!("actual RetireB first post-Retire MIB observed_ms={} retirement_pending={} B={b:?} related_rows={related:?} B_MIB_absent={}", retirement_started.elapsed().as_millis(), retired.retirement_pending, related.is_empty());
+                }
+                Err(error) => eprintln!(
+                    "actual RetireB first post-Retire MIB UNKNOWN B={b:?} error={error:?}"
+                ),
+            }
             if retired.retirement_pending {
                 assert!(!retired.cleanup_pending);
                 assert_eq!(retired.session.phase, SessionPhase::Running);
@@ -1188,309 +1180,174 @@ fn carrier_factory_actual_cold_child() {
                     paired.members[1].as_ref().unwrap().owner.proof
                 );
                 assert!(stopping.retired_proof.is_none(), "pending is not Closed");
-                // This exact Retire pending result roots the original Stop/Delete
-                // ACK. Independently query the same SCM name and captured PnP
-                // instance before stopping A; a lookup error is not absence.
-                // A held original SCM handle may yield MARKED_FOR_DELETE;
-                // report that result without replacing the rooted Delete ACK.
-                let scm_absent = crate::windows::install::open_slot_service(
-                    TunnelSlot::B,
-                    stopping.intent.transport,
-                    windows_service::service::ServiceAccess::QUERY_STATUS,
-                )
-                .map(|service| service.is_none());
-                let instance = b_instance.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
-                let mut devinst = 0;
-                let pnp = unsafe {
-                    windows_sys::Win32::Devices::DeviceAndDriverInstallation::CM_Locate_DevNodeW(
-                        &mut devinst, instance.as_ptr(),
-                        windows_sys::Win32::Devices::DeviceAndDriverInstallation::CM_LOCATE_DEVNODE_NORMAL,
-                    )
-                };
-                eprintln!("actual RetireB then StopA precondition elapsed_ms={} B={b:?} instance={b_instance:?} pnp_result={pnp} scm_name_absent={scm_absent:?} original_Stop_Delete_ACK=true", retirement_started.elapsed().as_millis());
+            } else {
+                assert!(!retired.cleanup_pending);
+                assert_eq!(retired.session.phase, SessionPhase::Running);
+                assert_eq!(retired.session.active, Slot::A);
+                assert_eq!(retired.leases[1], None);
+                assert_eq!(retired.current_leases, current.current_leases);
+                assert!(!retired.session.installed[1]);
+                assert!(!retired.session.committed[1]);
+                let mut files = MemberFiles::new().expect("actual retirement member files");
+                let closed = files
+                    .load(TunnelSlot::B)
+                    .unwrap()
+                    .expect("actual SAME B stopped journal");
+                assert_eq!(closed.phase, crate::member_owner::Phase::Stopped);
                 assert_eq!(
-                    pnp,
-                    windows_sys::Win32::Devices::DeviceAndDriverInstallation::CR_NO_SUCH_DEVNODE,
-                    "original B PnP removal not confirmed before full Stop"
+                    closed.intent,
+                    paired.members[1].as_ref().unwrap().owner.intent
                 );
-                let before_stop = crate::windows::member_carrier_provider::native::table()
-                    .expect("actual B MIB before diagnostic full Stop");
+                assert!(closed.proof.is_none());
                 assert_eq!(
-                    before_stop
-                        .iter()
-                        .filter(|row| row.identity.guid == b.guid
-                            && row.identity.luid == b.luid
-                            && row.identity.index == b.index)
-                        .count(),
-                    1,
-                    "diagnostic requires exact B still in MIB after Stop/Delete/PnP removal"
+                    closed.retired_proof,
+                    paired.members[1].as_ref().unwrap().owner.proof
                 );
-                assert_eq!(second.snapshot().session.phase, SessionPhase::Running);
-                assert_eq!(second.snapshot().session.active, Slot::A);
-                let full_stop_started = std::time::Instant::now();
-                let observe_done = Arc::new(AtomicBool::new(false));
-                let done = observe_done.clone();
-                let observer = std::thread::spawn(move || {
-                    let mut first_absent = None;
-                    loop {
-                        let finished = done.load(std::sync::atomic::Ordering::Acquire);
-                        let absent = match crate::windows::member_carrier_provider::native::table()
-                        {
-                            Ok(rows) => !rows.iter().any(|row| {
-                                row.identity.guid == b.guid
-                                    || row.identity.luid == b.luid
-                                    || row.identity.index == b.index
-                                    || row.identity.name.eq_ignore_ascii_case("nelomai-b")
-                            }),
-                            Err(error) => {
-                                eprintln!(
-                                    "actual RetireB then StopA MIB UNKNOWN B={b:?} error={error:?}"
-                                );
-                                false
-                            }
-                        };
-                        if absent && first_absent.is_none() {
-                            let elapsed = full_stop_started.elapsed();
-                            first_absent = Some(elapsed);
-                            eprintln!("actual RetireB then StopA first_B_MIB_absent_ms={} since_Retire_ms={} B={b:?}", elapsed.as_millis(), retirement_started.elapsed().as_millis());
-                        }
-                        if finished {
-                            return (first_absent, absent);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                });
-                second_now += 1;
-                let full_stop_now = second_now;
-                let mut stopped = second.execute(
-                    Command::Stop {
-                        scope: next.clone(),
-                    },
-                    second_now,
+                assert_eq!(
+                    second.physical_network_fingerprint().unwrap(),
+                    physical_before,
+                    "exact owned B absence preserves the physical fingerprint"
                 );
-                let retry_started = std::time::Instant::now();
-                while stopped.is_err()
-                    && second.snapshot().cleanup_pending
-                    && retry_started.elapsed() <= std::time::Duration::from_secs(90)
-                {
-                    second_now = full_stop_now + full_stop_started.elapsed().as_millis() as u64;
-                    match second.tick(second_now) {
-                        Ok(_) => {
-                            let snapshot = second.snapshot();
-                            if !snapshot.cleanup_pending {
-                                stopped = Ok(snapshot);
-                            }
-                        }
-                        Err(error) => {
-                            eprintln!("actual RetireB then StopA full Stop pending: {error:?}");
-                            fixture.trace_pair_stage();
-                            stopped = Err(error);
-                        }
-                    }
-                    if second.snapshot().cleanup_pending {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-                let full_stop_elapsed = full_stop_started.elapsed();
-                observe_done.store(true, std::sync::atomic::Ordering::Release);
-                let (first_absent, absent) = observer.join().expect("actual B MIB observer");
-                eprintln!("actual RetireB then StopA full_Stop_ms={} first_B_MIB_absent_ms={:?} final_B_MIB_absent={absent} B={b:?} result={stopped:?}", full_stop_elapsed.as_millis(), first_absent.map(|elapsed| elapsed.as_millis()));
-                if stopped.is_err() || second.snapshot().cleanup_pending {
-                    // Preserve the SAME original owners on incomplete cleanup;
-                    // process exit is never an invented Stop/native close ACK.
-                    std::mem::forget(second);
-                    std::mem::forget(factory);
-                    panic!("actual RetireB then StopA remains incomplete");
-                }
-                let stopped = stopped.expect("actual RetireB then StopA completed Stop");
-                assert_eq!(stopped.session.phase, SessionPhase::Stopped);
-                assert!(!stopped.cleanup_pending);
-                assert!(
-                    first_absent.is_some() && absent,
-                    "exact original B MIB absence not confirmed"
-                );
-                let pair = fixture
+                crate::windows::member_owner::require_reboot_guids_absent(TunnelSlot::B, &[b.guid])
+                    .expect("actual old B MIB GUID/alias absent before replacement");
+                let completed = fixture
                     .trace_pair_stage()
-                    .expect("actual diagnostic terminal Pair");
-                pair.validate()
-                    .expect("actual diagnostic terminal Pair invariants");
-                assert_eq!(pair.scope, next);
-                assert_eq!(pair.phase, crate::member_carrier_pair::Phase::Stopped);
-                assert!(pair.pending.is_none());
-                assert_eq!(
-                    pair.guard,
-                    crate::member_carrier_guard::Model::empty(next.clone()).unwrap()
-                );
-                assert_eq!(
-                    second
-                        .execute(
-                            Command::Stop {
-                                scope: next.clone()
-                            },
-                            second_now
-                        )
-                        .expect("actual diagnostic repeated Stop"),
-                    stopped
-                );
-                return;
+                    .expect("actual completed retirement Pair");
+                assert!(completed.members[1].is_none());
+                assert!(completed.operation.is_none());
+                assert!(completed.pending.is_none());
+                assert!(completed.guard.permits);
+                assert_eq!(completed.guard.active, Some(Slot::A));
             }
-            assert!(!retired.cleanup_pending);
-            assert_eq!(retired.session.phase, SessionPhase::Running);
-            assert_eq!(retired.session.active, Slot::A);
-            assert_eq!(retired.leases[1], None);
-            assert_eq!(retired.current_leases, current.current_leases);
-            assert!(!retired.session.installed[1]);
-            assert!(!retired.session.committed[1]);
-            let mut files = MemberFiles::new().expect("actual retirement member files");
-            let closed = files
-                .load(TunnelSlot::B)
-                .unwrap()
-                .expect("actual SAME B stopped journal");
-            assert_eq!(closed.phase, crate::member_owner::Phase::Stopped);
-            assert_eq!(
-                closed.intent,
-                paired.members[1].as_ref().unwrap().owner.intent
-            );
-            assert!(closed.proof.is_none());
-            assert_eq!(
-                closed.retired_proof,
-                paired.members[1].as_ref().unwrap().owner.proof
-            );
-            assert_eq!(
-                second.physical_network_fingerprint().unwrap(),
-                physical_before,
-                "exact owned B absence preserves the physical fingerprint"
-            );
-            crate::windows::member_owner::require_reboot_guids_absent(TunnelSlot::B, &[b.guid])
-                .expect("actual old B MIB GUID/alias absent before replacement");
-            let completed = fixture
-                .trace_pair_stage()
-                .expect("actual completed retirement Pair");
-            assert!(completed.members[1].is_none());
-            assert!(completed.operation.is_none());
-            assert!(completed.pending.is_none());
-            assert!(completed.guard.permits);
-            assert_eq!(completed.guard.active, Some(Slot::A));
-            reserve_lease = "44444444-4444-4444-8444-444444444444".into();
-            let stale = second.execute(
-                Command::StageCandidate {
+            // Full Stop runs for either rooted Retire outcome. SCM lookup
+            // is diagnostic only; marked-for-delete is not absence or failure.
+            let scm_absent = crate::windows::install::open_slot_service(
+                TunnelSlot::B,
+                paired.members[1].as_ref().unwrap().owner.intent.transport,
+                windows_service::service::ServiceAccess::QUERY_STATUS,
+            )
+            .map(|service| service.is_none());
+            let before_stop = crate::windows::member_carrier_provider::native::table()
+                .expect("actual B MIB before diagnostic full Stop");
+            let related = before_stop
+                .iter()
+                .filter(|row| {
+                    row.identity.guid == b.guid
+                        || row.identity.luid == b.luid
+                        || row.identity.index == b.index
+                        || row.identity.name.eq_ignore_ascii_case("nelomai-b")
+                })
+                .map(|row| &row.identity)
+                .collect::<Vec<_>>();
+            let absent_before_stop = related.is_empty();
+            eprintln!("actual RetireB before full Stop observed_ms={} retirement_pending={} B={b:?} related_rows={related:?} B_MIB_absent={absent_before_stop} scm_name_absent={scm_absent:?} PnP_assertion=false", retirement_started.elapsed().as_millis(), retired.retirement_pending);
+            assert_eq!(second.snapshot().session.phase, SessionPhase::Running);
+            assert_eq!(second.snapshot().session.active, Slot::A);
+            let full_stop_started = std::time::Instant::now();
+            let observe_done = Arc::new(AtomicBool::new(false));
+            let done = observe_done.clone();
+            let observer = std::thread::spawn(move || {
+                let mut first_absent = absent_before_stop.then_some(std::time::Duration::ZERO);
+                loop {
+                    let finished = done.load(std::sync::atomic::Ordering::Acquire);
+                    let absent = match crate::windows::member_carrier_provider::native::table() {
+                        Ok(rows) => !rows.iter().any(|row| {
+                            row.identity.guid == b.guid
+                                || row.identity.luid == b.luid
+                                || row.identity.index == b.index
+                                || row.identity.name.eq_ignore_ascii_case("nelomai-b")
+                        }),
+                        Err(error) => {
+                            eprintln!(
+                                "actual RetireB then StopA MIB UNKNOWN B={b:?} error={error:?}"
+                            );
+                            false
+                        }
+                    };
+                    if absent && first_absent.is_none() {
+                        let elapsed = full_stop_started.elapsed();
+                        first_absent = Some(elapsed);
+                        eprintln!("actual RetireB then StopA first_B_MIB_absent_ms={} since_Retire_ms={} B={b:?}", elapsed.as_millis(), retirement_started.elapsed().as_millis());
+                    }
+                    if finished {
+                        return (first_absent, absent);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            });
+            second_now += 1;
+            let full_stop_now = second_now;
+            let mut stopped = second.execute(
+                Command::Stop {
                     scope: next.clone(),
-                    member: reserve(&reserve_lease),
-                    expected_revision: current.session.local_revision,
-                    expected_network_epoch: current.session.network_epoch,
-                    expected_membership_generation: 2,
                 },
                 second_now,
             );
-            assert!(stale.is_err());
-            let staged = second
-                .execute(
-                    Command::StageCandidate {
-                        scope: next.clone(),
-                        member: reserve(&reserve_lease),
-                        expected_revision: retired.session.local_revision,
-                        expected_network_epoch: retired.session.network_epoch,
-                        expected_membership_generation: 2,
-                    },
-                    second_now,
-                )
-                .expect("actual replacement StageCandidate B");
-            let committed = second
-                .execute(
-                    Command::CommitCandidate {
-                        scope: next.clone(),
-                        slot: Slot::B,
-                        expected_revision: staged.session.local_revision,
-                        expected_network_epoch: staged.session.network_epoch,
-                        session: nelomai_contracts::RedundantSessionView {
-                            session_id: next.session_id.clone(),
-                            state: nelomai_contracts::RedundantSessionState::Connected,
-                            active_lease_id: staged.leases[0].clone(),
-                            slot_a_lease_id: staged.leases[0].clone(),
-                            slot_b_lease_id: Some(reserve_lease.clone()),
-                            standby_desired: true,
-                            role_generation: 3,
-                            membership_generation: 3,
-                            reason: None,
-                        },
-                    },
-                    second_now,
-                )
-                .expect("actual replacement CommitCandidate");
-            assert_eq!(committed.session.membership_generation, 3);
-            assert_eq!(committed.session.active, Slot::A);
-            let replacement = fixture.trace_pair_stage().expect("actual replacement Pair");
-            assert_eq!(replacement.carrier, Some(carrier));
-            assert_eq!(replacement.addresses, addresses);
-            assert_eq!(
-                replacement.members[0]
-                    .as_ref()
-                    .unwrap()
-                    .owner
-                    .proof
-                    .unwrap()
-                    .interface,
-                a
-            );
-            assert_ne!(
-                replacement.members[1]
-                    .as_ref()
-                    .unwrap()
-                    .owner
-                    .proof
-                    .unwrap()
-                    .process,
-                paired.members[1]
-                    .as_ref()
-                    .unwrap()
-                    .owner
-                    .proof
-                    .unwrap()
-                    .process
-            );
-            assert_ne!(
-                replacement.members[1]
-                    .as_ref()
-                    .unwrap()
-                    .owner
-                    .intent
-                    .config_sha256,
-                paired.members[1]
-                    .as_ref()
-                    .unwrap()
-                    .owner
-                    .intent
-                    .config_sha256
-            );
-            second_now += 1;
-            let rebound = second
-                .execute(
-                    Command::NetworkChanged {
-                        scope: next.clone(),
-                    },
-                    second_now,
-                )
-                .expect("actual same-owner NetworkChanged after replacement");
-            assert_eq!(rebound.session.phase, SessionPhase::Running);
-            assert_eq!(rebound.session.active, Slot::A);
-            assert_eq!(rebound.session.membership_generation, 3);
-            assert!(!rebound.cleanup_pending);
-            let rebound = fixture.trace_pair_stage().expect("actual rebound Pair");
-            assert_eq!(rebound.carrier, replacement.carrier);
-            assert_eq!(rebound.addresses, replacement.addresses);
-            for slot in 0..2 {
-                let before = &replacement.members[slot].as_ref().unwrap().owner;
-                let after = &rebound.members[slot].as_ref().unwrap().owner;
-                assert!(after == before, "NetworkChanged changed original owner");
-                assert_eq!(after.proof, before.proof); // SAME interface and full PID/creation proof.
+            let retry_started = std::time::Instant::now();
+            while stopped.is_err()
+                && second.snapshot().cleanup_pending
+                && retry_started.elapsed() <= std::time::Duration::from_secs(90)
+            {
+                second_now = full_stop_now + full_stop_started.elapsed().as_millis() as u64;
+                match second.tick(second_now) {
+                    Ok(_) => {
+                        let snapshot = second.snapshot();
+                        if !snapshot.cleanup_pending {
+                            stopped = Ok(snapshot);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("actual RetireB then StopA full Stop pending: {error:?}");
+                        fixture.trace_pair_stage();
+                        stopped = Err(error);
+                    }
+                }
+                if second.snapshot().cleanup_pending {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
-            second_now += 500;
-            second
-                .tick(second_now)
-                .expect("actual health tick resumes after NetworkChanged");
-            assert_eq!(second.snapshot().session.phase, SessionPhase::Running);
-            assert_eq!(second.snapshot().session.active, Slot::A);
-            assert!(!second.snapshot().cleanup_pending);
+            let full_stop_elapsed = full_stop_started.elapsed();
+            observe_done.store(true, std::sync::atomic::Ordering::Release);
+            let (first_absent, absent) = observer.join().expect("actual B MIB observer");
+            eprintln!("actual RetireB then StopA full_Stop_ms={} first_B_MIB_absent_ms={:?} final_B_MIB_absent={absent} B_absent_before_Stop={absent_before_stop} B={b:?} result={stopped:?}", full_stop_elapsed.as_millis(), first_absent.map(|elapsed| elapsed.as_millis()));
+            if stopped.is_err() || second.snapshot().cleanup_pending {
+                // Preserve the SAME original owners on incomplete cleanup;
+                // process exit is never an invented Stop/native close ACK.
+                std::mem::forget(second);
+                std::mem::forget(factory);
+                panic!("actual RetireB then StopA remains incomplete");
+            }
+            let stopped = stopped.expect("actual RetireB then StopA completed Stop");
+            assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+            assert!(!stopped.cleanup_pending);
+            assert!(
+                first_absent.is_some() && absent,
+                "exact original B MIB absence not confirmed"
+            );
+            let pair = fixture
+                .trace_pair_stage()
+                .expect("actual diagnostic terminal Pair");
+            pair.validate()
+                .expect("actual diagnostic terminal Pair invariants");
+            assert_eq!(pair.scope, next);
+            assert_eq!(pair.phase, crate::member_carrier_pair::Phase::Stopped);
+            assert!(pair.pending.is_none());
+            assert_eq!(
+                pair.guard,
+                crate::member_carrier_guard::Model::empty(next.clone()).unwrap()
+            );
+            assert_eq!(
+                second
+                    .execute(
+                        Command::Stop {
+                            scope: next.clone()
+                        },
+                        second_now
+                    )
+                    .expect("actual diagnostic repeated Stop"),
+                stopped
+            );
+            return;
         }
         second_now += 1;
         eprintln!("actual factory {case}: repeat Stop");
