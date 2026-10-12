@@ -9,6 +9,7 @@ use nelomai_contracts::{
 /// Compiled runtime resources, never an IPC path or DLL-search fallback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LibraryKind {
+    Worker,
     Wintun,
     WireGuard,
     Tunnel,
@@ -17,6 +18,7 @@ enum LibraryKind {
 impl LibraryKind {
     fn path(self) -> &'static str {
         match self {
+            Self::Worker => "nelomai-windows-worker.exe",
             Self::Wintun => "wintun.dll",
             Self::WireGuard => "wireguard.dll",
             Self::Tunnel => "tunnel.dll",
@@ -58,7 +60,12 @@ fn library_entry(
         .iter()
         .find(|entry| entry.path == kind.path())
         .ok_or(Error::Invalid)?;
-    if entry.role != RuntimeFileRole::SharedLibrary
+    if entry.role
+        != if kind == LibraryKind::Worker {
+            RuntimeFileRole::Executable
+        } else {
+            RuntimeFileRole::SharedLibrary
+        }
         || entry.size_bytes == 0
         || entry.size_bytes > 16 * 1024 * 1024
     {
@@ -408,6 +415,43 @@ pub(crate) mod native {
         }
     }
     /// Actual original Wintun source; preserves the existing opaque API.
+    pub(crate) struct WorkerSource {
+        worker: LibrarySource,
+        wintun: LibrarySource,
+        digest: String,
+    }
+    impl WorkerSource {
+        pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {
+            let worker = LibrarySource::new(root, owner.clone(), LibraryKind::Worker)?;
+            let wintun = LibrarySource::new(root, owner, LibraryKind::Wintun)?;
+            if worker.identity != wintun.identity || worker.directory != wintun.directory {
+                return Err(Error::Conflict);
+            }
+            let digest =
+                read_signed_entry(&worker.directory, &worker.identity, LibraryKind::Wintun)?.sha256;
+            let source = Self {
+                worker,
+                wintun,
+                digest,
+            };
+            source.verify()?;
+            Ok(source)
+        }
+        pub(crate) fn verify(&self) -> Result<()> {
+            self.worker.verify()?;
+            self.wintun.verify()
+        }
+        pub(crate) fn path(&self) -> Result<&Path> {
+            self.verify()?;
+            self.worker.path()
+        }
+        pub(crate) fn dll_sha256(&self) -> &str {
+            &self.digest
+        }
+        pub(crate) fn identity(&self) -> &EngineIdentity {
+            &self.worker.identity
+        }
+    }
     pub(crate) struct WintunSource(LibrarySource);
     impl WintunSource {
         pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {

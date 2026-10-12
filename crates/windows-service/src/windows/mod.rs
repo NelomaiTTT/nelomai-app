@@ -64,6 +64,11 @@ mod member_pair;
 pub(crate) mod member_physical;
 pub mod member_routes;
 mod member_session;
+mod member_worker;
+mod member_worker_factory;
+#[cfg(test)]
+mod member_worker_factory_native_tests;
+mod member_worker_guard;
 mod ringlogger;
 mod routes;
 mod service;

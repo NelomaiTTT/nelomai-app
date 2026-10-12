@@ -1,0 +1,1441 @@
+//! Selected one-TUN worker ownership. IPC DATA never replaces original handles.
+use super::{
+    member_carrier_payload::native::WorkerSource,
+    member_files::{MemberFiles, PrivateFile, SessionFileIo},
+    member_session::{NativeSessionFiles, SessionFiles, WindowsSessionStore},
+    member_worker_guard::Guard,
+};
+use crate::{
+    member_dns,
+    member_owner::{InterfaceProof, ProcessProof},
+    member_pair::{DnsRecord, MemberParameters},
+    member_worker_guard::Model,
+};
+use nelomai_client_tunnel::{
+    redundancy::{
+        control::PairControl,
+        driver::{NativePair, SessionStore},
+        evidence::NativeHealthSample,
+        network::{
+            NetworkJournal, NetworkJournalStore, NetworkOwner, NetworkValue, RouteScope, RouteValue,
+        },
+        protocol::Member,
+        session::{SessionPhase, SessionSnapshot},
+        SessionScope, Slot,
+    },
+    DesktopTunnelOptions,
+};
+use nelomai_contracts::dispatcher::{EngineIdentity, MutationGuard};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    cell::{Cell, RefCell},
+    io::{self, BufRead, BufReader, Write},
+    net::IpAddr,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    rc::Rc,
+    sync::{mpsc, Arc},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{
+        GetHandleInformation, FILETIME, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
+    NetworkManagement::IpHelper::*,
+    Networking::WinSock::*,
+    System::{JobObjects::*, Threading::*},
+};
+use zeroize::{Zeroize, Zeroizing};
+
+const FRAME: usize = 65536;
+const STOP: Duration = Duration::from_secs(7);
+fn failed() -> io::Error {
+    io::Error::other("worker_ownership_conflict")
+}
+fn checked<T>(value: Result<T, impl std::fmt::Debug>) -> io::Result<T> {
+    value.map_err(|_| failed())
+}
+fn slot_index(slot: Slot) -> usize {
+    match slot {
+        Slot::A => 0,
+        Slot::B => 1,
+    }
+}
+fn guid_text(bytes: [u8; 16]) -> String {
+    let s = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{{{}-{}-{}-{}-{}}}",
+        &s[..8],
+        &s[8..12],
+        &s[12..16],
+        &s[16..20],
+        &s[20..]
+    )
+}
+fn identity_value(p: InterfaceProof) -> Value {
+    json!({"guid":guid_text(p.guid),"luid":p.luid,"index":p.index})
+}
+fn same_mapping(p: InterfaceProof) -> io::Result<()> {
+    let by_index = super::member_physical::read_identity(p.index)?;
+    if by_index.guid != p.guid || by_index.luid != p.luid || by_index.index != p.index {
+        return Err(failed());
+    }
+    let mut row = MIB_IF_ROW2::default();
+    row.InterfaceLuid.Value = p.luid;
+    if unsafe { GetIfEntry2(&mut row) } != 0
+        || row.InterfaceIndex != p.index
+        || super::member_carrier_guard::key(row.InterfaceGuid).0 != p.guid
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+fn absent(requested: [u8; 16], original: Option<InterfaceProof>) -> io::Result<bool> {
+    let rows = super::member_carrier_provider::native::table().map_err(|_| failed())?;
+    for row in rows {
+        if row.identity.guid == requested {
+            return Ok(false);
+        }
+        if original.is_some_and(|p| row.identity.index == p.index || row.identity.luid == p.luid) {
+            return Err(failed());
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddressIntent {
+    source: [u8; 4],
+    attempted: bool,
+    acknowledged: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Record {
+    version: u32,
+    runtime: EngineIdentity,
+    boot: [u8; 16],
+    scope: SessionScope,
+    requested_guid: [u8; 16],
+    process: Option<ProcessProof>,
+    interface: Option<InterfaceProof>,
+    closing: bool,
+    stopped: bool,
+    guard: Model,
+    guard_pending: Option<crate::member_worker_guard::Plan>,
+    network: NetworkJournal,
+    dns: Option<DnsRecord>,
+    address: Option<AddressIntent>,
+}
+struct Journal {
+    private: MemberFiles,
+    owner: Arc<MutationGuard>,
+    root: PathBuf,
+    current: Record,
+    expected: Option<Vec<u8>>,
+}
+impl Journal {
+    fn save(&mut self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
+        self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
+        let mut next = self.current.clone();
+        change(&mut next);
+        let bytes = serde_json::to_vec(&next).map_err(|_| failed())?;
+        if bytes.len() > PrivateFile::Worker.limit() {
+            return Err(failed());
+        }
+        self.private.transaction(|files| {
+            files.compare_exchange(PrivateFile::Worker, self.expected.as_deref(), &bytes)?;
+            if files.read(PrivateFile::Worker)?.as_deref() != Some(bytes.as_slice()) {
+                return Err(failed());
+            }
+            Ok(())
+        })?;
+        self.current = next;
+        self.expected = Some(bytes);
+        Ok(())
+    }
+    fn verify(&mut self) -> io::Result<()> {
+        self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
+        self.private.transaction(|files| {
+            if files.read(PrivateFile::Worker)?.as_deref() != self.expected.as_deref() {
+                return Err(failed());
+            }
+            Ok(())
+        })
+    }
+}
+type SharedJournal = Rc<RefCell<Journal>>;
+
+struct Rpc {
+    send: mpsc::SyncSender<Zeroizing<Vec<u8>>>,
+    receive: mpsc::Receiver<io::Result<Value>>,
+    next: u64,
+    session: u64,
+    failed: bool,
+}
+impl Rpc {
+    fn start(child: &mut Child, session: u64) -> io::Result<Self> {
+        let mut input = child.stdin.take().ok_or_else(failed)?;
+        let output = child.stdout.take().ok_or_else(failed)?;
+        let (send, requests) = mpsc::sync_channel::<Zeroizing<Vec<u8>>>(1);
+        let (responses, receive) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("nelomai-worker-pipe".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(output);
+                while let Ok(bytes) = requests.recv() {
+                    let result = (|| {
+                        input.write_all(&bytes)?;
+                        input.flush()?;
+                        let mut reply = Vec::new();
+                        // fill_buf bounds allocation BEFORE copying an oversized
+                        // child frame; no unbounded read_until on privileged input.
+                        loop {
+                            let part = reader.fill_buf()?;
+                            if part.is_empty() {
+                                return Err(failed());
+                            }
+                            let end = part
+                                .iter()
+                                .position(|b| *b == b'\n')
+                                .map_or(part.len(), |n| n + 1);
+                            if reply.len() + end > FRAME {
+                                return Err(failed());
+                            }
+                            reply.extend_from_slice(&part[..end]);
+                            reader.consume(end);
+                            if reply.last() == Some(&b'\n') {
+                                break;
+                            }
+                        }
+                        serde_json::from_slice(&reply).map_err(|_| failed())
+                    })();
+                    let terminal = result.is_err();
+                    if responses.send(result).is_err() || terminal {
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            send,
+            receive,
+            next: 0,
+            session,
+            failed: false,
+        })
+    }
+    fn call(&mut self, mut request: Value, budget: Duration) -> io::Result<Value> {
+        if self.failed || budget.is_zero() {
+            return Err(failed());
+        }
+        self.next = self.next.checked_add(1).ok_or_else(failed)?;
+        request["id"] = self.next.into();
+        request["session"] = self.session.into();
+        request["deadline_ms"] = (budget.as_millis().min(u32::MAX as u128) as u32).into();
+        let bytes = Zeroizing::new(serde_json::to_vec(&request).map_err(|_| failed())?);
+        if let Some(Value::String(secret)) = request.get_mut("configuration") {
+            secret.zeroize();
+        }
+        if bytes.len() + 1 > FRAME {
+            return Err(failed());
+        }
+        let mut bytes = bytes;
+        bytes.push(b'\n');
+        self.failed = true;
+        self.send.try_send(bytes).map_err(|_| failed())?;
+        let reply = self.receive.recv_timeout(budget).map_err(|_| failed())??;
+        if reply["id"].as_u64() != Some(self.next)
+            || reply["session"].as_u64() != Some(self.session)
+            || reply["ok"].as_bool().is_none()
+        {
+            return Err(failed());
+        }
+        // A valid command rejection leaves transport available for scoped Stop.
+        self.failed = false;
+        if reply["ok"].as_bool() != Some(true) {
+            return Err(failed());
+        }
+        Ok(reply)
+    }
+}
+struct Original {
+    source: Rc<WorkerSource>,
+    child: RefCell<Option<Child>>,
+    job: RefCell<Option<OwnedHandle>>,
+    process: Cell<Option<ProcessProof>>,
+    interface: Cell<Option<InterfaceProof>>,
+    requested: [u8; 16],
+    exit_ack: Cell<bool>,
+    close_ack: Cell<bool>,
+    start_attempted: Cell<bool>,
+    address_ack: Cell<bool>,
+}
+impl Original {
+    fn verify_live(&self) -> io::Result<()> {
+        checked(self.source.verify())?;
+        let child = self.child.try_borrow().map_err(|_| failed())?;
+        let child = child.as_ref().ok_or_else(failed)?;
+        if unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } != WAIT_TIMEOUT
+            || process_proof(child)? != self.process.get().ok_or_else(failed)?
+        {
+            return Err(failed());
+        }
+        let mut in_job = 0;
+        let job = self.job.try_borrow().map_err(|_| failed())?;
+        if unsafe {
+            IsProcessInJob(
+                child.as_raw_handle(),
+                job.as_ref().ok_or_else(failed)?.as_raw_handle(),
+                &mut in_job,
+            )
+        } == 0
+            || in_job == 0
+        {
+            return Err(failed());
+        }
+        if let Some(p) = self.interface.get() {
+            same_mapping(p)?;
+        }
+        Ok(())
+    }
+    fn verify_process_exit(&self) -> io::Result<()> {
+        checked(self.source.verify())?;
+        if let Some(child) = self.child.try_borrow().map_err(|_| failed())?.as_ref() {
+            if !self.exit_ack.get()
+                || unsafe { WaitForSingleObject(child.as_raw_handle(), 0) } != WAIT_OBJECT_0
+            {
+                return Err(failed());
+            }
+        }
+        Ok(())
+    }
+    fn verify_exit(&self) -> io::Result<()> {
+        if !self.close_ack.get() {
+            return Err(failed());
+        }
+        self.verify_process_exit()?;
+        if !absent(self.requested, self.interface.get())? {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn spawn(&self, session: u64) -> io::Result<Rpc> {
+        if self.child.borrow().is_some() {
+            return Err(failed());
+        }
+        checked(self.source.verify())?;
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        let mut flags = 0;
+        if unsafe { GetHandleInformation(job.as_raw_handle(), &mut flags) } == 0
+            || flags & HANDLE_FLAG_INHERIT != 0
+        {
+            return Err(failed());
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as _,
+                std::mem::size_of_val(&limits) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        *self.job.borrow_mut() = Some(job);
+        let child = Command::new(checked(self.source.path())?)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        *self.child.borrow_mut() = Some(child); // retain BEFORE any fallible postflight
+        let mut children = self.child.borrow_mut();
+        let child = children.as_mut().ok_or_else(failed)?;
+        let job = self.job.borrow();
+        if unsafe {
+            AssignProcessToJobObject(
+                job.as_ref().ok_or_else(failed)?.as_raw_handle(),
+                child.as_raw_handle(),
+            )
+        } == 0
+        {
+            let assignment_error = io::Error::last_os_error();
+            // This original child is OUTSIDE the Job; Job close cannot stop it.
+            // Retain the same handle even if kill/wait fails, for scoped cleanup.
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+            if unsafe { WaitForSingleObject(child.as_raw_handle(), STOP.as_millis() as u32) }
+                != WAIT_OBJECT_0
+                || child.try_wait()?.is_none()
+            {
+                return Err(failed());
+            }
+            self.exit_ack.set(true);
+            return Err(assignment_error);
+        }
+        self.process.set(Some(process_proof(child)?));
+        let mut image = vec![0u16; 32768];
+        let mut length = image.len() as u32;
+        if unsafe {
+            QueryFullProcessImageNameW(child.as_raw_handle(), 0, image.as_mut_ptr(), &mut length)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let image = String::from_utf16(&image[..length as usize]).map_err(|_| failed())?;
+        if std::fs::canonicalize(image)? != std::fs::canonicalize(checked(self.source.path())?)? {
+            return Err(failed());
+        }
+        // No Start bytes may be sent before the original Job assignment ACK.
+        Rpc::start(child, session)
+    }
+    fn wait_exit(&self, deadline: Instant) -> io::Result<()> {
+        let mut children = self.child.borrow_mut();
+        let Some(child) = children.as_mut() else {
+            drop(children);
+            return self.verify_process_exit();
+        };
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        if unsafe { WaitForSingleObject(child.as_raw_handle(), remaining) } != WAIT_OBJECT_0
+            || child.try_wait()?.is_none()
+        {
+            return Err(failed());
+        }
+        self.exit_ack.set(true);
+        drop(children);
+        self.verify_process_exit()
+    }
+    fn terminate(&self) -> io::Result<()> {
+        let mut children = self.child.borrow_mut();
+        if let Some(child) = children.as_mut() {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+            }
+        }
+        Ok(())
+    }
+}
+fn process_proof(child: &Child) -> io::Result<ProcessProof> {
+    let (mut created, mut exit, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    if unsafe {
+        GetProcessTimes(
+            child.as_raw_handle(),
+            &mut created,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let creation_time =
+        (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    if creation_time == 0 || child.id() == 0 {
+        return Err(failed());
+    }
+    Ok(ProcessProof {
+        pid: child.id(),
+        creation_time,
+    })
+}
+
+pub(crate) struct Completion {
+    original: Rc<Original>,
+    guard: Option<Rc<RefCell<Guard>>>,
+    journal: SharedJournal,
+}
+impl Completion {
+    pub(crate) fn verify(&self, scope: &SessionScope) -> io::Result<()> {
+        self.verify_storage(scope)?;
+        self.journal.borrow_mut().verify()
+    }
+    pub(crate) fn verify_storage(&self, scope: &SessionScope) -> io::Result<()> {
+        self.original.verify_exit()?;
+        if let Some(guard) = &self.guard {
+            checked(guard.borrow().verify_terminal())?;
+        }
+        let journal = self.journal.borrow();
+        let record = &journal.current;
+        let network = record.network.read_view()?;
+        if &record.scope != scope
+            || !record.stopped
+            || record.guard.interface.is_some()
+            || record.guard_pending.is_some()
+            || network.current().next().is_some()
+            || network.pending().is_some()
+            || network.recorded_active().is_some()
+            || record.dns.is_some()
+            || record.address.is_some()
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    pub(crate) fn bytes(&self) -> io::Result<Vec<u8>> {
+        self.journal.borrow().expected.clone().ok_or_else(failed)
+    }
+}
+pub(crate) fn terminal_identity(
+    bytes: &[u8],
+) -> io::Result<(SessionScope, EngineIdentity, [u8; 16])> {
+    let record: Record = serde_json::from_slice(bytes).map_err(|_| failed())?;
+    let network = record.network.read_view()?;
+    if record.version != 1
+        || !record.scope.validate()
+        || record.runtime.slot != record.scope.runtime
+        || !record.stopped
+        || !record.closing
+        || record.guard.interface.is_some()
+        || record.guard_pending.is_some()
+        || record
+            .guard
+            .snapshot()
+            .map_err(|_| failed())?
+            .sublayer
+            .is_some()
+        || network.current().next().is_some()
+        || network.pending().is_some()
+        || network.recorded_active().is_some()
+        || record.dns.is_some()
+        || record.address.is_some()
+    {
+        return Err(failed());
+    }
+    Ok((record.scope, record.runtime, record.boot))
+}
+pub(crate) fn verify_terminal_record(bytes: &[u8]) -> io::Result<()> {
+    terminal_identity(bytes)?;
+    let record: Record = serde_json::from_slice(bytes).map_err(|_| failed())?;
+    if !absent(record.requested_guid, None)? {
+        return Err(failed());
+    }
+    Ok(())
+}
+pub(crate) struct Store {
+    session: Rc<RefCell<Option<WindowsSessionStore<NativeSessionFiles>>>>,
+    files: Rc<RefCell<NativeSessionFiles>>,
+    completed: Rc<RefCell<Option<Rc<Completion>>>>,
+}
+impl SessionStore for Store {
+    fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
+        if snapshot.phase == SessionPhase::Stopped {
+            let completion = self.completed.borrow().clone().ok_or_else(failed)?;
+            completion.verify(&snapshot.scope)?;
+            self.ensure_session(&snapshot.scope)?;
+            self.session
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(failed)?
+                .save(snapshot)?;
+            self.files
+                .borrow_mut()
+                .complete_worker(&snapshot.scope, &completion)
+        } else {
+            self.session
+                .borrow_mut()
+                .as_mut()
+                .ok_or_else(failed)?
+                .save(snapshot)
+        }
+    }
+}
+impl Store {
+    fn ensure_session(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if self.session.borrow().is_none() {
+            let (store, _) = WindowsSessionStore::open(
+                self.files.borrow().clone(),
+                scope.clone(),
+                super::member_session::RecordKind::Session,
+            )?;
+            *self.session.borrow_mut() = Some(store);
+        }
+        Ok(())
+    }
+}
+pub(crate) struct Control {
+    scope: SessionScope,
+    original: Rc<Original>,
+    journal: SharedJournal,
+    rpc: Rc<RefCell<Option<Rpc>>>,
+    guard: Option<Rc<RefCell<Guard>>>,
+    routes: Option<
+        NetworkOwner<
+            crate::member_routes::MemberRoutes<super::member_routes::NativeRowIo, WorkerIdentity>,
+            RouteJournal,
+        >,
+    >,
+    completed: Rc<RefCell<Option<Rc<Completion>>>>,
+    members: [Option<(IpAddr, IpAddr)>; 2],
+    ready: bool,
+    fenced: bool,
+    stopped: bool,
+    files: Rc<RefCell<NativeSessionFiles>>,
+    session: Rc<RefCell<Option<WindowsSessionStore<NativeSessionFiles>>>>,
+    parameters: [Option<MemberParameters>; 2],
+    options: Option<DesktopTunnelOptions>,
+}
+struct WorkerIdentity {
+    original: Rc<Original>,
+    physical: Vec<crate::member_physical::PhysicalRoute>,
+}
+impl crate::member_routes::IdentityCheck for WorkerIdentity {
+    fn verify(&mut self, index: u32) -> io::Result<crate::member_routes::NativeProof> {
+        self.original.verify_live()?;
+        if let Some(p) = self.original.interface.get().filter(|p| p.index == index) {
+            return Ok(crate::member_routes::NativeProof {
+                index,
+                luid: p.luid,
+            });
+        }
+        let path = self
+            .physical
+            .iter()
+            .find(|p| p.proof.identity.index == index)
+            .ok_or_else(failed)?;
+        super::member_physical::verify(
+            path,
+            &self
+                .original
+                .interface
+                .get()
+                .map(|p| crate::member_physical::InterfaceIdentity {
+                    index: p.index,
+                    luid: p.luid,
+                    guid: p.guid,
+                })
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(crate::member_routes::NativeProof {
+            index,
+            luid: path.proof.identity.luid,
+        })
+    }
+}
+struct RouteJournal(SharedJournal);
+impl NetworkJournalStore for RouteJournal {
+    fn save(&mut self, network: &NetworkJournal) -> io::Result<()> {
+        self.0
+            .borrow_mut()
+            .save(|record| record.network = network.clone())
+    }
+}
+
+pub(crate) fn prepare(
+    root: &Path,
+    owner: Arc<MutationGuard>,
+    files: NativeSessionFiles,
+    scope: SessionScope,
+) -> io::Result<(Control, Store)> {
+    let source = Rc::new(checked(WorkerSource::new(root, owner.clone()))?);
+    if source.identity().slot != scope.runtime {
+        return Err(failed());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"nelomai-worker-tun/v1\0");
+    hash.update(serde_json::to_vec(&scope).map_err(|_| failed())?);
+    let mut requested: [u8; 16] = hash.finalize()[..16].try_into().map_err(|_| failed())?;
+    requested[6] = (requested[6] & 15) | 64;
+    requested[8] = (requested[8] & 63) | 128;
+    if !absent(requested, None)? {
+        return Err(failed());
+    }
+    let record = Record {
+        version: 1,
+        runtime: source.identity().clone(),
+        boot: super::member_boot::boot_id()?,
+        scope: scope.clone(),
+        requested_guid: requested,
+        process: None,
+        interface: None,
+        closing: false,
+        stopped: false,
+        guard: Model::empty(scope.clone()),
+        guard_pending: None,
+        network: NetworkJournal::default(),
+        dns: None,
+        address: None,
+    };
+    let mut private = checked(MemberFiles::new())?;
+    let expected = private.transaction(|records| records.read(PrivateFile::Worker))?;
+    if let Some(old) = &expected {
+        let old: Record = serde_json::from_slice(old).map_err(|_| failed())?;
+        if !old.stopped || old.scope == scope {
+            return Err(failed());
+        }
+    }
+    let journal = Rc::new(RefCell::new(Journal {
+        private,
+        owner,
+        root: root.into(),
+        current: record,
+        expected,
+    }));
+    let original = Rc::new(Original {
+        source,
+        child: RefCell::new(None),
+        job: RefCell::new(None),
+        process: Cell::new(None),
+        interface: Cell::new(None),
+        requested,
+        exit_ack: Cell::new(false),
+        close_ack: Cell::new(false),
+        start_attempted: Cell::new(false),
+        address_ack: Cell::new(false),
+    });
+    let completed = Rc::new(RefCell::new(None));
+    let files = Rc::new(RefCell::new(files));
+    let session = Rc::new(RefCell::new(None));
+    Ok((
+        Control {
+            scope,
+            original,
+            journal,
+            rpc: Rc::new(RefCell::new(None)),
+            guard: None,
+            routes: None,
+            completed: completed.clone(),
+            members: [None, None],
+            ready: false,
+            fenced: true,
+            stopped: false,
+            files: files.clone(),
+            session: session.clone(),
+            parameters: [None, None],
+            options: None,
+        },
+        Store {
+            session,
+            files,
+            completed,
+        },
+    ))
+}
+
+impl Control {
+    fn call(&self, value: Value, budget: Duration) -> io::Result<Value> {
+        self.rpc
+            .borrow_mut()
+            .as_mut()
+            .ok_or_else(failed)?
+            .call(value, budget)
+    }
+    fn authorize(&self) -> io::Result<()> {
+        self.original.verify_live()?;
+        self.journal.borrow_mut().verify()
+    }
+    fn guard_transition(&mut self, desired: Model, retired: bool) -> io::Result<()> {
+        let original = self.original.clone();
+        let journal = self.journal.clone();
+        checked(
+            self.guard
+                .as_ref()
+                .ok_or_else(failed)?
+                .borrow_mut()
+                .transition(
+                    desired,
+                    |current, pending| {
+                        journal.borrow_mut().save(|record| {
+                            record.guard = current.clone();
+                            record.guard_pending = pending.cloned();
+                        })
+                    },
+                    || {
+                        if retired {
+                            original.verify_process_exit()?;
+                        } else {
+                            original.verify_live()?;
+                        }
+                        journal.borrow_mut().verify()
+                    },
+                ),
+        )
+    }
+    fn attach_device(&mut self, member: &Member, params: MemberParameters) -> io::Result<()> {
+        let uapi = uapi(member.configuration.expose())?;
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        let path = super::member_physical::capture(&[crate::member_physical::InterfaceIdentity {
+            index: p.index,
+            luid: p.luid,
+            guid: p.guid,
+        }])?
+        .resolve_host(params.endpoint)
+        .map_err(|_| failed())?
+        .path;
+        super::member_physical::verify(
+            &path,
+            &[crate::member_physical::InterfaceIdentity {
+                index: p.index,
+                luid: p.luid,
+                guid: p.guid,
+            }],
+        )?;
+        self.authorize()?;
+        self.call(json!({"op":"attach","slot":slot_index(member.slot),"configuration":uapi.as_str(),"physical":identity_value(InterfaceProof {index:path.proof.identity.index,luid:path.proof.identity.luid,guid:path.proof.identity.guid})}), Duration::from_secs(10))?;
+        self.authorize()?;
+        self.members[slot_index(member.slot)] = Some((
+            IpAddr::V4(params.source),
+            IpAddr::V4(member.probe.target_ipv4),
+        ));
+        self.parameters[slot_index(member.slot)] = Some(params);
+        Ok(())
+    }
+    fn create_address(&mut self, source: [u8; 4]) -> io::Result<()> {
+        self.authorize()?;
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        let mut row = address_row(p, source);
+        let before = unsafe { GetUnicastIpAddressEntry(&mut row) };
+        if before != windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+            return Err(failed());
+        }
+        self.journal.borrow_mut().save(|r| {
+            r.address = Some(AddressIntent {
+                source,
+                attempted: true,
+                acknowledged: false,
+            })
+        })?;
+        let row = address_row(p, source);
+        if unsafe { CreateUnicastIpAddressEntry(&row) } != 0 {
+            return Err(failed());
+        }
+        self.original.address_ack.set(true); // SAME original actual Create ACK
+        self.journal
+            .borrow_mut()
+            .save(|r| r.address.as_mut().expect("retained address").acknowledged = true)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.authorize()?;
+            let mut actual = address_row(p, source);
+            if unsafe { GetUnicastIpAddressEntry(&mut actual) } != 0
+                || !address_matches(&actual, p, source)
+            {
+                return Err(failed());
+            }
+            if actual.DadState == IpDadStatePreferred {
+                break;
+            }
+            if actual.DadState == IpDadStateDuplicate || Instant::now() >= deadline {
+                return Err(failed());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+    fn delete_address(&mut self) -> io::Result<()> {
+        let source = self
+            .journal
+            .borrow()
+            .current
+            .address
+            .as_ref()
+            .map(|a| a.source);
+        if let Some(source) = source {
+            if !self.original.address_ack.get()
+                || !self
+                    .journal
+                    .borrow()
+                    .current
+                    .address
+                    .as_ref()
+                    .is_some_and(|a| a.acknowledged)
+            {
+                return Err(failed());
+            }
+            self.authorize()?;
+            let p = self.original.interface.get().ok_or_else(failed)?;
+            let mut row = address_row(p, source);
+            let code = unsafe { GetUnicastIpAddressEntry(&mut row) };
+            if code == 0 {
+                if !address_matches(&row, p, source) {
+                    return Err(failed());
+                }
+                if unsafe { DeleteUnicastIpAddressEntry(&row) } != 0 {
+                    return Err(failed());
+                }
+            } else if code != windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+                return Err(failed());
+            }
+            self.authorize()?;
+            if unsafe { GetUnicastIpAddressEntry(&mut address_row(p, source)) }
+                != windows_sys::Win32::Foundation::ERROR_NOT_FOUND
+            {
+                return Err(failed());
+            }
+            self.journal.borrow_mut().save(|r| r.address = None)?;
+        }
+        Ok(())
+    }
+    fn dns(&self) -> io::Result<member_dns::OwnedDns<WorkerDns, super::member_dns::NativeDnsIo>> {
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        checked(super::member_dns::owned(
+            member_dns::OwnedInterface {
+                scope: self.scope.clone(),
+                guid: p.guid,
+                luid: p.luid,
+                index: p.index,
+            },
+            WorkerDns {
+                original: self.original.clone(),
+                scope: self.scope.clone(),
+            },
+        ))
+    }
+    fn set_dns(&mut self, servers: &[IpAddr]) -> io::Result<()> {
+        if self.journal.borrow().current.dns.is_some() {
+            return Err(failed());
+        }
+        let mut owner = self.dns()?;
+        let baseline = checked(owner.snapshot())?;
+        let desired = checked(baseline.with_servers(servers))?;
+        self.journal.borrow_mut().save(|r| {
+            r.dns = Some(DnsRecord {
+                baseline: baseline.clone(),
+                current: baseline.clone(),
+                pending: Some(desired.clone()),
+            })
+        })?;
+        let actual = checked(owner.compare_exchange(&baseline, &desired))?;
+        self.journal.borrow_mut().save(|r| {
+            let d = r.dns.as_mut().expect("retained DNS");
+            d.current = actual;
+            d.pending = None;
+        })
+    }
+    fn restore_dns(&mut self) -> io::Result<()> {
+        let saved = self.journal.borrow().current.dns.clone();
+        if let Some(saved) = saved {
+            let mut owner = self.dns()?;
+            let actual = checked(owner.snapshot())?;
+            if actual != saved.current && saved.pending.as_ref() != Some(&actual) {
+                return Err(failed());
+            }
+            self.journal.borrow_mut().save(|r| {
+                r.dns.as_mut().expect("retained DNS").pending = Some(saved.baseline.clone())
+            })?;
+            checked(owner.compare_exchange(&actual, &saved.baseline))?;
+            self.journal.borrow_mut().save(|r| r.dns = None)?;
+        }
+        Ok(())
+    }
+    fn route_values(
+        &self,
+        params: &MemberParameters,
+        options: &DesktopTunnelOptions,
+    ) -> io::Result<(
+        Vec<NetworkValue>,
+        Vec<crate::member_physical::PhysicalRoute>,
+    )> {
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        let owned = [crate::member_physical::InterfaceIdentity {
+            index: p.index,
+            luid: p.luid,
+            guid: p.guid,
+        }];
+        let physical = super::member_physical::capture(&owned)?;
+        let mut exclusions = options
+            .excluded_ipv4_cidrs
+            .iter()
+            .map(|s| s.parse::<ipnet::IpNet>().map_err(|_| failed()))
+            .collect::<io::Result<Vec<_>>>()?;
+        if options.exclude_local_networks {
+            exclusions.extend(physical.lan_prefixes());
+        }
+        exclusions.push(ipnet::IpNet::from(params.endpoint));
+        exclusions.sort();
+        exclusions.dedup();
+        let mut paths = Vec::new();
+        let mut values = Vec::new();
+        for destination in &exclusions {
+            let path = physical
+                .resolve_bypass(*destination)
+                .map_err(|_| failed())?;
+            let desired = RouteValue {
+                destination: *destination,
+                scope: RouteScope::WindowsInterface(path.proof.identity.index),
+                interface: path.proof.identity.index,
+                gateway: path.row.route.gateway,
+                metric: path.row.route.metric,
+            };
+            // A compatible existing physical row is retained as evidence,
+            // never adopted into NetworkOwner or deleted on Stop.
+            if path.row.route != desired {
+                values.push(NetworkValue::Route(desired));
+            }
+            paths.push(path);
+        }
+        for network in ipnet::IpNet::aggregate(&params.allowed) {
+            let data = if network.prefix_len() == 0 {
+                if network.addr().is_ipv4() {
+                    vec!["0.0.0.0/1".parse().unwrap(), "128.0.0.0/1".parse().unwrap()]
+                } else {
+                    vec!["::/1".parse().unwrap(), "8000::/1".parse().unwrap()]
+                }
+            } else {
+                vec![network]
+            };
+            for destination in data {
+                if !exclusions.iter().any(|e| e.contains(&destination)) {
+                    values.push(NetworkValue::Route(RouteValue {
+                        destination,
+                        scope: RouteScope::WindowsInterface(p.index),
+                        interface: p.index,
+                        gateway: None,
+                        metric: 1,
+                    }));
+                }
+            }
+        }
+        Ok((values, paths))
+    }
+}
+fn address_row(p: InterfaceProof, source: [u8; 4]) -> MIB_UNICASTIPADDRESS_ROW {
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceIndex = p.index;
+    row.InterfaceLuid.Value = p.luid;
+    row.Address.Ipv4 = SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: 0,
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(source),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    row.PrefixOrigin = IpPrefixOriginManual;
+    row.SuffixOrigin = IpSuffixOriginManual;
+    row.ValidLifetime = u32::MAX;
+    row.PreferredLifetime = u32::MAX;
+    row.OnLinkPrefixLength = 32;
+    row.SkipAsSource = false;
+    row.DadState = IpDadStateInvalid;
+    row
+}
+fn address_matches(row: &MIB_UNICASTIPADDRESS_ROW, p: InterfaceProof, source: [u8; 4]) -> bool {
+    row.InterfaceIndex == p.index
+        && unsafe { row.InterfaceLuid.Value } == p.luid
+        && unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr } == u32::from_ne_bytes(source)
+        && row.OnLinkPrefixLength == 32
+        && row.PrefixOrigin == IpPrefixOriginManual
+        && row.SuffixOrigin == IpSuffixOriginManual
+        && row.ValidLifetime == u32::MAX
+        && row.PreferredLifetime == u32::MAX
+        && !row.SkipAsSource
+}
+struct WorkerDns {
+    original: Rc<Original>,
+    scope: SessionScope,
+}
+impl member_dns::Identity for WorkerDns {
+    fn verify_owned(
+        &mut self,
+        interface: &member_dns::OwnedInterface,
+    ) -> member_dns::Result<member_dns::Ownership> {
+        self.original
+            .verify_live()
+            .map_err(|_| member_dns::DnsError::Ownership)?;
+        let p = self
+            .original
+            .interface
+            .get()
+            .ok_or(member_dns::DnsError::Ownership)?;
+        if interface.scope != self.scope
+            || (interface.guid, interface.luid, interface.index) != (p.guid, p.luid, p.index)
+        {
+            return Err(member_dns::DnsError::Ownership);
+        }
+        Ok(member_dns::Ownership::NewlyCreated)
+    }
+}
+fn uapi(configuration: &str) -> io::Result<Zeroizing<String>> {
+    let canonical = crate::redundancy::slot_configuration(configuration).map_err(|_| failed())?;
+    let mut text = Zeroizing::new(String::from("listen_port=0\nreplace_peers=true\n"));
+    let mut peer = false;
+    for line in canonical.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            peer = line.eq_ignore_ascii_case("[Peer]");
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(failed)?;
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        let field = match (peer, key.as_str()) {
+            (false, "address" | "dns" | "table") => continue,
+            (false, "privatekey") => "private_key",
+            (true, "publickey") => "public_key",
+            (true, "presharedkey") => "preshared_key",
+            (true, "endpoint") => "endpoint",
+            (true, "allowedips") => "allowed_ip",
+            (true, "persistentkeepalive") => "persistent_keepalive_interval",
+            (
+                false,
+                "jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" | "h1" | "h2" | "h3" | "h4"
+                | "i1" | "i2" | "i3" | "i4" | "i5",
+            ) => key.as_str(),
+            _ => return Err(io::ErrorKind::Unsupported.into()),
+        };
+        if matches!(field, "private_key" | "public_key" | "preshared_key") {
+            let mut bytes = crate::member_pair::decode_peer(value)?;
+            text.push_str(field);
+            text.push('=');
+            for byte in bytes {
+                text.push_str(&format!("{byte:02x}"));
+            }
+            text.push('\n');
+            bytes.zeroize();
+        } else {
+            for value in value.split(',') {
+                text.push_str(field);
+                text.push('=');
+                text.push_str(value.trim());
+                text.push('\n');
+            }
+        }
+    }
+    if text.len() > FRAME / 2 {
+        return Err(failed());
+    }
+    Ok(text)
+}
+
+impl PairControl for Control {
+    fn prepare_session(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if scope != &self.scope || self.session.borrow().is_some() {
+            return Err(failed());
+        }
+        // SessionControl already retains THIS cold control/store before claim.
+        self.files.borrow_mut().claim(scope)?;
+        self.journal.borrow_mut().save(|_| {})?;
+        let (session, previous) = WindowsSessionStore::open(
+            self.files.borrow().clone(),
+            scope.clone(),
+            super::member_session::RecordKind::Session,
+        )?;
+        if previous.is_some() {
+            return Err(failed());
+        }
+        *self.session.borrow_mut() = Some(session);
+        Ok(())
+    }
+    fn start_primary(
+        &mut self,
+        scope: &SessionScope,
+        member: &Member,
+        options: &DesktopTunnelOptions,
+    ) -> io::Result<()> {
+        if scope != &self.scope || self.original.child.borrow().is_some() || self.stopped {
+            return Err(failed());
+        }
+        options.validate().map_err(|_| failed())?;
+        let params = MemberParameters::parse(member.configuration.expose())?;
+        let _validated = uapi(member.configuration.expose())?;
+        let session = u64::from_be_bytes(
+            self.original.requested[..8]
+                .try_into()
+                .map_err(|_| failed())?,
+        )
+        .max(1);
+        *self.rpc.borrow_mut() = Some(self.original.spawn(session)?);
+        self.journal
+            .borrow_mut()
+            .save(|r| r.process = self.original.process.get())?;
+        self.original.start_attempted.set(true);
+        let reply=self.call(json!({"op":"start","name":format!("NeloWorker-{}",&self.scope.session_id[..8]),"guid":guid_text(self.original.requested),"dll_sha256":self.original.source.dll_sha256()}),Duration::from_secs(30))?;
+        let identity = &reply["identity"];
+        let p = InterfaceProof {
+            guid: self.original.requested,
+            luid: identity["luid"]
+                .as_u64()
+                .filter(|v| *v != 0)
+                .ok_or_else(failed)?,
+            index: identity["index"]
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|v| *v != 0)
+                .ok_or_else(failed)?,
+        };
+        if identity["guid"].as_str().map(|s| s.to_ascii_lowercase()) != Some(guid_text(p.guid)) {
+            return Err(failed());
+        }
+        self.original.interface.set(Some(p));
+        self.original.verify_live()?;
+        self.journal.borrow_mut().save(|r| r.interface = Some(p))?;
+        self.guard = Some(Rc::new(RefCell::new(checked(Guard::open(Model::empty(
+            self.scope.clone(),
+        )))?)));
+        let deny = Model {
+            version: 1,
+            scope: self.scope.clone(),
+            interface: Some(p),
+            source: Some(IpAddr::V4(params.source)),
+            admitted: false,
+            weight: None,
+        };
+        self.guard_transition(deny.clone(), false)?;
+        self.create_address(params.source.octets())?;
+        if !params.dns.is_empty() {
+            self.set_dns(&params.dns)?;
+        }
+        let (values, physical) = self.route_values(&params, options)?;
+        self.routes = Some(NetworkOwner::fresh(
+            crate::member_routes::MemberRoutes::new(
+                super::member_routes::NativeRowIo,
+                WorkerIdentity {
+                    original: self.original.clone(),
+                    physical,
+                },
+            ),
+            RouteJournal(self.journal.clone()),
+        ));
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .select(member.slot, values)?;
+        let mut admitted = deny;
+        admitted.admitted = true;
+        self.guard_transition(admitted, false)?;
+        self.attach_device(member, params)?;
+        self.call(
+            json!({"op":"switch","slot":slot_index(member.slot)}),
+            Duration::from_secs(1),
+        )?;
+        self.options = Some(options.clone());
+        Ok(())
+    }
+    fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if scope != &self.scope {
+            return Err(failed());
+        }
+        self.check_integrity()?;
+        self.ready = true;
+        self.fenced = false;
+        Ok(())
+    }
+    fn attach(&mut self, _: &SessionScope, _: &Member) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn remove_standby(&mut self, _: &SessionScope, _: Slot) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn rebind_pair(&mut self, _: &SessionScope) -> io::Result<bool> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn complete_rebind(&mut self, _: &SessionScope) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn cleanup_pending(&self) -> bool {
+        self.fenced && !self.stopped
+    }
+}
+impl NativePair for Control {
+    type Socket = nelomai_client_tunnel::redundancy::NativeProbeSocket;
+    fn check_integrity(&mut self) -> io::Result<()> {
+        self.authorize()?;
+        checked(
+            self.guard
+                .as_ref()
+                .ok_or_else(failed)?
+                .borrow_mut()
+                .verify(|| self.original.verify_live()),
+        )
+    }
+    fn sample(&mut self, _: Slot) -> Option<NativeHealthSample> {
+        None
+    }
+    fn open_probe(&mut self, _: Slot) -> io::Result<(Self::Socket, String)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn select_active(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
+        if scope != &self.scope || !self.ready || self.members[slot_index(slot)].is_none() {
+            return Err(failed());
+        }
+        self.check_integrity()?;
+        self.call(
+            json!({"op":"switch","slot":slot_index(slot)}),
+            Duration::from_secs(1),
+        )?;
+        Ok(())
+    }
+    fn close(&mut self, scope: &SessionScope) -> io::Result<()> {
+        if scope != &self.scope {
+            return Err(failed());
+        }
+        if self.stopped {
+            return self
+                .completed
+                .borrow()
+                .as_ref()
+                .ok_or_else(failed)?
+                .verify(scope);
+        }
+        let deadline = Instant::now() + STOP;
+        self.ready = false;
+        self.fenced = true;
+        let mut error = None;
+        if let Err(e) = self.journal.borrow_mut().save(|r| r.closing = true) {
+            error = Some(e);
+        }
+        if let Some(guard) = &self.guard {
+            let mut deny = guard.borrow().current.clone();
+            deny.admitted = false;
+            if deny.interface.is_some() {
+                if let Err(e) = self.guard_transition(deny, false) {
+                    error = Some(e);
+                }
+            }
+        }
+        if let Some(routes) = &mut self.routes {
+            if let Err(e) = routes.cleanup() {
+                error = Some(e);
+            }
+        }
+        if let Err(e) = self.restore_dns() {
+            error = Some(e);
+        }
+        if let Err(e) = self.delete_address() {
+            error = Some(e);
+        }
+        if self.original.child.borrow().is_some() && !self.original.exit_ack.get() {
+            if self.rpc.borrow().is_some() {
+                match self.call(
+                    json!({"op":"stop","await_absence":false}),
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(4)),
+                ) {
+                    Ok(reply)
+                        if reply["closed"].as_bool() == Some(true)
+                            && reply["absent"].as_bool() == Some(false) =>
+                    {
+                        self.original.close_ack.set(true)
+                    }
+                    _ => {
+                        error = Some(failed());
+                    }
+                }
+            } else {
+                // No Start bytes were ever sent (e.g. Job assignment Err).
+                if let Err(e) = self.original.terminate() {
+                    error = Some(e);
+                }
+                if !self.original.start_attempted.get() {
+                    self.original.close_ack.set(true);
+                } else {
+                    error = Some(failed());
+                }
+            }
+            self.rpc.borrow_mut().take();
+            if !self.original.close_ack.get() {
+                let _ = self.original.terminate();
+            }
+            if let Err(e) = self.original.wait_exit(deadline) {
+                error = Some(e);
+            }
+        }
+        if !self.original.start_attempted.get() && self.original.verify_process_exit().is_ok() {
+            self.original.close_ack.set(true);
+        }
+        // Static index filters may themselves pin MIB rundown. Original Child
+        // exit (not interface absence) authorizes exact owned filter retirement.
+        let network_empty = {
+            let journal = self.journal.borrow();
+            let network = journal.current.network.read_view()?;
+            network.current().next().is_none()
+                && network.pending().is_none()
+                && network.recorded_active().is_none()
+        };
+        if self.original.close_ack.get()
+            && self.original.verify_process_exit().is_ok()
+            && network_empty
+            && self.journal.borrow().current.dns.is_none()
+            && self.journal.borrow().current.address.is_none()
+            && self.guard.is_some()
+        {
+            if self
+                .guard
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .current
+                .interface
+                .is_some()
+            {
+                if let Err(e) = self.guard_transition(Model::empty(self.scope.clone()), true) {
+                    error = Some(e);
+                }
+            }
+            if error.is_none()
+                && self
+                    .guard
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .verify_terminal()
+                    .is_err()
+            {
+                if let Err(e) = checked(self.guard.as_ref().unwrap().borrow_mut().close()) {
+                    error = Some(e);
+                }
+            }
+        }
+        loop {
+            match self.original.verify_exit() {
+                Ok(()) => break,
+                Err(e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(e) = error {
+            return Err(e);
+        }
+        if !self.original.close_ack.get() {
+            return Err(failed());
+        }
+        self.journal.borrow_mut().save(|r| {
+            r.stopped = true;
+            r.guard = Model::empty(r.scope.clone());
+            r.guard_pending = None;
+        })?;
+        let completed = Rc::new(Completion {
+            original: self.original.clone(),
+            guard: self.guard.clone(),
+            journal: self.journal.clone(),
+        });
+        completed.verify(scope)?;
+        *self.completed.borrow_mut() = Some(completed);
+        self.stopped = true;
+        Ok(())
+    }
+}

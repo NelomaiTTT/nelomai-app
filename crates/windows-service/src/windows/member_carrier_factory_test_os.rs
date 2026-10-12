@@ -555,7 +555,15 @@ impl Fixture {
             .ok_or_else(|| io::Error::other("actual factory runtime fixture input absent"))?;
         Self::with_runtime(Some(PathBuf::from(directory)))
     }
+    pub(crate) fn new_worker_modules() -> io::Result<Self> {
+        let directory = std::env::var_os("NELOMAI_FACTORY_RUNTIME_DIRECTORY")
+            .ok_or_else(|| io::Error::other("actual worker runtime fixture input absent"))?;
+        Self::with_selected_runtime(Some(PathBuf::from(directory)), true)
+    }
     fn with_runtime(native_runtime: Option<PathBuf>) -> io::Result<Self> {
+        Self::with_selected_runtime(native_runtime, false)
+    }
+    fn with_selected_runtime(native_runtime: Option<PathBuf>, worker: bool) -> io::Result<Self> {
         use ed25519_dalek::{Signer, SigningKey};
         use member_files::SessionFileIo;
         use nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN;
@@ -669,13 +677,21 @@ impl Fixture {
         let version = env!("CARGO_PKG_VERSION");
         let bin = source.join(format!("engines/latest/{version}"));
         std::fs::create_dir_all(&bin)?;
-        let names = [
-            "nelomai-windows-service.exe",
-            "wintun.dll",
-            "wireguard.dll",
-            "tunnel.dll",
-            "amneziawg-tunnel.dll",
-        ];
+        let names: &[&str] = if worker {
+            &[
+                "nelomai-windows-service.exe",
+                "wintun.dll",
+                "nelomai-windows-worker.exe",
+            ]
+        } else {
+            &[
+                "nelomai-windows-service.exe",
+                "wintun.dll",
+                "wireguard.dll",
+                "tunnel.dll",
+                "amneziawg-tunnel.dll",
+            ]
+        };
         let payloads = match &native_runtime {
             Some(directory) => names
                 .iter()
@@ -688,7 +704,7 @@ impl Fixture {
         };
         let mut files = Vec::new();
         for (index, (name, bytes)) in names.iter().zip(&payloads).enumerate() {
-            let role = if index == 0 {
+            let role = if index == 0 || *name == "nelomai-windows-worker.exe" {
                 "executable"
             } else {
                 "shared_library"
@@ -720,7 +736,7 @@ impl Fixture {
         );
         let layout = installation.install(&source, &client, "S-1-5-21-1000", &d::RealInstallIo)?;
         let executable = std::fs::canonicalize(layout.engine_path())?;
-        if native_runtime.is_some() {
+        if native_runtime.is_some() && !worker {
             let wireguard_package =
                 crate::member_owner::cold_wireguard_data::native::prepare_fixture_package(
                     &executable.with_file_name("wireguard.dll"),
@@ -772,6 +788,22 @@ impl Fixture {
             self.identity.slot,
             &self.executable,
             &self.root,
+            owner,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+    pub(crate) fn worker_factory(
+        &self,
+    ) -> io::Result<super::member_worker_factory::WorkerPairFactory> {
+        member_files::pin_private_directory(&self.root)
+            .map_err(io::Error::other)?
+            .verify()
+            .map_err(io::Error::other)?;
+        let owner = Arc::new(MutationGuard::at(&self.root.join("engine-owner.lock"))?);
+        super::member_worker_factory::WorkerPairFactory::from_service(
+            &self.root,
+            self.identity.clone(),
+            &self.executable,
             owner,
             Arc::new(AtomicBool::new(false)),
         )

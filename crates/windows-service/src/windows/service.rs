@@ -343,7 +343,7 @@ pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
     // factory. EOF/poison during construction cannot leave a fresh false token.
     let (frames, client) =
         engine_channel::spawn_input(std::io::stdin()).map_err(|_| ServiceError::InvalidRequest)?;
-    let factory = super::member_pair::NativePairFactory::from_service(
+    let factory = super::member_worker_factory::WorkerPairFactory::from_service(
         root,
         layout.identity.clone(),
         &layout.engine_path(),

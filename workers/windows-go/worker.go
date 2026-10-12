@@ -37,6 +37,7 @@ type request struct {
 	Target        string   `json:"target,omitempty"`
 	DNS           []byte   `json:"dns,omitempty"`
 	Probe         uint64   `json:"probe,omitempty"`
+	AwaitAbsence  *bool    `json:"await_absence,omitempty"`
 }
 type response struct {
 	Closed     bool                    `json:"closed"`
@@ -49,7 +50,7 @@ type response struct {
 	Counters   RedundantTunnelCounters `json:"counters"`
 	Probe      uint64                  `json:"probe,omitempty"`
 	DNS        []byte                  `json:"dns,omitempty"`
-	Absent     bool                    `json:"absent,omitempty"`
+	Absent     bool                    `json:"absent"`
 	ElapsedMS  int64                   `json:"elapsed_ms"`
 }
 type workerProbe struct {
@@ -68,6 +69,7 @@ type worker struct {
 	generations [2]uint64
 	probes      map[uint64]workerProbe
 	nextProbe   uint64
+	closeDone   bool
 }
 
 func newWorker() *worker {
@@ -144,6 +146,9 @@ func (w *worker) bounded(req request) (response, bool) {
 		if w.tunnel != nil {
 			reply.Counters = w.tunnel.Counters()
 			reply.Closed = w.tunnel.Closed()
+		}
+		if req.Op == "stop" {
+			reply.Closed = w.closeDone
 		}
 		reply.ElapsedMS = time.Since(started).Milliseconds()
 		done <- reply
@@ -242,14 +247,15 @@ func (w *worker) command(req request, reply *response) error {
 		if w.session != 0 && req.Session != 0 && w.session != req.Session {
 			return errors.New("wrong_stop_session")
 		}
-		absent, err := w.stop()
+		await := req.AwaitAbsence == nil || *req.AwaitAbsence
+		absent, err := w.stop(await)
 		reply.Absent = absent
 		return err
 	default:
 		return errors.New("unsupported_operation")
 	}
 }
-func (w *worker) stop() (bool, error) {
+func (w *worker) stop(await bool) (bool, error) {
 	for id := range w.probes {
 		w.cancelProbe(id)
 	}
@@ -265,6 +271,14 @@ func (w *worker) stop() (bool, error) {
 			slot.Close()
 			<-slot.Wait()
 		}
+	}
+	if closeErr == nil {
+		w.closeDone = true
+	}
+	// Parent-owned filters may pin the interface row. Native close ACK and
+	// process exit precede parent filter retirement; absence stays explicit.
+	if !await {
+		return false, closeErr
 	}
 	deadline := time.Now().Add(7 * time.Second)
 	for {

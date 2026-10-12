@@ -1345,6 +1345,25 @@ impl PairFactory for NativePairFactory<NativeSessionFiles> {
     }
 }
 impl NativePairFactory<NativeSessionFiles> {
+    pub(crate) fn into_worker_factory(self) -> super::member_worker_factory::WorkerPairFactory {
+        let files = self.files.clone();
+        let root = self.root.clone();
+        let owner = self.owner.clone();
+        let runtime = self.runtime;
+        super::member_worker_factory::WorkerPairFactory::from_legacy(
+            self, files, root, owner, runtime,
+        )
+    }
+    pub(crate) fn verify_worker_start_context(&self, runtime: RuntimeSlot) -> io::Result<()> {
+        self.execution.require_engine()?;
+        require_factory_start_context(
+            runtime,
+            self.runtime,
+            tokio::runtime::Handle::try_current().is_ok(),
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        )?;
+        self.verify_service_owner()
+    }
     fn prepare_carrier_parts(
         &mut self,
         runtime: RuntimeSlot,

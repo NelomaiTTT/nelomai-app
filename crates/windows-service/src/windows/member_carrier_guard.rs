@@ -1334,8 +1334,18 @@ pub(crate) fn validate_arbitration(
     filters: &[ArbitrationFilter],
     service_domains: &[crate::member_owner::ServiceDomain],
 ) -> Result<()> {
-    let sub = snapshot.sublayer.as_ref().ok_or(GuardError::Conflict)?;
     let keys = crate::member_carrier_guard::resource_keys(scope)?;
+    validate_arbitration_with_keys(scope, snapshot, ids, filters, service_domains, &keys)
+}
+pub(crate) fn validate_arbitration_with_keys(
+    scope: &SessionScope,
+    snapshot: &Snapshot,
+    ids: &BTreeMap<Key, u64>,
+    filters: &[ArbitrationFilter],
+    service_domains: &[crate::member_owner::ServiceDomain],
+    keys: &crate::member_carrier_guard::ResourceKeys,
+) -> Result<()> {
+    let sub = snapshot.sublayer.as_ref().ok_or(GuardError::Conflict)?;
     if snapshot.scope != *scope
         || sub.key != keys.sublayer
         || sub.flags != 0
@@ -2563,6 +2573,7 @@ mod bfe {
 
     pub(crate) struct Wfp {
         scope: SessionScope,
+        keys: crate::member_carrier_guard::ResourceKeys,
         base: Engine,
         permits: Engine,
     }
@@ -2609,6 +2620,27 @@ mod bfe {
         }
     }
     impl Wfp {
+        pub(crate) fn open_worker(scope: SessionScope) -> Result<Self> {
+            let keys = crate::member_worker_guard::keys(&scope)?;
+            Ok(Self {
+                scope,
+                keys,
+                base: Engine::open(SessionKind::StaticBase)?,
+                permits: Engine::open(SessionKind::DynamicPermits)?,
+            })
+        }
+        fn allowed_key(&self, kind: SessionKind, k: Key) -> Result<()> {
+            let i = self
+                .keys
+                .filters
+                .iter()
+                .position(|p| *p == k)
+                .ok_or(GuardError::Invalid)?;
+            if (i % 24 >= 8) != (kind == SessionKind::DynamicPermits) {
+                return Err(GuardError::Invalid);
+            }
+            Ok(())
+        }
         fn engine(&self, kind: SessionKind) -> &Engine {
             if kind == SessionKind::StaticBase {
                 &self.base
@@ -2624,7 +2656,7 @@ mod bfe {
             }
         }
         fn subkey(&self, k: Key) -> Result<()> {
-            if crate::member_carrier_guard::resource_keys(&self.scope)?.sublayer != k {
+            if self.keys.sublayer != k {
                 return Err(GuardError::Invalid);
             }
             Ok(())
@@ -2641,6 +2673,7 @@ mod bfe {
             Self::new(
                 scope.clone(),
                 Wfp {
+                    keys: crate::member_carrier_guard::resource_keys(&scope)?,
                     scope,
                     base,
                     permits,
@@ -2660,6 +2693,7 @@ mod bfe {
             Self::fresh(
                 scope.clone(),
                 Wfp {
+                    keys: crate::member_carrier_guard::resource_keys(&scope)?,
                     scope,
                     base,
                     permits,
@@ -2955,10 +2989,7 @@ mod bfe {
         }
         fn filter(&mut self, kind: SessionKind, k: Key, sub: Key) -> Result<Option<NativeFilter>> {
             self.subkey(sub)?;
-            if !crate::member_carrier_guard::resource_keys(&self.scope)?
-                .filters
-                .contains(&k)
-            {
+            if !self.keys.filters.contains(&k) {
                 return Err(GuardError::Invalid);
             }
             let mut raw = ptr::null_mut();
@@ -3094,7 +3125,7 @@ mod bfe {
             status(unsafe { FwpmSubLayerDeleteByKey0(self.base.handle()?, &guid(k)) })
         }
         fn add_filter(&mut self, kind: SessionKind, filter: &Filter) -> Result<u64> {
-            allowed(&self.scope, kind, filter.key)?;
+            self.allowed_key(kind, filter.key)?;
             self.subkey(filter.sublayer)?;
             if (filter.action == Action::Permit) != (kind == SessionKind::DynamicPermits) {
                 return Err(GuardError::Invalid);
@@ -3115,7 +3146,7 @@ mod bfe {
             Ok(id)
         }
         fn delete_filter(&mut self, kind: SessionKind, k: Key) -> Result<()> {
-            allowed(&self.scope, kind, k)?;
+            self.allowed_key(kind, k)?;
             // Never bypass WRONG_SESSION by retrying via the ordinary engine.
             status(unsafe { FwpmFilterDeleteByKey0(self.engine(kind).handle()?, &guid(k)) })
         }

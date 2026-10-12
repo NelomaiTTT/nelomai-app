@@ -31,6 +31,7 @@ pub(crate) enum PrivateFile {
     MemberARows,
     MemberBRows,
     NativeCreator,
+    Worker,
     /// SHA256 of the canonical SessionScope, computed by the trusted adapter.
     /// Never accepts a path component or text from IPC.
     Completed([u8; 32]),
@@ -49,6 +50,7 @@ impl PrivateFile {
             Self::MemberARows => "nelomai-redundant-member-a-rows.json".into(),
             Self::MemberBRows => "nelomai-redundant-member-b-rows.json".into(),
             Self::NativeCreator => "nelomai-redundant-native-creator.json".into(),
+            Self::Worker => "nelomai-redundant-worker.json".into(),
             Self::Completed(hash) => format!(
                 "nelomai-redundant-completed-{}.json",
                 hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -60,6 +62,7 @@ impl PrivateFile {
             Self::Index => 8192,
             Self::Completed(_) => 4096,
             Self::Carrier
+            | Self::Worker
             | Self::NativeCreator
             | Self::NativeCarrierReceipts
             | Self::CarrierGuard

@@ -649,6 +649,12 @@ impl<I> ProtectedSessionFiles<I> {
     }
 }
 impl<I: SessionFileIo> ProtectedSessionFiles<I> {
+    #[cfg(windows)]
+    pub(crate) fn verify_completed_worker(&mut self) -> io::Result<()> {
+        self.backend_guard()?
+            .io
+            .transaction(require_completed_worker)
+    }
     pub(crate) fn retire_native_empty(
         &mut self,
         expected: &ProtectedRecoveryRecords,
@@ -1369,6 +1375,8 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                 if index.active.is_some() || read_completed(files, scope)?.is_some() {
                     return Err(failed());
                 }
+                #[cfg(windows)]
+                require_completed_worker(files)?;
                 // Orphan/foreign records cannot become an empty new session merely
                 // because an index was removed. Only completed identities may remain.
                 require_retired_records(files, &index)?;
@@ -1495,6 +1503,9 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
         backend
             .io
             .transaction(|files| {
+                if files.read(PrivateFile::Worker)?.is_some() {
+                    return Err(failed());
+                }
                 let (raw, mut index) = load_index(files)?;
                 if already_completed(files, &index, &identity)? {
                     return Ok(());
@@ -1575,6 +1586,9 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
         backend
             .io
             .transaction(|files| {
+                if files.read(PrivateFile::Worker)?.is_some() {
+                    return Err(failed());
+                }
                 let (raw, mut index) = load_index(files)?;
                 if already_completed(files, &index, &identity)? {
                     return Ok(());
@@ -1593,6 +1607,50 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
     }
 }
 impl<I: SessionFileIo> ProtectedSessionFiles<I> {
+    #[cfg(windows)]
+    pub(crate) fn complete_worker(
+        &mut self,
+        scope: &SessionScope,
+        original: &super::member_worker::Completion,
+    ) -> io::Result<()> {
+        original.verify(scope)?;
+        let expected = original.bytes()?;
+        let identity = self.identity(scope)?;
+        let mut backend = self.backend_guard()?;
+        backend.fresh = None;
+        backend.io.transaction(|files| {
+            if files.read(PrivateFile::Worker)?.as_deref() != Some(expected.as_slice()) {
+                return Err(failed());
+            }
+            let worker = super::member_worker::terminal_identity(&expected)?;
+            if worker != (scope.clone(), identity.runtime.clone(), identity.boot_id) {
+                return Err(failed());
+            }
+            let (raw, mut index) = load_index(files)?;
+            if already_completed(files, &index, &identity)? {
+                return Ok(());
+            }
+            require_active(&index, &identity)?;
+            let (_, saved) = load_record(files, &index, &identity, RecordKind::Session)?;
+            let session: SessionSnapshot =
+                decode(scope, saved.as_ref().ok_or_else(failed)?.data.as_bytes())?;
+            if session.phase != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped {
+                return Err(failed());
+            }
+            for kind in RecordKind::OWNED {
+                if kind != RecordKind::Session
+                    && load_record(files, &index, &identity, kind)?.1.is_some()
+                {
+                    return Err(failed());
+                }
+            }
+            // SAME original exit/row/filter receipt brackets permanent replay
+            // publication. No old C/A/B completion can ignore this sidecar.
+            original.verify_storage(scope)?;
+            finish_completion(files, raw.as_deref(), &mut index, &identity)
+        })?;
+        original.verify(scope)
+    }
     fn exchange_private(
         &mut self,
         scope: &SessionScope,
@@ -2426,6 +2484,21 @@ fn completed_file(scope: &SessionScope) -> io::Result<PrivateFile> {
     })
     .map_err(|_| failed())?;
     Ok(PrivateFile::Completed(Sha256::digest(bytes).into()))
+}
+#[cfg(windows)]
+fn require_completed_worker(files: &mut dyn PrivateRecords) -> io::Result<()> {
+    if let Some(bytes) = files.read(PrivateFile::Worker)? {
+        let (scope, runtime, boot_id) = super::member_worker::terminal_identity(&bytes)?;
+        let expected = SessionIdentity {
+            scope: scope.clone(),
+            runtime,
+            boot_id,
+        };
+        if read_completed(files, &scope)?.as_ref() != Some(&expected) {
+            return Err(failed());
+        }
+    }
+    Ok(())
 }
 fn read_completed(
     files: &mut dyn PrivateRecords,

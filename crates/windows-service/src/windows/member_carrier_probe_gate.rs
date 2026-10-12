@@ -1456,9 +1456,10 @@ pub(crate) mod native {
                         compare_retired_target(
                             &self.context,
                             record,
-                            bindings.carrier.as_ref().ok_or_else(|| {
-                                crate::windows::member_carrier_wintun::Error::Conflict
-                            })?,
+                            bindings
+                                .carrier
+                                .as_ref()
+                                .ok_or(crate::windows::member_carrier_wintun::Error::Conflict)?,
                             bindings.egress.each_ref().map(Option::as_ref),
                             history,
                         )

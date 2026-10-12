@@ -1426,7 +1426,7 @@ impl MemberParameters {
         })
     }
 }
-fn decode_peer(text: &str) -> io::Result<[u8; 32]> {
+pub(crate) fn decode_peer(text: &str) -> io::Result<[u8; 32]> {
     // Strict canonical 32-byte WireGuard base64 key, without another dependency.
     if text.len() != 44 || !text.ends_with('=') {
         return Err(failed());

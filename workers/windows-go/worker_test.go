@@ -85,9 +85,22 @@ func TestWorkerLifecycle(t *testing.T) {
 		if err := json.NewEncoder(feed).Encode(req); err != nil {
 			t.Fatal(err)
 		}
-		var reply response
-		if err := decoder.Decode(&reply); err != nil {
+		var frame json.RawMessage
+		if err := decoder.Decode(&frame); err != nil {
 			t.Fatal(err)
+		}
+		var reply response
+		if err := json.Unmarshal(frame, &reply); err != nil {
+			t.Fatal(err)
+		}
+		if req.Op == "stop" && req.AwaitAbsence != nil && !*req.AwaitAbsence {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(frame, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(bytes.TrimSpace(fields["absent"]), []byte("false")) {
+				t.Fatal("two-phase Stop omitted explicit absent:false ACK")
+			}
 		}
 		if reply.ID != id {
 			t.Fatalf("wrong ACK identity: %+v", reply)
@@ -243,14 +256,33 @@ func TestWorkerLifecycle(t *testing.T) {
 	if stale := call(request{Op: "probe_poll", Probe: sent.Probe}); stale.OK {
 		t.Fatal("cancelled probe remained live")
 	}
-	// Normal Stop is the acceptance path: exact absence and original process
-	// exit before starting a second process with another fresh GUID.
-	clean := call(request{Op: "stop"})
-	if !clean.OK || !clean.Absent || clean.ElapsedMS > 8000 {
+	// Two-phase Stop proves native close, then the parent independently proves
+	// exact absence and original process exit before the fresh-child repeat.
+	awaitAbsence := false
+	stopAt := time.Now()
+	clean := call(request{Op: "stop", AwaitAbsence: &awaitAbsence})
+	if !clean.OK || !clean.Closed || clean.Absent || clean.ElapsedMS > 7000 {
 		t.Fatalf("clean Stop: %+v", clean)
 	}
 	if err := child.Wait(); err != nil {
 		t.Fatalf("original process did not exit cleanly: %v", err)
+	}
+	observer := newNativeOwner()
+	for {
+		absent, err := observer.absent(start.Identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if absent {
+			break
+		}
+		if time.Since(stopAt) >= 7*time.Second {
+			t.Fatal("original exact interface remained after Close/exit")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if time.Since(stopAt) > 7*time.Second {
+		t.Fatal("normal two-phase Stop exceeded 7s")
 	}
 	closeUDP()
 	feed.Close()
