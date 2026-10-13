@@ -801,10 +801,14 @@ const MAX_ARBITRATION_FILTERS: usize = 32768;
 /// Comparison DATA, not original creator ownership or a WFP permission.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdGuardPolicies {
-    current: Model,
-    pending: Option<crate::member_carrier_guard::ExchangePlan>,
+    pub(crate) current: Option<Model>,
+    pub(crate) pending: Option<crate::member_carrier_guard::ExchangePlan>,
+    pub(crate) worker: Option<(
+        crate::member_worker_guard::Model,
+        Option<crate::member_worker_guard::Plan>,
+    )>,
     // Exact full protected DATA, including context and revision. Still not ACK.
-    protected_record: Vec<u8>,
+    pub(crate) protected_record: Vec<u8>,
 }
 impl ColdGuardPolicies {
     #[cfg(windows)]
@@ -839,8 +843,9 @@ impl ColdGuardPolicies {
             )
         };
         Ok(Self {
-            current,
+            current: Some(current),
             pending,
+            worker: None,
             protected_record,
         })
     }
@@ -851,6 +856,10 @@ impl ColdGuardPolicies {
 /// current bounded cleanup Calling and full C/A/B, process, socket, network and
 /// row native absence. Hold their lease across `read`, reattest before/after
 /// EVERY callback, and preserve the authenticated write-ahead record unchanged.
+/// Worker alternative: current signed entry/held owner/exact Worker bytes,
+/// independently dead engine+worker, persisted physical cleanup, exact TUN
+/// route/address/DNS absence, and original MIB tuple or absence. Full MIB
+/// absence is required after BLOCK deletion before storage retirement.
 /// Policies are comparison DATA. No reconstructed Source/Retired/creator ACK.
 /// Reentry, error (including callback error) or unwind permanently revokes this
 /// issuer, even if a caller swallows the failure. No successful default.
@@ -879,7 +888,7 @@ pub(crate) struct ColdWfpFacts {
 /// Separate retained cleanup issuer. No constructor from JSON, serialization,
 /// adoption/live APIs, original Guard ACK or automatic deletion on Drop.
 pub(crate) struct ColdStaticCleanup<N: ColdStaticNativeApi, A: ColdStaticAuthorization> {
-    scope: SessionScope,
+    pub(crate) scope: SessionScope,
     authority: std::rc::Rc<A>,
     io: std::cell::RefCell<Option<N>>,
     policies: std::cell::RefCell<Option<ColdGuardPolicies>>,
@@ -1021,7 +1030,12 @@ impl<N: ColdStaticNativeApi, A: ColdStaticAuthorization> ColdStaticCleanup<N, A>
                         .try_borrow_mut()
                         .map_err(|_| GuardError::Conflict)?;
                     match captured.as_ref() {
-                        Some(before) if before != &actual => return Err(GuardError::Conflict),
+                        Some(before)
+                            if before.sublayer != actual.sublayer
+                                || before.filters != actual.filters =>
+                        {
+                            return Err(GuardError::Conflict)
+                        }
                         Some(_) => {}
                         // Factual first native IDs retained even on lost read
                         // commit/postflight. They are NOT a creator ACK.
@@ -1035,7 +1049,7 @@ impl<N: ColdStaticNativeApi, A: ColdStaticAuthorization> ColdStaticCleanup<N, A>
         flight.success = true;
         Ok(())
     }
-    pub(crate) fn cleanup(&self) -> Result<()> {
+    pub(crate) fn cleanup(&self, allow_effects: bool) -> Result<()> {
         let mut flight = self.enter()?;
         if self.attempted.replace(true) || self.complete.get() {
             return Err(GuardError::Conflict);
@@ -1046,12 +1060,16 @@ impl<N: ColdStaticNativeApi, A: ColdStaticAuthorization> ColdStaticCleanup<N, A>
             .map_err(|_| GuardError::Conflict)?
             .clone()
             .ok_or(GuardError::Conflict)?;
+        if !allow_effects && (!original.filters.is_empty() || original.sublayer.is_some()) {
+            return Err(GuardError::Conflict);
+        }
         self.authorized(|data| {
             self.compare_authorized(data)?;
             let mut held = self.io.try_borrow_mut().map_err(|_| GuardError::Conflict)?;
             let io = held.as_mut().ok_or(GuardError::Conflict)?;
             cold_transaction(io, false, |io| {
-                if cold_read_checked(io, &self.scope, data)? != original {
+                let actual = cold_read_checked(io, &self.scope, data)?;
+                if actual.sublayer != original.sublayer || actual.filters != original.filters {
                     return Err(GuardError::Conflict);
                 }
                 self.healthy()?;
@@ -1138,14 +1156,51 @@ impl<N: ColdStaticNativeApi, A: ColdStaticAuthorization> Drop for ColdFlight<'_,
     }
 }
 fn cold_known_policies(scope: &SessionScope, data: &ColdGuardPolicies) -> Result<Vec<Snapshot>> {
-    if !scope.validate() || data.current.scope != *scope || data.protected_record.is_empty() {
+    if !scope.validate() || data.protected_record.is_empty() {
         return Err(GuardError::Conflict);
     }
-    data.current.validate()?;
-    let mut models = vec![&data.current];
+    if let Some((current, pending)) = &data.worker {
+        if data.current.is_some() || data.pending.is_some() || current.scope != *scope {
+            return Err(GuardError::Conflict);
+        }
+        current.snapshot()?;
+        let mut models = vec![current.clone()];
+        if let Some(plan) = pending {
+            let rebuilt =
+                crate::member_worker_guard::Plan::new(plan.expected.clone(), plan.desired.clone())?;
+            if rebuilt != *plan
+                || ![&plan.expected, &plan.withdrawn, &plan.base, &plan.desired].contains(&current)
+            {
+                return Err(GuardError::Conflict);
+            }
+            models.extend([
+                plan.expected.clone(),
+                plan.withdrawn.clone(),
+                plan.base.clone(),
+                plan.desired.clone(),
+            ]);
+        }
+        return models
+            .into_iter()
+            .map(|mut model| {
+                if model.scope != *scope {
+                    return Err(GuardError::Conflict);
+                }
+                model.snapshot()?;
+                model.admitted = false;
+                model.snapshot()
+            })
+            .collect();
+    }
+    let current = data.current.as_ref().ok_or(GuardError::Conflict)?;
+    if current.scope != *scope {
+        return Err(GuardError::Conflict);
+    }
+    current.validate()?;
+    let mut models = vec![current];
     if let Some(p) = &data.pending {
         p.validate()?;
-        if p.expected != data.current {
+        if p.expected != *current {
             return Err(GuardError::Conflict);
         }
         models.extend([&p.expected, &p.withdrawn, &p.base, &p.desired]);
@@ -1161,13 +1216,18 @@ fn cold_known_policies(scope: &SessionScope, data: &ColdGuardPolicies) -> Result
         })
         .collect()
 }
+
 fn cold_read_checked<N: ColdStaticNativeApi>(
     io: &mut N,
     scope: &SessionScope,
     data: &ColdGuardPolicies,
 ) -> Result<ColdWfpFacts> {
     let known = cold_known_policies(scope, data)?;
-    let keys = crate::member_carrier_guard::resource_keys(scope)?;
+    let keys = if data.worker.is_some() {
+        crate::member_worker_guard::keys(scope)?
+    } else {
+        crate::member_carrier_guard::resource_keys(scope)?
+    };
     let mut actual = io.read_full(scope)?;
     if actual.filters.len() > 48 || actual.arbitration.len() > MAX_ARBITRATION_FILTERS {
         return Err(GuardError::Conflict);
@@ -2131,6 +2191,7 @@ mod bfe {
     /// No add/permit/Source/retirement/module APIs are exposed.
     pub(crate) struct ColdBfe {
         scope: SessionScope,
+        keys: crate::member_carrier_guard::ResourceKeys,
         engine: Engine,
     }
     pub(crate) type NativeColdStaticCleanup<A> = ColdStaticCleanup<ColdBfe, A>;
@@ -2139,9 +2200,18 @@ mod bfe {
         authority: std::rc::Rc<A>,
         retain: impl FnOnce(std::rc::Rc<NativeColdStaticCleanup<A>>) -> Result<()>,
     ) -> Result<std::rc::Rc<NativeColdStaticCleanup<A>>> {
+        let keys = authority.with_cleanup_authority(&scope, |data| {
+            cold_known_policies(&scope, data)?;
+            if data.worker.is_some() {
+                crate::member_worker_guard::keys(&scope)
+            } else {
+                crate::member_carrier_guard::resource_keys(&scope)
+            }
+        })?;
         retain_cold_issuer(scope.clone(), authority, retain, || {
             Ok(ColdBfe {
                 scope,
+                keys,
                 engine: Engine::open(SessionKind::StaticBase)?,
             })
         })
@@ -2160,11 +2230,11 @@ mod bfe {
                 return Err(GuardError::Conflict);
             }
             let engine = self.engine.handle()?;
-            let keys = crate::member_carrier_guard::resource_keys(scope)?;
-            let sublayer = read_bfe_sublayer(engine, scope, keys.sublayer)?;
+            let keys = &self.keys;
+            let sublayer = read_bfe_sublayer(engine, keys, keys.sublayer)?;
             let mut filters = Vec::new();
             for k in keys.filters {
-                if let Some(f) = read_bfe_filter(engine, scope, k, keys.sublayer)? {
+                if let Some(f) = read_bfe_filter(engine, keys, k, keys.sublayer)? {
                     filters.push(f);
                 }
             }
@@ -2194,7 +2264,7 @@ mod bfe {
             })
         }
         fn delete_original_block(&mut self, original: &NativeFilter) -> Result<()> {
-            let keys = crate::member_carrier_guard::resource_keys(&self.scope)?;
+            let keys = &self.keys;
             if original.id == 0
                 || original.policy.action != Action::Block
                 || original.policy.flags != 0
@@ -2204,7 +2274,7 @@ mod bfe {
                 return Err(GuardError::Conflict);
             }
             let engine = self.engine.handle()?;
-            if read_bfe_filter(engine, &self.scope, original.policy.key, keys.sublayer)?.as_ref()
+            if read_bfe_filter(engine, keys, original.policy.key, keys.sublayer)?.as_ref()
                 != Some(original)
             {
                 return Err(GuardError::Conflict);
@@ -2230,7 +2300,7 @@ mod bfe {
         }
         fn delete_original_sublayer(&mut self, original: &Sublayer) -> Result<()> {
             let engine = self.engine.handle()?;
-            if read_bfe_sublayer(engine, &self.scope, original.key)?.as_ref() != Some(original) {
+            if read_bfe_sublayer(engine, &self.keys, original.key)?.as_ref() != Some(original) {
                 return Err(GuardError::Conflict);
             }
             // Confirm no hidden references at ANY layer within THIS write txn.
@@ -2512,7 +2582,11 @@ mod bfe {
             if kind != SessionKind::StaticBase {
                 return Err(GuardError::Conflict);
             }
-            read_bfe_sublayer(self.original.engine.handle()?, &self.original.scope, key)
+            read_bfe_sublayer(
+                self.original.engine.handle()?,
+                &crate::member_carrier_guard::resource_keys(&self.original.scope)?,
+                key,
+            )
         }
         fn filter(
             &mut self,
@@ -2525,7 +2599,7 @@ mod bfe {
             }
             read_bfe_filter(
                 self.original.engine.handle()?,
-                &self.original.scope,
+                &crate::member_carrier_guard::resource_keys(&self.original.scope)?,
                 key,
                 sub,
             )
@@ -3193,8 +3267,12 @@ mod bfe {
             }
         }
     }
-    fn read_bfe_sublayer(engine: HANDLE, scope: &SessionScope, k: Key) -> Result<Option<Sublayer>> {
-        if crate::member_carrier_guard::resource_keys(scope)?.sublayer != k {
+    fn read_bfe_sublayer(
+        engine: HANDLE,
+        keys: &crate::member_carrier_guard::ResourceKeys,
+        k: Key,
+    ) -> Result<Option<Sublayer>> {
+        if keys.sublayer != k {
             return Err(GuardError::Invalid);
         }
         let mut raw = ptr::null_mut();
@@ -3208,11 +3286,10 @@ mod bfe {
     }
     fn read_bfe_filter(
         engine: HANDLE,
-        scope: &SessionScope,
+        keys: &crate::member_carrier_guard::ResourceKeys,
         k: Key,
         sub: Key,
     ) -> Result<Option<NativeFilter>> {
-        let keys = crate::member_carrier_guard::resource_keys(scope)?;
         if keys.sublayer != sub || !keys.filters.contains(&k) {
             return Err(GuardError::Invalid);
         }

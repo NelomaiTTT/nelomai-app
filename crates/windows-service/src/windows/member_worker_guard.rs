@@ -60,6 +60,21 @@ impl Guard {
         };
         let value = action(transaction.guard)?;
         transaction.guard.io.commit(kind)?;
+        #[cfg(test)]
+        if kind == SessionKind::DynamicPermits
+            && super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+                if fault.get()
+                    == Some(super::member_worker_factory_native_tests::StopFault::GuardWithdrawal)
+                {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            return Err(GuardError::Conflict);
+        }
         transaction.finished = true;
         Ok(value)
     }
@@ -204,8 +219,31 @@ impl Guard {
         self.failed = false;
         Ok(())
     }
-    pub(crate) fn close(&mut self) -> Result<()> {
-        if self.closed || self.current.interface.is_some() {
+    pub(crate) fn close(
+        &mut self,
+        lifetime_only: bool,
+        retired: Option<
+            &super::member_carrier_guard::NativeColdStaticCleanup<
+                std::cell::RefCell<super::member_worker::Journal>,
+            >,
+        >,
+    ) -> Result<()> {
+        if let Some(retired) = retired {
+            if retired.scope != self.current.scope || retired.disposition() != (true, true, false) {
+                return Err(GuardError::Conflict);
+            }
+            self.verify_terminal(true)?;
+            if let Some(p) = self.current.interface {
+                if !super::member_worker::absent(p.guid, Some(p)).map_err(denied)? {
+                    return Err(GuardError::Conflict);
+                }
+            }
+            self.current = Model::empty(self.current.scope.clone());
+            self.plan = None;
+            // failed remains sticky: this is terminal bookkeeping, never rearm.
+            return self.verify_terminal(false);
+        }
+        if self.closed || (!lifetime_only && self.current.interface.is_some()) {
             return Err(GuardError::Conflict);
         }
         self.io.enter_terminal_lane();
@@ -216,8 +254,10 @@ impl Guard {
         self.closed = true;
         Ok(())
     }
-    pub(crate) fn verify_terminal(&self) -> Result<()> {
-        if !self.closed || self.current.interface.is_some() || self.plan.is_some() {
+    pub(crate) fn verify_terminal(&self, lifetime_only: bool) -> Result<()> {
+        if !self.closed
+            || (!lifetime_only && (self.current.interface.is_some() || self.plan.is_some()))
+        {
             return Err(GuardError::Conflict);
         }
         for kind in [SessionKind::DynamicPermits, SessionKind::StaticBase] {

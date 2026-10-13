@@ -111,7 +111,7 @@ const PROBLEM_OR_TRANSITION: u32 = 0x8044_8420;
 fn text(value: &str, max: usize) -> bool {
     !value.is_empty() && value.encode_utf16().count() <= max && !value.chars().any(char::is_control)
 }
-fn validate_expected(want: &Expected) -> Result<()> {
+pub(crate) fn validate_expected(want: &Expected) -> Result<()> {
     // SDK ifdef.h: Reserved24, NetLuidIndex24, IfType16. Not an ownership check.
     if want.guid == [0; 16]
         || want.index == 0
@@ -135,13 +135,13 @@ fn validate_row(want: &Expected, row: &Interface) -> Result<()> {
     }
     Ok(())
 }
-fn collides(want: &Expected, row: &Interface) -> bool {
+pub(crate) fn collides(want: &Expected, row: &Interface) -> bool {
     row.identity.guid == want.guid
         || row.identity.luid == want.luid
         || row.identity.index == want.index
         || row.identity.name.eq_ignore_ascii_case(&want.name)
 }
-fn validate_interfaces(want: &Expected, seen: &Observed) -> Result<()> {
+pub(crate) fn validate_interfaces(want: &Expected, seen: &Observed) -> Result<()> {
     for row in [&seen.by_luid, &seen.by_index, &seen.by_guid] {
         validate_row(want, row)?;
     }
@@ -168,9 +168,14 @@ fn inf_name(inf: &str) -> bool {
         .is_some_and(|s| !s.is_empty() && s.len() <= 10 && s.bytes().all(|b| b.is_ascii_digit()))
 }
 fn validate_device(want: &Expected, devices: &[Device]) -> Result<()> {
-    validate_provider_device(want, ProviderKind::Wintun, devices)
+    validate_provider_device(want, ProviderKind::Wintun, devices, false)
 }
-fn validate_provider_device(want: &Expected, kind: ProviderKind, devices: &[Device]) -> Result<()> {
+pub(crate) fn validate_provider_device(
+    want: &Expected,
+    kind: ProviderKind,
+    devices: &[Device],
+    terminal_cleanup: bool,
+) -> Result<()> {
     // This is the WHOLE related set, not a filter which hides mismatches.
     if devices.len() != 1 {
         return Err(Error::Conflict("missing/extra/legacy provider instances"));
@@ -247,7 +252,17 @@ fn validate_provider_device(want: &Expected, kind: ProviderKind, devices: &[Devi
     // CM_Locate_DevNodeW(NORMAL) additionally proves presence natively.
     // DN_DRIVER_LOADED2 + DN_STARTED8; reject HAS_PROBLEM, PRIVATE_PROBLEM,
     // BOOT_LOG_PROB, BAD_PARTIAL, WILL_BE_REMOVED and pending NEED_TO_ENUM.
-    if d.presence != Presence::Present
+    if terminal_cleanup {
+        // Comparison only; the factory separately supplies current signed
+        // cleanup authority. No live caller accepts a phantom provider.
+        if kind != ProviderKind::Wintun
+            || d.presence != Presence::Phantom
+            || d.status != 0
+            || d.problem != 0
+        {
+            return Err(Error::Conflict("non-terminal cleanup instance"));
+        }
+    } else if d.presence != Presence::Present
         || d.status & 0xa != 0xa
         || d.status & PROBLEM_OR_TRANSITION != 0
         || d.problem != 0
@@ -264,8 +279,8 @@ fn validate_provider(
 ) -> Result<Observation> {
     validate_expected(want)?;
     validate_interfaces(want, before)?;
-    validate_provider_device(want, kind, &before.devices)?;
-    validate_provider_device(want, kind, &after.devices)?;
+    validate_provider_device(want, kind, &before.devices, false)?;
+    validate_provider_device(want, kind, &after.devices, false)?;
     validate_interfaces(want, after)?;
     // Compare stable identity/role and ALL queried device metadata. Interface
     // traffic counters and unrelated interface churn are not identity evidence.
@@ -415,8 +430,8 @@ trait Queries {
 /// Entire ALLCLASSES scan: all Net-class nodes plus every related non-Net node.
 /// No caller-supplied classification, completeness bit, or foreign allowance.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DeviceSnapshot {
-    nodes: Vec<Device>,
+pub(crate) struct DeviceSnapshot {
+    pub(crate) nodes: Vec<Device>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StackEdge {
@@ -426,9 +441,9 @@ struct StackEdge {
 
 /// Name/GUID comparison only. It carries no creator or mutation authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AbsenceTarget {
-    guid: [u8; 16],
-    name: String,
+pub(crate) struct AbsenceTarget {
+    pub(crate) guid: [u8; 16],
+    pub(crate) name: String,
 }
 
 fn target(want: &Expected) -> AbsenceTarget {
@@ -564,7 +579,7 @@ fn validate_universe_table(wants: &[Expected], rows: &[Interface], foreign: &[u3
     }
     Ok(())
 }
-fn device_related(targets: &[AbsenceTarget], d: &Device) -> Result<bool> {
+pub(crate) fn device_related(targets: &[AbsenceTarget], d: &Device) -> Result<bool> {
     Ok(
         related_targets(targets, &d.instance, &d.hardware_ids, &d.compatible_ids,
         Some(&d.service), Some(&d.netcfg_instance_id), Some(&d.name))?
@@ -1249,7 +1264,7 @@ fn bind_devices(
             bound.push(None);
             continue;
         }
-        validate_provider_device(want, expected.kind, &matches)?;
+        validate_provider_device(want, expected.kind, &matches, false)?;
         bound.push(Some(matches.remove(0)));
     }
     Ok(bound)
@@ -1442,7 +1457,7 @@ pub(crate) mod native {
         s.encode_utf16().chain(Some(0)).collect()
     }
 
-    struct InfoSet(HDEVINFO);
+    pub(crate) struct InfoSet(pub(crate) HDEVINFO);
     impl Drop for InfoSet {
         fn drop(&mut self) {
             unsafe {
@@ -1530,7 +1545,7 @@ pub(crate) mod native {
             role_flags: row.InterfaceAndOperStatusFlags._bitfield,
         })
     }
-    fn interfaces(want: &Expected) -> Result<Observed> {
+    pub(crate) fn interfaces(want: &Expected) -> Result<Observed> {
         let by_luid = row(want.luid, 0)?;
         let by_index = row(0, want.index)?;
         let mut from_guid = NET_LUID_LH::default();
@@ -1709,7 +1724,7 @@ pub(crate) mod native {
         let (kind, b) = value(key, name, false)?.ok_or(Error::Invalid("missing DWORD"))?;
         dword_property(kind, &b)
     }
-    fn instance(set: &InfoSet, d: &SP_DEVINFO_DATA) -> Result<String> {
+    pub(crate) fn instance(set: &InfoSet, d: &SP_DEVINFO_DATA) -> Result<String> {
         let mut buf = [0; INSTANCE_WORDS];
         let mut size = 0;
         if unsafe {
@@ -1729,7 +1744,7 @@ pub(crate) mod native {
             .collect::<Vec<_>>();
         string_property(DEVPROP_TYPE_STRING, DEVPROP_TYPE_STRING, &b)
     }
-    fn live(instance: &str, d: &SP_DEVINFO_DATA) -> Result<(Presence, u32, u32)> {
+    pub(crate) fn live(instance: &str, d: &SP_DEVINFO_DATA) -> Result<(Presence, u32, u32)> {
         let mut located = 0;
         let normal = unsafe {
             CM_Locate_DevNodeW(
@@ -1783,7 +1798,7 @@ pub(crate) mod native {
         }
         Ok((presence, flags, problem))
     }
-    fn device_snapshot(targets: &[AbsenceTarget]) -> Result<DeviceSnapshot> {
+    pub(crate) fn device_snapshot(targets: &[AbsenceTarget]) -> Result<DeviceSnapshot> {
         // No PRESENT filter: phantom, legacy, stub and wrong-class related
         // nodes must never be hidden from the exactly-one predicate.
         let raw = unsafe {

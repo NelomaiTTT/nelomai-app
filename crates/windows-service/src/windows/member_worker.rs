@@ -18,7 +18,8 @@ use nelomai_client_tunnel::{
         driver::{NativePair, SessionStore},
         evidence::NativeHealthSample,
         network::{
-            NetworkJournal, NetworkJournalStore, NetworkOwner, NetworkValue, RouteScope, RouteValue,
+            NetworkJournal, NetworkJournalStore, NetworkOwner, NetworkSystem, NetworkValue,
+            ResourceKey, RouteScope, RouteValue,
         },
         protocol::Member,
         session::{SessionPhase, SessionSnapshot},
@@ -98,7 +99,7 @@ fn same_mapping(p: InterfaceProof) -> io::Result<()> {
     }
     Ok(())
 }
-fn absent(requested: [u8; 16], original: Option<InterfaceProof>) -> io::Result<bool> {
+pub(crate) fn absent(requested: [u8; 16], original: Option<InterfaceProof>) -> io::Result<bool> {
     let rows = super::member_carrier_provider::native::table().map_err(|_| failed())?;
     let mut present = false;
     for row in rows {
@@ -121,43 +122,62 @@ fn absent(requested: [u8; 16], original: Option<InterfaceProof>) -> io::Result<b
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AddressIntent {
-    source: [u8; 4],
+pub(crate) struct AddressIntent {
+    pub(crate) source: [u8; 4],
     attempted: bool,
     acknowledged: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Record {
-    version: u32,
-    runtime: EngineIdentity,
-    boot: [u8; 16],
-    scope: SessionScope,
-    requested_guid: [u8; 16],
-    process: Option<ProcessProof>,
-    interface: Option<InterfaceProof>,
-    closing: bool,
-    stopped: bool,
-    guard: Model,
-    guard_pending: Option<crate::member_worker_guard::Plan>,
-    network: NetworkJournal,
-    dns: Option<DnsRecord>,
-    address: Option<AddressIntent>,
+pub(crate) struct Record {
+    pub(crate) version: u32,
+    pub(crate) runtime: EngineIdentity,
+    pub(crate) boot: [u8; 16],
+    pub(crate) scope: SessionScope,
+    pub(crate) requested_guid: [u8; 16],
+    pub(crate) process: Option<ProcessProof>,
+    pub(crate) interface: Option<InterfaceProof>,
+    pub(crate) closing: bool,
+    pub(crate) stopped: bool,
+    pub(crate) guard: Model,
+    pub(crate) guard_pending: Option<crate::member_worker_guard::Plan>,
+    pub(crate) network: NetworkJournal,
+    pub(crate) dns: Option<DnsRecord>,
+    pub(crate) address: Option<AddressIntent>,
+    #[serde(default)]
+    pub(crate) creator: Option<ProcessProof>,
+    #[serde(default)]
+    pub(crate) physical: Vec<super::member_session::PhysicalLease>,
 }
-struct Journal {
-    private: MemberFiles,
-    owner: Arc<MutationGuard>,
-    root: PathBuf,
-    current: Record,
-    expected: Option<Vec<u8>>,
+pub(crate) struct Journal {
+    pub(crate) private: MemberFiles,
+    pub(crate) owner: Arc<MutationGuard>,
+    pub(crate) root: PathBuf,
+    pub(crate) current: Record,
+    pub(crate) expected: Option<Vec<u8>>,
     // First, cold publication only. These bytes are a cleanup CAS predecessor,
     // never confirmed state or permission to spawn/Start.
-    initial_attempt: Option<Vec<u8>>,
+    pub(crate) initial_attempt: Option<Vec<u8>>,
     // Unconfirmed cold Closing bytes have only retry/cleanup authority.
-    closing_attempt: Option<Vec<u8>>,
+    pub(crate) closing_attempt: Option<Vec<u8>>,
+    pub(crate) source: Rc<WorkerSource>,
+    pub(crate) cold: bool,
+    pub(crate) retirement: Option<(
+        super::member_session::OriginalSessionFilesIdentity,
+        super::member_session::ProtectedRecoveryRecords,
+    )>,
+    pub(crate) cleanup_busy: bool,
+    pub(crate) retirement_attempted: bool,
+    pub(crate) retirement_failed: bool,
+    pub(crate) retirement_verified: bool,
+    pub(crate) retirement_ack: Option<Rc<super::member_session::ColdRetirementAck>>,
+    pub(crate) retained: Option<(Rc<Original>, Rc<RefCell<Guard>>)>,
 }
 impl Journal {
-    fn save(&mut self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
+    pub(crate) fn save(&mut self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
+        if self.cold {
+            self.verify()?;
+        }
         if self.initial_attempt.is_some() || self.closing_attempt.is_some() {
             return Err(failed());
         }
@@ -177,11 +197,175 @@ impl Journal {
         })?;
         self.current = next;
         self.expected = Some(bytes);
+        if self.cold {
+            self.verify()?;
+        }
         Ok(())
     }
-    fn verify(&mut self) -> io::Result<()> {
+    pub(crate) fn verify(&mut self) -> io::Result<()> {
         if self.initial_attempt.is_some() || self.closing_attempt.is_some() {
             return Err(failed());
+        }
+        if self.cold {
+            checked(self.source.verify())?;
+            let mut hash = Sha256::new();
+            hash.update(b"nelomai-worker-tun/v1\0");
+            hash.update(serde_json::to_vec(&self.current.scope).map_err(|_| failed())?);
+            let mut requested: [u8; 16] = hash.finalize()[..16].try_into().map_err(|_| failed())?;
+            requested[6] = (requested[6] & 15) | 64;
+            requested[8] = (requested[8] & 63) | 128;
+            if requested != self.current.requested_guid {
+                return Err(failed());
+            }
+            let changed_boot = self.current.boot != super::member_boot::boot_id()?;
+            let absence_only = changed_boot
+                || self.current.version == 1
+                || self.current.creator.is_none()
+                || self.current.process.is_none()
+                || self.current.runtime != *self.source.identity();
+            if !self.current.scope.validate()
+                || self.current.scope.runtime != self.current.runtime.slot
+                || !matches!(self.current.version, 1 | 2)
+            {
+                return Err(failed());
+            }
+            if self.current.scope.runtime != self.source.identity().slot {
+                return Err(failed());
+            }
+            if let Some((original, guard)) = &self.retained {
+                if !Rc::ptr_eq(&original.source, &self.source)
+                    || original.requested != self.current.requested_guid
+                    || original.interface.get() != self.current.interface
+                    || guard.borrow().current.scope != self.current.scope
+                {
+                    return Err(failed());
+                }
+                original.verify_process_exit()?;
+                checked(guard.borrow().verify_terminal(true))?;
+            } else if !changed_boot {
+                for process in self
+                    .current
+                    .creator
+                    .iter()
+                    .chain(self.current.process.iter())
+                {
+                    if process.pid == 0 || process.creation_time == 0 {
+                        return Err(failed());
+                    }
+                    super::member_carrier_recovery::native::absent_process(*process)?;
+                }
+            }
+            let gone = absent(
+                self.current.requested_guid,
+                if changed_boot {
+                    None
+                } else {
+                    self.current.interface
+                },
+            )?;
+            if (self.retirement_verified || absence_only) && !gone {
+                return Err(failed());
+            }
+            if let Some(interface) = self.current.interface {
+                if interface.guid != self.current.requested_guid
+                    || interface.index == 0
+                    || interface.luid == 0
+                {
+                    return Err(failed());
+                }
+            }
+            for model in std::iter::once(&self.current.guard).chain(
+                self.current
+                    .guard_pending
+                    .iter()
+                    .flat_map(|plan| [&plan.expected, &plan.withdrawn, &plan.base, &plan.desired]),
+            ) {
+                if model.scope != self.current.scope
+                    || model
+                        .interface
+                        .is_some_and(|p| Some(p) != self.current.interface)
+                {
+                    return Err(failed());
+                }
+                checked(model.snapshot())?;
+            }
+            if self.current.physical.len() > crate::member_plan::MAX_ROUTES {
+                return Err(failed());
+            }
+            let network = self.current.network.read_view()?;
+            for value in network
+                .current()
+                .chain(network.pending().into_iter().flatten())
+            {
+                if let NetworkValue::Route(route) = value {
+                    if self
+                        .current
+                        .interface
+                        .is_some_and(|p| p.index == route.interface)
+                        || absence_only
+                    {
+                        use crate::member_routes::RowIo;
+                        if !super::member_routes::NativeRowIo
+                            .read(route.destination, route.interface)?
+                            .is_empty()
+                        {
+                            return Err(failed());
+                        }
+                    }
+                }
+            }
+            if let Some(p) = self.current.interface {
+                if let Some(address) = &self.current.address {
+                    let code =
+                        unsafe { GetUnicastIpAddressEntry(&mut address_row(p, address.source)) };
+                    #[cfg(test)]
+                    eprintln!("worker cold address absence status={code}");
+                    if code != windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+                        return Err(failed());
+                    }
+                }
+                if let Some(saved) = &self.current.dns {
+                    for snapshot in [&saved.baseline, &saved.current]
+                        .into_iter()
+                        .chain(saved.pending.iter())
+                    {
+                        if snapshot.interface.scope != self.current.scope
+                            || (
+                                snapshot.interface.guid,
+                                snapshot.interface.luid,
+                                snapshot.interface.index,
+                            ) != (p.guid, p.luid, p.index)
+                        {
+                            return Err(failed());
+                        }
+                    }
+                    let mut settings = DNS_INTERFACE_SETTINGS {
+                        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                        ..Default::default()
+                    };
+                    let code = unsafe {
+                        GetInterfaceDnsSettings(
+                            windows_sys::core::GUID::from_u128(u128::from_be_bytes(p.guid)),
+                            &mut settings,
+                        )
+                    };
+                    if code == 0 {
+                        unsafe { FreeInterfaceDnsSettings(&mut settings) };
+                    }
+                    #[cfg(test)]
+                    eprintln!("worker cold DNS absence status={code}");
+                    // A proven same-boot owner may restore its exact retained
+                    // DNS intent before WFP cleanup. Success means DNS exists,
+                    // never absence; unknown owners remain absence-only.
+                    if code != windows_sys::Win32::Foundation::ERROR_NOT_FOUND
+                        && (code != 0 || absence_only || self.retirement_verified)
+                    {
+                        return Err(failed());
+                    }
+                }
+            } else if self.current.address.is_some() || self.current.dns.is_some() {
+                return Err(failed());
+            }
         }
         self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
         self.private.transaction(|files| {
@@ -192,7 +376,132 @@ impl Journal {
         })
     }
 }
-type SharedJournal = Rc<RefCell<Journal>>;
+// These issuers are NEW cleanup authority rooted in the current signed entry,
+// same exclusive lease and exact protected bytes. No old native ACK is imported.
+unsafe impl super::member_carrier_guard::ColdStaticAuthorization for RefCell<Journal> {
+    fn with_cleanup_authority<T>(
+        &self,
+        scope: &SessionScope,
+        read: impl FnOnce(
+            &super::member_carrier_guard::ColdGuardPolicies,
+        ) -> crate::member_carrier_guard::Result<T>,
+    ) -> crate::member_carrier_guard::Result<T> {
+        let policies = {
+            let mut journal = self
+                .try_borrow_mut()
+                .map_err(|_| crate::member_carrier_guard::GuardError::Conflict)?;
+            if journal.cleanup_busy || journal.retirement_failed {
+                journal.retirement_failed = true;
+                return Err(crate::member_carrier_guard::GuardError::Conflict);
+            }
+            // The latch is cleared only after positive postflight. Error and
+            // unwind revoke this issuer; a nested callback can mark failure
+            // because no Journal borrow is held across the callback.
+            journal.cleanup_busy = true;
+            journal
+                .verify()
+                .map_err(|_| crate::member_carrier_guard::GuardError::Conflict)?;
+            let network = journal
+                .current
+                .network
+                .read_view()
+                .map_err(|_| crate::member_carrier_guard::GuardError::Conflict)?;
+            if !journal.cold
+                || journal.current.dns.is_some()
+                || journal.current.address.is_some()
+                || &journal.current.scope != scope
+                || network.current().next().is_some()
+                || network.pending().is_some()
+                || network.recorded_active().is_some()
+            {
+                return Err(crate::member_carrier_guard::GuardError::Conflict);
+            }
+            super::member_carrier_guard::ColdGuardPolicies {
+                current: None,
+                pending: None,
+                worker: Some((
+                    journal.current.guard.clone(),
+                    journal.current.guard_pending.clone(),
+                )),
+                protected_record: journal
+                    .expected
+                    .clone()
+                    .ok_or(crate::member_carrier_guard::GuardError::Conflict)?,
+            }
+        };
+        let output = read(&policies)?;
+        let mut journal = self
+            .try_borrow_mut()
+            .map_err(|_| crate::member_carrier_guard::GuardError::Conflict)?;
+        if !journal.cleanup_busy
+            || journal.retirement_failed
+            || journal.expected.as_ref() != Some(&policies.protected_record)
+            || policies.worker.as_ref()
+                != Some(&(
+                    journal.current.guard.clone(),
+                    journal.current.guard_pending.clone(),
+                ))
+        {
+            return Err(crate::member_carrier_guard::GuardError::Conflict);
+        }
+        journal
+            .verify()
+            .map_err(|_| crate::member_carrier_guard::GuardError::Conflict)?;
+        journal.cleanup_busy = false;
+        Ok(output)
+    }
+}
+unsafe impl super::member_session::OriginalColdNativeEmptyProof for RefCell<Journal> {
+    fn begin_retirement(
+        &self,
+        origin: &super::member_session::OriginalSessionFilesIdentity,
+        expected: &super::member_session::ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        let mut journal = self.try_borrow_mut().map_err(|_| failed())?;
+        if journal.retirement_attempted
+            || journal.retirement_failed
+            || !journal.retirement_verified
+            || journal
+                .retirement
+                .as_ref()
+                .is_none_or(|(registered, facts)| {
+                    !registered.same_original(origin) || facts != expected
+                })
+            || expected.worker != journal.expected
+        {
+            return Err(failed());
+        }
+        journal.retirement_attempted = true;
+        Ok(())
+    }
+    fn verify_retirement(
+        &self,
+        origin: &super::member_session::OriginalSessionFilesIdentity,
+        expected: &super::member_session::ProtectedRecoveryRecords,
+    ) -> io::Result<()> {
+        let journal = self.try_borrow().map_err(|_| failed())?;
+        if !journal.retirement_attempted
+            || journal.retirement_failed
+            || !journal.retirement_verified
+            || journal
+                .retirement
+                .as_ref()
+                .is_none_or(|(registered, facts)| {
+                    !registered.same_original(origin) || facts != expected
+                })
+            || expected.worker != journal.expected
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn fail_retirement(&self) {
+        if let Ok(mut journal) = self.try_borrow_mut() {
+            journal.retirement_failed = true;
+        }
+    }
+}
+pub(crate) type SharedJournal = Rc<RefCell<Journal>>;
 
 struct Rpc {
     send: mpsc::SyncSender<Zeroizing<Vec<u8>>>,
@@ -303,7 +612,7 @@ impl Rpc {
         Ok(reply)
     }
 }
-struct Original {
+pub(crate) struct Original {
     source: Rc<WorkerSource>,
     child: RefCell<Option<Child>>,
     job: RefCell<Option<OwnedHandle>>,
@@ -539,7 +848,7 @@ impl Completion {
     pub(crate) fn verify_storage(&self, scope: &SessionScope) -> io::Result<()> {
         self.original.verify_exit()?;
         if let Some(guard) = &self.guard {
-            checked(guard.borrow().verify_terminal())?;
+            checked(guard.borrow().verify_terminal(false))?;
         }
         let journal = self.journal.borrow();
         let record = &journal.current;
@@ -564,22 +873,33 @@ impl Completion {
 }
 pub(crate) fn terminal_identity(
     bytes: &[u8],
+    cold: bool,
 ) -> io::Result<(SessionScope, EngineIdentity, [u8; 16])> {
     let record: Record = serde_json::from_slice(bytes).map_err(|_| failed())?;
+    let mut hash = Sha256::new();
+    hash.update(b"nelomai-worker-tun/v1\0");
+    hash.update(serde_json::to_vec(&record.scope).map_err(|_| failed())?);
+    let mut requested: [u8; 16] = hash.finalize()[..16].try_into().map_err(|_| failed())?;
+    requested[6] = (requested[6] & 15) | 64;
+    requested[8] = (requested[8] & 63) | 128;
+    if requested != record.requested_guid {
+        return Err(failed());
+    }
     let network = record.network.read_view()?;
-    if record.version != 1
+    if !matches!(record.version, 1 | 2)
         || !record.scope.validate()
         || record.runtime.slot != record.scope.runtime
-        || !record.stopped
-        || !record.closing
-        || record.guard.interface.is_some()
-        || record.guard_pending.is_some()
-        || record
-            .guard
-            .snapshot()
-            .map_err(|_| failed())?
-            .sublayer
-            .is_some()
+        || (!cold
+            && (!record.stopped
+                || !record.closing
+                || record.guard.interface.is_some()
+                || record.guard_pending.is_some()
+                || record
+                    .guard
+                    .snapshot()
+                    .map_err(|_| failed())?
+                    .sublayer
+                    .is_some()))
         || network.current().next().is_some()
         || network.pending().is_some()
         || network.recorded_active().is_some()
@@ -591,7 +911,7 @@ pub(crate) fn terminal_identity(
     Ok((record.scope, record.runtime, record.boot))
 }
 pub(crate) fn verify_terminal_record(bytes: &[u8]) -> io::Result<()> {
-    terminal_identity(bytes)?;
+    terminal_identity(bytes, true)?;
     let record: Record = serde_json::from_slice(bytes).map_err(|_| failed())?;
     if !absent(record.requested_guid, None)? {
         return Err(failed());
@@ -661,12 +981,8 @@ pub(crate) struct Control {
     journal: SharedJournal,
     rpc: Rc<RefCell<Option<Rpc>>>,
     guard: Option<Rc<RefCell<Guard>>>,
-    routes: Option<
-        NetworkOwner<
-            crate::member_routes::MemberRoutes<super::member_routes::NativeRowIo, WorkerIdentity>,
-            RouteJournal,
-        >,
-    >,
+    cold_guard: Option<Rc<super::member_carrier_guard::NativeColdStaticCleanup<RefCell<Journal>>>>,
+    routes: Option<NetworkOwner<WorkerIdentity, RouteJournal>>,
     completed: Rc<RefCell<Option<Rc<Completion>>>>,
     members: [Option<(IpAddr, IpAddr)>; 2],
     ready: bool,
@@ -683,18 +999,23 @@ pub(crate) struct Control {
     physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
     options: Option<DesktopTunnelOptions>,
 }
-struct WorkerIdentity {
-    original: Rc<Original>,
-    physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
+pub(crate) struct WorkerIdentity {
+    pub(crate) original: Option<Rc<Original>>,
+    pub(crate) journal: SharedJournal,
+    pub(crate) physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
 }
 impl crate::member_routes::IdentityCheck for WorkerIdentity {
     fn verify(&mut self, index: u32) -> io::Result<crate::member_routes::NativeProof> {
-        self.original.verify_live()?;
-        if let Some(p) = self.original.interface.get().filter(|p| p.index == index) {
-            return Ok(crate::member_routes::NativeProof {
-                index,
-                luid: p.luid,
-            });
+        if let Some(original) = &self.original {
+            original.verify_live()?;
+            if let Some(p) = original.interface.get().filter(|p| p.index == index) {
+                return Ok(crate::member_routes::NativeProof {
+                    index,
+                    luid: p.luid,
+                });
+            }
+        } else {
+            self.journal.borrow_mut().verify()?;
         }
         let path = self
             .physical
@@ -703,32 +1024,117 @@ impl crate::member_routes::IdentityCheck for WorkerIdentity {
             .find(|p| p.proof.identity.index == index)
             .cloned()
             .ok_or_else(failed)?;
-        super::member_physical::verify(
-            &path,
-            &self
-                .original
-                .interface
-                .get()
-                .map(|p| crate::member_physical::InterfaceIdentity {
-                    index: p.index,
-                    luid: p.luid,
-                    guid: p.guid,
-                })
-                .into_iter()
-                .collect::<Vec<_>>(),
-        )?;
+        if self.original.is_none() {
+            // Cleanup keeps the original physical identity, independently of a
+            // DHCP/default-route or interface metric change after engine death.
+            if super::member_physical::read_identity(index)? != path.proof.identity {
+                return Err(failed());
+            }
+        } else {
+            let interface = self.journal.borrow().current.interface;
+            super::member_physical::verify(
+                &path,
+                &interface
+                    .map(|p| crate::member_physical::InterfaceIdentity {
+                        index: p.index,
+                        luid: p.luid,
+                        guid: p.guid,
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )?;
+        }
         Ok(crate::member_routes::NativeProof {
             index,
             luid: path.proof.identity.luid,
         })
     }
 }
-struct RouteJournal(SharedJournal);
+impl NetworkSystem for WorkerIdentity {
+    fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        if self.original.is_none() {
+            self.journal.borrow_mut().verify()?;
+            let interface = self.journal.borrow().current.interface;
+            let absence_only = {
+                let journal = self.journal.borrow();
+                journal.current.version == 1
+                    || journal.current.creator.is_none()
+                    || journal.current.process.is_none()
+                    || journal.current.boot != super::member_boot::boot_id()?
+                    || journal.current.runtime != *journal.source.identity()
+            };
+            if absence_only
+                || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
+            {
+                if let ResourceKey::Route(destination, RouteScope::WindowsInterface(index)) = key {
+                    use crate::member_routes::RowIo;
+                    if !super::member_routes::NativeRowIo
+                        .read(*destination, *index)?
+                        .is_empty()
+                    {
+                        return Err(failed());
+                    }
+                    self.journal.borrow_mut().verify()?;
+                    return Ok(None);
+                }
+            }
+        }
+        crate::member_routes::MemberRoutes::new(super::member_routes::NativeRowIo, |index| {
+            crate::member_routes::IdentityCheck::verify(self, index)
+        })
+        .read(key)
+    }
+    fn compare_exchange(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+    ) -> io::Result<()> {
+        if self.original.is_none() {
+            if after.is_some() {
+                return Err(failed());
+            } // Never recreate via pending rollback.
+            let interface = self.journal.borrow().current.interface;
+            let absence_only = {
+                let journal = self.journal.borrow();
+                journal.current.version == 1
+                    || journal.current.creator.is_none()
+                    || journal.current.process.is_none()
+                    || journal.current.boot != super::member_boot::boot_id()?
+                    || journal.current.runtime != *journal.source.identity()
+            };
+            if absence_only
+                || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
+            {
+                return if before.is_none() && self.read(key)?.is_none() {
+                    Ok(())
+                } else {
+                    Err(failed())
+                };
+            }
+        }
+        crate::member_routes::MemberRoutes::new(super::member_routes::NativeRowIo, |index| {
+            crate::member_routes::IdentityCheck::verify(self, index)
+        })
+        .compare_exchange(key, before, after)
+    }
+}
+pub(crate) struct RouteJournal(
+    pub(crate) SharedJournal,
+    pub(crate) Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
+);
 impl NetworkJournalStore for RouteJournal {
     fn save(&mut self, network: &NetworkJournal) -> io::Result<()> {
-        self.0
-            .borrow_mut()
-            .save(|record| record.network = network.clone())
+        let physical = self
+            .1
+            .borrow()
+            .iter()
+            .map(super::member_session::PhysicalLease::capture)
+            .collect();
+        self.0.borrow_mut().save(|record| {
+            record.network = network.clone();
+            record.physical = physical;
+        })
     }
 }
 
@@ -751,8 +1157,29 @@ pub(crate) fn prepare(
     if !absent(requested, None)? {
         return Err(failed());
     }
+    let mut times = [FILETIME::default(); 4];
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut times[0],
+            &mut times[1],
+            &mut times[2],
+            &mut times[3],
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let creator = ProcessProof {
+        pid: unsafe { GetCurrentProcessId() },
+        creation_time: (u64::from(times[0].dwHighDateTime) << 32)
+            | u64::from(times[0].dwLowDateTime),
+    };
+    if creator.pid == 0 || creator.creation_time == 0 {
+        return Err(failed());
+    }
     let record = Record {
-        version: 1,
+        version: 2,
         runtime: source.identity().clone(),
         boot: super::member_boot::boot_id()?,
         scope: scope.clone(),
@@ -766,13 +1193,18 @@ pub(crate) fn prepare(
         network: NetworkJournal::default(),
         dns: None,
         address: None,
+        creator: Some(creator),
+        physical: Vec::new(),
     };
     let mut private = checked(MemberFiles::new())?;
     let expected = private.transaction(|records| records.read(PrivateFile::Worker))?;
     if let Some(old) = &expected {
         let old: Record = serde_json::from_slice(old).map_err(|_| failed())?;
-        if !old.stopped || old.scope == scope {
+        if old.scope == scope {
             return Err(failed());
+        }
+        if !old.stopped {
+            files.clone().verify_completed_worker()?;
         }
     }
     let journal = Rc::new(RefCell::new(Journal {
@@ -783,6 +1215,15 @@ pub(crate) fn prepare(
         expected,
         initial_attempt: None,
         closing_attempt: None,
+        source: source.clone(),
+        cold: false,
+        retirement: None,
+        cleanup_busy: false,
+        retirement_attempted: false,
+        retirement_failed: false,
+        retirement_verified: false,
+        retirement_ack: None,
+        retained: None,
     }));
     let original = Rc::new(Original {
         source,
@@ -806,6 +1247,7 @@ pub(crate) fn prepare(
             journal,
             rpc: Rc::new(RefCell::new(None)),
             guard: None,
+            cold_guard: None,
             routes: None,
             completed: completed.clone(),
             members: [None, None],
@@ -998,18 +1440,28 @@ impl Control {
         }
         Ok(())
     }
-    fn dns(&self) -> io::Result<member_dns::OwnedDns<WorkerDns, super::member_dns::NativeDnsIo>> {
-        let p = self.original.interface.get().ok_or_else(failed)?;
+    fn dns(
+        journal: SharedJournal,
+        original: Option<Rc<Original>>,
+    ) -> io::Result<member_dns::OwnedDns<WorkerDns, super::member_dns::NativeDnsIo>> {
+        let (scope, p) = {
+            let journal = journal.borrow();
+            (
+                journal.current.scope.clone(),
+                journal.current.interface.ok_or_else(failed)?,
+            )
+        };
         checked(super::member_dns::owned(
             member_dns::OwnedInterface {
-                scope: self.scope.clone(),
+                scope: scope.clone(),
                 guid: p.guid,
                 luid: p.luid,
                 index: p.index,
             },
             WorkerDns {
-                original: self.original.clone(),
-                scope: self.scope.clone(),
+                original,
+                scope,
+                journal,
             },
         ))
     }
@@ -1017,7 +1469,7 @@ impl Control {
         if self.journal.borrow().current.dns.is_some() {
             return Err(failed());
         }
-        let mut owner = self.dns()?;
+        let mut owner = Self::dns(self.journal.clone(), Some(self.original.clone()))?;
         let baseline = checked(owner.snapshot())?;
         let desired = checked(baseline.with_servers(servers))?;
         self.journal.borrow_mut().save(|r| {
@@ -1034,19 +1486,57 @@ impl Control {
             d.pending = None;
         })
     }
-    fn restore_dns(&mut self) -> io::Result<()> {
-        let saved = self.journal.borrow().current.dns.clone();
+    pub(crate) fn restore_dns(
+        journal: SharedJournal,
+        original: Option<Rc<Original>>,
+    ) -> io::Result<()> {
+        let saved = journal.borrow().current.dns.clone();
         if let Some(saved) = saved {
-            let mut owner = self.dns()?;
-            let actual = checked(owner.snapshot())?;
+            if original.is_none() {
+                let mut state = journal.borrow_mut();
+                state.verify()?;
+                let p = state.current.interface.ok_or_else(failed)?;
+                let mut settings = DNS_INTERFACE_SETTINGS {
+                    Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                    ..Default::default()
+                };
+                let code = unsafe {
+                    GetInterfaceDnsSettings(
+                        windows_sys::core::GUID::from_u128(u128::from_be_bytes(p.guid)),
+                        &mut settings,
+                    )
+                };
+                if code == 0 {
+                    unsafe { FreeInterfaceDnsSettings(&mut settings) };
+                } else if code == windows_sys::Win32::Foundation::ERROR_NOT_FOUND
+                    && absent(state.current.requested_guid, Some(p))?
+                {
+                    state.save(|record| record.dns = None)?;
+                    return Ok(());
+                } else {
+                    return Err(io::Error::from_raw_os_error(code as i32));
+                }
+            }
+            let mut owner = Self::dns(journal.clone(), original)?;
+            let actual = owner.snapshot().map_err(|e| {
+                crate::member_diagnostic::PairFailure::dns("worker_dns_restore_read", e)
+            })?;
             if actual != saved.current && saved.pending.as_ref() != Some(&actual) {
                 return Err(failed());
             }
-            self.journal.borrow_mut().save(|r| {
-                r.dns.as_mut().expect("retained DNS").pending = Some(saved.baseline.clone())
+            journal.borrow_mut().save(|r| {
+                let dns = r.dns.as_mut().expect("retained DNS");
+                // Preserve the independently read predecessor even when an
+                // earlier Set ACK was lost and it was recorded only as pending.
+                dns.current = actual.clone();
+                dns.pending = Some(saved.baseline.clone());
             })?;
-            checked(owner.compare_exchange(&actual, &saved.baseline))?;
-            self.journal.borrow_mut().save(|r| r.dns = None)?;
+            owner
+                .compare_exchange(&actual, &saved.baseline)
+                .map_err(|e| {
+                    crate::member_diagnostic::PairFailure::dns("worker_dns_restore_cas", e)
+                })?;
+            journal.borrow_mut().save(|r| r.dns = None)?;
         }
         Ok(())
     }
@@ -1166,22 +1656,49 @@ fn address_matches(row: &MIB_UNICASTIPADDRESS_ROW, p: InterfaceProof, source: [u
         && !row.SkipAsSource
 }
 struct WorkerDns {
-    original: Rc<Original>,
+    original: Option<Rc<Original>>,
     scope: SessionScope,
+    journal: SharedJournal,
 }
 impl member_dns::Identity for WorkerDns {
     fn verify_owned(
         &mut self,
         interface: &member_dns::OwnedInterface,
     ) -> member_dns::Result<member_dns::Ownership> {
-        self.original
-            .verify_live()
-            .map_err(|_| member_dns::DnsError::Ownership)?;
-        let p = self
-            .original
-            .interface
-            .get()
-            .ok_or(member_dns::DnsError::Ownership)?;
+        let p = if let Some(original) = &self.original {
+            original
+                .verify_live()
+                .map_err(|_| member_dns::DnsError::Ownership)?;
+            original
+                .interface
+                .get()
+                .ok_or(member_dns::DnsError::Ownership)?
+        } else {
+            let mut journal = self
+                .journal
+                .try_borrow_mut()
+                .map_err(|_| member_dns::DnsError::Ownership)?;
+            journal
+                .verify()
+                .map_err(|_| member_dns::DnsError::Ownership)?;
+            if !journal.cold
+                || journal.retained.is_some()
+                || journal.current.version != 2
+                || journal.current.creator.is_none()
+                || journal.current.process.is_none()
+                || journal.current.boot
+                    != super::member_boot::boot_id().map_err(|_| member_dns::DnsError::Ownership)?
+                || journal.current.runtime != *journal.source.identity()
+                || journal.current.scope != self.scope
+                || journal.current.dns.is_none()
+            {
+                return Err(member_dns::DnsError::Ownership);
+            }
+            journal
+                .current
+                .interface
+                .ok_or(member_dns::DnsError::Ownership)?
+        };
         if interface.scope != self.scope
             || (interface.guid, interface.luid, interface.index) != (p.guid, p.luid, p.index)
         {
@@ -1365,16 +1882,20 @@ impl PairControl for Control {
         if physical.len() > crate::member_plan::MAX_ROUTES || !physical.contains(&binding) {
             return Err(failed());
         }
+        self.journal.borrow_mut().save(|r| {
+            r.physical = physical
+                .iter()
+                .map(super::member_session::PhysicalLease::capture)
+                .collect()
+        })?;
         *self.physical.borrow_mut() = physical;
         self.routes = Some(NetworkOwner::fresh(
-            crate::member_routes::MemberRoutes::new(
-                super::member_routes::NativeRowIo,
-                WorkerIdentity {
-                    original: self.original.clone(),
-                    physical: self.physical.clone(),
-                },
-            ),
-            RouteJournal(self.journal.clone()),
+            WorkerIdentity {
+                original: Some(self.original.clone()),
+                journal: self.journal.clone(),
+                physical: self.physical.clone(),
+            },
+            RouteJournal(self.journal.clone(), self.physical.clone()),
         ));
         self.routes
             .as_mut()
@@ -1839,22 +2360,7 @@ impl NativePair for Control {
             let mut deny = guard.borrow().current.clone();
             deny.admitted = false;
             if deny.interface.is_some() {
-                #[cfg(test)]
-                let interrupted = super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
-                    if fault.get() == Some(super::member_worker_factory_native_tests::StopFault::GuardWithdrawal) {
-                        fault.set(None);
-                        true
-                    } else {
-                        false
-                    }
-                });
-                #[cfg(not(test))]
-                let interrupted = false;
-                match if interrupted {
-                    Err(failed())
-                } else {
-                    self.guard_transition(deny, false)
-                } {
+                match self.guard_transition(deny, false) {
                     Ok(()) => withdrawn = true,
                     Err(e) => error = Some(e),
                 }
@@ -1882,7 +2388,7 @@ impl NativePair for Control {
                 error = Some(e);
             }
         }
-        if let Err(e) = self.restore_dns() {
+        if let Err(e) = Self::restore_dns(self.journal.clone(), Some(self.original.clone())) {
             error = Some(e);
         }
         if let Err(e) = self.delete_address() {
@@ -1959,6 +2465,46 @@ impl NativePair for Control {
             {
                 if let Err(e) = self.guard_transition(Model::empty(self.scope.clone()), true) {
                     error = Some(e);
+                    let guard = self.guard.as_ref().ok_or_else(failed)?.clone();
+                    if guard.borrow().verify_terminal(true).is_err() {
+                        checked(guard.borrow_mut().close(true, None))?;
+                    }
+                    {
+                        let mut journal = self.journal.borrow_mut();
+                        journal.cold = true;
+                        journal.retained = Some((self.original.clone(), guard.clone()));
+                    }
+                    self.journal.borrow_mut().verify()?;
+                    let cold = match &self.cold_guard {
+                        Some(cold) if cold.disposition() == (true, true, false) => cold.clone(),
+                        Some(_) => return Err(failed()),
+                        None => {
+                            let cold =
+                                checked(super::member_carrier_guard::issue_cold_static_cleanup(
+                                    self.scope.clone(),
+                                    self.journal.clone(),
+                                    |cold| {
+                                        self.cold_guard = Some(cold);
+                                        Ok(())
+                                    },
+                                ))?;
+                            checked(cold.cleanup(true))?;
+                            cold
+                        }
+                    };
+                    while !absent(self.original.requested, self.original.interface.get())? {
+                        if Instant::now() >= deadline {
+                            return Err(failed());
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    self.journal.borrow_mut().retirement_verified = true;
+                    self.journal.borrow_mut().verify()?;
+                    checked(guard.borrow_mut().close(false, Some(cold.as_ref())))?;
+                    self.journal.borrow_mut().save(|r| {
+                        r.guard = Model::empty(r.scope.clone());
+                        r.guard_pending = None;
+                    })?;
                 }
             }
             if error.is_none()
@@ -1967,10 +2513,12 @@ impl NativePair for Control {
                     .as_ref()
                     .unwrap()
                     .borrow()
-                    .verify_terminal()
+                    .verify_terminal(false)
                     .is_err()
             {
-                if let Err(e) = checked(self.guard.as_ref().unwrap().borrow_mut().close()) {
+                if let Err(e) =
+                    checked(self.guard.as_ref().unwrap().borrow_mut().close(false, None))
+                {
                     error = Some(e);
                 }
             }
@@ -2002,6 +2550,7 @@ impl NativePair for Control {
         completed.verify(scope)?;
         *self.completed.borrow_mut() = Some(completed);
         self.stopped = true;
+        self.cold_guard = None;
         Ok(())
     }
 }

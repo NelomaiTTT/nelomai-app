@@ -2629,11 +2629,64 @@ fn wrong_driver_service_provider_version_date_binding_or_properties_fail() {
             validate_provider(&expected(), ProviderKind::Wintun, &seen, &seen).is_err(),
             "field {field}"
         );
+        seen.devices[0].presence = Presence::Phantom;
+        seen.devices[0].status = 0;
+        seen.devices[0].problem = 0;
+        assert!(
+            validate_provider_device(&expected(), ProviderKind::Wintun, &seen.devices, true)
+                .is_err(),
+            "terminal field {field}"
+        );
     }
 }
 
 #[test]
 fn phantom_nonstarted_problem_removal_missing_and_duplicate_devices_fail() {
+    let mut terminal = observed();
+    terminal.devices[0].presence = Presence::Phantom;
+    terminal.devices[0].status = 0;
+    terminal.devices[0].problem = 0;
+    assert!(
+        validate_provider_device(&expected(), ProviderKind::Wintun, &terminal.devices, false)
+            .is_err()
+    );
+    validate_provider_device(&expected(), ProviderKind::Wintun, &terminal.devices, true).unwrap();
+    assert!(validate_provider_device(
+        &expected(),
+        ProviderKind::WireGuardNt,
+        &terminal.devices,
+        true
+    )
+    .is_err());
+    assert!(
+        validate_provider_device(&expected(), ProviderKind::Wintun, &observed().devices, true)
+            .is_err()
+    );
+    for (status, problem) in [(2, 0), (8, 0), (0xa, 0), (0, 22), (0x4000a, 0)] {
+        terminal.devices[0].status = status;
+        terminal.devices[0].problem = problem;
+        assert!(validate_provider_device(
+            &expected(),
+            ProviderKind::Wintun,
+            &terminal.devices,
+            true
+        )
+        .is_err());
+    }
+    terminal.devices.clear();
+    assert!(
+        validate_provider_device(&expected(), ProviderKind::Wintun, &terminal.devices, true)
+            .is_err()
+    );
+    let mut duplicate = observed().devices.remove(0);
+    duplicate.presence = Presence::Phantom;
+    duplicate.status = 0;
+    duplicate.problem = 0;
+    terminal.devices = vec![duplicate.clone(), duplicate];
+    assert!(
+        validate_provider_device(&expected(), ProviderKind::Wintun, &terminal.devices, true)
+            .is_err()
+    );
     for (status, problem) in [(0, 0), (2, 0), (8, 0), (0x40a, 0), (0xa, 22), (0x4000a, 0)] {
         let mut seen = observed();
         seen.devices[0].status = status;

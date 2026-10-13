@@ -912,6 +912,7 @@ struct World {
     arbitration_fault: bool,
     indexed_arbitration: bool,
     arbitration_extra: Vec<ArbitrationFilter>,
+    foreign_churn_after_commit: bool,
     denied: bool,
     closed: [bool; 2],
     panic_authorize: bool,
@@ -931,13 +932,13 @@ struct Api(Rc<RefCell<World>>);
 
 // These tests exercise the production cold lifecycle; only external BFE and
 // authenticated caller inputs are doubled. No original creator ACK is minted.
-struct ColdApi(Api);
+struct ColdApi(Api, crate::member_carrier_guard::ResourceKeys);
 impl ColdStaticNativeApi for ColdApi {
     fn begin(&mut self, readonly: bool) -> Result<()> {
         self.0.begin(SessionKind::StaticBase, readonly)
     }
-    fn read_full(&mut self, scope: &SessionScope) -> Result<ColdWfpFacts> {
-        let keys = crate::member_carrier_guard::resource_keys(scope)?;
+    fn read_full(&mut self, _: &SessionScope) -> Result<ColdWfpFacts> {
+        let keys = &self.1;
         let sublayer = self.0.sublayer(SessionKind::StaticBase, keys.sublayer)?;
         let mut filters = Vec::new();
         for k in keys.filters {
@@ -978,7 +979,17 @@ impl ColdStaticNativeApi for ColdApi {
         self.0.delete_sublayer(original.key)
     }
     fn commit(&mut self) -> Result<()> {
-        self.0.commit(SessionKind::StaticBase)
+        self.0.commit(SessionKind::StaticBase)?;
+        let mut world = self.0 .0.borrow_mut();
+        if world.foreign_churn_after_commit {
+            world.foreign_churn_after_commit = false;
+            world
+                .arbitration_extra
+                .first_mut()
+                .expect("retained foreign policy")
+                .id += 1;
+        }
+        Ok(())
     }
     fn abort(&mut self) -> Result<()> {
         self.0.abort(SessionKind::StaticBase)
@@ -1041,8 +1052,9 @@ fn cold_policies(
 ) -> ColdGuardPolicies {
     let protected_record = serde_json::to_vec(&(&current, &pending)).unwrap();
     ColdGuardPolicies {
-        current,
+        current: Some(current),
         pending,
+        worker: None,
         protected_record,
     }
 }
@@ -1073,7 +1085,13 @@ fn cold_fixture(count: usize) -> ColdFixture {
         hook: RefCell::new(None),
     });
     let root = ColdStaticCleanup::root(scope(), auth.clone());
-    root.initialize(|| Ok(ColdApi(Api(world.clone())))).unwrap();
+    root.initialize(|| {
+        Ok(ColdApi(
+            Api(world.clone()),
+            crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+        ))
+    })
+    .unwrap();
     (root, world, auth)
 }
 #[test]
@@ -1088,7 +1106,7 @@ fn cold_static_cleanup_removes_exact_captured_partial_blocks_only() {
         .map(|(f, _)| f.id)
         .collect();
     assert_eq!(captured_ids, vec![700, 701, 702]);
-    root.cleanup().unwrap();
+    root.cleanup(true).unwrap();
     assert!(world.borrow().objects.filters.is_empty());
     assert!(world.borrow().objects.sublayer.is_none());
     assert_eq!(root.disposition(), (true, true, false));
@@ -1110,9 +1128,68 @@ fn cold_static_cleanup_removes_exact_captured_partial_blocks_only() {
     let (root, world, _) = cold_fixture(3);
     world.borrow_mut().indexed_arbitration = true;
     root.capture().unwrap();
-    root.cleanup().unwrap();
+    root.cleanup(true).unwrap();
     assert!(world.borrow().objects.filters.is_empty());
     assert_eq!(root.disposition(), (true, true, false));
+
+    // Worker transition may durably contain an intermediate state. Validate
+    // the original assigned weight and strip only its admitted permits.
+    for state in 0..4 {
+        let (_, world, auth) = cold_fixture(0);
+        let empty = crate::member_worker_guard::Model::empty(scope());
+        let mut desired = empty.clone();
+        desired.interface = Some(crate::member_owner::InterfaceProof {
+            guid: [17; 16],
+            luid: 18,
+            index: 19,
+        });
+        desired.source = Some("10.66.0.2".parse().unwrap());
+        desired.admitted = true;
+        let mut pending = crate::member_worker_guard::Plan::new(empty, desired).unwrap();
+        pending.bind_created_weight(65533).unwrap();
+        let current = [
+            &pending.expected,
+            &pending.withdrawn,
+            &pending.base,
+            &pending.desired,
+        ][state]
+            .clone();
+        let mut block = pending.base.clone();
+        block.admitted = false;
+        let snapshot = block.snapshot().unwrap();
+        world.borrow_mut().objects.sublayer = snapshot.sublayer;
+        for (i, policy) in snapshot.filters.into_iter().enumerate() {
+            world.borrow_mut().objects.filters.insert(
+                policy.key,
+                (
+                    NativeFilter {
+                        policy,
+                        id: 800 + i as u64,
+                    },
+                    SessionKind::StaticBase,
+                ),
+            );
+        }
+        *auth.policies.borrow_mut() = ColdGuardPolicies {
+            current: None,
+            pending: None,
+            protected_record: serde_json::to_vec(&(&current, &pending)).unwrap(),
+            worker: Some((current, Some(pending))),
+        };
+        let root = ColdStaticCleanup::root(scope(), auth);
+        root.initialize(|| {
+            Ok(ColdApi(
+                Api(world.clone()),
+                crate::member_worker_guard::keys(&scope()).unwrap(),
+            ))
+        })
+        .unwrap();
+        root.capture().unwrap();
+        root.cleanup(true).unwrap();
+        assert!(world.borrow().objects.filters.is_empty());
+        assert!(world.borrow().objects.sublayer.is_none());
+        assert_eq!(root.disposition(), (true, true, false));
+    }
 }
 
 #[test]
@@ -1189,7 +1266,7 @@ fn cold_static_capture_denies_foreign_extra_permit_unknown_policy_and_reused_ids
         }
         let before = world.borrow().objects.filters.len();
         assert!(root.capture().is_err(), "fault {fault}");
-        assert!(root.cleanup().is_err());
+        assert!(root.cleanup(true).is_err());
         assert_eq!(world.borrow().objects.filters.len(), before);
         assert!(
             !world
@@ -1216,7 +1293,7 @@ fn cold_static_mutation_after_capture_never_deletes_replacement() {
             f.policy.conditions = vec![Condition::EgressIndex(456)];
         }
         drop(w);
-        assert!(root.cleanup().is_err());
+        assert!(root.cleanup(true).is_err());
         assert_eq!(world.borrow().objects.filters.len(), 3);
         assert!(!world
             .borrow()
@@ -1237,7 +1314,7 @@ fn cold_static_commit_loss_and_postflight_error_keep_facts_without_success_or_re
             2 => auth.after_fault.set(true),
             _ => auth.panic_after.set(true),
         }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cleanup()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cleanup(true)));
         if fault == 3 {
             assert!(result.is_err());
         } else {
@@ -1246,7 +1323,7 @@ fn cold_static_commit_loss_and_postflight_error_keep_facts_without_success_or_re
         assert_eq!(world.borrow().objects.filters.is_empty(), fault != 0);
         assert_eq!(root.disposition(), (fault >= 2, false, true));
         let events = world.borrow().events.clone();
-        assert!(root.cleanup().is_err());
+        assert!(root.cleanup(true).is_err());
         assert_eq!(world.borrow().events, events);
     }
 }
@@ -1257,9 +1334,9 @@ fn cold_static_reentry_swallowed_by_authorizer_permanently_denies_all_effects() 
     root.capture().unwrap();
     let weak = Rc::downgrade(&root);
     *auth.hook.borrow_mut() = Some(Box::new(move || {
-        assert!(weak.upgrade().unwrap().cleanup().is_err());
+        assert!(weak.upgrade().unwrap().cleanup(true).is_err());
     }));
-    assert!(root.cleanup().is_err());
+    assert!(root.cleanup(true).is_err());
     assert_eq!(world.borrow().objects.filters.len(), 3);
     assert!(!world
         .borrow()
@@ -1275,7 +1352,7 @@ fn cold_static_authorization_callback_failure_is_sticky_in_retained_issuer_itsel
     let result: Result<()> = root.authorized(|_| Err(GuardError::Native(998)));
     assert!(result.is_err());
     assert_eq!(root.disposition(), (false, false, true));
-    assert!(root.cleanup().is_err());
+    assert!(root.cleanup(true).is_err());
     assert!(world.borrow().events.is_empty());
     assert_eq!(world.borrow().objects.filters.len(), 2);
 }
@@ -1294,13 +1371,16 @@ fn cold_static_root_is_retained_before_open_and_survives_issuer_postflight_loss(
         },
         || {
             assert!(retained.borrow().is_some());
-            Ok(ColdApi(Api(world.clone())))
+            Ok(ColdApi(
+                Api(world.clone()),
+                crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+            ))
         },
     );
     assert!(result.is_err());
     let root = retained.borrow().as_ref().unwrap().clone();
     assert!(root.io.borrow().is_some());
-    assert!(root.cleanup().is_err());
+    assert!(root.cleanup(true).is_err());
     assert!(world.borrow().events.is_empty());
 }
 
@@ -1314,7 +1394,10 @@ fn cold_static_issuer_rejects_discarded_retention_callback_before_native_open() 
         |_| Ok(()),
         || {
             opened.set(true);
-            Ok(ColdApi(Api(world.clone())))
+            Ok(ColdApi(
+                Api(world.clone()),
+                crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+            ))
         },
     );
     assert!(result.is_err());
@@ -1344,7 +1427,7 @@ fn cold_static_missing_or_foreign_authority_and_duplicate_capture_never_write() 
             }
         }
         assert!(root.capture().is_err());
-        assert!(root.cleanup().is_err());
+        assert!(root.cleanup(true).is_err());
         assert_eq!(world.borrow().objects.filters.len(), 2);
         assert!(!world
             .borrow()
@@ -1409,10 +1492,15 @@ fn cold_static_pending_prior_and_prospective_base_subsets_are_comparison_only() 
             *retained.borrow_mut() = Some(r);
             Ok(())
         },
-        || Ok(ColdApi(Api(world.clone()))),
+        || {
+            Ok(ColdApi(
+                Api(world.clone()),
+                crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+            ))
+        },
     )
     .unwrap();
-    root.cleanup().unwrap();
+    root.cleanup(true).unwrap();
     assert!(world.borrow().objects.filters.is_empty());
     assert_eq!(root.disposition(), (true, true, false));
 }
@@ -1432,7 +1520,7 @@ fn cold_static_dynamic_block_cannot_be_deleted_through_static_session_or_fallbac
     // external SDK's WRONG_SESSION boundary rejects deletion, rolling back ALL
     // earlier staged deletes. No alternate engine is opened/retried.
     root.capture().unwrap();
-    assert!(root.cleanup().is_err());
+    assert!(root.cleanup(true).is_err());
     assert_eq!(world.borrow().objects.filters.len(), 3);
     assert_eq!(root.disposition(), (false, false, true));
     assert!(!world
@@ -1460,7 +1548,10 @@ fn cold_static_authority_and_retained_root_failures_never_open_or_mutate() {
                 },
                 || {
                     opened.set(true);
-                    Ok(ColdApi(Api(world.clone())))
+                    Ok(ColdApi(
+                        Api(world.clone()),
+                        crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+                    ))
                 },
             )
         }));
@@ -1471,7 +1562,7 @@ fn cold_static_authority_and_retained_root_failures_never_open_or_mutate() {
         }
         assert!(!opened.get());
         let root = retained.borrow().as_ref().unwrap().clone();
-        assert!(root.cleanup().is_err());
+        assert!(root.cleanup(true).is_err());
         assert!(world.borrow().events.is_empty());
         assert_eq!(world.borrow().objects.filters.len(), 2);
     }
@@ -1479,30 +1570,37 @@ fn cold_static_authority_and_retained_root_failures_never_open_or_mutate() {
 
 #[test]
 fn cold_static_scope_reads_all_48_keys_and_unrelated_layers_objects_remain_untouched() {
-    let (root, world, _) = cold_fixture(1);
-    world
-        .borrow_mut()
-        .arbitration_extra
-        .push(ArbitrationFilter {
-            service_domain: None,
-            key: Key([90; 16]),
-            id: 12345,
-            layer: Layer::AleConnectV6,
-            sublayer: Key([91; 16]),
-            sublayer_weight: 65535,
-            flags: FWPM_FILTER_FLAG_PERSISTENT,
-            action: FWP_ACTION_PERMIT,
-        });
-    root.capture().unwrap();
-    let keys = crate::member_carrier_guard::resource_keys(&scope()).unwrap();
-    let expected_lookups: Vec<_> = std::iter::once(keys.sublayer).chain(keys.filters).collect();
-    assert_eq!(
-        world.borrow().lookups,
-        [expected_lookups.clone(), expected_lookups].concat()
-    );
-    root.cleanup().unwrap();
-    assert_eq!(world.borrow().arbitration_extra.len(), 1);
-    assert_eq!(world.borrow().arbitration_extra[0].id, 12345);
+    for churn in [false, true] {
+        let (root, world, _) = cold_fixture(1);
+        world
+            .borrow_mut()
+            .arbitration_extra
+            .push(ArbitrationFilter {
+                service_domain: None,
+                key: Key([90; 16]),
+                id: 12345,
+                layer: Layer::AleConnectV6,
+                sublayer: Key([91; 16]),
+                sublayer_weight: 65535,
+                flags: FWPM_FILTER_FLAG_PERSISTENT,
+                action: FWP_ACTION_PERMIT,
+            });
+        world.borrow_mut().foreign_churn_after_commit = churn;
+        root.capture().unwrap();
+        let keys = crate::member_carrier_guard::resource_keys(&scope()).unwrap();
+        let expected_lookups: Vec<_> = std::iter::once(keys.sublayer).chain(keys.filters).collect();
+        assert_eq!(
+            world.borrow().lookups,
+            [expected_lookups.clone(), expected_lookups].concat()
+        );
+        if churn {
+            world.borrow_mut().arbitration_extra[0].id += 10;
+        }
+        let foreign = world.borrow().arbitration_extra.clone();
+        root.cleanup(true).unwrap();
+        assert_eq!(world.borrow().arbitration_extra, foreign);
+        assert_eq!(world.borrow().arbitration_extra.len(), 1);
+    }
 }
 
 #[test]
@@ -1512,7 +1610,7 @@ fn cold_static_equal_model_cannot_hide_changed_protected_context_or_revision() {
     // External private-record boundary changes only context/revision DATA while
     // WFP policies remain equal. There is no metadata-equal new authorization.
     auth.policies.borrow_mut().protected_record.push(9);
-    assert!(root.cleanup().is_err());
+    assert!(root.cleanup(true).is_err());
     assert_eq!(world.borrow().objects.filters.len(), 2);
     assert!(!world
         .borrow()
@@ -1557,7 +1655,12 @@ fn cold_static_permit_bearing_journal_is_data_but_any_native_permit_denies_clean
                 *retained.borrow_mut() = Some(r);
                 Ok(())
             },
-            || Ok(ColdApi(Api(world.clone()))),
+            || {
+                Ok(ColdApi(
+                    Api(world.clone()),
+                    crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+                ))
+            },
         );
         if native_permit {
             assert!(result.is_err());
@@ -1568,7 +1671,7 @@ fn cold_static_permit_bearing_journal_is_data_but_any_native_permit_denies_clean
                 .iter()
                 .any(|e| e.starts_with("delete:")));
         } else {
-            result.unwrap().cleanup().unwrap();
+            result.unwrap().cleanup(true).unwrap();
             assert!(world.borrow().objects.filters.is_empty());
         }
     }
@@ -1576,7 +1679,7 @@ fn cold_static_permit_bearing_journal_is_data_but_any_native_permit_denies_clean
 
 #[test]
 fn cold_static_invalid_pending_plan_or_missing_protected_frame_denies_before_engine_open() {
-    for fault in 0..6 {
+    for fault in 0..12 {
         let (_, world, auth) = cold_fixture(2);
         let current = pair(None).without_permits().unwrap();
         let current = current
@@ -1595,6 +1698,38 @@ fn cold_static_invalid_pending_plan_or_missing_protected_frame_denies_before_eng
         let mut data = cold_policies(current, Some(plan));
         if fault == 5 {
             data.protected_record.clear();
+        } else if fault >= 6 {
+            let empty = crate::member_worker_guard::Model::empty(scope());
+            let mut worker = empty.clone();
+            worker.interface = Some(crate::member_owner::InterfaceProof {
+                guid: [17; 16],
+                luid: 18,
+                index: 19,
+            });
+            worker.source = Some("10.66.0.2".parse().unwrap());
+            let mut pending = crate::member_worker_guard::Plan::new(empty, worker.clone()).unwrap();
+            pending.bind_created_weight(65533).unwrap();
+            worker = pending.base.clone();
+            data.current = None;
+            data.pending = None;
+            match fault {
+                6 => data.current = Some(Model::empty(scope()).unwrap()),
+                7 => {
+                    data.pending = Some(
+                        crate::member_carrier_guard::ExchangePlan::new(
+                            &Model::empty(scope()).unwrap(),
+                            &Model::empty(scope()).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                }
+                8 => worker.scope.connection_generation += 1,
+                9 => pending.withdrawn = worker.clone(),
+                10 => worker.source = Some("127.0.0.1".parse().unwrap()),
+                11 => data.protected_record.clear(),
+                _ => unreachable!(),
+            }
+            data.worker = Some((worker, Some(pending)));
         }
         *auth.policies.borrow_mut() = data;
         let retained = RefCell::new(None);
@@ -1608,7 +1743,10 @@ fn cold_static_invalid_pending_plan_or_missing_protected_frame_denies_before_eng
             },
             || {
                 opened.set(true);
-                Ok(ColdApi(Api(world.clone())))
+                Ok(ColdApi(
+                    Api(world.clone()),
+                    crate::member_carrier_guard::resource_keys(&scope()).unwrap(),
+                ))
             },
         );
         assert!(result.is_err(), "fault {fault}");

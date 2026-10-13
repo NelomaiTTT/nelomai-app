@@ -164,7 +164,7 @@ pub mod member_routes;
 #[cfg(any(windows, test))]
 mod member_serialized_lease;
 mod member_source;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod member_worker_guard;
 pub mod redundancy;
 #[cfg(any(windows, test))]

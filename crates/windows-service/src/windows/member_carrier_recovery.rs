@@ -1713,7 +1713,7 @@ pub(crate) mod native {
             unsafe { CloseHandle(self.0) };
         }
     }
-    fn absent_process(proof: crate::member_owner::ProcessProof) -> io::Result<()> {
+    pub(crate) fn absent_process(proof: crate::member_owner::ProcessProof) -> io::Result<()> {
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,

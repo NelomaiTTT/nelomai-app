@@ -152,7 +152,7 @@ impl NativeColdGuardCleanup {
             if !Rc::ptr_eq(&issued, &retained) {
                 return Err(denied());
             }
-            retained.cleanup().map_err(|_| denied())?;
+            retained.cleanup(true).map_err(|_| denied())?;
             let (committed, complete, failed) = retained.disposition();
             if !committed || !complete || failed || self.authority.failed.get() {
                 return Err(denied());

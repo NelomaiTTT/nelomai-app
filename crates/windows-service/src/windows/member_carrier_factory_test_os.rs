@@ -580,59 +580,100 @@ impl Fixture {
         if INPUTS.with(|inputs| inputs.borrow().is_some()) {
             return Err(io::Error::other("nested factory OS fixture"));
         }
-        // Fresh owned CI directory only. No existing parent ACL, token,
-        // privileged runtime, service, driver, NIC or product record is changed.
-        let nonce = format!(
-            "Nelomai-FactoryFixture-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos()
-        );
-        let parent = PathBuf::from(
+        // Re-entry is exclusively the existing crash test's fresh subprocess.
+        // It binds the same protected nonce tree and never creates/installs it.
+        let existing = std::env::var_os("NELOMAI_WORKER_ENGINE_CRASH_ROOT").map(PathBuf::from);
+        let program_data = PathBuf::from(
             std::env::var_os("ProgramData")
                 .ok_or_else(|| io::Error::other("ProgramData absent"))?,
-        )
-        .join(nonce);
-        let root = parent.join("installation");
-        let sddl = super::wide("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
-        let mut descriptor = std::ptr::null_mut();
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
-            bInheritHandle: 0,
-        };
-        let created = unsafe { CreateDirectoryW(super::wide(&parent).as_ptr(), &attributes) };
-        let error = io::Error::last_os_error();
-        // Installation::install preserves Windows ACLs; its portable filesystem
-        // writer does not create a protected native root. Exclusively create our
-        // new root with the exact private DACL before installing signed bytes.
-        let root_created = if created != 0 {
-            unsafe { CreateDirectoryW(super::wide(&root).as_ptr(), &attributes) }
+        );
+        let parent = if let Some(root) = &existing {
+            if !worker
+                || std::env::var("NELOMAI_WORKER_ENGINE_CRASH").as_deref() != Ok("1")
+                || std::env::var("NELOMAI_WORKER_ENGINE_CRASH_ROLE").as_deref() != Ok("recover")
+                || std::fs::canonicalize(std::env::current_exe()?)?
+                    != std::fs::canonicalize(PathBuf::from(
+                        std::env::var_os("NELOMAI_WORKER_ENGINE_CRASH_TEST_EXE")
+                            .ok_or_else(|| io::Error::other("original test executable absent"))?,
+                    ))?
+                || root.file_name().and_then(|name| name.to_str()) != Some("installation")
+            {
+                return Err(io::Error::other("invalid fixture crash re-entry"));
+            }
+            let parent = root
+                .parent()
+                .ok_or_else(|| io::Error::other("fixture parent absent"))?;
+            let engine: u32 = std::env::var("NELOMAI_WORKER_ENGINE_CRASH_ENGINE_PID")
+                .map_err(io::Error::other)?
+                .parse()
+                .map_err(io::Error::other)?;
+            let prefix = format!("Nelomai-FactoryFixture-{engine}-");
+            let nonce = parent
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                .and_then(|nonce| nonce.parse::<u128>().ok());
+            if engine == 0
+                || nonce.is_none_or(|nonce| nonce == 0)
+                || std::fs::canonicalize(
+                    parent
+                        .parent()
+                        .ok_or_else(|| io::Error::other("fixture ancestor absent"))?,
+                )? != std::fs::canonicalize(&program_data)?
+            {
+                return Err(io::Error::other("wrong original fixture nonce root"));
+            }
+            parent.to_owned()
         } else {
-            0
+            program_data.join(format!(
+                "Nelomai-FactoryFixture-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(io::Error::other)?
+                    .as_nanos()
+            ))
         };
-        let root_error = io::Error::last_os_error();
-        unsafe {
-            LocalFree(descriptor);
-        }
-        if created == 0 {
-            return Err(error);
-        }
-        if root_created == 0 {
-            return Err(root_error);
+        let root = parent.join("installation");
+        if existing.is_none() {
+            let sddl = super::wide("O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+            let mut descriptor = std::ptr::null_mut();
+            if unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let created = unsafe { CreateDirectoryW(super::wide(&parent).as_ptr(), &attributes) };
+            let error = io::Error::last_os_error();
+            // Installation::install preserves Windows ACLs; its portable filesystem
+            // writer does not create a protected native root. Exclusively create our
+            // new root with the exact private DACL before installing signed bytes.
+            let root_created = if created != 0 {
+                unsafe { CreateDirectoryW(super::wide(&root).as_ptr(), &attributes) }
+            } else {
+                0
+            };
+            let root_error = io::Error::last_os_error();
+            unsafe {
+                LocalFree(descriptor);
+            }
+            if created == 0 {
+                return Err(error);
+            }
+            if root_created == 0 {
+                return Err(root_error);
+            }
         }
         let state = parent.join("state");
         let key = SigningKey::from_bytes(&[83; 32]); // existing test trust boundary only
@@ -670,6 +711,40 @@ impl Fixture {
                 route_postflight_fault_reached: false,
             })
         });
+        if existing.is_some() {
+            member_files::pin_private_directory(&root)
+                .map_err(io::Error::other)?
+                .verify()
+                .map_err(io::Error::other)?;
+            member_files::pin_private_directory(&state)
+                .map_err(io::Error::other)?
+                .verify()
+                .map_err(io::Error::other)?;
+            let installation = Installation::for_owner(
+                &root,
+                key.verifying_key().to_bytes(),
+                "windows",
+                "x86_64",
+                0,
+            );
+            let layout = installation.load()?;
+            let executable = std::fs::canonicalize(layout.engine_path())?;
+            installation.load_engine(&executable)?;
+            INPUTS.with(|inputs| {
+                inputs
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("re-entry fixture inputs")
+                    .executable = Some(executable.clone())
+            });
+            return Ok(Self {
+                root,
+                state,
+                installation,
+                identity: layout.identity,
+                executable,
+            });
+        }
         // Real private-directory/ancestor/lock/CAS implementation creates state.
         let mut backend = member_files::MemberFiles::new().map_err(io::Error::other)?;
         backend.transaction(|_| Ok(()))?;

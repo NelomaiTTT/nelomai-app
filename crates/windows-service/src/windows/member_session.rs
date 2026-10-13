@@ -60,6 +60,7 @@ pub(crate) struct ProtectedRecoveryRecords {
     pub provenance: carrier::Provenance,
     pub changed_boot: bool,
     pub records: [(RecordKind, Option<Vec<u8>>); 10],
+    pub worker: Option<Vec<u8>>,
     // Original canonical index/envelope bytes, not caller-importable authority.
     // Equality across separate read brackets must fence same-looking rewrites.
     stamp: Vec<Option<Vec<u8>>>,
@@ -561,6 +562,8 @@ struct InitialDataCompletedRecord {
 struct ColdRetirementStamp {
     version: u32,
     records: Vec<(RecordKind, Option<[u8; 32]>)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker: Option<[u8; 32]>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -685,61 +688,87 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
             .io
             .transaction(|files| {
                 let (raw, mut index, identity) = match_cold_snapshot(files, expected)?;
-                // Context is DATA for independent queries, not Runtime/SDK authority.
-                let context = match expected
-                    .records
-                    .iter()
-                    .find(|(k, _)| *k == RecordKind::NativeCarrierReceipts)
-                    .and_then(|(_, b)| b.as_deref())
-                {
-                    Some(bytes) => {
-                        native_receipt::Record::decode(bytes)
-                            .map_err(|_| failed())?
-                            .context
+                if let Some(_worker) = &expected.worker {
+                    #[cfg(windows)]
+                    {
+                        let facts = super::member_worker::terminal_identity(_worker, true)?;
+                        if facts
+                            != (
+                                identity.scope.clone(),
+                                identity.runtime.clone(),
+                                identity.boot_id,
+                            )
+                            || expected.records.iter().any(|(kind, bytes)| {
+                                *kind != RecordKind::Session && bytes.is_some()
+                            })
+                            || files.read(PrivateFile::Worker)?.as_ref() != Some(_worker)
+                        {
+                            return Err(failed());
+                        }
                     }
-                    None => expected
+                    #[cfg(not(windows))]
+                    return Err(failed());
+                } else {
+                    // Context is DATA for independent queries, not Runtime/SDK authority.
+                    let context = match expected
                         .records
                         .iter()
-                        .find(|(k, _)| *k == RecordKind::CarrierGuard)
+                        .find(|(k, _)| *k == RecordKind::NativeCarrierReceipts)
                         .and_then(|(_, b)| b.as_deref())
-                        .map(CarrierGuardRecord::decode)
-                        .transpose()?
-                        .map(|r| r.context)
-                        .or(expected
+                    {
+                        Some(bytes) => {
+                            native_receipt::Record::decode(bytes)
+                                .map_err(|_| failed())?
+                                .context
+                        }
+                        None => expected
                             .records
                             .iter()
-                            .find(|(k, _)| *k == RecordKind::NativeCreator)
+                            .find(|(k, _)| *k == RecordKind::CarrierGuard)
                             .and_then(|(_, b)| b.as_deref())
-                            .map(CreatorRecord::decode)
+                            .map(CarrierGuardRecord::decode)
                             .transpose()?
-                            .map(|r| r.context().clone()))
-                        .ok_or_else(failed)?,
-                };
-                native_receipt::validate_context(&context).map_err(|_| failed())?;
-                if context.intent.scope != identity.scope
-                    || context.provenance.boot_id != identity.boot_id
-                    || context.provenance.runtime != identity.runtime
-                    || context.provenance.network_epoch > expected.provenance.network_epoch
-                {
-                    return Err(failed());
-                }
-                if let Some(bytes) = expected
-                    .records
-                    .iter()
-                    .find(|(k, _)| *k == RecordKind::Pair)
-                    .and_then(|(_, b)| b.as_deref())
-                {
-                    if !matches!(
-                        carrier_pair_store::decode_pair_payload(&identity.scope, bytes)?,
-                        crate::member_carrier_pair::CleanupRecord::Carrier(_)
-                    ) {
+                            .map(|r| r.context)
+                            .or(expected
+                                .records
+                                .iter()
+                                .find(|(k, _)| *k == RecordKind::NativeCreator)
+                                .and_then(|(_, b)| b.as_deref())
+                                .map(CreatorRecord::decode)
+                                .transpose()?
+                                .map(|r| r.context().clone()))
+                            .ok_or_else(failed)?,
+                    };
+                    native_receipt::validate_context(&context).map_err(|_| failed())?;
+                    if context.intent.scope != identity.scope
+                        || context.provenance.boot_id != identity.boot_id
+                        || context.provenance.runtime != identity.runtime
+                        || context.provenance.network_epoch > expected.provenance.network_epoch
+                    {
                         return Err(failed());
+                    }
+                    if let Some(bytes) = expected
+                        .records
+                        .iter()
+                        .find(|(k, _)| *k == RecordKind::Pair)
+                        .and_then(|(_, b)| b.as_deref())
+                    {
+                        if !matches!(
+                            carrier_pair_store::decode_pair_payload(&identity.scope, bytes)?,
+                            crate::member_carrier_pair::CleanupRecord::Carrier(_)
+                        ) {
+                            return Err(failed());
+                        }
                     }
                 }
                 proof.verify_retirement(&origin, expected)?;
                 let mut stamp = ColdRetirementStamp {
                     version: 1,
                     records: RecordKind::OWNED.map(|kind| (kind, None)).to_vec(),
+                    worker: expected
+                        .worker
+                        .as_ref()
+                        .map(|bytes| Sha256::digest(bytes).into()),
                 };
                 let mut residual = Vec::new();
                 for (i, (kind, digest)) in stamp.records.iter_mut().enumerate() {
@@ -755,7 +784,7 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
                         }
                     }
                 }
-                if !residual.contains(&identity) {
+                if !residual.contains(&identity) && expected.worker.is_none() {
                     return Err(failed());
                 }
                 let marker = completed_file(&identity.scope)?;
@@ -796,6 +825,9 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
                     }
                 }
                 if files.read(marker)?.as_deref() != Some(marker_bytes.as_slice()) {
+                    return Err(failed());
+                }
+                if files.read(PrivateFile::Worker)? != expected.worker {
                     return Err(failed());
                 }
                 let (_, after) = load_index(files)?;
@@ -879,6 +911,7 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
                             },
                             changed_boot: identity.boot_id != self.current_boot,
                             records,
+                            worker: files.read(PrivateFile::Worker)?,
                             stamp: stamp.clone(),
                         },
                         stamp,
@@ -1623,7 +1656,7 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
             if files.read(PrivateFile::Worker)?.as_deref() != Some(expected.as_slice()) {
                 return Err(failed());
             }
-            let worker = super::member_worker::terminal_identity(&expected)?;
+            let worker = super::member_worker::terminal_identity(&expected, false)?;
             if worker != (scope.clone(), identity.runtime.clone(), identity.boot_id) {
                 return Err(failed());
             }
@@ -2492,18 +2525,33 @@ fn completed_file(scope: &SessionScope) -> io::Result<PrivateFile> {
 #[cfg(windows)]
 fn require_completed_worker(files: &mut dyn PrivateRecords) -> io::Result<()> {
     if let Some(bytes) = files.read(PrivateFile::Worker)? {
-        let (scope, runtime, boot_id) = super::member_worker::terminal_identity(&bytes)?;
+        let (scope, runtime, boot_id) = super::member_worker::terminal_identity(&bytes, true)?;
         let expected = SessionIdentity {
             scope: scope.clone(),
             runtime,
             boot_id,
         };
-        if read_completed(files, &scope)?.as_ref() != Some(&expected) {
+        let completed = read_completed_detail(files, &scope)?.ok_or_else(failed)?;
+        if completed.0 != expected {
+            return Err(failed());
+        }
+        if completed.1.as_ref().and_then(|stamp| stamp.worker)
+            == Some(Sha256::digest(&bytes).into())
+        {
+            return Ok(()); // Exact cold DATA disposition, never a live Stop/close ACK.
+        }
+        super::member_worker::terminal_identity(&bytes, false)?;
+        if completed
+            .1
+            .as_ref()
+            .is_some_and(|stamp| stamp.worker.is_some())
+        {
             return Err(failed());
         }
     }
     Ok(())
 }
+
 fn read_completed(
     files: &mut dyn PrivateRecords,
     scope: &SessionScope,
@@ -2598,6 +2646,9 @@ fn match_cold_snapshot(
         if raw != expected.stamp[i + 1] || saved.map(|r| r.data.into_bytes()) != *payload {
             return Err(failed());
         }
+    }
+    if files.read(PrivateFile::Worker)? != expected.worker {
+        return Err(failed());
     }
     require_native_obligation(files, &index, &identity)?;
     Ok((raw, index, identity))
@@ -3480,6 +3531,7 @@ impl<I: SessionFileIo> WindowsNativeCarrierReceiptStore<ProtectedSessionFiles<I>
                 let mut stamp = ColdRetirementStamp {
                     version: 1,
                     records: RecordKind::OWNED.map(|kind| (kind, None)).to_vec(),
+                    worker: None,
                 };
                 let mut residual = Vec::new();
                 for (i, (kind, hash)) in stamp.records.iter_mut().enumerate() {

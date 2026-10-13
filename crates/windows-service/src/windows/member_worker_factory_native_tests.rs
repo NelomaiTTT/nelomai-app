@@ -17,9 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     },
 };
@@ -127,7 +127,7 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
         .unwrap();
         assert!(before["process"].is_null() && before["interface"].is_null());
         assert!(
-            observe_worker().is_err(),
+            observe_worker(None).is_err(),
             "child spawned before cold publication ACK"
         );
         assert!(!super::member_carrier_provider::native::table()
@@ -253,6 +253,195 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
 #[test]
 #[ignore = "requires elevated clean Windows VM and NELOMAI_FACTORY_RUNTIME_DIRECTORY with signed fixture inputs"]
 fn worker_factory_start_stop_fresh_child_repeat() {
+    let crash = std::env::var("NELOMAI_WORKER_ENGINE_CRASH").ok();
+    assert!(
+        crash.as_deref().is_none_or(|value| value == "1"),
+        "unknown crash scenario"
+    );
+    let role = std::env::var("NELOMAI_WORKER_ENGINE_CRASH_ROLE").ok();
+    assert!(
+        role.as_deref()
+            .is_none_or(|value| crash.is_some() && ["engine", "recover"].contains(&value)),
+        "unknown crash role"
+    );
+    if crash.is_some() && role.is_none() {
+        // Parent retains the actual original engine Child HANDLE. Killing it
+        // executes no Rust Drop/Stop and releases its real KILL_ON_JOB_CLOSE Job.
+        let output = tempfile::tempdir().unwrap();
+        let ready = output.path().join("ready.json");
+        let test_exe = std::env::current_exe().unwrap();
+        let child_test = format!(
+            "{}::worker_factory_start_stop_fresh_child_repeat",
+            module_path!().split_once("::").unwrap().1
+        );
+        let stdout = output.path().join("engine.stdout");
+        let stderr = output.path().join("engine.stderr");
+        let mut engine = std::process::Command::new(&test_exe)
+            .args([
+                "--exact",
+                &child_test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NELOMAI_WORKER_ENGINE_CRASH_ROLE", "engine")
+            .env("NELOMAI_WORKER_ENGINE_CRASH_READY", &ready)
+            .env_remove("NELOMAI_WORKER_ENGINE_CRASH_ROOT")
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let clock = Instant::now();
+        while !ready.is_file() {
+            if engine.try_wait().unwrap().is_some() || clock.elapsed() > Duration::from_secs(30) {
+                let _ = engine.kill();
+                let _ = engine.wait();
+                eprintln!(
+                    "engine readiness stdout={} stderr={}",
+                    std::fs::read_to_string(&stdout).unwrap(),
+                    std::fs::read_to_string(&stderr).unwrap()
+                );
+                panic!("actual engine did not durably reach Running");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(std::fs::metadata(&ready).unwrap().len() <= 16384);
+        let ready: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ready).unwrap()).unwrap();
+        let root = std::path::PathBuf::from(ready["root"].as_str().unwrap());
+        let executable = std::path::PathBuf::from(ready["executable"].as_str().unwrap());
+        let state = root.parent().unwrap().join("state");
+        let worker = observe_worker(Some((&state, &executable)))
+            .expect("independent original live worker observer");
+        assert_eq!(
+            unsafe { WaitForSingleObject(engine.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        engine
+            .kill()
+            .expect("terminate only our original engine Child");
+        let engine_status = engine.wait().unwrap();
+        assert_eq!(
+            unsafe { WaitForSingleObject(engine.as_raw_handle(), 0) },
+            WAIT_OBJECT_0
+        );
+        let worker_wait = unsafe { WaitForSingleObject(worker.1.as_raw_handle(), 7000) };
+        assert_eq!(
+            worker_wait, WAIT_OBJECT_0,
+            "original Job did not stop original worker after engine death"
+        );
+        let worker_pid = worker.0;
+        // Production engine death drops every original worker process HANDLE.
+        // Release this test-only observer only after actual original exit proof;
+        // keep the separate original engine Child/HANDLE through recovery.
+        drop(worker);
+        let worker_json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join("nelomai-redundant-worker.json")).unwrap(),
+        )
+        .unwrap();
+        let network: nelomai_client_tunnel::redundancy::network::NetworkJournal =
+            serde_json::from_value(worker_json["network"].clone()).unwrap();
+        for value in network.read_view().unwrap().current() {
+            if let nelomai_client_tunnel::redundancy::network::NetworkValue::Route(route) = value {
+                let rows = crate::member_routes::RowIo::read(
+                    &mut super::member_routes::NativeRowIo,
+                    route.destination,
+                    route.interface,
+                );
+                eprintln!("after engine death addressed native route={route:?} rows={rows:?}");
+            }
+        }
+        let interface: crate::member_owner::InterfaceProof =
+            serde_json::from_value(worker_json["interface"].clone()).unwrap();
+        let rows = super::member_carrier_provider::native::table().unwrap();
+        let exact_rows = rows
+            .iter()
+            .filter(|row| {
+                row.identity.guid == interface.guid
+                    || row.identity.index == interface.index
+                    || row.identity.luid == interface.luid
+            })
+            .collect::<Vec<_>>();
+        let scope: SessionScope = serde_json::from_value(worker_json["scope"].clone()).unwrap();
+        let guard_absent = super::member_worker_guard::Guard::open(
+            crate::member_worker_guard::Model::empty(scope.clone()),
+        )
+        .and_then(|mut guard| guard.close(false, None));
+        eprintln!("actual engine crash engine_pid={} engine_status={engine_status:?} worker_pid={} worker_wait={worker_wait} Worker={worker_json} exact_MIB={exact_rows:?} WFP_absence={guard_absent:?}", engine.id(), worker_pid);
+        eprintln!(
+            "engine stdout={} stderr={}",
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        let stdout = output.path().join("recover.stdout");
+        let stderr = output.path().join("recover.stderr");
+        let mut recovery = std::process::Command::new(&test_exe)
+            .args([
+                "--exact",
+                &child_test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NELOMAI_WORKER_ENGINE_CRASH_ROLE", "recover")
+            .env("NELOMAI_WORKER_ENGINE_CRASH_ROOT", &root)
+            .env("NELOMAI_WORKER_ENGINE_CRASH_TEST_EXE", &test_exe)
+            .env(
+                "NELOMAI_WORKER_ENGINE_CRASH_ENGINE_PID",
+                engine.id().to_string(),
+            )
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let status = loop {
+            if let Some(status) = recovery.try_wait().unwrap() {
+                break status;
+            }
+            if clock.elapsed() > Duration::from_secs(85) {
+                recovery.kill().unwrap();
+                break recovery.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        eprintln!(
+            "fresh factory recovery status={status:?} elapsed={:?} stdout={} stderr={}",
+            clock.elapsed(),
+            std::fs::read_to_string(&stdout).unwrap(),
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        let after: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(state.join("nelomai-redundant-worker.json")).unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "after fresh process Worker={after} MIB={:?}",
+            super::member_carrier_provider::native::table().unwrap()
+        );
+        assert!(
+            status.success(),
+            "fresh process cannot recover engine crash and complete fresh Start/Stop/repeat"
+        );
+        assert_eq!(after["stopped"], true);
+        assert_ne!(after["scope"], worker_json["scope"]);
+        assert_ne!(
+            after["process"], worker_json["process"],
+            "fresh factory reused original process proof"
+        );
+        assert!(
+            super::member_carrier_provider::native::table()
+                .unwrap()
+                .iter()
+                .all(|row| row.identity.guid != interface.guid
+                    && row.identity.index != interface.index
+                    && row.identity.luid != interface.luid),
+            "old exact GUID/LUID/index remained or was reused"
+        );
+        super::member_worker_guard::Guard::open(crate::member_worker_guard::Model::empty(scope))
+            .and_then(|mut guard| guard.close(false, None))
+            .expect("old exact WFP scope remained after fresh recovery");
+        return;
+    }
     // This signed fixture contains ONLY service, worker and Wintun. The old
     // C/A/B selector must reject its missing member DLLs before native effects.
     let fixture = Fixture::new_worker_modules().expect("signed private runtime fixture");
@@ -285,7 +474,12 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         peers[2]["public_key"].as_str().unwrap(),
     ];
     let mut previous_process = None;
-    for round in 0..3 {
+    let rounds = match role.as_deref() {
+        Some("engine") => 1..2,
+        Some("recover") => 2..4,
+        _ => 0..3,
+    };
+    for round in rounds {
         let scope = SessionScope {
             runtime: RuntimeSlot::Latest,
             runtime_generation: 2,
@@ -340,6 +534,44 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             warm_stop_v1: true,
             options: DesktopTunnelOptions::default(),
         });
+        if role.as_deref() == Some("engine") {
+            assert_eq!(
+                started.as_ref().expect("actual engine Start").session.phase,
+                SessionPhase::Running
+            );
+            let state = super::member_carrier_factory_test_os::state().unwrap();
+            let worker: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(state.join("nelomai-redundant-worker.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(worker["guard"]["admitted"], true);
+            assert!(!worker["process"].is_null() && !worker["interface"].is_null());
+            assert!(!worker["dns"].is_null() && !worker["address"].is_null());
+            let network: nelomai_client_tunnel::redundancy::network::NetworkJournal =
+                serde_json::from_value(worker["network"].clone()).unwrap();
+            assert!(network.read_view().unwrap().current().next().is_some());
+            assert_eq!(worker["closing"], false);
+            assert_eq!(worker["stopped"], false);
+            let ready = serde_json::json!({"root":fixture.original_root(), "executable":super::member_carrier_factory_test_os::executable().unwrap()});
+            let path = std::path::PathBuf::from(
+                std::env::var_os("NELOMAI_WORKER_ENGINE_CRASH_READY").unwrap(),
+            );
+            let pending = path.with_extension("pending");
+            // Parent observes readiness only after a complete durable publication.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&pending)
+                .unwrap();
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&ready).unwrap()).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            std::fs::rename(&pending, &path).unwrap();
+            eprintln!("actual engine durable Running Worker={worker}");
+            loop {
+                std::thread::park();
+            }
+        }
         // Extend the same actual actor route; no direct private Native calls.
         // These configured real Go devices need not be Healthy or handshaken.
         let attached = if round == 0 {
@@ -594,7 +826,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         });
         // Read-only independent observer. This HANDLE cannot authorize cleanup;
         // production retains its OWN original Child HANDLE from process creation.
-        let observed = observe_worker();
+        let observed = observe_worker(None);
         // Always attempt the actual scoped cleanup before asserting a red Start.
         let fault = match round {
             0 => StopFault::RoutesCleanup,
@@ -770,10 +1002,39 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         );
         previous_process = Some((pid, process));
     }
+    if crash.is_none() {
+        // The default native gate also executes actual engine death and two
+        // fresh sessions under a new process using the same protected root.
+        let test_exe = std::env::current_exe().unwrap();
+        let child_test = format!(
+            "{}::worker_factory_start_stop_fresh_child_repeat",
+            module_path!().split_once("::").unwrap().1
+        );
+        let result = std::process::Command::new(test_exe)
+            .args([
+                "--exact",
+                &child_test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("NELOMAI_WORKER_ENGINE_CRASH", "1")
+            .env_remove("NELOMAI_WORKER_ENGINE_CRASH_ROLE")
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "default native engine-crash recovery failed"
+        );
+    }
 }
 
-fn observe_worker() -> std::io::Result<(u32, OwnedHandle)> {
-    let directory = super::member_carrier_factory_test_os::state()
+fn observe_worker(
+    context: Option<(&std::path::Path, &std::path::Path)>,
+) -> std::io::Result<(u32, OwnedHandle)> {
+    let directory = context
+        .map(|(state, _)| state.to_owned())
+        .or_else(super::member_carrier_factory_test_os::state)
         .ok_or_else(|| std::io::Error::other("fixture state absent"))?;
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
         directory.join("nelomai-redundant-worker.json"),
@@ -796,6 +1057,28 @@ fn observe_worker() -> std::io::Result<(u32, OwnedHandle)> {
         return Err(std::io::Error::last_os_error());
     }
     let process = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let (mut created, mut exited, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    if unsafe {
+        GetProcessTimes(
+            process.as_raw_handle(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+        || value["process"]["creation_time"].as_u64()
+            != Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    {
+        return Err(std::io::Error::other(
+            "original worker creation time mismatch",
+        ));
+    }
     let mut image = vec![0u16; 32768];
     let mut length = image.len() as u32;
     if unsafe {
@@ -805,7 +1088,9 @@ fn observe_worker() -> std::io::Result<(u32, OwnedHandle)> {
         return Err(std::io::Error::last_os_error());
     }
     let image = String::from_utf16(&image[..length as usize]).map_err(std::io::Error::other)?;
-    let expected = super::member_carrier_factory_test_os::executable()
+    let expected = context
+        .map(|(_, executable)| executable.to_owned())
+        .or_else(super::member_carrier_factory_test_os::executable)
         .ok_or_else(|| std::io::Error::other("fixture executable absent"))?
         .with_file_name("nelomai-windows-worker.exe");
     if std::fs::canonicalize(&image)? != std::fs::canonicalize(&expected)?

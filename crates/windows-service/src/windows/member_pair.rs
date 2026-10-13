@@ -1460,7 +1460,7 @@ impl NativePairFactory<NativeSessionFiles> {
 }
 
 impl PhysicalLease {
-    fn capture(p: &PhysicalRoute) -> Self {
+    pub(crate) fn capture(p: &PhysicalRoute) -> Self {
         Self {
             interface: p.proof.identity.index,
             luid: p.proof.identity.luid,
@@ -1476,7 +1476,7 @@ impl PhysicalLease {
             flags: p.row.flags,
         }
     }
-    fn restore(&self) -> PhysicalRoute {
+    pub(crate) fn restore(&self) -> PhysicalRoute {
         PhysicalRoute {
             proof: PhysicalProof {
                 identity: InterfaceIdentity {
