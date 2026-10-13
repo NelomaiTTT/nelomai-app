@@ -4,6 +4,15 @@
 
 **Goal:** Завершить Windows carrier/hot-standby расширение для 0.4.0: проверить программный жизненный цикл и подготовить протокол аппаратной приёмки. Версии в коде и параметры сборки/подписи меняются только после отдельного согласования.
 
+## Текущий исполняемый путь и проверка — 2026-10-13
+
+Позднейшее согласованное упрощение заменило C/A/B SDK-путь одним Wintun и Go worker с двумя одновременно работающими crypto members. Production service и installer выбирают worker factory. Нижние C-specific шаги сохраняются как история требований; их тесты не подменяют доказательство worker lifecycle. Killswitch остаётся вне 0.4.0.
+
+- `d7c15e14d6274ca044ecd820e284e0a6d18b6356`: checks `38365839211` SUCCESS, включая обязательный worker native job на чистой VM. Реальные Start A, Attach B, health/probe, отказ A → promotion B, retire/replace A, Stop и fresh Start/Stop прошли; локальные Stop 566.739/563.8741 ms. Hardware/UI/panel acceptance этим не доказаны.
+- Следующий проверенный срез исправляет повторный Stop после ошибки network cleanup и потери Stop reply. Живой worker сохраняется только после подтверждённого DATA withdrawal; original process exit не выдаётся за native Stop ACK. Существующий native сценарий расширен тремя прерываниями, без новых runtime/helpers/workflows.
+- Native RED на baseline завершил worker при ошибке cleanup (ожидался живой original handle). GREEN на точном overlay `a2a31972b3cd0cee7723a888643e482342b3e6fba8f1e3b9aafbdbc7ff428a64`: 55.03 s, retry Stop 504.0029/85.6643/151.3213 ms, worker/adapter/guard/peer ports = 0, VM Off. Evidence: `/tmp/nelomai040-interrupted-{red,green}-evidence`. Это локальная development-проверка, не CI нового SHA.
+- Recovery после смерти engine и реальные mid-WFP transaction failures остаются открыты. Nonterminal Worker records, static BLOCK и physical bypass routes могут пережить crash; прежние original handles нельзя восстановить из journal. Кандидат до завершения recovery/gates не запускался.
+
 ## Решение пользователя от 2026-10-07 и контрольная точка переноса
 
 - Разработка перенесена в `Future/windows-hot-standby-0.4.0`, отдельный worktree `.worktrees/windows-hot-standby-0.4.0`. Исходный код и вся его история сохранены от `6f005ddb0bd60629b77d3913f0b7b10e7cc76b20`; последующий коммит переноса меняет только этот план.

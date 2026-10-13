@@ -24,6 +24,18 @@ use windows_sys::Win32::{
     },
 };
 
+// One-shot interruption of the external cleanup/pipe boundary. Native effects
+// still use the production actor, original worker and retained OS handles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum StopFault {
+    RoutesCleanup,
+    StopReply,
+    GuardWithdrawal,
+}
+thread_local! {
+    pub(crate) static STOP_FAULT: std::cell::Cell<Option<StopFault>> = const { std::cell::Cell::new(None) };
+}
+
 // Pair commands must never enter the unused single-tunnel backend.
 struct SingleStopped;
 impl ServiceTunnelBackend for SingleStopped {
@@ -273,7 +285,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         peers[2]["public_key"].as_str().unwrap(),
     ];
     let mut previous_process = None;
-    for round in 0..2 {
+    for round in 0..3 {
         let scope = SessionScope {
             runtime: RuntimeSlot::Latest,
             runtime_generation: 2,
@@ -584,11 +596,54 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         // production retains its OWN original Child HANDLE from process creation.
         let observed = observe_worker();
         // Always attempt the actual scoped cleanup before asserting a red Start.
+        let fault = match round {
+            0 => StopFault::RoutesCleanup,
+            1 => StopFault::StopReply,
+            _ => StopFault::GuardWithdrawal,
+        };
+        STOP_FAULT.with(|value| value.set(Some(fault)));
         let stop_at = Instant::now();
+        let interrupted = actor.redundant(Command::Stop {
+            scope: scope.clone(),
+        });
+        let first_elapsed = stop_at.elapsed();
+        let interruption_reached = STOP_FAULT.with(|value| value.take().is_none());
+        let pending = actor.redundant(Command::Status {
+            scope: scope.clone(),
+        });
+        let first_wait = observed
+            .as_ref()
+            .ok()
+            .map(|(_, process)| unsafe { WaitForSingleObject(process.as_raw_handle(), 0) });
+        let repeat_at = Instant::now();
         let stopped = actor.redundant(Command::Stop {
             scope: scope.clone(),
         });
-        let elapsed = stop_at.elapsed();
+        let elapsed = repeat_at.elapsed();
+        assert!(
+            interruption_reached,
+            "native {fault:?} interruption not reached"
+        );
+        assert!(
+            interrupted.is_err(),
+            "native {fault:?} interruption ACK was ignored"
+        );
+        let pending = pending.expect("same scope retained after interrupted Stop");
+        assert_eq!(pending.session.phase, SessionPhase::Stopping);
+        assert!(pending.cleanup_pending);
+        assert_eq!(
+            first_wait,
+            Some(if round == 0 {
+                WAIT_TIMEOUT
+            } else {
+                WAIT_OBJECT_0
+            }),
+            "original worker lifecycle after {fault:?}"
+        );
+        assert!(
+            first_elapsed <= Duration::from_secs(7),
+            "interrupted Stop elapsed {first_elapsed:?}"
+        );
         eprintln!("worker factory round={round} local Stop={elapsed:?}");
         let after = super::member_carrier_provider::native::table().unwrap();
         let started = started.expect("actual worker factory Start A");
@@ -600,6 +655,13 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         assert_eq!(started.session.phase, SessionPhase::Running);
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        let repeated = actor
+            .redundant(Command::Stop {
+                scope: scope.clone(),
+            })
+            .expect("same interrupted scope terminal repeat Stop");
+        assert_eq!(repeated.session, stopped.session);
+        assert!(!repeated.cleanup_pending);
         if let Some(attached) = attached {
             let attached = attached.expect("actual worker factory Attach B");
             assert_eq!(attached.session.phase, SessionPhase::Running);

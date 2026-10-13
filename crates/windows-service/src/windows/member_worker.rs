@@ -100,15 +100,23 @@ fn same_mapping(p: InterfaceProof) -> io::Result<()> {
 }
 fn absent(requested: [u8; 16], original: Option<InterfaceProof>) -> io::Result<bool> {
     let rows = super::member_carrier_provider::native::table().map_err(|_| failed())?;
+    let mut present = false;
     for row in rows {
         if row.identity.guid == requested {
-            return Ok(false);
-        }
-        if original.is_some_and(|p| row.identity.index == p.index || row.identity.luid == p.luid) {
+            if original.is_some_and(|p| {
+                (row.identity.guid, row.identity.luid, row.identity.index)
+                    != (p.guid, p.luid, p.index)
+            }) {
+                return Err(failed());
+            }
+            present = true;
+        } else if original
+            .is_some_and(|p| row.identity.index == p.index || row.identity.luid == p.luid)
+        {
             return Err(failed());
         }
     }
-    Ok(true)
+    Ok(!present)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -245,6 +253,8 @@ impl Rpc {
         })
     }
     fn call(&mut self, mut request: Value, budget: Duration) -> io::Result<Value> {
+        #[cfg(test)]
+        let stop = request["op"].as_str() == Some("stop");
         if self.failed || budget.is_zero() {
             return Err(failed());
         }
@@ -270,6 +280,21 @@ impl Rpc {
         {
             return Err(failed());
         }
+        #[cfg(test)]
+        if stop
+            && super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+                if fault.get()
+                    == Some(super::member_worker_factory_native_tests::StopFault::StopReply)
+                {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            })
+        {
+            return Err(failed());
+        }
         // A valid command rejection leaves transport available for scoped Stop.
         self.failed = false;
         if reply["ok"].as_bool() != Some(true) {
@@ -286,6 +311,8 @@ struct Original {
     interface: Cell<Option<InterfaceProof>>,
     requested: [u8; 16],
     exit_ack: Cell<bool>,
+    // Only the original successful native Stop reply supplies this receipt.
+    // OS exit and exact absence remain separate cleanup completion evidence.
     close_ack: Cell<bool>,
     start_attempted: Cell<bool>,
     address_ack: Cell<bool>,
@@ -326,13 +353,36 @@ impl Original {
             {
                 return Err(failed());
             }
+            if let Some(process) = self.process.get() {
+                if process_proof(child)? != process {
+                    return Err(failed());
+                }
+                let mut in_job = 0;
+                let job = self.job.try_borrow().map_err(|_| failed())?;
+                if unsafe {
+                    IsProcessInJob(
+                        child.as_raw_handle(),
+                        job.as_ref().ok_or_else(failed)?.as_raw_handle(),
+                        &mut in_job,
+                    )
+                } == 0
+                    || in_job == 0
+                {
+                    return Err(failed());
+                }
+            } else if self.start_attempted.get() {
+                return Err(failed());
+            }
+            if let Some(p) = self.interface.get() {
+                // Our static filters can pin MIB rundown. This table check
+                // rejects identifier reuse before exact filter retirement;
+                // final completion still requires positive interface absence.
+                absent(self.requested, Some(p))?;
+            }
         }
         Ok(())
     }
     fn verify_exit(&self) -> io::Result<()> {
-        if !self.close_ack.get() {
-            return Err(failed());
-        }
         self.verify_process_exit()?;
         if !absent(self.requested, self.interface.get())? {
             return Err(failed());
@@ -1779,6 +1829,7 @@ impl NativePair for Control {
             journal.closing_attempt = None;
         }
         let mut error = None;
+        let mut withdrawn = false;
         if !closing_published {
             if let Err(e) = self.journal.borrow_mut().save(|r| r.closing = true) {
                 error = Some(e);
@@ -1788,13 +1839,46 @@ impl NativePair for Control {
             let mut deny = guard.borrow().current.clone();
             deny.admitted = false;
             if deny.interface.is_some() {
-                if let Err(e) = self.guard_transition(deny, false) {
-                    error = Some(e);
+                #[cfg(test)]
+                let interrupted = super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+                    if fault.get() == Some(super::member_worker_factory_native_tests::StopFault::GuardWithdrawal) {
+                        fault.set(None);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                #[cfg(not(test))]
+                let interrupted = false;
+                match if interrupted {
+                    Err(failed())
+                } else {
+                    self.guard_transition(deny, false)
+                } {
+                    Ok(()) => withdrawn = true,
+                    Err(e) => error = Some(e),
                 }
             }
         }
         if let Some(routes) = &mut self.routes {
-            if let Err(e) = routes.cleanup() {
+            #[cfg(test)]
+            let interrupted = super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+                if fault.get()
+                    == Some(super::member_worker_factory_native_tests::StopFault::RoutesCleanup)
+                {
+                    fault.set(None);
+                    true
+                } else {
+                    false
+                }
+            });
+            #[cfg(not(test))]
+            let interrupted = false;
+            if let Err(e) = if interrupted {
+                Err(failed())
+            } else {
+                routes.cleanup()
+            } {
                 error = Some(e);
             }
         }
@@ -1803,6 +1887,16 @@ impl NativePair for Control {
         }
         if let Err(e) = self.delete_address() {
             error = Some(e);
+        }
+        // Cleanup needs this original live worker/interface. After DATA
+        // withdrawal, preserve that prerequisite for the same scoped retry.
+        if withdrawn
+            && error.is_some()
+            && self.original.child.borrow().as_ref().is_some_and(|child| {
+                (unsafe { WaitForSingleObject(child.as_raw_handle(), 0) }) == WAIT_TIMEOUT
+            })
+        {
+            return Err(error.take().ok_or_else(failed)?);
         }
         if self.original.child.borrow().is_some() && !self.original.exit_ack.get() {
             if self.rpc.borrow().is_some() {
@@ -1827,9 +1921,7 @@ impl NativePair for Control {
                 if let Err(e) = self.original.terminate() {
                     error = Some(e);
                 }
-                if !self.original.start_attempted.get() {
-                    self.original.close_ack.set(true);
-                } else {
+                if self.original.start_attempted.get() {
                     error = Some(failed());
                 }
             }
@@ -1841,9 +1933,6 @@ impl NativePair for Control {
                 error = Some(e);
             }
         }
-        if !self.original.start_attempted.get() && self.original.verify_process_exit().is_ok() {
-            self.original.close_ack.set(true);
-        }
         // Static index filters may themselves pin MIB rundown. Original Child
         // exit (not interface absence) authorizes exact owned filter retirement.
         let network_empty = {
@@ -1853,8 +1942,7 @@ impl NativePair for Control {
                 && network.pending().is_none()
                 && network.recorded_active().is_none()
         };
-        if self.original.close_ack.get()
-            && self.original.verify_process_exit().is_ok()
+        if self.original.verify_process_exit().is_ok()
             && network_empty
             && self.journal.borrow().current.dns.is_none()
             && self.journal.borrow().current.address.is_none()
@@ -1900,9 +1988,6 @@ impl NativePair for Control {
         }
         if let Some(e) = error {
             return Err(e);
-        }
-        if !self.original.close_ack.get() {
-            return Err(failed());
         }
         self.journal.borrow_mut().save(|r| {
             r.stopped = true;
