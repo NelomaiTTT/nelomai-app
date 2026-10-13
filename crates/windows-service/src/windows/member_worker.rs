@@ -145,10 +145,12 @@ struct Journal {
     // First, cold publication only. These bytes are a cleanup CAS predecessor,
     // never confirmed state or permission to spawn/Start.
     initial_attempt: Option<Vec<u8>>,
+    // Unconfirmed cold Closing bytes have only retry/cleanup authority.
+    closing_attempt: Option<Vec<u8>>,
 }
 impl Journal {
     fn save(&mut self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
-        if self.initial_attempt.is_some() {
+        if self.initial_attempt.is_some() || self.closing_attempt.is_some() {
             return Err(failed());
         }
         self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
@@ -170,7 +172,7 @@ impl Journal {
         Ok(())
     }
     fn verify(&mut self) -> io::Result<()> {
-        if self.initial_attempt.is_some() {
+        if self.initial_attempt.is_some() || self.closing_attempt.is_some() {
             return Err(failed());
         }
         self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
@@ -730,6 +732,7 @@ pub(crate) fn prepare(
         current: record,
         expected,
         initial_attempt: None,
+        closing_attempt: None,
     }));
     let original = Rc::new(Original {
         source,
@@ -1201,7 +1204,7 @@ impl PairControl for Control {
         self.files.borrow_mut().claim(scope)?;
         {
             let mut journal = self.journal.borrow_mut();
-            if journal.initial_attempt.is_some() {
+            if journal.initial_attempt.is_some() || journal.closing_attempt.is_some() {
                 return Err(failed());
             }
             journal
@@ -1244,6 +1247,7 @@ impl PairControl for Control {
             || self.original.child.borrow().is_some()
             || self.stopped
             || self.journal.borrow().initial_attempt.is_some()
+            || self.journal.borrow().closing_attempt.is_some()
             || self.journal.borrow().current.closing
         {
             return Err(failed());
@@ -1736,13 +1740,33 @@ impl NativePair for Control {
             let mut closing = record.clone();
             closing.closing = true;
             let bytes = serde_json::to_vec(&closing).map_err(|_| failed())?;
-            journal.private.transaction(|files| {
+            if journal
+                .closing_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt != &bytes)
+            {
+                return Err(failed());
+            }
+            let previous_closing = journal.closing_attempt.clone();
+            let Journal {
+                private,
+                closing_attempt,
+                ..
+            } = &mut *journal;
+            private.transaction(|files| {
                 let predecessor = files.read(PrivateFile::Worker)?;
-                if predecessor != expected && predecessor.as_deref() != Some(attempted.as_slice()) {
+                if predecessor != expected
+                    && predecessor.as_deref() != Some(attempted.as_slice())
+                    && previous_closing
+                        .as_ref()
+                        .is_none_or(|attempt| predecessor.as_deref() != Some(attempt.as_slice()))
+                {
                     return Err(failed());
                 }
                 // Matching attempted bytes grant only this cleanup CAS. Only
                 // its original positive write/readback ACK confirms Closing.
+                // Retain exact desired bytes BEFORE the actual CAS Err/unwind.
+                *closing_attempt = Some(bytes.clone());
                 files.compare_exchange(PrivateFile::Worker, predecessor.as_deref(), &bytes)?;
                 if files.read(PrivateFile::Worker)?.as_deref() != Some(bytes.as_slice()) {
                     return Err(failed());
@@ -1752,6 +1776,7 @@ impl NativePair for Control {
             journal.current = closing;
             journal.expected = Some(bytes);
             journal.initial_attempt = None;
+            journal.closing_attempt = None;
         }
         let mut error = None;
         if !closing_published {

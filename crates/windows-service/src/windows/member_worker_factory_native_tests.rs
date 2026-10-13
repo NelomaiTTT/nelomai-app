@@ -48,7 +48,17 @@ impl ServiceTunnelBackend for SingleStopped {
 fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
     use super::member_files::{MemberFiles, PrivateFile, SessionFileIo};
     let mut pending = Vec::new();
-    for (unwind, foreign) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (case, (unwind, foreign, closing_unwind)) in [
+        (false, false, None),
+        (true, false, None),
+        (false, true, None),
+        (true, true, None),
+        (false, false, Some(false)),
+        (true, false, Some(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let fixture = Fixture::new_worker_modules().expect("signed private runtime fixture");
         let mut actor = CompositeBackend::new(
             RuntimeSlot::Latest,
@@ -61,7 +71,7 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
             runtime_generation: 2,
             session_id: format!(
                 "7ef40200-0000-4000-8000-{:012x}",
-                u64::from(std::process::id()) * 4 + u64::from(unwind) * 2 + u64::from(foreign)
+                u64::from(std::process::id()) * 8 + case as u64
             ),
             connection_generation: 1,
         };
@@ -132,22 +142,38 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
         } else {
             None
         };
+        if let Some(unwind) = closing_unwind {
+            fixture.lose_ack(PrivateFile::Worker, unwind);
+        }
         let stop_at = Instant::now();
-        let first = actor.redundant(Command::Stop {
-            scope: scope.clone(),
-        });
-        let first_ok = first.is_ok();
-        // Retain the same owner on any first-call failure; never replace it.
-        let stopped = if first.is_err() {
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             actor.redundant(Command::Stop {
                 scope: scope.clone(),
             })
-        } else {
-            first
+        }));
+        let first_ok = first.as_ref().is_ok_and(|result| result.is_ok());
+        if closing_unwind.is_some() {
+            assert!(!first_ok, "Closing publication ACK fault was ignored");
+            fixture
+                .verify_files()
+                .expect("actual Closing publication fault reached");
+            let closing: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(closing["closing"], true);
+            assert_eq!(closing["stopped"], false);
+        }
+        // Retain the same owner on any first-call failure; never replace it.
+        let stopped = match first {
+            Ok(result) if result.is_ok() => result,
+            _ => actor.redundant(Command::Stop {
+                scope: scope.clone(),
+            }),
         };
         let elapsed = stop_at.elapsed();
         eprintln!(
-            "worker cold publication unwind={unwind} foreign={foreign} first_ok={first_ok} local Stop={elapsed:?} scoped Stop={stopped:?}"
+            "worker cold publication unwind={unwind} foreign={foreign} closing_unwind={closing_unwind:?} first_ok={first_ok} local Stop={elapsed:?} scoped Stop={stopped:?}"
         );
         assert!(
             elapsed <= Duration::from_secs(7),
@@ -174,14 +200,16 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
                 let retained = actor.redundant(Command::Status { scope }).unwrap();
                 assert!(retained.cleanup_pending);
                 assert_ne!(retained.session.phase, SessionPhase::Running);
-                pending.push(unwind);
+                pending.push((unwind, closing_unwind));
                 continue;
             }
         };
-        assert!(
-            first_ok,
-            "cold scoped Stop required a terminal publication retry"
-        );
+        if closing_unwind.is_none() {
+            assert!(
+                first_ok,
+                "cold scoped Stop required a terminal publication retry"
+            );
+        }
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
         let after: serde_json::Value = serde_json::from_slice(
