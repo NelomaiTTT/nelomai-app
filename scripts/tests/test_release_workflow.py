@@ -148,8 +148,25 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 "retention-days": 1,
             },
         })
+        build = workflow["jobs"]["windows-build"]
+        for event, ref, expected in (
+            ("push", "refs/heads/Future/windows-hot-standby-0.4.0", ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"]),
+            ("push", "refs/heads/main", "windows-latest"),
+            ("push", "refs/heads/Future/another-branch", "windows-latest"),
+            ("push", "refs/tags/0.4.0", "windows-latest"),
+            ("pull_request", "refs/pull/42/merge", "windows-latest"),
+            ("pull_request", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
+            ("pull_request_target", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
+            ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
+        ):
+            with self.subTest(event=event, ref=ref):
+                selected = self.expression(build["runs-on"], mode="build_only", context={
+                    "github": SimpleNamespace(event_name=event, ref=ref),
+                }) if build["runs-on"].startswith("${{") else build["runs-on"]
+                self.assertEqual(selected, expected)
         checker.assert_windows_factory_jobs(workflow, factory)
         mutations = (
+            lambda jobs: jobs["windows-build"].update(**{"runs-on": ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"]}),
             lambda jobs: jobs["windows-build"]["steps"][-2].update(
                 run=jobs["windows-build"]["steps"][-2]["run"].replace("--release ", "")),
             lambda jobs: jobs["windows"]["needs"].remove("windows-build"),
@@ -519,8 +536,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         draft_windows = next(row for row in jobs["native_drafts"]["strategy"]["matrix"]["include"]
                              if row["platform"] == "windows")
-        self.assertEqual(draft_windows["runner"], checks["jobs"]["windows-build"]["runs-on"],
-                         "Windows drafts must execute ordinary service tests on the checks build host")
+        checks_runner = checks["jobs"]["windows-build"]["runs-on"]
+        hosted_runner = self.expression(checks_runner, mode="build_only", context={
+            "github": SimpleNamespace(event_name="pull_request", ref="refs/pull/42/merge"),
+        }) if checks_runner.startswith("${{") else checks_runner
+        self.assertEqual(draft_windows["runner"], hosted_runner,
+                         "Windows draft fallback must retain the hosted checks build runner")
         package_windows = next(row for row in jobs["native_packages"]["strategy"]["matrix"]["include"]
                                if row["platform"] == "windows")
         self.assertEqual(package_windows["runner"], "windows-2022")
@@ -602,6 +623,16 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("panel_notification_ready", build)
         self.assertNotIn("candidate_acceptance", workflow["jobs"])
         self.assertNotIn("native_recheck", workflow["jobs"])
+        packages = workflow["jobs"]["native_packages"]
+        downloads = [step for step in packages["steps"] if step.get("uses") == "actions/download-artifact@v4"]
+        signed = next(step for step in downloads if step["with"]["name"] == "signed-runtime")
+        draft = next(step for step in downloads if step["with"]["name"] == "draft-${{ matrix.platform }}")
+        for platform, required in (("linux", True), ("windows", False), ("macos", True), ("android", True)):
+            for mode in ("build_only", "sign_candidate", "build_and_publish", "publish_approved_candidate"):
+                with self.subTest(platform=platform, mode=mode):
+                    context = {"matrix": SimpleNamespace(platform=platform)}
+                    self.assertTrue(self.expression(signed.get("if", "True"), mode=mode, context=context))
+                    self.assertEqual(self.expression(draft.get("if", "True"), mode=mode, context=context), required)
         self.assertNotIn("verify_promotion", workflow["jobs"])
 
     def test_merged_signing_steps_expose_release_credentials_only_in_release_mode(self):

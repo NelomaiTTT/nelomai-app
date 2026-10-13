@@ -305,6 +305,7 @@ jobs:
           path: "signed"
       -
         uses: "actions/download-artifact@v4"
+        if: "matrix.platform != 'windows'"
         with:
           name: "draft-${{ matrix.platform }}"
           path: "draft"

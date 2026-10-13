@@ -192,7 +192,7 @@ jobs:
 
   windows-build:
     if: github.event_name != 'workflow_dispatch'
-    runs-on: windows-latest
+    runs-on: "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' && '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON('windows-latest')) }}"
     outputs:
       manifest_sha256: ${{ steps.artifact.outputs.manifest_sha256 }}
       artifact_name: ${{ steps.artifact.outputs.artifact_name }}
