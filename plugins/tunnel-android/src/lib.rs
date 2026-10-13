@@ -74,6 +74,13 @@ pub fn connection_intent_tunnel_options(
     options: nelomai_client_tunnel::TunnelOptions,
 ) -> models::TunnelOptions {
     let mut plugin_options = models::TunnelOptions {
+        dns46_dot_hostname: options.dns46_dot.as_ref().map(|dot| dot.hostname.clone()),
+        dns46_dot_endpoint_ipv4s: options
+            .dns46_dot
+            .as_ref()
+            .map(|dot| dot.endpoint_ipv4s.clone())
+            .unwrap_or_default(),
+        dns46_dot_expires_at_unix: options.dns46_dot_expires_at_unix,
         split_active: options.policy_hash.is_some(),
         policy_hash: options.policy_hash,
         split_tunnel_routes: options.excluded_ipv4_cidrs,
@@ -162,27 +169,7 @@ impl<R: Runtime> AndroidTunnelController<R> {
         if local_restart {
             plugin_request.start_source = "local_restart".into();
         }
-        plugin_request.options.split_active = request.options.policy_hash.is_some();
-        plugin_request.options.policy_hash = request.options.policy_hash.clone();
-        match request.options.application_mode {
-            Some(SplitTunnelMode::ExcludeSelected) => {
-                plugin_request.options.application_mode = Some("exclude_selected".to_string());
-                plugin_request.options.excluded_packages = request.options.package_ids;
-            }
-            Some(SplitTunnelMode::IncludeSelected) => {
-                plugin_request.options.application_mode = Some("include_selected".to_string());
-                plugin_request.options.included_packages = request.options.package_ids;
-            }
-            None => {}
-        }
-        plugin_request.options.split_tunnel_routes = request.options.excluded_ipv4_cidrs;
-        plugin_request.options.exclude_local_networks = request.options.exclude_local_networks;
-        plugin_request.options.dns_servers = request
-            .options
-            .dns_servers
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        plugin_request.options = connection_intent_tunnel_options(request.options);
         match request.quick_reconnect {
             QuickReconnect::Disabled => {}
             QuickReconnect::Persistent => {

@@ -8,6 +8,25 @@ import org.junit.Test
 
 class BackgroundCredentialStoreTest {
     @Test
+    fun dotMetadataPersistsButEqualRevisionWithdrawalCannotRestoreStaleReadiness() {
+        val backend = CredentialFakeBackend()
+        var store = BackgroundCredentialStore(backend)
+        val dot = Dns46DotMetadata("dns.nelomai.ru", listOf("93.184.216.34"))
+        val ready = BackgroundCapabilitySnapshot(12, true, 500, dns46Dot = dot)
+        store.configure(0, provision(ready)).successCredential()
+        store = BackgroundCredentialStore(backend)
+        val restored = store.read().successCredential()
+        assertEquals(ready, restored.capability)
+        val withdrawn = store.configure(restored.revision, provision(ready.copy(dns46Dot = null))).successCredential()
+        val late = store.configure(withdrawn.revision, provision(ready)).successCredential()
+        assertNull(late.capability?.dns46Dot)
+        assertEquals(withdrawn.active, late.active)
+        assertEquals(withdrawn.ownerScope, late.ownerScope)
+        assertEquals(dot, conservativeBackgroundCapability(late.capability, ready.copy(revision = 13)).dns46Dot)
+        assertEquals(400L, conservativeBackgroundCapability(ready, ready.copy(expiresAtUnix = 400)).expiresAtUnix)
+    }
+
+    @Test
     fun enabledCapabilityCannotPersistWithTheDisabledSentinelRevision() {
         val store = BackgroundCredentialStore(CredentialFakeBackend())
 

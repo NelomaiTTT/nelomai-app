@@ -93,6 +93,7 @@
       "type": "object",
       "required": ["revision", "expires_at", "connection_intent_recovery_v1"],
       "properties": {
+        "dns46_dot": { "$ref": "common.schema.json#/$defs/dns46Dot" },
         "revision": { "type": "integer", "minimum": 1 },
         "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
         "connection_intent_recovery_v1": { "type": "boolean" }

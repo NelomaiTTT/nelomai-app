@@ -8,6 +8,27 @@ import javax.net.ssl.HttpsURLConnection
 import java.security.cert.Certificate
 
 class NativeAuthScopeTest {
+    @Test fun noopProvisionStillAppliesConservativeDotWithdrawalWithoutIssuingToken() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val owner = operation()
+        var current = store.beginOwnerOperation(0, owner, false).value()
+        val ready = BackgroundCapabilitySnapshot(12, true, 500,
+            dns46Dot = Dns46DotMetadata("dns.nelomai.ru", listOf("93.184.216.34")))
+        current = store.configure(current.revision, BackgroundCredentialProvision(owner.scope.deviceId,
+            "https://synthetic.invalid", "same-token", 9999999999, "install", 1, ready)).value()
+        val request = BackgroundUiProvisionRequest(current.revision, owner.scope.deviceId,
+            "https://synthetic.invalid", "bearer", "install", 1, ready.copy(dns46Dot = null), owner.scope)
+        val begun = store.beginProvisionOperation(request, owner).value()
+        val saved = store.withOwnerOperation(owner) {
+            provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = begun.revision), "noop", 100,
+                provision = { error("unexpected provisioning") }, rotate = { error("unexpected rotation") },
+                legacy = { error("unexpected token issuance") })
+        }
+        assertNull(saved.capability?.dns46Dot)
+        assertEquals(current.active, saved.active)
+        assertEquals(owner.scope, saved.ownerScope)
+    }
+
     @Test fun successorWithoutPendingMutationReissuesUsingEffectiveCapability() {
         val cases = listOf(
             Triple(BackgroundCapabilitySnapshot(1, true, 9999999999),

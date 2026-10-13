@@ -13,6 +13,7 @@
     "next_attempt_at"
   ],
   "properties": {
+    "stop_acceptance": { "$ref": "common.schema.json#/$defs/stopAcceptance" },
     "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
     "state": {

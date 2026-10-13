@@ -122,6 +122,10 @@ impl fmt::Debug for InstalledApplicationsResponse {
 
 pub const TUNNEL_API_VERSION: u16 = 2;
 
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOptions {
@@ -133,6 +137,12 @@ pub struct TunnelOptions {
     pub split_tunnel_routes: Vec<String>,
     pub exclude_local_networks: bool,
     pub dns_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns46_dot_hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns46_dot_endpoint_ipv4s: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dns46_dot_expires_at_unix: i64,
 }
 
 impl fmt::Debug for TunnelOptions {
@@ -215,6 +225,7 @@ impl Serialize for RedundantStandbyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RedundantStartRequest {
     pub warm_stop_v1: bool,
+    pub async_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
     pub operation_id: String,
@@ -269,6 +280,7 @@ impl From<RedundantTunnelStart> for RedundantStartRequest {
     fn from(start: RedundantTunnelStart) -> Self {
         Self {
             warm_stop_v1: start.warm_stop_v1,
+            async_stop_v1: start.async_stop_v1,
             session_id: start.session_id,
             state: start.state,
             operation_id: start.operation_id,
@@ -707,6 +719,7 @@ mod tests {
         let mut request = StartTunnelRequest::new(b"primary-never-log-this");
         request.redundancy = Some(RedundantStartRequest {
             warm_stop_v1: false,
+            async_stop_v1: false,
             session_id: "session-1".to_string(),
             state: RedundancyState::Ready,
             operation_id: "operation-1".to_string(),

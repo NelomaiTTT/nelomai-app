@@ -379,6 +379,7 @@ impl CoreLogger for MemoryLogger {
 #[derive(Default)]
 struct MemoryTunnel {
     starts: AtomicUsize,
+    async_stop_supported: AtomicBool,
     stops: AtomicUsize,
     fail_next_starts: AtomicUsize,
     start_failure_code: Mutex<Option<String>>,
@@ -450,6 +451,8 @@ impl TunnelController for MemoryTunnel {
         *self.quick_connection.lock().unwrap() = request.quick_connection.clone();
         *self.quick_reconnect.lock().unwrap() = request.quick_reconnect;
         if let Some(redundancy) = request.redundancy.as_ref() {
+            self.async_stop_supported
+                .store(redundancy.async_stop_v1, Ordering::SeqCst);
             *self.redundant_session_id.lock().unwrap() = Some(redundancy.session_id.clone());
             *self.standby_configuration.lock().unwrap() = redundancy
                 .standby
@@ -874,6 +877,7 @@ impl CoreApi for MockApi {
             .unwrap()
             .pop_front()
             .unwrap_or(OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "reconcile-request".to_string(),
                 state: OperationState::Cancelled,
@@ -949,6 +953,7 @@ impl CoreApi for MockApi {
                 "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
             ))
             .unwrap();
+            response.redundancy.as_mut().unwrap().async_stop_v1 = true;
         }
         Ok(response)
     }
@@ -1010,6 +1015,7 @@ impl CoreApi for MockApi {
             .map(|start| start.tic_connection_mode);
         if let Some(connection) = self.stop_response_override.lock().unwrap().clone() {
             return Ok(ConnectionOperationResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "req-stop".into(),
                 connection,
@@ -1023,6 +1029,7 @@ impl CoreApi for MockApi {
             && !self.server_observed_handshake.load(Ordering::SeqCst)
             && last_start_mode == Some(TicConnectionMode::Dynamic);
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-stop".to_string(),
             connection: Connection {
@@ -1065,12 +1072,14 @@ impl CoreApi for MockApi {
         }
         if let Some(result) = self.redundant_stop_responses.lock().unwrap().pop_front() {
             return result.map(|connection| ConnectionOperationResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "req-redundant-stop".to_string(),
                 connection,
             });
         }
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-redundant-stop".to_string(),
             connection: Connection {
@@ -1099,6 +1108,7 @@ impl CoreApi for MockApi {
             });
         }
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-pin".to_string(),
             connection: Connection {
@@ -1115,6 +1125,7 @@ impl CoreApi for MockApi {
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.unpin_calls.fetch_add(1, Ordering::SeqCst);
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-unpin".to_string(),
             connection: Connection {
@@ -1358,6 +1369,8 @@ async fn recovery_v2_local_failure_uses_only_the_redundant_stop_contract() {
     let stops = api.redundant_stop_requests.lock().unwrap();
     assert_eq!(stops[0].session_id, "20000000-0000-4000-8000-000000000001");
     assert_eq!(stops[0].lease_id, "20000000-0000-4000-8000-000000000002");
+    assert!(!stops[0].background_cleanup);
+    assert!(!stops[0].retain_active_peer);
     assert!(store
         .load()
         .unwrap()
@@ -1632,6 +1645,118 @@ async fn local_dns_servers_are_forwarded_to_the_tunnel() {
         tunnel.options.lock().unwrap().as_ref().unwrap().dns_servers,
         dns_servers
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dot_metadata_reaches_start_and_downgrade_clears_it_without_restarting_active_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let metadata = nelomai_contracts::Dns46DotCapability {
+        ready: true,
+        hostname: "dns.nelomai.ru".into(),
+        endpoint_ipv4s: vec!["93.184.216.34".into()],
+    };
+    let mut response = bootstrap();
+    response.capabilities = Some(nelomai_contracts::ConnectionIntentCapability {
+        revision: 1,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        connection_intent_recovery_v1: true,
+        dns46_dot: Some(metadata.clone()),
+    });
+    *api.bootstrap_reply.lock().unwrap() = Some(response.clone());
+    core.bootstrap(1_700_000_000).await.unwrap();
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    assert_eq!(
+        tunnel.options.lock().unwrap().as_ref().unwrap().dns46_dot,
+        Some(metadata)
+    );
+    *api.bootstrap_connection.lock().unwrap() = Some(connection);
+    *api.bootstrap_reply.lock().unwrap() = None;
+    core.bootstrap(1_700_000_001).await.unwrap();
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+    core.stop().await.unwrap();
+    *api.bootstrap_connection.lock().unwrap() = None;
+    core.start(options(), 1_700_000_002).await.unwrap();
+    assert!(tunnel
+        .options
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .dns46_dot
+        .is_none());
+    core.stop().await.unwrap();
+    response.capabilities.as_mut().unwrap().revision = 0;
+    *api.bootstrap_reply.lock().unwrap() = Some(response);
+    core.bootstrap(1_700_000_003).await.unwrap();
+    core.start(options(), 1_700_000_003).await.unwrap();
+    assert!(tunnel
+        .options
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .dns46_dot
+        .is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_bootstrap_cannot_restore_withdrawn_dot_readiness() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let mut response = bootstrap();
+    response.capabilities = Some(nelomai_contracts::ConnectionIntentCapability {
+        revision: 2,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        connection_intent_recovery_v1: true,
+        dns46_dot: Some(nelomai_contracts::Dns46DotCapability {
+            ready: true,
+            hostname: "dns.nelomai.ru".into(),
+            endpoint_ipv4s: vec!["93.184.216.34".into()],
+        }),
+    });
+    for kind in ["older", "equal", "legacy"] {
+        let mut withdrawn = response.clone();
+        withdrawn.capabilities.as_mut().unwrap().revision = 3;
+        withdrawn.capabilities.as_mut().unwrap().dns46_dot = None;
+        *api.bootstrap_reply.lock().unwrap() = Some(withdrawn);
+        core.bootstrap(1_700_000_000).await.unwrap();
+        if kind == "legacy" {
+            *api.bootstrap_reply.lock().unwrap() = Some(bootstrap());
+            core.bootstrap(1_700_000_001).await.unwrap();
+        }
+        let mut late = response.clone();
+        if kind == "equal" {
+            late.capabilities.as_mut().unwrap().revision = 3;
+        }
+        *api.bootstrap_reply.lock().unwrap() = Some(late);
+        core.bootstrap(1_700_000_002).await.unwrap();
+        core.start(options(), 1_700_000_003).await.unwrap();
+        assert!(
+            tunnel
+                .options
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .dns46_dot
+                .is_none(),
+            "{kind}"
+        );
+        core.stop().await.unwrap();
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4004,6 +4129,7 @@ fn pending_redundant_cleanup() -> StoredPendingStart {
 
 fn cleanup_reconciliation(state: OperationState) -> OperationReconcileResponse {
     OperationReconcileResponse {
+        stop_acceptance: None,
         api_version: ApiVersion::V1,
         request_id: "cleanup-reconcile".into(),
         state,
@@ -4532,6 +4658,7 @@ fn pending_cleanup_live_lease() -> StoredPendingStart {
 
 fn live_cleanup_reconciliation() -> OperationReconcileResponse {
     OperationReconcileResponse {
+        stop_acceptance: None,
         lease_id: Some("old-stray-start".into()),
         lease_status: Some(LeaseStatus::Connected),
         ..cleanup_reconciliation(OperationState::Applied)
@@ -5084,6 +5211,7 @@ async fn redundant_pending_start_reconciles_its_original_kind_for_retry_and_canc
             .lock()
             .unwrap()
             .push_back(OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "redundant-reconcile".into(),
                 state: OperationState::Compensating,
@@ -8966,6 +9094,7 @@ async fn cancellation_polls_server_owned_unknown_start_until_authoritative_termi
             .push_back(CoreApiError::Retryable);
         api.reconcile_responses.lock().unwrap().extend([
             OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "reconcile-pending".to_string(),
                 state: nonterminal,
@@ -8976,6 +9105,7 @@ async fn cancellation_polls_server_owned_unknown_start_until_authoritative_termi
                 next_attempt_at: None,
             },
             OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "reconcile-terminal".to_string(),
                 state: OperationState::Terminal,
@@ -9054,6 +9184,7 @@ async fn cancellation_not_found_tombstone_clears_pending_without_replaying_start
         .lock()
         .unwrap()
         .push_back(OperationReconcileResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "reconcile-cancelled-absence".to_string(),
             state: OperationState::NotFound,
@@ -9119,6 +9250,7 @@ async fn retry_reconcile_polls_nonterminal_server_owned_operations_without_repla
             .lock()
             .unwrap()
             .push_back(OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "reconcile-request".to_string(),
                 state,
@@ -9192,6 +9324,7 @@ async fn retry_reconcile_exact_replays_not_found_and_applied_active_and_replaces
             .lock()
             .unwrap()
             .push_back(OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "reconcile-request".to_string(),
                 state,
@@ -9257,6 +9390,7 @@ async fn retry_reconcile_does_not_clear_a_lease_without_authoritative_terminal_s
         .lock()
         .unwrap()
         .push_back(OperationReconcileResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "reconcile-request".to_string(),
             state: OperationState::Terminal,
@@ -9303,6 +9437,7 @@ async fn cancellation_stops_an_already_applied_unknown_recovery_lease() {
         .push_back(CoreApiError::Retryable);
     api.reconcile_responses.lock().unwrap().extend([
         OperationReconcileResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "reconcile-request-1".to_string(),
             state: OperationState::Applied,
@@ -9313,6 +9448,7 @@ async fn cancellation_stops_an_already_applied_unknown_recovery_lease() {
             next_attempt_at: None,
         },
         OperationReconcileResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "reconcile-request-2".to_string(),
             state: OperationState::Applied,
@@ -10569,6 +10705,7 @@ async fn stalled_stop_not_found_reconciles_and_exact_replays_after_core_reconstr
         .lock()
         .unwrap()
         .push_back(OperationReconcileResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "stalled-stop-not-found".to_string(),
             state: OperationState::NotFound,
@@ -10663,6 +10800,7 @@ async fn stalled_stop_reconcile_polls_nonterminal_completes_only_terminal_lease_
             .lock()
             .unwrap()
             .push_back(OperationReconcileResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "stalled-stop-reconcile".to_string(),
                 state: operation_state,
@@ -10744,4 +10882,26 @@ impl support::TestAuthApi for MockApi {
         self.refresh_completions.fetch_add(1, Ordering::SeqCst);
         Ok(token_response("fresh-access", "fresh-refresh"))
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn negotiated_async_stop_reaches_native_owner_and_core_does_not_take_its_stop() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start_recovery_v2(options(), 1_700_000_000, true)
+        .await
+        .unwrap();
+    assert!(tunnel.async_stop_supported.load(Ordering::SeqCst));
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    assert!(core.stop().await.is_err());
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
 }

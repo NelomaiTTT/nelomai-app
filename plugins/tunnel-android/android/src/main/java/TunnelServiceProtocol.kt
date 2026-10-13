@@ -409,6 +409,7 @@ internal object TunnelServiceClient {
             .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
             .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
             .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
+            .putExtra("dns46_dot_json", args.dns46DotJson)
             .putExtra(EXTRA_CAPABILITY_EXPIRES_AT, args.capabilityExpiresAt),
         { onSuccess() },
         onError,
@@ -475,6 +476,7 @@ internal object TunnelServiceClient {
             .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
             .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
             .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
+            .putExtra("dns46_dot_json", args.dns46DotJson)
             .putExtra(EXTRA_CAPABILITY_EXPIRES_AT, args.capabilityExpiresAt),
         { onSuccess() },
         onError,
@@ -730,6 +732,9 @@ internal fun TunnelOptionsArgs.toBundle(): Bundle = Bundle().apply {
     putStringArrayList("split_tunnel_routes", splitTunnelRoutes)
     putBoolean("exclude_local_networks", excludeLocalNetworks)
     putStringArrayList("dns_servers", dnsServers)
+    dns46DotHostname?.let { putString("dns46_dot_hostname", it) }
+    putStringArrayList("dns46_dot_endpoints", dns46DotEndpointIpv4s)
+    putLong("dns46_dot_expires_at", dns46DotExpiresAtUnix)
 }
 
 internal fun Bundle.toTunnelOptions(): TunnelOptionsArgs = TunnelOptionsArgs().also {
@@ -741,6 +746,9 @@ internal fun Bundle.toTunnelOptions(): TunnelOptionsArgs = TunnelOptionsArgs().a
     it.splitTunnelRoutes = getStringArrayList("split_tunnel_routes") ?: arrayListOf()
     it.excludeLocalNetworks = getBoolean("exclude_local_networks")
     it.dnsServers = getStringArrayList("dns_servers") ?: arrayListOf()
+    it.dns46DotHostname = getString("dns46_dot_hostname")
+    it.dns46DotEndpointIpv4s = getStringArrayList("dns46_dot_endpoints") ?: arrayListOf()
+    it.dns46DotExpiresAtUnix = getLong("dns46_dot_expires_at", 0)
 }
 
 internal fun QuickConnectionArgs.toBundle(): Bundle = Bundle().apply {
@@ -793,6 +801,7 @@ private fun Bundle.toRedundantMember(): RedundantMemberArgs = RedundantMemberArg
 private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
     RedundantStartArgs().also { copy ->
         copy.warmStopV1 = warmStopV1
+        copy.asyncStopV1 = asyncStopV1
         copy.sessionId = sessionId
         copy.state = state
         copy.operationId = operationId
@@ -815,6 +824,7 @@ private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
 
 internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
     putBoolean("warm_stop_v1", warmStopV1)
+    putBoolean("async_stop_v1", asyncStopV1)
     putString("session_id", sessionId)
     putString("state", state)
     putString("operation_id", operationId)
@@ -837,6 +847,7 @@ internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
 
 internal fun Bundle.toRedundantStart(): RedundantStartArgs = RedundantStartArgs().also {
     it.warmStopV1 = getBoolean("warm_stop_v1", false)
+    it.asyncStopV1 = getBoolean("async_stop_v1", false)
     it.sessionId = requireNotNull(getString("session_id"))
     it.state = requireNotNull(getString("state"))
     it.operationId = requireNotNull(getString("operation_id"))

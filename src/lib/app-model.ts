@@ -190,7 +190,14 @@ export interface Bootstrap {
   capabilities: ConnectionIntentCapability | null;
 }
 
+export interface Dns46DotCapability {
+  ready: true;
+  hostname: string;
+  endpoint_ipv4s: string[];
+}
+
 export interface ConnectionIntentCapability {
+  dns46_dot?: Dns46DotCapability | null;
   revision: number;
   expires_at: string;
   connection_intent_recovery_v1: boolean;
@@ -459,4 +466,22 @@ export function connectionEgressMode(
   return ticConnectionMode === "personal"
     ? preferences.personalTicEgressMode
     : preferences.dynamicTicEgressMode;
+}
+
+export function dns46DotHostname(capability: ConnectionIntentCapability | null | undefined, nowMillis = Date.now()): string | null {
+  const dot = capability?.dns46_dot;
+  if (!capability || capability.revision < 1 || !(Date.parse(capability.expires_at) > nowMillis) || dot?.ready !== true) return null;
+  if (!/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(dot.hostname) ||
+      /^\d+(?:\.\d+){3}$/.test(dot.hostname) ||
+      !Array.isArray(dot.endpoint_ipv4s) || dot.endpoint_ipv4s.length === 0 || dot.endpoint_ipv4s.length > 16) return null;
+  for (const ip of dot.endpoint_ipv4s) {
+    const parts = ip.split('.');
+    if (parts.length !== 4 || parts.some(part => !/^\d+$/.test(part) || Number(part) > 255 || String(Number(part)) !== part)) return null;
+    const [a,b,c] = parts.map(Number);
+    if (a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) ||
+        (a === 198 && (b === 18 || b === 19)) || (a === 192 && b === 0 && c === 2) ||
+        (a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)) return null;
+  }
+  return dot.hostname;
 }

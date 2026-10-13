@@ -811,9 +811,15 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private val retainedRedundantOwnerRetry = Runnable { retryRetainedRedundantOwners() }
     @Volatile private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
+    private var nextRetiredReconcileAtMillis = 0L
     private val redundantHealthTick = object : Runnable {
         override fun run() {
             if (redundantVpnOwner != null && !redundantStartBlocked()) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now >= nextRetiredReconcileAtMillis) {
+                    nextRetiredReconcileAtMillis = now + 60_000L
+                    reconcileRetiredStops()
+                }
                 redundantWork.tick {
                     val installed = redundantVpnOwnerSlot.snapshot()
                     val transaction = activeRedundantTransactionForCurrentWork(
@@ -1279,6 +1285,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun startRedundantClient(args: StartTunnelArgs, receiver: ResultReceiver?) {
+        reconcileRetiredStops()
         val startedAt = System.nanoTime()
         val clientOperationId = requireNotNull(args.clientOperationId)
         val quickPlan = args.copyForQuickPlan()
@@ -1487,6 +1494,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             Build.VERSION.SDK_INT,
             transaction.template.options.toTunnelOptionsArgs(),
             transaction.template.egressMode,
+            privateDnsHostname = AndroidSplitTunnel.privateDnsHostname(applicationContext),
         )
         val localRoutes = if (options.splitSupported && options.excludeLocalNetworks) {
             physicalState.localRoutes
@@ -1507,13 +1515,15 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 // configuration. Install the DNS route chosen from that actual
                 // address immediately before constructing the shared TUN.
                 val effective = AndroidSplitTunnel.resolveConfigurationOptions(Build.VERSION.SDK_INT,
-                    preparingOptions.toTunnelOptionsArgs(), transaction.template.egressMode, config)
+                    preparingOptions.toTunnelOptionsArgs(), transaction.template.egressMode, config,
+                    AndroidSplitTunnel.privateDnsHostname(applicationContext))
                 val routes = if (effective.splitSupported && effective.excludeLocalNetworks) {
                     PhysicalNetworks(applicationContext).snapshotState().localRoutes
                 } else emptyList()
                 AndroidSplitTunnel.replaceVpnRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(effective.excludedRoutes, routes),
                     config.getInterface().dnsServers.toList(),
+                    effective.dns46DotRoutes,
                 )
                 establishRedundantTun(config)?.also {
                     redundantMutationFence.runSerializedIfActive(transaction.startOperationId) {
@@ -1533,18 +1543,20 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 resolveRedundantEndpoints(parsed)
                 prepareOwnedRedundantConfiguration(resolvedRedundantConfiguration(parsed)
                     .toAwgQuickString().toByteArray(StandardCharsets.UTF_8), preparingOptions,
-                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName)
+                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName,
+                    AndroidSplitTunnel.privateDnsHostname(applicationContext))
             },
             preparePolicy = { configuration, policy ->
                 preparingOptions = policy
                 prepareOwnedRedundantConfiguration(configuration, policy,
-                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName)
+                    transaction.template.egressMode, Build.VERSION.SDK_INT, applicationContext.packageName,
+                    AndroidSplitTunnel.privateDnsHostname(applicationContext))
             },
             equivalentPolicy = { old, new ->
                 AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT, old.toTunnelOptionsArgs(),
-                    transaction.template.egressMode) ==
+                    transaction.template.egressMode, privateDnsHostname = AndroidSplitTunnel.privateDnsHostname(applicationContext)) ==
                     AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT, new.toTunnelOptionsArgs(),
-                        transaction.template.egressMode)
+                        transaction.template.egressMode, privateDnsHostname = AndroidSplitTunnel.privateDnsHostname(applicationContext))
             },
             probeSourceIpv4 = probeSourceIpv4,
             initialNetworkAvailable = physicalState.available,
@@ -1607,6 +1619,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             AndroidSplitTunnel.replaceVpnRoutes(
                 AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
                 options.dnsServers,
+                options.dns46DotRoutes,
             )
             setUnderlyingNetworks(
                 physicalState.networks.toTypedArray().takeIf { it.isNotEmpty() },
@@ -1729,7 +1742,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                                 RedundantPhysicalNetworkCallbackIdentity(serviceGeneration,
                                     tx.startOperationId, owner),
                                 AndroidSplitTunnel.resolveOptions(Build.VERSION.SDK_INT,
-                                    tx.template.options.toTunnelOptionsArgs(), tx.template.egressMode),
+                                    tx.template.options.toTunnelOptionsArgs(), tx.template.egressMode,
+                                    privateDnsHostname = AndroidSplitTunnel.privateDnsHostname(applicationContext)),
                                 owner, PhysicalNetworks(applicationContext).snapshotState())
                         }
                     }
@@ -3277,6 +3291,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     capability = BackgroundCapabilitySnapshot(
                         revision = intent.getLongExtra(EXTRA_CAPABILITY_REVISION, -1),
                         enabled = intent.getBooleanExtra(EXTRA_CAPABILITY_ENABLED, false),
+                        dns46Dot = intent.getStringExtra("dns46_dot_json")?.let { Dns46DotMetadata.fromJson(JSONObject(it)) },
                         expiresAtUnix = Instant.parse(
                             requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
                         ).epochSecond,
@@ -3387,6 +3402,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 capability = BackgroundCapabilitySnapshot(
                     revision = intent.getLongExtra(EXTRA_CAPABILITY_REVISION, -1),
                     enabled = intent.getBooleanExtra(EXTRA_CAPABILITY_ENABLED, false),
+                    dns46Dot = intent.getStringExtra("dns46_dot_json")?.let { Dns46DotMetadata.fromJson(JSONObject(it)) },
                     expiresAtUnix = Instant.parse(
                         requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
                     ).epochSecond,
@@ -4234,6 +4250,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     ) {
         if (recovery is RecoveryStoreResult.Success) {
             unreadableRecoveryRetriesExhausted = false
+            reconcileRetiredStops()
         }
         routeAndroidEnsureRunning(
             recovery = recovery,
@@ -4373,7 +4390,19 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         routeConnectionIntentResumeThroughRedundantGate() ||
             connectionIntentLifecycle.onStickyRestart()
 
+    private fun reconcileRetiredStops() {
+        if ((recoveryStore.read() as? RecoveryStoreResult.Success)?.value?.acceptedStops.isNullOrEmpty()) return
+        // The existing process cleanup executor is independent of foreground Start/native owner work.
+        VPN_PROCESS_CLEANUP_WORK.tick {
+            reconcileAcceptedStops(recoveryStore) { old ->
+                BackgroundConnectionClient.reconcile(old.credential, old.operationId,
+                    "redundant_stop", 2, old.requestFingerprint, false)
+            }
+        }
+    }
+
     private fun dispatchDurableWorkAfterRedundantBarrier() {
+        reconcileRetiredStops()
         if (!redundantStartBlocked() && connectionIntentLifecycle.onEnsureRunning()) return
         stopIfIdle()
     }
@@ -4791,9 +4820,15 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             val networkIdentity = runCatching {
                 PhysicalNetworks(applicationContext).snapshotState().fingerprint
             }.getOrDefault("unavailable")
+            val capability = (AndroidBackgroundCredentialStores.open(applicationContext).read() as? CredentialStoreResult.Success)?.value?.capability
+            val prepared = if (capability != null) template.copy(options = template.options.copy(
+                dns46DotHostname = capability.dns46Dot?.hostname,
+                dns46DotEndpointIpv4s = capability.dns46Dot?.endpointIpv4s ?: emptyList(),
+                dns46DotExpiresAtUnix = capability.expiresAtUnix,
+            )) else template
             return BackgroundConnectionClient.startExact(
                 credential,
-                template,
+                prepared,
                 transaction,
                 candidateProbeCache,
                 networkIdentity,

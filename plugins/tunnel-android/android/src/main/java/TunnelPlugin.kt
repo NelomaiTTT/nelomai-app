@@ -81,6 +81,9 @@ class TunnelOptionsArgs {
     var splitTunnelRoutes: ArrayList<String> = arrayListOf()
     var excludeLocalNetworks: Boolean = false
     var dnsServers: ArrayList<String> = arrayListOf()
+    var dns46DotHostname: String? = null
+    var dns46DotEndpointIpv4s: ArrayList<String> = arrayListOf()
+    var dns46DotExpiresAtUnix: Long = 0
 
     companion object {}
 
@@ -159,6 +162,7 @@ class RedundantStandbyArgs {
 @InvokeArg
 class RedundantStartArgs {
     var warmStopV1: Boolean = false
+    var asyncStopV1: Boolean = false
     lateinit var sessionId: String
     lateinit var state: String
     lateinit var operationId: String
@@ -206,6 +210,7 @@ class BackgroundCredentialArgs {
     lateinit var installSecret: String
     var capabilityRevision: Long = 0
     var capabilityEnabled: Boolean = false
+    var dns46DotJson: String? = null
     lateinit var capabilityExpiresAt: String
 }
 
@@ -226,6 +231,7 @@ class BackgroundUiProvisionArgs {
     lateinit var installSecret: String
     var capabilityRevision: Long = 0
     var capabilityEnabled: Boolean = false
+    var dns46DotJson: String? = null
     lateinit var capabilityExpiresAt: String
 }
 
@@ -884,6 +890,7 @@ internal object TunnelRuntime {
                     args.options,
                     args.quickConnection?.egressMode ?: "ipv4",
                     originalConfig,
+                    AndroidSplitTunnel.privateDnsHostname(applicationContext),
                 )
                 val config = AndroidSplitTunnel.applyOptions(
                     originalConfig,
@@ -934,6 +941,7 @@ internal object TunnelRuntime {
                         localRoutes,
                     ),
                     config.getInterface().getDnsServers().toList(),
+                    options.dns46DotRoutes,
                 )
                 logStage(
                     "start.options_ready",
@@ -2785,6 +2793,9 @@ internal fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
             optionsCopy.splitTunnelRoutes = ArrayList(options.splitTunnelRoutes)
             optionsCopy.excludeLocalNetworks = options.excludeLocalNetworks
             optionsCopy.dnsServers = ArrayList(options.dnsServers)
+            optionsCopy.dns46DotHostname = options.dns46DotHostname
+            optionsCopy.dns46DotEndpointIpv4s = ArrayList(options.dns46DotEndpointIpv4s)
+            optionsCopy.dns46DotExpiresAtUnix = options.dns46DotExpiresAtUnix
         }
         copy.cacheQuickAction = true
         copy.quickActionValidUntilUnix = quickActionValidUntilUnix

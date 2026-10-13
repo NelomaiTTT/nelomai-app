@@ -85,6 +85,12 @@ internal enum class RedundantDiagnosticEvent {
     REPLACEMENT,
 }
 
+internal sealed class RedundantStopOutcome {
+    object Pending : RedundantStopOutcome()
+    object Completed : RedundantStopOutcome()
+    data class Accepted(val acceptance: StopAcceptance, val credential: BackgroundCredential) : RedundantStopOutcome()
+}
+
 /** Background transport seam. Configuration bytes only cross this boundary in process memory. */
 internal interface RedundantConnectionPanel {
     fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse
@@ -103,6 +109,8 @@ internal interface RedundantConnectionPanel {
         candidateLeaseId: String,
     ): BackgroundRedundantSession = throw UnsupportedOperationException()
     fun stop(transaction: AndroidRedundantTransaction): Boolean
+    fun stopOutcome(transaction: AndroidRedundantTransaction): RedundantStopOutcome =
+        if (stop(transaction)) RedundantStopOutcome.Completed else RedundantStopOutcome.Pending
 }
 
 internal data class RedundantRecoveryResponse(
@@ -1670,8 +1678,17 @@ internal class RedundantConnectionCoordinator(
         }
         val pending = status() ?: return@synchronized true
         val localStopped = try { native.stop() } catch (_: Throwable) { false }
-        val panelStopped = if (localStopped) try { panel.stop(pending) } catch (_: Throwable) { false } else false
-        if (!localStopped || !panelStopped) return@synchronized false
+        val outcome = if (localStopped) try {
+            if (pending.backgroundCleanupOnStop) panel.stopOutcome(pending)
+            else if (panel.stop(pending)) RedundantStopOutcome.Completed else RedundantStopOutcome.Pending
+        } catch (_: Throwable) {
+            RedundantStopOutcome.Pending
+        } else RedundantStopOutcome.Pending
+        if (outcome is RedundantStopOutcome.Accepted) {
+            return@synchronized store.detachAcceptedStop(pending.startOperationId, outcome.acceptance,
+                outcome.credential, nativeClosed = localStopped) is RecoveryStoreResult.Success
+        }
+        if (!localStopped || outcome !is RedundantStopOutcome.Completed) return@synchronized false
         val acknowledged = pending.copy(retry = pending.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
         if (!persistCleanup(acknowledged)) return@synchronized false
         store.completeRedundantStop(

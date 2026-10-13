@@ -145,6 +145,9 @@ private fun TunnelOptionsArgs.toJson(): JSONObject = JSONObject().apply {
     put("splitTunnelRoutes", JSONArray(splitTunnelRoutes))
     put("excludeLocalNetworks", excludeLocalNetworks)
     put("dnsServers", JSONArray(dnsServers))
+    dns46DotHostname?.let { put("dns46DotHostname", it) }
+    if (dns46DotEndpointIpv4s.isNotEmpty()) put("dns46DotEndpointIpv4s", JSONArray(dns46DotEndpointIpv4s))
+    if (dns46DotExpiresAtUnix > 0) put("dns46DotExpiresAtUnix", dns46DotExpiresAtUnix)
 }
 
 private fun TunnelOptionsArgs.Companion.fromJson(payload: JSONObject): TunnelOptionsArgs =
@@ -157,6 +160,9 @@ private fun TunnelOptionsArgs.Companion.fromJson(payload: JSONObject): TunnelOpt
         splitTunnelRoutes = payload.stringList("splitTunnelRoutes")
         excludeLocalNetworks = payload.optBoolean("excludeLocalNetworks", false)
         dnsServers = payload.stringList("dnsServers")
+        dns46DotHostname = payload.optString("dns46DotHostname").takeIf(String::isNotBlank)
+        dns46DotEndpointIpv4s = payload.stringList("dns46DotEndpointIpv4s")
+        dns46DotExpiresAtUnix = payload.optLong("dns46DotExpiresAtUnix", 0)
     }
 
 private fun JSONObject.stringList(key: String): ArrayList<String> {

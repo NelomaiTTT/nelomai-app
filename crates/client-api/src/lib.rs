@@ -1738,8 +1738,19 @@ impl ClientApi {
         access_token: &str,
         request: &RedundantStopRequest,
     ) -> Result<ConnectionOperationResponse, ClientApiError> {
-        self.redundant_operation(access_token, "connections/stop", request)
-            .await
+        let response: ConnectionOperationResponse = self
+            .redundant_operation(access_token, "connections/stop", request)
+            .await?;
+        if response
+            .stop_acceptance
+            .as_ref()
+            .is_some_and(|acceptance| !acceptance.matches_request(request))
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "stop_acceptance_scope_conflict",
+            });
+        }
+        Ok(response)
     }
 
     async fn redundant_operation<Request, ResponseBody>(
@@ -1831,12 +1842,23 @@ impl ClientApi {
         background_token: &str,
         request: &RedundantStopRequest,
     ) -> Result<ConnectionOperationResponse, ClientApiError> {
-        self.background_redundant_operation(
-            background_token,
-            "background/connections/stop",
-            request,
-        )
-        .await
+        let response: ConnectionOperationResponse = self
+            .background_redundant_operation(
+                background_token,
+                "background/connections/stop",
+                request,
+            )
+            .await?;
+        if response
+            .stop_acceptance
+            .as_ref()
+            .is_some_and(|acceptance| !acceptance.matches_request(request))
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "stop_acceptance_scope_conflict",
+            });
+        }
+        Ok(response)
     }
 
     async fn background_redundant_operation<Request, ResponseBody>(
@@ -2361,6 +2383,8 @@ mod tests {
         );
 
         let redundant_stop = RedundantStopRequest {
+            retain_active_peer: false,
+            background_cleanup: false,
             operation_id: "55555555-5555-4555-8555-555555555555".to_string(),
             lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
             recovery_contract_version: nelomai_contracts::RecoveryContractV2,

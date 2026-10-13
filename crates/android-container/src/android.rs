@@ -314,7 +314,8 @@ impl PrivateBackgroundDispatcher for Native {
             } else {
                 "1970-01-01T00:00:01Z"
             };
-            serde_json::json!({"revision":revision,"enabled":enabled,"expires_at_unix":expiry,"expires_at":expires_at})
+            serde_json::json!({"revision":revision,"enabled":enabled,"expires_at_unix":expiry,"expires_at":expires_at,
+                "dns46_dot": value.and_then(|v| v.dns46_dot.as_ref())})
         } else {
             serde_json::Value::Null
         };

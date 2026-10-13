@@ -1323,6 +1323,7 @@ pub struct ClientCore<A, S, T, L> {
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
     split_tunnel_options: Mutex<split_tunnel::RunningSplitTunnelOptions>,
     dns_servers: RwLock<Vec<IpAddr>>,
+    dns46_dot: RwLock<(i64, Option<(nelomai_contracts::Dns46DotCapability, i64)>)>,
     split_tunnel_warning: Mutex<SplitTunnelWarnings>,
     physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
     offline_connection_quarantine: RwLock<HashSet<String>>,
@@ -1389,6 +1390,7 @@ where
             split_tunnel_packages: RwLock::new(Vec::new()),
             split_tunnel_options: Mutex::new(split_tunnel::RunningSplitTunnelOptions::default()),
             dns_servers: RwLock::new(Vec::new()),
+            dns46_dot: RwLock::new((0, None)),
             split_tunnel_warning: Mutex::new(SplitTunnelWarnings::default()),
             physical_network_change: Mutex::new(
                 split_tunnel::PhysicalNetworkChangeDetector::default(),
@@ -1443,6 +1445,13 @@ where
             .read()
             .map(|servers| servers.clone())
             .unwrap_or_default();
+        options.dns46_dot = None;
+        options.dns46_dot_expires_at_unix = 0;
+        if let Ok(dot) = self.dns46_dot.read() {
+            options.dns46_dot = dot.1.as_ref().map(|(metadata, _)| metadata.clone());
+            options.dns46_dot_expires_at_unix =
+                dot.1.as_ref().map(|(_, expiry)| *expiry).unwrap_or(0);
+        }
         options
     }
 
@@ -1958,6 +1967,33 @@ where
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Bootstrap, CoreError> {
         self.ensure_start_not_cancelled(cancel_epoch)?;
+        if let Ok(mut current) = self.dns46_dot.write() {
+            if let Some(capability) = response
+                .capabilities
+                .as_ref()
+                .filter(|value| value.revision > 0)
+            {
+                let incoming = capability
+                    .expires_at_unix()
+                    .filter(|expiry| *expiry > now_unix)
+                    .and_then(|expiry| capability.dns46_dot.clone().map(|dot| (dot, expiry)));
+                if capability.revision > current.0 {
+                    *current = (capability.revision, incoming);
+                } else if capability.revision == current.0 {
+                    // Equal-revision responses can withdraw readiness or shorten
+                    // validity, but cannot restore a withdrawn/changed snapshot.
+                    current.1 = current
+                        .1
+                        .as_ref()
+                        .zip(incoming.as_ref())
+                        .filter(|(old, new)| old.0 == new.0)
+                        .map(|(old, new)| (old.0.clone(), old.1.min(new.1)));
+                }
+            } else {
+                // Preserve the revision fence even when a legacy response omits metadata.
+                current.1 = None;
+            }
+        }
         let mut current_stored = self.load_runtime()?;
         current_stored.compatibility = Some(StoredCompatibility {
             update_required: response.update.required,
@@ -5680,6 +5716,8 @@ where
                 .await;
         };
         let request = RedundantStopRequest {
+            retain_active_peer: false,
+            background_cleanup: false,
             operation_id: pending.operation_id.clone(),
             lease_id: pending.lease_id.clone(),
             recovery_contract_version: RecoveryContractV2,
@@ -6069,6 +6107,7 @@ fn redundant_tunnel_start(
         });
     Ok(Some(RedundantTunnelStart {
         warm_stop_v1: redundancy.warm_stop_v1,
+        async_stop_v1: redundancy.async_stop_v1,
         session_id: redundancy.session_id.clone(),
         state: redundancy.state,
         operation_id: operation_id.to_string(),

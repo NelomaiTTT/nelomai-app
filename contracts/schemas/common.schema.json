@@ -142,6 +142,70 @@
         "measured_at": { "$ref": "#/$defs/timestamp" }
       },
       "additionalProperties": false
+    },
+    "stopAcceptance": {
+      "type": "object",
+      "required": [
+        "operation_id",
+        "session_id",
+        "lease_id",
+        "accepted",
+        "cleanup_pending"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        "session_id": {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        "lease_id": {
+          "$ref": "common.schema.json#/$defs/uuid"
+        },
+        "accepted": {
+          "const": true
+        },
+        "cleanup_pending": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "dns46Dot": {
+      "type": "object",
+      "required": [
+        "ready",
+        "hostname",
+        "endpoint_ipv4s"
+      ],
+      "properties": {
+        "ready": {
+          "const": true
+        },
+        "hostname": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+          "not": {
+            "pattern": "^\\d+(?:\\.\\d+){3}$"
+          }
+        },
+        "endpoint_ipv4s": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "ipv4",
+            "not": {
+              "pattern": "^(?:(?:0|10|127|22[4-9]|23[0-9]|24[0-9]|25[0-5])\\.|169\\.254\\.|172\\.(?:1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.|100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.|198\\.1[89]\\.|192\\.0\\.2\\.|198\\.51\\.100\\.|203\\.0\\.113\\.)"
+            },
+            "pattern": "^(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}$"
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

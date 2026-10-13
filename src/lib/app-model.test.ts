@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   bindingPreferenceUpdateRequest,
+  dns46DotHostname,
   bindingPreferencesMatch,
   bindingRequest,
   connectionEgressMode,
@@ -322,5 +323,18 @@ describe("runtime selector view", () => {
       ),
     ).toBe(true);
     expect(runtimeRestartRequired(runtimeStatus())).toBe(false);
+  });
+});
+
+describe("DNS46 Private DNS instruction", () => {
+  const capability = {revision:1, expires_at:"2099-01-01T00:00:00Z",connection_intent_recovery_v1:true,
+    dns46_dot:{ready:true as const,hostname:"dns.nelomai.ru",endpoint_ipv4s:["93.184.216.34"]}};
+  it("shows only a ready unexpired public capability", () => {
+    expect(dns46DotHostname(capability)).toBe("dns.nelomai.ru");
+    expect(dns46DotHostname({...capability,expires_at:"2000-01-01T00:00:00Z"})).toBeNull();
+    expect(dns46DotHostname({...capability,dns46_dot:null})).toBeNull();
+    for (const ip of ["10.0.0.1","127.0.0.1","224.0.0.1","bad"]) {
+      expect(dns46DotHostname({...capability,dns46_dot:{...capability.dns46_dot,endpoint_ipv4s:[ip]}})).toBeNull();
+    }
   });
 });

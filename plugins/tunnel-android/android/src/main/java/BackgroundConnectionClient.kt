@@ -270,7 +270,36 @@ internal data class BackgroundReconcileResult(
     val leaseStatus: String?,
     val retryCount: Int,
     val nextAttemptAtUnix: Long?,
+    val stopAcceptance: StopAcceptance? = null,
 )
+
+internal fun parseStopAcceptance(value: JSONObject): StopAcceptance {
+    require(value.get("accepted") == true && value.get("cleanup_pending") is Boolean)
+    return StopAcceptance(value.getString("operation_id"), value.getString("session_id"),
+        value.getString("lease_id"), value.getBoolean("cleanup_pending")).also {
+        listOf(it.operationId, it.sessionId, it.leaseId).forEach { id ->
+            require(java.util.UUID.fromString(id).toString() == id)
+        }
+    }
+}
+
+// Retired callbacks can only remove their own immutable record, never mutate the live intent.
+internal fun reconcileAcceptedStops(
+    store: AndroidRecoveryStore,
+    reconcile: (AcceptedStopCleanup) -> BackgroundReconcileResult,
+) {
+    val snapshot = (store.read() as? RecoveryStoreResult.Success)?.value ?: return
+    snapshot.acceptedStops.forEach { entry ->
+        runCatching {
+            val reply = reconcile(entry)
+            val acceptance = reply.stopAcceptance ?: return@runCatching
+            if (reply.state == "applied" && !acceptance.cleanupPending &&
+                acceptance.operationId == entry.operationId && acceptance.sessionId == entry.sessionId &&
+                acceptance.leaseId == entry.leaseId
+            ) store.completeAcceptedCleanup(entry)
+        }
+    }
+}
 
 internal data class BackgroundLogoutFinalizeResult(
     val code: String,
@@ -444,7 +473,11 @@ internal fun provisionOwnedBackgroundCredential(
         val capability = conservativeBackgroundCapability(current.capability, request.capability)
         selected = if (capability.enabled && capability.expiresAtUnix > nowUnix) "two_phase" else "legacy"
     }
-    if (selected == "noop") return current
+    if (selected == "noop") {
+        val capability = conservativeBackgroundCapability(current.capability, request.capability)
+        return if (capability == current.capability) current
+        else store.updateCapability(current.revision, capability).provisionEnvelopeOrThrow()
+    }
     if (selected == "rotate") {
         try {
             rotate(current.revision)
@@ -588,6 +621,7 @@ internal class BackgroundOperationClient(
                 enabled = payload.getBoolean("connection_intent_recovery_v1"),
                 expiresAtUnix = parseTimestamp(payload.getString("expires_at")),
                 reserveEnabled = payload.optBoolean("android_hot_standby_v1", false),
+                dns46Dot = payload.optJSONObject("dns46_dot")?.let(Dns46DotMetadata::fromJson),
             )
         }
     }
@@ -633,7 +667,7 @@ internal class BackgroundOperationClient(
         cancelIfAbsent: Boolean,
     ): BackgroundReconcileResult {
         requireUuid(operationId)
-        require(kind in setOf("start", "redundant_start", "stalled_stop"))
+        require(kind in setOf("start", "redundant_start", "redundant_stop", "stalled_stop"))
         require(contractVersion in 1..32)
         require(requestFingerprint.matches(Regex("[0-9a-f]{64}")))
         val payload = transport.execute(
@@ -662,6 +696,7 @@ internal class BackgroundOperationClient(
                 leaseStatus = payload.optionalString("lease_status")?.also(::requireWireValue),
                 retryCount = payload.optInt("retry_count", 0).also { require(it >= 0) },
                 nextAttemptAtUnix = payload.optionalString("next_attempt_at")?.let(::parseTimestamp),
+                stopAcceptance = payload.optJSONObject("stop_acceptance")?.let(::parseStopAcceptance),
             )
         }
     }
@@ -1358,10 +1393,24 @@ internal fun backgroundRedundantStopPayload(
     leaseId: String,
 ): JSONObject = JSONObject().apply {
     if (transaction.retainActivePeerOnStop) put("retain_active_peer", true)
+    if (transaction.backgroundCleanupOnStop) put("background_cleanup", true)
     put("operation_id", requireNotNull(transaction.stopOperationId))
     put("lease_id", leaseId)
     put("recovery_contract_version", 2)
     put("session_id", transaction.sessionId)
+}
+
+internal fun backgroundRedundantStopFingerprint(transaction: AndroidRedundantTransaction, leaseId: String): String {
+    // Sorted compact JSON agrees with the server's immutable operation signature.
+    val fields = sortedMapOf<String, Any>("kind" to "redundant_stop", "lease_id" to leaseId,
+        "operation_id" to requireNotNull(transaction.stopOperationId), "session_id" to transaction.sessionId)
+    if (transaction.backgroundCleanupOnStop) fields["background_cleanup"] = true
+    if (transaction.retainActivePeerOnStop) fields["retain_active_peer"] = true
+    val wire = fields.entries.joinToString(prefix = "{", postfix = "}", separator = ",") {
+        JSONObject.quote(it.key) + ":" + if (it.value is String) JSONObject.quote(it.value as String) else it.value.toString()
+    }
+    return java.security.MessageDigest.getInstance("SHA-256").digest(wire.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 255) }
 }
 
 private fun probesToJson(probes: List<BackgroundProbeResult>) = JSONArray().apply {
@@ -1531,6 +1580,9 @@ internal fun backgroundExactStartResult(
             val address = view.getString("virtual_address_v4")
             require(address.endsWith("/32") && canonicalRedundantIpv4(address.removeSuffix("/32")))
             val redundant = AndroidRedundantTransaction(
+                asyncStopSupported = if (view.has("async_stop_v1")) {
+                    (view.get("async_stop_v1").also { require(it is Boolean) }) as Boolean
+                } else false,
                 warmStopSupported = view.optBoolean("warm_stop_v1", false),
                 desiredActive = true,
                 template = template,
@@ -1693,6 +1745,9 @@ internal fun backgroundTunnelOptions(
         if (!optBoolean("enabled", false)) {
             return TunnelOptionsArgs().apply {
                 dnsServers = ArrayList(fallback.dnsServers)
+                dns46DotHostname = fallback.dns46DotHostname
+                dns46DotEndpointIpv4s = ArrayList(fallback.dns46DotEndpointIpv4s)
+                dns46DotExpiresAtUnix = fallback.dns46DotExpiresAtUnix
             }
         }
 
@@ -1749,6 +1804,9 @@ internal fun backgroundTunnelOptions(
             splitTunnelRoutes = ArrayList(routes)
             excludeLocalNetworks = optBoolean("exclude_local_networks", true)
             dnsServers = ArrayList(fallback.dnsServers)
+            dns46DotHostname = fallback.dns46DotHostname
+            dns46DotEndpointIpv4s = ArrayList(fallback.dns46DotEndpointIpv4s)
+            dns46DotExpiresAtUnix = fallback.dns46DotExpiresAtUnix
         }
     }
 }

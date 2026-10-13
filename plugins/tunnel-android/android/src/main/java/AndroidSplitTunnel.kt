@@ -19,6 +19,35 @@ private const val MAX_DNS_SERVERS = 4
 private val DNS46_TUNNEL_RESOLVERS = listOf("10.255.255.53", "10.255.255.54")
 private val PACKAGE_ID = Regex("^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$")
 
+internal data class Dns46DotMetadata(val hostname: String, val endpointIpv4s: List<String>) {
+    init {
+        require(!hostname.matches(Regex("[0-9]+(?:\\.[0-9]+){3}")))
+        require(hostname.matches(Regex("(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")))
+        require(endpointIpv4s.size in 1..16 && endpointIpv4s.distinct().size == endpointIpv4s.size)
+        endpointIpv4s.forEach { value ->
+            val parts = value.split('.')
+            require(parts.size == 4 && parts.all { it.toIntOrNull() in 0..255 && it == it.toInt().toString() })
+            val octets = parts.map(String::toInt)
+            val address = InetAddress.getByAddress(octets.map(Int::toByte).toByteArray())
+            val a = octets[0]; val b = octets[1]; val c = octets[2]
+            require(!address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isSiteLocalAddress &&
+                !address.isLinkLocalAddress && !address.isMulticastAddress && a in 1..223 &&
+                !(a == 100 && b in 64..127) && !(a == 198 && b in 18..19) &&
+                !(a == 192 && b == 0 && c == 2) && !(a == 198 && b == 51 && c == 100) &&
+                !(a == 203 && b == 0 && c == 113))
+        }
+    }
+    fun toJson() = org.json.JSONObject().put("ready", true).put("hostname", hostname)
+        .put("endpoint_ipv4s", org.json.JSONArray(endpointIpv4s))
+    companion object {
+        fun fromJson(value: org.json.JSONObject): Dns46DotMetadata {
+            require(value.get("ready") == true)
+            val values = value.getJSONArray("endpoint_ipv4s")
+            return Dns46DotMetadata(value.getString("hostname"), (0 until values.length()).map { values.getString(it) })
+        }
+    }
+}
+
 internal class AndroidSplitTunnelException(
     val code: String,
 ) : RuntimeException(code)
@@ -47,13 +76,14 @@ internal data class EffectiveAndroidTunnelOptions(
     val excludedRoutes: List<Ipv4Prefix> = emptyList(),
     val excludeLocalNetworks: Boolean = false,
     val dnsServers: List<InetAddress> = emptyList(),
+    val dns46DotRoutes: List<Ipv4Prefix> = emptyList(),
 ) {
     fun isEmpty(): Boolean =
         excludedPackages.isEmpty() &&
             includedPackages.isEmpty() &&
             excludedRoutes.isEmpty() &&
             !excludeLocalNetworks &&
-            dnsServers.isEmpty()
+            dnsServers.isEmpty() && dns46DotRoutes.isEmpty()
 }
 
 internal data class AndroidVpnRoutes(
@@ -64,16 +94,27 @@ internal data class AndroidVpnRoutes(
 internal object AndroidSplitTunnel {
     private val currentVpnRoutes = AtomicReference(AndroidVpnRoutes())
 
+    fun privateDnsHostname(context: android.content.Context): String? = runCatching {
+        val manager = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val active = manager.activeNetwork?.let(manager::getLinkProperties)?.privateDnsServerName
+        active?.takeIf { it.isNotBlank() } ?: if (
+            android.provider.Settings.Global.getString(context.contentResolver, "private_dns_mode") == "hostname"
+        ) android.provider.Settings.Global.getString(context.contentResolver, "private_dns_specifier")
+        else null
+    }.getOrNull()
+
     fun resolveConfigurationOptions(
         androidApiLevel: Int,
         args: TunnelOptionsArgs,
         egressMode: String,
         config: Config,
+        privateDnsHostname: String? = null,
     ): EffectiveAndroidTunnelOptions = resolveOptions(
         androidApiLevel,
         args,
         egressMode,
         config.getInterface().addresses.mapNotNull { it.address.hostAddress },
+        privateDnsHostname,
     )
 
     fun resolveOptions(
@@ -81,6 +122,7 @@ internal object AndroidSplitTunnel {
         args: TunnelOptionsArgs,
         egressMode: String = "ipv4",
         tunnelAddresses: List<String> = emptyList(),
+        privateDnsHostname: String? = null,
     ): EffectiveAndroidTunnelOptions {
         val requestedDnsServers = normalizeDnsServers(args.dnsServers)
         val dnsServers = if (egressMode == "prefer_ipv6") {
@@ -90,8 +132,15 @@ internal object AndroidSplitTunnel {
         } else {
             requestedDnsServers
         }
+        val dotRoutes = if (egressMode == "prefer_ipv6" &&
+            args.dns46DotExpiresAtUnix > System.currentTimeMillis() / 1000 &&
+            privateDnsHostname?.lowercase()?.trimEnd('.') == args.dns46DotHostname
+        ) runCatching {
+            Dns46DotMetadata(requireNotNull(args.dns46DotHostname), args.dns46DotEndpointIpv4s)
+                .endpointIpv4s.map { canonicalIpv4Prefix("$it/32") }
+        }.getOrDefault(emptyList()) else emptyList()
         if (androidApiLevel < 33 || !args.splitActive) {
-            return EffectiveAndroidTunnelOptions(dnsServers = dnsServers)
+            return EffectiveAndroidTunnelOptions(dnsServers = dnsServers, dns46DotRoutes = dotRoutes)
         }
         if (args.excludedPackages.isNotEmpty() && args.includedPackages.isNotEmpty()) {
             throw AndroidSplitTunnelException("conflicting_application_rules")
@@ -114,6 +163,7 @@ internal object AndroidSplitTunnel {
             excludedRoutes = excludedRoutes.values.toList(),
             excludeLocalNetworks = args.excludeLocalNetworks,
             dnsServers = dnsServers,
+            dns46DotRoutes = dotRoutes,
         )
     }
 
@@ -180,25 +230,39 @@ internal object AndroidSplitTunnel {
 
         return Config.Builder()
             .setInterface(builder.build())
-            .addPeers(config.getPeers())
+            .addPeers(if (options.dns46DotRoutes.isEmpty()) config.getPeers() else {
+                require(config.peers.size == 1) { "dns46_dot_requires_single_peer" }
+                config.peers.map { peer ->
+                    org.amnezia.awg.config.Peer.Builder().apply {
+                        setPublicKey(peer.publicKey)
+                        addAllowedIps(peer.allowedIps)
+                        peer.endpoint.ifPresent(::setEndpoint)
+                        peer.preSharedKey.ifPresent(::setPreSharedKey)
+                        peer.persistentKeepalive.ifPresent(::setPersistentKeepalive)
+                        options.dns46DotRoutes.forEach { addAllowedIp(org.amnezia.awg.config.InetNetwork.parse(it.canonical)) }
+                    }.build()
+                }
+            })
             .build()
     }
 
     fun replaceVpnRoutes(
         excludedRoutes: List<Ipv4Prefix>,
         dnsServers: List<InetAddress>,
+        dns46DotRoutes: List<Ipv4Prefix> = emptyList(),
     ) {
-        currentVpnRoutes.set(planVpnRoutes(excludedRoutes, dnsServers))
+        currentVpnRoutes.set(planVpnRoutes(excludedRoutes, dnsServers, dns46DotRoutes))
     }
 
     fun planVpnRoutes(
         excludedRoutes: List<Ipv4Prefix>,
         dnsServers: List<InetAddress>,
+        dns46DotRoutes: List<Ipv4Prefix> = emptyList(),
     ): AndroidVpnRoutes = AndroidVpnRoutes(
         excludedRoutes = excludedRoutes.toList(),
         forcedTunnelRoutes = dnsServers.filterIsInstance<Inet4Address>().map { server ->
             canonicalIpv4Prefix("${server.hostAddress}/32")
-        },
+        }.plus(dns46DotRoutes).distinctBy { it.canonical },
     )
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)

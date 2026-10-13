@@ -91,10 +91,11 @@ internal fun prepareOwnedRedundantConfiguration(
     egressMode: String,
     apiLevel: Int,
     packageName: String,
+    privateDnsHostname: String? = null,
 ): PreparedRedundantConfiguration = TunnelPayload.consume(bytes) {
     val parsed = Config.parse(ByteArrayInputStream(it))
     val effective = AndroidSplitTunnel.resolveConfigurationOptions(apiLevel,
-        options.toTunnelOptionsArgs(), egressMode, parsed)
+        options.toTunnelOptionsArgs(), egressMode, parsed, privateDnsHostname)
     val config = AndroidSplitTunnel.applyOptions(parsed, effective, packageName)
     PreparedRedundantConfiguration(config,
         config.toAwgUserspaceString().toByteArray(StandardCharsets.UTF_8), it.copyOf())

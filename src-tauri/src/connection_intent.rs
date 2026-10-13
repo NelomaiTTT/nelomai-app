@@ -1972,6 +1972,7 @@ mod tests {
     #[test]
     fn capability_refresh_accepts_only_a_present_enabled_unexpired_snapshot() {
         let enabled = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 7,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -1995,6 +1996,7 @@ mod tests {
     #[test]
     fn initial_desktop_preflight_falls_back_to_legacy_only_after_authoritative_capability_check() {
         let enabled = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 7,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,

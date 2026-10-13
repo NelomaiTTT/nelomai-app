@@ -47,6 +47,7 @@ class LatestRuntimeNativeBridgeV1 : RuntimeNativeBridgeV1 {
                         capabilityRevision = desired.getLong("revision")
                         capabilityEnabled = desiredEnabled
                         capabilityExpiresAt = desired.getString("expires_at")
+                        dns46DotJson = desired.optJSONObject("dns46_dot")?.toString()
                     }
                     TunnelServiceClient.provisionBackground(context, args, { result.success("null") }, result::failure)
                 }

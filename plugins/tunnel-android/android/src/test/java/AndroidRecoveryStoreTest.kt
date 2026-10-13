@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -8,6 +9,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AndroidRecoveryStoreTest {
+    @Test
+    fun dotRoutesPersistAcrossProcessDeathAndPolicyReplacementWithoutChangingOwnership() {
+        val backend = FakeEncryptedRecordBackend()
+        val options = AndroidTunnelOptions(splitActive = true,
+            splitTunnelRoutes = listOf("0.0.0.0/0"), dns46DotHostname = "dns.nelomai.ru",
+            dns46DotEndpointIpv4s = listOf("93.184.216.34"), dns46DotExpiresAtUnix = 4_000_000_000)
+        val initial = store(backend).beginStart(0,
+            template().copy(egressMode = "prefer_ipv6", options = options), replay()).success()
+        val recovered = store(backend).read().success()
+        assertEquals(initial, recovered)
+        val durable = requireNotNull(recovered.intent.template).options
+        val reapplied = AndroidSplitTunnel.resolveOptions(34,
+            durable.copy(splitTunnelRoutes = listOf("93.184.216.34/32")).toTunnelOptionsArgs(),
+            "prefer_ipv6", privateDnsHostname = "dns.nelomai.ru")
+        assertEquals(listOf("93.184.216.34/32"), reapplied.dns46DotRoutes.map { it.canonical })
+        assertEquals(initial.intent.generation, recovered.intent.generation)
+        assertEquals(initial.leaseTransaction?.startOperationId, recovered.leaseTransaction?.startOperationId)
+    }
+
     @Test
     fun pendingV2HandoffRejectsForeignOperationCancellationAndWriteFailure() {
         val backend = FakeEncryptedRecordBackend()
@@ -249,7 +269,7 @@ class AndroidRecoveryStoreTest {
     fun legacyV1EnvelopeMigratesWithUnarmedHistoryAndEmptyOptions() {
         val legacy = AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(7))
             .toString(Charsets.UTF_8)
-            .replace("\"formatVersion\":2", "\"formatVersion\":1")
+            .replace("\"formatVersion\":$ANDROID_RECOVERY_FORMAT", "\"formatVersion\":1")
             .replace(",\"armedHistory\":false", "")
             .toByteArray()
         val restored = store(FakeEncryptedRecordBackend(legacy)).read().success()
@@ -267,7 +287,7 @@ class AndroidRecoveryStoreTest {
         store.recordLease(1, "lease-1").success()
         store.activateCheckpoint(1).success()
         val legacy = requireNotNull(backend.record).toString(Charsets.UTF_8)
-            .replace("\"formatVersion\":2", "\"formatVersion\":1")
+            .replace("\"formatVersion\":$ANDROID_RECOVERY_FORMAT", "\"formatVersion\":1")
             .replace(",\"armedHistory\":true", "")
             .toByteArray()
 
@@ -410,26 +430,26 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
-    fun corruptRecordIsReplacedByAFailClosedEnvelope() {
+    fun corruptRecordIsPreservedAndAdmissionRemainsClosed() {
         val backend = FakeEncryptedRecordBackend("not-json".toByteArray())
 
         val failure = store(backend).read().failure()
 
         assertEquals("recovery_record_corrupt", failure.code)
-        val persisted = AndroidRecoveryEnvelopeCodec.decode(requireNotNull(backend.record))
-        assertFalse(persisted.intent.desiredActive)
-        assertNull(persisted.leaseTransaction)
+        assertEquals("not-json", requireNotNull(backend.record).toString(Charsets.UTF_8))
+        assertEquals(0, backend.writeCount)
+        assertEquals("recovery_record_corrupt", store(backend).read().failure().code)
     }
 
     @Test
-    fun corruptCiphertextIsReplacedByAFailClosedEnvelope() {
+    fun corruptCiphertextIsPreservedWithoutWritingAnEmptyEnvelope() {
         val backend = FakeEncryptedRecordBackend(throwCorruptRead = true)
 
         val failure = store(backend).read().failure()
 
         assertEquals("recovery_record_corrupt", failure.code)
-        backend.throwCorruptRead = false
-        assertFalse(store(backend).read().success().intent.desiredActive)
+        assertEquals(0, backend.writeCount)
+        assertEquals("recovery_record_corrupt", store(backend).read().failure().code)
     }
 
     @Test
@@ -445,7 +465,8 @@ class AndroidRecoveryStoreTest {
         val failure = store(backend).read().failure()
 
         assertEquals("recovery_record_corrupt", failure.code)
-        assertNull(store(backend).read().success().leaseTransaction)
+        assertArrayEquals(invalidCheckpoint, backend.record)
+        assertEquals("recovery_record_corrupt", store(backend).read().failure().code)
     }
 
     @Test

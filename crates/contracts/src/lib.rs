@@ -369,6 +369,76 @@ pub struct UpdateManifest {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Dns46DotWire")]
+pub struct Dns46DotCapability {
+    pub ready: bool,
+    pub hostname: String,
+    pub endpoint_ipv4s: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Dns46DotWire {
+    ready: bool,
+    hostname: String,
+    endpoint_ipv4s: Vec<String>,
+}
+
+impl TryFrom<Dns46DotWire> for Dns46DotCapability {
+    type Error = &'static str;
+    fn try_from(value: Dns46DotWire) -> Result<Self, Self::Error> {
+        let hostname = &value.hostname;
+        let valid_name = hostname.is_ascii()
+            && hostname.len() <= 253
+            && hostname.split('.').count() >= 2
+            && hostname.parse::<std::net::IpAddr>().is_err()
+            && hostname.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            });
+        let valid_address = |text: &String| {
+            text.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+                let [a, b, _, _] = ip.octets();
+                ip.to_string() == *text
+                    && !ip.is_private()
+                    && !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !ip.is_multicast()
+                    && !ip.is_documentation()
+                    && !ip.is_unspecified()
+                    && a < 240
+                    && a != 0
+                    && !(a == 100 && (64..=127).contains(&b))
+                    && !(a == 198 && (b == 18 || b == 19))
+            })
+        };
+        if !value.ready
+            || !valid_name
+            || value.endpoint_ipv4s.is_empty()
+            || value.endpoint_ipv4s.len() > 16
+            || !value.endpoint_ipv4s.iter().all(valid_address)
+            || value
+                .endpoint_ipv4s
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != value.endpoint_ipv4s.len()
+        {
+            return Err("invalid DNS46 DoT capability");
+        }
+        Ok(Self {
+            ready: true,
+            hostname: value.hostname,
+            endpoint_ipv4s: value.endpoint_ipv4s,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Bootstrap {
     pub api_version: ApiVersion,
@@ -386,6 +456,8 @@ pub struct Bootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnectionIntentCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns46_dot: Option<Dns46DotCapability>,
     pub revision: i64,
     pub expires_at: String,
     pub connection_intent_recovery_v1: bool,
@@ -548,6 +620,8 @@ impl fmt::Debug for RedundancyMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundancySession {
+    #[serde(default)]
+    pub async_stop_v1: bool,
     #[serde(default)]
     pub warm_stop_v1: bool,
     pub session_id: String,
@@ -746,10 +820,29 @@ impl<'de> Deserialize<'de> for RecoveryContractV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundantStopRequest {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retain_active_peer: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background_cleanup: bool,
     pub operation_id: String,
     pub lease_id: String,
     pub recovery_contract_version: RecoveryContractV2,
     pub session_id: String,
+}
+
+impl RedundantStopRequest {
+    pub fn request_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut value = serde_json::json!({"kind": "redundant_stop", "operation_id": self.operation_id,
+            "session_id": self.session_id, "lease_id": self.lease_id});
+        if self.retain_active_peer {
+            value["retain_active_peer"] = true.into();
+        }
+        if self.background_cleanup {
+            value["background_cleanup"] = true.into();
+        }
+        format!("{:x}", Sha256::digest(value.to_string().as_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -761,7 +854,39 @@ pub struct ConnectionOperationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StopAcceptance {
+    pub operation_id: String,
+    pub session_id: String,
+    pub lease_id: String,
+    #[serde(deserialize_with = "deserialize_true")]
+    pub accepted: bool,
+    pub cleanup_pending: bool,
+}
+
+impl StopAcceptance {
+    pub fn matches_request(&self, request: &RedundantStopRequest) -> bool {
+        request.background_cleanup
+            && self.accepted
+            && self.operation_id == request.operation_id
+            && self.session_id == request.session_id
+            && self.lease_id == request.lease_id
+    }
+}
+
+fn deserialize_true<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    if bool::deserialize(deserializer)? {
+        Ok(true)
+    } else {
+        Err(<D::Error as serde::de::Error>::custom(
+            "Stop acceptance must be true",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnectionOperationResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_acceptance: Option<StopAcceptance>,
     pub api_version: ApiVersion,
     pub request_id: String,
     pub connection: Connection,
@@ -801,6 +926,8 @@ pub struct OperationReconcileRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OperationReconcileResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_acceptance: Option<StopAcceptance>,
     pub api_version: ApiVersion,
     pub request_id: String,
     pub state: OperationState,

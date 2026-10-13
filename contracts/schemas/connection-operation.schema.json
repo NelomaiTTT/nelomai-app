@@ -4,6 +4,7 @@
   "type": "object",
   "required": ["api_version", "request_id", "connection"],
   "properties": {
+    "stop_acceptance": { "$ref": "common.schema.json#/$defs/stopAcceptance" },
     "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
     "connection": { "$ref": "common.schema.json#/$defs/connection" }

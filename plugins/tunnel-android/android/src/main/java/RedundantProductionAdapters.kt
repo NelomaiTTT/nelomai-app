@@ -93,6 +93,7 @@ internal fun redundantTransactionFromStart(
     redundantHealthProbesFromStart(redundancy)
     return AndroidRedundantTransaction(
         warmStopSupported = redundancy.warmStopV1,
+        asyncStopSupported = redundancy.asyncStopV1,
         desiredActive = true,
         template = AndroidIntentTemplate(
             deviceId = UUID.fromString(deviceId).toString(),
@@ -946,23 +947,30 @@ internal class ServiceRedundantConnectionPanel(
         candidateLeaseId,
     )
 
-    override fun stop(transaction: AndroidRedundantTransaction): Boolean {
-        val leaseId = transaction.localActiveLeaseId
-            ?: transaction.slotALeaseId
-            ?: transaction.slotBLeaseId
-            ?: return false
+    override fun stop(transaction: AndroidRedundantTransaction): Boolean =
+        stopOutcome(transaction) is RedundantStopOutcome.Completed
+
+    override fun stopOutcome(transaction: AndroidRedundantTransaction): RedundantStopOutcome {
+        val leaseId = transaction.localActiveLeaseId ?: transaction.slotALeaseId ?: transaction.slotBLeaseId
+            ?: return RedundantStopOutcome.Pending
         return runCatching {
-            val connection = stopTransport(
-                credential(transaction.template.deviceId),
-                transaction,
-                leaseId,
-            ).getJSONObject("connection")
-            // HTTP 200/APPLIED only accepts the Stop. A released primary may
-            // still belong to a session whose standby cleanup is in progress.
-            connection.getString("lease_id") == leaseId &&
-                (connection.getString("status") in setOf("released", "failed") ||
-                    (transaction.retainActivePeerOnStop && connection.getString("status") == "warm")) &&
-                connection.has("session_id") && connection.isNull("session_id")
-        }.getOrDefault(false)
+            val auth = credential(transaction.template.deviceId)
+            val reply = stopTransport(auth, transaction, leaseId)
+            val accepted = reply.optJSONObject("stop_acceptance")
+            if (accepted != null) {
+                require(transaction.asyncStopSupported && transaction.backgroundCleanupOnStop)
+                val acceptance = parseStopAcceptance(accepted)
+                require(acceptance.operationId == transaction.stopOperationId &&
+                    acceptance.sessionId == transaction.sessionId && acceptance.leaseId == leaseId)
+                RedundantStopOutcome.Accepted(acceptance, auth)
+            } else {
+                val connection = reply.getJSONObject("connection")
+                val completed = connection.getString("lease_id") == leaseId &&
+                    (connection.getString("status") in setOf("released", "failed") ||
+                        (transaction.retainActivePeerOnStop && connection.getString("status") == "warm")) &&
+                    connection.has("session_id") && connection.isNull("session_id")
+                if (completed) RedundantStopOutcome.Completed else RedundantStopOutcome.Pending
+            }
+        }.getOrDefault(RedundantStopOutcome.Pending)
     }
 }

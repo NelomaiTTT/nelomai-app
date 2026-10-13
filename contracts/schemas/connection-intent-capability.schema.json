@@ -10,6 +10,7 @@
     "connection_intent_recovery_v1"
   ],
   "properties": {
+    "dns46_dot": { "$ref": "common.schema.json#/$defs/dns46Dot" },
     "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
     "revision": { "type": "integer", "minimum": 1 },

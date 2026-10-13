@@ -1602,6 +1602,9 @@ class BackgroundConnectionClientTest {
             excludedPackages = arrayListOf("old.package")
             splitTunnelRoutes = arrayListOf("198.51.100.0/24")
             dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+            dns46DotHostname = "dns.nelomai.ru"
+            dns46DotEndpointIpv4s = arrayListOf("93.184.216.34")
+            dns46DotExpiresAtUnix = 4_000_000_000
         }
         val payload = JSONObject().apply {
             put("enabled", true)
@@ -1634,6 +1637,11 @@ class BackgroundConnectionClientTest {
         )
         assertFalse(options.excludeLocalNetworks)
         assertEquals(listOf("9.9.9.9", "149.112.112.112"), options.dnsServers)
+        for (policy in listOf(payload, JSONObject().put("enabled", false))) {
+            val applied = backgroundTunnelOptions(policy, emptySet(), fallback) { emptyList() }
+            assertEquals(listOf("93.184.216.34/32"), AndroidSplitTunnel.resolveOptions(34, applied,
+                "prefer_ipv6", privateDnsHostname = "dns.nelomai.ru").dns46DotRoutes.map { it.canonical })
+        }
     }
 
     @Test

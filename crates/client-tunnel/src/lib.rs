@@ -188,6 +188,7 @@ impl fmt::Debug for RedundantTunnelStandbyStart {
 #[derive(Debug)]
 pub struct RedundantTunnelStart {
     pub warm_stop_v1: bool,
+    pub async_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
     pub operation_id: String,
@@ -271,6 +272,8 @@ pub struct TunnelOptions {
     pub exclude_local_networks: bool,
     pub policy_hash: Option<String>,
     pub dns_servers: Vec<IpAddr>,
+    pub dns46_dot: Option<nelomai_contracts::Dns46DotCapability>,
+    pub dns46_dot_expires_at_unix: i64,
 }
 
 impl fmt::Debug for TunnelOptions {
@@ -628,6 +631,8 @@ mod tests {
                 "[Interface]\nPrivateKey = never-log-this\n".to_string(),
             ),
             options: TunnelOptions {
+                dns46_dot: None,
+                dns46_dot_expires_at_unix: 0,
                 application_mode: Some(SplitTunnelMode::ExcludeSelected),
                 package_ids: vec!["com.example.secret".to_string()],
                 excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
@@ -639,6 +644,7 @@ mod tests {
             quick_connection: None,
             redundancy: Some(RedundantTunnelStart {
                 warm_stop_v1: false,
+                async_stop_v1: false,
                 session_id: "session-1".to_string(),
                 state: RedundancyState::Ready,
                 operation_id: "operation-1".to_string(),
@@ -689,6 +695,8 @@ mod tests {
     #[test]
     fn tunnel_options_validate_packages_and_ipv4_cidrs() {
         let valid = TunnelOptions {
+            dns46_dot: None,
+            dns46_dot_expires_at_unix: 0,
             application_mode: Some(SplitTunnelMode::ExcludeSelected),
             package_ids: vec!["com.example.app_1".to_string()],
             excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
@@ -720,6 +728,8 @@ mod tests {
     #[test]
     fn policy_hash_does_not_change_effective_routes() {
         let first = TunnelOptions {
+            dns46_dot: None,
+            dns46_dot_expires_at_unix: 0,
             application_mode: Some(SplitTunnelMode::ExcludeSelected),
             package_ids: vec!["com.example.app".to_string()],
             excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],

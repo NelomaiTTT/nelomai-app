@@ -2,8 +2,9 @@ package ru.nelomai.tunnel
 
 import java.util.UUID
 import org.json.JSONObject
+import org.json.JSONArray
 
-internal const val ANDROID_RECOVERY_FORMAT = 2
+internal const val ANDROID_RECOVERY_FORMAT = 3
 private const val ANDROID_RECOVERY_LEGACY_FORMAT = 1
 
 internal interface EncryptedRecordBackend {
@@ -48,6 +49,9 @@ internal data class AndroidTunnelOptions(
     val splitTunnelRoutes: List<String> = emptyList(),
     val excludeLocalNetworks: Boolean = false,
     val dnsServers: List<String> = emptyList(),
+    val dns46DotHostname: String? = null,
+    val dns46DotEndpointIpv4s: List<String> = emptyList(),
+    val dns46DotExpiresAtUnix: Long = 0,
 ) {
     fun toTunnelOptionsArgs() = TunnelOptionsArgs().also { args ->
         args.splitActive = splitActive
@@ -58,6 +62,9 @@ internal data class AndroidTunnelOptions(
         args.splitTunnelRoutes = ArrayList(splitTunnelRoutes)
         args.excludeLocalNetworks = excludeLocalNetworks
         args.dnsServers = ArrayList(dnsServers)
+        args.dns46DotHostname = dns46DotHostname
+        args.dns46DotEndpointIpv4s = ArrayList(dns46DotEndpointIpv4s)
+        args.dns46DotExpiresAtUnix = dns46DotExpiresAtUnix
     }
 }
 
@@ -77,6 +84,9 @@ internal fun normalizeAndroidTunnelOptions(
         splitTunnelRoutes = effective.excludedRoutes.map { it.canonical },
         excludeLocalNetworks = effective.excludeLocalNetworks,
         dnsServers = effective.dnsServers.mapNotNull { it.hostAddress },
+        dns46DotHostname = args.dns46DotHostname,
+        dns46DotEndpointIpv4s = args.dns46DotEndpointIpv4s.toList(),
+        dns46DotExpiresAtUnix = args.dns46DotExpiresAtUnix,
     )
 }
 
@@ -217,6 +227,8 @@ internal data class AndroidRedundantTransaction(
     val candidateLeaseId: String? = null,
     val candidateSlot: RedundantSlot? = null,
     val retry: AndroidRedundantRetryState = AndroidRedundantRetryState(),
+    val asyncStopSupported: Boolean = false,
+    val backgroundCleanupOnStop: Boolean = false,
     val warmStopSupported: Boolean = false,
     val retainActivePeerOnStop: Boolean = false,
 ) {
@@ -224,11 +236,31 @@ internal data class AndroidRedundantTransaction(
         leaseId in setOf(slotALeaseId, slotBLeaseId)
 }
 
+internal data class StopAcceptance(
+    val operationId: String,
+    val sessionId: String,
+    val leaseId: String,
+    val cleanupPending: Boolean,
+)
+
+internal data class AcceptedStopCleanup(
+    val operationId: String,
+    val sessionId: String,
+    val leaseId: String,
+    val startOperationId: String,
+    val intentGeneration: Long,
+    val accountScope: String,
+    val requestFingerprint: String,
+    val acceptedAtUnix: Long,
+    val credential: BackgroundCredential,
+)
+
 internal data class AndroidRecoveryEnvelope(
     val formatVersion: Int,
     val intent: AndroidConnectionIntent,
     val leaseTransaction: AndroidLeaseTransaction?,
     val redundantTransaction: AndroidRedundantTransaction? = null,
+    val acceptedStops: List<AcceptedStopCleanup> = emptyList(),
 ) {
     companion object {
         fun empty(bootCount: Long) = AndroidRecoveryEnvelope(
@@ -257,6 +289,9 @@ internal object AndroidRecoveryEnvelopeCodec {
             put("intent", intent)
             envelope.leaseTransaction?.let { put("leaseTransaction", leaseToJson(it)) }
             envelope.redundantTransaction?.let { put("redundantTransaction", redundantToJson(it)) }
+            if (envelope.acceptedStops.isNotEmpty()) put("acceptedStops", JSONArray().apply {
+                envelope.acceptedStops.forEach { add -> put(acceptedToJson(add)) }
+            })
         }
         return payload.toString().toByteArray(Charsets.UTF_8)
     }
@@ -264,7 +299,7 @@ internal object AndroidRecoveryEnvelopeCodec {
     fun decode(plaintext: ByteArray): AndroidRecoveryEnvelope {
         val payload = JSONObject(plaintext.toString(Charsets.UTF_8))
         val formatVersion = payload.getInt("formatVersion")
-        require(formatVersion in setOf(ANDROID_RECOVERY_LEGACY_FORMAT, ANDROID_RECOVERY_FORMAT)) {
+        require(formatVersion in setOf(ANDROID_RECOVERY_LEGACY_FORMAT, 2, ANDROID_RECOVERY_FORMAT)) {
             "unsupported_recovery_format"
         }
         val intentPayload = payload.getJSONObject("intent")
@@ -294,6 +329,10 @@ internal object AndroidRecoveryEnvelopeCodec {
             intent = migratedIntent,
             leaseTransaction = transaction,
             redundantTransaction = redundantTransaction,
+            acceptedStops = payload.optJSONArray("acceptedStops")?.let { entries ->
+                require(entries.length() <= 8) { "accepted_stop_capacity_exceeded" }
+                (0 until entries.length()).map { acceptedFromJson(entries.getJSONObject(it)) }
+            } ?: emptyList(),
         ).also(::validateEnvelope)
     }
 
@@ -343,6 +382,9 @@ internal object AndroidRecoveryEnvelopeCodec {
         put("splitTunnelRoutes", org.json.JSONArray(options.splitTunnelRoutes))
         put("excludeLocalNetworks", options.excludeLocalNetworks)
         put("dnsServers", org.json.JSONArray(options.dnsServers))
+        options.dns46DotHostname?.let { put("dns46DotHostname", it) }
+        if (options.dns46DotEndpointIpv4s.isNotEmpty()) put("dns46DotEndpointIpv4s", org.json.JSONArray(options.dns46DotEndpointIpv4s))
+        if (options.dns46DotExpiresAtUnix > 0) put("dns46DotExpiresAtUnix", options.dns46DotExpiresAtUnix)
     }
 
     private fun optionsFromJson(payload: JSONObject) = AndroidTunnelOptions(
@@ -354,6 +396,9 @@ internal object AndroidRecoveryEnvelopeCodec {
         splitTunnelRoutes = payload.stringList("splitTunnelRoutes"),
         excludeLocalNetworks = payload.optBoolean("excludeLocalNetworks", false),
         dnsServers = payload.stringList("dnsServers"),
+        dns46DotHostname = payload.optionalString("dns46DotHostname"),
+        dns46DotEndpointIpv4s = payload.stringList("dns46DotEndpointIpv4s"),
+        dns46DotExpiresAtUnix = payload.optLong("dns46DotExpiresAtUnix", 0),
     )
 
     private fun retryToJson(retry: AndroidRetryState) = JSONObject().apply {
@@ -436,6 +481,8 @@ internal object AndroidRecoveryEnvelopeCodec {
     }
 
     private fun redundantToJson(transaction: AndroidRedundantTransaction) = JSONObject().apply {
+        put("asyncStopSupported", transaction.asyncStopSupported)
+        put("backgroundCleanupOnStop", transaction.backgroundCleanupOnStop)
         put("warmStopSupported", transaction.warmStopSupported)
         put("retainActivePeerOnStop", transaction.retainActivePeerOnStop)
         put("desiredActive", transaction.desiredActive)
@@ -512,6 +559,8 @@ internal object AndroidRecoveryEnvelopeCodec {
             )
         }
         return AndroidRedundantTransaction(
+            asyncStopSupported = payload.optBoolean("asyncStopSupported", false),
+            backgroundCleanupOnStop = payload.optBoolean("backgroundCleanupOnStop", false),
             warmStopSupported = payload.optBoolean("warmStopSupported", false),
             retainActivePeerOnStop = payload.optBoolean("retainActivePeerOnStop", false),
             desiredActive = payload.getBoolean("desiredActive"),
@@ -573,8 +622,38 @@ internal object AndroidRecoveryEnvelopeCodec {
         require(value.isNotBlank() && value.length <= 512 && !value.contains('\u0000'))
     }
 
+    private fun acceptedToJson(value: AcceptedStopCleanup) = JSONObject().apply {
+        put("operationId", value.operationId); put("sessionId", value.sessionId)
+        put("leaseId", value.leaseId); put("startOperationId", value.startOperationId)
+        put("intentGeneration", value.intentGeneration); put("accountScope", value.accountScope)
+        put("requestFingerprint", value.requestFingerprint); put("acceptedAtUnix", value.acceptedAtUnix)
+        put("credential", JSONObject().apply {
+            put("deviceId", value.credential.deviceId); put("panelBase", value.credential.panelBase)
+            put("token", value.credential.token); put("expiresAtUnix", value.credential.expiresAtUnix)
+            value.credential.ownerScope?.let { put("ownerScope", it.toJson()) }
+        })
+    }
+
+    private fun acceptedFromJson(value: JSONObject): AcceptedStopCleanup {
+        val auth = value.getJSONObject("credential")
+        return AcceptedStopCleanup(value.getString("operationId"), value.getString("sessionId"),
+            value.getString("leaseId"), value.getString("startOperationId"), value.getLong("intentGeneration"),
+            value.getString("accountScope"), value.getString("requestFingerprint"), value.getLong("acceptedAtUnix"),
+            BackgroundCredential(auth.getString("deviceId"), auth.getString("panelBase"), auth.getString("token"),
+                auth.getLong("expiresAtUnix"), auth.optJSONObject("ownerScope")?.let(NativeOwnerScope::fromJson)))
+    }
+
     private fun validateEnvelope(envelope: AndroidRecoveryEnvelope) {
         require(envelope.formatVersion == ANDROID_RECOVERY_FORMAT)
+        require(envelope.acceptedStops.size <= 8)
+        require(envelope.acceptedStops.map { it.operationId to it.sessionId }.distinct().size == envelope.acceptedStops.size)
+        envelope.acceptedStops.forEach { entry ->
+            listOf(entry.operationId, entry.sessionId, entry.leaseId, entry.startOperationId,
+                entry.accountScope, entry.credential.deviceId, entry.credential.panelBase,
+                entry.credential.token).forEach(::validateSafeValue)
+            require(entry.intentGeneration >= 0 && entry.acceptedAtUnix >= 0)
+            require(entry.requestFingerprint.matches(Regex("[0-9a-f]{64}")))
+        }
         require(envelope.intent.generation >= 0 && envelope.intent.bootCount >= 0)
         require(envelope.intent.diagnosticsEpisodeId >= 0)
         require(envelope.intent.retry.attempt >= 0)
@@ -908,6 +987,7 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
+        if (current.acceptedStops.size >= 8) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
         if (current.leaseTransaction != null || current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_pending")
         }
@@ -923,6 +1003,38 @@ internal class AndroidRecoveryStore(
         } catch (_: Throwable) {
             RecoveryStoreResult.Failure("redundant_recovery_invalid")
         }
+    }
+
+    fun detachAcceptedStop(
+        expectedStartOperationId: String,
+        acceptance: StopAcceptance,
+        credential: BackgroundCredential,
+        nativeClosed: Boolean,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val read = readLocked()
+        if (read is RecoveryStoreResult.Failure) return@synchronized read
+        val current = (read as RecoveryStoreResult.Success).value
+        val transaction = current.redundantTransaction
+            ?: return@synchronized RecoveryStoreResult.Failure("redundant_recovery_not_found")
+        if (!nativeClosed || transaction.desiredActive || current.intent.desiredActive ||
+            !transaction.asyncStopSupported || !transaction.backgroundCleanupOnStop ||
+            transaction.startOperationId != expectedStartOperationId ||
+            transaction.stopOperationId != acceptance.operationId || transaction.sessionId != acceptance.sessionId ||
+            acceptance.leaseId != (transaction.localActiveLeaseId ?: transaction.slotALeaseId ?: transaction.slotBLeaseId) ||
+            credential.deviceId != transaction.template.deviceId || current.acceptedStops.size >= 8
+        ) return@synchronized RecoveryStoreResult.Failure("stop_acceptance_scope_conflict")
+        val pending = AcceptedStopCleanup(acceptance.operationId, acceptance.sessionId, acceptance.leaseId,
+            transaction.startOperationId, current.intent.generation, transaction.template.accountScope,
+            backgroundRedundantStopFingerprint(transaction, acceptance.leaseId), System.currentTimeMillis() / 1000, credential)
+        persist(clearDisarmedEpisode(current).copy(redundantTransaction = null,
+            acceptedStops = current.acceptedStops + if (acceptance.cleanupPending) listOf(pending) else emptyList()))
+    }
+
+    fun completeAcceptedCleanup(expected: AcceptedStopCleanup): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val read = readLocked()
+        if (read is RecoveryStoreResult.Failure) return@synchronized read
+        val current = (read as RecoveryStoreResult.Success).value
+        persist(current.copy(acceptedStops = current.acceptedStops.filterNot { it == expected }))
     }
 
     fun completeRedundantStop(
@@ -1084,6 +1196,9 @@ internal class AndroidRecoveryStore(
             redundantTransaction = transaction.copy(
                 desiredActive = false,
                 stopOperationId = normalizedStopOperationId,
+                backgroundCleanupOnStop = if (transaction.stopOperationId == null) {
+                    retainActivePeer && transaction.asyncStopSupported
+                } else transaction.backgroundCleanupOnStop,
                 retainActivePeerOnStop = if (transaction.stopOperationId == null) {
                     retainActivePeer && transaction.warmStopSupported &&
                         transaction.retry.pendingNativeActiveLeaseId == null
@@ -1122,6 +1237,7 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
+        if (current.acceptedStops.size >= 8) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
         if (current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_recovery_v2_owned")
         }
@@ -1153,6 +1269,7 @@ internal class AndroidRecoveryStore(
                     template = normalizeTemplate(template),
                     retry = AndroidRetryState(),
                 ),
+                acceptedStops = current.acceptedStops,
                 leaseTransaction = AndroidLeaseTransaction(
                     generation = nextGeneration,
                     bootCount = bootCount,
@@ -2015,12 +2132,9 @@ internal class AndroidRecoveryStore(
         val plaintext = try {
             backend.read()
         } catch (_: EncryptedRecordCorruptException) {
-            val bootCount = bootIdentity.bootCount()
-                ?: return RecoveryStoreResult.Failure("boot_identity_unavailable")
-            return persistFailClosed(
-                AndroidRecoveryEnvelope.empty(bootCount),
-                "recovery_record_corrupt",
-            )
+            // A damaged encrypted record may still contain unfinished accepted cleanup.
+            // Preserve it and deny admission; replacing it would silently evict that work.
+            return RecoveryStoreResult.Failure("recovery_record_corrupt")
         } catch (_: Throwable) {
             return RecoveryStoreResult.Failure("recovery_record_read_failed")
         }
@@ -2035,8 +2149,7 @@ internal class AndroidRecoveryStore(
         val current = try {
             AndroidRecoveryEnvelopeCodec.decode(plaintext)
         } catch (_: Throwable) {
-            val failClosed = AndroidRecoveryEnvelope.empty(bootCount ?: 0)
-            return persistFailClosed(failClosed, "recovery_record_corrupt")
+            return RecoveryStoreResult.Failure("recovery_record_corrupt")
         } finally {
             plaintext.fill(0)
         }

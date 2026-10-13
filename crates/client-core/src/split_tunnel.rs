@@ -399,6 +399,8 @@ impl EffectiveSplitTunnelPolicy {
         }
 
         let options = TunnelOptions {
+            dns46_dot: None,
+            dns46_dot_expires_at_unix: 0,
             application_mode,
             package_ids,
             excluded_ipv4_cidrs,

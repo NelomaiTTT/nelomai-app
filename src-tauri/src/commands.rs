@@ -5897,6 +5897,7 @@ mod tests {
         };
         let desired = android_background_capability_snapshot(
             Some(&ConnectionIntentCapability {
+                dns46_dot: None,
                 revision: 10,
                 expires_at: "1970-01-01T00:05:00Z".to_string(),
                 connection_intent_recovery_v1: true,
@@ -5913,6 +5914,7 @@ mod tests {
     #[test]
     fn capability_expiring_now_is_disabled_for_android_provisioning() {
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 7,
             expires_at: "1970-01-01T00:02:30Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -5928,6 +5930,7 @@ mod tests {
     #[test]
     fn malformed_capability_expiry_is_disabled_for_android_provisioning() {
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 8,
             expires_at: "not-a-timestamp".to_string(),
             connection_intent_recovery_v1: true,
@@ -5943,6 +5946,7 @@ mod tests {
     #[test]
     fn invalid_capability_revision_uses_the_disabled_android_sentinel() {
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: -1,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -6027,11 +6031,13 @@ mod tests {
         for capability in [
             None,
             Some(ConnectionIntentCapability {
+                dns46_dot: None,
                 revision: 7,
                 expires_at: "2099-01-01T00:00:00Z".to_string(),
                 connection_intent_recovery_v1: false,
             }),
             Some(ConnectionIntentCapability {
+                dns46_dot: None,
                 revision: 8,
                 expires_at: "1970-01-01T00:01:40Z".to_string(),
                 connection_intent_recovery_v1: true,
@@ -6084,6 +6090,7 @@ mod tests {
     #[test]
     fn android_reserve_preference_selects_v2_only_for_a_new_supported_session() {
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 1,
             expires_at: "2030-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -6126,6 +6133,7 @@ mod tests {
         let service_observer = Arc::clone(&service_calls);
         let legacy_observer = Arc::clone(&legacy_calls);
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 9,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -6165,6 +6173,7 @@ mod tests {
         let service_observer = Arc::clone(&service_calls);
         let legacy_observer = Arc::clone(&legacy_calls);
         let disabled = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 10,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: false,
@@ -6202,6 +6211,7 @@ mod tests {
         let legacy_calls = Arc::new(AtomicUsize::new(0));
         let legacy_observer = Arc::clone(&legacy_calls);
         let capability = ConnectionIntentCapability {
+            dns46_dot: None,
             revision: 11,
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             connection_intent_recovery_v1: true,

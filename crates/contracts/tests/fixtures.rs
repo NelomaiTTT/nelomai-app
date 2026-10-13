@@ -347,6 +347,7 @@ fn connection_intent_error_policy_is_complete_and_unambiguous() {
 #[test]
 fn connection_intent_capability_requires_a_present_enabled_unexpired_snapshot() {
     let capability = ConnectionIntentCapability {
+        dns46_dot: None,
         revision: 1,
         expires_at: "2026-08-28T18:05:00Z".to_string(),
         connection_intent_recovery_v1: true,
@@ -362,6 +363,7 @@ fn connection_intent_capability_requires_a_present_enabled_unexpired_snapshot() 
     assert!(!allows_new_connection_intent_operation(None, 0));
 
     let disabled = ConnectionIntentCapability {
+        dns46_dot: None,
         connection_intent_recovery_v1: false,
         ..capability
     };
@@ -369,6 +371,7 @@ fn connection_intent_capability_requires_a_present_enabled_unexpired_snapshot() 
 
     for revision in [0, -1] {
         let invalid = ConnectionIntentCapability {
+            dns46_dot: None,
             revision,
             expires_at: "2026-08-28T18:05:00Z".to_string(),
             connection_intent_recovery_v1: true,
@@ -712,4 +715,108 @@ fn split_tunnel_debug_omits_packages_names_and_cidrs() {
     assert!(settings_debug.contains("selected_packages_count"));
     assert!(!settings_debug.contains("com.private.application"));
     assert!(!settings_debug.contains("Private App"));
+}
+
+#[test]
+fn async_stop_opt_in_is_preserved_and_false_is_legacy_wire() {
+    let raw = fixture("valid/connection-redundant-stop.json");
+    let mut value: Value = serde_json::from_str(&raw).unwrap();
+    let legacy: RedundantStopRequest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(legacy).unwrap(), value);
+    value["background_cleanup"] = Value::Bool(true);
+    value["retain_active_peer"] = Value::Bool(true);
+    let request: RedundantStopRequest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+    assert!(schema_is_valid("connection-redundancy.schema.json", &value));
+}
+
+#[test]
+fn acceptance_is_typed_and_bound_to_the_requested_session() {
+    let request: RedundantStopRequest =
+        serde_json::from_str(&fixture("valid/connection-redundant-stop-async.json")).unwrap();
+    check::<RedundantStopRequest>(
+        "valid/connection-redundant-stop-async.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<ConnectionOperationResponse>(
+        "valid/connection-operation-accepted.json",
+        "connection-operation.schema.json",
+    );
+    check::<OperationReconcileResponse>(
+        "valid/connection-operation-reconcile-accepted.json",
+        "connection-operation-reconcile.schema.json",
+    );
+    let response: ConnectionOperationResponse =
+        serde_json::from_str(&fixture("valid/connection-operation-accepted.json")).unwrap();
+    assert!(response.stop_acceptance.unwrap().matches_request(&request));
+    for name in ["missing-session", "wrong-bool"] {
+        let raw = fixture(&format!(
+            "invalid/connection-operation-accepted-{name}.json"
+        ));
+        assert!(serde_json::from_str::<ConnectionOperationResponse>(&raw).is_err());
+        assert!(!schema_is_valid(
+            "connection-operation.schema.json",
+            &serde_json::from_str(&raw).unwrap()
+        ));
+    }
+    let wrong: ConnectionOperationResponse = serde_json::from_str(&fixture(
+        "invalid/connection-operation-accepted-changed-scope.json",
+    ))
+    .unwrap();
+    assert!(!wrong.stop_acceptance.unwrap().matches_request(&request));
+}
+
+#[test]
+fn async_stop_fingerprint_agrees_with_server_and_android_fixture() {
+    let value: Value =
+        serde_json::from_str(&fixture("valid/connection-redundant-stop-fingerprint.json")).unwrap();
+    let request: RedundantStopRequest = serde_json::from_value(value["request"].clone()).unwrap();
+    assert_eq!(request.request_fingerprint(), value["request_fingerprint"]);
+}
+
+#[test]
+fn dot_capability_survives_typed_contract_roundtrip() {
+    let mut value: Value = serde_json::from_str(&fixture("valid/bootstrap.json")).unwrap();
+    value["capabilities"] = serde_json::json!({"revision":1,"expires_at":"2099-01-01T00:00:00Z",
+        "connection_intent_recovery_v1":true,"dns46_dot":{"ready":true,"hostname":"dns.nelomai.ru",
+        "endpoint_ipv4s":["93.184.216.34"]}});
+    let typed: Bootstrap = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(typed).unwrap()["capabilities"]["dns46_dot"],
+        value["capabilities"]["dns46_dot"]
+    );
+}
+
+#[test]
+fn dot_ready_fixtures_and_invalid_metadata_agree_with_schema() {
+    check::<Bootstrap>("valid/bootstrap-dot-ready.json", "bootstrap.schema.json");
+    check::<ConnectionIntentCapabilityResponse>(
+        "valid/connection-intent-capability-dot-ready.json",
+        "connection-intent-capability.schema.json",
+    );
+    for name in [
+        "private",
+        "multicast",
+        "ipv6",
+        "duplicate",
+        "unready",
+        "hostname",
+        "literal-hostname",
+        "wrong-bool",
+    ] {
+        let raw = fixture(&format!(
+            "invalid/connection-intent-capability-dot-{name}.json"
+        ));
+        assert!(
+            serde_json::from_str::<ConnectionIntentCapabilityResponse>(&raw).is_err(),
+            "{name}"
+        );
+        assert!(
+            !schema_is_valid(
+                "connection-intent-capability.schema.json",
+                &serde_json::from_str(&raw).unwrap()
+            ),
+            "{name}"
+        );
+    }
 }

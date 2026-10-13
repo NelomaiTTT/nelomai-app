@@ -6,6 +6,9 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import uuid
+import hashlib
+import ipaddress
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -170,6 +173,71 @@ def load(path: Path) -> dict:
     return value
 
 
+def validate_stop_acceptance(reply: dict, request: dict) -> None:
+    value = reply["stop_acceptance"]
+    assert value["accepted"] is True
+    assert type(value["cleanup_pending"]) is bool
+    for field in ("operation_id", "session_id", "lease_id"):
+        assert str(uuid.UUID(value[field])) == value[field]
+        assert value[field] == request[field]
+    assert request["background_cleanup"] is True
+
+
+def validate_async_stop(fixtures: dict) -> None:
+    request = fixtures["connection-redundant-stop-async"]
+    assert type(request["background_cleanup"]) is bool
+    assert type(request["retain_active_peer"]) is bool
+    assert request["recovery_contract_version"] == 2
+    fingerprint = fixtures["connection-redundant-stop-fingerprint"]
+    canonical = {key: value for key, value in fingerprint["request"].items() if key != "recovery_contract_version"}
+    canonical["kind"] = "redundant_stop"
+    assert hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == fingerprint["request_fingerprint"]
+    for name in ("connection-operation-accepted", "connection-operation-reconcile-accepted"):
+        validate_stop_acceptance(fixtures[name], request)
+    for name in ("missing-session", "wrong-bool", "changed-scope"):
+        try:
+            validate_stop_acceptance(load(INVALID / f"connection-operation-accepted-{name}.json"), request)
+        except (AssertionError, KeyError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"invalid acceptance accepted: {name}")
+
+
+def validate_dot_metadata(value: dict) -> None:
+    dot = value["dns46_dot"]
+    assert dot["ready"] is True
+    hostname = dot["hostname"]
+    assert isinstance(hostname, str) and len(hostname) <= 253
+    assert re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", hostname)
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("DoT hostname must not be an IP literal")
+    endpoints = dot["endpoint_ipv4s"]
+    assert isinstance(endpoints, list) and 1 <= len(endpoints) <= 16
+    assert len(set(endpoints)) == len(endpoints)
+    for endpoint in endpoints:
+        ip = ipaddress.IPv4Address(endpoint)
+        assert str(ip) == endpoint and ip.is_global and not ip.is_multicast
+
+
+def validate_dot_fixtures() -> None:
+    ready = assert_canonical(VALID / "connection-intent-capability-dot-ready.json")
+    bootstrap = assert_canonical(VALID / "bootstrap-dot-ready.json")
+    validate_dot_metadata(ready)
+    validate_dot_metadata(bootstrap["capabilities"])
+    assert ready["dns46_dot"] == bootstrap["capabilities"]["dns46_dot"]
+    for path in sorted(INVALID.glob("connection-intent-capability-dot-*.json")):
+        value = assert_canonical(path)
+        try:
+            validate_dot_metadata(value)
+        except (AssertionError, ValueError):
+            continue
+        raise AssertionError(f"Invalid DoT metadata accepted: {path.name}")
+
+
 def main() -> None:
     fixtures = {path.stem: load(path) for path in sorted(VALID.glob("*.json"))}
     assert fixtures["bootstrap"]["api_version"] == "1"
@@ -197,6 +265,8 @@ def main() -> None:
 
     unsafe_error = load(INVALID / "error-with-config.json")
     assert set(unsafe_error) - SAFE_ERROR_KEYS
+    validate_async_stop(fixtures)
+    validate_dot_fixtures()
     validate_runtime_fixtures()
     print(f"validated {len(fixtures)} shared client contract fixtures")
 

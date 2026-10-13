@@ -6365,6 +6365,7 @@ impl CoreApi for CoordinatorApi {
             return Err(CoreApiError::Retryable);
         }
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "stop".to_string(),
             connection: Connection {

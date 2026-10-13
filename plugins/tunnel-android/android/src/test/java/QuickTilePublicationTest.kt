@@ -16,6 +16,22 @@ import org.robolectric.annotation.Implements
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE, shadows = [TileRefreshRecorder::class])
 class QuickTilePublicationTest {
+    @Test fun coldTilePlanRetainsDotRoutesWhenDns53PreferenceChanges() {
+        val backend = QuickPlanMemoryBackend()
+        val storage = QuickTunnelPlanStorage(backend)
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            dns46DotHostname = "dns.nelomai.ru"
+            dns46DotEndpointIpv4s = arrayListOf("93.184.216.34")
+            dns46DotExpiresAtUnix = 4_000_000_000
+        }, quickConnection(true).apply { egressMode = "prefer_ipv6" }))
+        assertTrue(storage.updateDnsServers(listOf("9.9.9.9")))
+        val restored = requireNotNull(QuickTunnelPlanStorage(backend).loadTemplate())
+        assertEquals(listOf("93.184.216.34/32"), AndroidSplitTunnel.resolveOptions(34,
+            restored.options, restored.connection.egressMode, privateDnsHostname = "dns.nelomai.ru")
+            .dns46DotRoutes.map { it.canonical })
+        assertEquals(listOf("9.9.9.9"), restored.options.dnsServers)
+    }
+
     @Test fun explicitUiStartCanDisableSplitWithoutRestoringAnOldPolicy() {
         val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
         storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs().apply {

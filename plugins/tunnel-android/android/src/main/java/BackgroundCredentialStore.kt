@@ -31,6 +31,7 @@ internal data class BackgroundCapabilitySnapshot(
     val enabled: Boolean,
     val expiresAtUnix: Long,
     val reserveEnabled: Boolean = false,
+    val dns46Dot: Dns46DotMetadata? = null,
 )
 
 internal fun conservativeBackgroundCapability(
@@ -44,6 +45,7 @@ internal fun conservativeBackgroundCapability(
         enabled = current.enabled && proposed.enabled,
         expiresAtUnix = minOf(current.expiresAtUnix, proposed.expiresAtUnix),
         reserveEnabled = current.reserveEnabled && proposed.reserveEnabled,
+        dns46Dot = current.dns46Dot.takeIf { it == proposed.dns46Dot },
     )
 }
 
@@ -334,11 +336,13 @@ internal object BackgroundCredentialEnvelopeCodec {
     private fun capabilityToJson(value: BackgroundCapabilitySnapshot) = JSONObject().apply {
         put("revision", value.revision); put("enabled", value.enabled); put("expiresAtUnix", value.expiresAtUnix)
         put("reserveEnabled", value.reserveEnabled)
+        value.dns46Dot?.let { put("dns46Dot", it.toJson()) }
     }
 
     private fun capabilityFromJson(payload: JSONObject) = BackgroundCapabilitySnapshot(
         payload.getLong("revision"), payload.getBoolean("enabled"), payload.getLong("expiresAtUnix"),
         payload.optBoolean("reserveEnabled", false),
+        payload.optionalObject("dns46Dot")?.let(Dns46DotMetadata::fromJson),
     )
 
     private fun reservationToJson(value: BackgroundMutationReservation) = JSONObject().apply {

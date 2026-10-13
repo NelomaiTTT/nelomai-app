@@ -33,6 +33,7 @@
 
   import {
     bindingPreferenceUpdateRequest,
+    dns46DotHostname,
     bindingRequest,
     connectionEgressMode,
     connectionView,
@@ -1628,6 +1629,11 @@
                   : "Готово к запуску"}
             </h1>
           </div>
+
+          {#if bootstrap?.device.platform === "android" && dns46DotHostname(bootstrap.capabilities)}
+            <p class="hint">Private DNS Nelomai: <strong>{dns46DotHostname(bootstrap.capabilities)}</strong>.
+              В настройках Android откройте «Частный DNS», выберите имя хоста и укажите этот адрес.</p>
+          {/if}
 
           <button
             class:stop={connectionAction === "stop" && !localStopPendingCleanup}
