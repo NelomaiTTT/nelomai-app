@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 import yaml
+import zipfile
 
 from scripts.tests.test_runtime_artifact import ROOT, module
 
@@ -436,6 +437,37 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("inputs.android-fixtures == 'true'", ndk["if"])
         self.assertIn("ndk;28.2.13676358", ndk["run"])
         self.assertIn("ANDROID_NDK_HOME=", ndk["run"])
+
+        runtime = (ROOT / "scripts/windows/prepare-runtime.ps1").read_text()
+        replacement = re.search(
+            r"\$amneziaBuildText\.Replace\(\s*\$amneziaArchiveExtractor,\s*'([^']+)'\s*\)", runtime)
+        self.assertIsNotNone(replacement, "pinned Amnezia ZIP extraction still uses system tar")
+        self.assertIn("[regex]::Matches($amneziaBuildText, [regex]::Escape($amneziaArchiveExtractor)).Count -ne 1", runtime)
+        self.assertIn("$amneziaArchiveExtractor = 'tar -xf %1 %~4 || exit /b 1'", runtime)
+        command, failure = replacement.group(1).split(" || ")
+        self.assertEqual(failure, "exit /b 1")
+        arguments = shlex.split(command)
+        self.assertEqual(arguments, ["python", "-m", "zipfile", "-e", "%1", "."])
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            archive = directory / "go.zip"
+            output = directory / "extracted"
+            output.mkdir()
+            paths = ("go/test/fixedbugs/issue27836.dir/Äfoo.go", "go/test/fixedbugs/issue27836.dir/Äfoo_test.go")
+            with zipfile.ZipFile(archive, "w") as zipped:
+                for path in paths:
+                    zipped.writestr(path, path.encode("utf-8"))
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            result = subprocess.run([sys.executable, *[str(archive) if value == "%1" else value for value in arguments[1:]]],
+                                    cwd=output, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(), digest)
+            for path in paths:
+                self.assertEqual((output / path).read_bytes(), path.encode("utf-8"))
+            archive.write_bytes(b"not a ZIP archive")
+            result = subprocess.run([sys.executable, *[str(archive) if value == "%1" else value for value in arguments[1:]]],
+                                    cwd=output, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
 
     def workflow(self):
         return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())

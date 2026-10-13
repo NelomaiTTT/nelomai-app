@@ -78,6 +78,16 @@ $amneziaBuildText = $amneziaBuildText.Replace(
 if ($amneziaBuildText -eq $amneziaBuildOriginal) {
     throw "Pinned AmneziaWG build script no longer contains the expected Go toolchain"
 }
+# The pinned callers download ZIPs without optional tar extraction arguments.
+# Python handles the Go archive's UTF-8 paths independently of the system locale.
+$amneziaArchiveExtractor = 'tar -xf %1 %~4 || exit /b 1'
+if ([regex]::Matches($amneziaBuildText, [regex]::Escape($amneziaArchiveExtractor)).Count -ne 1) {
+    throw "Pinned AmneziaWG build script no longer contains the expected ZIP extractor"
+}
+$amneziaBuildText = $amneziaBuildText.Replace(
+    $amneziaArchiveExtractor,
+    'python -m zipfile -e %1 . || exit /b 1'
+)
 Set-Content -LiteralPath $amneziaBuild -Value $amneziaBuildText -Encoding ASCII
 $amneziaPathSource = Join-Path $amneziaSource "conf/path_windows.go"
 $amneziaPathText = Get-Content -LiteralPath $amneziaPathSource -Raw
