@@ -190,6 +190,22 @@ fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
         .unwrap();
         assert_eq!(after["stopped"], true);
         assert!(after["process"].is_null() && after["interface"].is_null());
+        let repeat_at = Instant::now();
+        let repeated = actor.redundant(Command::Stop { scope });
+        let repeat_elapsed = repeat_at.elapsed();
+        eprintln!("worker cold publication unwind={unwind} repeated Stop={repeated:?} elapsed={repeat_elapsed:?}");
+        assert!(repeat_elapsed <= Duration::from_secs(7));
+        let repeated = repeated.expect("same original completed scope accepts repeated Stop");
+        assert_eq!(repeated.session, stopped.session);
+        assert!(!repeated.cleanup_pending);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap()
+            )
+            .unwrap(),
+            after,
+            "repeated Stop rewrote terminal Worker state"
+        );
     }
     assert!(pending.is_empty(), "same retained cold owner cannot terminalize lost Worker publication ACK: unwind={pending:?}");
 }

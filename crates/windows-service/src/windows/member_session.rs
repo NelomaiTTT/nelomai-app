@@ -1612,6 +1612,7 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
         &mut self,
         scope: &SessionScope,
         original: &super::member_worker::Completion,
+        acknowledged_session: &SessionSnapshot,
     ) -> io::Result<()> {
         original.verify(scope)?;
         let expected = original.bytes()?;
@@ -1627,16 +1628,19 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
                 return Err(failed());
             }
             let (raw, mut index) = load_index(files)?;
+            let (_, saved) = load_record(files, &index, &identity, RecordKind::Session)?;
+            let session: SessionSnapshot =
+                decode(scope, saved.as_ref().ok_or_else(failed)?.data.as_bytes())?;
+            if &session != acknowledged_session
+                || session.phase
+                    != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+            {
+                return Err(failed());
+            }
             if already_completed(files, &index, &identity)? {
                 return Ok(());
             }
             require_active(&index, &identity)?;
-            let (_, saved) = load_record(files, &index, &identity, RecordKind::Session)?;
-            let session: SessionSnapshot =
-                decode(scope, saved.as_ref().ok_or_else(failed)?.data.as_bytes())?;
-            if session.phase != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped {
-                return Err(failed());
-            }
             for kind in RecordKind::OWNED {
                 if kind != RecordKind::Session
                     && load_record(files, &index, &identity, kind)?.1.is_some()

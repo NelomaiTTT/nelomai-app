@@ -550,6 +550,9 @@ pub(crate) struct Store {
     session: Rc<RefCell<Option<WindowsSessionStore<NativeSessionFiles>>>>,
     files: Rc<RefCell<NativeSessionFiles>>,
     completed: Rc<RefCell<Option<Rc<Completion>>>>,
+    // Only the SAME store's positive terminal Session CAS ACK sets this.
+    // Disk DATA can never create it, including after a lost publication ACK.
+    terminal_session: Option<SessionSnapshot>,
 }
 impl SessionStore for Store {
     fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
@@ -557,14 +560,21 @@ impl SessionStore for Store {
             let completion = self.completed.borrow().clone().ok_or_else(failed)?;
             completion.verify(&snapshot.scope)?;
             self.ensure_session(&snapshot.scope)?;
-            self.session
-                .borrow_mut()
-                .as_mut()
-                .ok_or_else(failed)?
-                .save(snapshot)?;
+            if let Some(acknowledged) = &self.terminal_session {
+                if acknowledged != snapshot {
+                    return Err(failed());
+                }
+            } else {
+                self.session
+                    .borrow_mut()
+                    .as_mut()
+                    .ok_or_else(failed)?
+                    .save(snapshot)?;
+                self.terminal_session = Some(snapshot.clone());
+            }
             self.files
                 .borrow_mut()
-                .complete_worker(&snapshot.scope, &completion)
+                .complete_worker(&snapshot.scope, &completion, snapshot)
         } else {
             // Failed cold preparation may never have opened the Session store.
             // Cleanup still requires the exact active protected scope; this
@@ -764,6 +774,7 @@ pub(crate) fn prepare(
             session,
             files,
             completed,
+            terminal_session: None,
         },
     ))
 }
