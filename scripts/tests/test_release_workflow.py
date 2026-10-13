@@ -211,7 +211,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 4", "None => cases.len()"))
 
-    def expression(self, expression, *, mode, result="success", cancelled=False):
+    def expression(self, expression, *, mode, result="success", cancelled=False, context=None):
         """Evaluate the boolean/string expressions used by our dispatch graph."""
         expression = expression.removeprefix("${{").removesuffix("}}").strip()
         expression = expression.replace("&&", " and ").replace("||", " or ")
@@ -228,6 +228,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 "NELOMAI_MACOS_SIGNING_P12_BASE64", "NELOMAI_MACOS_SIGNING_P12_PASSWORD",
                 "ANDROID_KEY_ALIAS", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD")}),
             "always": lambda: True, "cancelled": lambda: cancelled,
+            "fromJSON": json.loads, "toJSON": json.dumps, **(context or {}),
         })
 
     def test_build_and_publish_uses_existing_signed_candidate_pipeline(self):
@@ -491,6 +492,35 @@ class ReleaseWorkflowTest(unittest.TestCase):
         package_windows = next(row for row in jobs["native_packages"]["strategy"]["matrix"]["include"]
                                if row["platform"] == "windows")
         self.assertEqual(package_windows["runner"], "windows-2022")
+        # Only an exact-source Windows candidate on the owner branch uses the PC.
+        for name in ("native_drafts", "native_packages"):
+            for row in jobs[name]["strategy"]["matrix"]["include"]:
+                for mode in ("build_only", "sign_candidate", "build_and_publish", "publish_approved_candidate"):
+                    for event, ref, sha in (
+                        ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
+                        ("push", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
+                        ("pull_request", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
+                        ("pull_request_target", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
+                        ("workflow_dispatch", "refs/heads/main", "a" * 40),
+                        ("workflow_dispatch", "refs/heads/Future/another-branch", "a" * 40),
+                        ("workflow_dispatch", "refs/tags/0.4.0", "a" * 40),
+                        ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "b" * 40),
+                    ):
+                        with self.subTest(job=name, platform=row["platform"], mode=mode, event=event, ref=ref, sha=sha):
+                            selected = self.expression(jobs[name]["runs-on"], mode=mode, context={
+                                "inputs": SimpleNamespace(mode=mode, source_sha="a" * 40),
+                                "github": SimpleNamespace(event_name=event, ref=ref, sha=sha),
+                                "matrix": SimpleNamespace(**row),
+                            })
+                            expected = ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"] if (
+                                row["platform"] == "windows" and mode == "sign_candidate"
+                                and event == "workflow_dispatch"
+                                and ref == "refs/heads/Future/windows-hot-standby-0.4.0" and sha == "a" * 40
+                            ) else row["runner"]
+                            self.assertEqual(selected, expected)
+        self.assertEqual(jobs["sign"]["runs-on"], "ubuntu-22.04")
+        self.assertEqual(jobs["finalize"]["runs-on"], "ubuntu-22.04")
+        self.assertEqual(jobs["macos_common_sign"]["runs-on"], "macos-14")
         self.assertEqual(jobs["sign"]["environment"], "release-candidate-signing")
         self.assertEqual(jobs["finalize"]["environment"], "release-candidate-finalization")
         for name in ("native_drafts", "native_packages"):

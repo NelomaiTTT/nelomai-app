@@ -133,7 +133,7 @@ jobs:
             architecture: "aarch64"
             runner: "ubuntu-22.04"
             rust_target: "aarch64-linux-android"
-    runs-on: "${{ matrix.runner }}"
+    runs-on: "${{ fromJSON(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' && github.sha == inputs.source_sha && inputs.mode == 'sign_candidate' && matrix.platform == 'windows' && '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON(matrix.runner)) }}"
     env:
       PLATFORM: "${{ matrix.platform }}"
       ARCHITECTURE: "${{ matrix.architecture }}"
@@ -262,7 +262,7 @@ jobs:
             architecture: "aarch64"
             runner: "ubuntu-22.04"
             rust_target: "aarch64-linux-android"
-    runs-on: "${{ matrix.runner }}"
+    runs-on: "${{ fromJSON(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' && github.sha == inputs.source_sha && inputs.mode == 'sign_candidate' && matrix.platform == 'windows' && '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON(matrix.runner)) }}"
     env:
       ROOT_SHA256: "${{ needs.sign.outputs.root_sha256 }}"
       PLATFORM: "${{ matrix.platform }}"
