@@ -518,6 +518,34 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                 and ref == "refs/heads/Future/windows-hot-standby-0.4.0" and sha == "a" * 40
                             ) else row["runner"]
                             self.assertEqual(selected, expected)
+        for name, script, expected in (
+            ("native_drafts", "scripts/build-release-platform.py", [
+                "--mode", "$RELEASE_MODE", "--source-sha", "$SOURCE_SHA", "--platform", "$PLATFORM",
+                "--architecture", "$ARCHITECTURE", "--public-key", "$RUNNER_TEMP/runtime-public.raw",
+                "--output", "$RUNNER_TEMP/draft/$PLATFORM", "--work", "$RUNNER_TEMP/native-work"]),
+            ("native_packages", "scripts/package-release-platform.py", [
+                "--mode", "$RELEASE_MODE", "--source-sha", "$SOURCE_SHA", "--release-set-sha256", "$ROOT_SHA256",
+                "--platform", "$PLATFORM", "--architecture", "$ARCHITECTURE", "--signed", "signed",
+                "--draft", "draft/$PLATFORM", "--public-key", "$RUNNER_TEMP/runtime-public.raw",
+                "--output", "packages/$PLATFORM"]),
+        ):
+            consumers = [step for step in jobs[name]["steps"] if script in step.get("run", "")]
+            for row in jobs[name]["strategy"]["matrix"]["include"]:
+                for mode in ("build_only", "sign_candidate", "build_and_publish", "publish_approved_candidate"):
+                    with self.subTest(job=name, platform=row["platform"], mode=mode):
+                        selected = [step for step in consumers if self.expression(
+                            step.get("if", "True"), mode=mode, context={"matrix": SimpleNamespace(**row)})]
+                        self.assertEqual(len(selected), 1, "exactly one native phase must run")
+                        step = selected[0]
+                        self.assertEqual(step.get("shell", workflow["defaults"]["run"]["shell"]),
+                                         "pwsh" if row["platform"] == "windows" else "bash")
+                        command = next(line for line in step["run"].replace("\\\n", " ").replace("`\n", " ").splitlines()
+                                       if line.strip().startswith("python "))
+                        arguments = shlex.split(command)
+                        if arguments[-1] == "${extra[@]}":
+                            arguments.pop()
+                        self.assertEqual([value.replace("$env:", "$") for value in arguments],
+                                         ["python", script, *expected])
         self.assertEqual(jobs["sign"]["runs-on"], "ubuntu-22.04")
         self.assertEqual(jobs["finalize"]["runs-on"], "ubuntu-22.04")
         self.assertEqual(jobs["macos_common_sign"]["runs-on"], "macos-14")

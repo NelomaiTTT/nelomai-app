@@ -160,6 +160,7 @@ jobs:
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
         name: "Native final payloads; ephemeral draft signatures only"
+        if: "matrix.platform != 'windows'"
         run: |
           extra=()
           if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
@@ -167,6 +168,14 @@ jobs:
           python scripts/build-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
             --platform "$PLATFORM" --architecture "$ARCHITECTURE" --public-key "$RUNNER_TEMP/runtime-public.raw" \
             --output "$RUNNER_TEMP/draft/$PLATFORM" --work "$RUNNER_TEMP/native-work" "${extra[@]}"
+      -
+        name: "Windows native final payloads; ephemeral draft signatures only"
+        if: "matrix.platform == 'windows'"
+        shell: "pwsh"
+        run: |
+          python scripts/build-release-platform.py --mode "$env:RELEASE_MODE" --source-sha "$env:SOURCE_SHA" `
+            --platform "$env:PLATFORM" --architecture "$env:ARCHITECTURE" --public-key "$env:RUNNER_TEMP/runtime-public.raw" `
+            --output "$env:RUNNER_TEMP/draft/$env:PLATFORM" --work "$env:RUNNER_TEMP/native-work"
       -
         uses: "actions/upload-artifact@v4"
         with:
@@ -301,6 +310,7 @@ jobs:
           path: "draft"
       -
         name: "Keyless native packaging and exact re-extraction"
+        if: "matrix.platform != 'windows'"
         run: |
           extra=()
           if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
@@ -308,6 +318,15 @@ jobs:
             --release-set-sha256 "$ROOT_SHA256" --platform "$PLATFORM" --architecture "$ARCHITECTURE" \
             --signed signed --draft "draft/$PLATFORM" --public-key "$RUNNER_TEMP/runtime-public.raw" \
             --output "packages/$PLATFORM" "${extra[@]}"
+      -
+        name: "Windows keyless native packaging and exact re-extraction"
+        if: "matrix.platform == 'windows'"
+        shell: "pwsh"
+        run: |
+          python scripts/package-release-platform.py --mode "$env:RELEASE_MODE" --source-sha "$env:SOURCE_SHA" `
+            --release-set-sha256 "$env:ROOT_SHA256" --platform "$env:PLATFORM" --architecture "$env:ARCHITECTURE" `
+            --signed signed --draft "draft/$env:PLATFORM" --public-key "$env:RUNNER_TEMP/runtime-public.raw" `
+            --output "packages/$env:PLATFORM"
       -
         uses: "actions/upload-artifact@v4"
         with:
