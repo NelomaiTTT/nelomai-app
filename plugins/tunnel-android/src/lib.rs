@@ -242,7 +242,18 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
             .tunnel_android()
             .apply_owned_redundant_policy_async(owned_redundant_policy_request(request)?)
             .await
-            .map_err(to_tunnel_error)?;
+            .map_err(|error| {
+                #[cfg(mobile)]
+                if let Some(code) = error.rejection_code().filter(|code| {
+                    matches!(
+                        *code,
+                        "redundant_policy_busy" | "tunnel_operation_in_progress"
+                    )
+                }) {
+                    return TunnelError::Backend(code.into());
+                }
+                to_tunnel_error(error)
+            })?;
         Ok(response.outcome)
     }
 

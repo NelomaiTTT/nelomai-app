@@ -453,6 +453,7 @@ export function commandMessage(
       return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Принудительная синхронизация».";
     case "split_tunnel_local_only":
     case "split_tunnel_policy_deferred":
+    case "split_tunnel_apply_busy":
       return splitTunnelWarningMessage(code);
     case "split_tunnel_state_save_failed":
       return "VPN продолжает работать, но новые настройки могут не сохраниться после перезапуска. Попробуйте сохранить их ещё раз.";

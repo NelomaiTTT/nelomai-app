@@ -354,15 +354,37 @@ internal class RedundantConnectionCoordinator(
         val template = expected.template
         if (!envelope.intent.desiredActive || envelope.intent.template == null || envelope.leaseTransaction != null ||
             !expected.desiredActive || expected.stopOperationId != null ||
-            expected.retry != AndroidRedundantRetryState() || expected.candidateLeaseId != null ||
-            standbyWorkPending || candidateWarmupLeaseId != null || pendingPrimaryReadiness != null ||
+            expected.retry.stopState != RedundantStopState.NONE || pendingPrimaryReadiness != null ||
             totalLossCommandEmitted || !recoveryStarted || scope.allowAlternate ||
             scope.sessionId != expected.sessionId || !expected.containsCurrentLease(scope.leaseId) ||
             scope.layer != template.layer || scope.ticConnectionMode != template.ticConnectionMode ||
             scope.routeMode != template.routeMode || scope.egressMode != template.egressMode ||
-            listOfNotNull(expected.slotALeaseId, expected.slotBLeaseId).any { !native.isUsable(it) } ||
             shouldCancel()
         ) throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+        val retry = expected.retry
+        // Scheduled repair/role reporting is not a native mutation. Keep it intact
+        // in the exact durable snapshot used by replacement and rollback below.
+        val passiveRetry = retry.copy(nextRetryAtUnix = null, roleObservationPending = false,
+            pendingRoleLeaseId = null, pendingRoleReason = null, acquirePending = false,
+            acquireOperationId = null, acquireReplaceLeaseId = null)
+        val acquireScopeValid = !retry.acquirePending || (retry.acquireOperationId != null &&
+            (retry.acquireReplaceLeaseId?.let {
+                expected.containsCurrentLease(it) && it != expected.localActiveLeaseId
+            } ?: (expected.slotALeaseId == null || expected.slotBLeaseId == null)))
+        val candidate = expected.candidateLeaseId
+        val sameCurrentWarmup = candidate != null && retry.acquirePending &&
+            candidate == retry.acquireReplaceLeaseId && expected.containsCurrentLease(candidate) &&
+            candidate != expected.localActiveLeaseId && expected.slot(candidate) == expected.candidateSlot &&
+            candidateWarmupLeaseId == candidate
+        if (standbyWorkPending || passiveRetry != AndroidRedundantRetryState() || !acquireScopeValid ||
+            (retry.roleObservationPending && (retry.pendingRoleLeaseId != expected.localActiveLeaseId ||
+                retry.pendingRoleReason == null)) ||
+            (candidate != null && !sameCurrentWarmup) ||
+            (candidateWarmupLeaseId != null && !sameCurrentWarmup)
+        ) throw BackgroundConnectionException("redundant_policy_busy")
+        if (listOfNotNull(expected.slotALeaseId, expected.slotBLeaseId).any { !native.isUsable(it) }) {
+            throw BackgroundConnectionException("redundant_policy_preflight_rejected")
+        }
         fun cancelled(): Boolean = shouldCancel() ||
             !mutationFence.runIfActive(expected.startOperationId) { true } ||
             (store.read() as? RecoveryStoreResult.Success)?.value != envelope

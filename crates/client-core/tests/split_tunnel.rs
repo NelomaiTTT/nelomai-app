@@ -998,6 +998,236 @@ async fn native_owned_pair_admission_error_preserves_live_transport() {
 }
 
 #[tokio::test]
+async fn native_owned_pair_busy_keeps_cached_policy_without_hour_penalty_or_false_apply_report() {
+    let (fixture, running) = native_owned_policy_fixture(Layer::Stray).await;
+    let old_hash = fixture.split_store.load().unwrap().working_policy_hash;
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 9;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.exclude_local_networks = false;
+    fixture.api.set_policy(changed.clone());
+    fixture
+        .api
+        .set_revision(changed.revision, changed.force_revision);
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err("redundant_policy_busy"));
+
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+
+    let stored = fixture.split_store.load().unwrap();
+    assert_eq!(stored.working_policy_hash, None);
+    assert_eq!(
+        stored.previous_working_policy.map(|p| p.policy_hash),
+        old_hash
+    );
+    assert_eq!(
+        stored.cached_policy.unwrap().policy_hash,
+        changed.policy_hash
+    );
+    assert_eq!(stored.failed_policy_hash, None);
+    assert_eq!(stored.failed_policy_retry_after_unix, None);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_apply_busy")
+    );
+    assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.core.state().await.connection, Some(running.clone()));
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+
+    // Existing revision polling, not a new timer/queue, retries once the owner is free.
+    fixture
+        .core
+        .synchronize_split_tunnel(1_401, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.tunnel.owned_policy_requests.lock().unwrap().len(),
+        2
+    );
+    assert_eq!(
+        fixture.split_store.load().unwrap().working_policy_hash,
+        Some(changed.policy_hash)
+    );
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Applied
+    );
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+}
+
+#[tokio::test]
+async fn native_owned_pair_busy_reply_cannot_claim_a_stopped_transport_is_connected() {
+    for status in [TunnelStatus::Stopped, TunnelStatus::Failed] {
+        let (fixture, _) = native_owned_policy_fixture(Layer::Stray).await;
+        *fixture.tunnel.status.lock().unwrap() = status;
+        fixture
+            .tunnel
+            .owned_policy_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err("redundant_policy_busy"));
+        fixture
+            .core
+            .synchronize_split_tunnel(1_100, true)
+            .await
+            .unwrap();
+        assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_apply_busy")
+        );
+        assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+        assert_eq!(fixture.split_store.load().unwrap().failed_policy_hash, None);
+    }
+}
+
+#[tokio::test]
+async fn native_owned_pair_busy_with_matching_hash_remains_pending_for_existing_poll() {
+    for code in ["redundant_policy_busy", "tunnel_operation_in_progress"] {
+        let (fixture, running) = native_owned_policy_fixture(Layer::Stray).await;
+        let initial = fixture.split_store.load().unwrap().cached_policy.unwrap();
+        fixture
+            .tunnel
+            .owned_policy_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(code));
+        fixture
+            .core
+            .synchronize_split_tunnel(1_100, true)
+            .await
+            .unwrap();
+        let pending = fixture.split_store.load().unwrap();
+        assert_eq!(
+            pending.cached_policy.unwrap().policy_hash,
+            initial.policy_hash
+        );
+        assert_eq!(pending.working_policy_hash, None);
+        assert_eq!(
+            pending.previous_working_policy.unwrap().policy_hash,
+            initial.policy_hash
+        );
+        assert_eq!(pending.failed_policy_hash, None);
+        assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+
+        fixture
+            .core
+            .synchronize_split_tunnel(1_401, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.tunnel.owned_policy_requests.lock().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(initial.policy_hash)
+        );
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+    }
+}
+
+#[tokio::test]
+async fn native_owned_pair_busy_status_rpc_failure_is_not_a_failed_policy() {
+    let (fixture, _) = native_owned_policy_fixture(Layer::Stray).await;
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err("redundant_policy_busy"));
+    fixture
+        .tunnel
+        .fail_next_status
+        .store(true, Ordering::SeqCst);
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+    assert!(!fixture.tunnel.fail_next_status.load(Ordering::SeqCst));
+    let pending = fixture.split_store.load().unwrap();
+    assert_eq!(pending.failed_policy_hash, None);
+    assert_eq!(pending.failed_policy_retry_after_unix, None);
+    assert_eq!(pending.working_policy_hash, None);
+    assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_apply_busy")
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+}
+
+#[tokio::test]
+async fn native_owned_pair_busy_then_rollback_keeps_previous_policy_for_next_start() {
+    let (fixture, running) = native_owned_policy_fixture(Layer::Stray).await;
+    let previous = fixture.split_store.load().unwrap().cached_policy.unwrap();
+    let mut changed = previous.clone();
+    changed.revision = 9;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.exclude_local_networks = false;
+    fixture.api.set_policy(changed.clone());
+    fixture
+        .api
+        .set_revision(changed.revision, changed.force_revision);
+    fixture
+        .tunnel
+        .owned_policy_outcomes
+        .lock()
+        .unwrap()
+        .extend([
+            Err("redundant_policy_busy"),
+            Ok(OwnedRedundantPolicyOutcome::RolledBack),
+        ]);
+    fixture
+        .core
+        .synchronize_split_tunnel(1_100, true)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .synchronize_split_tunnel(1_401, false)
+        .await
+        .unwrap();
+    let stored = fixture.split_store.load().unwrap();
+    assert_eq!(
+        stored.working_policy_hash, None,
+        "rollback must not invent native confirmation"
+    );
+    assert_eq!(stored.failed_policy_hash, Some(changed.policy_hash));
+    assert_eq!(
+        stored.previous_working_policy.unwrap().policy_hash,
+        previous.policy_hash
+    );
+
+    let next = fixture
+        .core
+        .connection_intent_tunnel_options(running.layer, running.route_mode, 1_402)
+        .await
+        .unwrap();
+    assert_eq!(next.policy_hash, Some(previous.policy_hash));
+    assert_eq!(next.exclude_local_networks, previous.exclude_local_networks);
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+}
+
+#[tokio::test]
 async fn native_owned_pair_late_policy_reply_cannot_revive_stop_or_owner_eof() {
     for owner_eof in [false, true] {
         let (fixture, _) = native_owned_policy_fixture(Layer::Tic).await;

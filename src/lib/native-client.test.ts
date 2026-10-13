@@ -87,6 +87,11 @@ describe("native client", () => {
       .toContain("при следующем подключении");
   });
 
+  it("explains a busy paired policy apply as temporary contention", () => {
+    expect(commandMessage(commandError("split_tunnel_apply_busy"), "split_tunnel"))
+      .toContain("занято восстановлением");
+  });
+
   it("explains the safe recovery after a Stray endpoint route failure", () => {
     expect(
       commandMessage(commandError("endpoint_route_unavailable"), "start"),

@@ -6,6 +6,117 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OwnedRedundantPolicyTest {
+    @Test fun pendingRoleObservationSurvivesPolicyApplication() {
+        val f = Fixture(panelOverride = PolicyRepairPanel())
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            val before = f.coordinator.status()!!
+            assertTrue(before.retry.roleObservationPending)
+            assertEquals("lease-b", before.retry.pendingRoleLeaseId)
+            assertEquals(OwnedRedundantPolicyOutcome.APPLIED, f.apply())
+            assertEquals(before.copy(template = before.template.copy(options = f.policy)), f.coordinator.status())
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            assertEquals(f.policy, f.coordinator.status()!!.template.options)
+            assertTrue(f.coordinator.status()!!.retry.acquirePending)
+        } finally { f.native.closeForStop() }
+    }
+
+    @Test fun scheduledRepairRollbackKeepsOldPolicyAndPendingRepair() {
+        val f = Fixture(panelOverride = PolicyRepairPanel())
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            val before = f.coordinator.status()!!
+            f.failTunStarts = setOf(2)
+            assertEquals(OwnedRedundantPolicyOutcome.ROLLED_BACK, f.apply())
+            assertEquals(3, f.tunStarts)
+            assertEquals(before, f.coordinator.status())
+            assertEquals(1, f.backend.activeSlots.last())
+            assertTrue(f.coordinator.isRunning())
+        } finally { f.native.closeForStop() }
+    }
+
+    @Test fun scheduledFailedMemberRepairDoesNotBlockPolicyOrLoseRepairState() {
+        val panel = PolicyRepairPanel()
+        val f = Fixture(panelOverride = panel)
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            val before = f.coordinator.status()!!
+            assertEquals("lease-b", before.localActiveLeaseId)
+            assertTrue(before.retry.acquirePending)
+            assertEquals("lease-a", before.retry.acquireReplaceLeaseId)
+            assertFalse(before.retry.roleObservationPending)
+
+            assertEquals(OwnedRedundantPolicyOutcome.APPLIED, f.apply())
+
+            assertEquals(2, f.tunStarts)
+            assertEquals(before.copy(template = before.template.copy(options = f.policy)), f.coordinator.status())
+            assertEquals(f.policy, (f.coldStore().read() as RecoveryStoreResult.Success).value.intent.template!!.options)
+            assertTrue(f.native.isUsable("lease-a")); assertTrue(f.native.isUsable("lease-b"))
+            assertEquals(1, f.backend.activeSlots.last())
+        } finally { f.native.closeForStop() }
+    }
+
+    @Test fun reissuedCurrentMemberWarmupDoesNotBlockPolicyOrLoseCandidate() {
+        val panel = PolicyRepairPanel()
+        val f = Fixture(panelOverride = panel)
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            val scheduled = f.coordinator.status()!!
+            assertTrue(f.coordinator.acquireAndCommitStandby(scheduled.retry.acquireOperationId!!))
+            val before = f.coordinator.status()!!
+            assertEquals("lease-a", before.candidateLeaseId)
+            assertEquals(RedundantSlot.A, before.candidateSlot)
+            assertTrue(before.retry.acquirePending)
+
+            assertEquals(OwnedRedundantPolicyOutcome.APPLIED, f.apply())
+
+            assertEquals(2, f.tunStarts)
+            assertEquals(before.copy(template = before.template.copy(options = f.policy)), f.coordinator.status())
+            assertEquals(f.policy, (f.coldStore().read() as RecoveryStoreResult.Success).value.redundantTransaction!!.template.options)
+            assertEquals(1, f.backend.activeSlots.last())
+            assertTrue(f.coordinator.isRunning())
+        } finally { f.native.closeForStop() }
+    }
+
+    @Test fun realStandbyRequestIsBusyBeforeNativePolicyMutation() {
+        val panel = PolicyRepairPanel()
+        val f = Fixture(panelOverride = panel)
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            panel.duringAcquire = {
+                try { f.apply(); fail("In-flight standby work must exclude policy replacement") }
+                catch (error: BackgroundConnectionException) { assertEquals("redundant_policy_busy", error.code) }
+                assertEquals(1, f.tunStarts)
+                assertEquals(AndroidTunnelOptions(), f.coordinator.status()!!.template.options)
+                assertTrue(f.coordinator.isRunning())
+            }
+            assertTrue(f.coordinator.acquireAndCommitStandby(f.coordinator.status()!!.retry.acquireOperationId!!))
+            assertEquals(1, f.tunStarts)
+        } finally { f.native.closeForStop() }
+    }
+
+    @Test fun newCandidateIsBusyAndCannotBeAppliedAsACurrentMember() {
+        val f = Fixture(panelOverride = PolicyRepairPanel("lease-c"))
+        try {
+            assertTrue(f.coordinator.slotFailed("lease-a", "primary_not_ready"))
+            assertTrue(f.coordinator.reportLocalRole("primary_not_ready"))
+            assertTrue(f.coordinator.acquireAndCommitStandby(f.coordinator.status()!!.retry.acquireOperationId!!))
+            val before = f.coordinator.status()!!
+            assertEquals("lease-c", before.candidateLeaseId)
+            assertFalse(f.native.isUsable("lease-a"))
+            assertTrue(f.native.isUsable("lease-c"))
+            try { f.apply(); fail("New candidate must not be rebuilt as a canonical member") }
+            catch (error: BackgroundConnectionException) { assertEquals("redundant_policy_busy", error.code) }
+            assertEquals(1, f.tunStarts)
+            assertEquals(before, f.coordinator.status())
+            assertTrue(f.coordinator.isRunning())
+        } finally { f.native.closeForStop() }
+    }
+
     @Test fun replacementPreservesBothMembersAndPromotedActiveBAndColdOptions() {
         for (active in listOf("lease-a", "lease-b")) {
             val f = Fixture(active)
@@ -105,9 +216,7 @@ class OwnedRedundantPolicyTest {
             assertEquals(1, f.tunStarts)
             assertTrue(f.coordinator.isRunning())
         }
-        for (retry in listOf(AndroidRedundantRetryState(roleObservationPending = true,
-                pendingRoleLeaseId = "lease-a", pendingRoleReason = "primary_ready"),
-            AndroidRedundantRetryState(acquirePending = true, acquireOperationId = "acquire"),
+        for (retry in listOf(AndroidRedundantRetryState(acquirePending = true, acquireOperationId = "acquire"),
             AndroidRedundantRetryState(standbyReleasePending = true))) {
             val f = Fixture()
             assertTrue(f.store.updateRedundant { it.copy(retry = retry) } is RecoveryStoreResult.Success)
@@ -226,7 +335,8 @@ class OwnedRedundantPolicyTest {
         }
     }
 
-    internal class Fixture(active: String = "lease-a", egressMode: String = "ipv4") {
+    internal class Fixture(active: String = "lease-a", egressMode: String = "ipv4",
+        panelOverride: RedundantConnectionPanel? = null) {
         val record = PolicyRecord()
         fun coldStore() = AndroidRecoveryStore(record, object : BootIdentityProvider {
             override fun bootCount() = 1L
@@ -261,7 +371,7 @@ class OwnedRedundantPolicyTest {
             return PreparedRedundantConfiguration(Config.parse(ByteArrayInputStream(CONFIG.toByteArray())),
                 byteArrayOf(5, 6).also { consumedBytes += it })
         }
-        val panel = object : RedundantConnectionPanel {
+        val panel = panelOverride ?: object : RedundantConnectionPanel {
             override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
                 panelCalls++; error("unexpected network recovery")
             }
@@ -291,6 +401,24 @@ class OwnedRedundantPolicyTest {
             if (failNextWrite) { failNextWrite = false; return false }
             bytes = plaintext.copyOf()
             return true
+        }
+    }
+
+    private class PolicyRepairPanel(private val candidateLeaseId: String = "lease-a") : RedundantConnectionPanel {
+        var duringAcquire: () -> Unit = {}
+        override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse = error("unexpected recovery")
+        override fun stop(transaction: AndroidRedundantTransaction): Boolean = error("unexpected Stop")
+        private fun session(transaction: AndroidRedundantTransaction, role: Long = transaction.roleGeneration) =
+            BackgroundRedundantSession(transaction.sessionId, "connected", transaction.localActiveLeaseId,
+                transaction.slotALeaseId, transaction.slotBLeaseId, true, role, transaction.membershipGeneration, null)
+        override fun reportRole(transaction: AndroidRedundantTransaction, reason: String) =
+            RedundantRoleResponse("ack", transaction.localActiveLeaseId!!, session(transaction, transaction.roleGeneration + 1))
+        override fun acquireStandby(transaction: AndroidRedundantTransaction, operationId: String,
+            replaceLeaseId: String?): BackgroundRedundantCandidate {
+            assertEquals("lease-a", replaceLeaseId)
+            duringAcquire()
+            return BackgroundRedundantCandidate(session(transaction), candidateLeaseId, RedundantSlot.A,
+                QuickConnectionArgs(), byteArrayOf(9, 8), BackgroundRedundantHealthProbe("dns_a", "8.8.8.8", "nelomai.ru", 4_000))
         }
     }
 

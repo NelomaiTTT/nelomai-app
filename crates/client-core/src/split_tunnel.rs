@@ -750,6 +750,7 @@ enum ConnectedPolicyApplyOutcome {
     RolledBack,
     StopFailed,
     ApplyFailed,
+    ApplyBusy,
     Failed,
 }
 
@@ -765,6 +766,7 @@ impl ConnectedPolicyApplyOutcome {
             Self::RolledBack => Some("split_tunnel_apply_failed"),
             Self::StopFailed => Some("split_tunnel_stop_failed"),
             Self::ApplyFailed => Some("split_tunnel_apply_failed"),
+            Self::ApplyBusy => Some("split_tunnel_apply_busy"),
             Self::Failed => Some("split_tunnel_rollback_failed"),
         }
     }
@@ -1950,6 +1952,10 @@ where
             .is_some_and(|(policy, failed_hash)| policy.policy_hash == failed_hash);
         if failed_cached_policy {
             if let Some(policy) = working_policy(&state)
+                // A busy apply retires native confirmation, not the previous
+                // usable policy. A later failed attempt must still let the next
+                // Start prepare that policy rather than repeat the failed cache.
+                .or(state.previous_working_policy.as_ref())
                 .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
                 .cloned()
             {
@@ -2233,6 +2239,40 @@ where
                         ConnectedPolicyApplyOutcome::Failed,
                         SplitTunnelApplyStatus::Failed,
                     )
+                }
+                Err(nelomai_client_tunnel::TunnelError::Backend(ref code))
+                    if matches!(
+                        code.as_str(),
+                        "redundant_policy_busy" | "tunnel_operation_in_progress"
+                    ) =>
+                {
+                    // No replacement started. Keep the desired policy cached for the
+                    // existing sync path; do not report Applied/Failed or punish busy
+                    // recovery with the one-hour failed-policy deadline.
+                    let phase = match self.tunnel.status().await {
+                        Ok(nelomai_client_tunnel::TunnelStatus::Running) => Phase::Connected,
+                        Ok(nelomai_client_tunnel::TunnelStatus::Starting) => Phase::Connecting,
+                        _ => Phase::Stopping,
+                    };
+                    self.publish_owned_policy_state(cancel_epoch, &connection, phase, None)
+                        .await?;
+                    // Equal policy hashes do not attest refreshed domain addresses
+                    // or this native instance's options. Existing polling must see
+                    // the desired policy as unconfirmed until a real apply succeeds.
+                    state.working_policy_hash = None;
+                    state.applied_physical_network_fingerprint = None;
+                    self.set_split_tunnel_warning(
+                        SplitTunnelWarningKind::Operation,
+                        "split_tunnel_apply_busy",
+                    )
+                    .await;
+                    self.logger.record(crate::CoreLogEvent {
+                        kind: "split_tunnel.apply_deferred",
+                        operation_id: None,
+                        request_id: None,
+                        code: Some("split_tunnel_apply_busy".into()),
+                    });
+                    return Ok(ConnectedPolicyApplyOutcome::ApplyBusy);
                 }
                 Err(_) => {
                     // Admission/preparation can fail before any native replacement.

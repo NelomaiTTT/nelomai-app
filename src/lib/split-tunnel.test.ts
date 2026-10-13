@@ -50,6 +50,15 @@ const applications: InstalledApplication[] = [
 ];
 
 describe("split-tunnel application model", () => {
+  it("explains temporary policy contention without claiming failed VPN or new settings applied", () => {
+    const message = splitTunnelWarningMessage("split_tunnel_apply_busy");
+    expect(message).toContain("занято восстановлением");
+    expect(message).toContain("предыдущие настройки");
+    expect(message).toContain("«Принудительная синхронизация»");
+    expect(message).not.toContain("без пользовательских исключений");
+    expect(message).not.toContain("при следующем подключении");
+  });
+
   it("warns that fallback VPN has LAN access but no custom exclusions", () => {
     const message = splitTunnelWarningMessage("split_tunnel_local_only");
     expect(message).toContain("локальная сеть доступна напрямую");
