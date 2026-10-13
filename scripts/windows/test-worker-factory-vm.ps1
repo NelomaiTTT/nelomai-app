@@ -111,6 +111,8 @@ try {
         $process = Start-Process -FilePath $exe -ArgumentList @('--exact', $selected, '--ignored', '--nocapture', '--test-threads=1') `
             -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -WindowStyle Hidden
         try {
+            # Retain the handle so Windows PowerShell preserves ExitCode after the redirected child exits.
+            $processHandle = $process.Handle
             if (-not $process.WaitForExit(90000)) { $process.Kill(); [void]$process.WaitForExit(5000); throw 'Native worker scenario exceeded 90 seconds' }
             $output = [string](Get-Content -LiteralPath $out -Raw) + [string](Get-Content -LiteralPath $err -Raw)
             $worker = @(Get-CimInstance Win32_Process -Filter "Name='nelomai-windows-worker.exe'")
@@ -120,7 +122,9 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Independent WFP inspection failed' }
             $guards = ([regex]::Matches((Get-Content $wfp -Raw), 'Nelomai carrier guard v2')).Count
             if ($process.ExitCode -ne 0 -or $output -notmatch '(?m)^test result: ok\. 1 passed; 0 failed;' -or
-                $worker.Count -ne 0 -or $adapters.Count -ne 0 -or $guards -ne 0) { throw 'Worker native scenario or independent cleanup audit failed' }
+                $worker.Count -ne 0 -or $adapters.Count -ne 0 -or $guards -ne 0) {
+                throw "Worker native scenario or independent cleanup audit failed: exit_code=$(if ($null -eq $process.ExitCode) { '<null>' } else { $process.ExitCode }); output_match=$($output -match '(?m)^test result: ok\. 1 passed; 0 failed;'); worker_count=$($worker.Count); adapter_count=$($adapters.Count); guard_count=$guards"
+            }
             @{ exit_code = $process.ExitCode; worker_count = $worker.Count; adapter_count = $adapters.Count; guard_count = $guards }
         } finally { $process.Dispose() }
     }
