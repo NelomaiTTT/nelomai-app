@@ -207,6 +207,10 @@ jobs:
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache-dependency-path: workers/windows-go/go.sum
       - run: cargo check -p nelomai-windows-service --all-targets
       - run: cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings
       - run: cargo check -p nelomai-app
@@ -246,7 +250,8 @@ jobs:
           $runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
           # Reuse the pinned production dependency builder: SCM executes this
           # exact-source engine with genuine WG/AWG tunnel DLLs, never DATA.
-          ./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine
+          $peer = Join-Path $env:RUNNER_TEMP 'worker-peers.exe'
+          ./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine -PeerTestExecutable $peer
           if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wintun.dll')).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
             throw 'Audited factory Wintun input hash mismatch'
           }
@@ -254,6 +259,7 @@ jobs:
             throw 'Audited factory WireGuard DLL hash mismatch'
           }
           "NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "NELOMAI_FACTORY_PEER_EXECUTABLE=$peer" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Assemble exact factory test artifact
         id: artifact
         env:
@@ -267,6 +273,7 @@ jobs:
           if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
           python scripts/windows/carrier-factory-artifact.py create `
             --test-executable $tests[0].executable --runtime-directory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
+            --peer-executable $env:NELOMAI_FACTORY_PEER_EXECUTABLE `
             --output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
@@ -277,7 +284,9 @@ jobs:
           retention-days: 1
 
   windows-native:
-    if: github.event_name != 'workflow_dispatch'
+    # The trusted 0.4 push validates its selected worker path below.
+    # Main/PR still execute the complete legacy compatibility matrix.
+    if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0')
     needs: [windows-build]
     name: windows-native (${{ matrix.case }})
     runs-on: windows-2022
@@ -290,6 +299,9 @@ jobs:
       matrix:
         case:
           - primary
+          - standby
+          - retire-stop
+          - hot-pair-stop
           - network-route-postflight
           - metrics-post-read-error
           - module-load-read-error
@@ -350,18 +362,74 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
+  windows-worker-native:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0'
+    needs: [windows-build]
+    runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
+    timeout-minutes: 7
+    concurrency:
+      group: nelomai-040-worker-vm
+      cancel-in-progress: false
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      MANIFEST_SHA256: ${{ needs.windows-build.outputs.manifest_sha256 }}
+      NELOMAI_WORKER_HOST: ${{ vars.NELOMAI_WORKER_HOST }}
+      NELOMAI_WORKER_VM_ID: ${{ vars.NELOMAI_WORKER_VM_ID }}
+      NELOMAI_WORKER_VM_NAME: ${{ vars.NELOMAI_WORKER_VM_NAME }}
+      NELOMAI_WORKER_SNAPSHOT_ID: ${{ vars.NELOMAI_WORKER_SNAPSHOT_ID }}
+      NELOMAI_WORKER_SNAPSHOT_NAME: ${{ vars.NELOMAI_WORKER_SNAPSHOT_NAME }}
+      NELOMAI_WORKER_CREDENTIAL_FILE: ${{ vars.NELOMAI_WORKER_CREDENTIAL_FILE }}
+      NELOMAI_WORKER_PEER_ADDRESS: ${{ vars.NELOMAI_WORKER_PEER_ADDRESS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.windows-build.outputs.artifact_name }}
+          path: ${{ runner.temp }}/factory-artifact/
+      - name: Actual worker promotion in clean VM with external host peers
+        run: |
+          $required = @('NELOMAI_WORKER_HOST', 'NELOMAI_WORKER_VM_ID', 'NELOMAI_WORKER_VM_NAME', 'NELOMAI_WORKER_SNAPSHOT_ID', 'NELOMAI_WORKER_SNAPSHOT_NAME', 'NELOMAI_WORKER_CREDENTIAL_FILE', 'NELOMAI_WORKER_PEER_ADDRESS')
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { throw "Missing explicit worker host boundary: $name" }
+          }
+          ./scripts/windows/test-worker-factory-vm.ps1 `
+            -ArtifactDirectory "$env:RUNNER_TEMP/factory-artifact" -SourceSha $env:SOURCE_SHA -ManifestSha256 $env:MANIFEST_SHA256 `
+            -HostName $env:NELOMAI_WORKER_HOST -VmId ([Guid]$env:NELOMAI_WORKER_VM_ID) -VmName $env:NELOMAI_WORKER_VM_NAME `
+            -SnapshotId ([Guid]$env:NELOMAI_WORKER_SNAPSHOT_ID) -SnapshotName $env:NELOMAI_WORKER_SNAPSHOT_NAME `
+            -CredentialFile $env:NELOMAI_WORKER_CREDENTIAL_FILE -PeerAddress $env:NELOMAI_WORKER_PEER_ADDRESS -OutputDirectory $env:RUNNER_TEMP
+      - name: Retain exact worker VM and peer evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-worker-native-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ runner.temp }}/worker-factory-vm-*/
+          if-no-files-found: warn
+          retention-days: 1
+
   windows:
     if: ${{ always() && github.event_name != 'workflow_dispatch' }}
-    needs: [windows-build, windows-native]
+    needs: [windows-build, windows-native, windows-worker-native]
     runs-on: ubuntu-latest
     steps:
       - name: Require common build and every isolated native factory case
         env:
           BUILD_RESULT: ${{ needs.windows-build.result }}
           NATIVE_RESULT: ${{ needs.windows-native.result }}
+          WORKER_RESULT: ${{ needs.windows-worker-native.result }}
+          WORKER_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' }}
         run: |
           test "$BUILD_RESULT" = success
-          test "$NATIVE_RESULT" = success
+          if [ "$WORKER_REQUIRED" = true ]; then
+            test "$NATIVE_RESULT" = skipped
+            test "$WORKER_RESULT" = success
+          else
+            test "$NATIVE_RESULT" = success
+            test "$WORKER_RESULT" = skipped
+          fi
 
   macos:
     if: github.event_name != 'workflow_dispatch'

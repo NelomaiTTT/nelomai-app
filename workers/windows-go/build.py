@@ -57,6 +57,7 @@ def main():
     parser.add_argument("--vendor-root", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--go", default="go")
+    parser.add_argument("--download", action="store_true", help="fetch and verify locked modules before the offline build")
     parser.add_argument("--test", action="store_true", help="also compile the one Windows integration test")
     parser.add_argument("--host-test", action="store_true", help="run the same scenario with only native OS effects replaced")
     args = parser.parse_args()
@@ -64,6 +65,13 @@ def main():
     output = args.output.resolve()
     worker = stage(root, (args.vendor_root or root / "vendor").resolve(), output)
     environment = dict(os.environ, CGO_ENABLED="0", GOTOOLCHAIN="local", GOWORK="off", GOPROXY="off", GOSUMDB="off")
+    if args.download:
+        locked = {name: (worker / name).read_bytes() for name in ("go.mod", "go.sum")}
+        run(args.go, "mod", "download", cwd=worker,
+            env=dict(environment, GOPROXY="https://proxy.golang.org", GOSUMDB="sum.golang.org"))
+        if any((worker / name).read_bytes() != value for name, value in locked.items()):
+            raise ValueError("module download changed the staged lock files")
+    run(args.go, "mod", "verify", cwd=worker, env=environment)
     if args.host_test:
         result = run(args.go, "test", "-mod=readonly", "-race", "-v", ".", cwd=worker,
                      env=dict(environment, CGO_ENABLED="1"))

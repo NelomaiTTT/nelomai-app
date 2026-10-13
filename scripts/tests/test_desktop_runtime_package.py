@@ -180,11 +180,26 @@ class DesktopPackageTest(unittest.TestCase):
                      "WIREGUARD-WINDOWS-LICENSE.txt", "WIREGUARD-NT-LICENSE.txt",
                      "AMNEZIAWG-WINDOWS-README.txt", "WINTUN-LICENSE.txt"):
             self.put("licenses/" + name, b"Test attribution only")
-        result = self.run_package(platform="windows")
+        self.assert_rejected(output="missing-worker", platform="windows")
+        worker = self.put("nelomai-windows-worker.exe", pe())
+        version = json.loads((SCRIPT.parents[1] / "src-tauri/tauri.conf.json").read_bytes())["version"]
+        result = self.run_package(platform="windows", version=version)
         self.assertEqual(result.returncode, 0, result.stderr)
         manifest = json.loads((self.root / "output/runtime-manifest-v1.json").read_bytes())
         roles = {item["path"]: item["role"] for item in manifest["files"]}
         self.assertEqual(roles["nelomai-runtime.exe"], "executable")
+        self.assertEqual(roles[worker.name], "executable")
+        with zipfile.ZipFile(self.root / "output/runtime.zip") as archive:
+            self.assertEqual(archive.read(worker.name), worker.read_bytes())
+        staged = self.root / "desktop-bundle"
+        result = subprocess.run([sys.executable, str(SCRIPT.with_name("stage-desktop-runtime.py")),
+                                 "--artifact", str(self.root / "output"), "--output", str(staged),
+                                 "--signing-key", str(self.key_path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        slot = staged / "runtime/engines/latest" / version
+        self.assertEqual((slot / worker.name).read_bytes(), worker.read_bytes())
+        container = json.loads((staged / "runtime/container-manifest-v1.json").read_bytes())
+        self.assertEqual(container["slots"][0]["manifest"], manifest)
         self.assertEqual(roles["wintun.dll"], "shared_library")
         self.put("wintun.dll", elf())
         self.assert_rejected(output="wrong-dll", platform="windows")

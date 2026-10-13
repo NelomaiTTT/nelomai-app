@@ -103,7 +103,7 @@ def file_role(name, path):
     return "resource"
 
 
-def validate_payload(payload, platform, architecture):
+def validate_payload(payload, platform, architecture, require_worker=False):
     files = payload_files(payload)
     paths = dict(files)
     binaries = {"nelomai-runtime", "nelomai-unix-service", "amneziawg-go"}
@@ -120,6 +120,8 @@ def validate_payload(payload, platform, architecture):
         licenses.add("WIREGUARD-GO-LICENSE.txt")
     else:
         binaries = {"nelomai-runtime.exe", "nelomai-windows-service.exe"} | WINDOWS_DLLS
+        if require_worker:
+            binaries.add("nelomai-windows-worker.exe")
         licenses |= {"WIREGUARD-WINDOWS-LICENSE.txt", "WIREGUARD-NT-LICENSE.txt",
                      "AMNEZIAWG-WINDOWS-README.txt", "WINTUN-LICENSE.txt"}
     missing = ({"webview/index.html"} | binaries | scripts
@@ -164,7 +166,7 @@ def package(payload, output, version, source_commit, platform, architecture, sig
         raise ValueError("immutable output already exists")
     if output.resolve().is_relative_to(payload.resolve()) or signing_key.resolve().is_relative_to(payload.resolve()):
         raise ValueError("output and signing key must be outside payload")
-    files = validate_payload(payload, platform, architecture)
+    files = validate_payload(payload, platform, architecture, require_worker=True)
     if any(path.samefile(signing_key) for _, path in files):
         raise ValueError("signing key must not be embedded through a hardlink")
     key = Ed25519PrivateKey.from_private_bytes(signing_key.read_bytes())
@@ -178,7 +180,7 @@ def package(payload, output, version, source_commit, platform, architecture, sig
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, destination)
             destination.chmod(0o755 if file_role(name, source) == "executable" else 0o644)
-        files = validate_payload(final_payload, platform, architecture)
+        files = validate_payload(final_payload, platform, architecture, require_worker=True)
         if platform == "macos":
             bundle = final_payload / "Nelomai.app"
             assets = Path(__file__).resolve().parents[1] / "src-tauri"

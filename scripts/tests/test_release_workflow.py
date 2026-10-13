@@ -18,6 +18,8 @@ from scripts.tests.test_runtime_artifact import ROOT, module
 class ReleaseWorkflowTest(unittest.TestCase):
     def test_windows_build_artifact_is_source_bound_and_every_byte_is_checked(self):
         artifact = module("windows/carrier-factory-artifact")
+        self.assertIn("nelomai-windows-worker.exe", artifact.RUNTIME_FILES)
+        self.assertIn("worker-peers.exe", artifact.PAYLOAD_FILES)
         source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -25,10 +27,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
             runtime.mkdir()
             test = root / "suite.exe"
             test.write_bytes(b"service library test bytes")
+            peer = root / "peers.exe"
+            peer.write_bytes(b"worker external peer test bytes")
             for name in artifact.RUNTIME_FILES:
                 (runtime / name).write_bytes(name.encode())
             output = root / "artifact"
-            digest = artifact.create(test, runtime, output, source)
+            digest = artifact.create(test, runtime, output, source, peer)
             artifact.verify(output, source, digest)
             for relative in artifact.PAYLOAD_FILES:
                 with self.subTest(file=relative):
@@ -61,7 +65,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             cli_output = root / "cli-artifact"
             name = "windows-factory-99-1-" + source
             subprocess.run([sys.executable, str(ROOT / "scripts/windows/carrier-factory-artifact.py"), "create",
-                            "--test-executable", str(test), "--runtime-directory", str(runtime),
+                            "--test-executable", str(test), "--peer-executable", str(peer), "--runtime-directory", str(runtime),
                             "--output", str(cli_output), "--source-sha", source, "--artifact-name", name],
                            env={**os.environ, "GITHUB_OUTPUT": str(outputs)}, check=True)
             self.assertEqual(outputs.read_text().splitlines(), ["manifest_sha256=" + digest, "artifact_name=" + name])
@@ -77,10 +81,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
             runtime.mkdir()
             test = root / "suite.exe"
             test.write_bytes(b"suite")
+            peer = root / "peers.exe"
+            peer.write_bytes(b"peers")
             for name in artifact.RUNTIME_FILES:
                 (runtime / name).write_bytes(name.encode())
             output = root / "artifact"
-            digest = artifact.create(test, runtime, output, source)
+            digest = artifact.create(test, runtime, output, source, peer)
             for directory in (False, True):
                 extra = output / "unexpected"
                 extra.mkdir() if directory else extra.write_bytes(b"extra")
@@ -111,6 +117,18 @@ class ReleaseWorkflowTest(unittest.TestCase):
         checker = module("release-workflow-check")
         workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+        cases = ["primary", "standby", "retire-stop", "hot-pair-stop", "network-route-postflight",
+                 "metrics-post-read-error", "module-load-read-error", "module-load-read-unwind",
+                 "resolver-reference-error", "resolver-reference-unwind", "carrier-ack", "carrier-unwind",
+                 "member-ack", "member-unwind", "running-ack", "running-unwind", "cold", "primary-data-denial",
+                 "creator-ack", "initial-native-ack", "initial-native-unwind", "fresh-ack", "starting-ack"]
+        # A pending workflow edit must not make an incomplete real matrix PASS.
+        # Exercise the exact proposed inventory without modifying that workflow.
+        if workflow["jobs"]["windows-native"]["strategy"]["matrix"]["case"] != cases:
+            with self.assertRaises(RuntimeError):
+                checker.assert_windows_factory_jobs(workflow, factory)
+            workflow = copy.deepcopy(workflow)
+            workflow["jobs"]["windows-native"]["strategy"]["matrix"]["case"] = cases
         artifact = next(step for step in workflow["jobs"]["windows-build"]["steps"]
                         if step.get("name") == "Assemble exact factory test artifact")
         self.assertIn("cargo test --release --locked", artifact["run"])
@@ -148,11 +166,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-native"]["steps"][-1]["with"].update(
                 name="windows-native-result"),
             lambda jobs: jobs["windows-native"]["steps"].pop(),
-            lambda jobs: jobs["windows-build"]["steps"][3].update(run="cargo check -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"][4].update(run="cargo check -p nelomai-windows-service"),
             lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),
-            lambda jobs: jobs["windows-build"]["steps"][6].update(run="cargo build -p nelomai-windows-service"),
-            lambda jobs: jobs["windows-build"]["steps"].insert(6, jobs["windows-build"]["steps"].pop(
+            lambda jobs: jobs["windows-build"]["steps"][7].update(run="cargo build -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"].insert(7, jobs["windows-build"]["steps"].pop(
                 next(index for index, step in enumerate(jobs["windows-build"]["steps"])
                      if step.get("name") == "Actual factory runtime input"))),
             lambda jobs: jobs["contracts-python"].update(steps=[
@@ -163,6 +181,16 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["contracts-python"]["steps"].append(
                 jobs["contracts-python"]["steps"].pop(3)),
             lambda jobs: jobs["contracts-python"].update(env={"RUSTUP_HOME": "${{ runner.temp }}/nelomai-contracts-rustup"}),
+            lambda jobs: jobs["windows-native"].update(**{"if": "github.event_name != 'workflow_dispatch'"}),
+            lambda jobs: jobs["windows-native"].update(**{"runs-on": "nelomai-040-worker-host"}),
+            lambda jobs: jobs["windows-native"]["strategy"]["matrix"]["case"].__setitem__(1, "primary"),
+            lambda jobs: jobs["windows-build"]["steps"][2]["with"].update(**{"go-version": "latest"}),
+            lambda jobs: jobs["windows-worker-native"].update(**{"if": "always()"}),
+            lambda jobs: jobs["windows-worker-native"].update(**{"runs-on": "windows-2022"}),
+            lambda jobs: jobs["windows-worker-native"]["concurrency"].update(**{"cancel-in-progress": True}),
+            lambda jobs: jobs["windows-worker-native"]["steps"][0]["with"].update(ref="main"),
+            lambda jobs: jobs["windows-worker-native"]["steps"][2].update(run="echo native skipped"),
+            lambda jobs: jobs["windows-worker-native"]["steps"][2].update(**{"continue-on-error": True}),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):
@@ -170,12 +198,16 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 mutate(changed["jobs"])
                 with self.assertRaises((RuntimeError, KeyError, ValueError)):
                     checker.assert_windows_factory_jobs(changed, factory)
-        for build in ("success", "failure", "skipped", "cancelled"):
-            for native in ("success", "failure", "skipped", "cancelled"):
-                result = subprocess.run(["bash", "-e", "-c", workflow["jobs"]["windows"]["steps"][0]["run"]],
-                                        env={**os.environ, "BUILD_RESULT": build, "NATIVE_RESULT": native},
-                                        capture_output=True)
-                self.assertEqual(result.returncode == 0, build == native == "success")
+        for required in ("true", "false"):
+            for build in ("success", "failure", "skipped", "cancelled"):
+                for native in ("success", "failure", "skipped", "cancelled"):
+                    for worker in ("success", "failure", "skipped", "cancelled"):
+                        result = subprocess.run(["bash", "-e", "-c", workflow["jobs"]["windows"]["steps"][0]["run"]],
+                                                env={**os.environ, "BUILD_RESULT": build, "NATIVE_RESULT": native,
+                                                     "WORKER_RESULT": worker, "WORKER_REQUIRED": required}, capture_output=True)
+                        expected = build == "success" and ((required == "true" and native == "skipped" and worker == "success")
+                                                          or (required == "false" and native == "success" and worker == "skipped"))
+                        self.assertEqual(result.returncode == 0, expected, (required, build, native, worker))
         with self.assertRaises(RuntimeError):
             checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 4", "None => cases.len()"))
 
@@ -388,6 +420,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
                          "discovery executes mandatory Android fixtures without its toolchain")
         action = yaml.safe_load((ROOT / ".github/actions/release-native-host/action.yml").read_text())
         setup = action["runs"]["steps"]
+        go = next(step for step in setup if step.get("uses") == "actions/setup-go@v5")
+        self.assertEqual(go["if"], "inputs.purpose == 'build'",
+                         "Windows candidate worker build must use the pinned Go toolchain")
+        self.assertEqual(go["with"]["go-version"], "1.25.0")
+        self.assertIn("\ngo 1.25.0\n", (ROOT / "workers/windows-go/go.mod").read_text())
         for prefix in ("actions/setup-java@", "android-actions/setup-android@"):
             step = next(step for step in setup if step.get("uses", "").startswith(prefix))
             self.assertIn("inputs.android-fixtures == 'true'", step["if"])

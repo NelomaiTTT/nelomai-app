@@ -41,7 +41,7 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
 
     jobs = workflow["jobs"]
     require(set(jobs) == {"linux-package-diagnostic", "frontend", "rust", "android-plugin",
-                          "windows-build", "windows-native", "windows", "macos", "contracts-python"},
+                          "windows-build", "windows-native", "windows-worker-native", "windows", "macos", "contracts-python"},
             "Checks must retain all six required checks and the isolated Windows graph")
     require("defaults" not in workflow, "Checks cannot override critical command shells")
     build, native, aggregate = (jobs[name] for name in ("windows-build", "windows-native", "windows"))
@@ -54,9 +54,11 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
                 allowed.add("if")
             require(set(step) <= allowed,
                     f"{name} steps must execute unconditionally and fail normally")
-    for name in ("frontend", "rust", "android-plugin", "windows-build", "windows-native", "macos", "contracts-python"):
+    for name in ("frontend", "rust", "android-plugin", "windows-build", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
+    require(native.get("if") == "github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0')",
+            "Legacy compatibility must be explicitly skipped only on the trusted worker push; main/PR remain required")
     contracts = jobs["contracts-python"]
     require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
         and all("RUSTUP_HOME" not in step.get("env", {}) for step in contracts["steps"]),
@@ -94,12 +96,15 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     selected = strategy.get("matrix", {}).get("case", [])
     require(set(strategy) == {"fail-fast", "matrix"} and strategy["fail-fast"] is False
             and set(strategy["matrix"]) == {"case"}, "Native matrix cannot suppress remaining cases")
-    require(len(cases) == len(set(cases)) == len(selected) == len(set(selected)) == 20
+    require(len(cases) == len(set(cases)) == len(selected) == len(set(selected)) == 23
             and set(selected) == set(cases), "Native matrix must cover every actual factory case exactly once")
     checkout = {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "submodules": "recursive"}}
     require(build["steps"][0] == native["steps"][0] == checkout, "Producer and consumer checkouts must use exact current SHA")
     require(build["steps"][1] == {"uses": "dtolnay/rust-toolchain@master", "with": {
         "toolchain": "1.88.0", "components": "rustfmt, clippy"}}, "Common build must retain the audited toolchain")
+    require(build["steps"][2] == {"uses": "actions/setup-go@v5", "with": {
+        "go-version": "1.25.0", "cache-dependency-path": "workers/windows-go/go.sum"}},
+        "Worker build must retain pinned Go and checksum-locked module cache")
     build_programs = [
         'cargo check -p nelomai-windows-service --all-targets',
         'cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings',
@@ -121,14 +126,16 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $engine = (Resolve-Path -LiteralPath 'target/release/nelomai-windows-service.exe').Path
 Write-Output "Actual factory release engine bytes=$((Get-Item -LiteralPath $engine).Length)"
 $runtime = Join-Path $env:RUNNER_TEMP 'factory-runtime'
-./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine
+$peer = Join-Path $env:RUNNER_TEMP 'worker-peers.exe'
+./scripts/windows/prepare-runtime.ps1 -OutputDirectory $runtime -ServiceExecutable $engine -PeerTestExecutable $peer
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wintun.dll')).Hash.ToLowerInvariant() -ne 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce') {
 throw 'Audited factory Wintun input hash mismatch'
 }
 if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $runtime 'wireguard.dll')).Hash.ToLowerInvariant() -ne 'b1b85e072c45d81358be29d94c599dc76652f912be8c0f0a41e2d5d89a6461d3') {
 throw 'Audited factory WireGuard DLL hash mismatch'
 }
-"NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append""",
+"NELOMAI_FACTORY_RUNTIME_DIRECTORY=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
+"NELOMAI_FACTORY_PEER_EXECUTABLE=$peer" | Out-File -FilePath $env:GITHUB_ENV -Append""",
         """$build = @(& cargo test --release --locked -p nelomai-windows-service --lib --no-run --message-format=json)
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $tests = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
@@ -137,13 +144,14 @@ $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'nelomai_windows_servi
 if ($tests.Count -ne 1) { throw 'Expected exactly one service library test executable' }
 python scripts/windows/carrier-factory-artifact.py create `
 --test-executable $tests[0].executable --runtime-directory $env:NELOMAI_FACTORY_RUNTIME_DIRECTORY `
+--peer-executable $env:NELOMAI_FACTORY_PEER_EXECUTABLE `
 --output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     ]
-    require(len(build["steps"]) == 12 and [program(step) for step in build["steps"][2:-1]] == build_programs,
+    require(len(build["steps"]) == 13 and [program(step) for step in build["steps"][3:-1]] == build_programs,
             "Common build must run ordinary/security/TxR gates before factory runtime preparation and retain all strict gates before artifact assembly")
-    require(all("env" not in step for step in build["steps"][:10]), "Common gates cannot override their source/runtime environment")
-    require(build["steps"][7].get("timeout-minutes") == build["steps"][8].get("timeout-minutes") == 2,
+    require(all("env" not in step for step in build["steps"][:11]), "Common gates cannot override their source/runtime environment")
+    require(build["steps"][8].get("timeout-minutes") == build["steps"][9].get("timeout-minutes") == 2,
             "Native readonly and isolated TxR gate budgets must remain unchanged")
     artifact = build["steps"][-2]
     require(artifact.get("id") == "artifact" and artifact.get("env") == {
@@ -183,13 +191,61 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
             "if-no-files-found": "warn", "retention-days": 1}},
         "Every native case must retain only actual SYSTEM outputs even on failure, uniquely bound to source/run/attempt/case for one day")
     require(aggregate.get("if") == "${{ always() && github.event_name != 'workflow_dispatch' }}"
-            and aggregate.get("needs") == ["windows-build", "windows-native"]
+            and aggregate.get("needs") == ["windows-build", "windows-native", "windows-worker-native"]
             and aggregate["runs-on"] == "ubuntu-latest" and len(aggregate["steps"]) == 1,
             "Required Windows check must observe both producer and every native case even on failure")
-    require(aggregate["steps"][0].get("env") == {
-        "BUILD_RESULT": "${{ needs.windows-build.result }}", "NATIVE_RESULT": "${{ needs.windows-native.result }}"}
-        and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\ntest "$NATIVE_RESULT" = success',
+    require(aggregate["steps"][0].get("env") == {'BUILD_RESULT': '${{ needs.windows-build.result }}',
+ 'NATIVE_RESULT': '${{ needs.windows-native.result }}',
+ 'WORKER_RESULT': '${{ needs.windows-worker-native.result }}',
+ 'WORKER_REQUIRED': "${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' }}"}
+        and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\nif [ "$WORKER_REQUIRED" = true ]; then\ntest "$NATIVE_RESULT" = skipped\ntest "$WORKER_RESULT" = success\nelse\ntest "$NATIVE_RESULT" = success\ntest "$WORKER_RESULT" = skipped\nfi',
         "Required Windows check must reject cancelled/skipped/failed producer or matrix")
+
+    require(jobs["windows-worker-native"] == {'if': "github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0'",
+ 'needs': ['windows-build'],
+ 'runs-on': ['self-hosted', 'Windows', 'x64', 'nelomai-040-worker-host'],
+ 'timeout-minutes': 7,
+ 'concurrency': {'group': 'nelomai-040-worker-vm', 'cancel-in-progress': False},
+ 'env': {'SOURCE_SHA': '${{ github.sha }}',
+         'MANIFEST_SHA256': '${{ needs.windows-build.outputs.manifest_sha256 }}',
+         'NELOMAI_WORKER_HOST': '${{ vars.NELOMAI_WORKER_HOST }}',
+         'NELOMAI_WORKER_VM_ID': '${{ vars.NELOMAI_WORKER_VM_ID }}',
+         'NELOMAI_WORKER_VM_NAME': '${{ vars.NELOMAI_WORKER_VM_NAME }}',
+         'NELOMAI_WORKER_SNAPSHOT_ID': '${{ vars.NELOMAI_WORKER_SNAPSHOT_ID }}',
+         'NELOMAI_WORKER_SNAPSHOT_NAME': '${{ vars.NELOMAI_WORKER_SNAPSHOT_NAME }}',
+         'NELOMAI_WORKER_CREDENTIAL_FILE': '${{ vars.NELOMAI_WORKER_CREDENTIAL_FILE }}',
+         'NELOMAI_WORKER_PEER_ADDRESS': '${{ vars.NELOMAI_WORKER_PEER_ADDRESS }}'},
+ 'steps': [{'uses': 'actions/checkout@v4',
+            'with': {'ref': '${{ github.sha }}', 'submodules': 'recursive', 'persist-credentials': False}},
+           {'uses': 'actions/download-artifact@v4',
+            'with': {'name': '${{ needs.windows-build.outputs.artifact_name }}',
+                     'path': '${{ runner.temp }}/factory-artifact/'}},
+           {'name': 'Actual worker promotion in clean VM with external host peers',
+            'run': "$required = @('NELOMAI_WORKER_HOST', 'NELOMAI_WORKER_VM_ID', 'NELOMAI_WORKER_VM_NAME', "
+                   "'NELOMAI_WORKER_SNAPSHOT_ID', 'NELOMAI_WORKER_SNAPSHOT_NAME', "
+                   "'NELOMAI_WORKER_CREDENTIAL_FILE', 'NELOMAI_WORKER_PEER_ADDRESS')\n"
+                   'foreach ($name in $required) {\n'
+                   '  if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { '
+                   'throw "Missing explicit worker host boundary: $name" }\n'
+                   '}\n'
+                   './scripts/windows/test-worker-factory-vm.ps1 `\n'
+                   '  -ArtifactDirectory "$env:RUNNER_TEMP/factory-artifact" -SourceSha $env:SOURCE_SHA '
+                   '-ManifestSha256 $env:MANIFEST_SHA256 `\n'
+                   '  -HostName $env:NELOMAI_WORKER_HOST -VmId ([Guid]$env:NELOMAI_WORKER_VM_ID) -VmName '
+                   '$env:NELOMAI_WORKER_VM_NAME `\n'
+                   '  -SnapshotId ([Guid]$env:NELOMAI_WORKER_SNAPSHOT_ID) -SnapshotName '
+                   '$env:NELOMAI_WORKER_SNAPSHOT_NAME `\n'
+                   '  -CredentialFile $env:NELOMAI_WORKER_CREDENTIAL_FILE -PeerAddress '
+                   '$env:NELOMAI_WORKER_PEER_ADDRESS -OutputDirectory $env:RUNNER_TEMP\n'},
+           {'name': 'Retain exact worker VM and peer evidence',
+            'if': 'always()',
+            'uses': 'actions/upload-artifact@v4',
+            'with': {'name': 'windows-worker-native-${{ github.run_id }}-${{ github.run_attempt }}-${{ '
+                             'github.sha }}',
+                     'path': '${{ runner.temp }}/worker-factory-vm-*/',
+                     'if-no-files-found': 'warn',
+                     'retention-days': 1}}]},
+            "Worker gate must retain exact trusted branch, host labels, serial VM and source/cleanup obligations")
 
 
 def run() -> None:

@@ -12,10 +12,10 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_FILES = (
-    "nelomai-windows-service.exe", "wintun.dll", "wireguard.dll",
+    "nelomai-windows-service.exe", "nelomai-windows-worker.exe", "wintun.dll", "wireguard.dll",
     "tunnel.dll", "amneziawg-tunnel.dll",
 )
-PAYLOAD_FILES = ("factory-tests.exe", *("runtime/" + name for name in RUNTIME_FILES))
+PAYLOAD_FILES = ("factory-tests.exe", "worker-peers.exe", *("runtime/" + name for name in RUNTIME_FILES))
 
 
 def sha256(path):
@@ -53,11 +53,12 @@ def require_layout(directory):
         raise ValueError("Factory artifact must contain exactly the fixed files and runtime directory")
 
 
-def create(test_executable, runtime_directory, output, source_sha):
+def create(test_executable, runtime_directory, output, source_sha, peer_executable):
     require_source(source_sha)
     output.mkdir()  # A fresh build must never reuse/merge a prior artifact tree.
     (output / "runtime").mkdir()
     shutil.copyfile(test_executable, output / "factory-tests.exe")
+    shutil.copyfile(peer_executable, output / "worker-peers.exe")
     for name in RUNTIME_FILES:
         shutil.copyfile(runtime_directory / name, output / "runtime" / name)
     if any((output / name).stat().st_size == 0 for name in PAYLOAD_FILES):
@@ -82,7 +83,7 @@ def verify(directory, source_sha, manifest_sha256):
         raise ValueError("Factory manifest source/schema mismatch")
     files = data["files"]
     if not isinstance(files, dict) or set(files) != set(PAYLOAD_FILES):
-        raise ValueError("Factory manifest must whitelist exactly the fixed six files")
+        raise ValueError("Factory manifest must whitelist exactly the fixed payload files")
     for name in PAYLOAD_FILES:
         if files[name] != sha256(directory / name):
             raise ValueError(f"Factory artifact file hash mismatch: {name}")
@@ -93,6 +94,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     build = commands.add_parser("create")
     build.add_argument("--test-executable", type=Path, required=True)
+    build.add_argument("--peer-executable", type=Path, required=True)
     build.add_argument("--runtime-directory", type=Path, required=True)
     build.add_argument("--output", type=Path, required=True)
     build.add_argument("--source-sha", required=True)
@@ -103,7 +105,7 @@ def main():
     consumer.add_argument("--manifest-sha256", required=True)
     args = parser.parse_args()
     if args.command == "create":
-        digest = create(args.test_executable, args.runtime_directory, args.output, args.source_sha)
+        digest = create(args.test_executable, args.runtime_directory, args.output, args.source_sha, args.peer_executable)
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"manifest_sha256={digest}\nartifact_name={args.artifact_name}\n")
     else:

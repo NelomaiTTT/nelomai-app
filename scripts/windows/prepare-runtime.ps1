@@ -1,6 +1,8 @@
 param(
     [string]$OutputDirectory = "",
-    [string]$ServiceExecutable = ""
+    [string]$ServiceExecutable = "",
+    [string]$GoExecutable = "go",
+    [string]$PeerTestExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -144,6 +146,25 @@ Copy-Item $wintunDll (Join-Path $OutputDirectory "wintun.dll") -Force
 Copy-Item $wintunLicense (Join-Path $OutputDirectory "WINTUN-LICENSE.txt") -Force
 Copy-Item $amneziaGoLicense (Join-Path $OutputDirectory "AMNEZIAWG-GO-LICENSE.txt") -Force
 
+# Build only from this checkout's exact gitlinks and patches in a fresh temp
+# tree. Peer test bytes are CI-only and must never enter the installed payload.
+$workerBuild = Join-Path $work "windows-worker"
+$workerArguments = @((Join-Path $root "workers/windows-go/build.py"), "--output", $workerBuild, "--go", $GoExecutable, "--download")
+if ($PeerTestExecutable) {
+    $PeerTestExecutable = [System.IO.Path]::GetFullPath($PeerTestExecutable)
+    if ($PeerTestExecutable.Equals($OutputDirectory, [StringComparison]::OrdinalIgnoreCase) -or
+        $PeerTestExecutable.StartsWith($OutputDirectory + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Peer test executable must be outside the runtime payload"
+    }
+    $workerArguments += "--test"
+}
+& python @workerArguments
+if ($LASTEXITCODE -ne 0) { throw "Pinned Windows worker build failed with exit code $LASTEXITCODE" }
+Copy-Item -LiteralPath (Join-Path $workerBuild "nelomai-windows-worker.exe") -Destination (Join-Path $OutputDirectory "nelomai-windows-worker.exe") -Force
+if ($PeerTestExecutable) {
+    Copy-Item -LiteralPath (Join-Path $workerBuild "windows-worker.test.exe") -Destination $PeerTestExecutable
+}
+
 $metadata = [ordered]@{
     wireguard_windows_commit = $WireGuardWindowsCommit
     wireguard_nt_version = $WireGuardNtVersion
@@ -154,6 +175,9 @@ $metadata = [ordered]@{
     amneziawg_tunnel_dll_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $OutputDirectory "amneziawg-tunnel.dll")).Hash.ToLowerInvariant()
     wintun_version = "0.14.1"
     wintun_dll_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $OutputDirectory "wintun.dll")).Hash.ToLowerInvariant()
+    worker_exe_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $OutputDirectory "nelomai-windows-worker.exe")).Hash.ToLowerInvariant()
+    worker_amneziawg_go_commit = (& git -C $root rev-parse HEAD:vendor/amneziawg-go)
+    worker_amneziawg_android_commit = (& git -C $root rev-parse HEAD:vendor/amneziawg-android)
 }
 $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $OutputDirectory "windows-runtime.json")
 
