@@ -137,6 +137,28 @@ fn defender_status_request_round_trips_through_the_typed_protocol() {
         decode_request(&frame).expect("decode Defender request"),
         request
     );
+    let mut wire: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+    assert!(
+        wire.get("identity").is_none(),
+        "legacy request must stay identity-less"
+    );
+    for slot in ["latest", "stable"] {
+        wire["identity"] = serde_json::json!({
+            "slot": slot, "runtime_version": "0.4.0", "runtime_contract_version": 1,
+            "container_version": "0.4.0", "manifest_sha256": "a".repeat(64),
+        });
+        let body = serde_json::to_vec(&wire).unwrap();
+        let mut selected_frame = (body.len() as u32).to_le_bytes().to_vec();
+        selected_frame.extend(body);
+        let selected = decode_request(&selected_frame).expect("decode selected Defender request");
+        assert_eq!(selected.diagnostic_name(), "defender_status");
+        let encoded = encode_request(&selected).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded[4..]).unwrap(),
+            wire
+        );
+        assert_ne!(selected, request);
+    }
 }
 
 #[test]

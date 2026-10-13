@@ -25,9 +25,14 @@ const REPAIR_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFENDER_ACTIVE_SCRIPT: &str = "$ErrorActionPreference=[Management.Automation.ActionPreference]::Stop; $status=Get-MpComputerStatus -ErrorAction Stop; if($status.AntivirusEnabled -and $status.RealTimeProtectionEnabled -and $status.AMRunningMode -ne 'Passive Mode'){exit 0}; exit 20";
 const EXCLUSION_SCRIPT: &str = include_str!("../../install/defender-exclusions.ps1");
 
-pub(crate) fn exclusion_status() -> DefenderStatus {
+pub(crate) fn exclusion_status(
+    layout: Option<&nelomai_contracts::dispatcher::VerifiedLayout>,
+) -> DefenderStatus {
     let (antivirus_products, antivirus_detail_code) = antivirus_products();
-    let dll_path = match std::env::current_exe() {
+    let dll_path = match layout
+        .map(|layout| Ok(layout.engine_path()))
+        .unwrap_or_else(std::env::current_exe)
+    {
         Ok(path) => path.with_file_name(AWG_DLL_NAME),
         Err(_) => {
             return status(

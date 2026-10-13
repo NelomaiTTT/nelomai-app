@@ -787,6 +787,16 @@ impl Fixture {
             std::fs::write(bin.join(name), bytes)?;
             files.push(serde_json::json!({"path": name, "size_bytes": bytes.len(), "sha256": d::digest(bytes), "role": role}));
         }
+        if worker {
+            // Installed desktop manifests include signed nested licenses. Keep
+            // their slash spelling in the manifest while writing native paths,
+            // so the real worker source pin exercises the complete inventory.
+            let bytes = b"Test attribution fixture; not a release license.";
+            let licenses = bin.join("licenses");
+            std::fs::create_dir(&licenses)?;
+            std::fs::write(licenses.join("AMNEZIAWG-GO-LICENSE.txt"), bytes)?;
+            files.push(serde_json::json!({"path": "licenses/AMNEZIAWG-GO-LICENSE.txt", "size_bytes": bytes.len(), "sha256": d::digest(bytes), "role": "license"}));
+        }
         let manifest = serde_json::to_vec(&serde_json::json!({
             "format_version": 1, "container_version": version, "release_set_id": "factory-fixture",
             "minimum_runtime_contract": 1, "maximum_runtime_contract": 1,

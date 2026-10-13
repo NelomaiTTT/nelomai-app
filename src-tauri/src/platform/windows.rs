@@ -220,25 +220,9 @@ async fn defender_status_cached(
             return Ok(status.clone());
         }
     }
-    let status = tunnel
-        .defender_status()
-        .await
-        .unwrap_or_else(|_| local_defender_status());
+    let status = tunnel.defender_status().await?;
     *cached = Some(status.clone());
     Ok(status)
-}
-
-fn local_defender_status() -> DefenderStatus {
-    let dll_present = std::env::current_exe()
-        .map(|path| path.with_file_name("amneziawg-tunnel.dll").is_file())
-        .unwrap_or(false);
-    DefenderStatus {
-        state: nelomai_windows_service::DefenderExclusionState::Unavailable,
-        dll_present,
-        detail_code: Some("service_status_unavailable".to_string()),
-        antivirus_products: Vec::new(),
-        antivirus_detail_code: Some("service_status_unavailable".to_string()),
-    }
 }
 
 fn tunnel_error(code: &str) -> TunnelError {

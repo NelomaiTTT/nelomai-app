@@ -213,7 +213,13 @@ pub(crate) mod native {
                     .join(name)
                     .join(&slot.manifest.runtime_version);
                 for entry in &slot.manifest.files {
-                    inventory.push((directory.join(&entry.path), Some(entry.size_bytes)));
+                    // Signed manifest paths use '/'; preserve native lexical
+                    // ancestors for the strict original-handle path validator.
+                    let mut path = directory.clone();
+                    for component in entry.path.split('/') {
+                        path.push(component);
+                    }
+                    inventory.push((path, Some(entry.size_bytes)));
                 }
             }
             inventory.push((

@@ -186,7 +186,7 @@ fn test_engine_path(name: &str) -> std::path::PathBuf {
 /// injected transports. A bound Version may create a verified engine lifetime
 /// to query capabilities, but only an explicit Start may start a VPN.
 pub fn exchange_selected(
-    request: Request,
+    mut request: Request,
     expected: Option<&dispatcher::EngineIdentity>,
     mut lifecycle: impl FnMut(
         &dispatcher::DispatcherRequest,
@@ -209,6 +209,9 @@ pub fn exchange_selected(
             || ready.running && expected != &reported
     }) {
         return Err(ServiceError::UnauthorizedClient);
+    }
+    if let Request::DefenderStatus { identity, .. } = &mut request {
+        *identity = expected.cloned();
     }
     let identity = expected.unwrap_or(&reported).clone();
     if matches!(request, Request::Stop { .. }) {
@@ -238,6 +241,7 @@ pub fn exchange_selected(
                     response.service_version = Some(identity.runtime_version);
                     Ok(response)
                 }
+                Request::DefenderStatus { .. } if expected.is_some() => private(request),
                 _ => Err(ServiceError::Backend("engine_not_running".into())),
             };
         }
@@ -433,6 +437,95 @@ mod selected_transport_tests {
         );
         assert!(exchange_selected(Request::diagnostics(), None, &mut lifecycle, private).is_err());
         assert!(!running);
+        for slot in [
+            nelomai_contracts::RuntimeSlot::Latest,
+            nelomai_contracts::RuntimeSlot::Stable,
+        ] {
+            let mut selected = identity.clone();
+            selected.slot = slot;
+            for (state, dll_present) in [
+                (DefenderExclusionState::Excluded, true),
+                (DefenderExclusionState::Missing, true),
+                (DefenderExclusionState::Unavailable, false),
+            ] {
+                let status = DefenderStatus {
+                    state,
+                    dll_present,
+                    detail_code: None,
+                    antivirus_products: Vec::new(),
+                    antivirus_detail_code: None,
+                };
+                let response = exchange_selected(
+                    Request::defender_status(),
+                    Some(&selected),
+                    |request| {
+                        assert!(matches!(
+                            request,
+                            dispatcher::DispatcherRequest::Version { .. }
+                        ));
+                        Ok(dispatcher::DispatcherResponse::success(
+                            identity.clone(),
+                            false,
+                        ))
+                    },
+                    |request| {
+                        assert_eq!(request.diagnostic_name(), "defender_status");
+                        assert_eq!(
+                            serde_json::to_value(request).unwrap()["identity"],
+                            serde_json::to_value(&selected).unwrap()
+                        );
+                        let mut response = Response::success(None);
+                        response.defender_status = Some(status.clone());
+                        Ok(response)
+                    },
+                )
+                .unwrap();
+                assert_eq!(response.defender_status, Some(status));
+            }
+            for stale in ["manifest", "container", "running_slot"] {
+                let mut reported = identity.clone();
+                match stale {
+                    "manifest" => reported.manifest_sha256 = "b".repeat(64),
+                    "container" => reported.container_version = "other".into(),
+                    _ => {
+                        reported.slot = if slot == nelomai_contracts::RuntimeSlot::Latest {
+                            nelomai_contracts::RuntimeSlot::Stable
+                        } else {
+                            nelomai_contracts::RuntimeSlot::Latest
+                        }
+                    }
+                }
+                assert_eq!(
+                    exchange_selected(
+                        Request::defender_status(),
+                        Some(&selected),
+                        |request| {
+                            assert!(matches!(
+                                request,
+                                dispatcher::DispatcherRequest::Version { .. }
+                            ));
+                            Ok(dispatcher::DispatcherResponse::success(
+                                reported.clone(),
+                                stale == "running_slot",
+                            ))
+                        },
+                        |_| panic!("stale selection must not reach Defender status"),
+                    )
+                    .unwrap_err(),
+                    ServiceError::UnauthorizedClient
+                );
+            }
+        }
+        assert!(exchange_selected(
+            Request::defender_status(),
+            None,
+            |_| Ok(dispatcher::DispatcherResponse::success(
+                identity.clone(),
+                false
+            )),
+            |_| panic!("unbound status must keep its stopped-engine rejection"),
+        )
+        .is_err());
     }
 }
 use serde::{Deserialize, Serialize};
@@ -609,6 +702,7 @@ pub enum Request {
     },
     DefenderStatus {
         protocol_version: u16,
+        identity: Option<dispatcher::EngineIdentity>,
     },
     RebindUdp {
         protocol_version: u16,
@@ -693,6 +787,7 @@ impl Request {
     pub fn defender_status() -> Self {
         Self::DefenderStatus {
             protocol_version: PROTOCOL_VERSION,
+            identity: None,
         }
     }
 
@@ -715,7 +810,9 @@ impl Request {
             | Self::Version { protocol_version }
             | Self::PhysicalNetworkFingerprint { protocol_version }
             | Self::Diagnostics { protocol_version }
-            | Self::DefenderStatus { protocol_version }
+            | Self::DefenderStatus {
+                protocol_version, ..
+            }
             | Self::RebindUdp { protocol_version }
             | Self::Metrics {
                 protocol_version, ..
@@ -804,11 +901,13 @@ impl PartialEq for Request {
             (
                 Self::DefenderStatus {
                     protocol_version: left,
+                    identity: left_identity,
                 },
                 Self::DefenderStatus {
                     protocol_version: right,
+                    identity: right_identity,
                 },
-            ) => left == right,
+            ) => left == right && left_identity == right_identity,
             (
                 Self::Metrics {
                     protocol_version: left_version,
@@ -1044,7 +1143,9 @@ impl fmt::Debug for Request {
                 .debug_struct("Diagnostics")
                 .field("protocol_version", protocol_version)
                 .finish(),
-            Self::DefenderStatus { protocol_version } => formatter
+            Self::DefenderStatus {
+                protocol_version, ..
+            } => formatter
                 .debug_struct("DefenderStatus")
                 .field("protocol_version", protocol_version)
                 .finish(),
@@ -1098,6 +1199,8 @@ enum RequestRef<'a> {
     DefenderStatus {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        identity: Option<&'a dispatcher::EngineIdentity>,
     },
     RebindUdp {
         #[serde(rename = "protocolVersion")]
@@ -1151,8 +1254,12 @@ impl Serialize for Request {
             Self::Diagnostics { protocol_version } => RequestRef::Diagnostics {
                 protocol_version: *protocol_version,
             },
-            Self::DefenderStatus { protocol_version } => RequestRef::DefenderStatus {
+            Self::DefenderStatus {
+                protocol_version,
+                identity,
+            } => RequestRef::DefenderStatus {
                 protocol_version: *protocol_version,
+                identity: identity.as_ref(),
             },
             Self::RebindUdp { protocol_version } => RequestRef::RebindUdp {
                 protocol_version: *protocol_version,
@@ -1205,6 +1312,8 @@ enum RequestOwned {
     DefenderStatus {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
+        #[serde(default)]
+        identity: Option<dispatcher::EngineIdentity>,
     },
     RebindUdp {
         #[serde(rename = "protocolVersion")]
@@ -1250,9 +1359,13 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::Diagnostics { protocol_version } => {
                 Self::Diagnostics { protocol_version }
             }
-            RequestOwned::DefenderStatus { protocol_version } => {
-                Self::DefenderStatus { protocol_version }
-            }
+            RequestOwned::DefenderStatus {
+                protocol_version,
+                identity,
+            } => Self::DefenderStatus {
+                protocol_version,
+                identity,
+            },
             RequestOwned::RebindUdp { protocol_version } => Self::RebindUdp { protocol_version },
         })
     }

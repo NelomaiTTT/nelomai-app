@@ -310,6 +310,29 @@ fn serve_owned_frame(
     let output = (|| {
         let mut dispatcher = owner.try_lock().map_err(|_| d::blocked())?;
         if private {
+            if let crate::Request::DefenderStatus {
+                protocol_version,
+                identity: Some(identity),
+            } = crate::decode_request(frame).map_err(|_| d::blocked())?
+            {
+                if protocol_version != crate::PROTOCOL_VERSION {
+                    return Err(d::blocked());
+                }
+                let ready = dispatcher.handle(
+                    d::DispatcherRequest::Version {
+                        contract_version: 1,
+                    },
+                    &mut |_, _| Err(d::blocked()),
+                );
+                if !ready.ok || ready.running && ready.identity.as_ref() != Some(&identity) {
+                    return Err(d::blocked());
+                }
+                let selected = dispatcher.installation.load_slot(identity.slot)?;
+                selected.authorize(&identity)?;
+                let mut response = crate::Response::success(None);
+                response.defender_status = Some(super::defender::exclusion_status(Some(&selected)));
+                return crate::encode_response(&response).map_err(|_| d::blocked());
+            }
             dispatcher.relay(frame, &mut |action, engine| {
                 super::install::engine_primitive(action, engine)
             })

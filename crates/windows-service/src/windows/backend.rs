@@ -253,7 +253,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
     }
 
     fn defender_status(&mut self) -> Result<DefenderStatus, ServiceError> {
-        Ok(super::defender::exclusion_status())
+        Ok(super::defender::exclusion_status(None))
     }
 
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
