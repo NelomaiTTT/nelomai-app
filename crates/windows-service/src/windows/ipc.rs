@@ -84,7 +84,7 @@ impl ServiceTransport for NamedPipeTransport {
                                     request,
                                     expected,
                                     dispatcher_exchange,
-                                    exchange_private,
+                                    |request| exchange_private(request, PIPE_NAME),
                                 ))
                             },
                         )
@@ -218,11 +218,13 @@ pub(crate) fn wake_server() {
 }
 
 fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
-    crate::exchange_selected(request, None, dispatcher_exchange, exchange_private)
+    crate::exchange_selected(request, None, dispatcher_exchange, |request| {
+        exchange_private(request, PIPE_NAME)
+    })
 }
 
-fn exchange_private(request: Request) -> Result<Response, ServiceError> {
-    let pipe_name = wide(PIPE_NAME);
+fn exchange_private(request: Request, name: &str) -> Result<Response, ServiceError> {
+    let pipe_name = wide(name);
     let pipe = open_client_pipe(&pipe_name)?;
     let result = (|| {
         write_all(pipe, &encode_request(&request)?)?;
@@ -529,7 +531,7 @@ fn last_error(context: &str) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::super::elevation::current_process_sid;
-    use super::{exchange_private as exchange_blocking, PipeServer};
+    use super::{exchange_private, PipeServer};
     use crate::{ClientPolicy, Request, Response};
     use std::sync::{mpsc, Mutex};
     use std::thread;
@@ -545,7 +547,9 @@ mod tests {
                 .unwrap(),
             manifest_sha256: "a".repeat(64),
         };
-        PipeServer::new(policy, broker, crate::PIPE_NAME)
+        let pipe_name =
+            Box::leak(format!(r"\\.\pipe\NelomaiIpcTest-{}", std::process::id()).into_boxed_str());
+        PipeServer::new(policy, broker, pipe_name)
     }
     fn finish_request(
         pipe: windows_sys::Win32::Foundation::HANDLE,
@@ -564,6 +568,7 @@ mod tests {
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
         let server = pipe_server(policy);
+        let pipe_name = server.name;
         let server_thread = thread::spawn(move || {
             let (request, pipe) = server
                 .accept()
@@ -579,8 +584,8 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(100));
-        let response =
-            exchange_blocking(Request::version()).expect("complete named pipe round trip");
+        let response = exchange_private(Request::version(), pipe_name)
+            .expect("complete named pipe round trip");
         assert_eq!(response.service_version.as_deref(), Some("test"));
         server_thread.join().expect("join pipe server");
     }
@@ -595,6 +600,7 @@ mod tests {
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
         let server = pipe_server(policy);
+        let pipe_name = server.name;
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             for index in 0..2 {
@@ -617,14 +623,15 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(100));
-        let first = thread::spawn(|| exchange_blocking(Request::version()));
+        let first = thread::spawn(move || exchange_private(Request::version(), pipe_name));
         // accept includes the real cold executable digest before signaling.
         // Use the existing exchange budget, not a shorter fixture-only bound.
         // The client's pipe-connect deadline and all auth guards are unchanged.
         accepted_rx
             .recv_timeout(super::PIPE_EXCHANGE_TIMEOUT)
             .expect("first request accepted within exchange budget");
-        let second = exchange_blocking(Request::version()).expect("wait for the pipe instance");
+        let second =
+            exchange_private(Request::version(), pipe_name).expect("wait for the pipe instance");
 
         assert_eq!(second.service_version.as_deref(), Some("test-1"));
         assert_eq!(
@@ -649,6 +656,7 @@ mod tests {
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
         let server = pipe_server(policy);
+        let pipe_name = server.name;
         let (gap_tx, gap_rx) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             let (request, pipe) = server
@@ -678,12 +686,12 @@ mod tests {
         });
 
         thread::sleep(Duration::from_millis(100));
-        exchange_blocking(Request::version()).expect("complete first request");
+        exchange_private(Request::version(), pipe_name).expect("complete first request");
         gap_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("wait for pipe recreation gap");
-        let response =
-            exchange_blocking(Request::version()).expect("wait for recreated pipe instance");
+        let response = exchange_private(Request::version(), pipe_name)
+            .expect("wait for recreated pipe instance");
 
         assert_eq!(response.service_version.as_deref(), Some("recreated"));
         server_thread.join().expect("join pipe server");

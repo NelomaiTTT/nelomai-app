@@ -14,8 +14,8 @@ const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-185329
 const ALL_ACCESS: u32 = 0x1f01ff;
 const PROTECTED: u16 = 0x1000;
 const MAX_JOURNAL: usize = 64 * 1024;
-const DIRECTORY_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-const FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+const DIRECTORY_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+const FILE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
 
 /// No caller-supplied path or basename crosses the private-file boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
