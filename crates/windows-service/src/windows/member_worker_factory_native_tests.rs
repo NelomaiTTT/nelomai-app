@@ -44,6 +44,166 @@ impl ServiceTunnelBackend for SingleStopped {
 }
 
 #[test]
+#[ignore = "requires elevated clean Windows VM and signed worker fixture inputs"]
+fn worker_factory_initial_publication_failure_retains_scoped_cleanup() {
+    use super::member_files::{MemberFiles, PrivateFile, SessionFileIo};
+    let mut pending = Vec::new();
+    for (unwind, foreign) in [(false, false), (true, false), (false, true), (true, true)] {
+        let fixture = Fixture::new_worker_modules().expect("signed private runtime fixture");
+        let mut actor = CompositeBackend::new(
+            RuntimeSlot::Latest,
+            SingleStopped,
+            fixture.worker_factory().unwrap(),
+        )
+        .unwrap();
+        let scope = SessionScope {
+            runtime: RuntimeSlot::Latest,
+            runtime_generation: 2,
+            session_id: format!(
+                "7ef40200-0000-4000-8000-{:012x}",
+                u64::from(std::process::id()) * 4 + u64::from(unwind) * 2 + u64::from(foreign)
+            ),
+            connection_generation: 1,
+        };
+        let command = Command::Start {
+                scope: scope.clone(),
+                primary: Member {
+                    slot: Slot::A,
+                    lease_id: "22222222-2222-4222-8222-222222222222".into(),
+                    configuration: TunnelConfiguration::new("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\n[Peer]\nPublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAllowedIPs = 198.51.100.0/24\nEndpoint = 192.0.2.1:51820\n".into()),
+                    probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "198.51.100.53".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 },
+                },
+                role_generation: 1,
+                membership_generation: 1,
+                warm_stop_v1: true,
+                options: DesktopTunnelOptions::default(),
+        };
+        let mut fresh = serde_json::to_value(&command).unwrap();
+        fresh["scope"]["connection_generation"] = 2.into();
+        fresh["scope"]["session_id"] = "7ef40201-0000-4000-8000-000000000001".into();
+        let fresh: Command = serde_json::from_value(fresh).unwrap();
+        fresh.validate(RuntimeSlot::Latest).unwrap();
+        fixture.lose_ack(PrivateFile::Worker, unwind);
+        let start =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actor.redundant(command)));
+        assert!(start.is_err() || start.unwrap().is_err(), "unwind={unwind}");
+        fixture
+            .verify_files()
+            .expect("actual Worker publication fault reached");
+        let status = actor
+            .redundant(Command::Status {
+                scope: scope.clone(),
+            })
+            .unwrap();
+        assert!(status.cleanup_pending);
+        assert_ne!(status.session.phase, SessionPhase::Running);
+        assert_eq!(status.session.installed, [false, false]);
+        let directory = super::member_carrier_factory_test_os::state().unwrap();
+        let before: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(before["process"].is_null() && before["interface"].is_null());
+        assert!(
+            observe_worker().is_err(),
+            "child spawned before cold publication ACK"
+        );
+        assert!(!super::member_carrier_provider::native::table()
+            .unwrap()
+            .iter()
+            .any(|r| r.identity.name.starts_with("NeloWorker-")));
+        assert!(
+            actor.redundant(fresh).is_err(),
+            "fresh pair replaced pending owner"
+        );
+        let foreign_bytes = if foreign {
+            let mut replacement = before.clone();
+            replacement["requested_guid"][0] =
+                (replacement["requested_guid"][0].as_u64().unwrap() ^ 1).into();
+            let bytes = serde_json::to_vec(&replacement).unwrap();
+            MemberFiles::new()
+                .unwrap()
+                .transaction(|files| {
+                    let expected = files.read(PrivateFile::Worker)?.unwrap();
+                    files.compare_exchange(PrivateFile::Worker, Some(&expected), &bytes)
+                })
+                .unwrap();
+            Some(bytes)
+        } else {
+            None
+        };
+        let stop_at = Instant::now();
+        let first = actor.redundant(Command::Stop {
+            scope: scope.clone(),
+        });
+        let first_ok = first.is_ok();
+        // Retain the same owner on any first-call failure; never replace it.
+        let stopped = if first.is_err() {
+            actor.redundant(Command::Stop {
+                scope: scope.clone(),
+            })
+        } else {
+            first
+        };
+        let elapsed = stop_at.elapsed();
+        eprintln!(
+            "worker cold publication unwind={unwind} foreign={foreign} first_ok={first_ok} local Stop={elapsed:?} scoped Stop={stopped:?}"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(7),
+            "cold scoped Stop elapsed {elapsed:?}"
+        );
+        if let Some(bytes) = foreign_bytes {
+            assert!(stopped.is_err(), "foreign Worker predecessor terminalized");
+            assert!(
+                actor
+                    .redundant(Command::Status { scope })
+                    .unwrap()
+                    .cleanup_pending
+            );
+            assert_eq!(
+                std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap(),
+                bytes,
+                "cleanup overwrote foreign Worker bytes"
+            );
+            continue;
+        }
+        let stopped = match stopped {
+            Ok(stopped) => stopped,
+            Err(_) => {
+                let retained = actor.redundant(Command::Status { scope }).unwrap();
+                assert!(retained.cleanup_pending);
+                assert_ne!(retained.session.phase, SessionPhase::Running);
+                pending.push(unwind);
+                continue;
+            }
+        };
+        assert!(
+            first_ok,
+            "cold scoped Stop required a terminal publication retry"
+        );
+        assert_eq!(stopped.session.phase, SessionPhase::Stopped);
+        assert!(!stopped.cleanup_pending);
+        let after: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after["stopped"], true);
+        assert!(after["process"].is_null() && after["interface"].is_null());
+        let repeat_at = Instant::now();
+        let repeated = actor.redundant(Command::Stop { scope });
+        let repeat_elapsed = repeat_at.elapsed();
+        eprintln!("worker cold publication unwind={unwind} repeated Stop={repeated:?} elapsed={repeat_elapsed:?}");
+        assert!(repeat_elapsed <= Duration::from_secs(7));
+        let repeated = repeated.expect("same original completed scope accepts repeated Stop");
+        assert_eq!(repeated.session, stopped.session);
+        assert!(!repeated.cleanup_pending);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&std::fs::read(directory.join("nelomai-redundant-worker.json")).unwrap()).unwrap(), after, "repeated Stop rewrote terminal Worker state");
+    }
+    assert!(pending.is_empty(), "same retained cold owner cannot terminalize lost Worker publication ACK: unwind={pending:?}");
+}
+
+#[test]
 #[ignore = "requires elevated clean Windows VM and NELOMAI_FACTORY_RUNTIME_DIRECTORY with signed fixture inputs"]
 fn worker_factory_start_stop_fresh_child_repeat() {
     // This signed fixture contains ONLY service, worker and Wintun. The old

@@ -142,9 +142,15 @@ struct Journal {
     root: PathBuf,
     current: Record,
     expected: Option<Vec<u8>>,
+    // First, cold publication only. These bytes are a cleanup CAS predecessor,
+    // never confirmed state or permission to spawn/Start.
+    initial_attempt: Option<Vec<u8>>,
 }
 impl Journal {
     fn save(&mut self, change: impl FnOnce(&mut Record)) -> io::Result<()> {
+        if self.initial_attempt.is_some() {
+            return Err(failed());
+        }
         self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
         let mut next = self.current.clone();
         change(&mut next);
@@ -164,6 +170,9 @@ impl Journal {
         Ok(())
     }
     fn verify(&mut self) -> io::Result<()> {
+        if self.initial_attempt.is_some() {
+            return Err(failed());
+        }
         self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
         self.private.transaction(|files| {
             if files.read(PrivateFile::Worker)?.as_deref() != self.expected.as_deref() {
@@ -557,6 +566,12 @@ impl SessionStore for Store {
                 .borrow_mut()
                 .complete_worker(&snapshot.scope, &completion)
         } else {
+            // Failed cold preparation may never have opened the Session store.
+            // Cleanup still requires the exact active protected scope; this
+            // exception cannot open a store for Starting/Running publication.
+            if snapshot.phase == SessionPhase::Stopping {
+                self.ensure_session(&snapshot.scope)?;
+            }
             self.session
                 .borrow_mut()
                 .as_mut()
@@ -704,6 +719,7 @@ pub(crate) fn prepare(
         root: root.into(),
         current: record,
         expected,
+        initial_attempt: None,
     }));
     let original = Rc::new(Original {
         source,
@@ -1172,7 +1188,30 @@ impl PairControl for Control {
         }
         // SessionControl already retains THIS cold control/store before claim.
         self.files.borrow_mut().claim(scope)?;
-        self.journal.borrow_mut().save(|_| {})?;
+        {
+            let mut journal = self.journal.borrow_mut();
+            if journal.initial_attempt.is_some() {
+                return Err(failed());
+            }
+            journal
+                .owner
+                .verify_at(&journal.root.join("engine-owner.lock"))?;
+            let bytes = serde_json::to_vec(&journal.current).map_err(|_| failed())?;
+            if bytes.len() > PrivateFile::Worker.limit() {
+                return Err(failed());
+            }
+            let expected = journal.expected.clone();
+            journal.initial_attempt = Some(bytes.clone()); // retain BEFORE IO/Err/unwind
+            journal.private.transaction(|files| {
+                files.compare_exchange(PrivateFile::Worker, expected.as_deref(), &bytes)?;
+                if files.read(PrivateFile::Worker)?.as_deref() != Some(bytes.as_slice()) {
+                    return Err(failed());
+                }
+                Ok(())
+            })?;
+            journal.expected = Some(bytes);
+            journal.initial_attempt = None;
+        }
         let (session, previous) = WindowsSessionStore::open(
             self.files.borrow().clone(),
             scope.clone(),
@@ -1190,7 +1229,12 @@ impl PairControl for Control {
         member: &Member,
         options: &DesktopTunnelOptions,
     ) -> io::Result<()> {
-        if scope != &self.scope || self.original.child.borrow().is_some() || self.stopped {
+        if scope != &self.scope
+            || self.original.child.borrow().is_some()
+            || self.stopped
+            || self.journal.borrow().initial_attempt.is_some()
+            || self.journal.borrow().current.closing
+        {
             return Err(failed());
         }
         options.validate().map_err(|_| failed())?;
@@ -1635,9 +1679,74 @@ impl NativePair for Control {
         let deadline = Instant::now() + STOP;
         self.ready = false;
         self.fenced = true;
+        let closing_published = self.journal.borrow().initial_attempt.is_some();
+        if closing_published {
+            // This exception is only the retained first publication, before
+            // ANY original Job/Child/Start/interface or network effect existed.
+            if self.original.child.borrow().is_some()
+                || self.original.job.borrow().is_some()
+                || self.original.process.get().is_some()
+                || self.original.interface.get().is_some()
+                || self.original.start_attempted.get()
+                || self.original.address_ack.get()
+                || self.rpc.borrow().is_some()
+                || self.guard.is_some()
+                || self.routes.is_some()
+            {
+                return Err(failed());
+            }
+            self.original.verify_process_exit()?;
+            let mut journal = self.journal.borrow_mut();
+            let record = &journal.current;
+            let network = record.network.read_view()?;
+            if record.scope != self.scope
+                || record.process.is_some()
+                || record.interface.is_some()
+                || record.closing
+                || record.stopped
+                || record.guard != Model::empty(self.scope.clone())
+                || record.guard_pending.is_some()
+                || network.current().next().is_some()
+                || network.pending().is_some()
+                || network.recorded_active().is_some()
+                || record.address.is_some()
+                || record.dns.is_some()
+            {
+                return Err(failed());
+            }
+            journal
+                .owner
+                .verify_at(&journal.root.join("engine-owner.lock"))?;
+            let attempted = journal.initial_attempt.as_ref().ok_or_else(failed)?.clone();
+            if attempted != serde_json::to_vec(record).map_err(|_| failed())? {
+                return Err(failed());
+            }
+            let expected = journal.expected.clone();
+            let mut closing = record.clone();
+            closing.closing = true;
+            let bytes = serde_json::to_vec(&closing).map_err(|_| failed())?;
+            journal.private.transaction(|files| {
+                let predecessor = files.read(PrivateFile::Worker)?;
+                if predecessor != expected && predecessor.as_deref() != Some(attempted.as_slice()) {
+                    return Err(failed());
+                }
+                // Matching attempted bytes grant only this cleanup CAS. Only
+                // its original positive write/readback ACK confirms Closing.
+                files.compare_exchange(PrivateFile::Worker, predecessor.as_deref(), &bytes)?;
+                if files.read(PrivateFile::Worker)?.as_deref() != Some(bytes.as_slice()) {
+                    return Err(failed());
+                }
+                Ok(())
+            })?;
+            journal.current = closing;
+            journal.expected = Some(bytes);
+            journal.initial_attempt = None;
+        }
         let mut error = None;
-        if let Err(e) = self.journal.borrow_mut().save(|r| r.closing = true) {
-            error = Some(e);
+        if !closing_published {
+            if let Err(e) = self.journal.borrow_mut().save(|r| r.closing = true) {
+                error = Some(e);
+            }
         }
         if let Some(guard) = &self.guard {
             let mut deny = guard.borrow().current.clone();
