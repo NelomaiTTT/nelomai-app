@@ -527,6 +527,38 @@ fn successful_stop_clears_pending_but_cannot_resurrect_same_owner() {
         assert!(owner.system_mut().values.is_empty());
         assert_eq!(owner.system_mut().writes, writes + 4); // Delete only.
     }
+    for lose_ack_at in [None, Some(3), Some(4)] {
+        let mut owner = NetworkOwner::fresh(
+            System::default(),
+            Journal {
+                lose_ack_at,
+                ..Default::default()
+            },
+        );
+        owner.select(Slot::A, pair(10)).unwrap();
+        let NetworkValue::Route(retired) = &pair(10)[0] else {
+            panic!("route fixture")
+        };
+        let result = owner.retire_owned_route(Slot::A, Some(retired));
+        assert_eq!(result.is_err(), lose_ack_at.is_some());
+        assert_eq!(owner.cleanup_pending(), lose_ack_at.is_some());
+        // A lost delete/commit ACK never rolls back by recreating the endpoint.
+        assert_eq!(
+            owner.system_mut().writes,
+            if lose_ack_at == Some(3) { 4 } else { 5 }
+        );
+        assert_eq!(
+            owner
+                .system_mut()
+                .read(&pair(10)[0].key())
+                .unwrap()
+                .is_some(),
+            lose_ack_at == Some(3)
+        );
+        owner.cleanup().unwrap();
+        assert!(owner.system_mut().values.is_empty());
+        assert_eq!(owner.system_mut().writes, 8); // Each original route deleted once.
+    }
 }
 
 #[test]

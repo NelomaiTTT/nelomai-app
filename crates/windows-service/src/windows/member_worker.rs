@@ -600,6 +600,9 @@ pub(crate) struct Control {
     parameters: [Option<MemberParameters>; 2],
     probes: [Option<RedundantHealthProbe>; 2],
     generations: [Option<u64>; 2],
+    bindings: [Option<crate::member_physical::PhysicalRoute>; 2],
+    common_routes: Vec<RouteValue>,
+    common_physical: Vec<crate::member_physical::PhysicalRoute>,
     physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
     options: Option<DesktopTunnelOptions>,
 }
@@ -735,6 +738,9 @@ pub(crate) fn prepare(
             parameters: [None, None],
             probes: [None, None],
             generations: [None, None],
+            bindings: [None, None],
+            common_routes: Vec::new(),
+            common_physical: Vec::new(),
             physical: Rc::new(RefCell::new(Vec::new())),
             options: None,
         },
@@ -823,6 +829,7 @@ impl Control {
         self.parameters[slot_index(member.slot)] = Some(params);
         self.probes[slot_index(member.slot)] = Some(member.probe.clone());
         self.generations[slot_index(member.slot)] = Some(generation);
+        self.bindings[slot_index(member.slot)] = Some(path.clone());
         Ok(())
     }
     fn create_address(&mut self, source: [u8; 4]) -> io::Result<()> {
@@ -964,7 +971,7 @@ impl Control {
         Ok(())
     }
     fn route_values(
-        &self,
+        &mut self,
         params: &MemberParameters,
         options: &DesktopTunnelOptions,
     ) -> io::Result<(
@@ -986,11 +993,14 @@ impl Control {
         if options.exclude_local_networks {
             exclusions.extend(physical.lan_prefixes());
         }
+        let common = exclusions.clone();
         exclusions.push(ipnet::IpNet::from(params.endpoint));
         exclusions.sort();
         exclusions.dedup();
         let mut paths = Vec::new();
         let mut values = Vec::new();
+        let mut common_routes = Vec::new();
+        let mut common_physical = Vec::new();
         for destination in &exclusions {
             let path = physical
                 .resolve_bypass(*destination)
@@ -1002,6 +1012,10 @@ impl Control {
                 gateway: path.row.route.gateway,
                 metric: path.row.route.metric,
             };
+            if common.contains(destination) {
+                common_physical.push(path.clone());
+                common_routes.push(desired.clone());
+            }
             // A compatible existing physical row is retained as evidence,
             // never adopted into NetworkOwner or deleted on Stop.
             if path.row.route != desired {
@@ -1031,6 +1045,8 @@ impl Control {
                 }
             }
         }
+        self.common_routes = common_routes;
+        self.common_physical = common_physical;
         Ok((values, paths))
     }
 }
@@ -1304,7 +1320,32 @@ impl PairControl for Control {
             luid: p.luid,
             guid: p.guid,
         }];
-        let path = super::member_physical::capture(&owned)?
+        let captured = super::member_physical::capture(&owned)?;
+        let mut excluded = Vec::new();
+        for route in self.routes.as_ref().ok_or_else(failed)?.excluded_routes() {
+            if route.interface == p.index {
+                continue;
+            }
+            let physical = self.physical.borrow();
+            let retained = physical
+                .iter()
+                .find(|path| path.proof.identity.index == route.interface)
+                .ok_or_else(failed)?;
+            let identity = super::member_physical::read_identity(route.interface)?;
+            if identity != retained.proof.identity {
+                return Err(failed());
+            }
+            excluded.push(crate::member_routes::Row::static_route(
+                route,
+                crate::member_routes::NativeProof {
+                    index: identity.index,
+                    luid: identity.luid,
+                },
+            ));
+        }
+        let path = captured
+            .without_owned_rows(&excluded)
+            .map_err(|_| failed())?
             .resolve_host(params.endpoint)
             .map_err(|_| failed())?
             .path;
@@ -1363,8 +1404,104 @@ impl PairControl for Control {
         self.fenced = false;
         Ok(())
     }
-    fn remove_standby(&mut self, _: &SessionScope, _: Slot) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
+    fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
+        if scope != &self.scope || !self.ready || self.fenced || self.stopped {
+            return Err(failed());
+        }
+        self.check_integrity()?;
+        let active = self
+            .routes
+            .as_ref()
+            .and_then(NetworkOwner::active)
+            .ok_or_else(failed)?;
+        if active == slot {
+            return Err(failed());
+        }
+        let index = slot_index(slot);
+        let Some(params) = &self.parameters[index] else {
+            return if self.members[index].is_none()
+                && self.generations[index].is_none()
+                && self.probes[index].is_none()
+                && self.bindings[index].is_none()
+            {
+                Ok(())
+            } else {
+                Err(failed())
+            };
+        };
+        let generation = self.generations[index].ok_or_else(failed)?;
+        let path = self.bindings[index].as_ref().ok_or_else(failed)?.clone();
+        let retired = RouteValue {
+            destination: ipnet::IpNet::from(params.endpoint),
+            scope: RouteScope::WindowsInterface(path.proof.identity.index),
+            interface: path.proof.identity.index,
+            gateway: path.row.route.gateway,
+            metric: path.row.route.metric,
+        };
+        let active_params = self.parameters[slot_index(active)]
+            .as_ref()
+            .ok_or_else(failed)?;
+        let active_path = self.bindings[slot_index(active)]
+            .as_ref()
+            .ok_or_else(failed)?;
+        let active_route = RouteValue {
+            destination: ipnet::IpNet::from(active_params.endpoint),
+            scope: RouteScope::WindowsInterface(active_path.proof.identity.index),
+            interface: active_path.proof.identity.index,
+            gateway: active_path.row.route.gateway,
+            metric: active_path.row.route.metric,
+        };
+        let shared = retired == active_route || self.common_routes.contains(&retired);
+        {
+            let journal = self.journal.borrow();
+            let network = journal.current.network.read_view()?;
+            if network.pending().is_some()
+                || network.stopping()
+                || network.recorded_active() != Some(active)
+            {
+                return Err(failed());
+            }
+        }
+        self.fenced = true;
+        let reply = self.call(
+            json!({"op":"detach","slot":index,"generation":generation}),
+            Duration::from_secs(5),
+        )?;
+        let retired_stats = &reply["slot_stats"][index];
+        let active_stats = &reply["slot_stats"][slot_index(active)];
+        if retired_stats["closed"].as_bool() != Some(true)
+            || retired_stats["generation"]
+                .as_u64()
+                .is_none_or(|value| value <= generation)
+            || active_stats["closed"].as_bool() != Some(false)
+            || active_stats["generation"].as_u64() != self.generations[slot_index(active)]
+        {
+            return Err(failed());
+        }
+        self.check_integrity()?;
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .retire_owned_route(active, (!shared).then_some(&retired))?;
+        self.check_integrity()?;
+        self.members[index] = None;
+        self.parameters[index] = None;
+        self.probes[index] = None;
+        self.generations[index] = None;
+        self.bindings[index] = None;
+        if !self
+            .bindings
+            .iter()
+            .flatten()
+            .any(|current| current == &path)
+            && !self.common_physical.contains(&path)
+        {
+            self.physical
+                .borrow_mut()
+                .retain(|current| current != &path);
+        }
+        self.fenced = false;
+        Ok(())
     }
     fn rebind_pair(&mut self, _: &SessionScope) -> io::Result<bool> {
         Err(io::ErrorKind::Unsupported.into())

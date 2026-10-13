@@ -101,6 +101,13 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             ),
             probe: primary.probe.clone(),
         };
+        let primary_lease = primary.lease_id.clone();
+        let fresh = Member {
+            slot: Slot::A,
+            lease_id: "44444444-4444-4444-8444-444444444444".into(),
+            configuration: TunnelConfiguration::new(primary.configuration.expose().to_owned()),
+            probe: primary.probe.clone(),
+        };
         let started = actor.redundant(Command::Start {
             scope: scope.clone(),
             primary,
@@ -134,6 +141,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         };
         let mut readiness = None;
         let mut promotion = None;
+        let mut promoted_network = None;
+        let mut replacement = None;
         let mut before_network = None;
         if round == 0 && attached.as_ref().is_some_and(|result| result.is_ok()) {
             let clock = Instant::now();
@@ -212,6 +221,81 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                         std::thread::sleep(Duration::from_millis(25));
                     }
                 })());
+                replacement = Some((|| -> std::io::Result<_> {
+                    let promoted = promotion
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .map_err(|_| std::io::Error::other("promotion failed"))?;
+                    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                        super::member_carrier_factory_test_os::state()
+                            .ok_or_else(|| std::io::Error::other("private state missing"))?
+                            .join("nelomai-redundant-worker.json"),
+                    )?)?;
+                    promoted_network = Some((
+                        serde_json::from_value::<crate::member_owner::InterfaceProof>(
+                            value["interface"].clone(),
+                        )?,
+                        serde_json::from_value::<
+                            nelomai_client_tunnel::redundancy::network::NetworkJournal,
+                        >(value["network"].clone())?,
+                    ));
+                    let active_lease = promoted.current_leases[1]
+                        .clone()
+                        .ok_or_else(|| std::io::Error::other("current B lease missing"))?;
+                    let confirmed = actor
+                        .redundant(Command::ConfirmRole {
+                            scope: scope.clone(),
+                            expected_revision: promoted.session.local_revision,
+                            expected_network_epoch: promoted.session.network_epoch,
+                            response: nelomai_contracts::RedundantRoleResponse {
+                                api_version: nelomai_contracts::ApiVersion::V1,
+                                request_id: "worker-fixture-role".into(),
+                                action: nelomai_contracts::RedundantRoleAction::Accepted,
+                                local_active_lease_id: active_lease.clone(),
+                                session: nelomai_contracts::RedundantSessionView {
+                                    session_id: scope.session_id.clone(),
+                                    state: nelomai_contracts::RedundantSessionState::Connected,
+                                    active_lease_id: Some(active_lease),
+                                    slot_a_lease_id: promoted.current_leases[0].clone(),
+                                    slot_b_lease_id: promoted.current_leases[1].clone(),
+                                    standby_desired: true,
+                                    role_generation: promoted.session.role_generation + 1,
+                                    membership_generation: promoted.session.membership_generation,
+                                    reason: None,
+                                },
+                            },
+                        })
+                        .map_err(|_| std::io::Error::other("canonical B role ACK failed"))?;
+                    if !confirmed.session.role_confirmed {
+                        return Err(std::io::Error::other("role remained unconfirmed"));
+                    }
+                    let retired = actor
+                        .redundant(Command::RetireInactive {
+                            scope: scope.clone(),
+                            slot: Slot::A,
+                            lease_id: primary_lease,
+                            expected_revision: confirmed.session.local_revision,
+                            expected_network_epoch: confirmed.session.network_epoch,
+                            expected_membership_generation: confirmed.session.membership_generation,
+                        })
+                        .map_err(|_| std::io::Error::other("actual inactive retirement failed"))?;
+                    if retired.session.active != Slot::B
+                        || retired.session.installed != [false, true]
+                        || !retired.primary_ready
+                    {
+                        return Err(std::io::Error::other("retirement interrupted active B"));
+                    }
+                    actor
+                        .redundant(Command::StageCandidate {
+                            scope: scope.clone(),
+                            member: fresh,
+                            expected_revision: retired.session.local_revision,
+                            expected_network_epoch: retired.session.network_epoch,
+                            expected_membership_generation: retired.session.membership_generation,
+                        })
+                        .map_err(|_| std::io::Error::other("actual fresh candidate attach failed"))
+                })());
             }
         }
         let during = super::member_carrier_provider::native::table().unwrap();
@@ -243,6 +327,10 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let after = super::member_carrier_provider::native::table().unwrap();
         let started = started.expect("actual worker factory Start A");
         let stopped = stopped.expect("actual worker factory Stop");
+        assert!(
+            elapsed <= Duration::from_secs(7),
+            "local Stop elapsed {elapsed:?}"
+        );
         assert_eq!(started.session.phase, SessionPhase::Running);
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
@@ -269,6 +357,15 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             assert!(promotion.primary_ready);
             assert_eq!(promotion.session.installed, [true, true]);
             assert!(!promotion.cleanup_pending);
+            let replacement = replacement
+                .expect("retirement and replacement attempted")
+                .expect("actual fresh candidate behind original TUN");
+            assert_eq!(replacement.session.active, Slot::B);
+            assert_eq!(replacement.session.installed, [true, true]);
+            assert_eq!(replacement.session.committed, [false, true]);
+            assert!(replacement.primary_ready);
+            assert!(!replacement.standby_ready); // Closed external A peer: no fabricated health.
+            assert!(!replacement.cleanup_pending);
         }
         let (identity, network) = retained.expect("original worker interface/network");
         let network = network.read_view().unwrap();
@@ -280,13 +377,20 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         if round == 0 {
             let (before_identity, before) =
                 before_network.expect("exact pre-promotion interface/network facts");
+            let (promoted_identity, promoted) =
+                promoted_network.expect("exact post-promotion facts before retirement");
             assert_eq!(
-                identity, before_identity,
+                promoted_identity, before_identity,
                 "promotion replaced original GUID/LUID/index"
             );
-            let before = before.read_view().unwrap();
             assert_eq!(
-                serde_json::to_vec(&network.current().collect::<Vec<_>>()).unwrap(),
+                identity, promoted_identity,
+                "replacement changed original TUN"
+            );
+            let before = before.read_view().unwrap();
+            let promoted = promoted.read_view().unwrap();
+            assert_eq!(
+                serde_json::to_vec(&promoted.current().collect::<Vec<_>>()).unwrap(),
                 serde_json::to_vec(&before.current().collect::<Vec<_>>()).unwrap(),
                 "promotion mutated exact route bytes"
             );
@@ -312,10 +416,6 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                 .count(),
             1,
             "one independently matched real TUN"
-        );
-        assert!(
-            elapsed <= Duration::from_secs(7),
-            "local Stop elapsed {elapsed:?}"
         );
         assert!(
             after.iter().all(|row| row.identity.guid != identity.guid

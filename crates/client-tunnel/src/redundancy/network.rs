@@ -459,6 +459,79 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         Ok(())
     }
 
+    /// Retire only owned routes, preserving every retained resource exactly.
+    /// A failed delete/save leaves pending for cleanup, never a recreating rollback.
+    pub fn retire_owned_route(
+        &mut self,
+        active: Slot,
+        route: Option<&RouteValue>,
+    ) -> io::Result<()> {
+        if self.journal.stopping
+            || self.journal.pending.is_some()
+            || self.journal.active != Some(active)
+        {
+            return Err(io::Error::other("network_retirement_fenced"));
+        }
+        validate_entries(&self.journal.owned)?;
+        let value = route.cloned().map(NetworkValue::Route);
+        if let Some(value) = &value {
+            if find(&self.journal.owned, &value.key()).is_some_and(|entry| entry.current != *value)
+            {
+                return Err(conflict());
+            }
+        }
+        let target = self
+            .journal
+            .owned
+            .iter()
+            .filter(|entry| Some(&entry.current) != value.as_ref())
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = self
+            .journal
+            .owned
+            .iter()
+            .filter(|entry| find(&target, &entry.current.key()).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed.iter().any(|entry| {
+            entry.original.is_some() || !matches!(entry.current, NetworkValue::Route(_))
+        }) {
+            return Err(invalid());
+        }
+        for entry in &self.journal.owned {
+            if self.system.read(&entry.current.key())?.as_ref() != Some(&entry.current) {
+                return Err(conflict());
+            }
+        }
+        self.journal.pending = Some(Pending {
+            target: target.clone(),
+            active: Some(active),
+        });
+        self.store.save(&self.journal)?;
+        for entry in removed {
+            self.system
+                .compare_exchange(&entry.current.key(), Some(&entry.current), None)?;
+            if self.system.read(&entry.current.key())?.is_some() {
+                return Err(conflict());
+            }
+        }
+        for entry in &target {
+            if self.system.read(&entry.current.key())?.as_ref() != Some(&entry.current) {
+                return Err(conflict());
+            }
+        }
+        let committed = NetworkJournal {
+            owned: target,
+            active: Some(active),
+            pending: None,
+            stopping: false,
+        };
+        self.store.save(&committed)?;
+        self.journal = committed;
+        Ok(())
+    }
+
     pub fn prepare(&mut self, values: Vec<NetworkValue>) -> io::Result<()> {
         if self.journal.active.is_some() || self.journal.stopping || self.journal.pending.is_some()
         {

@@ -279,6 +279,31 @@ func TestWorkerLifecycle(t *testing.T) {
 	if stale := call(request{Op: "probe_poll", Probe: sent.Probe}); stale.OK {
 		t.Fatal("cancelled probe remained live")
 	}
+	// Retire only inactive A and replace its crypto device behind the SAME TUN.
+	oldGeneration := stats[0].Generation
+	if detached := call(request{Op: "detach", Slot: 0, Generation: oldGeneration}); !detached.OK || !detached.SlotStats[0].Closed || detached.SlotStats[1].Closed || detached.Identity != start.Identity {
+		t.Fatalf("inactive retirement: %+v", detached)
+	}
+	send([]byte("reserve-continuity"))
+	if string(receiveUDP()) != "peer-1:reserve-continuity" {
+		t.Fatal("retirement interrupted active B")
+	}
+	if attached := call(request{Op: "attach", Slot: 0, Configuration: configurations[0], Physical: physical}); !attached.OK || attached.SlotStats[0].Generation <= oldGeneration {
+		t.Fatalf("fresh crypto replacement: %+v", attached)
+	}
+	if stale := call(request{Op: "detach", Slot: 0, Generation: oldGeneration}); stale.OK {
+		t.Fatal("old generation detached replacement")
+	}
+	if active := call(request{Op: "detach", Slot: 1, Generation: stats[1].Generation}); active.OK {
+		t.Fatal("active device retirement accepted")
+	}
+	if switched := call(request{Op: "switch", Slot: 0}); !switched.OK {
+		t.Fatal(switched)
+	}
+	send([]byte("replacement"))
+	if string(receiveUDP()) != "peer-0:replacement" {
+		t.Fatal("replacement crypto dataplane failed")
+	}
 	// Two-phase Stop proves native close, then the parent independently proves
 	// exact absence and original process exit before the fresh-child repeat.
 	awaitAbsence := false

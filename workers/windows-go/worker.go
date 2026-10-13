@@ -31,6 +31,7 @@ type request struct {
 	GUID          string   `json:"guid,omitempty"`
 	DLLSHA256     string   `json:"dll_sha256,omitempty"`
 	Slot          uint32   `json:"slot,omitempty"`
+	Generation    uint64   `json:"generation,omitempty"`
 	Configuration string   `json:"configuration,omitempty"`
 	Physical      identity `json:"physical,omitempty"`
 	Source        string   `json:"source,omitempty"`
@@ -67,6 +68,7 @@ type worker struct {
 	identity    identity
 	tunnel      *RedundantTunnel
 	slots       [2]*device.Device
+	active      uint32
 	generations [2]uint64
 	probes      map[uint64]workerProbe
 	nextProbe   uint64
@@ -117,6 +119,8 @@ func (w *worker) bounded(req request) (response, bool) {
 		limit = 30 * time.Second
 	case "attach":
 		limit = 10 * time.Second
+	case "detach":
+		limit = 4 * time.Second
 	case "stop":
 		limit = 8 * time.Second
 	}
@@ -125,7 +129,7 @@ func (w *worker) bounded(req request) (response, bool) {
 	}
 	operation := req.Op
 	switch operation {
-	case "start", "attach", "switch", "sample", "probe_send", "probe_poll", "probe_cancel", "stop":
+	case "start", "attach", "detach", "switch", "sample", "probe_send", "probe_poll", "probe_cancel", "stop":
 	default:
 		operation = "protocol"
 	}
@@ -228,6 +232,23 @@ func (w *worker) command(req request, reply *response) error {
 		w.slots[req.Slot] = backend
 		backend.SendKeepalivesToAllRunningPeers()
 		return nil
+	case "detach":
+		if req.Slot >= 2 || req.Slot == w.active || w.slots[req.Slot] == nil || req.Generation == 0 || w.tunnel.Closed() || w.tunnel.SlotStats()[req.Slot].Generation != req.Generation {
+			return errors.New("invalid_retirement")
+		}
+		for id, probe := range w.probes {
+			if probe.slot == req.Slot {
+				w.cancelProbe(id)
+			}
+		}
+		backend := w.slots[req.Slot]
+		backend.Close()
+		<-backend.Wait()
+		if err := w.tunnel.ResetSlot(req.Slot); err != nil {
+			return err
+		}
+		w.slots[req.Slot] = nil
+		return nil
 	case "switch":
 		if req.Slot >= 2 || w.slots[req.Slot] == nil {
 			return errors.New("missing_slot")
@@ -237,7 +258,11 @@ func (w *worker) command(req request, reply *response) error {
 			return errors.New("closed_slot")
 		default:
 		}
-		return w.tunnel.SwitchActive(req.Slot)
+		if err := w.tunnel.SwitchActive(req.Slot); err != nil {
+			return err
+		}
+		w.active = req.Slot
+		return nil
 	case "sample":
 		return nil
 	case "probe_send":
