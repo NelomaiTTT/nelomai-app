@@ -406,8 +406,8 @@ func TestMain(m *testing.M) {
 		if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsUnspecified() {
 			os.Exit(1)
 		}
-		var peers [2]*device.Device
-		ready := make([]map[string]string, 2)
+		var peers [3]*device.Device
+		ready := make([]map[string]string, len(peers))
 		for slot := range peers {
 			clientBytes, remoteBytes := bytes.Repeat([]byte{byte(1 + slot*2)}, 32), bytes.Repeat([]byte{byte(2 + slot*2)}, 32)
 			client, err := ecdh.X25519().NewPrivateKey(clientBytes)

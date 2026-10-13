@@ -62,13 +62,20 @@ fn worker_factory_start_stop_fresh_child_repeat() {
     assert!(std::fs::metadata(&peer_file).unwrap().len() <= 4096);
     let peers: serde_json::Value =
         serde_json::from_slice(&std::fs::read(peer_file).unwrap()).unwrap();
+    assert_eq!(
+        peers.as_array().unwrap().len(),
+        3,
+        "three independent external peers"
+    );
     let endpoints = [
         peers[0]["endpoint"].as_str().unwrap(),
         peers[1]["endpoint"].as_str().unwrap(),
+        peers[2]["endpoint"].as_str().unwrap(),
     ];
     let public = [
         peers[0]["public_key"].as_str().unwrap(),
         peers[1]["public_key"].as_str().unwrap(),
+        peers[2]["public_key"].as_str().unwrap(),
     ];
     let mut previous_process = None;
     for round in 0..2 {
@@ -105,7 +112,17 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let fresh = Member {
             slot: Slot::A,
             lease_id: "44444444-4444-4444-8444-444444444444".into(),
-            configuration: TunnelConfiguration::new(primary.configuration.expose().to_owned()),
+            configuration: TunnelConfiguration::new(
+                primary
+                    .configuration
+                    .expose()
+                    .replace(
+                        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                        "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+                    )
+                    .replace(public[0], public[2])
+                    .replace(endpoints[0], endpoints[2]),
+            ),
             probe: primary.probe.clone(),
         };
         let started = actor.redundant(Command::Start {
@@ -286,7 +303,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                     {
                         return Err(std::io::Error::other("retirement interrupted active B"));
                     }
-                    actor
+                    let staged = actor
                         .redundant(Command::StageCandidate {
                             scope: scope.clone(),
                             member: fresh,
@@ -294,7 +311,61 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                             expected_network_epoch: retired.session.network_epoch,
                             expected_membership_generation: retired.session.membership_generation,
                         })
-                        .map_err(|_| std::io::Error::other("actual fresh candidate attach failed"))
+                        .map_err(|_| {
+                            std::io::Error::other("actual fresh candidate attach failed")
+                        })?;
+                    let staged_at = clock.elapsed();
+                    let ready = loop {
+                        actor
+                            .tick(clock.elapsed().as_millis() as u64)
+                            .map_err(|_| {
+                                std::io::Error::other("fresh candidate health tick failed")
+                            })?;
+                        let status = actor
+                            .redundant(Command::Status {
+                                scope: scope.clone(),
+                            })
+                            .map_err(|_| std::io::Error::other("fresh candidate status failed"))?;
+                        if status.primary_ready && status.standby_ready {
+                            break status;
+                        }
+                        if clock.elapsed().saturating_sub(staged_at) >= Duration::from_secs(25) {
+                            return Err(std::io::Error::other(
+                                "authentic fresh A readiness deadline",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    };
+                    if ready.session.active != Slot::B
+                        || ready.session.committed != [false, true]
+                        || ready.session.membership_generation
+                            != staged.session.membership_generation
+                    {
+                        return Err(std::io::Error::other(
+                            "candidate health changed role/membership",
+                        ));
+                    }
+                    actor
+                        .redundant(Command::CommitCandidate {
+                            scope: scope.clone(),
+                            slot: Slot::A,
+                            expected_revision: ready.session.local_revision,
+                            expected_network_epoch: ready.session.network_epoch,
+                            session: nelomai_contracts::RedundantSessionView {
+                                session_id: scope.session_id.clone(),
+                                state: nelomai_contracts::RedundantSessionState::Connected,
+                                active_lease_id: ready.current_leases[1].clone(),
+                                slot_a_lease_id: ready.leases[0].clone(),
+                                slot_b_lease_id: ready.current_leases[1].clone(),
+                                standby_desired: true,
+                                role_generation: ready.session.role_generation,
+                                membership_generation: ready.session.membership_generation + 1,
+                                reason: None,
+                            },
+                        })
+                        .map_err(|_| {
+                            std::io::Error::other("canonical healthy candidate commit failed")
+                        })
                 })());
             }
         }
@@ -362,9 +433,14 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                 .expect("actual fresh candidate behind original TUN");
             assert_eq!(replacement.session.active, Slot::B);
             assert_eq!(replacement.session.installed, [true, true]);
-            assert_eq!(replacement.session.committed, [false, true]);
+            assert_eq!(replacement.session.committed, [true, true]);
+            assert_eq!(replacement.session.membership_generation, 3);
+            assert_eq!(
+                replacement.current_leases[0].as_deref(),
+                Some("44444444-4444-4444-8444-444444444444")
+            );
             assert!(replacement.primary_ready);
-            assert!(!replacement.standby_ready); // Closed external A peer: no fabricated health.
+            assert!(replacement.standby_ready);
             assert!(!replacement.cleanup_pending);
         }
         let (identity, network) = retained.expect("original worker interface/network");
