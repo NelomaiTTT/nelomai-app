@@ -480,7 +480,8 @@ fn recover_stale_engine(
                 &engine,
                 owner,
                 execution.clone(),
-            )?;
+            )?
+            .into_worker_factory();
             pair.recover(layout.identity.slot)
                 .map_err(|_| d::blocked())?;
             cleanup_legacy_services(&engine).map_err(|_| d::blocked())?;
