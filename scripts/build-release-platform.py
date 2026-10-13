@@ -69,7 +69,11 @@ def desktop(args, work, environment):
     run("cargo", "build", "--locked", "--release", "--target", target, "-p", "nelomai-app",
         "--features", "custom-protocol,desktop-runtime", "--bin", "nelomai-runtime", env=environment)
     if args.platform == "windows":
-        run("cargo", "test", "--locked", "--target", target, "-p", "nelomai-windows-service", env=environment)
+        # Match ordinary checks; this legacy carrier test requires the separate
+        # signed-fixture SYSTEM harness.
+        run("cargo", "test", "--locked", "--target", target, "-p", "nelomai-windows-service",
+            "--", "--skip", "windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair",
+            env=environment)
         run("pwsh", "-NoProfile", "-File", ROOT / "crates/windows-service/tests/defender-exclusions.ps1", env=environment)
         run("pwsh", "-NoProfile", "-File", ROOT / "scripts/windows/prepare-runtime.ps1", env=environment)
         native = ROOT / "src-tauri/windows/runtime"

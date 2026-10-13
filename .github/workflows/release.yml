@@ -121,7 +121,7 @@ jobs:
           -
             platform: "windows"
             architecture: "x86_64"
-            runner: "windows-2022"
+            runner: "windows-latest"
             rust_target: "x86_64-pc-windows-msvc"
           -
             platform: "macos"

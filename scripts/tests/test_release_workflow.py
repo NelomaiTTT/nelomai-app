@@ -483,6 +483,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
             targets = jobs[name]["strategy"]["matrix"]["include"]
             self.assertEqual({(row["platform"], row["architecture"]) for row in targets},
                 {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64")})
+        checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        draft_windows = next(row for row in jobs["native_drafts"]["strategy"]["matrix"]["include"]
+                             if row["platform"] == "windows")
+        self.assertEqual(draft_windows["runner"], checks["jobs"]["windows-build"]["runs-on"],
+                         "Windows drafts must execute ordinary service tests on the checks build host")
+        package_windows = next(row for row in jobs["native_packages"]["strategy"]["matrix"]["include"]
+                               if row["platform"] == "windows")
+        self.assertEqual(package_windows["runner"], "windows-2022")
         self.assertEqual(jobs["sign"]["environment"], "release-candidate-signing")
         self.assertEqual(jobs["finalize"]["environment"], "release-candidate-finalization")
         for name in ("native_drafts", "native_packages"):

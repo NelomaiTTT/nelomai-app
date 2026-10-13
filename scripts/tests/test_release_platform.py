@@ -32,11 +32,19 @@ class ReleasePlatformTest(ArtifactFixture):
         # Native compilation is external; packaging and signature verification
         # consume actual prepared payload bytes, not mocked manifests.
         def compiled(*command, **kwargs):
+            if command[:2] == ("cargo", "test"):
+                self.assertEqual(command, ("cargo", "test", "--locked", "--target",
+                    "x86_64-pc-windows-msvc", "-p", "nelomai-windows-service", "--", "--skip",
+                    "windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair"))
+                raise StopIteration("ordinary Windows service test command observed")
             return SimpleNamespace(stdout=json.dumps({"packages": [
                 {"name": "tauri", "manifest_path": str(tauri / "Cargo.toml")}
             ]}) if command[:2] == ("cargo", "metadata") else "")
         with patch.object(builder, "ROOT", self.root), patch.object(builder, "run", side_effect=compiled):
             manifest = builder.desktop(args, work, {})
+            windows = SimpleNamespace(**{**vars(args), "platform": "windows"})
+            with self.assertRaisesRegex(StopIteration, "ordinary Windows service test command observed"):
+                builder.desktop(windows, work, {})
         self.assertEqual(manifest["runtime_version"], "0.4.0")
         for slot in ("stable", "latest"):
             self.assertEqual(sorted(path.name for path in (output / slot).iterdir()), [
