@@ -6,6 +6,7 @@ $legacyName = 'ManagedDefenderExclusionPath'
 $prefix = $legacyName + 'V1-'
 
 function Normalize-LocalPath([string]$value) {
+    if ($value -match '^\\\\\?\\[A-Za-z]:\\') { $value = $value.Substring(4) }
     if ($value -notmatch '^[A-Za-z]:[\\/]') { throw 'Local absolute path required' }
     return [IO.Path]::GetFullPath($value).TrimEnd('\')
 }

@@ -1324,7 +1324,7 @@ pub(crate) struct ReadonlyNativeProfile {
     keys: zeroize::Zeroizing<Vec<[u8; 32]>>,
 }
 
-fn profile_number(value: &str, maximum: u32) -> Result<u32> {
+pub(crate) fn profile_number(value: &str, maximum: u32) -> Result<u32> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err(OwnerError::Invalid);
     }
@@ -1332,7 +1332,7 @@ fn profile_number(value: &str, maximum: u32) -> Result<u32> {
     (n <= maximum).then_some(n).ok_or(OwnerError::Invalid)
 }
 
-fn profile_range(value: &str, maximum: u32) -> Result<(u32, u32)> {
+pub(crate) fn profile_range(value: &str, maximum: u32) -> Result<(u32, u32)> {
     let (lo, hi) = value.split_once('-').unwrap_or((value, value));
     let range = (profile_number(lo, maximum)?, profile_number(hi, maximum)?);
     // AWG PickOne computes hi-lo+1 in uint32. The full uint32 interval is
@@ -1343,7 +1343,7 @@ fn profile_range(value: &str, maximum: u32) -> Result<(u32, u32)> {
     Ok(range)
 }
 
-fn profile_key(value: &str, allow_zero: bool) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+pub(crate) fn profile_key(value: &str, allow_zero: bool) -> Result<zeroize::Zeroizing<[u8; 32]>> {
     fn digit(b: u8) -> Result<u8> {
         match b {
             b'A'..=b'Z' => Ok(b - b'A'),

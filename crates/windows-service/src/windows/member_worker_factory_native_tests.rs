@@ -18,6 +18,10 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    NetworkManagement::IpHelper::{
+        GetIpInterfaceEntry, InitializeIpInterfaceEntry, MIB_IPINTERFACE_ROW,
+    },
+    Networking::WinSock::AF_INET,
     System::Threading::{
         GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -491,7 +495,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         };
 
         let primary = Member { slot: Slot::A, lease_id: format!("22222222-2222-4222-8222-{:012x}", round + 1),
-            configuration: TunnelConfiguration::new(format!("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {}\nAllowedIPs = 198.51.100.0/24\nEndpoint = {}\nPersistentKeepalive = 1\n",public[0],endpoints[0])),
+            configuration: TunnelConfiguration::new(format!("[Interface]\nPrivateKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAddress = 10.7.0.2/32\nDNS = 1.1.1.1\nMTU = 1280\nJc = 2\nJmin = 40\nJmax = 80\nS1 = 12\nS2 = 12\nS3 = 12\nS4 = 12\nH1 = 111111\nH2 = 222222\nH3 = 333333\nH4 = 444444\nHeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nContentPaddingAddition = 0-32\n[Peer]\nPublicKey = {}\nAllowedIPs = 198.51.100.0/24\nEndpoint = {}\nPersistentKeepalive = 1\n",public[0],endpoints[0])),
             probe: RedundantHealthProbe { kind: HealthProbeKind::DnsA, target_ipv4: "198.51.100.53".parse().unwrap(), query_name: "example.com".into(), timeout_ms: 2000 } };
         let standby = Member {
             slot: Slot::B,
@@ -824,6 +828,17 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             .ok()?;
             Some((identity, network))
         });
+        let interface_mtu = retained.as_ref().and_then(|(proof, _)| {
+            let mut row = MIB_IPINTERFACE_ROW::default();
+            unsafe { InitializeIpInterfaceEntry(&mut row) };
+            row.Family = AF_INET;
+            row.InterfaceIndex = proof.index;
+            row.InterfaceLuid.Value = proof.luid;
+            (unsafe { GetIpInterfaceEntry(&mut row) } == 0
+                && row.InterfaceIndex == proof.index
+                && unsafe { row.InterfaceLuid.Value } == proof.luid)
+                .then_some(row.NlMtu)
+        });
         // Read-only independent observer. This HANDLE cannot authorize cleanup;
         // production retains its OWN original Child HANDLE from process creation.
         let observed = observe_worker(None);
@@ -852,9 +867,13 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             scope: scope.clone(),
         });
         let elapsed = repeat_at.elapsed();
+        let start_failure = started.as_ref().err().map(|error| match error {
+            ServiceError::PairOperation(failure) => failure.to_string(),
+            _ => error.code().to_owned(),
+        });
         assert!(
             interruption_reached,
-            "native {fault:?} interruption not reached"
+            "native {fault:?} interruption not reached; Start failure={start_failure:?}"
         );
         assert!(
             interrupted.is_err(),
@@ -885,6 +904,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             "local Stop elapsed {elapsed:?}"
         );
         assert_eq!(started.session.phase, SessionPhase::Running);
+        assert_eq!(interface_mtu, Some(1280), "actual owned Windows MTU");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
         let repeated = actor

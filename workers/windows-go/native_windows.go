@@ -50,7 +50,7 @@ func (o *nativeOwner) start(req request) (real tun.Device, ident identity, err e
 	if err = o.pinDLL(req.DLLSHA256); err != nil {
 		return nil, o.pending, err
 	}
-	o.real, err = createNativeTUN(req.Name, &guid, 1420)
+	o.real, err = createNativeTUN(req.Name, &guid, int(req.MTU))
 	if o.real != nil {
 		luidOwner, ok := o.real.(interface{ LUID() uint64 })
 		if !ok {

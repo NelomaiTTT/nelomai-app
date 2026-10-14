@@ -29,7 +29,7 @@ func (o *nativeOwner) start(req request) (tun.Device, identity, error) {
 	if err != nil {
 		return nil, identity{}, err
 	}
-	o.real = &hostTestTUN{socket: socket, events: make(chan tun.Event)}
+	o.real = &hostTestTUN{socket: socket, events: make(chan tun.Event), mtu: int(req.MTU)}
 	o.pending = identity{GUID: req.GUID, LUID: 1, Index: uint32(socket.LocalAddr().(*net.UDPAddr).Port)}
 	return &testWriteFault{Device: o.real}, o.pending, nil
 }
@@ -84,6 +84,7 @@ func testTransport(t *testing.T, ident identity) (func([]byte), func() []byte, f
 }
 
 type hostTestTUN struct {
+	mtu    int
 	socket *net.UDPConn
 	events chan tun.Event
 	mu     sync.Mutex
@@ -92,7 +93,7 @@ type hostTestTUN struct {
 
 func (t *hostTestTUN) File() *os.File           { return nil }
 func (t *hostTestTUN) Name() (string, error)    { return "host-test-native-effect", nil }
-func (t *hostTestTUN) MTU() (int, error)        { return 1420, nil }
+func (t *hostTestTUN) MTU() (int, error)        { return t.mtu, nil }
 func (t *hostTestTUN) BatchSize() int           { return 1 }
 func (t *hostTestTUN) Events() <-chan tun.Event { return t.events }
 func (t *hostTestTUN) LUID() uint64             { return 1 }

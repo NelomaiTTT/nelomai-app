@@ -30,6 +30,7 @@ type request struct {
 	Name          string   `json:"name,omitempty"`
 	GUID          string   `json:"guid,omitempty"`
 	DLLSHA256     string   `json:"dll_sha256,omitempty"`
+	MTU           uint32   `json:"mtu,omitempty"`
 	Slot          uint32   `json:"slot,omitempty"`
 	Generation    uint64   `json:"generation,omitempty"`
 	Configuration string   `json:"configuration,omitempty"`
@@ -46,6 +47,7 @@ type response struct {
 	Session    uint64                  `json:"session"`
 	OK         bool                    `json:"ok"`
 	Error      string                  `json:"error,omitempty"`
+	MTU        uint32                  `json:"mtu,omitempty"`
 	Identity   identity                `json:"identity"`
 	Handshakes [2]int64                `json:"handshakes"`
 	Counters   RedundantTunnelCounters `json:"counters"`
@@ -187,6 +189,9 @@ func (w *worker) command(req request, reply *response) error {
 	}
 	switch req.Op {
 	case "start":
+		if req.MTU < 576 || req.MTU > 1969 {
+			return errors.New("invalid_mtu")
+		}
 		digest, err := hex.DecodeString(req.DLLSHA256)
 		if w.started || req.Name == "" || len(req.Name) > 100 || req.GUID == "" || err != nil || len(digest) != 32 {
 			return errors.New("invalid_start")
@@ -198,6 +203,11 @@ func (w *worker) command(req request, reply *response) error {
 		if err != nil {
 			return err
 		}
+		mtu, err := real.MTU()
+		if err != nil || mtu != int(req.MTU) {
+			return errors.New("native_mtu_mismatch")
+		}
+		reply.MTU = uint32(mtu)
 		dispatcher, err := NewRedundantTunnel(real)
 		if err != nil {
 			return err

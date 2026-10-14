@@ -1319,7 +1319,7 @@ impl Control {
         params: MemberParameters,
         path: &crate::member_physical::PhysicalRoute,
     ) -> io::Result<()> {
-        let uapi = uapi(member.configuration.expose())?;
+        let uapi = uapi(member.configuration.expose(), params.mtu)?;
         let p = self.original.interface.get().ok_or_else(failed)?;
         super::member_physical::verify(
             path,
@@ -1354,9 +1354,35 @@ impl Control {
         self.bindings[slot_index(member.slot)] = Some(path.clone());
         Ok(())
     }
-    fn create_address(&mut self, source: [u8; 4]) -> io::Result<()> {
+    fn create_address(&mut self, source: [u8; 4], mtu: u32) -> io::Result<()> {
         self.authorize()?;
         let p = self.original.interface.get().ok_or_else(failed)?;
+        let mut interface = MIB_IPINTERFACE_ROW::default();
+        unsafe { InitializeIpInterfaceEntry(&mut interface) };
+        interface.Family = AF_INET;
+        interface.InterfaceIndex = p.index;
+        interface.InterfaceLuid.Value = p.luid;
+        if unsafe { GetIpInterfaceEntry(&mut interface) } != 0
+            || interface.InterfaceIndex != p.index
+            || unsafe { interface.InterfaceLuid.Value } != p.luid
+        {
+            return Err(failed());
+        }
+        self.authorize()?;
+        interface.NlMtu = mtu;
+        interface.SitePrefixLength = 0; // Required for IPv4 SetIpInterfaceEntry.
+        if unsafe { SetIpInterfaceEntry(&mut interface) } != 0 {
+            return Err(failed());
+        }
+        self.authorize()?;
+        if unsafe { GetIpInterfaceEntry(&mut interface) } != 0
+            || interface.InterfaceIndex != p.index
+            || unsafe { interface.InterfaceLuid.Value } != p.luid
+            || interface.NlMtu != mtu
+        {
+            return Err(failed());
+        }
+        self.authorize()?;
         let mut row = address_row(p, source);
         let before = unsafe { GetUnicastIpAddressEntry(&mut row) };
         if before != windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
@@ -1707,10 +1733,13 @@ impl member_dns::Identity for WorkerDns {
         Ok(member_dns::Ownership::NewlyCreated)
     }
 }
-fn uapi(configuration: &str) -> io::Result<Zeroizing<String>> {
+fn uapi(configuration: &str, mtu: u32) -> io::Result<Zeroizing<String>> {
     let canonical = crate::redundancy::slot_configuration(configuration).map_err(|_| failed())?;
     let mut text = Zeroizing::new(String::from("listen_port=0\nreplace_peers=true\n"));
     let mut peer = false;
+    let mut paddings = [0; 4];
+    let mut content_padding = 0;
+    let mut header_protection = false;
     for line in canonical.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -1724,25 +1753,45 @@ fn uapi(configuration: &str) -> io::Result<Zeroizing<String>> {
         let key = key.trim().to_ascii_lowercase();
         let value = value.trim();
         let field = match (peer, key.as_str()) {
-            (false, "address" | "dns" | "table") => continue,
+            (false, "address" | "dns" | "table" | "mtu") => continue,
             (false, "privatekey") => "private_key",
             (true, "publickey") => "public_key",
             (true, "presharedkey") => "preshared_key",
             (true, "endpoint") => "endpoint",
             (true, "allowedips") => "allowed_ip",
             (true, "persistentkeepalive") => "persistent_keepalive_interval",
+            (false, "headerprotectionkey") => "header_protection_key",
+            (false, "contentpaddingaddition") => {
+                content_padding = checked(crate::member_owner::profile_range(value, 2016))?.1;
+                "content_padding_addition"
+            }
+            (false, "s1" | "s2" | "s3" | "s4") => {
+                paddings[(key.as_bytes()[1] - b'1') as usize] =
+                    checked(crate::member_owner::profile_number(value, 65535))?;
+                key.as_str()
+            }
             (
                 false,
-                "jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" | "h1" | "h2" | "h3" | "h4"
-                | "i1" | "i2" | "i3" | "i4" | "i5",
+                "jc" | "jmin" | "jmax" | "h1" | "h2" | "h3" | "h4" | "i1" | "i2" | "i3" | "i4"
+                | "i5",
             ) => key.as_str(),
             _ => return Err(io::ErrorKind::Unsupported.into()),
         };
-        if matches!(field, "private_key" | "public_key" | "preshared_key") {
-            let mut bytes = crate::member_pair::decode_peer(value)?;
+        if matches!(
+            field,
+            "private_key" | "public_key" | "preshared_key" | "header_protection_key"
+        ) {
+            let mut bytes = if field == "header_protection_key" {
+                checked(crate::member_owner::profile_key(value, true))?
+            } else {
+                Zeroizing::new(crate::member_pair::decode_peer(value)?)
+            };
+            if field == "header_protection_key" {
+                header_protection = bytes.iter().any(|byte| *byte != 0);
+            }
             text.push_str(field);
             text.push('=');
-            for byte in bytes {
+            for byte in bytes.iter() {
                 text.push_str(&format!("{byte:02x}"));
             }
             text.push('\n');
@@ -1756,7 +1805,16 @@ fn uapi(configuration: &str) -> io::Result<Zeroizing<String>> {
             }
         }
     }
-    if text.len() > FRAME / 2 {
+    // The pinned Windows worker uses a 2016-byte AWG-Go buffer for both
+    // transports. Preserve the existing profile's worst-case padding bound.
+    if [148, 92, 64]
+        .iter()
+        .zip(paddings)
+        .any(|(message, padding)| message + padding > 2016)
+        || mtu + paddings[3] + content_padding + 47 > 2016
+        || (header_protection && paddings.iter().any(|padding| *padding < 12))
+        || text.len() > FRAME / 2
+    {
         return Err(failed());
     }
     Ok(text)
@@ -1821,7 +1879,7 @@ impl PairControl for Control {
         }
         options.validate().map_err(|_| failed())?;
         let params = MemberParameters::parse(member.configuration.expose())?;
-        let _validated = uapi(member.configuration.expose())?;
+        let _validated = uapi(member.configuration.expose(), params.mtu)?;
         let session = u64::from_be_bytes(
             self.original.requested[..8]
                 .try_into()
@@ -1833,7 +1891,15 @@ impl PairControl for Control {
             .borrow_mut()
             .save(|r| r.process = self.original.process.get())?;
         self.original.start_attempted.set(true);
-        let reply=self.call(json!({"op":"start","name":format!("NeloWorker-{}",&self.scope.session_id[..8]),"guid":guid_text(self.original.requested),"dll_sha256":self.original.source.dll_sha256()}),Duration::from_secs(30))?;
+        let reply=self.call(json!({"op":"start","name":format!("NeloWorker-{}",&self.scope.session_id[..8]),"guid":guid_text(self.original.requested),"dll_sha256":self.original.source.dll_sha256(),"mtu":params.mtu}),Duration::from_secs(30))?;
+        if reply["mtu"].as_u64() != Some(u64::from(params.mtu)) {
+            return Err(failed());
+        }
+        #[cfg(test)]
+        super::member_carrier_factory_test_os::trace_step(&format!(
+            "worker actual TUN MTU={}",
+            params.mtu
+        ));
         let identity = &reply["identity"];
         let p = InterfaceProof {
             guid: self.original.requested,
@@ -1865,7 +1931,7 @@ impl PairControl for Control {
             weight: None,
         };
         self.guard_transition(deny.clone(), false)?;
-        self.create_address(params.source.octets())?;
+        self.create_address(params.source.octets(), params.mtu)?;
         if !params.dns.is_empty() {
             self.set_dns(&params.dns)?;
         }
@@ -1938,11 +2004,12 @@ impl PairControl for Control {
         // One immutable OS dataplane: B changes only its crypto peer/endpoint.
         if params.source != primary.source
             || params.dns != primary.dns
+            || params.mtu != primary.mtu
             || ipnet::IpNet::aggregate(&params.allowed) != ipnet::IpNet::aggregate(&primary.allowed)
         {
             return Err(failed());
         }
-        let _validated = uapi(member.configuration.expose())?;
+        let _validated = uapi(member.configuration.expose(), params.mtu)?;
         self.check_integrity()?;
         let p = self.original.interface.get().ok_or_else(failed)?;
         let owned = [crate::member_physical::InterfaceIdentity {

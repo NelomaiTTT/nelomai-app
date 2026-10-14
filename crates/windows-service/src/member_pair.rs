@@ -1330,6 +1330,7 @@ pub(crate) struct MemberParameters {
     pub peer: [u8; 32],
     pub allowed: Vec<ipnet::IpNet>,
     pub dns: Vec<IpAddr>,
+    pub mtu: u32,
 }
 impl MemberParameters {
     pub(crate) fn parse(configuration: &str) -> io::Result<Self> {
@@ -1354,7 +1355,7 @@ impl MemberParameters {
             let key = key.trim().to_ascii_lowercase();
             if matches!(
                 (section, key.as_str()),
-                ("interface", "address" | "dns")
+                ("interface", "address" | "dns" | "mtu")
                     | ("peer", "endpoint" | "allowedips" | "publickey")
             ) && fields.insert(key, value.trim()).is_some()
             {
@@ -1417,12 +1418,21 @@ impl MemberParameters {
         {
             return Err(failed());
         }
+        let mtu = fields
+            .get("mtu")
+            .map(|value| crate::member_owner::profile_number(value, 65535).map_err(|_| failed()))
+            .transpose()?
+            .unwrap_or(1420);
+        if mtu < 576 {
+            return Err(failed());
+        }
         Ok(Self {
             source: sources[0],
             endpoint: endpoint.ip(),
             peer: decode_peer(get("publickey")?)?,
             allowed,
             dns,
+            mtu,
         })
     }
 }

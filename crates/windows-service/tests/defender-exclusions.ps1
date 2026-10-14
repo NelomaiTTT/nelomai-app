@@ -43,6 +43,30 @@ Assert ($global:Owned.Count -eq 2 -and $global:Excluded.Count -eq 2) 'Stage clea
 Invoke-Fixture 'cleanup'
 Assert ($global:Owned.Count -eq 0 -and $global:Excluded.Count -eq 0) 'Full cleanup must remove owned paths'
 
+# The verified broker uses a canonical extended local path; copying/repair must
+# own the same exact DLL paths as the ordinary NSIS representation.
+$plainInstallDir = $env:NELOMAI_DEFENDER_INSTALL_DIR
+$plainPrivilegedDir = $env:NELOMAI_DEFENDER_PRIVILEGED_DIR
+$currentPaths = @($source, $stage, $final) | ForEach-Object { $_.Replace('0.2.16', '0.4.0') }
+foreach ($path in $currentPaths) { Invoke-Fixture 'add' $path }
+$ownershipNames = @($global:Owned.Keys | Sort-Object) -join ','
+try {
+    $env:NELOMAI_DEFENDER_INSTALL_DIR = '\\?\' + $plainInstallDir
+    foreach ($path in $currentPaths) { Invoke-Fixture 'add' $path }
+    $env:NELOMAI_DEFENDER_PRIVILEGED_DIR = '\\?\' + $plainPrivilegedDir
+    foreach ($path in $currentPaths) { Invoke-Fixture 'add' ('\\?\' + $path) }
+    Assert ($global:Owned.Count -eq 3 -and $global:Excluded.Count -eq 3) 'Canonical paths must not duplicate exact exceptions'
+    Assert ((@($global:Owned.Keys | Sort-Object) -join ',') -eq $ownershipNames) 'Canonical paths must retain the same ownership names'
+    foreach ($path in $currentPaths) {
+        Assert ($global:Excluded -contains $path) 'Store the same ordinary exact path for Defender'
+        Invoke-Fixture 'remove' ('\\?\' + $path)
+    }
+    Assert ($global:Owned.Count -eq 0 -and $global:Excluded.Count -eq 0) 'Canonical removal must clean the same owned paths'
+} finally {
+    $env:NELOMAI_DEFENDER_INSTALL_DIR = $plainInstallDir
+    $env:NELOMAI_DEFENDER_PRIVILEGED_DIR = $plainPrivilegedDir
+}
+
 # An already present user's exception must not become installer-owned.
 $global:Excluded = @($source)
 Invoke-Fixture 'add' $source
@@ -61,7 +85,7 @@ Invoke-Fixture 'cleanup'
 Assert ($global:Owned.Count -eq 0) 'Failed Add record remained after cleanup'
 
 # Invalid roots/paths cannot reach any external Add; old valid ownership works.
-foreach ($path in @('C:\Users\fixture\amneziawg-tunnel.dll', 'C:\Program Files\Nelomai', 'C:\Program Files\Nelomai\runtime\engines\latest\0.2.16\other.dll', '\\host\share\amneziawg-tunnel.dll')) {
+foreach ($path in @('C:\Users\fixture\amneziawg-tunnel.dll', 'C:\Program Files\Nelomai', 'C:\Program Files\Nelomai\runtime\engines\latest\0.2.16\other.dll', '\\host\share\amneziawg-tunnel.dll', '\\?\UNC\host\share\amneziawg-tunnel.dll', '\\.\C:\Program Files\Nelomai\amneziawg-tunnel.dll', '\\?\C:relative\amneziawg-tunnel.dll', '\??\C:\Program Files\Nelomai\amneziawg-tunnel.dll', '\\?\C:\Users\fixture\amneziawg-tunnel.dll')) {
     $failed = $false
     try { Invoke-Fixture 'add' $path } catch { $failed = $true }
     Assert ($failed -and $global:Owned.Count -eq 0 -and $global:Excluded.Count -eq 0) 'Invalid path reached Defender'

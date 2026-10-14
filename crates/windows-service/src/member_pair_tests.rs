@@ -1035,6 +1035,13 @@ fn native_parameters_are_literal_bounded_and_reject_duplicate_or_ipv6_dns() {
     assert_eq!(p.peer, [1; 32]);
     assert_eq!(p.source, Ipv4Addr::new(10, 2, 0, 2));
     assert_eq!(p.allowed.len(), 2);
+    assert_eq!(p.mtu, 1420);
+    let explicit = config.replace("[Peer]", "MTU = 1280\n[Peer]");
+    assert_eq!(MemberParameters::parse(&explicit).unwrap().mtu, 1280);
+    for mtu in ["575", "65536", "invalid", "1280\nMTU = 1280"] {
+        let invalid = config.replace("[Peer]", &format!("MTU = {mtu}\n[Peer]"));
+        assert!(MemberParameters::parse(&invalid).is_err());
+    }
     assert!(MemberParameters::parse(&config.replace("9.9.9.9", "2001:db8::53")).is_err());
     assert!(
         MemberParameters::parse(&config.replace("192.0.2.5:51820", "host.example:51820")).is_err()

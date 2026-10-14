@@ -823,6 +823,28 @@ fn cold_native_profile_rejects_keys_ranges_and_unsafe_awg_before_effects() {
         "ContentPaddingAddition = 4294967295\n",
         "HeaderProtectionKey = not-a-key\n",
     ] {
+        if extra.starts_with("MTU") {
+            let (_, state) = setup();
+            let logical = CARRIER_CONFIG
+                .replace("PRIVATE-TEST-KEY", COLD_KEY)
+                .replace("[Peer]", &format!("{extra}[Peer]"));
+            assert!(
+                MemberOwner::from_trusted_carrier_engine(
+                    &carrier_intent(),
+                    TunnelSlot::B,
+                    TunnelTransport::WireGuard,
+                    crate::test_engine_path("engine.exe"),
+                    &logical,
+                    Disk(state.clone()),
+                    Io(state.clone(), false),
+                )
+                .is_err(),
+                "{extra}"
+            );
+            assert_eq!(state.borrow().read_step, 0);
+            assert!(state.borrow().events.is_empty());
+            continue;
+        }
         let (mut owner, state) = cold_owner(extra);
         assert!(owner.prepare_readonly_native_profile().is_err(), "{extra}");
         assert_eq!(state.borrow().read_step, 0);

@@ -120,10 +120,10 @@ func TestWorkerLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		guid := fmt.Sprintf("{%x-%x-%x-%x-%x}", nonce[:4], nonce[4:6], nonce[6:8], nonce[8:10], nonce[10:])
-		return request{Op: "start", Name: "NeloWorker-" + fmt.Sprint(time.Now().UnixNano()), GUID: guid, DLLSHA256: testDLLSHA(t)}
+		return request{Op: "start", Name: "NeloWorker-" + fmt.Sprint(time.Now().UnixNano()), GUID: guid, DLLSHA256: testDLLSHA(t), MTU: 1280}
 	}
 	start := call(startRequest())
-	if !start.OK || start.Identity.Index == 0 || start.Identity.LUID == 0 {
+	if !start.OK || start.Identity.Index == 0 || start.Identity.LUID == 0 || start.MTU != 1280 {
 		t.Fatalf("Start: %+v", start)
 	}
 	send, receiveUDP, closeUDP := testTransport(t, start.Identity)
@@ -419,7 +419,7 @@ func TestMain(m *testing.M) {
 				os.Exit(1)
 			}
 			peers[slot] = device.NewDevice(newTestPeer(fmt.Sprint(slot)), conn.NewStdNetBind(), device.NewLogger(device.LogLevelSilent, ""))
-			configuration := fmt.Sprintf("private_key=%s\nlisten_port=0\npublic_key=%s\nallowed_ip=10.7.0.2/32\n\n", hex.EncodeToString(remote.Bytes()), hex.EncodeToString(client.PublicKey().Bytes()))
+			configuration := fmt.Sprintf("private_key=%s\nlisten_port=0\njc=2\njmin=40\njmax=80\ns1=12\ns2=12\ns3=12\ns4=12\nh1=111111\nh2=222222\nh3=333333\nh4=444444\nheader_protection_key=%s\ncontent_padding_addition=0-32\npublic_key=%s\nallowed_ip=10.7.0.2/32\n\n", hex.EncodeToString(remote.Bytes()), hex.EncodeToString(bytes.Repeat([]byte{2}, 32)), hex.EncodeToString(client.PublicKey().Bytes()))
 			if peers[slot].IpcSet(configuration) != nil || peers[slot].Up() != nil {
 				os.Exit(1)
 			}
