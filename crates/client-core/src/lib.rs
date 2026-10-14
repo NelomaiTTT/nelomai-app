@@ -3317,7 +3317,7 @@ where
             if pending.redundant_session_id.as_deref() != Some(pair.session.session_id.as_str()) {
                 return Err(CoreError::Storage);
             }
-            self.close_desktop_pair(desktop_redundancy::scope(&pair, self.load_runtime()?.slot)?)
+            self.close_desktop_pair(desktop_redundancy::scope(pair, self.load_runtime()?.slot)?)
                 .await?;
         }
         if !desktop_stop && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
