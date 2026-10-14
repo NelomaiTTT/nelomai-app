@@ -725,3 +725,43 @@ fn split_tunnel_debug_omits_packages_names_and_cidrs() {
     assert!(!settings_debug.contains("com.private.application"));
     assert!(!settings_debug.contains("Private App"));
 }
+
+#[test]
+fn async_stop_extension_is_optional_and_typed() {
+    let mut start: Value =
+        serde_json::from_str(&fixture("valid/connection-start-redundant-response.json")).unwrap();
+    let legacy: ConnectionStartResponse = serde_json::from_value(start.clone()).unwrap();
+    assert!(!legacy.redundancy.unwrap().async_stop_v1);
+    start["redundancy"]["async_stop_v1"] = true.into();
+    assert!(
+        serde_json::from_value::<ConnectionStartResponse>(start.clone())
+            .unwrap()
+            .redundancy
+            .unwrap()
+            .async_stop_v1
+    );
+    start["redundancy"]["async_stop_v1"] = "true".into();
+    assert!(!schema_is_valid(
+        "connection-start-response.schema.json",
+        &start
+    ));
+    assert!(serde_json::from_value::<ConnectionStartResponse>(start).is_err());
+    let mut stop: Value =
+        serde_json::from_str(&fixture("valid/connection-redundant-stop.json")).unwrap();
+    let legacy: RedundantStopRequest = serde_json::from_value(stop.clone()).unwrap();
+    assert!(!legacy.background_cleanup);
+    assert!(serde_json::to_value(legacy)
+        .unwrap()
+        .get("background_cleanup")
+        .is_none());
+    stop["background_cleanup"] = true.into();
+    assert!(schema_is_valid("connection-redundancy.schema.json", &stop));
+    let negotiated: RedundantStopRequest = serde_json::from_value(stop.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(negotiated).unwrap()["background_cleanup"],
+        true
+    );
+    stop["background_cleanup"] = "true".into();
+    assert!(!schema_is_valid("connection-redundancy.schema.json", &stop));
+    assert!(serde_json::from_value::<RedundantStopRequest>(stop).is_err());
+}

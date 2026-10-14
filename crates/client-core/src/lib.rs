@@ -3002,14 +3002,7 @@ where
             .flatten()
             .and_then(|stored| stored.pending_compensation_stop)
         {
-            self.resume_pending_compensation_stop(pending).await?;
-            return self
-                .state
-                .lock()
-                .await
-                .connection
-                .clone()
-                .ok_or(CoreError::SavedConnectionUnavailable);
+            return self.resume_pending_compensation_stop(pending).await;
         }
         if self.pending_start_active.load(Ordering::SeqCst) {
             let pending_is_recovery_v2 = self
@@ -3031,14 +3024,7 @@ where
                     None,
                     current.session_id.as_deref(),
                 )?;
-                self.resume_pending_compensation_stop(pending).await?;
-                return self
-                    .state
-                    .lock()
-                    .await
-                    .connection
-                    .clone()
-                    .ok_or(CoreError::SavedConnectionUnavailable);
+                return self.resume_pending_compensation_stop(pending).await;
             }
         }
         if self.state.lock().await.connection.is_none() {
@@ -3083,7 +3069,10 @@ where
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
         let stored = self.load_runtime()?;
         if let Some(pending) = stored.pending_compensation_stop.clone() {
-            return self.resume_pending_compensation_stop(pending).await;
+            return self
+                .resume_pending_compensation_stop(pending)
+                .await
+                .map(|_| ());
         }
         if let Some(pending) = stored.pending_stalled_stop.clone() {
             return self
@@ -3227,7 +3216,7 @@ where
     async fn resume_pending_compensation_stop(
         &self,
         pending: StoredPendingCompensationStop,
-    ) -> Result<(), CoreError> {
+    ) -> Result<Connection, CoreError> {
         self.require_core_stop_ownership().await?;
         let current = self.state.lock().await.connection.clone();
         let session_id = pending_compensation_redundant_session(&pending)?;
@@ -3264,7 +3253,8 @@ where
         if pending.failure_code.as_deref() == Some("tunnel_handshake_timeout") {
             self.reconcile_pending_handshake_timeout_storage(&stopped)?;
         }
-        self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)
+        self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
+        Ok(stopped)
     }
 
     /// Close only the protected original scope. A restarted cleanup-only helper
@@ -3307,7 +3297,7 @@ where
     async fn replay_pending_compensation_stop_without_connection(
         &self,
         pending: StoredPendingCompensationStop,
-    ) -> Result<(), CoreError> {
+    ) -> Result<Connection, CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         self.set_phase(Phase::Stopping).await;
@@ -3323,7 +3313,7 @@ where
         #[cfg(target_os = "android")]
         let desktop_stop = false;
         #[cfg(not(target_os = "android"))]
-        if let Some(pair) = desktop_pair {
+        if let Some(pair) = desktop_pair.as_ref() {
             if pending.redundant_session_id.as_deref() != Some(pair.session.session_id.as_str()) {
                 return Err(CoreError::Storage);
             }
@@ -3354,11 +3344,15 @@ where
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
 
+        let access_token = self.access_snapshot().await?;
+        #[cfg(not(target_os = "android"))]
+        if desktop_stop {
+            self.desktop_stop_retention(&access_token, &pending).await?;
+        }
         let stored = self.load_runtime()?;
         if stored.pending_compensation_stop.as_ref() != Some(&pending) {
             return Err(CoreError::Storage);
         }
-        let access_token = self.access_snapshot().await?;
         let response = match self.retry_compensation_stop(&access_token, &pending).await {
             Ok(response) => response,
             Err(error) => {
@@ -3381,6 +3375,58 @@ where
                 return Err(error);
             }
         };
+        if response.stop_acceptance.is_some() {
+            // Acceptance transfers remote cleanup to the panel. It is not a
+            // terminal lease result and must not remain the current connection.
+            let mut current = self.load_runtime()?;
+            if current.auth_scope != stored.auth_scope
+                || current.pending_compensation_stop.as_ref() != Some(&pending)
+                || current.desktop_redundancy != stored.desktop_redundancy
+            {
+                return Err(CoreError::Storage);
+            }
+            let pair = stored
+                .desktop_redundancy
+                .as_ref()
+                .ok_or(CoreError::Storage)?;
+            let frozen = pair.stop.as_ref().ok_or(CoreError::Storage)?;
+            for cached in [
+                &mut current.saved_connection,
+                &mut current.pinned_connection,
+            ] {
+                if cached.as_ref().is_some_and(|saved| {
+                    saved.lease_id == pair.connection.lease_id
+                        || frozen
+                            .committed_leases
+                            .iter()
+                            .flatten()
+                            .any(|id| id == &saved.lease_id)
+                        || pair.candidate.as_ref().is_some_and(|candidate| {
+                            candidate.connection.lease_id == saved.lease_id
+                        })
+                }) {
+                    *cached = None;
+                }
+            }
+            current.pending_compensation_stop = None;
+            current.desktop_redundancy = None;
+            if self.store.save(&current).is_err()
+                && self.store.load().ok().flatten().as_ref() != Some(&current)
+            {
+                return Err(CoreError::Storage);
+            }
+            *self.state.lock().await = CoreState {
+                phase: Phase::Ready,
+                connection: None,
+            };
+            self.logger.record(CoreLogEvent {
+                kind: "connection.stop_accepted",
+                operation_id: Some(pending.operation_id),
+                request_id: Some(response.request_id),
+                code: None,
+            });
+            return Ok(response.connection);
+        }
         require_compensation_stop_finished(
             pending.failure_code.as_deref(),
             pending.accept_warm,
@@ -3402,7 +3448,7 @@ where
             request_id: Some(response.request_id),
             code: None,
         });
-        Ok(())
+        Ok(response.connection)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -5473,7 +5519,26 @@ where
         let retain_active_peer = self.desktop_stop_retention(access_token, pending).await?;
         #[cfg(target_os = "android")]
         let retain_active_peer = false;
+        let stored = self.load_runtime()?;
+        let background_cleanup = match stored.desktop_redundancy.as_ref() {
+            Some(pair) => match pair.stop.as_ref() {
+                Some(stop)
+                    if pair.session.session_id == session_id
+                        && stop.operation_id == pending.operation_id
+                        && stop.active_lease_id == pending.lease_id
+                        && stop.retain_active_peer == pending.accept_warm
+                        && (!stop.retain_active_peer || stop.role_confirmed)
+                        && stored.pending_compensation_stop.as_ref() == Some(pending) =>
+                {
+                    stop.background_cleanup
+                }
+                None => false, // Failed Start keeps the full compensation path.
+                _ => return Err(CoreError::Storage),
+            },
+            None => false,
+        };
         let request = RedundantStopRequest {
+            background_cleanup,
             retain_active_peer,
             operation_id: pending.operation_id.clone(),
             lease_id: pending.lease_id.clone(),
@@ -5493,6 +5558,22 @@ where
                 Ok(response) => {
                     if response.connection.lease_id != pending.lease_id {
                         return Err(invalid_operation_reconcile_response());
+                    }
+                    if let Some(acceptance) = response.stop_acceptance.as_ref() {
+                        if !request.background_cleanup
+                            || !acceptance.accepted
+                            || acceptance.operation_id != request.operation_id
+                            || acceptance.session_id != request.session_id
+                            || acceptance.lease_id != request.lease_id
+                            || response
+                                .connection
+                                .session_id
+                                .as_deref()
+                                .is_some_and(|id| id != request.session_id)
+                        {
+                            return Err(invalid_operation_reconcile_response());
+                        }
+                        return Ok(response);
                     }
                     // A released primary is not proof that the reserve is clean.
                     if response.connection.session_id.is_some() {

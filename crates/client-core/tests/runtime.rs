@@ -539,6 +539,7 @@ impl TunnelController for MemoryTunnel {
 struct MockApi {
     stop_response_override: Mutex<Option<Connection>>,
     redundant_stop_responses: Mutex<VecDeque<Result<Connection, CoreApiError>>>,
+    async_stop_responses: Mutex<VecDeque<serde_json::Value>>,
     transport_resets: AtomicUsize,
     refresh_calls: AtomicUsize,
     start_calls: AtomicUsize,
@@ -602,6 +603,7 @@ impl MockApi {
         Self {
             stop_response_override: Mutex::new(None),
             redundant_stop_responses: Mutex::new(VecDeque::new()),
+            async_stop_responses: Mutex::new(VecDeque::new()),
             transport_resets: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
@@ -881,6 +883,7 @@ impl CoreApi for MockApi {
             .map(|start| start.tic_connection_mode);
         if let Some(connection) = self.stop_response_override.lock().unwrap().clone() {
             return Ok(ConnectionOperationResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "req-stop".into(),
                 connection,
@@ -894,6 +897,7 @@ impl CoreApi for MockApi {
             && !self.server_observed_handshake.load(Ordering::SeqCst)
             && last_start_mode == Some(TicConnectionMode::Dynamic);
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-stop".to_string(),
             connection: Connection {
@@ -989,14 +993,19 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.clone());
+        if let Some(response) = self.async_stop_responses.lock().unwrap().pop_front() {
+            return serde_json::from_value(response).map_err(|_| CoreApiError::Retryable);
+        }
         if let Some(result) = self.redundant_stop_responses.lock().unwrap().pop_front() {
             return result.map(|connection| ConnectionOperationResponse {
+                stop_acceptance: None,
                 api_version: ApiVersion::V1,
                 request_id: "req-redundant-stop".to_string(),
                 connection,
             });
         }
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-redundant-stop".to_string(),
             connection: Connection {
@@ -1025,6 +1034,7 @@ impl CoreApi for MockApi {
             });
         }
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-pin".to_string(),
             connection: Connection {
@@ -1041,6 +1051,7 @@ impl CoreApi for MockApi {
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.unpin_calls.fetch_add(1, Ordering::SeqCst);
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "req-unpin".to_string(),
             connection: Connection {
@@ -2761,6 +2772,7 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
                 let mut stored = store.value.lock().unwrap();
                 let pair = stored.desktop_redundancy.as_mut().unwrap();
                 pair.session.warm_stop_v1 = true;
+                pair.session.async_stop_v1 = true;
                 pair.primary_reported = true;
                 let id = pair
                     .session
@@ -2852,6 +2864,7 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
                 .unwrap();
             assert_eq!(frozen.active_lease_id, last_active);
             assert!(frozen.retain_active_peer);
+            assert_eq!(frozen.background_cleanup, cfg!(target_os = "windows"));
             assert_eq!(core.state().await.connection.unwrap().lease_id, last_active);
             assert!(core.local_stop_pending_cleanup().await);
             core.stop().await.unwrap();
@@ -10915,5 +10928,236 @@ impl support::TestAuthApi for MockApi {
         self.refresh_calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(20)).await;
         Ok(token_response("fresh-access", "fresh-refresh"))
+    }
+}
+
+// Exercise the real journal/replay path on every host without changing native
+// Windows-only negotiation. This is an already-frozen Windows journal.
+async fn frozen_async_desktop_stop() -> (
+    PairCore,
+    Arc<MockApi>,
+    Arc<PairRuntime>,
+    Arc<DesktopPairTunnel>,
+    serde_json::Value,
+) {
+    let (core, api, store, tunnel, _) = missing_desktop_reserve().await;
+    core.finish_start_attempt();
+    core.stop_locally().await.unwrap();
+    let mut journal = serde_json::to_value(store.value.lock().unwrap().clone()).unwrap();
+    journal["desktop_redundancy"]["session"]["async_stop_v1"] = true.into();
+    journal["desktop_redundancy"]["stop"]["background_cleanup"] = true.into();
+    *store.value.lock().unwrap() =
+        serde_json::from_value(journal).expect("load negotiated Stop journal");
+    let pending = store
+        .value
+        .lock()
+        .unwrap()
+        .pending_compensation_stop
+        .clone()
+        .unwrap();
+    let mut stopped = connection(&pending.lease_id);
+    stopped.session_id = pending.redundant_session_id.clone();
+    let response = serde_json::json!({
+        "api_version": "1", "request_id": "accepted-stop", "connection": stopped,
+        "stop_acceptance": { "operation_id": pending.operation_id, "session_id": pending.redundant_session_id,
+            "lease_id": pending.lease_id, "accepted": true, "cleanup_pending": true }
+    });
+    (
+        core.with_retry_policy(RetryPolicy::new(Vec::new())),
+        api,
+        store,
+        tunnel,
+        response,
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_async_stop_acceptance_releases_local_ownership_without_faking_cleanup() {
+    for (cleanup_pending, session_present) in [(true, true), (true, false), (false, false)] {
+        let (core, api, store, tunnel, mut response) = frozen_async_desktop_stop().await;
+        response["stop_acceptance"]["cleanup_pending"] = cleanup_pending.into();
+        if !session_present {
+            response["connection"]["session_id"] = serde_json::Value::Null;
+        }
+        api.async_stop_responses
+            .lock()
+            .unwrap()
+            .push_back(response.clone());
+        let stopped = core.stop().await.unwrap();
+        assert_eq!(
+            stopped.session_id.as_deref(),
+            response["connection"]["session_id"].as_str()
+        );
+        assert_eq!(stopped.status, LeaseStatus::Issued);
+        assert_eq!(core.state().await.phase, Phase::Ready);
+        assert!(core.state().await.connection.is_none());
+        assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+        assert!(!core.local_stop_pending_cleanup().await);
+        let saved = store.value.lock().unwrap().clone();
+        assert!(saved.pending_compensation_stop.is_none() && saved.desktop_redundancy.is_none());
+        assert_eq!(
+            serde_json::to_value(&api.redundant_stop_requests.lock().unwrap()[0]).unwrap()
+                ["background_cleanup"],
+            true
+        );
+        let old_operation = response["stop_acceptance"]["operation_id"]
+            .as_str()
+            .unwrap();
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_002,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        core.finish_start_attempt();
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+        assert_ne!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .start_operation_id,
+            old_operation
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_async_stop_rejects_foreign_or_missing_acceptance_and_retains_exact_journal() {
+    for wrong in [
+        "operation_id",
+        "session_id",
+        "lease_id",
+        "accepted",
+        "missing",
+        "connection_lease",
+        "connection_session",
+        "malformed",
+        "native_close",
+    ] {
+        let (core, api, store, tunnel, mut response) = frozen_async_desktop_stop().await;
+        if wrong == "native_close" {
+            tunnel.fail_pair_close.store(true, Ordering::SeqCst);
+        } else if wrong == "malformed" {
+            response["stop_acceptance"]["accepted"] = "true".into();
+        } else if wrong == "connection_lease" {
+            response["connection"]["lease_id"] = "cccccccc-0000-4000-8000-000000000003".into();
+        } else if wrong == "connection_session" {
+            response["connection"]["session_id"] = "cccccccc-0000-4000-8000-000000000003".into();
+        } else if wrong == "missing" {
+            response.as_object_mut().unwrap().remove("stop_acceptance");
+        } else if wrong == "accepted" {
+            response["stop_acceptance"][wrong] = false.into();
+        } else {
+            response["stop_acceptance"][wrong] = "cccccccc-0000-4000-8000-000000000003".into();
+        }
+        let before = store.value.lock().unwrap().clone();
+        api.async_stop_responses.lock().unwrap().push_back(response);
+        assert!(core.stop().await.is_err(), "{wrong}");
+        assert_eq!(core.state().await.phase, Phase::Stopping);
+        assert_eq!(*store.value.lock().unwrap(), before, "{wrong}");
+        if wrong == "native_close" {
+            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_async_stop_lost_ack_and_storage_failure_replay_frozen_request_after_reload() {
+    let (core, api, store, tunnel, response) = frozen_async_desktop_stop().await;
+    api.redundant_stop_responses
+        .lock()
+        .unwrap()
+        .push_back(Err(CoreApiError::Rejected {
+            code: "connection_retryable".into(),
+            message: "lost ACK".into(),
+            retry_after_seconds: Some(1),
+        }));
+    assert!(core.stop().await.is_err());
+    let before = store.value.lock().unwrap().clone();
+    // Restart from the exact persisted journal; negotiation may no longer be advertised.
+    let mut journal = serde_json::to_value(&before).unwrap();
+    journal["desktop_redundancy"]["session"]["async_stop_v1"] = false.into();
+    *store.value.lock().unwrap() = serde_json::from_value(journal).unwrap();
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(support::TestOwner::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        local.clone(),
+    ));
+    let restarted = PairCore::new(
+        api.clone(),
+        store.clone(),
+        owner,
+        local,
+        Arc::new(MemoryLogger::default()),
+    );
+    api.async_stop_responses
+        .lock()
+        .unwrap()
+        .push_back(response.clone());
+    store.reject_next_save.store(true, Ordering::SeqCst);
+    assert!(restarted.stop().await.is_err());
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .pending_compensation_stop
+        .is_some());
+    api.async_stop_responses.lock().unwrap().push_back(response);
+    store.lose_next_save_ack.store(true, Ordering::SeqCst);
+    restarted.stop().await.unwrap();
+    assert_eq!(restarted.state().await.phase, Phase::Ready);
+    let requests = api.redundant_stop_requests.lock().unwrap();
+    assert!(requests.len() >= 3);
+    assert!(requests.iter().all(|request| request == &requests[0]));
+    assert_eq!(
+        serde_json::to_value(&requests[0]).unwrap()["background_cleanup"],
+        true
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_async_stop_clears_only_saved_members_of_the_retired_pair() {
+    for same_pair in [true, false] {
+        let (core, api, store, _, response) = frozen_async_desktop_stop().await;
+        let saved = StoredConnection {
+            lease_id: if same_pair {
+                response["stop_acceptance"]["lease_id"]
+                    .as_str()
+                    .unwrap()
+                    .into()
+            } else {
+                "cccccccc-0000-4000-8000-000000000003".into()
+            },
+            pool_id: None,
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: None,
+            kind: StoredConnectionKind::Pinned,
+            configuration: awg3_configuration("old-pinned"),
+            valid_until_unix: None,
+        };
+        {
+            let mut journal = store.value.lock().unwrap();
+            journal.saved_connection = Some(saved.clone());
+            journal.pinned_connection = Some(saved.clone());
+        }
+        api.async_stop_responses.lock().unwrap().push_back(response);
+        core.stop().await.unwrap();
+        let journal = store.value.lock().unwrap();
+        assert_eq!(
+            journal.saved_connection,
+            (!same_pair).then_some(saved.clone())
+        );
+        assert_eq!(journal.pinned_connection, (!same_pair).then_some(saved));
     }
 }

@@ -105,6 +105,7 @@ impl CoreApi for Panel {
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.requests.lock().unwrap().push(request.clone());
         Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
             api_version: ApiVersion::V1,
             request_id: "cold-cleanup".into(),
             connection: self.stopped.clone(),
@@ -397,6 +398,7 @@ async fn redundant_stall_accepted_receipt_survives_cleanup_before_start_attempt(
         assert!(f.app.desktop_redundancy_status().await.unwrap().is_none());
         f.app.reconcile_pending_operation_for_retry().await.unwrap();
         let expected = RedundantStopRequest {
+            background_cleanup: false,
             operation_id: pending.operation_id.clone(),
             lease_id: pending.lease_id.clone(),
             session_id: pending.redundant_session_id.clone().unwrap(),

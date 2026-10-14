@@ -549,6 +549,8 @@ impl fmt::Debug for RedundancyMember {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundancySession {
     #[serde(default)]
+    pub async_stop_v1: bool,
+    #[serde(default)]
     pub warm_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
@@ -746,6 +748,8 @@ impl<'de> Deserialize<'de> for RecoveryContractV2 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundantStopRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_cleanup: bool,
     pub operation_id: String,
     pub lease_id: String,
     pub recovery_contract_version: RecoveryContractV2,
@@ -766,9 +770,20 @@ pub struct ConnectionOperationRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnectionOperationResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_acceptance: Option<ClientStopAcceptance>,
     pub api_version: ApiVersion,
     pub request_id: String,
     pub connection: Connection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClientStopAcceptance {
+    pub operation_id: String,
+    pub session_id: String,
+    pub lease_id: String,
+    pub accepted: bool,
+    pub cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

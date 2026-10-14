@@ -152,6 +152,8 @@ impl fmt::Debug for StoredDesktopRedundancy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoredDesktopRedundantStop {
+    #[serde(default)]
+    pub background_cleanup: bool,
     pub operation_id: String,
     pub active_lease_id: String,
     pub role_generation: u64,

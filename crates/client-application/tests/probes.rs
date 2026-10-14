@@ -591,6 +591,7 @@ mod desktop_reserve_probes {
                     "absent" => state.desktop_redundancy = None,
                     "stopping" => {
                         pair.stop = Some(nelomai_client_storage::StoredDesktopRedundantStop {
+                            background_cleanup: false,
                             operation_id: "30000000-0000-4000-8000-000000000002".into(),
                             active_lease_id: pair.connection.lease_id.clone(),
                             role_generation: 0,

@@ -566,6 +566,7 @@ fn frozen_unconfirmed_pair() -> (
 ) {
     let mut pair = pair();
     let stop = StoredDesktopRedundantStop {
+        background_cleanup: false,
         operation_id: OP.into(),
         active_lease_id: B.into(),
         role_generation: 0,
@@ -728,6 +729,7 @@ fn canonical_role_ack_same_generation_is_action_fenced_for_running_and_stopped()
     assert!(confirm_role_command(&snapshot, &response).is_ok());
     let mut frozen = pair.clone();
     let stop = StoredDesktopRedundantStop {
+        background_cleanup: false,
         operation_id: OP.into(),
         active_lease_id: A.into(),
         role_generation: 4,
