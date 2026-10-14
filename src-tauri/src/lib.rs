@@ -2083,6 +2083,7 @@ mod tests {
         ));
     }
 
+    #[cfg(desktop)]
     #[test]
     fn automatic_upload_diagnostics_preserves_the_stable_failure_reason() {
         assert_eq!(
@@ -2237,6 +2238,7 @@ mod tests {
 
     #[test]
     fn windows_service_recovery_waits_for_a_terminal_tunnel_state() {
+        use nelomai_client_tunnel::TunnelStatus;
         assert_eq!(
             classify_windows_service_recovery(None),
             WindowsServiceRecoveryDecision::Wait,

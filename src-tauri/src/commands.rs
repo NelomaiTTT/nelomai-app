@@ -2107,79 +2107,82 @@ pub async fn app_state(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
-    runtime_state_if_channel_open(|| application.runtime_channel_closed(), async {
-        #[cfg(target_os = "android")]
-        {
-            android_app_state(
-                app,
-                application.inner().clone(),
-                diagnostics.inner().clone(),
-                metrics.inner().clone(),
-            )
-            .await
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            if metrics_view_is_visible(&app) {
-                metrics.mark_observed().await;
+    runtime_state_if_channel_open(
+        || application.runtime_channel_closed(),
+        Box::pin(async {
+            #[cfg(target_os = "android")]
+            {
+                android_app_state(
+                    app,
+                    application.inner().clone(),
+                    diagnostics.inner().clone(),
+                    metrics.inner().clone(),
+                )
+                .await
             }
-            let quick_state_change = app
-                .tunnel_android()
-                .take_quick_state_change()
-                .unwrap_or_default();
-            let quick_state_changed = quick_state_change.changed;
-            let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
-                match application.bootstrap(now_unix()).await {
-                    Ok(response) => {
-                        #[cfg(desktop)]
-                        diagnostics.set_automatic_device(&response.device.id);
-                        provision_android_background_resilient(
-                            app.clone(),
-                            application.inner().clone(),
-                            diagnostics.inner().clone(),
-                            response,
-                        )
-                        .await;
-                        if app
-                            .tunnel_android()
-                            .acknowledge_quick_state_change(quick_state_change.revision)
-                            .is_ok()
-                        {
-                            clear_quick_reconcile_retry();
-                        } else {
-                            defer_quick_reconcile(now_unix());
-                        }
-                        application.state().await
-                    }
-                    Err(_) => {
-                        defer_quick_reconcile(now_unix());
-                        application.reconcile_external_tunnel_state().await
-                    }
+            #[cfg(not(target_os = "android"))]
+            {
+                if metrics_view_is_visible(&app) {
+                    metrics.mark_observed().await;
                 }
-            } else if quick_state_changed {
-                application.reconcile_external_tunnel_state().await
-            } else {
-                application.state().await
-            };
-            let warning = application.split_tunnel_warning().await;
-            let metrics_context = application.connection_metrics_context().await;
-            let current_metrics =
-                current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-            let status_unavailable_fallback = android_status_unavailable_fallback();
-            let (intent_status, next_retry_at_unix, reserve_state) =
-                current_connection_intent(&app, status_unavailable_fallback).await;
-            let local_cleanup = application.local_stop_pending_cleanup().await;
-            Ok(AppStateResponse::new(
-                state,
-                warning,
-                current_metrics,
-                intent_status,
-                next_retry_at_unix,
-                reserve_state,
-            )
-            .with_local_stop_pending_cleanup(local_cleanup))
-        }
-    })
+                let quick_state_change = app
+                    .tunnel_android()
+                    .take_quick_state_change()
+                    .unwrap_or_default();
+                let quick_state_changed = quick_state_change.changed;
+                let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
+                    match application.bootstrap(now_unix()).await {
+                        Ok(response) => {
+                            #[cfg(desktop)]
+                            diagnostics.set_automatic_device(&response.device.id);
+                            provision_android_background_resilient(
+                                app.clone(),
+                                application.inner().clone(),
+                                diagnostics.inner().clone(),
+                                response,
+                            )
+                            .await;
+                            if app
+                                .tunnel_android()
+                                .acknowledge_quick_state_change(quick_state_change.revision)
+                                .is_ok()
+                            {
+                                clear_quick_reconcile_retry();
+                            } else {
+                                defer_quick_reconcile(now_unix());
+                            }
+                            application.state().await
+                        }
+                        Err(_) => {
+                            defer_quick_reconcile(now_unix());
+                            application.reconcile_external_tunnel_state().await
+                        }
+                    }
+                } else if quick_state_changed {
+                    application.reconcile_external_tunnel_state().await
+                } else {
+                    application.state().await
+                };
+                let warning = application.split_tunnel_warning().await;
+                let metrics_context = application.connection_metrics_context().await;
+                let current_metrics =
+                    current_connection_metrics(&metrics, metrics_context.as_ref()).await;
+                let status_unavailable_fallback = android_status_unavailable_fallback();
+                let (intent_status, next_retry_at_unix, reserve_state) =
+                    current_connection_intent(&app, status_unavailable_fallback).await;
+                let local_cleanup = application.local_stop_pending_cleanup().await;
+                Ok(AppStateResponse::new(
+                    state,
+                    warning,
+                    current_metrics,
+                    intent_status,
+                    next_retry_at_unix,
+                    reserve_state,
+                )
+                .with_local_stop_pending_cleanup(local_cleanup))
+            }
+        }),
+    )
     .await
 }
 
@@ -2390,6 +2393,8 @@ where
 {
     let snapshot = local.await;
     if let Ok(guard) = gate.try_lock_owned() {
+        // Box before the Tauri spawn wrappers copy the concrete future.
+        let enrichment = Box::pin(enrichment);
         tauri::async_runtime::spawn(async move {
             let _guard = guard;
             enrichment.await;
@@ -2832,12 +2837,12 @@ pub async fn app_login(
     }
     #[cfg(not(target_os = "android"))]
     let _ = quick_plan_result;
-    provision_android_background_resilient(
+    Box::pin(provision_android_background_resilient(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
         response.clone(),
-    )
+    ))
     .await;
     schedule_startup_split_tunnel_refresh(
         app.clone(),
@@ -2872,12 +2877,12 @@ pub async fn app_bootstrap(
     let bootstrap_started = Instant::now();
     let response = match tokio::time::timeout(
         STARTUP_BOOTSTRAP_TIMEOUT,
-        bootstrap_application_for_startup(
+        Box::pin(bootstrap_application_for_startup(
             &app,
             application.inner(),
             diagnostics.inner(),
             now_unix(),
-        ),
+        )),
     )
     .await
     {
@@ -3173,8 +3178,7 @@ pub async fn app_bind_peer(
     application: State<'_, Arc<NativeApplication>>,
     request: BindPeerRequest,
 ) -> Result<SafePeerBindingResponse, CommandError> {
-    application
-        .bind_peer(request)
+    Box::pin(application.bind_peer(request))
         .await
         .map(Into::into)
         .map_err(Into::into)
@@ -3432,7 +3436,7 @@ pub async fn app_start(
     let android_start_ticket = ANDROID_UI_START_STOP_COORDINATOR.start_ticket();
     #[cfg(not(target_os = "android"))]
     let _ = &application;
-    let start_result: Result<StartCommandResponse, CommandError> = async {
+    let start_result: Result<StartCommandResponse, CommandError> = Box::pin(async {
         let options = ConnectOptions {
             layer: request.layer,
             tic_connection_mode: request.tic_connection_mode,
@@ -3666,7 +3670,7 @@ pub async fn app_start(
                 .await?;
             Ok(response)
         }
-    }
+    })
     .await;
     match start_result {
         Ok(response) => {
@@ -3767,8 +3771,7 @@ pub async fn app_start_saved_stray(
         RouteMode::Standalone,
     )
     .await?;
-    let session_id = application
-        .start_saved_stray_offline(now_unix())
+    let session_id = Box::pin(application.start_saved_stray_offline(now_unix()))
         .await
         .map_err(CommandError::from)?;
     #[cfg(desktop)]
@@ -3950,7 +3953,7 @@ pub async fn app_update_restart(
     }
     #[cfg(not(desktop))]
     {
-        stop_for_shutdown(&app, &application).await?;
+        Box::pin(stop_for_shutdown(&app, &application)).await?;
         let _ = app;
         Err(update_command_error("common restart unavailable".into()))
     }
@@ -4316,11 +4319,11 @@ pub async fn app_logout(
     let logout_result =
         route_android_logout(push_registration_scheduler.logout(application.logout())).await;
     #[cfg(desktop)]
-    let logout_result = route_desktop_logout(
+    let logout_result = Box::pin(route_desktop_logout(
         push_registration_scheduler.logout(application.logout()),
         cancel_desktop_connection_intent(&app),
         prepare_desktop_logout(&app, &application, &diagnostics),
-    )
+    ))
     .await;
     #[cfg(all(not(desktop), not(target_os = "android")))]
     let logout_result = push_registration_scheduler
@@ -7244,3 +7247,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(any(test, target_os = "android"))]
+#[path = "ipc_stack_budget.rs"]
+mod ipc_stack_budget;

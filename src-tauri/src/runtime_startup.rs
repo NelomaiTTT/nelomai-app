@@ -8,7 +8,7 @@ pub(crate) async fn request_ready(
     diagnostics: &crate::diagnostics::AppDiagnostics,
 ) -> Result<(), PrivateError> {
     use nelomai_client_container::host::{HostRequestV1, HostResponseV1};
-    let result = port.owner_request(HostRequestV1::RuntimeReady).await;
+    let result = Box::pin(port.owner_request(HostRequestV1::RuntimeReady)).await;
     match result {
         Ok(HostResponseV1::Done) => Ok(()),
         Ok(_) => Err(PrivateError::Protocol),

@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, not(target_os = "android")))]
 use ed25519_dalek::{Signer, SigningKey};
 use nelomai_client_container::desktop::VerifiedRuntime;
 use nelomai_contracts::{dispatcher::digest, RuntimeSlot, CONTAINER_MANIFEST_SIGNATURE_DOMAIN};

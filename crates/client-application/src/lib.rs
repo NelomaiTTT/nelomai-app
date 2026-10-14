@@ -480,7 +480,9 @@ where
         self.auth.login(parameters).await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.clear_probe_cache()?;
-        self.core.bootstrap(now_unix).await.map_err(Into::into)
+        Box::pin(self.core.bootstrap(now_unix))
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn peer_options(&self) -> Result<PeerOptions, ApplicationError> {
@@ -530,8 +532,7 @@ where
         now_unix: i64,
         force_full: bool,
     ) -> Result<SplitTunnelSyncOutcome, ApplicationError> {
-        self.core
-            .synchronize_split_tunnel(now_unix, force_full)
+        Box::pin(self.core.synchronize_split_tunnel(now_unix, force_full))
             .await
             .map_err(Into::into)
     }
@@ -541,8 +542,7 @@ where
         request: &SplitTunnelSettingsUpdate,
         now_unix: i64,
     ) -> Result<SplitTunnelPolicy, ApplicationError> {
-        self.core
-            .save_split_tunnel_settings(request, now_unix)
+        Box::pin(self.core.save_split_tunnel_settings(request, now_unix))
             .await
             .map_err(Into::into)
     }
@@ -552,8 +552,7 @@ where
         request: &SplitTunnelAddressRuleUpdate,
         now_unix: i64,
     ) -> Result<SplitTunnelPolicy, ApplicationError> {
-        self.core
-            .add_split_tunnel_address_rule(request, now_unix)
+        Box::pin(self.core.add_split_tunnel_address_rule(request, now_unix))
             .await
             .map_err(Into::into)
     }
@@ -564,10 +563,12 @@ where
         scope: SplitTunnelAddressRuleScope,
         now_unix: i64,
     ) -> Result<SplitTunnelPolicy, ApplicationError> {
-        self.core
-            .remove_split_tunnel_address_rule(rule_id, scope, now_unix)
-            .await
-            .map_err(Into::into)
+        Box::pin(
+            self.core
+                .remove_split_tunnel_address_rule(rule_id, scope, now_unix),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn split_tunnel_warning(&self) -> Option<String> {
@@ -879,9 +880,12 @@ where
             .map_err(Into::into)
     }
 
+    // Keep large Core futures off callers' inline state (notably Tauri JNI IPC).
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.core.bootstrap(now_unix).await.map_err(Into::into)
+        Box::pin(self.core.bootstrap(now_unix))
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn bootstrap_for_foreground(
@@ -889,8 +893,7 @@ where
         now_unix: i64,
     ) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.core
-            .bootstrap_for_foreground(now_unix)
+        Box::pin(self.core.bootstrap_for_foreground(now_unix))
             .await
             .map_err(Into::into)
     }
@@ -900,8 +903,7 @@ where
         now_unix: i64,
     ) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.core
-            .bootstrap_without_refresh(now_unix)
+        Box::pin(self.core.bootstrap_without_refresh(now_unix))
             .await
             .map_err(Into::into)
     }
@@ -1236,7 +1238,7 @@ where
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         #[cfg(not(target_os = "android"))]
         {
-            let result = self.core.stop_locally().await;
+            let result = Box::pin(self.core.stop_locally()).await;
             if result.is_ok() {
                 // Retain one permit if the scheduler is busy or has not started yet.
                 self.pending_stop_wake.notify_one();
@@ -1244,7 +1246,7 @@ where
             result.map_err(Into::into)
         }
         #[cfg(target_os = "android")]
-        self.core.stop().await.map_err(Into::into)
+        Box::pin(self.core.stop()).await.map_err(Into::into)
     }
 
     pub async fn local_stop_pending_cleanup(&self) -> bool {
@@ -1280,7 +1282,10 @@ where
         if shutdown_requires_core_stop(state.phase, cancelled_pending_start)
             || self.core.has_pending_stop_cleanup()?
         {
-            return self.core.stop().await.map(Some).map_err(Into::into);
+            return Box::pin(self.core.stop())
+                .await
+                .map(Some)
+                .map_err(Into::into);
         }
         Ok(None)
     }
