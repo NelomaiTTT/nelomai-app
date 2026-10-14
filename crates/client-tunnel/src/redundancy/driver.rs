@@ -30,6 +30,9 @@ pub struct TickResult {
     pub standby_failed: bool,
     pub switched: Option<Slot>,
     pub stalled: bool,
+    /// Temporary diagnostics, present only on the first Stalled emission.
+    pub stalled_observations: Vec<SlotObservation>,
+    pub stalled_samples: [Option<NativeHealthSample>; 2],
 }
 
 pub struct SessionDriver<N: NativePair, S> {
@@ -741,7 +744,11 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
             .collect::<Vec<_>>();
         match self.monitor.evaluate(now, &eligible) {
             FailoverDecision::None => (),
-            FailoverDecision::Stalled => result.stalled = true,
+            FailoverDecision::Stalled => {
+                result.stalled = true;
+                result.stalled_observations = eligible;
+                result.stalled_samples = self.samples;
+            }
             FailoverDecision::SwitchTo(slot) => {
                 let ticket = self
                     .state

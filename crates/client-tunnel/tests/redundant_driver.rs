@@ -10,6 +10,7 @@ struct World {
     rx: [u64; 2],
     lost: [bool; 2],
     dead: [bool; 2],
+    missing_samples: [bool; 2],
     selects: Vec<Slot>,
     closed: usize,
     drops: usize,
@@ -80,6 +81,9 @@ impl NativePair for Pair {
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
         let w = self.0.borrow();
         let i = ix(slot);
+        if w.missing_samples[i] {
+            return None;
+        }
         Some(NativeHealthSample {
             admitted: !w.dead[i],
             closed: w.dead[i],
@@ -310,6 +314,47 @@ fn helper_proves_primary_before_standby_exists() {
     let (mut d, _) = setup();
     assert!(!d.tick(0).unwrap().primary_ready);
     assert!(d.tick(100).unwrap().primary_ready);
+}
+
+#[test]
+fn stalled_diagnostics_distinguish_missing_samples_from_probe_loss() {
+    for missing in [true, false] {
+        let (mut d, w) = setup();
+        d.tick(0).unwrap();
+        let healthy = d.tick(100).unwrap();
+        assert!(healthy.stalled_observations.is_empty());
+        assert_eq!(healthy.stalled_samples, [None; 2]);
+        w.borrow_mut().missing_samples[0] = missing;
+        w.borrow_mut().lost[0] = !missing;
+        let mut stalled_count = 0;
+        for now in (200..=15000).step_by(100) {
+            let result = d.tick(now).unwrap();
+            if result.stalled {
+                stalled_count += 1;
+                assert_eq!(result.stalled_observations.len(), 1);
+                let observation = result.stalled_observations[0];
+                assert_eq!(observation.slot, Slot::A);
+                assert!(observation.active);
+                assert_eq!(observation.hard_failure, missing);
+                assert_eq!(result.stalled_samples[1], None);
+                if missing {
+                    assert_eq!(result.stalled_samples[0], None);
+                } else {
+                    assert!(observation.probe_failed);
+                    assert!(observation.independent_failure_signal);
+                    assert!(observation.corroborated_probe_failures >= 2);
+                    let sample = result.stalled_samples[0].unwrap();
+                    assert!(sample.admitted && !sample.closed);
+                    assert!(sample.tx_packets > 1);
+                    assert_eq!(sample.rx_data_packets, 1);
+                }
+            } else {
+                assert!(result.stalled_observations.is_empty());
+                assert_eq!(result.stalled_samples, [None; 2]);
+            }
+        }
+        assert_eq!(stalled_count, 1);
+    }
 }
 
 #[test]

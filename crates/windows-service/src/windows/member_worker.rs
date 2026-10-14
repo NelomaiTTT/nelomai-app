@@ -2224,38 +2224,63 @@ impl NativePair for Control {
     }
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
         let index = slot_index(slot);
-        if !self.ready || self.fenced || self.members[index].is_none() {
-            return None;
-        }
-        self.check_integrity().ok()?;
-        let reply = self
-            .call(json!({"op":"sample","slot":index}), Duration::from_secs(1))
+        let mut stage = "eligibility";
+        let sample = (|| {
+            if !self.ready || self.fenced || self.members[index].is_none() {
+                return None;
+            }
+            stage = "integrity";
+            self.check_integrity().ok()?;
+            stage = "sample_rpc";
+            let reply = self
+                .call(json!({"op":"sample","slot":index}), Duration::from_secs(1))
+                .ok()?;
+            stage = "post_sample_authorize";
+            self.authorize().ok()?;
+            let stats = &reply["slot_stats"][index];
+            stage = "closed_field";
+            let closed = stats["closed"].as_bool()?;
+            stage = "generation";
+            if !closed && stats["generation"].as_u64() != self.generations[index] {
+                return None;
+            }
+            stage = "clock";
+            let now = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_millis(),
+            )
             .ok()?;
-        self.authorize().ok()?;
-        let stats = &reply["slot_stats"][index];
-        let closed = stats["closed"].as_bool()?;
-        if !closed && stats["generation"].as_u64() != self.generations[index] {
-            return None;
+            let handshake_fresh = reply["handshakes"][index]
+                .as_u64()
+                .filter(|value| *value > 0)
+                .and_then(|value| now.checked_sub(value))
+                .is_some_and(|age| age <= 180_000);
+            Some(NativeHealthSample {
+                admitted: {
+                    stage = "guard";
+                    self.guard.as_ref()?.borrow().current.admitted
+                },
+                closed,
+                handshake_fresh,
+                tx_packets: {
+                    stage = "tx_packets_field";
+                    stats["tx_packets"].as_u64()?
+                },
+                rx_data_packets: {
+                    stage = "rx_data_packets_field";
+                    stats["rx_data_packets"].as_u64()?
+                },
+            })
+        })();
+        if sample.is_none() {
+            super::install::record_service_message(
+                "redundant_health",
+                &format!("sample_missing slot={index} stage={stage}"),
+            );
         }
-        let now = u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_millis(),
-        )
-        .ok()?;
-        let handshake_fresh = reply["handshakes"][index]
-            .as_u64()
-            .filter(|value| *value > 0)
-            .and_then(|value| now.checked_sub(value))
-            .is_some_and(|age| age <= 180_000);
-        Some(NativeHealthSample {
-            admitted: self.guard.as_ref()?.borrow().current.admitted,
-            closed,
-            handshake_fresh,
-            tx_packets: stats["tx_packets"].as_u64()?,
-            rx_data_packets: stats["rx_data_packets"].as_u64()?,
-        })
+        sample
     }
     fn open_probe(&mut self, slot: Slot) -> io::Result<(Self::Socket, String)> {
         if !self.ready || self.fenced || self.stopped {

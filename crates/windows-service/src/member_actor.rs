@@ -280,6 +280,18 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
                     .expect("pair retained during physical poll")
                     .tick(now)
             })();
+            #[cfg(windows)]
+            if let Ok(evidence) = &result {
+                if evidence.stalled {
+                    crate::windows::record_service_diagnostic(
+                        "redundant_health",
+                        &ServiceError::Backend(format!(
+                            "stalled observations={:?} samples={:?}",
+                            evidence.stalled_observations, evidence.stalled_samples
+                        )),
+                    );
+                }
+            }
             self.refresh();
             result.map_err(|e| operation_failed("tick", e))?;
             if backwards {
