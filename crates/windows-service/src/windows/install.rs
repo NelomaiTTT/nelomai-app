@@ -530,7 +530,8 @@ fn stop_manager_for_recovery(
     // The expected hash comes from the independently verified signed OLD
     // layout. Hold its exact private file/ancestry across every SCM effect;
     // never learn an authorization digest from current untrusted file bytes.
-    let payload = super::member_files::pin_runtime_payload(&expected, size, &hash)
+    let native_expected: PathBuf = expected.components().collect();
+    let payload = super::member_files::pin_runtime_payload(&native_expected, size, &hash)
         .map_err(|_| ServiceError::UnauthorizedClient)?;
     let verify = || -> Result<(), ServiceError> {
         payload
