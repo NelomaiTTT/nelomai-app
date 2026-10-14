@@ -1,6 +1,7 @@
 package ru.nelomai.tunnel
 
 import android.app.ActivityManager
+import android.app.ApplicationExitInfo
 import android.app.job.JobInfo
 import android.app.job.JobParameters
 import android.app.job.JobScheduler
@@ -120,6 +121,26 @@ internal fun automaticDiagnosticsSessionTriggerAllowed(trigger: String): Boolean
 internal fun automaticDiagnosticsIncludeCurrentProcessMemory(trigger: String): Boolean =
     trigger != "tunnel_interrupted"
 
+private fun automaticDiagnosticsExitReason(reason: Int): String = when (reason) {
+    ApplicationExitInfo.REASON_EXIT_SELF -> "exit_self"
+    ApplicationExitInfo.REASON_SIGNALED -> "signaled"
+    ApplicationExitInfo.REASON_LOW_MEMORY -> "low_memory"
+    ApplicationExitInfo.REASON_CRASH -> "crash"
+    ApplicationExitInfo.REASON_CRASH_NATIVE -> "native_crash"
+    ApplicationExitInfo.REASON_ANR -> "anr"
+    ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "initialization_failure"
+    ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "permission_change"
+    ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "excessive_resource_usage"
+    ApplicationExitInfo.REASON_USER_REQUESTED -> "user_requested"
+    ApplicationExitInfo.REASON_USER_STOPPED -> "user_stopped"
+    ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "dependency_died"
+    ApplicationExitInfo.REASON_OTHER -> "other"
+    ApplicationExitInfo.REASON_FREEZER -> "freezer"
+    ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "package_state_change"
+    ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "package_updated"
+    else -> "unknown"
+}
+
 internal fun automaticDiagnosticsReportResourceComponents(
     trigger: String,
     processes: JSONArray,
@@ -151,6 +172,7 @@ private const val KEY_SESSION_RUNNING = "session_running"
 private const val KEY_SESSION_DEVICE_ID = "session_device_id"
 private const val KEY_SESSION_LEASE_ID = "session_lease_id"
 private const val KEY_SESSION_LAST_LIVE_AT = "session_last_live_at"
+private const val KEY_SESSION_PROCESS_ID = "session_process_id"
 private const val KEY_STOPPED_SESSION_PENDING = "stopped_session_pending"
 private const val KEY_STOPPED_SESSION_TRIGGER = "stopped_session_trigger"
 private const val KEY_STOPPED_SESSION_ENDED_AT = "stopped_session_ended_at"
@@ -783,6 +805,7 @@ internal object AutomaticDiagnostics {
                     .putString(KEY_SESSION_DEVICE_ID, deviceId)
                     .putString(KEY_SESSION_LEASE_ID, connectionLeaseId)
                     .putLong(KEY_SESSION_LAST_LIVE_AT, now)
+                    .putInt(KEY_SESSION_PROCESS_ID, Process.myPid())
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .remove(KEY_STOPPED_SESSION_TRIGGER)
                     .remove(KEY_STOPPED_SESSION_ENDED_AT)
@@ -1412,6 +1435,7 @@ internal object AutomaticDiagnostics {
                     .remove(KEY_SESSION_DEVICE_ID)
                     .remove(KEY_SESSION_LEASE_ID)
                     .remove(KEY_SESSION_LAST_LIVE_AT)
+                    .remove(KEY_SESSION_PROCESS_ID)
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .remove(KEY_STOPPED_SESSION_TRIGGER)
                     .remove(KEY_STOPPED_SESSION_ENDED_AT)
@@ -1475,6 +1499,12 @@ internal object AutomaticDiagnostics {
             endedAt,
             finalMemorySample,
         )
+        // The actual exit may follow lastLiveAt, which seals this interval.
+        // Append it after interval filtering and reserve its bounded log space.
+        val previousExit = if (trigger == "tunnel_interrupted") {
+            previousVpnProcessExit(context, startedAt)
+        } else null
+        val exitLog = previousExit?.let { it.toString() + "\n" }.orEmpty()
         return JSONObject().apply {
             put("report_id", reportId)
             put("trigger", trigger)
@@ -1497,10 +1527,10 @@ internal object AutomaticDiagnostics {
                 intervalLog(
                     context,
                     "android-tunnel",
-                    MAX_HELPER_LOG_BYTES,
+                    MAX_HELPER_LOG_BYTES - exitLog.toByteArray(StandardCharsets.UTF_8).size,
                     startedAt,
                     endedAt,
-                ),
+                ) + exitLog,
             )
             val networkIncidents = intervalLog(
                 context,
@@ -1525,6 +1555,52 @@ internal object AutomaticDiagnostics {
                 },
             )
             redundantSnapshotForReport()?.let { put("redundant_runtime", it) }
+        }.also {
+            previousExit?.let { exit ->
+                // Keep the same observation available to manual diagnostics too.
+                TunnelLog.info("tunnel.previous_process_exit", exit.keys().asSequence()
+                    .filter { it != "timestamp" && it != "level" && it != "event" }
+                    .associateWith { exit.get(it) })
+            }
+        }
+    }
+
+    private fun previousVpnProcessExit(context: Context, startedAt: Long): JSONObject {
+        val event = JSONObject()
+            .put("timestamp", Instant.now().toString())
+            .put("level", "info")
+            .put("event", "tunnel.previous_process_exit")
+            .put("source", "application_exit_info")
+            .put("process", "vpn")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return event.put("availability", "unsupported")
+        }
+        return runCatching {
+            val pid = preferences(context).getInt(KEY_SESSION_PROCESS_ID, 0)
+            if (pid <= 0) return@runCatching event.put("availability", "pid_unavailable")
+            event.put("pid", pid)
+            val observedAt = System.currentTimeMillis()
+            val exit = context.getSystemService(ActivityManager::class.java)
+                .getHistoricalProcessExitReasons(context.packageName, pid, 1)
+                .firstOrNull {
+                    it.pid == pid && it.processName == "${context.packageName}:vpn" &&
+                        it.timestamp > 0 && it.timestamp / 1000L >= startedAt &&
+                        it.timestamp <= observedAt
+                }
+                ?: return@runCatching event.put("availability", "not_found")
+            event.put("availability", "available")
+                .put("exit_timestamp_unix_ms", exit.timestamp)
+                .put("exit_reason", automaticDiagnosticsExitReason(exit.reason))
+                .put("exit_reason_code", exit.reason)
+                .put("exit_status", exit.status)
+                .put("importance", exit.importance)
+                // SIGKILL alone does not distinguish low memory from other kills.
+                .put("low_memory_kill_report_supported", runCatching {
+                    ActivityManager.isLowMemoryKillReportSupported()
+                }.getOrNull() ?: JSONObject.NULL)
+        }.getOrElse { error ->
+            event.put("availability", "query_failed")
+                .put("error_type", error.javaClass.simpleName.take(64))
         }
     }
 
