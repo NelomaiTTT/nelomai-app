@@ -367,6 +367,30 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun immediateStopAfterNativeReadinessReportsEitherPrimaryBeforeServerStop() {
+        for (primary in listOf(0, 1)) for (fallback in listOf(false, true)) {
+            var serverReady = false
+            val fixture = StartupFixture(primary, ::prepared, onStop = { serverReady })
+            fixture.healthySlots = setOf(if (fallback) 1 - primary else primary)
+            for (now in 0L..8_000L step 100L) {
+                fixture.tick(now)
+                if (fixture.ready == 1) break
+            }
+            assertEquals(1, fixture.ready)
+            assertTrue(fixture.reportedRoles.isEmpty())
+            assertTrue(fixture.store.updateRedundant("start") {
+                it.copy(warmStopSupported = true, asyncStopSupported = true)
+            } is RecoveryStoreResult.Success)
+            assertTrue(fixture.store.cancelRedundantIntentAndDeferStop("immediate-stop", "start", retainActivePeer = true)
+                is RecoveryStoreResult.Success)
+            // Observe the real native/store readiness result, not an already acknowledged role.
+            fixture.onRole = { reason -> if (reason == "primary_ready") serverReady = true }
+            assertTrue(fixture.coordinator.revoke())
+            assertEquals(null, fixture.coordinator.status())
+        }
+    }
+
+    @Test
     fun dnsOnlyFailureDoesNotStopOrdinaryStandbyProbes() {
         for (primary in listOf(0, 1)) {
             val fixture = pairFixture(primary)
@@ -1218,6 +1242,7 @@ class RedundantProductionAdaptersTest {
         initialStandby: Boolean = true,
         standbyExecutor: Executor = Executor { it.run() },
         beforeCommitReply: () -> Unit = {},
+        onStop: (AndroidRedundantTransaction) -> Boolean = { true },
     ) {
         @Volatile var now = 0L
         var healthySlots = setOf(0, 1)
@@ -1230,6 +1255,7 @@ class RedundantProductionAdaptersTest {
         var stalled = 0
         var maxPrimaryCorroboration = 0
         val reportedRoles = mutableListOf<Pair<String, String?>>()
+        var onRole: (String) -> Unit = {}
         val backend = RecordingSessionBackend { 1_800_000_000_000L }
         private val adapter = ServiceRedundantConnectionNative(backend, { 41 }, prepare,
             probeSourceIpv4 = "10.241.0.1/32",
@@ -1251,7 +1277,7 @@ class RedundantProductionAdaptersTest {
                 return true
             }
         }
-        private val store = AndroidRecoveryStore(record, object : BootIdentityProvider {
+        val store = AndroidRecoveryStore(record, object : BootIdentityProvider {
             override fun bootCount(): Long = 1
         })
         private val transaction = AndroidRedundantTransaction(
@@ -1270,6 +1296,7 @@ class RedundantProductionAdaptersTest {
                 error("unexpected recovery")
             override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
                 reportedRoles += reason to transaction.localActiveLeaseId
+                onRole(reason)
                 return RedundantRoleResponse("accepted", requireNotNull(transaction.localActiveLeaseId),
                     BackgroundRedundantSession(transaction.sessionId, "connected",
                         transaction.localActiveLeaseId, transaction.slotALeaseId,
@@ -1297,7 +1324,7 @@ class RedundantProductionAdaptersTest {
                 beforeCommitReply()
                 return committed
             }
-            override fun stop(transaction: AndroidRedundantTransaction): Boolean = true
+            override fun stop(transaction: AndroidRedundantTransaction): Boolean = onStop(transaction)
         }
         val coordinator = RedundantConnectionCoordinator(store, panel, native,
             epochNowMs = { now }, monotonicMs = { now }, onAllSlotsStalled = { stalled++ },

@@ -1200,6 +1200,12 @@ internal class AndroidRecoveryStore(
         }
         val normalizedStopOperationId = transaction.stopOperationId
             ?: stopOperationId.also(AndroidRecoveryEnvelopeCodec::validateSafeValue)
+        // Native readiness may already be visible while its role HTTP is still pending.
+        // Keep that proof for ordered delivery before Stop, never an unsettled switch.
+        val pendingReadiness = transaction.retry.roleObservationPending &&
+            transaction.retry.pendingRoleReason == "primary_ready" &&
+            transaction.retry.pendingRoleLeaseId == transaction.localActiveLeaseId &&
+            transaction.retry.pendingNativeActiveLeaseId == null
         persist(current.copy(
             intent = current.intent.copy(desiredActive = false),
             redundantTransaction = transaction.copy(
@@ -1216,9 +1222,9 @@ internal class AndroidRecoveryStore(
                 candidateSlot = null,
                 retry = transaction.retry.copy(
                     stopState = RedundantStopState.PENDING,
-                    roleObservationPending = false,
-                    pendingRoleLeaseId = null,
-                    pendingRoleReason = null,
+                    roleObservationPending = pendingReadiness,
+                    pendingRoleLeaseId = transaction.retry.pendingRoleLeaseId.takeIf { pendingReadiness },
+                    pendingRoleReason = transaction.retry.pendingRoleReason.takeIf { pendingReadiness },
                     acquirePending = false,
                     acquireOperationId = null,
                     acquireReplaceLeaseId = null,

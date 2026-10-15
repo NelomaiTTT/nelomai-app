@@ -1677,7 +1677,41 @@ internal class RedundantConnectionCoordinator(
         val pending = (store.read() as? RecoveryStoreResult.Success)?.value?.redundantTransaction
             ?.takeIf { it.startOperationId == boundStartOperationId } ?: return
         if (pending.desiredActive || pending.stopOperationId == null) return
-        runCatching { panel.stop(pending) }
+        if (reportReadinessBeforeStop(pending)) runCatching { panel.stop(pending) }
+    }
+
+    private fun reportReadinessBeforeStop(pending: AndroidRedundantTransaction): Boolean {
+        val retry = pending.retry
+        if (!pending.backgroundCleanupOnStop || !retry.roleObservationPending ||
+            retry.pendingRoleReason != "primary_ready" ||
+            retry.pendingRoleLeaseId != pending.localActiveLeaseId ||
+            retry.pendingNativeActiveLeaseId != null
+        ) return true
+        // Keep proof durable until Stop is accepted/completed. Lost replies and process
+        // death can replay it; rebasing this report never changes Stop's frozen payload.
+        var report = pending
+        repeat(2) {
+            val response = try {
+                panel.reportRole(report, "primary_ready")
+            } catch (error: Throwable) {
+                // Fenced/revoked roles must not prevent cleanup. Stop still owns all
+                // authorization, confirmed-start and ACK checks; no acceptance is inferred here.
+                return error is BackgroundConnectionException &&
+                    ConnectionIntentErrorPolicy().classify(error.code) == ConnectionIntentDecision.TERMINAL
+            }
+            val session = response.session
+            if (session.sessionId != pending.sessionId ||
+                response.localActiveLeaseId != pending.localActiveLeaseId ||
+                !session.containsCurrentLease(pending.localActiveLeaseId)
+            ) return false
+            if (response.action != "rebase") {
+                return response.action in setOf("accepted", "acknowledged") &&
+                    session.activeLeaseId == pending.localActiveLeaseId
+            }
+            report = report.copy(roleGeneration = session.roleGeneration,
+                membershipGeneration = session.membershipGeneration)
+        }
+        return false
     }
 
     // Called only after the service's durable cancellation fence. Native has
@@ -1701,7 +1735,7 @@ internal class RedundantConnectionCoordinator(
         }
         val pending = status() ?: return@synchronized true
         val localStopped = try { native.stop() } catch (_: Throwable) { false }
-        val outcome = if (localStopped) try {
+        val outcome = if (localStopped && reportReadinessBeforeStop(pending)) try {
             if (pending.backgroundCleanupOnStop) panel.stopOutcome(pending)
             else if (panel.stop(pending)) RedundantStopOutcome.Completed else RedundantStopOutcome.Pending
         } catch (_: Throwable) {
