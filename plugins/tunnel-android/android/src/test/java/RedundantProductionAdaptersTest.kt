@@ -158,19 +158,17 @@ class RedundantProductionAdaptersTest {
     fun inlineInitialReserveCommitCannotUsePreCommitProbe() {
         val fixture = StartupFixture(0, ::prepared, initialStandby = false)
         fixture.healthySlots = setOf(1)
-        fixture.backend.rebindFailures += 0
-        for (now in 0L..15_000L step 1_000L) fixture.tick(now)
-        assertEquals("lease-b", fixture.coordinator.status()?.slotBLeaseId)
+        val committedAt = fixture.awaitInitialStandbyCommit()
         assertEquals(0, fixture.ready)
         assertEquals(listOf(0), fixture.backend.activeSlots)
-        fixture.tick(16_000L)
+        fixture.tick(committedAt + 100L)
         assertEquals(0, fixture.ready)
-        for (now in 17_000L..20_000L step 1_000L) fixture.tick(now)
+        for (now in (committedAt + 200L)..(committedAt + 4_000L) step 100L) fixture.tick(now)
         assertEquals(1, fixture.ready)
         assertEquals(0, fixture.failed)
         assertEquals(listOf(0, 1), fixture.backend.activeSlots)
         assertTrue(fixture.backend.probeLaunches.any { (started, slot) ->
-            slot == 1 && started >= 16_000L
+            slot == 1 && started > committedAt
         })
     }
 
@@ -180,16 +178,15 @@ class RedundantProductionAdaptersTest {
             val fixture = StartupFixture(primary, ::prepared)
             fixture.healthySlots = setOf(1 - primary)
             fixture.backend.rebindFailures += primary
-            for (now in 0L..20_000L step 100L) {
+            fixture.failPrimaryRebind()
+            for (now in 0L..8_000L step 100L) {
                 fixture.tick(now)
                 assertEquals("premature failure at $now", 0, fixture.failed)
-                if (now < 15_000L) assertEquals(0, fixture.ready)
+                if (now < 4_000L) assertEquals(0, fixture.ready)
             }
             assertEquals(1, fixture.ready)
             assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
-            assertTrue(fixture.backend.probeLaunches.any { (started, slot) ->
-                slot == 1 - primary && started >= 15_000L
-            })
+            assertTrue(fixture.backend.probeLaunches.count { it.second == 1 - primary } >= 4)
         }
     }
 
@@ -208,18 +205,21 @@ class RedundantProductionAdaptersTest {
 
     @Test
     fun failedInitialRebindCannotUseReserveWithFailedPostWarmupProbe() {
-        val fixture = StartupFixture(0, ::prepared)
+        val fixture = StartupFixture(0, ::prepared, initialStandby = false)
         fixture.healthySlots = setOf(1)
         fixture.backend.rebindFailures += 0
-        for (now in 0L..20_000L step 100L) {
-            if (now >= 14_900L) fixture.dnsBlockedSlots = setOf(1)
+        fixture.failPrimaryRebind()
+        val committedAt = fixture.awaitInitialStandbyCommit()
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.receiveFrozenAtMs = committedAt
+        for (now in (committedAt + 100L)..30_000L step 100L) {
             fixture.tick(now)
             assertEquals(0, fixture.ready)
         }
         assertEquals(1, fixture.failed)
         assertEquals(listOf(0), fixture.backend.activeSlots)
         assertTrue(fixture.backend.probeLaunches.any { (started, slot) ->
-            slot == 1 && started >= 15_000L
+            slot == 1 && started > committedAt
         })
     }
 
@@ -243,12 +243,79 @@ class RedundantProductionAdaptersTest {
             fixture.healthySlots = setOf(1 - primary)
             for (now in 0L..20_000L step 100L) {
                 fixture.tick(now)
-                if (now < 15_000L) assertEquals(0, fixture.ready)
+                if (now < 4_000L) assertEquals(0, fixture.ready)
             }
             assertEquals("primary=$primary", 1, fixture.ready)
             assertEquals(0, fixture.failed)
             assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
             assertEquals(0, fixture.maxPrimaryCorroboration)
+        }
+    }
+
+    @Test
+    fun recoveryReadinessKeepsBackgroundReserveDwell() {
+        val fixture = timingFixture(active = true)
+        assertTrue(fixture.native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
+        for (now in 0L..15_000L step 100L) {
+            fixture.clock.elapsedMs = now
+            fixture.backend.probeStatuses.replaceAll { _, _ -> NativeProbeStatus.SUCCEEDED }
+            val reserve = fixture.native.healthObservations(initialReadiness = true,
+                committedStandbyLeaseId = "lease-b", freshStart = false).single { it.index == 1 }
+            if (now in 11_000L..14_900L) {
+                assertEquals(3, reserve.consecutiveProbeSuccesses)
+                assertEquals(BackendHealth.WARMING, reserve.health)
+            }
+            if (now == 15_000L) assertEquals(BackendHealth.READY, reserve.health)
+        }
+    }
+
+    @Test
+    fun initialColdReserveCanRecoverItsOwnUdpBinding() {
+        for (primary in listOf(0, 1)) {
+            for (initialStandby in listOf(false, true)) {
+                val fixture = StartupFixture(primary, ::prepared, initialStandby = initialStandby)
+                fixture.healthySlots = emptySet()
+                for (now in 0L..25_000L step 100L) {
+                    if (1 - primary in fixture.backend.reboundSlots) {
+                        fixture.healthySlots = setOf(1 - primary)
+                    }
+                    fixture.tick(now)
+                }
+                assertEquals("the cold reserve must receive its own recovery attempt", 1, fixture.ready)
+                assertEquals(0, fixture.failed)
+                assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
+                assertEquals(1, fixture.backend.reboundSlots.count { it == primary })
+                assertEquals(1, fixture.backend.reboundSlots.count { it == 1 - primary })
+            }
+        }
+    }
+
+    @Test
+    fun freshStartChecksReserveBeforeBackgroundStabilityDwell() {
+        for (primary in listOf(0, 1)) {
+            val fixture = StartupFixture(primary, ::prepared, initialStandby = false)
+            fixture.healthySlots = setOf(1 - primary)
+            for (now in 0L..8_000L step 100L) fixture.tick(now)
+            assertEquals("a proven initial reserve must not wait for background dwell", 1, fixture.ready)
+            assertEquals(0, fixture.failed)
+            assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
+            assertTrue("three warmup checks plus a fresh check after commit are required",
+                fixture.backend.probeLaunches.count { it.second == 1 - primary } >= 4)
+        }
+    }
+
+    @Test
+    fun initialFallbackReportsConfirmedReadinessForActualActiveMember() {
+        for (primary in listOf(0, 1)) {
+            val fixture = StartupFixture(primary, ::prepared)
+            fixture.healthySlots = setOf(1 - primary)
+            for (now in 0L..20_000L step 100L) fixture.tick(now)
+            assertEquals(1, fixture.ready)
+            val activeLease = if (primary == 0) "lease-b" else "lease-a"
+            assertTrue("initial fallback must confirm the working lease to permit async Stop",
+                fixture.reportedRoles.contains("primary_ready" to activeLease))
+            assertFalse(fixture.reportedRoles.contains("primary_ready" to
+                if (primary == 0) "lease-a" else "lease-b"))
         }
     }
 
@@ -269,7 +336,7 @@ class RedundantProductionAdaptersTest {
             fixture.healthySlots = setOf(1)
             if (rebindFails) fixture.backend.rebindFailures += 0
             for (now in 0L..20_000L step 100L) {
-                if (now == 14_900L) fixture.cancel = true
+                if (now == 3_900L) fixture.cancel = true
                 fixture.tick(now)
             }
             assertEquals(0, fixture.ready)
@@ -1162,6 +1229,7 @@ class RedundantProductionAdaptersTest {
         var cancelled = 0
         var stalled = 0
         var maxPrimaryCorroboration = 0
+        val reportedRoles = mutableListOf<Pair<String, String?>>()
         val backend = RecordingSessionBackend { 1_800_000_000_000L }
         private val adapter = ServiceRedundantConnectionNative(backend, { 41 }, prepare,
             probeSourceIpv4 = "10.241.0.1/32",
@@ -1200,12 +1268,14 @@ class RedundantProductionAdaptersTest {
         private val panel = object : RedundantConnectionPanel {
             override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
                 error("unexpected recovery")
-            override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse =
-                RedundantRoleResponse("accepted", requireNotNull(transaction.localActiveLeaseId),
+            override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
+                reportedRoles += reason to transaction.localActiveLeaseId
+                return RedundantRoleResponse("accepted", requireNotNull(transaction.localActiveLeaseId),
                     BackgroundRedundantSession(transaction.sessionId, "connected",
                         transaction.localActiveLeaseId, transaction.slotALeaseId,
                         transaction.slotBLeaseId, true, transaction.roleGeneration,
                         transaction.membershipGeneration, null))
+            }
             override fun acquireStandby(transaction: AndroidRedundantTransaction,
                 operationId: String, replaceLeaseId: String?): BackgroundRedundantCandidate {
                 check(replaceLeaseId == null)
@@ -1253,6 +1323,16 @@ class RedundantProductionAdaptersTest {
                     .associateWith { probe },
                 shouldCancel = { cancel }, onPrimaryStarted = { ready += 1 },
                 onPrimaryFailed = { failed += 1 }, onPrimaryCancelled = { cancelled += 1 }))
+        }
+
+        fun awaitInitialStandbyCommit(): Long {
+            for (elapsed in 0L..8_000L step 100L) {
+                tick(elapsed)
+                if (coordinator.status()?.let { it.slotALeaseId != null && it.slotBLeaseId != null } == true) {
+                    return elapsed
+                }
+            }
+            error("initial standby was not committed within the startup check window")
         }
 
         fun failPrimaryRebind() {
@@ -1416,6 +1496,7 @@ internal class RecordingSessionBackend(
     var useSlotCounters = false
     private val slotSendPackets = mutableMapOf<Int, Long>()
     val rebindFailures = mutableSetOf<Int>()
+    val reboundSlots = mutableListOf<Int>()
     var latestProbeToken: Long? = null
     var countProbeSend = true
     var decryptedReceivePackets = 0L
@@ -1454,8 +1535,10 @@ internal class RecordingSessionBackend(
 
     override fun stopSlot(session: NativeSession, slot: Int): Boolean = admitted.remove(slot)
 
-    override fun rebind(session: NativeSession, slot: Int): Boolean =
-        slot in admitted && slot !in rebindFailures
+    override fun rebind(session: NativeSession, slot: Int): Boolean {
+        reboundSlots += slot
+        return slot in admitted && slot !in rebindFailures
+    }
 
     override fun startProbe(
         session: NativeSession,

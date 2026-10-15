@@ -215,6 +215,38 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun coldStandbyRebindUsesItsOwnAgeAndCannotExtendStartDeadline() {
+        for (standbyStartedAt in listOf(6_000L, 23_000L)) {
+            var now = 0L
+            val native = FakeNative()
+            var failed = 0
+            val coordinator = testRedundantCoordinator(emptyStore(), FakePanel(), native,
+                monotonicMs = { now })
+            assertTrue(coordinator.start(transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe(), "lease-b" to probe()),
+                onPrimaryFailed = { failed++ }))
+            val waiting = listOf(healthSlot(0, active = true, probeFailed = true, stableSinceMs = 0),
+                healthSlot(1, probeFailed = true, stableSinceMs = standbyStartedAt))
+            now = 7_000L
+            assertTrue(coordinator.onHealthObservations(waiting))
+            assertEquals(listOf("lease-a"), native.rebindAttempts)
+            now = 12_999L
+            assertTrue(coordinator.onHealthObservations(waiting))
+            assertEquals(listOf("lease-a"), native.rebindAttempts)
+            now = 13_000L
+            assertTrue(coordinator.onHealthObservations(waiting))
+            val expected = if (standbyStartedAt == 6_000L) listOf("lease-a", "lease-b") else listOf("lease-a")
+            assertEquals(expected, native.rebindAttempts)
+            now = 30_000L
+            assertFalse(coordinator.onHealthObservations(waiting))
+            assertEquals(1, failed)
+            assertFalse(coordinator.isRunning())
+            assertEquals(expected, native.rebindAttempts)
+        }
+    }
+
+    @Test
     fun coldPreparedStartCanUseNewReserveBeforePrimaryDeadline() {
         var now = 0L
         val original = transaction().copy(slotBLeaseId = null)

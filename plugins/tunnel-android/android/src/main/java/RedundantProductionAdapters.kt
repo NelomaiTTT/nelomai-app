@@ -466,6 +466,7 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized emptyList()
         val epochNow = epochNowMs()
         val elapsedNow = elapsedNowMs()
+        val initialWarmup = initialReadiness && freshStart
         val rawMetrics = runCatching { backend.metrics(nativeSession) }.getOrNull()
         transportDiagnostics.record("sample", rawMetrics, elapsedNow)
         val metricsBySlot = parseHealthMetricsLocked(rawMetrics)
@@ -497,7 +498,7 @@ internal class ServiceRedundantConnectionNative(
         val canStartStandbyCheck = !initialReadiness || slots.values.any {
             it.slot != activeSlot && it.leaseId == committedStandbyLeaseId &&
                 (standbyCheckStartedAtMs != null ||
-                    slotReady(it, metricsBySlot.getValue(it.slot.index), epochNow, elapsedNow))
+                    slotReady(it, metricsBySlot.getValue(it.slot.index), epochNow, elapsedNow, initialWarmup))
         }
         if (networkAvailable && active != null &&
             (activeSuspected || initialColdFallback) && canStartStandbyCheck
@@ -516,7 +517,8 @@ internal class ServiceRedundantConnectionNative(
             val metrics = metricsBySlot.getValue(runtime.slot.index)
             advanceProbeLocked(nativeSession, runtime, elapsedNow,
                 metrics.txPackets, metrics.rxPackets,
-                holdCompletedStandby = activeConfirmed || initialColdFallback)
+                holdCompletedStandby = activeConfirmed || initialColdFallback,
+                initialWarmup = initialWarmup)
         }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
             val nativeMetrics = requireNotNull(metricsBySlot[runtime.slot.index])
@@ -527,7 +529,7 @@ internal class ServiceRedundantConnectionNative(
             val handshakeFresh = handshakeFresh(nativeMetrics, epochNow)
             val admitted = nativeMetrics.admitted
             val closed = nativeMetrics.closed
-            val ready = slotReady(runtime, nativeMetrics, epochNow, elapsedNow)
+            val ready = slotReady(runtime, nativeMetrics, epochNow, elapsedNow, initialWarmup)
             SlotObservation(
                 index = runtime.slot.index,
                 active = runtime.slot == activeSlot,
@@ -563,11 +565,14 @@ internal class ServiceRedundantConnectionNative(
         metrics: NativeSlotHealthMetrics,
         epochNow: Long,
         elapsedNow: Long,
+        initialWarmup: Boolean = false,
     ): Boolean = !runtime.hardFailure && metrics.admitted && !metrics.closed &&
         handshakeFresh(metrics, epochNow) &&
         runtime.consecutiveProbeSuccesses >= READY_PROBE_SUCCESSES &&
         elapsedNow >= runtime.startedAtElapsedMs &&
-        elapsedNow - runtime.startedAtElapsedMs >= READY_STABILITY_MILLIS
+        // Initial fallback needs the same proof before carrying any user traffic;
+        // the background reserve dwell must not postpone a fresh connection.
+        (initialWarmup || elapsedNow - runtime.startedAtElapsedMs >= READY_STABILITY_MILLIS)
 
     private fun parseHealthMetricsLocked(payload: String?): Map<Int, NativeSlotHealthMetrics>? {
         val root = payload?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
@@ -641,6 +646,7 @@ internal class ServiceRedundantConnectionNative(
         currentTxPackets: Long,
         currentRxPackets: Long,
         holdCompletedStandby: Boolean = false,
+        initialWarmup: Boolean = false,
     ) {
         if (!networkAvailable) return
         val checkStarted = standbyCheckStartedAtMs.takeIf { runtime.slot != activeSlot }
@@ -710,7 +716,7 @@ internal class ServiceRedundantConnectionNative(
             recentStandbyResult(runtime, elapsedNow)
         ) return
         val urgent = runtime.urgentEvidence
-        val interval = if (runtime.slot == activeSlot || checkStarted != null) {
+        val interval = if (runtime.slot == activeSlot || checkStarted != null || initialWarmup) {
             ACTIVE_PROBE_INTERVAL_MILLIS
         } else if (urgent) {
             0L

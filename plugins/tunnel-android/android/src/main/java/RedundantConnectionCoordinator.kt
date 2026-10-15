@@ -126,6 +126,7 @@ private data class PendingPrimaryReadiness(
     val deadlineElapsedMs: Long,
     var rebindAtElapsedMs: Long,
     var rebindAttempted: Boolean = false,
+    var standbyRebindAttempted: Boolean = false,
     val shouldCancel: () -> Boolean,
     val freshStart: Boolean,
     val onReady: () -> Unit,
@@ -792,6 +793,28 @@ internal class RedundantConnectionCoordinator(
             observation?.handshakeFresh == false && !observation.hardFailure &&
             observation.health != BackendHealth.UNHEALTHY
         val standbyIndex = 1 - pending.activeIndex
+        val standbyObservation = observations.singleOrNull { it.index == standbyIndex }
+        val standbyStartedAt = standbyObservation?.stableSinceMs
+        // The reserve has its own socket and may still be an uncommitted candidate.
+        // Give it the same bounded first-handshake recovery as the primary, from
+        // its own start time. Do not reset a working reserve's proofs or deadline.
+        if (transaction.template.layer == "stray" && transaction.standbyDesired &&
+            !pending.standbyRebindAttempted && elapsedNow() < pending.deadlineElapsedMs &&
+            standbyObservation?.handshakeFresh == false && !standbyObservation.hardFailure &&
+            standbyObservation.health != BackendHealth.UNHEALTHY && standbyStartedAt != null &&
+            elapsedNow() >= saturatingAdd(standbyStartedAt, INITIAL_HANDSHAKE_REBIND_MILLIS) &&
+            healthMonitor.networkReady(elapsedNow())
+        ) {
+            val leaseId = transaction.candidateLeaseId?.takeIf {
+                it == candidateWarmupLeaseId &&
+                    transaction.candidateSlot == (if (standbyIndex == 0) RedundantSlot.A else RedundantSlot.B)
+            } ?: transaction.leaseIdAt(standbyIndex)
+            if (leaseId != null) {
+                pending.standbyRebindAttempted = true
+                mutateNative(transaction) { runCatching { native.rebind(leaseId) }.getOrDefault(false) }
+                return true // Rebind invalidates this snapshot's health evidence.
+            }
+        }
         val readyStandby = transaction.standbyDesired && transaction.leaseIdAt(standbyIndex) != null &&
             standbyReadyForStart(observations.singleOrNull { it.index == standbyIndex })
         if (observation?.hardFailure == true ||
@@ -895,7 +918,7 @@ internal class RedundantConnectionCoordinator(
                 readyTransaction,
                 target = standbyLeaseId,
                 failed = pending.activeLeaseId,
-                reason = HEALTH_FAILOVER_REASON,
+                reason = "primary_ready",
             )
         ) {
             return if (status()?.retry?.hasPendingNativeSwitch() == true) {
