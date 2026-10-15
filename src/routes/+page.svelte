@@ -770,6 +770,7 @@
     error = null;
     try {
       if (stopping) {
+        phase = "stopping";
         connection = await nativeClient.stop();
         if (runtimeChannelClosed) return;
         connectionMetrics = null;
@@ -1651,7 +1652,9 @@
               (connectionAction !== "stop" && runtimeStartBlocked(runtimeStatus))}
           >
             <span>
-              {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
+              {localStopPendingCleanup ? "Выключен"
+                : connectionActionState.cancelBusy ? "Выключаем"
+                : connectionAction === "stop"
                 ? "Стоп"
                 : runtimeStateSync.blocking ? "Проверяем состояние"
                 : connectionAction === "retry"
