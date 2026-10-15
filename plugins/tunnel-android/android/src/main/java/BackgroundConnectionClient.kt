@@ -882,6 +882,30 @@ internal class UrlConnectionBackgroundApiTransport(
         payload: JSONObject?,
         authorization: BackgroundAuthorization,
     ): JSONObject {
+        // Keep Stop's client-side wait separate from the panel's cleanup time.
+        // outputStream may connect or buffer; writing it does not prove peer receipt.
+        val startedAt = if (endpoint == "background/connections/stop") System.nanoTime() else null
+        val stopOperationId = if (startedAt != null) runCatching {
+            UUID.fromString(payload?.optString("operation_id")).toString()
+        }.getOrNull() else null
+        var phase = "prepare"
+        var responseStatus: Int? = null
+        fun recordPhase(next: String, error: Throwable? = null) {
+            val began = startedAt ?: return
+            TunnelLog.info("background.stop_http", buildMap {
+                put("phase", next)
+                put("operation_id", stopOperationId)
+                put("thread_id", android.os.Process.myTid())
+                put("elapsed_ms", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - began))
+                put("status", responseStatus)
+                if (error != null) {
+                    put("failed_phase", phase)
+                    put("error_type", error.javaClass.simpleName)
+                }
+            })
+            phase = next
+        }
+        recordPhase("prepare")
         val base = URI(credential.panelBase)
         val url = base.resolve("/api/client/v1/$endpoint").toURL()
         val connection = openConnection(url)
@@ -899,12 +923,18 @@ internal class UrlConnectionBackgroundApiTransport(
                 connection.setRequestProperty("Content-Type", "application/json")
                 val encoded = payload.toString().toByteArray(StandardCharsets.UTF_8)
                 try {
+                    recordPhase("request_body")
                     connection.outputStream.use { it.write(encoded) }
+                    recordPhase("request_body_written")
                 } finally {
                     encoded.fill(0)
                 }
             }
+            phase = "response_headers"
             val status = connection.responseCode
+            responseStatus = status
+            recordPhase("response_headers")
+            phase = "response_body"
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             val body = stream?.use { input ->
                 val buffer = ByteArray(8 * 1024)
@@ -937,10 +967,13 @@ internal class UrlConnectionBackgroundApiTransport(
                     retryAfterHeader = connection.getHeaderField("Retry-After"),
                 )
             }
-            json ?: throw BackgroundConnectionException("invalid_background_response")
+            (json ?: throw BackgroundConnectionException("invalid_background_response"))
+                .also { recordPhase("complete") }
         } catch (error: BackgroundConnectionException) {
+            recordPhase("failed", error)
             throw error
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            recordPhase("failed", error)
             throw BackgroundConnectionException("background_transport_unavailable")
         } finally {
             connection.disconnect()

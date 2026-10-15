@@ -2183,7 +2183,17 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             }
             return
         }
+        val requestedAt = System.nanoTime()
+        TunnelLog.info("redundant.stop_cleanup_requested", mapOf(
+            "start_operation_id" to pending.startOperationId,
+        ))
         executeRedundantCleanup(coalescingGate = redundantStopRetryQueued) {
+            val cleanupStartedAt = System.nanoTime()
+            TunnelLog.info("redundant.stop_cleanup_started", mapOf(
+                "start_operation_id" to pending.startOperationId,
+                "thread_id" to Process.myTid(),
+                "queue_ms" to TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requestedAt),
+            ))
             val tombstone = pending.tombstone ?: when (
                 val persisted = redundantCancelTombstones.persist(
                     pending.startOperationId,
@@ -2229,41 +2239,64 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     runCatching { pending.owner?.closeLocal() }
                     RedundantRevokeResult(fenced = true, stopped = true)
                 }
-                else -> runRedundantStopCleanupAttempt(
-                    transaction = transaction,
-                    owner = pending.owner
-                        ?: redundantOwnerForOperation(pending.startOperationId),
-                    createCleanupOwner = ::createRedundantCleanupCoordinator,
-                    deferStop = {
-                        val restartStillAllowed = pendingRedundantStop?.takeIf {
-                            it.startOperationId == pending.startOperationId &&
-                                it.serviceGeneration == pending.serviceGeneration
-                        }?.allowRestart == true
-                        val durableRestartAllowed =
-                            (redundantCancelTombstones.read() as? RecoveryStoreResult.Success)
-                                ?.value?.takeIf {
-                                    it.startOperationId == tombstone.startOperationId &&
-                                        it.stopOperationId == tombstone.stopOperationId
-                                }?.allowRestart == true
-                        val restartPrepared = restartStillAllowed &&
-                            durableRestartAllowed &&
-                            transaction.retry.totalLossRestartReplay != null
-                        val fenced = if (restartPrepared) {
-                            recoveryStore.deferRedundantStop(
-                                stopOperationId = tombstone.stopOperationId,
-                                expectedStartOperationId = pending.startOperationId,
-                            )
-                        } else {
-                            recoveryStore.cancelRedundantIntentAndDeferStop(
-                                stopOperationId = tombstone.stopOperationId,
-                                expectedStartOperationId = pending.startOperationId,
-                            )
-                        }
-                        fenced is RecoveryStoreResult.Success
-                    },
-                    closeTemporaryOwner = ::closeOrRetainRedundantOwner,
-                )
+                else -> {
+                    val ownerCloseStartedAt = System.nanoTime()
+                    TunnelLog.info("redundant.stop_cleanup_owner_close_begin", mapOf(
+                        "operation_id" to tombstone.stopOperationId,
+                    ))
+                    runRedundantStopCleanupAttempt(
+                        transaction = transaction,
+                        owner = pending.owner
+                            ?: redundantOwnerForOperation(pending.startOperationId),
+                        createCleanupOwner = ::createRedundantCleanupCoordinator,
+                        deferStop = {
+                            TunnelLog.info("redundant.stop_cleanup_owner_close_returned", mapOf(
+                                "operation_id" to tombstone.stopOperationId,
+                                "elapsed_ms" to TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - ownerCloseStartedAt),
+                            ))
+                            val fenceStartedAt = System.nanoTime()
+                            val restartStillAllowed = pendingRedundantStop?.takeIf {
+                                it.startOperationId == pending.startOperationId &&
+                                    it.serviceGeneration == pending.serviceGeneration
+                            }?.allowRestart == true
+                            val durableRestartAllowed =
+                                (redundantCancelTombstones.read() as? RecoveryStoreResult.Success)
+                                    ?.value?.takeIf {
+                                        it.startOperationId == tombstone.startOperationId &&
+                                            it.stopOperationId == tombstone.stopOperationId
+                                    }?.allowRestart == true
+                            val restartPrepared = restartStillAllowed &&
+                                durableRestartAllowed &&
+                                transaction.retry.totalLossRestartReplay != null
+                            val fenced = if (restartPrepared) {
+                                recoveryStore.deferRedundantStop(
+                                    stopOperationId = tombstone.stopOperationId,
+                                    expectedStartOperationId = pending.startOperationId,
+                                )
+                            } else {
+                                recoveryStore.cancelRedundantIntentAndDeferStop(
+                                    stopOperationId = tombstone.stopOperationId,
+                                    expectedStartOperationId = pending.startOperationId,
+                                )
+                            }
+                            (fenced is RecoveryStoreResult.Success).also { success ->
+                                TunnelLog.info("redundant.stop_cleanup_fenced", mapOf(
+                                    "operation_id" to tombstone.stopOperationId,
+                                    "success" to success,
+                                    "elapsed_ms" to TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - fenceStartedAt),
+                                ))
+                            }
+                        },
+                        closeTemporaryOwner = ::closeOrRetainRedundantOwner,
+                    )
+                }
             }
+            TunnelLog.info("redundant.stop_cleanup_returned", mapOf(
+                "operation_id" to tombstone.stopOperationId,
+                "fenced" to result.fenced,
+                "stopped" to result.stopped,
+                "elapsed_ms" to TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cleanupStartedAt),
+            ))
             val attempt = PendingRedundantStopAttempt(
                 pending = pending,
                 tombstone = tombstone,
@@ -4951,18 +4984,32 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun serviceActiveCredential(deviceId: String): BackgroundCredential {
-        val envelope = when (val result = AndroidBackgroundCredentialStores.open(
-            applicationContext,
-        ).read()) {
-            is CredentialStoreResult.Success -> result.value
-            is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+        val threadId = Process.myTid()
+        TunnelLog.info("background.active_credential_read", mapOf("phase" to "begin", "thread_id" to threadId))
+        val startedAt = System.nanoTime()
+        var success = false
+        try {
+            val envelope = when (val result = AndroidBackgroundCredentialStores.open(
+                applicationContext,
+            ).read()) {
+                is CredentialStoreResult.Success -> result.value
+                is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+            }
+            val credential = envelope.active
+                ?: throw BackgroundConnectionException("invalid_background_token")
+            if (credential.deviceId != deviceId) {
+                throw BackgroundConnectionException("background_credential_device_mismatch")
+            }
+            success = true
+            return credential
+        } finally {
+            TunnelLog.info("background.active_credential_read", mapOf(
+                "phase" to "returned",
+                "thread_id" to threadId,
+                "success" to success,
+                "elapsed_ms" to TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt),
+            ))
         }
-        val credential = envelope.active
-            ?: throw BackgroundConnectionException("invalid_background_token")
-        if (credential.deviceId != deviceId) {
-            throw BackgroundConnectionException("background_credential_device_mismatch")
-        }
-        return credential
     }
 
     private fun beginExplicitConnectionIntent(
