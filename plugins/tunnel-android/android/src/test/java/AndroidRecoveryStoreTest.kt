@@ -10,6 +10,97 @@ import org.junit.Test
 
 class AndroidRecoveryStoreTest {
     @Test
+    fun userStopDuringPreparedRecoveryCancelsRestartWithoutLosingCleanup() {
+        for (deferred in listOf(false, true)) for (cancel in 0..2) {
+            val backend = FakeEncryptedRecordBackend()
+            var recovery = store(backend)
+            recovery.beginRedundant(redundantTransaction("v2-start")).success()
+            recovery.prepareRedundantTotalLoss("v2-start",
+                AndroidStartReplay("replacement-start", 2, "replacement-fingerprint")).success()
+            if (deferred) recovery.deferRedundantStop("existing-stop", "v2-start").success()
+            recovery = store(backend)
+            val stopped = when (cancel) {
+                0 -> recovery.cancelCurrentIntent()
+                1 -> recovery.cancelCurrentIntentForQuickToggle()
+                else -> recovery.setDesiredActive(0, false)
+            }.success()
+            assertFalse(stopped.intent.desiredActive)
+            assertEquals(1L, stopped.intent.generation)
+            val pending = requireNotNull(stopped.redundantTransaction)
+            assertEquals("v2-start", pending.startOperationId)
+            assertEquals("22222222-2222-4222-8222-222222222222", pending.sessionId)
+            assertEquals(if (deferred) "existing-stop" else null, pending.stopOperationId)
+            assertNull(pending.retry.totalLossRestartReplay)
+            assertNull(pending.retry.totalLossIntentGeneration)
+            assertNull(pending.retry.totalLossSourceStartOperationId)
+            assertFalse(pending.retry.sessionStalledRecorded)
+            assertEquals(stopped, store(backend).read().success())
+            recovery.cancelRedundantIntentAndDeferStop("user-stop", "v2-start", retainActivePeer = true).success()
+            recovery.updateRedundant("v2-start") {
+                it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+            }.success()
+            val completed = recovery.completeRedundantStop(pending.stopOperationId ?: "user-stop", "v2-start").success()
+            assertFalse(completed.intent.desiredActive)
+            assertNull(completed.leaseTransaction)
+            assertNull(completed.redundantTransaction)
+        }
+    }
+
+    @Test
+    fun pendingV2HandoffAcceptsRefreshedDotMetadataAtomically() {
+        for (dotEnabled in listOf(false, true)) {
+            val backend = FakeEncryptedRecordBackend()
+            var recovery = store(backend)
+            val selected = template().copy(reserveEnabled = true)
+            val request = replay().copy(contractVersion = 2, requestFingerprint = "v2-fingerprint")
+            val pending = requireNotNull(recovery.beginStart(0, selected, request).success().leaseTransaction)
+            val refreshed = selected.copy(options = selected.options.copy(
+                dns46DotHostname = if (dotEnabled) "dns.nelomai.ru" else null,
+                dns46DotEndpointIpv4s = if (dotEnabled) listOf("93.184.216.34") else emptyList(),
+                dns46DotExpiresAtUnix = 4_000_000_000,
+            ))
+            val allocated = redundantTransaction(request.startOperationId).copy(template = refreshed)
+            val before = requireNotNull(backend.record).copyOf()
+            backend.failWrites = true
+            assertEquals("recovery_record_write_failed",
+                recovery.promotePendingRedundant(pending, allocated).failure().code)
+            assertArrayEquals(before, backend.record)
+            backend.failWrites = false
+            recovery.promotePendingRedundant(pending, allocated).success()
+            recovery = store(backend)
+            val restored = recovery.read().success()
+            assertEquals(refreshed, restored.intent.template)
+            assertEquals(pending.generation, restored.intent.generation)
+            assertTrue(restored.intent.desiredActive)
+            assertNull(restored.leaseTransaction)
+            assertEquals(allocated, restored.redundantTransaction)
+        }
+    }
+
+    @Test
+    fun freshDotMetadataCannotHideChangedPolicyOrOwnershipDuringV2Handoff() {
+        val backend = FakeEncryptedRecordBackend()
+        val recovery = store(backend)
+        val selected = template().copy(reserveEnabled = true)
+        val request = replay().copy(contractVersion = 2, requestFingerprint = "v2-fingerprint")
+        val pending = requireNotNull(recovery.beginStart(0, selected, request).success().leaseTransaction)
+        val refreshed = selected.copy(options = selected.options.copy(dns46DotExpiresAtUnix = 4_000_000_000))
+        for (changed in listOf(
+            refreshed.copy(deviceId = "99999999-9999-4999-8999-999999999999"),
+            refreshed.copy(accountScope = "another-account"),
+            refreshed.copy(egressMode = "prefer_ipv6"),
+            refreshed.copy(reserveEnabled = false),
+            refreshed.copy(options = refreshed.options.copy(excludeLocalNetworks = !refreshed.options.excludeLocalNetworks)),
+            refreshed.copy(options = refreshed.options.copy(dnsServers = listOf("1.1.1.1"))),
+        )) {
+            val before = requireNotNull(backend.record).copyOf()
+            assertEquals("connection_intent_generation_conflict", recovery.promotePendingRedundant(pending,
+                redundantTransaction(request.startOperationId).copy(template = changed)).failure().code)
+            assertArrayEquals(before, backend.record)
+        }
+    }
+
+    @Test
     fun dotRoutesPersistAcrossProcessDeathAndPolicyReplacementWithoutChangingOwnership() {
         val backend = FakeEncryptedRecordBackend()
         val options = AndroidTunnelOptions(splitActive = true,
@@ -829,6 +920,17 @@ class AndroidRecoveryStoreTest {
                 "03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3"
             else "a476f93c67f4f7c4c0c8a5a6fa316b871ab11e653c5ec63d64d7d61543daf281",
                 request.getString("request_fingerprint"))
+            val refreshed = selected.copy(options = selected.options.copy(dns46DotExpiresAtUnix = 4_000_000_000))
+            val allocated = redundantTransaction(pending.startOperationId).copy(
+                template = refreshed, standbyDesired = reserve, startReserveEnabled = reserve,
+                startRequestFingerprint = pending.replay.requestFingerprint,
+            )
+            recovery.promotePendingRedundant(pending, allocated).success()
+            val resumed = store(backend).read().success()
+            assertEquals(restored.intent.generation, resumed.intent.generation)
+            assertEquals(refreshed, resumed.intent.template)
+            assertEquals(allocated, resumed.redundantTransaction)
+            assertNull(resumed.leaseTransaction)
         }
     }
 

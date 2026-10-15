@@ -965,17 +965,26 @@ internal class AndroidRecoveryStore(
         val result = readLocked()
         if (result is RecoveryStoreResult.Failure) return@synchronized result
         val current = (result as RecoveryStoreResult.Success).value
+        // The service refreshes server-issued DoT metadata before replay. It is
+        // not user intent; all other template fields must still match exactly.
+        val refreshedTemplate = current.intent.template?.let { template ->
+            template.copy(options = template.options.copy(
+                dns46DotHostname = transaction.template.options.dns46DotHostname,
+                dns46DotEndpointIpv4s = transaction.template.options.dns46DotEndpointIpv4s,
+                dns46DotExpiresAtUnix = transaction.template.options.dns46DotExpiresAtUnix,
+            ))
+        }
         if (!current.intent.desiredActive || current.intent.generation != pending.generation ||
             current.leaseTransaction != pending || current.redundantTransaction != null ||
             pending.phase != LeasePhase.START_PENDING || pending.leaseId != null ||
             pending.replay.contractVersion != 2 || !transaction.desiredActive ||
-            current.intent.template != transaction.template ||
+            refreshedTemplate != transaction.template ||
             transaction.startOperationId != pending.startOperationId ||
             transaction.startRequestFingerprint != pending.replay.requestFingerprint ||
             transaction.template.reserveEnabled != transaction.startReserveEnabled
         ) return@synchronized RecoveryStoreResult.Failure("connection_intent_generation_conflict")
         persist(current.copy(
-            intent = current.intent.copy(retry = AndroidRetryState()),
+            intent = current.intent.copy(template = transaction.template, retry = AndroidRetryState()),
             leaseTransaction = null,
             redundantTransaction = transaction,
         ))
@@ -1362,6 +1371,16 @@ internal class AndroidRecoveryStore(
                         null
                     },
                 ),
+                // User Stop also retires a prepared internal restart. Otherwise
+                // its old generation/desiredActive invariant rejects cancellation.
+                redundantTransaction = current.redundantTransaction?.let { transaction ->
+                    if (desiredActive) transaction else transaction.copy(retry = transaction.retry.copy(
+                        sessionStalledRecorded = false,
+                        totalLossRestartReplay = null,
+                        totalLossIntentGeneration = null,
+                        totalLossSourceStartOperationId = null,
+                    ))
+                },
             ),
         )
     }
