@@ -20,14 +20,22 @@ class ReadinessBeforeStopTest {
 
     private class Backend : EncryptedRecordBackend {
         var bytes: ByteArray? = null
+        var failWrites = false
+        var rejectEmptyWrites = false
         override fun read() = bytes?.copyOf()
-        override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+        override fun write(plaintext: ByteArray): Boolean {
+            if (failWrites || (rejectEmptyWrites && !org.json.JSONObject(String(plaintext, Charsets.UTF_8))
+                    .has("redundantTransaction"))) return false
+            bytes = plaintext.copyOf()
+            return true
+        }
     }
 
     private inner class Fixture(transaction: AndroidRedundantTransaction = active, retain: Boolean = true) {
         val backend = Backend()
         var store = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
         var serverReady = false
+        var completeStop = false
         var localStops = 0
         var roleCalls = 0
         val stops = mutableListOf<String>()
@@ -39,7 +47,9 @@ class ReadinessBeforeStopTest {
             credential = { BackgroundCredential(it, "https://nelomai.example", "token", 1_900_000_000) },
             stopTransport = { _, tx, lease ->
                 stops += backgroundRedundantStopPayload(tx, lease).toString()
-                if (serverReady) org.json.JSONObject().put("stop_acceptance", org.json.JSONObject()
+                if (completeStop) org.json.JSONObject().put("connection", org.json.JSONObject()
+                    .put("lease_id", lease).put("status", "released").put("session_id", org.json.JSONObject.NULL))
+                else if (serverReady) org.json.JSONObject().put("stop_acceptance", org.json.JSONObject()
                     .put("operation_id", stopId).put("session_id", tx.sessionId)
                     .put("lease_id", lease).put("accepted", true).put("cleanup_pending", true))
                 else org.json.JSONObject()
@@ -121,6 +131,91 @@ class ReadinessBeforeStopTest {
         assertTrue(f.envelope().acceptedStops.isEmpty())
         assertTrue(f.coordinator.revoke())
         assertEquals(f.stops[0], f.stops[1])
+    }
+
+    @Test fun acknowledgedReadinessDoesNotGateAcceptedStopOnLaterRoleFailure() {
+        checkAcknowledgedReadinessReplay(false)
+    }
+
+    @Test fun acknowledgedReadinessAfterRecreationDoesNotGateAcceptedStopOnLaterRoleFailure() {
+        checkAcknowledgedReadinessReplay(true)
+    }
+
+    private fun checkAcknowledgedReadinessReplay(recreate: Boolean) {
+        val f = Fixture()
+        f.coordinator.notifyStop()
+        assertTrue(f.serverReady)
+        assertEquals(1, f.stops.size)
+        if (recreate) f.reopen()
+        f.role = { throw BackgroundConnectionException("background_transport_unavailable") }
+        assertTrue(f.coordinator.revoke())
+        assertEquals(1, f.roleCalls)
+        assertEquals(f.stops[0], f.stops[1])
+        assertEquals(stopId, f.envelope().acceptedStops.single().operationId)
+    }
+
+    @Test fun failedReadinessAcknowledgementWriteKeepsProofForReplay() {
+        val f = Fixture()
+        f.role = { tx ->
+            f.serverReady = true
+            f.backend.failWrites = true
+            f.response(tx)
+        }
+        f.coordinator.notifyStop()
+        assertTrue(f.stops.isEmpty())
+        f.backend.failWrites = false
+        f.reopen()
+        assertTrue(f.envelope().redundantTransaction!!.retry.roleObservationPending)
+        f.role = { f.response(it) }
+        assertTrue(f.coordinator.revoke())
+        assertEquals(2, f.roleCalls)
+        assertEquals(stopId, f.envelope().acceptedStops.single().operationId)
+    }
+
+    @Test fun concurrentReadinessAcknowledgementOutlivesAnotherRequestsTransportFailure() {
+        val f = Fixture()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val stopped = java.util.concurrent.atomic.AtomicBoolean()
+        f.role = { tx ->
+            if (f.roleCalls == 1) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+                throw BackgroundConnectionException("background_transport_unavailable")
+            }
+            f.serverReady = true
+            f.response(tx)
+        }
+        val worker = Thread { stopped.set(f.coordinator.revoke()) }.also { it.start() }
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            f.coordinator.notifyStop()
+            assertFalse(f.envelope().redundantTransaction!!.retry.roleObservationPending)
+            release.countDown()
+            worker.join(2_000)
+            assertFalse(worker.isAlive)
+            assertTrue(stopped.get())
+            assertEquals(stopId, f.envelope().acceptedStops.single().operationId)
+            assertEquals(f.stops[0], f.stops[1])
+        } finally { release.countDown(); worker.join(2_000) }
+    }
+
+    @Test fun cleanupAcknowledgementCannotRestoreDeliveredReadinessAfterFailedCompletionWrite() {
+        val f = Fixture()
+        f.completeStop = true
+        f.backend.rejectEmptyWrites = true
+        assertFalse(f.coordinator.revoke())
+        val pending = f.envelope().redundantTransaction!!
+        assertEquals(RedundantStopState.ACKNOWLEDGED, pending.retry.stopState)
+        assertFalse(pending.retry.roleObservationPending)
+        assertNull(pending.retry.pendingRoleLeaseId)
+        assertNull(pending.retry.pendingRoleReason)
+        f.backend.rejectEmptyWrites = false
+        f.reopen()
+        f.role = { throw BackgroundConnectionException("background_transport_unavailable") }
+        assertTrue(f.coordinator.revoke())
+        assertEquals(1, f.roleCalls)
+        assertNull(f.envelope().redundantTransaction)
     }
 
     @Test fun lostReadinessReplyRetriesBeforeStopAfterProcessRecreation() {
@@ -225,6 +320,10 @@ class ReadinessBeforeStopTest {
     }
 
     @Test fun lateNotificationCannotMutateNewStartAfterConcurrentStopAcceptance() {
+        for (acknowledge in listOf(false, true)) checkLateNotification(acknowledge)
+    }
+
+    private fun checkLateNotification(acknowledge: Boolean) {
         val f = Fixture()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -232,7 +331,7 @@ class ReadinessBeforeStopTest {
             if (f.roleCalls == 1) {
                 entered.countDown()
                 check(release.await(5, TimeUnit.SECONDS))
-                throw BackgroundConnectionException("session_membership_conflict")
+                if (!acknowledge) throw BackgroundConnectionException("session_membership_conflict")
             }
             f.serverReady = true
             f.response(tx)
@@ -250,7 +349,7 @@ class ReadinessBeforeStopTest {
             assertFalse(worker.isAlive)
             assertEquals(snapshot, f.envelope())
             assertEquals(next, f.envelope().redundantTransaction)
-            assertEquals(f.stops[0], f.stops[1])
+            assertTrue(f.stops.all { it == f.stops.first() })
         } finally { release.countDown(); worker.join(2_000) }
     }
 }

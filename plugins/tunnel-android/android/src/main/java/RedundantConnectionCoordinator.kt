@@ -1687,17 +1687,27 @@ internal class RedundantConnectionCoordinator(
             retry.pendingRoleLeaseId != pending.localActiveLeaseId ||
             retry.pendingNativeActiveLeaseId != null
         ) return true
-        // Keep proof durable until Stop is accepted/completed. Lost replies and process
-        // death can replay it; rebasing this report never changes Stop's frozen payload.
+        val acknowledged = pending.copy(retry = retry.copy(
+            roleObservationPending = false,
+            pendingRoleLeaseId = null,
+            pendingRoleReason = null,
+        ))
+        // Another Stop request can acknowledge delivery while this HTTP is in flight.
+        // Compare the exact stopped transaction without taking the coordinator/native gate.
+        fun deliveryRecorded(): Boolean =
+            (store.read() as? RecoveryStoreResult.Success)?.value?.redundantTransaction == acknowledged
+        // Replay lost replies until role delivery is durably recorded. Rebasing only
+        // this report never changes Stop's frozen payload.
         var report = pending
         repeat(2) {
+            if (deliveryRecorded()) return true
             val response = try {
                 panel.reportRole(report, "primary_ready")
             } catch (error: Throwable) {
                 // Fenced/revoked roles must not prevent cleanup. Stop still owns all
                 // authorization, confirmed-start and ACK checks; no acceptance is inferred here.
-                return error is BackgroundConnectionException &&
-                    ConnectionIntentErrorPolicy().classify(error.code) == ConnectionIntentDecision.TERMINAL
+                return deliveryRecorded() || (error is BackgroundConnectionException &&
+                    ConnectionIntentErrorPolicy().classify(error.code) == ConnectionIntentDecision.TERMINAL)
             }
             val session = response.session
             if (session.sessionId != pending.sessionId ||
@@ -1705,13 +1715,15 @@ internal class RedundantConnectionCoordinator(
                 !session.containsCurrentLease(pending.localActiveLeaseId)
             ) return false
             if (response.action != "rebase") {
-                return response.action in setOf("accepted", "acknowledged") &&
-                    session.activeLeaseId == pending.localActiveLeaseId
+                if (response.action !in setOf("accepted", "acknowledged") ||
+                    session.activeLeaseId != pending.localActiveLeaseId
+                ) return false
+                return deliveryRecorded() || persistExactTransaction(pending, acknowledged)
             }
             report = report.copy(roleGeneration = session.roleGeneration,
                 membershipGeneration = session.membershipGeneration)
         }
-        return false
+        return deliveryRecorded()
     }
 
     // Called only after the service's durable cancellation fence. Native has
@@ -1746,7 +1758,14 @@ internal class RedundantConnectionCoordinator(
                 outcome.credential, nativeClosed = localStopped) is RecoveryStoreResult.Success
         }
         if (!localStopped || outcome !is RedundantStopOutcome.Completed) return@synchronized false
-        val acknowledged = pending.copy(retry = pending.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+        // Whole-session cleanup also ends role delivery; do not restore a stale pending
+        // observation from the snapshot taken before the role/Stop HTTP calls.
+        val acknowledged = pending.copy(retry = pending.retry.copy(
+            stopState = RedundantStopState.ACKNOWLEDGED,
+            roleObservationPending = false,
+            pendingRoleLeaseId = null,
+            pendingRoleReason = null,
+        ))
         if (!persistCleanup(acknowledged)) return@synchronized false
         store.completeRedundantStop(
             stopOperationId = requireNotNull(acknowledged.stopOperationId),
