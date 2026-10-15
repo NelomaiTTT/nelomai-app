@@ -777,7 +777,6 @@
         reserveState = null;
         connectionIntentStatus = "none";
         nextRetryAtUnix = null;
-        phase = "ready";
       } else {
         if (!startDeviceId) return;
         phase = "connecting";
@@ -1653,7 +1652,9 @@
           >
             <span>
               {localStopPendingCleanup ? "Выключен"
-                : connectionActionState.cancelBusy ? "Выключаем"
+                : connectionActionState.cancelBusy ||
+                  (phase === "stopping" && connectionIntentStatus === "none")
+                  ? "Выключаем"
                 : connectionAction === "stop"
                 ? "Стоп"
                 : runtimeStateSync.blocking ? "Проверяем состояние"

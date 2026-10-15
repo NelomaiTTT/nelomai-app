@@ -7,6 +7,7 @@ import { beginConnectionStart, beginConnectionStop, initialConnectionActionState
   finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
 import { commandCode, commandMessage } from "./native-client";
+import { primaryAction, type Phase, type ConnectionIntentStatus } from "./app-model";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -39,6 +40,28 @@ const modalBlock = template.fragment.nodes.filter((node) => node.type === "IfBlo
 const modalTest = modalBlock.test as typeof modalBlock.test & { start: number; end: number };
 const modalVisible = new Function("context",
   `with (context) { return ${page.slice(modalTest.start, modalTest.end)}; }`);
+
+// Find and evaluate the actual button expression, including asynchronous phase
+// changes. This catches presentation regressions that a callback-only test misses.
+function findConnectButton(node: any): any {
+  if (!node || typeof node !== "object") return null;
+  if (node.type === "RegularElement" && node.name === "button" &&
+      node.attributes.some((attribute: any) => attribute.name === "class" &&
+        attribute.value?.some((value: any) => value.data === "connect-button"))) return node;
+  for (const child of Object.values(node)) {
+    for (const value of Array.isArray(child) ? child : [child]) {
+      const found = findConnectButton(value);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+const connectButton = findConnectButton(template.fragment);
+const buttonLabelExpression = connectButton.fragment.nodes
+  .find((node: any) => node.type === "RegularElement" && node.name === "span")
+  .fragment.nodes.find((node: any) => node.type === "ExpressionTag").expression;
+const buttonLabel = new Function("context", `with (context) { return ${
+  page.slice(buttonLabelExpression.start, buttonLabelExpression.end)}; }`);
 
 function fixture() {
   let reply!: (value: unknown) => void;
@@ -77,6 +100,87 @@ function logoutFixture() {
   });
   return result;
 }
+
+describe("async Stop presentation", () => {
+  function stopFixture() {
+    const result = fixture();
+    const { context } = result;
+    Object.assign(context, {
+      phase: "connected", splitTunnelBlocksStart: false, runtimeStatus: null,
+      bootstrap: { device: { id: "own-device", platform: "android" }, binding: {} },
+      canBeginConnectionAction, beginConnectionStart, beginConnectionStop,
+      finishConnectionStart, finishConnectionStop,
+    });
+    Object.defineProperty(context, "connectionAction", { get: () => primaryAction({
+      phase: context.phase as Phase,
+      connectionIntentStatus: context.connectionIntentStatus as ConnectionIntentStatus,
+    }) });
+    return result;
+  }
+
+  it("keeps shutdown presentation between Stop acceptance and the authoritative state reply", async () => {
+    const { context, reply, state } = stopFixture();
+    let acceptStop!: () => void;
+    let stateRequested!: () => void;
+    const requested = new Promise<void>((resolve) => { stateRequested = resolve; });
+    const readState = context.nativeClient.state;
+    Object.assign(context.nativeClient, {
+      stop: () => new Promise<void>((resolve) => { acceptStop = resolve; }),
+      state: () => { stateRequested(); return readState(); },
+    });
+    const pending = toggle(context);
+    expect(context.phase).toBe("stopping");
+    expect(buttonLabel(context)).toBe("Выключаем");
+    acceptStop();
+    await requested;
+    const phaseAfterAcceptance = context.phase;
+    reply({ ...state, phase: "stopping", connectionIntentStatus: "none" });
+    await pending;
+    expect(phaseAfterAcceptance).toBe("stopping");
+    expect(context.connectionActionState.cancelBusy).toBe(false);
+    expect(buttonLabel(context)).toBe("Выключаем");
+  });
+
+  it("keeps Выключаем after IPC settles until a later poll confirms completion", async () => {
+    const { context, reply, state } = stopFixture();
+    Object.assign(context.nativeClient, { stop: async () => null });
+    const pending = toggle(context);
+    reply({ ...state, phase: "stopping" });
+    await pending;
+    expect(context.busy).toBe(false);
+    expect(buttonLabel(context)).toBe("Выключаем");
+    context.nativeClient.state = async () => ({ ...state, phase: "ready" });
+    await synchronize(context, false);
+    expect(buttonLabel(context)).toBe("Старт");
+  });
+
+  it("keeps automatic recovery cancellable instead of presenting it as user shutdown", () => {
+    const { context } = stopFixture();
+    context.phase = "stopping";
+    context.connectionIntentStatus = "recovering";
+    expect(buttonLabel(context)).toBe("Стоп");
+    expect(canBeginConnectionAction(context.connectionActionState, false, true)).toBe(true);
+  });
+
+  it("shows confirmed local shutdown separately from a pending Stop", () => {
+    const { context } = stopFixture();
+    context.phase = "stopping";
+    context.localStopPendingCleanup = true;
+    expect(buttonLabel(context)).toBe("Выключен");
+  });
+
+  it("restores Stop after a failed cancellation while the tunnel remains connected", async () => {
+    const { context, reply, state } = stopFixture();
+    Object.assign(context.nativeClient, { stop: async () => { throw { code: "temporarily_unavailable" }; } });
+    const pending = toggle(context);
+    reply(state);
+    await pending;
+    expect(context.phase).toBe("connected");
+    expect(context.connectionActionState.cancelBusy).toBe(false);
+    expect(buttonLabel(context)).toBe("Стоп");
+    expect(context.error).not.toBeNull();
+  });
+});
 
 describe("foreground native state callback", () => {
   it("finishes an explicit logout without replacing the confirmed-closure screen with login", async () => {
