@@ -9,45 +9,56 @@ use tokio::sync::{mpsc, oneshot, watch};
 type Queued = (FrameV1, Instant);
 pub(super) struct Outbox {
     sender: mpsc::Sender<Queued>,
-    closed: watch::Sender<bool>,
+    closed: watch::Sender<Option<&'static str>>,
     next_id: AtomicU64,
 }
 impl Outbox {
     pub fn close(&self) {
-        self.closed.send_replace(true);
+        self.close_with_reason("local_close");
+    }
+    pub fn close_with_reason(&self, reason: &'static str) {
+        // Keep the first cause: both pumps and request guards subsequently close.
+        self.closed.send_if_modified(|value| {
+            if value.is_some() {
+                return false;
+            }
+            *value = Some(reason);
+            true
+        });
     }
     pub fn is_closed(&self) -> bool {
-        *self.closed.borrow()
+        self.closed.borrow().is_some()
     }
-    pub fn cancellation(&self) -> watch::Receiver<bool> {
+    pub fn cancellation(&self) -> watch::Receiver<Option<&'static str>> {
         self.closed.subscribe()
     }
     pub fn id(&self) -> Result<u64, PrivateError> {
         self.next_id
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| old.checked_add(1))
             .map_err(|_| {
-                self.close();
+                self.close_with_reason("request_id_exhausted");
                 PrivateError::Closed
             })
     }
     pub fn enqueue(&self, frame: FrameV1, deadline: Instant) -> Result<(), PrivateError> {
-        validate_frame_size(&frame).inspect_err(|_| self.close())?;
+        validate_frame_size(&frame)
+            .inspect_err(|_| self.close_with_reason("outgoing_frame_invalid"))?;
         if self.is_closed() {
             return Err(PrivateError::Closed);
         }
         if Instant::now() >= deadline {
-            self.close();
+            self.close_with_reason("enqueue_timeout");
             return Err(PrivateError::Timeout);
         }
         self.sender.try_send((frame, deadline)).map_err(|_| {
-            self.close();
+            self.close_with_reason("outbox_full_or_closed");
             PrivateError::Closed
         })
     }
 }
-pub(super) async fn closed(receiver: &mut watch::Receiver<bool>) {
+pub(super) async fn closed(receiver: &mut watch::Receiver<Option<&'static str>>) {
     loop {
-        if *receiver.borrow_and_update() {
+        if receiver.borrow_and_update().is_some() {
             return;
         }
         if receiver.changed().await.is_err() {
@@ -64,7 +75,7 @@ pub(super) struct RequestLifetime {
 impl Drop for RequestLifetime {
     fn drop(&mut self) {
         if !self.complete {
-            self.outbox.close();
+            self.outbox.close_with_reason("request_cancelled");
         }
     }
 }
@@ -75,7 +86,7 @@ where
 {
     let (sender, mut receiver) = mpsc::channel::<Queued>(OUTBOX_CAPACITY);
     let (incoming, frames) = mpsc::channel(OUTBOX_CAPACITY);
-    let (cancel, _) = watch::channel(false);
+    let (cancel, _) = watch::channel(None);
     let outbox = Arc::new(Outbox {
         sender,
         closed: cancel,
@@ -90,17 +101,34 @@ where
             // starting at its first byte, including the rest of its header.
             let first = tokio::select! { biased;
                 _ = closed(&mut reader_cancel) => break,
-                value = read.read_u8() => match value { Ok(value) => value, Err(_) => break },
+                value = read.read_u8() => match value {
+                    Ok(value) => value,
+                    Err(error) => {
+                        reader_box.close_with_reason(if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                            "peer_eof"
+                        } else { "read_failed" });
+                        break;
+                    }
+                },
             };
             let started = Instant::now();
             let prefix = [first];
             let mut prefixed = prefix.as_slice().chain(&mut read);
             let frame = tokio::select! { biased;
                 _ = closed(&mut reader_cancel) => break,
-                result = read_frame(&mut prefixed, started + REQUEST_BUDGET) => match result { Ok(frame) => frame, Err(_) => break },
+                result = read_frame(&mut prefixed, started + REQUEST_BUDGET) => match result {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        reader_box.close_with_reason(if matches!(error, PrivateError::Timeout) {
+                            "read_frame_timeout"
+                        } else { "read_frame_failed" });
+                        break;
+                    }
+                },
             };
             let deadline = started + Duration::from_millis(frame.remaining_ms);
             if Instant::now() >= deadline || incoming.try_send((frame, deadline)).is_err() {
+                reader_box.close_with_reason("incoming_expired_or_full");
                 break;
             }
         }
@@ -119,6 +147,7 @@ where
                 result = write_frame(&mut write, item.0, item.1) => result,
             };
             if result.is_err() {
+                writer_box.close_with_reason("write_frame_failed");
                 break;
             }
         }

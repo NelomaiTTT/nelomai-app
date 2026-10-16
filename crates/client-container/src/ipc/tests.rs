@@ -7,7 +7,7 @@ use nelomai_client_storage::*;
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{Platform, RuntimeSlot};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -915,19 +915,33 @@ impl ProtectedRecordStore for Record {
     }
 }
 #[derive(Default)]
-struct Tunnel(AtomicUsize, AtomicUsize);
+struct Tunnel(AtomicUsize, AtomicUsize, AtomicBool, AtomicBool);
 #[async_trait::async_trait]
 impl TunnelController for Tunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
         self.1.fetch_add(1, Ordering::SeqCst);
+        if self.2.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            return Err(TunnelError::Backend("tunnel_start_timeout".into()));
+        }
         Ok(())
     }
     async fn stop(&self) -> Result<(), TunnelError> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        if self.2.load(Ordering::SeqCst) {
+            return Err(TunnelError::Backend("redundant_stop_pending".into()));
+        }
         Ok(())
     }
     async fn status(&self) -> Result<TunnelStatus, TunnelError> {
-        Ok(TunnelStatus::Stopped)
+        Ok(if self.2.load(Ordering::SeqCst) {
+            TunnelStatus::Failed
+        } else {
+            TunnelStatus::Stopped
+        })
+    }
+    async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
+        Ok(self.3.load(Ordering::SeqCst))
     }
 }
 
@@ -944,6 +958,152 @@ struct Fixture {
     record: Arc<RuntimeRecordOwner<ProtectedRuntimeStore<Record>>>,
     auth_backend: Record,
     runtime_backend: Record,
+}
+
+#[tokio::test]
+async fn channel_diagnostics_distinguish_eof_cancel_and_timeout() {
+    for expected in ["peer_eof", "request_cancelled", "request_timeout"] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+        let (mut peer, socket) = private_socketpair().unwrap();
+        let client =
+            PrivateRuntimeAuthClient::new(socket, fixture.child.clone(), fixture.local.clone());
+        if expected == "peer_eof" {
+            drop(peer);
+        } else {
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let request = client.request(AuthRequestV1::State, deadline);
+            tokio::pin!(request);
+            poll_pending(request.as_mut()).await;
+            read_frame(&mut peer, deadline).await.unwrap();
+            if expected == "request_timeout" {
+                assert!(matches!(request.await, Err(PrivateError::Timeout)));
+            }
+            // Dropping a dispatched, unanswered request must still fail closed.
+        }
+        let reason = tokio::time::timeout(Duration::from_secs(1), client.wait_for_channel_close())
+            .await
+            .unwrap();
+        assert_eq!(reason, expected);
+        assert!(client.is_channel_closed());
+        assert!(client.check_start_barrier().is_err());
+    }
+}
+
+#[tokio::test]
+async fn completed_private_requests_do_not_accumulate_or_expire_idle_channel() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    for _ in 0..(MAX_PENDING * 4) {
+        assert_eq!(
+            fixture.client.state().await.unwrap(),
+            RuntimeAuthState::Active
+        );
+        fixture.client.access(None).await.unwrap();
+    }
+    tokio::time::pause();
+    tokio::time::advance(REQUEST_BUDGET * 4).await;
+    tokio::time::resume();
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::Active
+    );
+    assert!(fixture.parent.is_connected());
+}
+
+#[tokio::test]
+async fn pending_limit_is_diagnosed_and_still_closes_the_channel() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+    let (mut peer, socket) = private_socketpair().unwrap();
+    let client =
+        PrivateRuntimeAuthClient::new(socket, fixture.child.clone(), fixture.local.clone());
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let mut requests = Vec::new();
+    for _ in 0..MAX_PENDING {
+        let mut request = Box::pin(client.request(AuthRequestV1::State, deadline));
+        poll_pending(request.as_mut()).await;
+        read_frame(&mut peer, deadline).await.unwrap();
+        requests.push(request);
+    }
+    assert!(matches!(
+        client.request(AuthRequestV1::State, deadline).await,
+        Err(PrivateError::Closed)
+    ));
+    drop(requests);
+    assert_eq!(
+        client.wait_for_channel_close().await,
+        "pending_limit_or_duplicate"
+    );
+    assert!(client.check_start_barrier().is_err());
+}
+
+#[tokio::test]
+async fn native_start_timeout_and_cleanup_pending_keep_real_auth_channel_usable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route("/api/client/v1/connections/start", axum::routing::post(|| async {
+        axum::Json(serde_json::json!({
+            "api_version":"1", "request_id":"synthetic", "reused":false,
+            "configuration":"[Interface]\nPrivateKey = synthetic\n",
+            "connection":{"lease_id":"11111111-1111-4111-8111-111111111111",
+                "layer":"stray", "transport_protocol":"wireguard", "tic_connection_mode":"dynamic",
+                "route_mode":"standalone", "egress_mode":"ipv4", "status":"issued", "pinned":false}
+        }))
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    for native_owner in [false, true] {
+        let fixture = Fixture::new(api.clone(), true);
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        fixture.tunnel.2.store(true, Ordering::SeqCst);
+        fixture.tunnel.3.store(native_owner, Ordering::SeqCst);
+        let core = Arc::new(nelomai_client_core::ClientCore::new(
+            Arc::new(api.clone()),
+            Arc::new(fixture.record.operational()),
+            fixture.client.clone(),
+            fixture.local.clone(),
+            Arc::new(nelomai_client_core::NoopLogger),
+        ));
+        let before = fixture.auth.load().unwrap();
+        let starting = core.clone();
+        let start =
+            tokio::spawn(async move { starting.start(nlm071_options(), 1_700_000_000).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while fixture.tunnel.1.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..MAX_PENDING * 2 {
+            let observation = core.begin_foreground_observation().await;
+            core.foreground_state(observation, None).await;
+        }
+        // Native waits longer than the private request budget. No pending auth
+        // request is dropped or timed out just because native Start times out.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+        let result = start.await.unwrap();
+        assert!(
+            matches!(result, Err(nelomai_client_core::CoreError::Tunnel(ref code)) if code == "tunnel_start_timeout"),
+            "{result:?}"
+        );
+        assert_eq!(fixture.tunnel.1.load(Ordering::SeqCst), 1);
+        assert!(!core.runtime_channel_closed());
+        assert_eq!(
+            fixture.client.state().await.unwrap(),
+            RuntimeAuthState::Active
+        );
+        assert_eq!(fixture.auth.load().unwrap(), before);
+    }
+    server.abort();
 }
 impl Fixture {
     fn new(api: ClientApi, active: bool) -> Self {

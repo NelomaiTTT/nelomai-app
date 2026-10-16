@@ -803,7 +803,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private val redundantStopRetryQueued = AtomicBoolean(false)
     private val redundantStopRetry = RedundantTotalLossRetryScheduler(
         retry = ::retryPendingRedundantStop,
-        delayMillis = 10_000L,
+        delayMillis = REDUNDANT_STOP_RETRY_MILLIS,
         scheduleAllowed = { pendingRedundantStop != null || redundantCancelTombstoneUnreadable },
         remove = restoreHandler::removeCallbacks,
         postDelayed = { task, delay -> restoreHandler.postDelayed(task, delay) },

@@ -54,6 +54,12 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
             )
         })
     })?;
+    let channel = port.clone();
+    let channel_diagnostics = diagnostics.clone();
+    tauri::async_runtime::spawn(async move {
+        let reason = channel.wait_for_channel_close().await;
+        channel_diagnostics.record_named("runtime.auth_channel_closed", None, None, Some(reason));
+    });
     let api = ClientApi::new(PANEL_BASE)?.with_app_version(&bootstrap.target.container_version)?;
     diagnostics.record_named("startup.rust.private_runtime_ready", None, None, None);
     let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(

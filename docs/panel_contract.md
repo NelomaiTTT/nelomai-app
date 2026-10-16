@@ -148,6 +148,17 @@ offline AWG3 start reaches the handshake timeout and local cleanup succeeds.
 
 ## Diagnostic reports
 
+Android records `runtime.auth_channel_closed` with the first local private-IPC
+closure reason (EOF, request cancellation/deadline, framing/queue failure or
+rejected response/control). Codes are fixed strings; frame bodies and tokens
+are never included. Later cleanup cannot overwrite the first reason. The UI
+continues to block Start after a real channel closure. A native Start timeout
+alone is not evidence that this authenticated channel closed.
+
+Recovery-v2 redundant Stop checks pending cleanup using the existing coalescing
+scheduler at one-second intervals. It still waits for the required server ACK;
+failed Start and total-loss cleanup do not become normal asynchronous Stop.
+
 An authenticated device can explicitly send a bounded diagnostic report to:
 
 ```text

@@ -1066,6 +1066,13 @@ impl Drop for PrivateRuntimeAuthClient {
     }
 }
 impl PrivateRuntimeAuthClient {
+    /// Local fixed diagnostic code only; never exposes private frame contents.
+    pub async fn wait_for_channel_close(&self) -> &'static str {
+        let mut receiver = self.outbox.cancellation();
+        closed(&mut receiver).await;
+        let reason = (*receiver.borrow()).unwrap_or("local_close");
+        reason
+    }
     /// Receives only closed enums, not requests, credentials, or server prose.
     pub fn with_login_failure_observer(
         mut self,
@@ -1309,7 +1316,7 @@ impl PrivateRuntimeAuthClient {
                 }
             }
             client_child.close();
-            client_box.close();
+            client_box.close_with_reason("response_or_control_rejected");
             client_pending.clear();
             controls.abort_all();
             // Physical stop is independent of held writer guards and is polled
@@ -1355,7 +1362,9 @@ impl PrivateRuntimeAuthClient {
         let (receiver, login_id) = {
             let _send = self.send_gate.lock().map_err(|_| PrivateError::Closed)?;
             let id = self.outbox.id()?;
-            let receiver = self.pending.insert(id)?;
+            let receiver = self.pending.insert(id).inspect_err(|_| {
+                self.outbox.close_with_reason("pending_limit_or_duplicate");
+            })?;
             let login_id = if matches!(request, AuthRequestV1::Login { .. }) {
                 let mut pending = self
                     .pending_login
@@ -1380,7 +1389,10 @@ impl PrivateRuntimeAuthClient {
         let mut cancel = self.outbox.cancellation();
         let response = tokio::select! { biased;
             _ = closed(&mut cancel) => Err(PrivateError::Closed),
-            result = timeout_at(deadline, receiver) => result.map_err(|_| PrivateError::Timeout)?.map_err(|_| PrivateError::Closed),
+            result = timeout_at(deadline, receiver) => result.map_err(|_| {
+                self.outbox.close_with_reason("request_timeout");
+                PrivateError::Timeout
+            })?.map_err(|_| PrivateError::Closed),
         }?;
         lifetime.complete = true;
         match response {
