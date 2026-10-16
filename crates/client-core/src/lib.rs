@@ -3348,7 +3348,19 @@ where
             let same_session = session_id.is_some() && current.session_id.as_deref() == session_id;
             (current.lease_id != pending.lease_id || current.session_id.is_some()) && !same_session
         }) {
-            return Err(CoreError::Storage);
+            // Bootstrap may fall back to an older inactive lease after the
+            // failed session finishes. Replay the exact v2 journal only with
+            // a confirmed local stop; never infer authority over a live owner.
+            let inactive_projection = session_id.is_some()
+                && current.as_ref().is_some_and(|current| {
+                    current.session_id.is_none()
+                        && (terminal_lease_status(current.status)
+                            || current.status == LeaseStatus::Warm)
+                })
+                && matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped));
+            if !inactive_projection {
+                return Err(CoreError::Storage);
+            }
         }
         let pending = self.migrate_legacy_pending_compensation_stop(pending, current.as_ref())?;
         if pending_compensation_redundant_session(&pending)?.is_some() {

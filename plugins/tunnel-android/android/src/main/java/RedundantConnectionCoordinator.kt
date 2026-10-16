@@ -452,7 +452,15 @@ internal class RedundantConnectionCoordinator(
         val active = transaction.localActiveLeaseId ?: return@synchronized false
         val activeConfiguration = configurations[active] ?: return@synchronized false
         if (!mutationFence.runIfActive(transaction.startOperationId) {
-                store.beginRedundant(transaction) is RecoveryStoreResult.Success
+                when (val saved = store.beginRedundant(transaction)) {
+                    is RecoveryStoreResult.Success -> true
+                    is RecoveryStoreResult.Failure -> {
+                        // Do not collapse a durable admission refusal into an
+                        // unexplained native failure in the diagnostic report.
+                        runCatching { TunnelLog.warning("redundant.start_rejected", saved.code) }
+                        false
+                    }
+                }
             }
         ) return@synchronized false
         primaryReadinessFailed = false

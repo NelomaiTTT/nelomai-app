@@ -5732,6 +5732,169 @@ async fn manual_stop_of_a_restored_session_does_not_stop_only_one_member() {
     assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn redundant_compensation_still_rejects_a_different_live_or_session_projection() {
+    for (status, session_id) in [
+        (LeaseStatus::Issued, None),
+        (LeaseStatus::Connected, None),
+        (LeaseStatus::Warm, Some("another-session")),
+        (LeaseStatus::Released, Some("another-session")),
+    ] {
+        let mut saved = auth();
+        let journal = StoredPendingCompensationStop {
+            operation_id: "exact-stop".into(),
+            lease_id: "failed-start-lease".into(),
+            recovery_contract_version: Some(2),
+            redundant_session_id: Some("failed-session".into()),
+            accept_warm: true,
+            failure_code: None,
+        };
+        saved.pending_compensation_stop = Some(journal.clone());
+        let store = Arc::new(MemoryStore::new(saved));
+        let api = Arc::new(MockApi::new(0));
+        let mut other = connection("different-lease");
+        other.status = status;
+        other.session_id = session_id.map(str::to_owned);
+        *api.bootstrap_connection.lock().unwrap() = Some(other);
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        assert!(matches!(
+            core.start_recovery_v2(options(), 1_700_000_001, true).await,
+            Err(CoreError::Storage)
+        ));
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load().unwrap().unwrap().pending_compensation_stop,
+            Some(journal)
+        );
+    }
+}
+
+#[tokio::test]
+async fn inactive_projection_cannot_bypass_native_stop_confirmation_or_legacy_scope() {
+    for (legacy, native_status) in [
+        (true, Some(TunnelStatus::Stopped)),
+        (false, Some(TunnelStatus::Running)),
+        (false, Some(TunnelStatus::Starting)),
+        (false, Some(TunnelStatus::Stopping)),
+        (false, Some(TunnelStatus::Failed)),
+        (false, None),
+    ] {
+        let mut saved = auth();
+        let journal = StoredPendingCompensationStop {
+            operation_id: "exact-stop".into(),
+            lease_id: "failed-start-lease".into(),
+            recovery_contract_version: (!legacy).then_some(2),
+            redundant_session_id: (!legacy).then(|| "failed-session".into()),
+            accept_warm: true,
+            failure_code: None,
+        };
+        saved.pending_compensation_stop = Some(journal.clone());
+        let store = Arc::new(MemoryStore::new(saved));
+        let api = Arc::new(MockApi::new(0));
+        let mut old = connection("older-retained-lease");
+        old.status = LeaseStatus::Warm;
+        *api.bootstrap_connection.lock().unwrap() = Some(old);
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        if let Some(status) = native_status {
+            *tunnel.status.lock().unwrap() = status;
+        } else {
+            tunnel.status_failures.store(1, Ordering::SeqCst);
+        }
+        assert!(core.stop().await.is_err());
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load().unwrap().unwrap().pending_compensation_stop,
+            Some(journal)
+        );
+    }
+}
+
+#[tokio::test]
+async fn redundant_compensation_replays_after_bootstrap_exposes_an_older_warm_lease() {
+    // A failed new Start leaves an exact v2 Stop journal. Once its session is
+    // cleaned, bootstrap may expose a different, older retained WARM lease.
+    for status in [
+        LeaseStatus::Warm,
+        LeaseStatus::Released,
+        LeaseStatus::Failed,
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        api.redundant_stop_responses
+            .lock()
+            .unwrap()
+            .push_back(Err(CoreApiError::Retryable));
+        let store = Arc::new(MemoryStore::new(auth()));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            tunnel,
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(Vec::new()));
+        assert!(core
+            .start_recovery_v2(options(), 1_700_000_000, true)
+            .await
+            .is_err());
+        let journal = store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pending_compensation_stop
+            .unwrap();
+        let mut old = connection("older-retained-lease");
+        old.status = status;
+        old.session_id = None;
+        *api.bootstrap_connection.lock().unwrap() = Some(old);
+        let restarted = support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(Vec::new()));
+        restarted.bootstrap(1_700_000_001).await.unwrap();
+        restarted
+            .start_recovery_v2(options(), 1_700_000_002, true)
+            .await
+            .expect("a stale inactive projection must not strand exact session cleanup");
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        {
+            let stops = api.redundant_stop_requests.lock().unwrap();
+            assert_eq!(stops.len(), 2);
+            assert_eq!(stops[0], stops[1]);
+            assert_eq!(stops[1].operation_id, journal.operation_id);
+            assert_eq!(stops[1].session_id, journal.redundant_session_id.unwrap());
+            assert_eq!(stops[1].lease_id, journal.lease_id);
+        }
+        assert!(store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pending_compensation_stop
+            .is_none());
+        assert_eq!(restarted.state().await.phase, Phase::Connected);
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn session_stop_keeps_identity_across_pending_cleanup_and_restart() {
     for status in [

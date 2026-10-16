@@ -283,6 +283,35 @@ internal fun parseStopAcceptance(value: JSONObject): StopAcceptance {
     }
 }
 
+// Runs on the Start worker, before acquiring an owner or coordinator/store lock.
+// The independent cleanup worker supplies receipts; only confirmed removal opens capacity.
+internal fun awaitAcceptedStopCapacity(
+    store: AndroidRecoveryStore,
+    shouldCancel: () -> Boolean,
+    timeoutMillis: Long = 5_000L,
+) {
+    val startedAt = System.nanoTime()
+    val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+    while (true) {
+        if (shouldCancel() || Thread.currentThread().isInterrupted) {
+            throw BackgroundConnectionException("tunnel_start_cancelled")
+        }
+        val snapshot = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+        }
+        if (snapshot.acceptedStops.size < MAX_ACCEPTED_STOP_CLEANUPS) return
+        val remaining = timeoutNanos - (System.nanoTime() - startedAt)
+        if (remaining <= 0) throw BackgroundConnectionException("accepted_stop_capacity_exceeded")
+        try {
+            Thread.sleep(TimeUnit.NANOSECONDS.toMillis(remaining).coerceIn(1L, 100L))
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw BackgroundConnectionException("tunnel_start_cancelled")
+        }
+    }
+}
+
 // Retired callbacks can only remove their own immutable record, never mutate the live intent.
 internal fun reconcileAcceptedStops(
     store: AndroidRecoveryStore,
@@ -293,7 +322,9 @@ internal fun reconcileAcceptedStops(
         runCatching {
             val reply = reconcile(entry)
             val acceptance = reply.stopAcceptance ?: return@runCatching
-            if (reply.state == "applied" && !acceptance.cleanupPending &&
+            // Released/failed leases project an applied Stop as terminal.
+            // The exact final receipt, not the lease status alone, is proof.
+            if (reply.state in setOf("applied", "terminal") && !acceptance.cleanupPending &&
                 acceptance.operationId == entry.operationId && acceptance.sessionId == entry.sessionId &&
                 acceptance.leaseId == entry.leaseId
             ) store.completeAcceptedCleanup(entry)

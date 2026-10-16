@@ -1295,6 +1295,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             if (args.apiVersion != TUNNEL_API_VERSION) {
                 throw BackgroundConnectionException("unsupported_api_version")
             }
+            awaitAcceptedStopCapacity(recoveryStore, shouldCancel = {
+                serviceDestroyed || serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                    redundantStartOperation.isCancelled(clientOperationId)
+            })
             val redundancy = requireNotNull(args.redundancy)
             val credential = serviceActiveCredential(serviceCredential().deviceId)
             val transaction = redundantTransactionFromStart(

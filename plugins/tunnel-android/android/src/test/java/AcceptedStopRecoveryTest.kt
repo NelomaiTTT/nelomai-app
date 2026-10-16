@@ -138,6 +138,48 @@ class AcceptedStopRecoveryTest {
         assertEquals(eight, (restored.read() as RecoveryStoreResult.Success).value.acceptedStops)
     }
 
+    @Test fun terminalReceiptDrainsFullArchiveAndAdmitsTheNextStart() {
+        val backend = Backend()
+        val store = prepared(backend)
+        val oldTransaction = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+        assertTrue(coordinator(store, { true }, { acceptedReply() }).revoke())
+        val current = (store.read() as RecoveryStoreResult.Success).value
+        val first = current.acceptedStops.single()
+        val eight = (0..7).map { index -> first.copy(
+            operationId = "55555555-5555-4555-8555-%012d".format(index),
+            sessionId = "22222222-2222-4222-8222-%012d".format(index)) }
+        backend.bytes = AndroidRecoveryEnvelopeCodec.encode(current.copy(acceptedStops = eight))
+        val next = oldTransaction.copy(desiredActive = true, stopOperationId = null,
+            retry = AndroidRedundantRetryState(), backgroundCleanupOnStop = false,
+            sessionId = "66666666-6666-4666-8666-666666666666",
+            startOperationId = "77777777-7777-4777-8777-777777777777")
+        assertTrue(store.beginRedundant(next) is RecoveryStoreResult.Failure)
+        // Panel projects APPLIED as terminal when the lease is released.
+        // Only its exact final receipt authorizes removing a retired record.
+        reconcileAcceptedStops(store) { old -> BackgroundReconcileResult("terminal", false,
+            old.leaseId, "released", 0, null,
+            StopAcceptance(old.operationId, old.sessionId, old.leaseId, false)) }
+        val restarted = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
+        assertTrue((restarted.read() as RecoveryStoreResult.Success).value.acceptedStops.isEmpty())
+        assertTrue(restarted.beginRedundant(next) is RecoveryStoreResult.Success)
+        assertEquals(next, (restarted.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+    }
+
+    @Test fun terminalStateAloneCannotEraseAcceptedCleanup() {
+        val backend = Backend()
+        val store = prepared(backend)
+        assertTrue(coordinator(store, { true }, { acceptedReply() }).revoke())
+        val before = (store.read() as RecoveryStoreResult.Success).value
+        val old = before.acceptedStops.single()
+        val final = StopAcceptance(old.operationId, old.sessionId, old.leaseId, false)
+        for (receipt in listOf(null, final.copy(operationId = device),
+            final.copy(sessionId = device), final.copy(leaseId = device), final.copy(cleanupPending = true))) {
+            reconcileAcceptedStops(store) { BackgroundReconcileResult("terminal", false,
+                old.leaseId, "released", 0, null, receipt) }
+            assertEquals(before, (store.read() as RecoveryStoreResult.Success).value)
+        }
+    }
+
     @Test fun reconcileRequiresExactTerminalAcceptanceAndUsesOriginalCredential() {
         val backend = Backend()
         val store = prepared(backend)
@@ -183,6 +225,117 @@ class AcceptedStopRecoveryTest {
             membershipGeneration = 0, startOperationId = start, startRequestFingerprint = "a".repeat(64),
             stopOperationId = "20000000-0000-4000-8000-000000000006", retainActivePeerOnStop = true, backgroundCleanupOnStop = true)
         assertEquals("56059211288db0f698ceda958b59a5548408dc3c2f1180968d309eb4e2c26eb0", backgroundRedundantStopFingerprint(transaction, "20000000-0000-4000-8000-000000000003"))
+    }
+
+
+    private fun fullArchive(): Pair<AndroidRecoveryStore, AndroidRedundantTransaction> {
+        val backend = Backend()
+        val store = prepared(backend)
+        val previous = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+        assertTrue(coordinator(store, { true }, { acceptedReply() }).revoke())
+        val current = (store.read() as RecoveryStoreResult.Success).value
+        val first = current.acceptedStops.single()
+        backend.bytes = AndroidRecoveryEnvelopeCodec.encode(current.copy(acceptedStops = (0..7).map { i ->
+            first.copy(operationId = "55555555-5555-4555-8555-%012d".format(i),
+                sessionId = "22222222-2222-4222-8222-%012d".format(i)) }))
+        return store to previous.copy(desiredActive = true, stopOperationId = null,
+            retry = AndroidRedundantRetryState(), backgroundCleanupOnStop = false,
+            sessionId = "66666666-6666-4666-8666-666666666666",
+            startOperationId = "77777777-7777-4777-8777-777777777777")
+    }
+
+    @Test fun queuedFinalReceiptAllowsTheSameStartWithoutAnotherClick() {
+        val (store, next) = fullArchive()
+        val first = (store.read() as RecoveryStoreResult.Success).value.acceptedStops.first()
+        val queued = mutableListOf<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(java.util.concurrent.Executor { queued.add(it) })
+        assertTrue(dispatcher.tick {
+            reconcileAcceptedStops(store) { old -> BackgroundReconcileResult("terminal", false,
+                old.leaseId, "released", 0, null,
+                StopAcceptance(old.operationId, old.sessionId, old.leaseId, old != first)) }
+        })
+        val checking = java.util.concurrent.CountDownLatch(1)
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val start = executor.submit<RecoveryStoreResult<AndroidRecoveryEnvelope>> {
+                awaitAcceptedStopCapacity(store, { checking.countDown(); false })
+                store.beginRedundant(next)
+            }
+            assertTrue(checking.await(1, java.util.concurrent.TimeUnit.SECONDS))
+            // An unrelated cleanup worker must remain able to write while Start waits.
+            queued.single().run()
+            assertTrue(start.get(2, java.util.concurrent.TimeUnit.SECONDS) is RecoveryStoreResult.Success)
+            assertEquals(next, (store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+            assertEquals(7, (store.read() as RecoveryStoreResult.Success).value.acceptedStops.size)
+        } finally { executor.shutdownNow() }
+    }
+
+    @Test fun stopDuringCapacityWaitCancelsWithoutAdmittingOrResumingStart() {
+        val (store, next) = fullArchive()
+        val gate = RedundantStartOperationGate()
+        var cancelledReplies = 0
+        assertTrue(gate.begin(next.startOperationId) { cancelledReplies++ })
+        val checking = java.util.concurrent.CountDownLatch(1)
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val before = (store.read() as RecoveryStoreResult.Success).value
+        try {
+            val start = executor.submit<String> {
+                try {
+                    awaitAcceptedStopCapacity(store, {
+                        checking.countDown(); gate.isCancelled(next.startOperationId)
+                    })
+                    store.beginRedundant(next)
+                    "admitted"
+                } catch (error: BackgroundConnectionException) { error.code }
+            }
+            assertTrue(checking.await(1, java.util.concurrent.TimeUnit.SECONDS))
+            assertTrue(gate.cancel(next.startOperationId))
+            assertEquals("tunnel_start_cancelled", start.get(1, java.util.concurrent.TimeUnit.SECONDS))
+            gate.completeFailure(next.startOperationId) { fail("cancelled Start must not publish failure") }
+            gate.finish(next.startOperationId)
+            assertEquals(1, cancelledReplies)
+            assertFalse(gate.hasPending())
+            assertEquals(before, (store.read() as RecoveryStoreResult.Success).value)
+            reconcileAcceptedStops(store) { old -> BackgroundReconcileResult("terminal", false,
+                old.leaseId, "released", 0, null,
+                StopAcceptance(old.operationId, old.sessionId, old.leaseId, false)) }
+            assertNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+        } finally { executor.shutdownNow() }
+    }
+
+    @Test fun capacityWaitIsBoundedAndPreservesUnconfirmedRecords() {
+        val (store, _) = fullArchive()
+        val before = (store.read() as RecoveryStoreResult.Success).value
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val result = executor.submit<String> {
+                try { awaitAcceptedStopCapacity(store, { false }, timeoutMillis = 30); "admitted" }
+                catch (error: BackgroundConnectionException) { error.code }
+            }
+            assertEquals("accepted_stop_capacity_exceeded", result.get(1, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(before, (store.read() as RecoveryStoreResult.Success).value)
+        } finally { executor.shutdownNow() }
+    }
+
+    @Test fun cancelledStartCannotPassEvenWhenCapacityIsAlreadyAvailable() {
+        val store = AndroidRecoveryStore(Backend(), BootIdentityProvider { 7L })
+        try { awaitAcceptedStopCapacity(store, { true }); fail("cancelled") }
+        catch (error: BackgroundConnectionException) { assertEquals("tunnel_start_cancelled", error.code) }
+    }
+
+    @Test fun availableCapacityNeedsNoWaitOrCleanup() {
+        val store = AndroidRecoveryStore(Backend(), BootIdentityProvider { 7L })
+        awaitAcceptedStopCapacity(store, { false }, timeoutMillis = 0)
+        assertNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+    }
+
+    @Test fun unreadableArchiveFailsClosedWithoutWaitingOrWriting() {
+        val backend = Backend().apply { bytes = byteArrayOf(1, 2, 3) }
+        val store = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
+        val failure = store.read() as RecoveryStoreResult.Failure
+        try { awaitAcceptedStopCapacity(store, { false }); fail("unreadable") }
+        catch (error: BackgroundConnectionException) { assertEquals(failure.code, error.code) }
+        assertArrayEquals(byteArrayOf(1, 2, 3), backend.bytes)
     }
 
 }

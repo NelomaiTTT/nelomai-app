@@ -5,6 +5,7 @@ import org.json.JSONObject
 import org.json.JSONArray
 
 internal const val ANDROID_RECOVERY_FORMAT = 3
+internal const val MAX_ACCEPTED_STOP_CLEANUPS = 8
 private const val ANDROID_RECOVERY_LEGACY_FORMAT = 1
 
 internal interface EncryptedRecordBackend {
@@ -645,7 +646,7 @@ internal object AndroidRecoveryEnvelopeCodec {
 
     private fun validateEnvelope(envelope: AndroidRecoveryEnvelope) {
         require(envelope.formatVersion == ANDROID_RECOVERY_FORMAT)
-        require(envelope.acceptedStops.size <= 8)
+        require(envelope.acceptedStops.size <= MAX_ACCEPTED_STOP_CLEANUPS)
         require(envelope.acceptedStops.map { it.operationId to it.sessionId }.distinct().size == envelope.acceptedStops.size)
         envelope.acceptedStops.forEach { entry ->
             listOf(entry.operationId, entry.sessionId, entry.leaseId, entry.startOperationId,
@@ -996,7 +997,7 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
-        if (current.acceptedStops.size >= 8) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
+        if (current.acceptedStops.size >= MAX_ACCEPTED_STOP_CLEANUPS) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
         if (current.leaseTransaction != null || current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_pending")
         }
@@ -1030,7 +1031,7 @@ internal class AndroidRecoveryStore(
             transaction.startOperationId != expectedStartOperationId ||
             transaction.stopOperationId != acceptance.operationId || transaction.sessionId != acceptance.sessionId ||
             acceptance.leaseId != (transaction.localActiveLeaseId ?: transaction.slotALeaseId ?: transaction.slotBLeaseId) ||
-            credential.deviceId != transaction.template.deviceId || current.acceptedStops.size >= 8
+            credential.deviceId != transaction.template.deviceId || current.acceptedStops.size >= MAX_ACCEPTED_STOP_CLEANUPS
         ) return@synchronized RecoveryStoreResult.Failure("stop_acceptance_scope_conflict")
         val pending = AcceptedStopCleanup(acceptance.operationId, acceptance.sessionId, acceptance.leaseId,
             transaction.startOperationId, current.intent.generation, transaction.template.accountScope,
@@ -1252,7 +1253,7 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
-        if (current.acceptedStops.size >= 8) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
+        if (current.acceptedStops.size >= MAX_ACCEPTED_STOP_CLEANUPS) return@synchronized RecoveryStoreResult.Failure("accepted_stop_capacity_exceeded")
         if (current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_recovery_v2_owned")
         }
