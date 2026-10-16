@@ -165,6 +165,23 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     let first = application.start(options.clone(), NOW).await.unwrap();
     assert_eq!(first.lease_id, LEASE_ID);
     assert_eq!(application.state().await.phase, Phase::Connected);
+    // Desktop still cleans up an unexpected native stop without a prior journal.
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopping;
+    let observation = application.begin_foreground_observation().await;
+    assert_eq!(
+        application
+            .foreground_state_guarded(observation, None, || true)
+            .await
+            .phase,
+        Phase::Stopping
+    );
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    assert!(!application.has_pending_stop_cleanup().unwrap());
+    assert!(application.retry_pending_stop().await.unwrap().is_some());
+    assert!(!application.has_pending_stop_cleanup().unwrap());
+    assert_eq!(application.state().await.phase, Phase::Ready);
+    application.start(options.clone(), NOW).await.unwrap();
+
     let pinned = application.pin_stray().await.unwrap();
     assert!(pinned.pinned);
     assert!(store.load().unwrap().unwrap().pinned_connection.is_some());
@@ -207,12 +224,12 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     assert!(!unpinned.pinned);
     assert_eq!(
         tunnel.configurations.lock().unwrap().as_slice(),
-        [CONFIGURATION, CONFIGURATION, CONFIGURATION]
+        [CONFIGURATION, CONFIGURATION, CONFIGURATION, CONFIGURATION]
     );
     assert_eq!(panel_state.candidate_requests.load(Ordering::SeqCst), 1);
     assert_eq!(panel_state.probe_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
-        panel_state.start_operations.lock().unwrap()[1],
+        panel_state.start_operations.lock().unwrap()[2],
         LEASE_ID,
         "warm reconnect must reuse the panel lease id"
     );

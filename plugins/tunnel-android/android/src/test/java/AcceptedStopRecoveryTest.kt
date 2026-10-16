@@ -22,7 +22,7 @@ class AcceptedStopRecoveryTest {
     private val start = "44444444-4444-4444-8444-444444444444"
     private val stop = "55555555-5555-4555-8555-555555555555"
 
-    private fun prepared(backend: Backend): AndroidRecoveryStore {
+    private fun prepared(backend: Backend, recovery: Boolean = false): AndroidRecoveryStore {
         val initial = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
         val tx = AndroidRedundantTransaction(desiredActive = true,
             template = AndroidIntentTemplate(device, "account", "stray", "dynamic", "standalone", "ipv4", true),
@@ -36,7 +36,13 @@ class AcceptedStopRecoveryTest {
         wire.getJSONObject("intent").put("armedHistory", true)
         backend.bytes = wire.toString().toByteArray(Charsets.UTF_8)
         val store = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
-        assertTrue(store.cancelRedundantIntentAndDeferStop(stop, start, retainActivePeer = true) is RecoveryStoreResult.Success)
+        if (recovery) {
+            assertTrue(store.prepareRedundantTotalLoss(start,
+                AndroidStartReplay("replacement-start", 2, "fingerprint")) is RecoveryStoreResult.Success)
+            assertTrue(store.deferRedundantStop(stop, start) is RecoveryStoreResult.Success)
+        } else {
+            assertTrue(store.cancelRedundantIntentAndDeferStop(stop, start, retainActivePeer = true) is RecoveryStoreResult.Success)
+        }
         return store
     }
 
@@ -59,6 +65,117 @@ class AcceptedStopRecoveryTest {
         return RedundantConnectionCoordinator(store, panel, native, expectedStartOperationId = start)
     }
 
+    @Test fun acceptedColdRecoveryStopPromotesRestartAndArchivesCleanupAtomically() {
+        val backend = Backend()
+        val store = prepared(backend, recovery = true)
+        val before = (store.read() as RecoveryStoreResult.Success).value
+        assertTrue(coordinator(store, { true }, { acceptedReply() }).revoke())
+        val reopened = AndroidRecoveryStore(backend, BootIdentityProvider { 7L })
+        val next = (reopened.read() as RecoveryStoreResult.Success).value
+        assertNull(next.redundantTransaction)
+        assertTrue(next.intent.desiredActive)
+        assertEquals(before.intent.generation + 1, next.intent.generation)
+        assertEquals(LeasePhase.START_PENDING, next.leaseTransaction!!.phase)
+        assertEquals("replacement-start", next.leaseTransaction.startOperationId)
+        assertEquals("redundant_total_loss_restart", next.intent.retry.pendingAction)
+        assertEquals(stop, next.acceptedStops.single().operationId)
+        assertTrue(before.redundantTransaction!!.backgroundCleanupOnStop)
+        assertFalse(before.redundantTransaction.retainActivePeerOnStop)
+        // A late cleanup ACK must not remove the promoted restart.
+        assertTrue(reopened.completeAcceptedCleanup(next.acceptedStops.single()) is RecoveryStoreResult.Success)
+        val completed = (reopened.read() as RecoveryStoreResult.Success).value
+        assertEquals(next.intent, completed.intent)
+        assertEquals(next.leaseTransaction, completed.leaseTransaction)
+        assertTrue(completed.acceptedStops.isEmpty())
+    }
+
+    @Test fun userStopDuringRecoveryHttpAcceptsFrozenColdStopWithoutRestart() {
+        val backend = Backend()
+        val store = prepared(backend, recovery = true)
+        val sent = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+        assertTrue(coordinator(store, { true }, {
+            assertTrue(store.cancelCurrentIntent() is RecoveryStoreResult.Success)
+            assertTrue(store.cancelRedundantIntentAndDeferStop("later-stop", start,
+                retainActivePeer = true) is RecoveryStoreResult.Success)
+            val cancelled = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertEquals(stop, cancelled.stopOperationId)
+            assertEquals(backgroundRedundantStopFingerprint(sent, lease),
+                backgroundRedundantStopFingerprint(cancelled, lease))
+            acceptedReply()
+        }).revoke())
+        val next = (AndroidRecoveryStore(backend, BootIdentityProvider { 7L }).read() as RecoveryStoreResult.Success).value
+        assertFalse(next.intent.desiredActive)
+        assertNull(next.redundantTransaction)
+        assertNull(next.leaseTransaction)
+        assertEquals(stop, next.acceptedStops.single().operationId)
+    }
+
+    @Test fun recoveryWithoutAcceptanceKeepsRestartBehindStopBarrier() {
+        val store = prepared(Backend(), recovery = true)
+        assertFalse(coordinator(store, { true }, { acceptedReply().also { it.remove("stop_acceptance") } }).revoke())
+        val next = (store.read() as RecoveryStoreResult.Success).value
+        assertTrue(next.intent.desiredActive)
+        assertNotNull(next.redundantTransaction)
+        assertNull(next.leaseTransaction)
+        assertTrue(next.acceptedStops.isEmpty())
+    }
+
+    @Test fun recoveryNativeFailureAndArchiveFailureCannotPromoteRestart() {
+        for (nativeFailure in listOf(true, false)) {
+            val backend = Backend()
+            val store = prepared(backend, recovery = true)
+            assertFalse(coordinator(store, {
+                if (!nativeFailure) backend.failWrites = true
+                !nativeFailure
+            }, { acceptedReply() }).revoke())
+            backend.failWrites = false
+            val next = (store.read() as RecoveryStoreResult.Success).value
+            assertNotNull(next.redundantTransaction)
+            assertNull(next.leaseTransaction)
+            assertTrue(next.acceptedStops.isEmpty())
+        }
+    }
+
+    @Test fun previouslyFrozenBlockingRecoveryStopCannotChangeItsPayload() {
+        val backend = Backend()
+        val store = prepared(backend, recovery = true)
+        // Restore the Stop created by the previous candidate before this fix.
+        val current = (store.read() as RecoveryStoreResult.Success).value
+        val frozen = current.redundantTransaction!!.copy(backgroundCleanupOnStop = false)
+        backend.bytes = AndroidRecoveryEnvelopeCodec.encode(current.copy(redundantTransaction = frozen))
+        assertTrue(store.deferRedundantStop("another-stop", start) is RecoveryStoreResult.Success)
+        assertTrue(store.cancelRedundantIntentAndDeferStop("user-stop", start,
+            retainActivePeer = true) is RecoveryStoreResult.Success)
+        val retry = (store.read() as RecoveryStoreResult.Success).value.redundantTransaction!!
+        assertEquals(stop, retry.stopOperationId)
+        assertFalse(retry.backgroundCleanupOnStop)
+        assertEquals(backgroundRedundantStopFingerprint(frozen, lease),
+            backgroundRedundantStopFingerprint(retry, lease))
+    }
+
+    @Test fun acceptanceCannotPromoteUnpreparedRecoveryOrOverflowCleanupArchive() {
+        for (fullArchive in listOf(false, true)) {
+            val backend = Backend()
+            val store = prepared(backend, recovery = true)
+            val original = (store.read() as RecoveryStoreResult.Success).value
+            val pending = original.redundantTransaction!!
+            val blocked = if (fullArchive) {
+                val credential = BackgroundCredential(device, "https://nelomai.example", "token", 1_900_000_000)
+                val retired = (0..7).map { index -> AcceptedStopCleanup(
+                    "retired-stop-$index", "retired-session-$index", lease, "retired-start-$index",
+                    original.intent.generation, pending.template.accountScope,
+                    backgroundRedundantStopFingerprint(pending, lease), 1, credential) }
+                original.copy(acceptedStops = retired)
+            } else original.copy(redundantTransaction = pending.copy(retry = pending.retry.copy(
+                sessionStalledRecorded = false, totalLossRestartReplay = null,
+                totalLossIntentGeneration = null, totalLossSourceStartOperationId = null)))
+            backend.bytes = AndroidRecoveryEnvelopeCodec.encode(blocked)
+            assertFalse(coordinator(store, { true }, { acceptedReply() }).revoke())
+            val after = (store.read() as RecoveryStoreResult.Success).value
+            assertEquals(blocked, after)
+        }
+    }
+
     @Test fun nativeClosedAndMatchedAcceptanceDetachDurablyBeforeNextStart() {
         val backend = Backend()
         val store = prepared(backend)
@@ -75,12 +192,14 @@ class AcceptedStopRecoveryTest {
     }
 
     @Test fun unknownNativeAndWrongAcceptanceKeepStopBarrier() {
-        for (localClosed in listOf(false, true)) {
-            val backend = Backend()
-            val store = prepared(backend)
-            val reply = if (localClosed) acceptedReply("66666666-6666-4666-8666-666666666666") else acceptedReply()
-            assertFalse(coordinator(store, { localClosed }, { reply }).revoke())
-            assertNotNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+        for (recovery in listOf(false, true)) {
+            for (localClosed in listOf(false, true)) {
+                val backend = Backend()
+                val store = prepared(backend, recovery)
+                val reply = if (localClosed) acceptedReply("66666666-6666-4666-8666-666666666666") else acceptedReply()
+                assertFalse(coordinator(store, { localClosed }, { reply }).revoke())
+                assertNotNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+            }
         }
     }
 

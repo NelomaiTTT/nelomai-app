@@ -1267,9 +1267,15 @@ where
 
     pub async fn retry_pending_stop(&self) -> Result<Option<Connection>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        if self.core.state().await.phase != Phase::Stopping
-            && !self.core.has_pending_stop_cleanup()?
-        {
+        let pending = self.core.has_pending_stop_cleanup()?;
+        // Keep the session identity after Android detaches its native owner:
+        // a stale projection must not create another whole-session Stop.
+        // Legacy connections still need core cleanup after an unexpected stop.
+        if !pending_stop_requires_core_stop(
+            pending,
+            &self.core.state().await,
+            cfg!(target_os = "android"),
+        ) {
             return Ok(None);
         }
         self.core.stop().await.map(Some).map_err(Into::into)
@@ -1414,6 +1420,15 @@ fn timestamp(now_unix: i64) -> Result<String, ApplicationError> {
         .map_err(|_| ApplicationError::Clock)
 }
 
+fn pending_stop_requires_core_stop(pending: bool, state: &CoreState, android: bool) -> bool {
+    let native_session = android
+        && state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.session_id.is_some());
+    pending || (state.phase == Phase::Stopping && !native_session)
+}
+
 fn shutdown_requires_core_stop(phase: Phase, cancelled_pending_start: bool) -> bool {
     cancelled_pending_start
         || matches!(
@@ -1424,8 +1439,59 @@ fn shutdown_requires_core_stop(phase: Phase, cancelled_pending_start: bool) -> b
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_requires_core_stop;
+    use super::{pending_stop_requires_core_stop, shutdown_requires_core_stop};
     use nelomai_client_core::Phase;
+
+    fn stopping_connection(session_id: Option<&str>) -> nelomai_client_core::CoreState {
+        nelomai_client_core::CoreState {
+            phase: Phase::Stopping,
+            connection: Some(
+                serde_json::from_value(serde_json::json!({
+                    "lease_id": "lease", "session_id": session_id,
+                    "layer": "stray", "tic_connection_mode": "dynamic",
+                    "route_mode": "standalone", "status": "connected", "pinned": false
+                }))
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn android_legacy_unexpected_stop_still_requires_core_cleanup() {
+        let legacy = stopping_connection(None);
+        assert!(pending_stop_requires_core_stop(false, &legacy, true));
+        assert!(pending_stop_requires_core_stop(false, &legacy, false));
+    }
+
+    #[test]
+    fn detached_android_session_projection_cannot_create_another_stop() {
+        // The server session remains in CoreState after native ownership ends;
+        // no live-owner query is needed to reject this stale Stop projection.
+        let retired = stopping_connection(Some("retired-session"));
+        assert!(!pending_stop_requires_core_stop(false, &retired, true));
+        assert!(pending_stop_requires_core_stop(false, &retired, false));
+    }
+
+    #[test]
+    fn durable_core_stop_is_retried_independently_of_native_projection() {
+        for session_id in [None, Some("retired-session")] {
+            for android in [false, true] {
+                for phase in [
+                    Phase::Ready,
+                    Phase::Connected,
+                    Phase::Stopping,
+                    Phase::Connecting,
+                ] {
+                    let mut state = stopping_connection(session_id);
+                    state.phase = phase;
+                    assert!(pending_stop_requires_core_stop(true, &state, android));
+                    if phase != Phase::Stopping {
+                        assert!(!pending_stop_requires_core_stop(false, &state, android));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn shutdown_stops_unresolved_start_even_when_the_visible_phase_is_not_connecting() {

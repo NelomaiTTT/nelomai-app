@@ -1026,7 +1026,8 @@ internal class AndroidRecoveryStore(
         val current = (read as RecoveryStoreResult.Success).value
         val transaction = current.redundantTransaction
             ?: return@synchronized RecoveryStoreResult.Failure("redundant_recovery_not_found")
-        if (!nativeClosed || transaction.desiredActive || current.intent.desiredActive ||
+        if (!nativeClosed || transaction.desiredActive ||
+            (current.intent.desiredActive && !hasExactTotalLossRestart(current, transaction)) ||
             !transaction.asyncStopSupported || !transaction.backgroundCleanupOnStop ||
             transaction.startOperationId != expectedStartOperationId ||
             transaction.stopOperationId != acceptance.operationId || transaction.sessionId != acceptance.sessionId ||
@@ -1036,8 +1037,11 @@ internal class AndroidRecoveryStore(
         val pending = AcceptedStopCleanup(acceptance.operationId, acceptance.sessionId, acceptance.leaseId,
             transaction.startOperationId, current.intent.generation, transaction.template.accountScope,
             backgroundRedundantStopFingerprint(transaction, acceptance.leaseId), System.currentTimeMillis() / 1000, credential)
-        persist(clearDisarmedEpisode(current).copy(redundantTransaction = null,
-            acceptedStops = current.acceptedStops + if (acceptance.cleanupPending) listOf(pending) else emptyList()))
+        finishRedundantStop(
+            current.copy(acceptedStops = current.acceptedStops +
+                if (acceptance.cleanupPending) listOf(pending) else emptyList()),
+            transaction,
+        )
     }
 
     fun completeAcceptedCleanup(expected: AcceptedStopCleanup): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
@@ -1063,31 +1067,44 @@ internal class AndroidRecoveryStore(
         ) {
             return@synchronized RecoveryStoreResult.Failure("redundant_stop_not_acknowledged")
         }
+        finishRedundantStop(current, transaction)
+    }
+
+    private fun hasExactTotalLossRestart(
+        current: AndroidRecoveryEnvelope,
+        transaction: AndroidRedundantTransaction,
+    ): Boolean = transaction.retry.totalLossRestartReplay != null && current.intent.desiredActive &&
+        transaction.retry.totalLossIntentGeneration == current.intent.generation &&
+        transaction.retry.totalLossSourceStartOperationId == transaction.startOperationId
+
+    // Both completion paths retire the old owner and promote its exact prepared
+    // restart in the same durable write; cancellation is read under the store gate.
+    private fun finishRedundantStop(
+        current: AndroidRecoveryEnvelope,
+        transaction: AndroidRedundantTransaction,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> {
         val replay = transaction.retry.totalLossRestartReplay
-        val restartExact = replay != null && current.intent.desiredActive &&
-            transaction.retry.totalLossIntentGeneration == current.intent.generation &&
-            transaction.retry.totalLossSourceStartOperationId == transaction.startOperationId
-        if (!restartExact) {
-            return@synchronized persist(
+        if (!hasExactTotalLossRestart(current, transaction)) {
+            return persist(
                 clearDisarmedEpisode(current).copy(redundantTransaction = null),
             )
         }
         val nextGeneration = current.intent.generation.checkedIncrement()
-            ?: return@synchronized RecoveryStoreResult.Failure(
+            ?: return RecoveryStoreResult.Failure(
                 "connection_intent_generation_exhausted",
             )
         val nextDiagnosticsEpisodeId = nextAndroidDiagnosticsEpisodeId(
             current.intent.diagnosticsEpisodeId,
             nextGeneration,
-        ) ?: return@synchronized RecoveryStoreResult.Failure(
+        ) ?: return RecoveryStoreResult.Failure(
             "connection_diagnostics_episode_exhausted",
         )
-        // This operation has not been sent: dispatch waits for acknowledged cleanup.
+        // Dispatch waits for completed cleanup or a durable async Stop acceptance.
         // Rebuild old v1 prepared replays too, without changing their operation ID.
         val restartReplay = redundantTotalLossRestartReplay(
             transaction, requireNotNull(replay).startOperationId,
         )
-        persist(current.copy(
+        return persist(current.copy(
             intent = current.intent.copy(
                 generation = nextGeneration,
                 diagnosticsEpisodeId = nextDiagnosticsEpisodeId,
@@ -1162,6 +1179,9 @@ internal class AndroidRecoveryStore(
             stopOperationId = transaction.stopOperationId ?: stopOperationId.also(
                 AndroidRecoveryEnvelopeCodec::validateSafeValue,
             ),
+            backgroundCleanupOnStop = if (transaction.stopOperationId == null) {
+                transaction.asyncStopSupported && transaction.retry.totalLossRestartReplay != null
+            } else transaction.backgroundCleanupOnStop,
             retry = transaction.retry.copy(
                 stopState = RedundantStopState.PENDING,
                 pendingNativeSourceLeaseId = null,
