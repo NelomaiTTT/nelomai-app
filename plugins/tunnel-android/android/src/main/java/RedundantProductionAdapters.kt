@@ -725,7 +725,7 @@ internal class ServiceRedundantConnectionNative(
         } else {
             WARMUP_PROBE_INTERVAL_MILLIS
         }
-        val intervalBase = if (runtime.slot == activeSlot || checkStarted != null) {
+        val intervalBase = if (runtime.slot == activeSlot || checkStarted != null || initialWarmup) {
             runtime.lastProbeAtElapsedMs
         } else runtime.lastProbeFinishedAtElapsedMs
         if (checkStarted != null && runtime.lastProbeAtElapsedMs < checkStarted) {

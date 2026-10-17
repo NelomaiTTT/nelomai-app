@@ -291,6 +291,46 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun initialReserveDoesNotAccumulatePollingDelayBetweenWarmupProbes() {
+        for (primary in listOf(0, 1)) {
+            val fixture = StartupFixture(primary, ::prepared, initialStandby = false)
+            fixture.healthySlots = setOf(1 - primary)
+            var committedAt: Long? = null
+            for (now in 0L..8_000L step 1_000L) {
+                fixture.tick(now)
+                if (fixture.coordinator.status()?.let { it.slotALeaseId != null && it.slotBLeaseId != null } == true && committedAt == null) {
+                    committedAt = now
+                }
+                if (now <= (committedAt ?: Long.MAX_VALUE)) assertEquals(0, fixture.ready)
+            }
+            assertEquals("healthy reserve must be usable within 8s at the service tick", 1, fixture.ready)
+            assertEquals(0, fixture.failed)
+            assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
+            assertTrue(fixture.backend.probeLaunches.count { it.second == 1 - primary } >= 4)
+            assertTrue(fixture.backend.probeLaunches.any { (started, slot) ->
+                slot == 1 - primary && started > requireNotNull(committedAt)
+            })
+        }
+    }
+
+    @Test
+    fun failedFreshReserveCheckStillRebindsPrimaryAndNeverPublishesReady() {
+        val fixture = StartupFixture(0, ::prepared, initialStandby = false)
+        fixture.healthySlots = setOf(1)
+        for (now in 0L..6_000L step 1_000L) fixture.tick(now)
+        assertEquals(0, fixture.ready)
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.receiveFrozenAtMs = 6_000L
+        for (now in 7_000L..30_000L step 1_000L) {
+            fixture.tick(now)
+            assertEquals(0, fixture.ready)
+        }
+        assertEquals(1, fixture.failed)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+        assertEquals(1, fixture.backend.reboundSlots.count { it == 0 })
+    }
+
+    @Test
     fun freshStartChecksReserveBeforeBackgroundStabilityDwell() {
         for (primary in listOf(0, 1)) {
             val fixture = StartupFixture(primary, ::prepared, initialStandby = false)

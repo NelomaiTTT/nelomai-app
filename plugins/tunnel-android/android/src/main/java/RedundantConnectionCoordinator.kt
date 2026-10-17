@@ -851,7 +851,13 @@ internal class RedundantConnectionCoordinator(
         // Match the ordinary AWG first-handshake recovery: one new protected UDP
         // socket, not a new lease or a longer startup deadline. DNS failure after
         // an established handshake is not a reason to change the socket.
-        if (waitingForStrayHandshake &&
+        // Do not discard an in-flight post-commit check of a warmed reserve
+        // merely to retry the primary socket. Its check budget and the overall
+        // startup deadline still bound this wait; a failed check permits rebind.
+        val checkingInitialReserve = pending.freshStart && transaction.leaseIdAt(standbyIndex) != null &&
+            standbyObservation?.health == BackendHealth.READY &&
+            standbyObservation.standbyProbeState == StandbyProbeState.PENDING
+        if (waitingForStrayHandshake && !checkingInitialReserve &&
             !pending.rebindAttempted && elapsedNow() >= pending.rebindAtElapsedMs &&
             healthMonitor.networkReady(elapsedNow())
         ) {
