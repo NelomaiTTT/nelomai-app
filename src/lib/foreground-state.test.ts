@@ -182,6 +182,129 @@ describe("async Stop presentation", () => {
   });
 });
 
+describe("binding changed outside the open UI", () => {
+  it.each(["peer_binding_required", "binding_conflict"])("refreshes after preference sync rejects %s", async (code) => {
+    let refreshed = 0;
+    const context = {
+      bootstrap: {}, connectionActionState: initialConnectionActionState(), isCurrentConnectionAction,
+      appPreferences: null, ticConnectionMode: "personal", error: null,
+      nativeClient: { setTicEgressMode: async () => ({}) },
+      syncBindingPreferences: async () => { throw { code }; },
+      refreshProbes: async () => {}, commandCode, commandMessage,
+      restore: async () => { refreshed++; },
+    };
+    await executePageFunction("setTicEgressMode", context, { currentTarget: { value: "prefer_ipv6" } });
+    expect(refreshed).toBe(1);
+  });
+
+  it("does not refresh from a preference rejection after a newer Stop", async () => {
+    let reject!: (error: unknown) => void;
+    let refreshed = 0;
+    const context = {
+      bootstrap: {}, connectionActionState: initialConnectionActionState(), isCurrentConnectionAction,
+      appPreferences: null, ticConnectionMode: "personal", error: null,
+      nativeClient: { setTicEgressMode: async () => ({}) },
+      syncBindingPreferences: () => new Promise((_resolve, fail) => { reject = fail; }),
+      refreshProbes: async () => {}, commandCode, commandMessage,
+      restore: async () => { refreshed++; },
+    };
+    const pending = executePageFunction("setTicEgressMode", context, { currentTarget: { value: "prefer_ipv6" } });
+    await Promise.resolve();
+    context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+    reject({ code: "binding_conflict" });
+    await pending;
+    expect(refreshed).toBe(0);
+  });
+
+  it("discards a bootstrap refresh overtaken by Stop without clearing its busy state", async () => {
+    const { context } = fixture();
+    let complete!: (value: unknown) => void;
+    let applied = 0;
+    Object.assign(context, {
+      startupRetry: { cancel: () => {} }, startupPending: false, refreshPending: false,
+      diagnosticsStatus: null, startupSlow: false, startupTimer: null,
+      window: { setTimeout: () => 1, clearTimeout: () => {} },
+      applyBootstrap: async () => { applied++; },
+    });
+    Object.assign(context.nativeClient, { bootstrap: () => new Promise((resolve) => { complete = resolve; }) });
+    const pending = executePageFunction("restore", context);
+    context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+    context.phase = "stopping";
+    complete({ binding: null });
+    await pending;
+    expect(applied).toBe(0);
+    expect(context.phase).toBe("stopping");
+    expect(context.busy).toBe(true);
+  });
+
+  it("discards the bootstrap state read if Stop takes ownership while it waits", async () => {
+    const { context, reply, state } = fixture();
+    Object.assign(context, {
+      startupRetry: { cancel: () => {} }, startupPending: false,
+      selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
+      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshProbes: async () => {},
+    });
+    const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
+      update: { required: false }, access: { can_connect: true }, binding: {} };
+    const pending = executePageFunction("applyBootstrap", context, response);
+    context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+    context.phase = "stopping";
+    reply({ ...state, phase: "ready" });
+    await pending;
+    expect(context.phase).toBe("stopping");
+  });
+
+  it("applies a current bootstrap even when reactive state wraps the response", async () => {
+    const { context, reply, state } = fixture();
+    let stored = context.bootstrap;
+    Object.defineProperty(context, "bootstrap", {
+      get: () => stored,
+      set: (value) => { stored = new Proxy(value, {}); },
+    });
+    Object.assign(context, {
+      startupRetry: { cancel: () => {} }, startupPending: false,
+      selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
+      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshProbes: async () => {},
+    });
+    const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
+      update: { required: false }, access: { can_connect: true }, binding: {} };
+    const pending = executePageFunction("applyBootstrap", context, response);
+    reply(state);
+    await pending;
+    expect(context.phase).toBe("connected");
+  });
+
+  it.each(["peer_binding_required", "binding_conflict"])("refreshes after Start rejects %s without retrying Start", async (code) => {
+    const { context } = fixture();
+    let starts = 0;
+    let refreshed = 0;
+    Object.assign(context, {
+      bootstrap: { device: { id: "own-device", platform: "android" }, binding: {} },
+      connectionAction: "start", runtimeStatus: null, splitTunnelBlocksStart: false,
+      runtimeStartBlocked: () => false, selectedLayer: "tic", ticConnectionMode: "dynamic",
+      routeMode: "via_tak", selectedEgressMode: "ipv4", antivirusStartFailure: false,
+      prepareConnectionStartForPlatform, canBeginConnectionAction, beginConnectionStart,
+      beginConnectionStop, finishConnectionStart, finishConnectionStop,
+      pendingBindingPreferenceRequest: () => ({ expected_binding_id: "old" }),
+      waitForSettlement: async () => {}, START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS: 10,
+      restore: async () => { refreshed++; context.phase = "needs_peer_binding"; context.view = "peer_selection"; },
+    });
+    Object.assign(context.nativeClient, {
+      prepareTunnel: async () => {},
+      start: async () => { starts++; throw { code }; },
+      state: async () => ({ phase: "ready", connection: null }),
+      queueStartFailureDiagnostics: async () => {},
+    });
+    await toggle(context);
+    expect(refreshed).toBe(1);
+    expect(starts).toBe(1);
+    expect(context.view).toBe("peer_selection");
+    expect(context.busy).toBe(false);
+  });
+});
+
 describe("foreground native state callback", () => {
   it("finishes an explicit logout without replacing the confirmed-closure screen with login", async () => {
     const { context, reject } = logoutFixture();

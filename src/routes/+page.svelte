@@ -409,6 +409,8 @@
   async function setTicEgressMode(event: Event) {
     const egressMode = (event.currentTarget as HTMLSelectElement)
       .value as EgressMode;
+    const observedBootstrap = bootstrap;
+    const actionEpoch = connectionActionState.epoch;
     try {
       appPreferences = await nativeClient.setTicEgressMode(
         ticConnectionMode,
@@ -417,6 +419,12 @@
       await syncBindingPreferences();
       void refreshProbes();
     } catch (reason) {
+      if (["peer_binding_required", "binding_conflict"].includes(commandCode(reason) ?? "")) {
+        if (bootstrap !== observedBootstrap ||
+          !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+        await restore();
+        return;
+      }
       error = commandMessage(reason, "preferences");
     }
   }
@@ -582,6 +590,8 @@
 
   async function restore() {
     if (runtimeChannelClosed) return;
+    const actionEpoch = connectionActionState.epoch;
+    let expectedBootstrap = bootstrap;
     startupRetry.cancel();
     startupPending = false;
     refreshPending = false;
@@ -591,14 +601,22 @@
     diagnosticsStatus = null;
     startupSlow = false;
     if (startupTimer !== null) window.clearTimeout(startupTimer);
-    startupTimer = window.setTimeout(() => {
+    const timer = window.setTimeout(() => {
       startupSlow = true;
       void nativeClient.recordStartupStage("bootstrap_slow");
     }, 8_000);
+    startupTimer = timer;
     try {
       const response = await nativeClient.bootstrap();
-      await applyBootstrap(response);
+      if (runtimeChannelClosed || bootstrap !== expectedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      const applying = applyBootstrap(response);
+      // Svelte may wrap the response; retain the assigned state identity.
+      expectedBootstrap = bootstrap;
+      await applying;
     } catch (reason) {
+      if (bootstrap !== expectedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
@@ -621,18 +639,20 @@
         error = commandMessage(reason, "startup");
       }
     } finally {
-      if (startupTimer !== null) window.clearTimeout(startupTimer);
-      startupTimer = null;
-      busy = false;
+      window.clearTimeout(timer);
+      if (startupTimer === timer) startupTimer = null;
+      if (isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
     }
   }
 
   async function applyBootstrap(response: Bootstrap) {
     if (runtimeChannelClosed) return;
+    const actionEpoch = connectionActionState.epoch;
     startupRetry.cancel();
     startupPending = false;
     localStopPendingCleanup = false;
     bootstrap = response;
+    const observedBootstrap = bootstrap;
     pinnedStray = response.pinned_stray;
     selectedLayer = response.defaults.layer;
     ticConnectionMode = response.defaults.tic_connection_mode;
@@ -658,7 +678,8 @@
     }
 
     const state = await nativeClient.state();
-    if (runtimeChannelClosed) return;
+    if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+      !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
     phase = state.phase;
     localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
@@ -825,6 +846,10 @@
       if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       if (applyRuntimeChannelClosure(reason)) return;
       const failureCode = commandCode(reason);
+      if (!stopping && ["peer_binding_required", "binding_conflict"].includes(failureCode ?? "")) {
+        await restore();
+        return;
+      }
       if (shouldReportStartFailure && startDeviceId) {
         await waitForSettlement(
           nativeClient.queueStartFailureDiagnostics(

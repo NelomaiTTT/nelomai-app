@@ -143,6 +143,7 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     application
         .bind_peer(BindPeerRequest {
             peer_id: "3".to_string(),
+            expected_binding_id: None,
             preferred_layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
