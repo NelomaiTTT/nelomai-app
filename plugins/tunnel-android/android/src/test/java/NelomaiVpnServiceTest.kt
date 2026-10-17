@@ -17,6 +17,57 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
+    @Test fun deferredServerStartReplaysExactOperationInsteadOfPollingPendingForever() {
+        for (reserve in listOf<Boolean?>(null, false, true)) for (reconcileAction in listOf(false, true)) {
+            val backend = ServiceRecoveryBackend()
+            val store = recoveryStore(backend)
+            val owner = coordinator(store)
+            owner.begin(template().copy(reserveEnabled = reserve))
+            val before = store.load()
+            val exact = requireNotNull(before.leaseTransaction).startOperationId
+            if (reconcileAction) store.recordFailure(before.intent.generation,
+                errorCode = "service_timeout", nextRetryAtUnix = 1_000,
+                pendingAction = "reconcile").successEnvelope()
+            val panel = ServicePanelFake().apply {
+                if (reconcileAction) reconcileResults += reconcile("pending")
+                reconcileResults += reconcile("pending")
+                startResults += Result.failure(BackgroundConnectionException("transport_error"))
+            }
+            assertEquals(AndroidCoordinatorStep.RETRY, coordinator(recoveryStore(backend)).runOnce(panel, ServiceRuntimeFake()))
+            assertEquals(listOf(exact), panel.startOperationIds)
+            assertEquals(exact, store.load().leaseTransaction?.startOperationId)
+            assertTrue(store.load().intent.desiredActive)
+        }
+    }
+
+    @Test fun confirmedPendingCancellationUsesShortPollButKeepsRestartFence() {
+        for (reserve in listOf<Boolean?>(null, false, true)) {
+            val backend = ServiceRecoveryBackend()
+            var store = recoveryStore(backend)
+            var owner = coordinator(store)
+            val selected = template().copy(reserveEnabled = reserve)
+            owner.begin(selected)
+            owner.cancelCurrent()
+            val exact = requireNotNull(store.load().leaseTransaction).startOperationId
+            for (state in listOf("applying", "compensating", "compensating", "compensating", "compensating")) {
+                // Recreate the owner as well: persisted retry must not restore 15/30s waits.
+                store = recoveryStore(backend)
+                owner = coordinator(store)
+                val panel = ServicePanelFake().apply {
+                    reconcileResults += reconcile(state, cancelRequested = true)
+                }
+                assertEquals(AndroidCoordinatorStep.RETRY, owner.runOnce(panel, ServiceRuntimeFake()))
+                assertEquals(2L, store.load().intent.retry.scheduledDelaySeconds)
+                assertEquals(exact, store.load().leaseTransaction?.startOperationId)
+                assertTrue(owner.begin(selected) is AndroidCoordinatorResult.Failure)
+            }
+            val done = ServicePanelFake().apply { reconcileResults += reconcile("cancelled", cancelRequested = true) }
+            assertEquals(AndroidCoordinatorStep.IDLE, owner.runOnce(done, ServiceRuntimeFake()))
+            assertNull(store.load().leaseTransaction)
+            assertTrue(owner.begin(selected) is AndroidCoordinatorResult.Accepted)
+        }
+    }
+
     @Test fun stopCancelsIssuedLeaseReplayButKeepsCleanupBarrierUntilAcknowledged() {
         for (activeCheckpoint in listOf(false, true)) for (quick in listOf(false, true)) {
             val backend = ServiceRecoveryBackend()
@@ -5229,7 +5280,7 @@ class NelomaiVpnServiceTest {
         )
         first.begin(template())
         val pending = ServicePanelFake().apply {
-            reconcileResults += reconcile("pending")
+            reconcileResults += reconcile("applying")
         }
 
         assertEquals(AndroidCoordinatorStep.RETRY, first.runOnce(pending, ServiceRuntimeFake()))
@@ -5242,7 +5293,7 @@ class NelomaiVpnServiceTest {
             nowUnix = { 1_010 },
         )
         val stillPending = ServicePanelFake().apply {
-            reconcileResults += reconcile("pending")
+            reconcileResults += reconcile("applying")
         }
         assertEquals(
             AndroidCoordinatorStep.RETRY,

@@ -7060,14 +7060,14 @@ internal class AndroidConnectionIntentCoordinator(
                 return resumeStalledStopReconcile(envelope, transaction, reconciled)
             }
             when (reconciled.state) {
-                "pending", "applying", "compensating" ->
+                "applying", "compensating" ->
                     recordDirectRetry("operation_reconcile_pending")
                 "terminal", "cancelled" -> closeAuthoritativePendingStartAndRetry(
                     envelope,
                     transaction,
                     "operation_reconcile_${reconciled.state}",
                 )
-                "not_found", "applied" -> {
+                "not_found", "pending", "applied" -> {
                     if (reconciled.state == "applied" && transaction.leaseId != null &&
                         reconciled.leaseId != null && reconciled.leaseId != transaction.leaseId
                     ) {
@@ -7218,7 +7218,12 @@ internal class AndroidConnectionIntentCoordinator(
             return AndroidCoordinatorStep.BUSY
         }
         val retry = envelope.intent.retry
-        val delay = RETRY_DELAYS_SECONDS[
+        // A successful reply saying cleanup is still running is progress, not
+        // a transport failure. Keep polling it promptly; actual failures retain
+        // the normal backoff and the durable journal still fences every Start.
+        val delay = if (!envelope.intent.desiredActive && code in setOf(
+                "operation_reconcile_pending", "connection_cleanup_reconcile_pending",
+            )) 2L else RETRY_DELAYS_SECONDS[
             retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)
         ]
         val result = store.recordFailure(
@@ -7310,12 +7315,14 @@ internal class AndroidConnectionIntentCoordinator(
         if (!stillDesired()) return cleanup(panel, runtime)
         if (!canStart()) return AndroidCoordinatorStep.BUSY
         when (reconciled.state) {
-            "pending", "applying", "compensating" ->
+            "applying", "compensating" ->
                 return recordDirectRetry("operation_reconcile_pending")
             "terminal", "cancelled" -> return closeAuthoritativePendingStartAndRetry(
                 envelope, transaction, "operation_reconcile_${reconciled.state}",
             )
-            "not_found", "applied" -> Unit
+            // PENDING is a deferred operation awaiting exact client replay.
+            // Merely polling it cannot advance allocation on the panel.
+            "not_found", "pending", "applied" -> Unit
             else -> return recordTerminalFailure("invalid_background_response")
         }
         val template = requireNotNull(envelope.intent.template)
@@ -7400,7 +7407,7 @@ internal class AndroidConnectionIntentCoordinator(
             }
         }
         return when (reconciled.state) {
-            "not_found", "applied" -> exactReplayAndStart(
+            "not_found", "pending", "applied" -> exactReplayAndStart(
                 envelope,
                 transaction,
                 panel,
@@ -7410,7 +7417,7 @@ internal class AndroidConnectionIntentCoordinator(
                 onRecovered = onRecovered,
                 canStart = canStart,
             )
-            "pending", "applying", "compensating" ->
+            "applying", "compensating" ->
                 recordDirectRetry("operation_reconcile_pending")
             "terminal", "cancelled" -> closeAuthoritativePendingStartAndRetry(
                 envelope,
@@ -7700,7 +7707,9 @@ internal class AndroidConnectionIntentCoordinator(
                         .coordinatorEnvelopeOrThrow()
                     cleanup(panel, runtime)
                 }
-                else -> recordDirectRetry("connection_cleanup_reconcile_pending")
+                "pending", "applying", "compensating" ->
+                    recordDirectRetry("connection_cleanup_reconcile_pending")
+                else -> recordDirectRetry("invalid_background_response")
             }
         }
         if (transaction.stopOperationId == null) {
