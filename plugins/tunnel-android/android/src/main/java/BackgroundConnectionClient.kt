@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import java.util.concurrent.CompletableFuture
 import android.content.Context
 import java.net.URI
 import java.net.Inet4Address
@@ -12,6 +13,14 @@ import java.util.concurrent.TimeUnit
 import java.util.Locale
 import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
+import okhttp3.Call
+import okhttp3.ConnectionPool
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.RequestBody
+import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -900,11 +909,21 @@ internal class BackgroundOperationClient(
     }
 }
 
-internal class UrlConnectionBackgroundApiTransport(
-    private val openConnection: (java.net.URL) -> HttpsURLConnection = { url ->
-        (url.openConnection() as? HttpsURLConnection)
-            ?: throw BackgroundConnectionException("background_transport_unavailable")
-    },
+// One client, synchronous calls on the existing credential worker. Do not retain
+// idle sockets across VPN/network changes. Keep standard alternate-address fallback.
+internal val backgroundHttpClient = OkHttpClient.Builder()
+    .connectTimeout(BACKGROUND_CONNECT_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
+    .readTimeout(BACKGROUND_READ_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
+    .writeTimeout(BACKGROUND_READ_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
+    .followRedirects(false)
+    .followSslRedirects(false)
+    .protocols(listOf(Protocol.HTTP_1_1))
+    .connectionPool(ConnectionPool(0, 1, TimeUnit.MINUTES))
+    .build()
+
+internal class BackgroundHttpApiTransport(
+    private val cancellation: CompletableFuture<Unit>? = null,
+    private val newCall: (Request) -> Call = backgroundHttpClient::newCall,
 ) : BackgroundApiTransport {
     override fun execute(
         credential: BackgroundCredential,
@@ -914,7 +933,7 @@ internal class UrlConnectionBackgroundApiTransport(
         authorization: BackgroundAuthorization,
     ): JSONObject {
         // Keep Stop's client-side wait separate from the panel's cleanup time.
-        // outputStream may connect or buffer; writing it does not prove peer receipt.
+        // Finishing the local write does not prove peer receipt.
         val startedAt = if (endpoint == "background/connections/stop") System.nanoTime() else null
         val stopOperationId = if (startedAt != null) runCatching {
             UUID.fromString(payload?.optString("operation_id")).toString()
@@ -937,77 +956,88 @@ internal class UrlConnectionBackgroundApiTransport(
             phase = next
         }
         recordPhase("prepare")
-        val base = URI(credential.panelBase)
-        val url = base.resolve("/api/client/v1/$endpoint").toURL()
-        val connection = openConnection(url)
+        if (cancellation?.isDone == true) throw BackgroundConnectionException("tunnel_start_cancelled")
+        val url = URI(credential.panelBase).resolve("/api/client/v1/$endpoint")
+        if (url.scheme != "https") throw BackgroundConnectionException("background_transport_unavailable")
+        val encoded = payload?.toString()?.toByteArray(StandardCharsets.UTF_8)
+        var cancelCall: CompletableFuture<Void>? = null
         return try {
-            connection.requestMethod = method
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = BACKGROUND_CONNECT_TIMEOUT_MILLIS
-            connection.readTimeout = BACKGROUND_READ_TIMEOUT_MILLIS
-            backgroundAuthorizationHeaders(credential, authorization).forEach { (name, value) ->
-                connection.setRequestProperty(name, value)
-            }
-            connection.setRequestProperty("Accept", "application/json")
-            if (payload != null) {
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json")
-                val encoded = payload.toString().toByteArray(StandardCharsets.UTF_8)
-                try {
-                    recordPhase("request_body")
-                    connection.outputStream.use { it.write(encoded) }
-                    recordPhase("request_body_written")
-                } finally {
-                    encoded.fill(0)
-                }
-            }
-            phase = "response_headers"
-            val status = connection.responseCode
-            responseStatus = status
-            recordPhase("response_headers")
-            phase = "response_body"
-            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.use { input ->
-                val buffer = ByteArray(8 * 1024)
-                val output = java.io.ByteArrayOutputStream()
-                try {
-                    while (true) {
-                        val count = input.read(buffer)
-                        if (count < 0) break
-                        if (output.size() + count > BACKGROUND_MAX_RESPONSE_BYTES) {
-                            throw BackgroundConnectionException("background_response_too_large")
+            val requestBody = if (encoded != null || method in setOf("POST", "PUT", "PATCH")) {
+                object : RequestBody() {
+                    override fun contentType() = if (encoded != null) "application/json".toMediaType() else null
+                    override fun contentLength() = encoded?.size?.toLong() ?: 0L
+                    override fun writeTo(sink: BufferedSink) {
+                        if (encoded != null) {
+                            sink.write(encoded)
+                            sink.flush()
+                            recordPhase("request_body_written")
                         }
-                        output.write(buffer, 0, count)
+                        phase = "response_headers"
                     }
-                    val responseBytes = output.toByteArray()
-                    try {
-                        responseBytes.toString(StandardCharsets.UTF_8)
-                    } finally {
-                        responseBytes.fill(0)
-                    }
-                } finally {
-                    buffer.fill(0)
                 }
-            }.orEmpty()
-            val json = runCatching { JSONObject(body) }.getOrNull()
-            if (status !in 200..299) {
-                throw backgroundPanelException(
-                    endpoint = endpoint.substringBefore('?'),
-                    status = status,
-                    panelCode = json?.optString("code")?.takeIf(String::isNotBlank),
-                    retryAfterHeader = connection.getHeaderField("Retry-After"),
-                )
+            } else null
+            val request = Request.Builder().url(url.toString()).method(method, requestBody)
+                .header("Accept", "application/json")
+            backgroundAuthorizationHeaders(credential, authorization).forEach { (name, value) ->
+                request.header(name, value)
             }
-            (json ?: throw BackgroundConnectionException("invalid_background_response"))
-                .also { recordPhase("complete") }
+            val call = newCall(request.build())
+            // Call.cancel is sticky even before execute/connect; disconnect on an
+            // unopened HttpURLConnection is not. No extra worker or polling timer.
+            cancelCall = cancellation?.thenRun { call.cancel() }
+            if (encoded != null) recordPhase("request_body") else phase = "response_headers"
+            call.execute().use { response ->
+                val status = response.code
+                responseStatus = status
+                recordPhase("response_headers")
+                phase = "response_body"
+                val stream = response.body?.byteStream()
+                val body = stream?.use { input ->
+                    val buffer = ByteArray(8 * 1024)
+                    val output = java.io.ByteArrayOutputStream()
+                    try {
+                        while (true) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            if (output.size() + count > BACKGROUND_MAX_RESPONSE_BYTES) {
+                                throw BackgroundConnectionException("background_response_too_large")
+                            }
+                            output.write(buffer, 0, count)
+                        }
+                        val responseBytes = output.toByteArray()
+                        try {
+                            responseBytes.toString(StandardCharsets.UTF_8)
+                        } finally {
+                            responseBytes.fill(0)
+                        }
+                    } finally {
+                        buffer.fill(0)
+                    }
+                }.orEmpty()
+                if (cancellation?.isDone == true) throw BackgroundConnectionException("tunnel_start_cancelled")
+                val json = runCatching { JSONObject(body) }.getOrNull()
+                if (status !in 200..299) {
+                    throw backgroundPanelException(
+                        endpoint = endpoint.substringBefore('?'),
+                        status = status,
+                        panelCode = json?.optString("code")?.takeIf(String::isNotBlank),
+                        retryAfterHeader = response.header("Retry-After"),
+                    )
+                }
+                (json ?: throw BackgroundConnectionException("invalid_background_response"))
+                    .also { recordPhase("complete") }
+            }
         } catch (error: BackgroundConnectionException) {
             recordPhase("failed", error)
             throw error
         } catch (error: Throwable) {
             recordPhase("failed", error)
-            throw BackgroundConnectionException("background_transport_unavailable")
+            throw BackgroundConnectionException(
+                if (cancellation?.isDone == true) "tunnel_start_cancelled" else "background_transport_unavailable",
+            )
         } finally {
-            connection.disconnect()
+            cancelCall?.cancel(false)
+            encoded?.fill(0)
         }
     }
 }
@@ -1061,7 +1091,7 @@ internal data class BackgroundRedundantHealthProbe(
 )
 
 internal object BackgroundConnectionClient {
-    private val transport: BackgroundApiTransport = UrlConnectionBackgroundApiTransport()
+    private val transport: BackgroundApiTransport = BackgroundHttpApiTransport()
     private val operations = BackgroundOperationClient(transport)
     fun start(
         context: Context,
@@ -1121,7 +1151,9 @@ internal object BackgroundConnectionClient {
         transaction: AndroidLeaseTransaction,
         probeCache: BackgroundCandidateProbeCache,
         networkIdentity: String,
+        cancellation: CompletableFuture<Unit>,
     ): BackgroundStartResult {
+        val startTransport = BackgroundHttpApiTransport(cancellation)
         val measured = requiresMeasuredCandidateSelection(
             template.layer,
             template.ticConnectionMode,
@@ -1132,13 +1164,13 @@ internal object BackgroundConnectionClient {
                 template.layer,
                 template.egressMode,
                 networkIdentity,
-                serverCandidates(credential, template.layer, template.egressMode),
+                BackgroundOperationClient(startTransport).serverCandidates(credential, template.layer, template.egressMode),
             )
         } else {
             emptyList()
         }
         val request = backgroundExactStartPayload(template, transaction, probes)
-        val payload = execute(credential, "background/connections/start", request)
+        val payload = startTransport.execute(credential, "POST", "background/connections/start", request)
         return backgroundExactStartResult(payload, template, transaction)
     }
 
@@ -1246,7 +1278,7 @@ internal object BackgroundConnectionClient {
     }
 
     fun legacyTokenWithBearer(credential: BackgroundCredential): BackgroundCredential {
-        val payload = UrlConnectionBackgroundApiTransport().execute(credential, "POST", "background/token", null, BackgroundAuthorization.BEARER)
+        val payload = BackgroundHttpApiTransport().execute(credential, "POST", "background/token", null, BackgroundAuthorization.BEARER)
         val token = payload.getString("token")
         val expiresIn = payload.getLong("expires_in")
         require(token.isNotBlank() && expiresIn > 0)

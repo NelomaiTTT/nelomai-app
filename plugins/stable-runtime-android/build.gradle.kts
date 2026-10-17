@@ -45,6 +45,7 @@ tasks.named("preBuild").configure { dependsOn(prepareStableSources) }
 
 dependencies {
     compileOnly(project(":runtime-android-common"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")

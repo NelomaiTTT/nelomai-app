@@ -1851,9 +1851,18 @@ impl AppStateResponse {
 
     #[cfg(any(target_os = "android", test))]
     fn with_android_owner(
-        self,
+        mut self,
         owner: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
     ) -> Self {
+        // The service has accepted cancellation even if a concurrent core
+        // observation still contains the previous recovery/start projection.
+        if !owner.desired_active
+            && owner.status == "stopping"
+            && matches!(self.phase, "connecting" | "connected")
+        {
+            self.phase = "stopping";
+            self.metrics = None;
+        }
         // Core Ready confirms local closure; the ordinary native owner does not
         // set the redundant-session localStopPendingCleanup field.
         let cleanup_pending = self.phase == "ready"
@@ -5233,6 +5242,44 @@ mod tests {
                 ));
                 assert!(response.metrics.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn android_cancelled_owner_never_projects_a_stale_connecting_or_connected_core() {
+        let owner = tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+            desired_active: false,
+            status: "stopping".into(),
+            lease_phase: Some("start_pending".into()),
+            ..Default::default()
+        };
+        for phase in [
+            Phase::Connecting,
+            Phase::Connected,
+            Phase::SignedOut,
+            Phase::UpdateRequired,
+        ] {
+            let response = AppStateResponse::new(
+                CoreState {
+                    phase,
+                    connection: None,
+                },
+                None,
+                None,
+                nelomai_client_core::ConnectionIntentStatus::None,
+                None,
+                None,
+            )
+            .with_android_owner(&owner);
+            assert_eq!(
+                response.phase,
+                if matches!(phase, Phase::Connecting | Phase::Connected) {
+                    "stopping"
+                } else {
+                    phase_name(phase)
+                }
+            );
+            assert!(!response.local_stop_pending_cleanup);
         }
     }
 

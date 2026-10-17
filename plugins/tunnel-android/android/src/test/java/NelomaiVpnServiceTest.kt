@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import java.util.concurrent.CompletableFuture
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -16,6 +17,294 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
+    @Test fun stopCancelsIssuedLeaseReplayButKeepsCleanupBarrierUntilAcknowledged() {
+        for (activeCheckpoint in listOf(false, true)) for (quick in listOf(false, true)) {
+            val backend = ServiceRecoveryBackend()
+            val store = recoveryStore(backend)
+            val coordinator = coordinator(store)
+            coordinator.begin(template())
+            val pending = requireNotNull(store.load().leaseTransaction)
+            store.recordLease(pending.generation, "existing-lease").successEnvelope()
+            if (activeCheckpoint) store.activateCheckpoint(pending.generation).successEnvelope()
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val finished = CountDownLatch(1)
+            val signal = AtomicReference<CompletableFuture<Unit>>()
+            val completion = AtomicReference<AndroidCoordinatorStep>()
+            val response = startResult("existing-lease")
+            val panel = ServicePanelFake().apply {
+                startResults += Result.success(response)
+                stopResults += Result.failure(BackgroundConnectionException("service_timeout"))
+                stopResults += Result.success(Unit)
+                onCancellableStart = { signal.set(it); it.thenRun { release.countDown() } }
+                onStart = { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+            }
+            val runtime = ServiceRuntimeFake(stopResults = ArrayDeque(listOf(true, true)))
+            val worker = Thread {
+                try { completion.set(coordinator.runOnce(panel, runtime)) } finally { finished.countDown() }
+            }.apply { start() }
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                assertTrue(coordinator.cancel(pending.generation - 1) is AndroidCoordinatorResult.Failure)
+                assertFalse(signal.get().isDone)
+                backend.writeSucceeds = false
+                val failed = if (quick) coordinator.cancelCurrentForQuickToggle() else coordinator.cancelCurrent()
+                assertTrue(failed is AndroidCoordinatorResult.Failure)
+                assertFalse(signal.get().isDone)
+                backend.writeSucceeds = true
+                val cancelled = if (quick) coordinator.cancelCurrentForQuickToggle() else coordinator.cancelCurrent()
+                assertTrue(cancelled is AndroidCoordinatorResult.Accepted)
+                assertFalse(store.load().intent.desiredActive)
+                assertTrue("accepted Stop must cancel the exact replay", signal.get().isDone)
+                assertTrue("replay must release the worker", finished.await(2, TimeUnit.SECONDS))
+                assertEquals(AndroidCoordinatorStep.BUSY, completion.get())
+                assertTrue(response.configuration.all { it == 0.toByte() })
+                assertEquals("existing-lease", store.load().leaseTransaction?.leaseId)
+                assertEquals(0, runtime.startCalls)
+                assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+                assertEquals("stopping", connectionIntentServiceStatus(store.load()).status)
+                assertEquals(LeasePhase.CLEANUP_PENDING, store.load().leaseTransaction?.phase)
+                assertTrue(coordinator.begin(template()) is AndroidCoordinatorResult.Failure)
+                assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+                assertNull(store.load().leaseTransaction)
+                assertEquals(listOf("existing-lease", "existing-lease"), panel.stopLeaseIds)
+                assertEquals(1, panel.stopOperationIds.distinct().size)
+                assertTrue(coordinator.begin(template()) is AndroidCoordinatorResult.Accepted)
+            } finally { backend.writeSucceeds = true; release.countDown(); worker.join(2_000) }
+            assertFalse(worker.isAlive)
+        }
+    }
+
+    @Test fun cancellationDoesNotWaitForOccupiedCleanupWorker() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(recovery)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val entered = CountDownLatch(1)
+        val releaseHttp = CountDownLatch(1)
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val completed = CountDownLatch(1)
+        val cancellation = AtomicReference<CompletableFuture<Unit>>()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            reconcileResults += reconcile("cancelled", cancelRequested = true)
+            startResults += Result.success(startResult("old-lease"))
+            onCancellableStart = { signal -> cancellation.set(signal); signal.thenRun { releaseHttp.countDown() } }
+            onStart = { entered.countDown(); check(releaseHttp.await(5, TimeUnit.SECONDS)) }
+        }
+        val credentials = Executors.newSingleThreadExecutor()
+        val cleanupExecutor = Executors.newSingleThreadExecutor()
+        val cleanupWork = RedundantVpnWorkDispatcher(cleanupExecutor)
+        val dispatcher = AndroidConnectionIntentAttemptDispatcher(
+            execute = credentials::execute,
+            persistedDelayMillis = { 0L }, scheduleAfter = { error("no timer expected") },
+            attempt = { coordinator.runOnce(panel, ServiceRuntimeFake()); completed.countDown() },
+        )
+        try {
+            // An older Stop's reconcile reply can remain outstanding after its separate
+            // credential-worker cleanup has already enabled the next user Start.
+            assertTrue(cleanupWork.resume { cleanupEntered.countDown(); check(releaseCleanup.await(5, TimeUnit.SECONDS)) })
+            assertTrue(cleanupEntered.await(2, TimeUnit.SECONDS))
+            dispatcher.request()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            coordinator.cancelCurrent()
+            dispatcher.request() // Cancellation does not dispatch anything to cleanupWork.
+            assertTrue(cancellation.get().isDone)
+            assertTrue(completed.await(2, TimeUnit.SECONDS))
+        } finally {
+            releaseCleanup.countDown(); releaseHttp.countDown()
+            credentials.shutdown(); cleanupExecutor.shutdown()
+            assertTrue(credentials.awaitTermination(2, TimeUnit.SECONDS))
+            assertTrue(cleanupExecutor.awaitTermination(2, TimeUnit.SECONDS))
+        }
+    }
+
+
+    @Test fun failedOrStaleStopDoesNotCancelTheActiveHttpRequest() {
+        for (quick in listOf(false, true)) {
+            val backend = ServiceRecoveryBackend()
+            val recovery = recoveryStore(backend)
+            val coordinator = coordinator(recovery)
+            coordinator.begin(template().copy(reserveEnabled = true))
+            val generation = recovery.load().intent.generation
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val signal = AtomicReference<CompletableFuture<Unit>>()
+            val panel = ServicePanelFake().apply {
+                reconcileResults += reconcile("not_found")
+                startResults += Result.success(startResult("old-lease"))
+                onCancellableStart = { signal.set(it); it.thenRun { release.countDown() } }
+                onStart = { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+            }
+            val worker = Thread { coordinator.runOnce(panel, ServiceRuntimeFake()) }.apply { start() }
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                assertTrue(coordinator.cancel(generation - 1) is AndroidCoordinatorResult.Failure)
+                assertFalse(signal.get().isDone)
+                backend.writeSucceeds = false
+                val failed = if (quick) coordinator.cancelCurrentForQuickToggle() else coordinator.cancelCurrent()
+                assertTrue(failed is AndroidCoordinatorResult.Failure)
+                assertFalse(signal.get().isDone)
+                assertTrue(recovery.load().intent.desiredActive)
+                backend.writeSucceeds = true
+                assertTrue(coordinator.cancel(generation) is AndroidCoordinatorResult.Accepted)
+                assertTrue(signal.get().isDone)
+            } finally { backend.writeSucceeds = true; release.countDown(); worker.join(2_000) }
+            assertFalse(worker.isAlive)
+        }
+    }
+
+    @Test
+    fun stopSignalsPendingStartWithoutParallelRemoteReconcile() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(recovery)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val operation = requireNotNull(recovery.load().leaseTransaction).startOperationId
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val runtime = ServiceRuntimeFake()
+        val delayed = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            reconcileResults += reconcile("cancelled")
+            startResults += Result.success(startResult("old-lease"))
+            onStart = { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+        }
+        val completion = AtomicReference<AndroidCoordinatorStep>()
+        val worker = Thread { completion.set(coordinator.runOnce(delayed, runtime)) }.apply { start() }
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            coordinator.cancelCurrent()
+            val cancel = ServicePanelFake().apply {
+                reconcileResults += reconcile("compensating", cancelRequested = true)
+            }
+            coordinator.runOnce(cancel, runtime, canStart = { false })
+            assertTrue(cancel.reconcileOperationIds.isEmpty())
+            assertTrue(cancel.cancelIfAbsent.isEmpty())
+            // Dispatching cancellation is not a cleanup acknowledgement.
+            assertEquals(operation, recovery.load().leaseTransaction?.startOperationId)
+            assertEquals(0, runtime.redundantStartCalls)
+        } finally {
+            release.countDown()
+            worker.join(2_000)
+        }
+        assertFalse(worker.isAlive)
+        assertEquals(AndroidCoordinatorStep.BUSY, completion.get())
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(delayed, runtime))
+        assertFalse(recovery.load().intent.desiredActive)
+        assertNull(recovery.load().leaseTransaction)
+        assertEquals(0, runtime.redundantStartCalls)
+    }
+
+    @Test
+    fun foregroundAndQuickStopReleaseBlockedStartOnlyAfterConfirmedCleanup() {
+        for (quick in listOf(false, true)) for (confirmed in listOf(false, true)) for (transportFails in listOf(false, true)) for (reserve in listOf(null, true)) {
+            val recovery = recoveryStore(ServiceRecoveryBackend())
+            val coordinator = coordinator(recovery)
+            coordinator.begin(template().copy(reserveEnabled = reserve))
+            val operation = requireNotNull(recovery.load().leaseTransaction).startOperationId
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val runtime = ServiceRuntimeFake()
+            val response = startResult("old-lease")
+            val panel = ServicePanelFake().apply {
+                reconcileResults += reconcile("not_found")
+                reconcileResults += reconcile(if (confirmed) "cancelled" else "compensating", cancelRequested = true)
+                startResults += Result.success(response)
+                onCancellableStart = { cancelled -> cancelled.thenRun { release.countDown() } }
+                onStart = {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                    if (transportFails) throw BackgroundConnectionException("tunnel_start_cancelled")
+                }
+            }
+            val completion = AtomicReference<AndroidCoordinatorStep>()
+            val completed = CountDownLatch(1)
+            val executor = Executors.newSingleThreadExecutor()
+            val dispatcher = AndroidConnectionIntentAttemptDispatcher(
+                execute = executor::execute,
+                persistedDelayMillis = { connectionIntentPersistedDelayMillis(recovery.load(), 1_000) },
+                scheduleAfter = { error("cancellation follow-up must not wait for a retry timer") },
+                attempt = {
+                    val step = coordinator.runOnce(panel, runtime)
+                    completion.set(step)
+                    if (step != AndroidCoordinatorStep.BUSY) completed.countDown()
+                },
+            )
+            dispatcher.request()
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                if (quick) coordinator.cancelCurrentForQuickToggle() else coordinator.cancelCurrent()
+                dispatcher.request() // Production Stop queues this on the existing credential worker.
+                assertTrue("Stop must release HTTP and run queued cleanup", completed.await(2, TimeUnit.SECONDS))
+                assertEquals(0, runtime.redundantStartCalls)
+                assertEquals(0, runtime.startCalls)
+                if (!transportFails) assertTrue(response.configuration.all { it == 0.toByte() })
+                if (confirmed) {
+                    assertEquals(AndroidCoordinatorStep.IDLE, completion.get())
+                    assertNull(recovery.load().leaseTransaction)
+                    assertTrue(coordinator.begin(template()) is AndroidCoordinatorResult.Accepted)
+                } else {
+                    assertEquals(AndroidCoordinatorStep.RETRY, completion.get())
+                    assertEquals(operation, recovery.load().leaseTransaction?.startOperationId)
+                    assertEquals("stopping", connectionIntentServiceStatus(recovery.load()).status)
+                    assertTrue(coordinator.begin(template()) is AndroidCoordinatorResult.Failure)
+                }
+            } finally {
+                release.countDown()
+                executor.shutdown()
+                assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            }
+        }
+    }
+
+    @Test
+    fun lateCancelledHttpCannotReconcileOrModifyANewerIntent() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(recovery)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.success(startResult("old-lease"))
+            onStart = { entered.countDown(); check(release.await(5, TimeUnit.SECONDS)) }
+        }
+        val runtime = ServiceRuntimeFake()
+        val completion = AtomicReference<AndroidCoordinatorStep>()
+        val worker = Thread { completion.set(coordinator.runOnce(panel, runtime)) }.apply { start() }
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            coordinator.cancelCurrent()
+            val cancel = ServicePanelFake().apply { reconcileResults += reconcile("cancelled", cancelRequested = true) }
+            coordinator.runOnce(cancel, runtime, canStart = { false })
+            // Simulate a confirmed cleanup by a replacement service owner.
+            recovery.completeCancelledStart(recovery.load().intent.generation).successEnvelope()
+            assertTrue(coordinator.begin(template()) is AndroidCoordinatorResult.Accepted)
+            val newer = recovery.load()
+            release.countDown()
+            worker.join(2_000)
+            assertFalse(worker.isAlive)
+            assertEquals(newer, recovery.load())
+            assertEquals(AndroidCoordinatorStep.BUSY, completion.get())
+            assertEquals(1, panel.reconcileOperationIds.size)
+            assertEquals(0, runtime.startCalls)
+            assertEquals(0, runtime.redundantStartCalls)
+        } finally { release.countDown(); worker.join(2_000) }
+    }
+
+    @Test
+    fun cancelledUnknownStartIsStoppingUntilReconciliationCompletes() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(recovery)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        coordinator.cancelCurrent()
+        val status = connectionIntentServiceStatus(recovery.load())
+        assertFalse(status.desiredActive)
+        assertEquals("stopping", status.status)
+        assertEquals("start_pending", status.leasePhase)
+        assertTrue(status.redundantSessionOwned)
+    }
+
     @Test
     fun idleCheckScheduledBeforeTileDoesNotInterruptCredentialPreflight() {
         val dispatch = AndroidConnectionIntentDispatchState()
@@ -145,6 +434,7 @@ class NelomaiVpnServiceTest {
             onStart = { coordinator.cancelCurrent() }
         }
         val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.BUSY, coordinator.runOnce(panel, runtime))
         assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
         assertNull(store.load().redundantTransaction)
         assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
@@ -2934,6 +3224,7 @@ class NelomaiVpnServiceTest {
         val runtime = ServiceRuntimeFake()
         val panel = ServicePanelFake().apply {
             reconcileResults += reconcile("not_found")
+            reconcileResults += reconcile("cancelled", cancelRequested = true)
             startResults += Result.success(startResult("late-busy-lease"))
             onStart = {
                 entered.countDown()
@@ -2949,7 +3240,10 @@ class NelomaiVpnServiceTest {
         assertTrue(cancelled is AndroidCoordinatorResult.Accepted)
         assertFalse(store.load().intent.desiredActive)
         release.countDown()
-        assertEquals(AndroidCoordinatorStep.CLEANUP_REQUIRED, attempt.get(2, TimeUnit.SECONDS))
+        assertEquals(AndroidCoordinatorStep.BUSY, attempt.get(2, TimeUnit.SECONDS))
+        assertEquals(LeasePhase.START_PENDING, store.load().leaseTransaction?.phase)
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction)
         assertEquals(0, runtime.startCalls)
         executor.shutdownNow()
     }
@@ -3301,11 +3595,12 @@ class NelomaiVpnServiceTest {
         }
 
         assertEquals(
-            AndroidCoordinatorStep.RETRY,
+            AndroidCoordinatorStep.BUSY,
             coordinator.runOnce(panel, ServiceRuntimeFake()),
         )
         assertFalse(store.load().intent.desiredActive)
-        assertEquals("service_timeout", store.load().intent.retry.lastErrorCode)
+        assertNull(store.load().intent.retry.lastErrorCode)
+        assertNull(store.load().intent.retry.nextRetryAtUnix)
         assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, ServiceRuntimeFake()))
         assertNull(store.load().leaseTransaction)
     }
@@ -3370,16 +3665,21 @@ class NelomaiVpnServiceTest {
         val runtime = ServiceRuntimeFake()
         val panel = ServicePanelFake().apply {
             reconcileResults += reconcile("not_found")
+            reconcileResults += reconcile("applied", "late-lease", cancelRequested = true)
             startResults += Result.success(startResult("late-lease"))
             onStart = { coordinator.cancel() }
+            stopResults += Result.success(Unit)
         }
 
-        assertEquals(AndroidCoordinatorStep.CLEANUP_REQUIRED, coordinator.runOnce(panel, runtime))
+        assertEquals(AndroidCoordinatorStep.BUSY, coordinator.runOnce(panel, runtime))
 
         val persisted = recoveryStore(backend).load()
         assertFalse(persisted.intent.desiredActive)
-        assertEquals(LeasePhase.CLEANUP_PENDING, persisted.leaseTransaction?.phase)
-        assertEquals("late-lease", persisted.leaseTransaction?.leaseId)
+        assertEquals(LeasePhase.START_PENDING, persisted.leaseTransaction?.phase)
+        assertNull(persisted.leaseTransaction?.leaseId)
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertEquals(listOf("late-lease"), panel.stopLeaseIds)
+        assertNull(recoveryStore(backend).load().leaseTransaction)
         assertEquals(0, runtime.startCalls)
     }
 
@@ -4855,7 +5155,7 @@ class NelomaiVpnServiceTest {
         }
         assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(terminal, ServiceRuntimeFake()))
         val idleProjection = connectionIntentServiceStatus(store.load())
-        assertEquals("none", idleProjection.status)
+        assertEquals("stopping", idleProjection.status)
         assertFalse(idleProjection.desiredActive)
         assertEquals("operation_id_conflict", idleProjection.lastErrorCode)
     }
@@ -5673,7 +5973,7 @@ class NelomaiVpnServiceTest {
         )
         val pendingReport = recoveryStore(backend).load()
         assertFalse(pendingReport.intent.desiredActive)
-        assertEquals("none", connectionIntentServiceStatus(pendingReport).status)
+        assertEquals("stopping", connectionIntentServiceStatus(pendingReport).status)
         assertTrue(pendingReport.intent.retry.terminalDiagnosticPending)
 
         val restored = coordinator(recoveryStore(backend))
@@ -6330,7 +6630,7 @@ class NelomaiVpnServiceTest {
         assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, ServiceRuntimeFake()))
 
         val status = connectionIntentServiceStatus(store.load())
-        assertEquals("none", status.status)
+        assertEquals("stopping", status.status)
         assertFalse(status.desiredActive)
         assertEquals("invalid_background_response", status.lastErrorCode)
     }
@@ -7846,6 +8146,7 @@ private class ServicePanelFake : AndroidConnectionIntentPanel {
     val reconcileKinds = mutableListOf<String>()
     val cancelIfAbsent = mutableListOf<Boolean>()
     var onStart: () -> Unit = {}
+    var onCancellableStart: (CompletableFuture<Unit>) -> Unit = {}
     var onBindingSync: () -> Unit = {}
     var onReconcile: () -> Unit = {}
 
@@ -7871,8 +8172,10 @@ private class ServicePanelFake : AndroidConnectionIntentPanel {
     override fun start(
         template: AndroidIntentTemplate,
         transaction: AndroidLeaseTransaction,
+        cancellation: CompletableFuture<Unit>,
     ): BackgroundStartResult {
         startOperationIds += transaction.startOperationId
+        onCancellableStart(cancellation)
         onStart()
         return startResults.removeFirst().getOrThrow()
     }

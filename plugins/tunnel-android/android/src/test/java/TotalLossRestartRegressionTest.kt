@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import java.util.concurrent.CompletableFuture
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -33,7 +34,7 @@ class TotalLossRestartRegressionTest {
         var starts = 0
         override fun reconcile(transaction: AndroidLeaseTransaction, cancelIfAbsent: Boolean) =
             BackgroundReconcileResult(state, false, null, null, 0, null)
-        override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction): BackgroundStartResult {
+        override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction, cancellation: CompletableFuture<Unit>): BackgroundStartResult {
             starts++
             throw BackgroundConnectionException("connection_already_active")
         }

@@ -125,8 +125,7 @@ private data class PendingPrimaryReadiness(
     val activeIndex: Int,
     val deadlineElapsedMs: Long,
     var rebindAtElapsedMs: Long,
-    var rebindAttempted: Boolean = false,
-    var standbyRebindAttempted: Boolean = false,
+    var standbyRebindAtElapsedMs: Long = 0L,
     val shouldCancel: () -> Boolean,
     val freshStart: Boolean,
     val onReady: () -> Unit,
@@ -807,10 +806,11 @@ internal class RedundantConnectionCoordinator(
         // Give it the same bounded first-handshake recovery as the primary, from
         // its own start time. Do not reset a working reserve's proofs or deadline.
         if (transaction.template.layer == "stray" && transaction.standbyDesired &&
-            !pending.standbyRebindAttempted && elapsedNow() < pending.deadlineElapsedMs &&
+            elapsedNow() < pending.deadlineElapsedMs &&
             standbyObservation?.handshakeFresh == false && !standbyObservation.hardFailure &&
             standbyObservation.health != BackendHealth.UNHEALTHY && standbyStartedAt != null &&
             elapsedNow() >= saturatingAdd(standbyStartedAt, INITIAL_HANDSHAKE_REBIND_MILLIS) &&
+            elapsedNow() >= pending.standbyRebindAtElapsedMs &&
             healthMonitor.networkReady(elapsedNow())
         ) {
             val leaseId = transaction.candidateLeaseId?.takeIf {
@@ -818,7 +818,7 @@ internal class RedundantConnectionCoordinator(
                     transaction.candidateSlot == (if (standbyIndex == 0) RedundantSlot.A else RedundantSlot.B)
             } ?: transaction.leaseIdAt(standbyIndex)
             if (leaseId != null) {
-                pending.standbyRebindAttempted = true
+                pending.standbyRebindAtElapsedMs = saturatingAdd(elapsedNow(), INITIAL_HANDSHAKE_REBIND_MILLIS)
                 mutateNative(transaction) { runCatching { native.rebind(leaseId) }.getOrDefault(false) }
                 return true // Rebind invalidates this snapshot's health evidence.
             }
@@ -848,9 +848,9 @@ internal class RedundantConnectionCoordinator(
                 observations,
             )
         }
-        // Match the ordinary AWG first-handshake recovery: one new protected UDP
-        // socket, not a new lease or a longer startup deadline. DNS failure after
-        // an established handshake is not a reason to change the socket.
+        // A replacement UDP flow can also remain silent. Retry protected sockets
+        // at the same bounded interval within the original startup deadline.
+        // DNS failure after a handshake is not a reason to change the socket.
         // Do not discard an in-flight post-commit check of a warmed reserve
         // merely to retry the primary socket. Its check budget and the overall
         // startup deadline still bound this wait; a failed check permits rebind.
@@ -858,10 +858,10 @@ internal class RedundantConnectionCoordinator(
             standbyObservation?.health == BackendHealth.READY &&
             standbyObservation.standbyProbeState == StandbyProbeState.PENDING
         if (waitingForStrayHandshake && !checkingInitialReserve &&
-            !pending.rebindAttempted && elapsedNow() >= pending.rebindAtElapsedMs &&
+            elapsedNow() >= pending.rebindAtElapsedMs &&
             healthMonitor.networkReady(elapsedNow())
         ) {
-            pending.rebindAttempted = true
+            pending.rebindAtElapsedMs = saturatingAdd(elapsedNow(), INITIAL_HANDSHAKE_REBIND_MILLIS)
             mutateNative(transaction) { runCatching { native.rebind(pending.activeLeaseId) }.getOrDefault(false) }
         }
         return true

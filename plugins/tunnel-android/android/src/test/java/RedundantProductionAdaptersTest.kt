@@ -327,7 +327,8 @@ class RedundantProductionAdaptersTest {
         }
         assertEquals(1, fixture.failed)
         assertEquals(listOf(0), fixture.backend.activeSlots)
-        assertEquals(1, fixture.backend.reboundSlots.count { it == 0 })
+        assertEquals(3, fixture.backend.reboundSlots.count { it == 0 })
+        assertEquals(0, fixture.backend.reboundSlots.count { it == 1 })
     }
 
     @Test

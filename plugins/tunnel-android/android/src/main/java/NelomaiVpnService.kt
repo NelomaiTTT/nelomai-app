@@ -4852,6 +4852,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         override fun start(
             template: AndroidIntentTemplate,
             transaction: AndroidLeaseTransaction,
+            cancellation: CompletableFuture<Unit>,
         ): BackgroundStartResult {
             val credential = serviceActiveCredential(template.deviceId)
             val networkIdentity = runCatching {
@@ -4869,6 +4870,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 transaction,
                 candidateProbeCache,
                 networkIdentity,
+                cancellation,
             )
         }
 
@@ -6016,6 +6018,7 @@ internal interface AndroidConnectionIntentPanel {
     fun start(
         template: AndroidIntentTemplate,
         transaction: AndroidLeaseTransaction,
+        cancellation: CompletableFuture<Unit>,
     ): BackgroundStartResult
 
     fun syncBindingPreferences(template: AndroidIntentTemplate)
@@ -6452,6 +6455,7 @@ internal fun connectionIntentServiceStatus(
     }
     val transaction = envelope.leaseTransaction
     val status = when {
+        !envelope.intent.desiredActive && transaction != null -> "stopping"
         transaction?.phase == LeasePhase.CLEANUP_PENDING ||
             transaction?.phase == LeasePhase.STALE_CLEANUP -> "stopping"
         envelope.intent.desiredActive && envelope.intent.retry.lastErrorCode != null &&
@@ -6552,6 +6556,11 @@ internal class AndroidConnectionIntentCoordinator(
         AndroidConnectionIntentDiagnosticsObserver {},
 ) {
     private val operationGate = AtomicBoolean(false)
+    private data class PendingStartRequest(
+        val operationId: String,
+        val cancellation: CompletableFuture<Unit> = CompletableFuture(),
+    )
+    private val pendingStartRequest = AtomicReference<PendingStartRequest?>()
 
     // Serialize local replacement with replay/cleanup, without disarming the
     // intent. Explicit cancellation still advances the durable generation.
@@ -6659,23 +6668,42 @@ internal class AndroidConnectionIntentCoordinator(
 
     fun cancelCurrent(): AndroidCoordinatorResult {
         return when (val result = store.cancelCurrentIntent()) {
-            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Success -> {
+                cancelPendingStartRequest(result.value)
+                AndroidCoordinatorResult.Accepted(result.value)
+            }
             is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
         }
     }
 
     fun cancelCurrentForQuickToggle(): AndroidCoordinatorResult {
         return when (val result = store.cancelCurrentIntentForQuickToggle()) {
-            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Success -> {
+                cancelPendingStartRequest(result.value)
+                AndroidCoordinatorResult.Accepted(result.value)
+            }
             is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
         }
     }
 
     fun cancel(expectedGeneration: Long): AndroidCoordinatorResult {
         return when (val result = store.setDesiredActive(expectedGeneration, false)) {
-            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Success -> {
+                cancelPendingStartRequest(result.value)
+                AndroidCoordinatorResult.Accepted(result.value)
+            }
             is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
         }
+    }
+
+    private fun cancelPendingStartRequest(envelope: AndroidRecoveryEnvelope) {
+        val transaction = envelope.leaseTransaction ?: return
+        if (envelope.intent.desiredActive) return
+        // Cancel both initial allocation and replay of an already issued lease.
+        // Signal only after durable cancellation, independent of any cleanup queue.
+        pendingStartRequest.get()?.takeIf {
+            it.operationId == transaction.startOperationId
+        }?.cancellation?.complete(Unit)
     }
 
     fun dataPlaneStalled(leaseId: String): AndroidCoordinatorResult {
@@ -7237,6 +7265,34 @@ internal class AndroidConnectionIntentCoordinator(
         val RETRY_DELAYS_SECONDS = longArrayOf(2, 5, 15, 30, 60, 300)
     }
 
+    private fun requestStart(
+        panel: AndroidConnectionIntentPanel,
+        template: AndroidIntentTemplate,
+        transaction: AndroidLeaseTransaction,
+    ): BackgroundStartResult? {
+        val pending = PendingStartRequest(transaction.startOperationId)
+        pendingStartRequest.set(pending)
+        return try {
+            // Publish before checking the durable intent, so cancellation cannot
+            // fall between admission and registration of the HTTP connection.
+            val current = store.read().coordinatorEnvelopeOrThrow()
+            if (!current.intent.desiredActive || current.intent.generation != transaction.generation) {
+                return null
+            }
+            val result = panel.start(template, transaction, pending.cancellation)
+            if (pending.cancellation.isDone) {
+                // The queued coordinator attempt will read the current owner and
+                // reconcile cleanup. A late HTTP task must not mutate a new intent.
+                result.clearSensitiveConfigurations()
+                null
+            } else result
+        } catch (error: Throwable) {
+            if (pending.cancellation.isDone) null else throw error
+        } finally {
+            pendingStartRequest.compareAndSet(pending, null)
+        }
+    }
+
     private fun runPendingRedundantStart(
         envelope: AndroidRecoveryEnvelope,
         transaction: AndroidLeaseTransaction,
@@ -7268,7 +7324,7 @@ internal class AndroidConnectionIntentCoordinator(
             if (!stillDesired()) return cleanup(panel, runtime)
             if (!canStart()) return AndroidCoordinatorStep.BUSY
         }
-        val result = panel.start(template, transaction)
+        val result = requestStart(panel, template, transaction) ?: return AndroidCoordinatorStep.BUSY
         try {
             if (!stillDesired()) return cleanup(panel, runtime)
             if (!canStart()) return AndroidCoordinatorStep.BUSY
@@ -7476,7 +7532,7 @@ internal class AndroidConnectionIntentCoordinator(
             if (!canStart()) return AndroidCoordinatorStep.BUSY
         }
         if (!canStart()) return AndroidCoordinatorStep.BUSY
-        val result = panel.start(template, transaction)
+        val result = requestStart(panel, template, transaction) ?: return AndroidCoordinatorStep.BUSY
         val leaseId = result.connection.leaseId
         val live = store.read().coordinatorEnvelopeOrThrow()
         val startStillAdmitted = canStart()

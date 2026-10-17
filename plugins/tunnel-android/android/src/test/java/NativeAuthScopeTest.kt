@@ -3,9 +3,7 @@ package ru.nelomai.tunnel
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
-import java.net.URL
-import javax.net.ssl.HttpsURLConnection
-import java.security.cert.Certificate
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 class NativeAuthScopeTest {
     @Test fun noopProvisionStillAppliesConservativeDotWithdrawalWithoutIssuingToken() {
@@ -842,29 +840,24 @@ class NativeAuthScopeTest {
     }
 
     @Test fun realBearerTransportWritesTheSnapshotHeadersToTheConnection() {
-        val connection = object : HttpsURLConnection(URL("https://synthetic.invalid")) {
-            override fun connect() {}
-            override fun disconnect() {}
-            override fun usingProxy() = false
-            override fun getCipherSuite() = "synthetic"
-            override fun getLocalCertificates(): Array<Certificate>? = null
-            override fun getServerCertificates(): Array<Certificate> = emptyArray()
-            override fun getResponseCode() = 200
-            override fun getInputStream() = "{}".byteInputStream()
-        }
+        var sent: okhttp3.Request? = null
+        val client = backgroundHttpClient.newBuilder().addInterceptor { chain ->
+            sent = chain.request()
+            okhttp3.Response.Builder().request(chain.request()).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200).message("OK").body("{}".toResponseBody()).build()
+        }.build()
         val credential = BackgroundCredential(operation().scope.deviceId, "https://synthetic.invalid", "synthetic-access", 1000, operation().scope)
-        val transport = UrlConnectionBackgroundApiTransport { url ->
-            assertEquals("/api/client/v1/background/token", url.path)
-            connection
-        }
-        transport.execute(credential, "POST", "background/token", null, BackgroundAuthorization.BEARER)
-        assertEquals("Bearer synthetic-access", connection.getRequestProperty("Authorization"))
-        assertEquals("0.2.16", connection.getRequestProperty("X-Nelomai-App-Version"))
-        assertEquals("0.2.16", connection.getRequestProperty("X-Nelomai-Container-Version"))
-        assertEquals("0.2.15", connection.getRequestProperty("X-Nelomai-Runtime-Version"))
-        assertEquals("1", connection.getRequestProperty("X-Nelomai-Runtime-Contract-Version"))
-        assertEquals("stable", connection.getRequestProperty("X-Nelomai-Runtime-Slot"))
-        assertEquals("7", connection.getRequestProperty("X-Nelomai-Session-Generation"))
+        BackgroundHttpApiTransport(newCall = client::newCall).execute(
+            credential, "POST", "background/token", null, BackgroundAuthorization.BEARER)
+        val request = requireNotNull(sent)
+        assertEquals("/api/client/v1/background/token", request.url.encodedPath)
+        assertEquals("Bearer synthetic-access", request.header("Authorization"))
+        assertEquals("0.2.16", request.header("X-Nelomai-App-Version"))
+        assertEquals("0.2.16", request.header("X-Nelomai-Container-Version"))
+        assertEquals("0.2.15", request.header("X-Nelomai-Runtime-Version"))
+        assertEquals("1", request.header("X-Nelomai-Runtime-Contract-Version"))
+        assertEquals("stable", request.header("X-Nelomai-Runtime-Slot"))
+        assertEquals("7", request.header("X-Nelomai-Session-Generation"))
     }
 
     @Test fun newerOwnerOperationFencesOldNativeWritesWithoutErasingScope() {

@@ -37,6 +37,8 @@ android {
 
 dependencies {
     implementation(project(":runtime-android-common"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
     implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation(project(":amneziawg-tunnel"))

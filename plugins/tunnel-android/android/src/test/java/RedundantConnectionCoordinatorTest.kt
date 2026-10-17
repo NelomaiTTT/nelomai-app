@@ -191,6 +191,59 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun coldStrayRetriesSilentSocketGenerationsWithinTheOriginalDeadline() {
+        var now = 0L
+        val native = FakeNative()
+        var failed = 0
+        val coordinator = testRedundantCoordinator(emptyStore(), FakePanel(), native,
+            monotonicMs = { now })
+        assertTrue(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe(), "lease-b" to probe()),
+            onPrimaryFailed = { failed++ }))
+        val waiting = listOf(healthSlot(0, active = true, probeFailed = true, stableSinceMs = 0),
+            healthSlot(1, probeFailed = true, stableSinceMs = 4_000))
+        for (second in 1..29) {
+            now = second * 1_000L
+            assertTrue(coordinator.onHealthObservations(waiting))
+        }
+        assertEquals(listOf("lease-a", "lease-b", "lease-a", "lease-b", "lease-a", "lease-b", "lease-a"),
+            native.rebindAttempts)
+        now = 30_000
+        assertFalse(coordinator.onHealthObservations(waiting))
+        assertEquals(1, failed)
+        assertEquals(7, native.rebindAttempts.size)
+        assertFalse(coordinator.isRunning())
+    }
+
+    @Test
+    fun secondColdRebindCanRecoverButNeverSubstitutesForHandshakeAndProbe() {
+        var now = 0L
+        var ready = 0
+        val native = FakeNative(rebindResults = ArrayDeque(listOf(false, true)))
+        val coordinator = testRedundantCoordinator(emptyStore(), FakePanel(), native,
+            monotonicMs = { now })
+        assertTrue(coordinator.start(transaction().copy(slotBLeaseId = null, standbyDesired = false),
+            mapOf("lease-a" to byteArrayOf(1)), mapOf("lease-a" to probe()),
+            onPrimaryStarted = { ready++ }))
+        val silent = healthSlot(0, active = true, probeFailed = true)
+        for (second in 1..14) {
+            now = second * 1_000L
+            assertTrue(coordinator.onHealthObservations(listOf(silent)))
+        }
+        assertEquals(listOf("lease-a", "lease-a"), native.rebindAttempts)
+        assertEquals(0, ready)
+        now = 22_000
+        assertTrue(coordinator.onHealthObservations(listOf(silent.copy(handshakeFresh = true))))
+        assertEquals(2, native.rebindAttempts.size)
+        assertEquals(0, ready)
+        assertTrue(coordinator.onHealthObservations(listOf(silent.copy(
+            handshakeFresh = true, probeFailed = false, consecutiveProbeSuccesses = 1))))
+        assertEquals(1, ready)
+        assertTrue(coordinator.isRunning())
+    }
+
+    @Test
     fun coldStrayProbeFailureBeforeFirstHandshakeStillGetsOneRebindAttempt() {
         var now = 0L
         val native = FakeNative()
@@ -382,7 +435,7 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun coldStrayStartRebindsPrimaryOnceWithoutExtendingDeadline() {
+    fun coldStrayStartSpacesPrimaryRebindsWithoutExtendingDeadline() {
         var now = 0L
         var failed = 0
         val native = FakeNative()
@@ -402,7 +455,7 @@ class RedundantConnectionCoordinatorTest {
             now = elapsed
             assertTrue(coordinator.onHealthObservations(waiting))
         }
-        assertEquals(listOf("lease-a"), native.rebindAttempts)
+        assertEquals(listOf("lease-a", "lease-a", "lease-a"), native.rebindAttempts)
         now = 30_000
         assertFalse(coordinator.onHealthObservations(waiting))
         assertEquals(1, failed)

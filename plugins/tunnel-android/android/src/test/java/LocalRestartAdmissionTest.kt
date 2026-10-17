@@ -1,5 +1,6 @@
 package ru.nelomai.tunnel
 
+import java.util.concurrent.CompletableFuture
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
@@ -20,7 +21,7 @@ class LocalRestartAdmissionTest {
         val coordinator = AndroidConnectionIntentCoordinator(store)
         val panel = object : AndroidConnectionIntentPanel {
             override fun reconcile(transaction: AndroidLeaseTransaction, cancelIfAbsent: Boolean): BackgroundReconcileResult = error("unexpected replay")
-            override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction): BackgroundStartResult = error("unexpected lease acquisition")
+            override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction, cancellation: CompletableFuture<Unit>): BackgroundStartResult = error("unexpected lease acquisition")
             override fun syncBindingPreferences(template: AndroidIntentTemplate) = error("unexpected preference update")
             override fun stop(leaseId: String, operationId: String, failureCode: String?) = error("unexpected server cleanup")
         }
