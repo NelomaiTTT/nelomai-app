@@ -308,7 +308,7 @@ fn serve_owned_frame(
         return failure();
     };
     let output = (|| {
-        let mut dispatcher = owner.try_lock().map_err(|_| d::blocked())?;
+        let mut dispatcher = owner.lock().map_err(|_| d::blocked())?;
         if private {
             if let crate::Request::DefenderStatus {
                 protocol_version,
@@ -346,6 +346,57 @@ fn serve_owned_frame(
     .unwrap_or_else(|_: std::io::Error| failure());
     watchdog.complete();
     output
+}
+
+#[cfg(test)]
+mod dispatcher_owner_tests {
+    use super::*;
+    use nelomai_contracts::dispatcher as d;
+    use std::sync::mpsc;
+
+    #[test]
+    #[ignore = "requires elevated Windows for the existing signed private fixture"]
+    fn foreground_request_waits_for_idle_owner_and_keeps_dispatcher_identity() {
+        let fixture = super::super::member_carrier_factory_test_os::Fixture::new().unwrap();
+        let installation =
+            super::super::member_carrier_factory_test_os::installation(fixture.original_root())
+                .unwrap();
+        let owner = Arc::new(Mutex::new(d::ProcessDispatcher::new(installation).unwrap()));
+        // Hold the same owner that IdleBroker keeps throughout its exchange.
+        let idle = owner.lock().unwrap();
+        let identity = idle.layout.identity.clone();
+        let foreground_owner = Arc::clone(&owner);
+        let (entered, ready) = mpsc::channel();
+        let (completed, response) = mpsc::channel();
+        let foreground = std::thread::spawn(move || {
+            let frame = d::encode_frame(&d::DispatcherRequest::Version {
+                contract_version: 1,
+            })
+            .unwrap();
+            entered.send(()).unwrap();
+            completed
+                .send(serve_owned_frame(&foreground_owner, &frame, false))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let early = response.recv_timeout(Duration::from_secs(1));
+        drop(idle);
+        let queued = early.is_err();
+        let frame =
+            early.unwrap_or_else(|_| response.recv_timeout(Duration::from_secs(5)).unwrap());
+        foreground.join().unwrap();
+        let response: d::DispatcherResponse =
+            serde_json::from_slice(d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).unwrap())
+                .unwrap();
+        assert!(queued, "foreground request rejected an occupied idle owner");
+        assert!(
+            response.ok,
+            "foreground request failed after the idle exchange"
+        );
+        assert_eq!(response.identity, Some(identity));
+        assert!(!response.running, "Version launched a synthetic engine");
+        assert!(!fixture.original_root().join(d::ACTIVE_ENGINE_NAME).exists());
+    }
 }
 
 pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
