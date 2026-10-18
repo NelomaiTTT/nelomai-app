@@ -211,6 +211,9 @@ pub struct PushRegistrationResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BindPeerRequest {
     pub peer_id: String,
+    /// Automatic preference changes may only update this exact active binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_binding_id: Option<String>,
     pub preferred_layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,

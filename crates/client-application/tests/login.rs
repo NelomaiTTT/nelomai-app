@@ -354,6 +354,7 @@ async fn binding_uses_the_peer_selected_by_the_user() {
     );
     let request = BindPeerRequest {
         peer_id: "peer-chosen-by-user".to_string(),
+        expected_binding_id: None,
         preferred_layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,

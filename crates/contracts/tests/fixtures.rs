@@ -19,6 +19,15 @@ fn contracts_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts")
 }
 
+#[test]
+fn automatic_binding_update_preserves_exact_binding_identity() {
+    let mut value: Value = serde_json::from_str(&fixture("valid/bind-peer-request.json")).unwrap();
+    value["expected_binding_id"] = "42".into();
+    assert!(schema_is_valid("bind-peer-request.schema.json", &value));
+    let request: BindPeerRequest = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(request).unwrap(), value);
+}
+
 fn fixture(name: &str) -> String {
     fs::read_to_string(contracts_root().join("fixtures").join(name)).unwrap()
 }

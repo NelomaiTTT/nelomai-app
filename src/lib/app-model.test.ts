@@ -120,6 +120,7 @@ describe("bindingPreferencesMatch", () => {
       ),
     ).toEqual({
       peer_id: "peer-15",
+      expected_binding_id: binding.id,
       preferred_layer: "tic",
       tic_connection_mode: "personal",
       route_mode: "via_tak",

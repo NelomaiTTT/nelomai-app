@@ -304,6 +304,7 @@ export type DnsProvider = "auto" | "google" | "yandex" | "quad9";
 
 export interface BindPeerRequest {
   peer_id: string;
+  expected_binding_id?: string;
   preferred_layer: Layer;
   tic_connection_mode: TicConnectionMode;
   route_mode: RouteMode;
@@ -426,6 +427,7 @@ export function bindingPreferenceUpdateRequest(
   }
   return {
     peer_id: binding.peer_id,
+    expected_binding_id: binding.id,
     preferred_layer: layer,
     tic_connection_mode: ticConnectionMode,
     route_mode: routeMode,
