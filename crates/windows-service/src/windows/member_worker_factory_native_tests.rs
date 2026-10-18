@@ -842,6 +842,39 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         // Read-only independent observer. This HANDLE cannot authorize cleanup;
         // production retains its OWN original Child HANDLE from process creation.
         let observed = observe_worker(None);
+        // Opt-in regression: let the trigger-start service stop naturally while
+        // this actual worker owns its TUN. Removing the cleanup wake must then
+        // fail the existing bounded Stop and exact interface absence assertions.
+        let idle_service = (crash.is_none()
+            && matches!(round, 0 | 2)
+            && std::env::var("NELOMAI_WORKER_WAIT_NETSETUP_IDLE").as_deref() == Ok("1"))
+        .then(|| -> std::io::Result<Duration> {
+            use windows_service::service::{ServiceAccess, ServiceState};
+            use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+            let manager =
+                ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                    .map_err(std::io::Error::other)?;
+            let service = manager
+                .open_service("NetSetupSvc", ServiceAccess::QUERY_STATUS)
+                .map_err(std::io::Error::other)?;
+            let waiting = Instant::now();
+            while service
+                .query_status()
+                .map_err(std::io::Error::other)?
+                .current_state
+                != ServiceState::Stopped
+            {
+                if waiting.elapsed() >= Duration::from_secs(300) {
+                    return Err(std::io::Error::other("NetSetupSvc natural idle deadline"));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            eprintln!(
+                "NetSetupSvc naturally stopped before worker Stop after {:?}",
+                waiting.elapsed()
+            );
+            Ok(waiting.elapsed())
+        });
         // Always attempt the actual scoped cleanup before asserting a red Start.
         let fault = match round {
             0 => StopFault::RoutesCleanup,
@@ -899,6 +932,9 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let after = super::member_carrier_provider::native::table().unwrap();
         let started = started.expect("actual worker factory Start A");
         let stopped = stopped.expect("actual worker factory Stop");
+        if let Some(idle_service) = idle_service {
+            idle_service.expect("NetSetupSvc naturally stopped before scoped cleanup");
+        }
         assert!(
             elapsed <= Duration::from_secs(7),
             "local Stop elapsed {elapsed:?}"

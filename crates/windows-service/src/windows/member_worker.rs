@@ -2355,6 +2355,39 @@ impl NativePair for Control {
                 .verify(scope);
         }
         let deadline = Instant::now() + STOP;
+        let wake_interface_cleanup = |original: &Original| -> io::Result<()> {
+            original.verify_process_exit()?;
+            if absent(original.requested, original.interface.get())? {
+                return Ok(());
+            }
+            use windows_service::service::{ServiceAccess, ServiceState};
+            use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+            let manager = checked(ServiceManager::local_computer(
+                None::<&str>,
+                ServiceManagerAccess::CONNECT,
+            ))?;
+            let service = checked(manager.open_service(
+                "NetSetupSvc",
+                ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+            ))?;
+            match checked(service.query_status())?.current_state {
+                ServiceState::Running | ServiceState::StartPending => Ok(()),
+                ServiceState::Stopped => match service.start::<&str>(&[]) {
+                    Ok(()) => Ok(()),
+                    Err(windows_service::Error::Winapi(error))
+                        if error.raw_os_error()
+                            == Some(
+                                windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING
+                                    as i32,
+                            ) =>
+                    {
+                        Ok(())
+                    }
+                    Err(_) => Err(failed()),
+                },
+                _ => Err(failed()),
+            }
+        };
         self.ready = false;
         self.fenced = true;
         let closing_published = self.journal.borrow().initial_attempt.is_some();
@@ -2584,6 +2617,10 @@ impl NativePair for Control {
                             cold
                         }
                     };
+                    // Wake deferred Windows interface inventory retirement only
+                    // after the original worker and owned index filters close.
+                    // SCM success is a hint; exact absence still proves cleanup.
+                    wake_interface_cleanup(&self.original)?;
                     while !absent(self.original.requested, self.original.interface.get())? {
                         if Instant::now() >= deadline {
                             return Err(failed());
@@ -2614,6 +2651,17 @@ impl NativePair for Control {
                     error = Some(e);
                 }
             }
+        }
+        if error.is_none()
+            && network_empty
+            && self.journal.borrow().current.dns.is_none()
+            && self.journal.borrow().current.address.is_none()
+            && self
+                .guard
+                .as_ref()
+                .is_none_or(|guard| guard.borrow().verify_terminal(false).is_ok())
+        {
+            wake_interface_cleanup(&self.original)?;
         }
         loop {
             match self.original.verify_exit() {
