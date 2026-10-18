@@ -366,7 +366,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0'
     needs: [windows-build]
     runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
-    timeout-minutes: 7
+    timeout-minutes: 15
     concurrency:
       group: nelomai-040-worker-vm
       cancel-in-progress: false
