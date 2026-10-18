@@ -4,11 +4,16 @@ import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
 import android.os.Process
+import android.os.Bundle
+import android.os.ResultReceiver
+import android.os.Handler
+import android.os.Looper
 import ru.nelomai.runtime.v1.RuntimeNativeBridgeV1
 import ru.nelomai.runtime.v1.RuntimeNativeResultV1
 import ru.nelomai.runtime.v1.RuntimeServiceIntents
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import org.json.JSONObject
 
 /** Called on the native owner's worker, never on Android's main thread. */
 class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
@@ -57,6 +62,17 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         require(action in setOf("provision", "recover", "status"))
         return try {
             ru.nelomai.runtime.v1.RuntimeNativeBackgroundReplyV1.await { result ->
+                val selected = RuntimeSelectionStore.decode(context.currentSelection())
+                if (action == "provision" && selected.slot == "stable" && selected.runtimeVersion == "0.2.20") {
+                    try {
+                        prepareStableBackground(request, selected)
+                        check(RuntimeSelectionStore.decode(context.currentSelection()) == selected)
+                    } catch (_: Exception) {
+                        ru.nelomai.runtime.v1.SupportBackgroundDiagnostics.recordFailure(action, "background_owner_scope_mismatch")
+                        result.failure("background_owner_scope_mismatch")
+                        return@await
+                    }
+                }
                 bridge().background(context, action, request, object : RuntimeNativeResultV1 {
                     override fun success(value: String) = result.success(value)
                     override fun failure(code: String) {
@@ -69,6 +85,35 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         } catch (error: Exception) {
             android.util.Log.w("NelomaiOwner", "background.$action.exception class=${error.javaClass.simpleName}")
             throw error
+        }
+    }
+
+    private fun prepareStableBackground(request: String, selected: RuntimeSelectionV1) {
+        require(request.toByteArray().size <= 65536)
+        val expiresAt = JSONObject(JSONObject(request).getString("owner_operation"))
+            .getLong("expires_at_unix_ms")
+        fun prepare(): Boolean {
+            val remaining = expiresAt - System.currentTimeMillis()
+            require(remaining in 1..10_000)
+            val done = CompletableFuture<Boolean>()
+            val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
+                override fun onReceiveResult(code: Int, data: Bundle?) {
+                    if (code == 1 && data != null) done.complete(!data.getBoolean("restart_required"))
+                    else done.completeExceptionally(IllegalStateException("background_owner_scope_mismatch"))
+                }
+            }
+            context.startService(RuntimeServiceIntents.vpn(context)
+                .setAction(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND)
+                .putExtra(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request)
+                .putExtra("result_receiver", receiver))
+            return done.get(remaining, TimeUnit.MILLISECONDS)
+        }
+        check(prepareStableBackgroundAfterExit(::prepare) {
+            check(System.currentTimeMillis() < expiresAt &&
+                RuntimeSelectionStore.decode(context.currentSelection()) == selected)
+            stopVpn(true)
+        }) {
+            "background_owner_scope_mismatch"
         }
     }
 
@@ -140,6 +185,11 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         context.getSystemService(ActivityManager::class.java).runningAppProcesses.orEmpty()
             .associate { it.pid to RuntimeProcessInfo(it.uid, it.processName) }
 }
+
+/** A READY probe must leave a running engine alone; a stale process gets one
+ * independently verified exit and one retry, never an unbounded restart loop. */
+internal fun prepareStableBackgroundAfterExit(prepare: () -> Boolean, stop: () -> Boolean): Boolean =
+    prepare() || (stop() && prepare())
 
 data class RuntimeProcessInfo(val uid: Int, val name: String)
 
