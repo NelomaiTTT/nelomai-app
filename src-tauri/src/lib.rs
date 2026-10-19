@@ -696,7 +696,6 @@ struct DesktopPairObservation {
 async fn coordinate_desktop_redundancy<T, S, TF, SF>(
     schedule: &mut DesktopCoordinationSchedule,
     now: i64,
-    diagnostics: Option<&diagnostics::AppDiagnostics>,
     tick: T,
     status: S,
 ) -> DesktopPairObservation
@@ -728,75 +727,29 @@ where
         // every slow probe/lease preparation halfway through its work.
         if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await {
             schedule.pending = None;
-            match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    let retry = match &error {
-                        ApplicationError::Api(CoreApiError::Rejected {
-                            retry_after_seconds,
-                            ..
-                        })
-                        | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                            retry_after_seconds,
-                            ..
-                        })) => *retry_after_seconds,
+            let retry = match result {
+                Ok(Ok(_)) => None,
+                result => Some(
+                    match result {
+                        Ok(Err(
+                            ApplicationError::Api(CoreApiError::Rejected {
+                                retry_after_seconds,
+                                ..
+                            })
+                            | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                                retry_after_seconds,
+                                ..
+                            })),
+                        )) => retry_after_seconds,
                         _ => None,
                     }
                     .unwrap_or(15)
-                    .max(1);
-                    schedule.retry_at_unix =
-                        now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
-                    if let Some(diagnostics) = diagnostics {
-                        let code = match &error {
-                            ApplicationError::Api(CoreApiError::Rejected { code, .. })
-                            | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                                code,
-                                ..
-                            })) => code.as_str(),
-                            ApplicationError::Api(CoreApiError::Retryable)
-                            | ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)) => {
-                                "retryable"
-                            }
-                            ApplicationError::Storage
-                            | ApplicationError::Core(CoreError::Storage) => "storage",
-                            ApplicationError::Core(CoreError::Tunnel(_)) => "tunnel",
-                            _ => "application_error",
-                        };
-                        let code: String = code
-                            .chars()
-                            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                            .take(64)
-                            .collect();
-                        diagnostics.record_named(
-                            "desktop.redundancy_retry_scheduled",
-                            None,
-                            None,
-                            Some(&format!(
-                                "reason=tick_error code={code} now={now} retry_at={}",
-                                schedule.retry_at_unix
-                            )),
-                        );
-                    }
-                }
-                Err(error) => {
-                    schedule.retry_at_unix = now.saturating_add(15);
-                    if let Some(diagnostics) = diagnostics {
-                        let code = if error.is_cancelled() {
-                            "cancelled"
-                        } else {
-                            "panic"
-                        };
-                        diagnostics.record_named(
-                            "desktop.redundancy_retry_scheduled",
-                            None,
-                            None,
-                            Some(&format!(
-                                "reason=join_error code={code} now={now} retry_at={}",
-                                schedule.retry_at_unix
-                            )),
-                        );
-                    }
-                }
+                    .max(1),
+                ),
+            };
+            if let Some(retry) = retry {
+                schedule.retry_at_unix =
+                    now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
             }
         }
     }
@@ -813,17 +766,6 @@ where
         },
         Err(_) => {
             schedule.retry_at_unix = schedule.retry_at_unix.max(now.saturating_add(15));
-            if let Some(diagnostics) = diagnostics {
-                diagnostics.record_named(
-                    "desktop.redundancy_retry_scheduled",
-                    None,
-                    None,
-                    Some(&format!(
-                        "reason=status_timeout code=timeout now={now} retry_at={}",
-                        schedule.retry_at_unix
-                    )),
-                );
-            }
             DesktopPairObservation {
                 owns_tunnel: true,
                 snapshot: None,
@@ -886,7 +828,6 @@ fn start_connection_metrics_scheduler(
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
                 current_unix_time(),
-                Some(diagnostics.as_ref()),
                 || {
                     let application = application.clone();
                     async move {
@@ -1865,7 +1806,6 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             100,
-            None,
             move || async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 worker.store(true, Ordering::SeqCst);
@@ -1878,7 +1818,6 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             102,
-            None,
             || async { panic!("must continue the in-flight probe, not start another") },
             || async { Ok(None) },
         )
@@ -1904,7 +1843,6 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
-                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1931,7 +1869,6 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
-                None,
                 || async { panic!("no retry before panel delay") },
                 || async {
                     status_calls.set(status_calls.get() + 1);
@@ -1947,7 +1884,6 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 55,
-                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1968,13 +1904,9 @@ mod tests {
     async fn desktop_coordination_unknown_status_blocks_legacy_repair_while_tick_remains_pending() {
         let mut schedule = DesktopCoordinationSchedule::default();
         assert!(
-            coordinate_desktop_redundancy(
-                &mut schedule,
-                100,
-                None,
-                std::future::pending,
-                || async { Err(nelomai_client_application::ApplicationError::Storage) }
-            )
+            coordinate_desktop_redundancy(&mut schedule, 100, std::future::pending, || async {
+                Err(nelomai_client_application::ApplicationError::Storage)
+            })
             .await
             .owns_tunnel
         );
@@ -2011,7 +1943,6 @@ mod tests {
         let observation = coordinate_desktop_redundancy(
             &mut schedule,
             10,
-            None,
             || async { Ok(None) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -2024,7 +1955,6 @@ mod tests {
         let fresh = coordinate_desktop_redundancy(
             &mut schedule,
             11,
-            None,
             move || async move { Ok(Some(stale)) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -2034,7 +1964,6 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
-                None,
                 || async { Ok(None) },
                 || async { Ok(None) }
             )

@@ -343,27 +343,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             self.store.save(&current).map_err(|_| CoreError::Storage)?;
         } else if !snapshot.session.role_confirmed {
             let request = desktop_redundancy::role_request(&snapshot)?;
-            self.logger.record(CoreLogEvent {
-                kind: "desktop.role_report_started",
-                operation_id: None,
-                request_id: None,
-                code: Some("unconfirmed_role".into()),
-            });
-            let role_started = Instant::now();
-            let result = self.api.report_redundant_role(&access, &request).await;
-            self.logger.record_timed(
-                CoreLogEvent {
-                    kind: "desktop.role_report_finished",
-                    operation_id: None,
-                    request_id: result
-                        .as_ref()
-                        .ok()
-                        .map(|response| response.request_id.clone()),
-                    code: Some(if result.is_ok() { "ok" } else { "error" }.into()),
-                },
-                elapsed_millis(role_started),
-            );
-            let response = result?;
+            let response = self.api.report_redundant_role(&access, &request).await?;
             let _writer = self.connection_gate.lock().await;
             let mut current = self.load_runtime()?;
             if current.auth_scope != stored.auth_scope
