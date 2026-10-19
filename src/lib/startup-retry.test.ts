@@ -52,4 +52,56 @@ describe("startup admission retry", () => {
     vi.runAllTimers();
     expect(attempts).toBe(0);
   });
+  it("retries temporary bootstrap failures twice, then stops scheduling", () => {
+    const retry = new StartupRetry();
+    let attempts = 0;
+    const attempt = () => {
+      attempts++;
+      retry.schedule("temporarily_unavailable", attempt);
+    };
+    retry.schedule("temporarily_unavailable", attempt);
+    vi.advanceTimersByTime(1999);
+    expect(attempts).toBe(0);
+    vi.advanceTimersByTime(1);
+    expect(attempts).toBe(1);
+    vi.advanceTimersByTime(10000);
+    expect(attempts).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("manual cancellation renews the temporary retry budget", () => {
+    const retry = new StartupRetry();
+    let attempts = 0;
+    const attempt = () => {
+      attempts++;
+      retry.schedule("temporarily_unavailable", attempt);
+    };
+    retry.schedule("temporarily_unavailable", attempt);
+    vi.advanceTimersByTime(10000);
+    expect(attempts).toBe(2);
+    retry.cancel();
+    retry.schedule("temporarily_unavailable", attempt);
+    vi.advanceTimersByTime(10000);
+    expect(attempts).toBe(4);
+  });
+  it("rescheduling a pending timer does not consume a retry", () => {
+    const retry = new StartupRetry();
+    let attempts = 0;
+    const attempt = () => { attempts++; retry.schedule("temporarily_unavailable", attempt); };
+    retry.schedule("temporarily_unavailable", attempt);
+    retry.schedule("temporarily_unavailable", attempt);
+    vi.advanceTimersByTime(10000);
+    expect(attempts).toBe(2);
+  });
+  it("cancels a temporary retry on authoritative or ambiguous auth failures", () => {
+    for (const code of ["signed_out", "auth_recovery_required", "invalid_refresh_token",
+      "access_expired", "update_required", "runtime_channel_closed", "auth_outcome_unknown"]) {
+      const retry = new StartupRetry();
+      let attempts = 0;
+      retry.schedule("temporarily_unavailable", () => { attempts++; });
+      retry.schedule(code, () => { attempts++; });
+      vi.runAllTimers();
+      expect(attempts).toBe(0);
+    }
+  });
+
 });

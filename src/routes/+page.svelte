@@ -465,6 +465,7 @@
 
   async function selectRuntime(useStable: boolean) {
     if (runtimeSelectionBusy) return;
+    startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
     try {
@@ -483,6 +484,7 @@
 
   async function restartRuntime() {
     if (runtimeSelectionBusy) return;
+    startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
     try {
@@ -499,6 +501,7 @@
     // Owner EOF is not logout, remote cleanup success, or a network timeout.
     // Keep the account/cleanup barrier; only retire unverified presentation.
     runtimeChannelClosed = true;
+    startupRetry.cancel();
     splitTunnelOpen = false;
     phase = "error";
     connection = null;
@@ -588,11 +591,12 @@
     }
   }
 
-  async function restore() {
-    if (runtimeChannelClosed) return;
+  async function restore(automaticRetry = false) {
+    if (runtimeChannelClosed || runtimeSelectionBusy) return;
     const actionEpoch = connectionActionState.epoch;
     let expectedBootstrap = bootstrap;
-    startupRetry.cancel();
+    startupRetry.cancel(!automaticRetry);
+    let isStartupCurrent = startupRetry.checkpoint();
     startupPending = false;
     refreshPending = false;
     busy = true;
@@ -608,20 +612,26 @@
     startupTimer = timer;
     try {
       const response = await nativeClient.bootstrap();
-      if (runtimeChannelClosed || bootstrap !== expectedBootstrap ||
+      if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       const applying = applyBootstrap(response);
+      isStartupCurrent = startupRetry.checkpoint();
       // Svelte may wrap the response; retain the assigned state identity.
       expectedBootstrap = bootstrap;
       await applying;
+      if (isStartupCurrent()) startupRetry.cancel();
     } catch (reason) {
-      if (bootstrap !== expectedBootstrap ||
+      if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
-      startupRetry.schedule(code, retryPendingStartup);
+      startupRetry.schedule(code, () => {
+        if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
+          !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+        retryPendingStartup(code);
+      });
       if (code === "signed_out") {
         reserveState = null;
         phase = "signed_out";
@@ -639,16 +649,18 @@
         error = commandMessage(reason, "startup");
       }
     } finally {
+      const ownsStartup = startupTimer === timer;
       window.clearTimeout(timer);
-      if (startupTimer === timer) startupTimer = null;
-      if (isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
+      if (ownsStartup) startupTimer = null;
+      if (ownsStartup && isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
     }
   }
 
   async function applyBootstrap(response: Bootstrap) {
     if (runtimeChannelClosed) return;
     const actionEpoch = connectionActionState.epoch;
-    startupRetry.cancel();
+    startupRetry.cancel(false);
+    const isStartupCurrent = startupRetry.checkpoint();
     startupPending = false;
     localStopPendingCleanup = false;
     bootstrap = response;
@@ -678,7 +690,7 @@
     }
 
     const state = await nativeClient.state();
-    if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+    if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== observedBootstrap ||
       !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
     phase = state.phase;
     localStopPendingCleanup = state.localStopPendingCleanup === true;
@@ -700,6 +712,7 @@
   async function submitLogin(event: SubmitEvent) {
     event.preventDefault();
     if (runtimeChannelClosed || busy) return;
+    startupRetry.cancel();
     busy = true;
     error = null;
     diagnosticsStatus = null;
@@ -1077,12 +1090,16 @@
     }
   }
 
-  function retryPendingStartup() {
-    if (!startupPending || view !== "unavailable") return;
+  function retryPendingStartup(code: string | null = "runtime_startup_pending") {
+    if (runtimeChannelClosed || runtimeSelectionBusy || view !== "unavailable" ||
+      (!startupPending && code !== "temporarily_unavailable")) return;
     if (busy) {
-      startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+      // New foreground work takes priority over a temporary network retry.
+      if (code !== "temporarily_unavailable") {
+        startupRetry.schedule(code, () => retryPendingStartup(code));
+      }
     } else {
-      void restore();
+      void restore(true);
     }
   }
 
@@ -1995,7 +2012,7 @@
         <p class="eyebrow">Доступ</p>
         <h1>Подключение пока недоступно</h1>
         <p>Срок доступа истёк. Продлите его в панели, затем нажмите «Проверить снова».</p>
-        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+        <button class="secondary-button" type="button" onclick={() => restore()} disabled={busy}>
           Проверить снова
         </button>
       </div>
@@ -2051,7 +2068,7 @@
           <p class="error-message">{error}</p>
         {/if}
         {#if !runtimeChannelClosed}
-          <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+          <button class="secondary-button" type="button" onclick={() => restore()} disabled={busy}>
             {busy ? "Проверяем…" : "Повторить"}
           </button>
         {/if}
