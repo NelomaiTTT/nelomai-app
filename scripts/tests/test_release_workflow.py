@@ -209,6 +209,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-worker-native"]["steps"][0]["with"].update(ref="main"),
             lambda jobs: jobs["windows-worker-native"]["steps"][2].update(run="echo native skipped"),
             lambda jobs: jobs["windows-worker-native"]["steps"][2].update(**{"continue-on-error": True}),
+            lambda jobs: jobs["windows-worker-native"]["env"].update(
+                NELOMAI_WORKER_PEER_ADDRESS="${{ vars.NELOMAI_WORKER_PEER_ADDRESS }}"),
+            lambda jobs: jobs["windows-worker-native"]["steps"][2].update(
+                run=jobs["windows-worker-native"]["steps"][2]["run"].replace(
+                    "-InterfaceAlias 'vEthernet (Default Switch)'", "-InterfaceAlias 'Ethernet'")),
+            lambda jobs: jobs["windows-worker-native"]["steps"][2].update(
+                run=jobs["windows-worker-native"]["steps"][2]["run"].replace(
+                    "$peerAddresses.Count -ne 1", "$peerAddresses.Count -lt 1")),
+            lambda jobs: jobs["windows-worker-native"]["steps"][2].update(
+                run=jobs["windows-worker-native"]["steps"][2]["run"].replace(
+                    "-PeerAddress $peerAddresses[0].IPAddress", "-PeerAddress $env:NELOMAI_WORKER_PEER_ADDRESS")),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):

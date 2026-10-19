@@ -217,8 +217,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
          'NELOMAI_WORKER_VM_NAME': '${{ vars.NELOMAI_WORKER_VM_NAME }}',
          'NELOMAI_WORKER_SNAPSHOT_ID': '${{ vars.NELOMAI_WORKER_SNAPSHOT_ID }}',
          'NELOMAI_WORKER_SNAPSHOT_NAME': '${{ vars.NELOMAI_WORKER_SNAPSHOT_NAME }}',
-         'NELOMAI_WORKER_CREDENTIAL_FILE': '${{ vars.NELOMAI_WORKER_CREDENTIAL_FILE }}',
-         'NELOMAI_WORKER_PEER_ADDRESS': '${{ vars.NELOMAI_WORKER_PEER_ADDRESS }}'},
+         'NELOMAI_WORKER_CREDENTIAL_FILE': '${{ vars.NELOMAI_WORKER_CREDENTIAL_FILE }}'},
  'steps': [{'uses': 'actions/checkout@v4',
             'with': {'ref': '${{ github.sha }}', 'submodules': 'recursive', 'persist-credentials': False}},
            {'uses': 'actions/download-artifact@v4',
@@ -227,11 +226,14 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
            {'name': 'Actual worker promotion in clean VM with external host peers',
             'run': "$required = @('NELOMAI_WORKER_HOST', 'NELOMAI_WORKER_VM_ID', 'NELOMAI_WORKER_VM_NAME', "
                    "'NELOMAI_WORKER_SNAPSHOT_ID', 'NELOMAI_WORKER_SNAPSHOT_NAME', "
-                   "'NELOMAI_WORKER_CREDENTIAL_FILE', 'NELOMAI_WORKER_PEER_ADDRESS')\n"
+                   "'NELOMAI_WORKER_CREDENTIAL_FILE')\n"
                    'foreach ($name in $required) {\n'
                    '  if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) { '
                    'throw "Missing explicit worker host boundary: $name" }\n'
                    '}\n'
+                   "$peerAddresses = @(Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)' "
+                   "-AddressFamily IPv4 -ErrorAction Stop)\n"
+                   "if ($peerAddresses.Count -ne 1) { throw 'Expected exactly one IPv4 address on the Hyper-V Default Switch' }\n"
                    './scripts/windows/test-worker-factory-vm.ps1 `\n'
                    '  -ArtifactDirectory "$env:RUNNER_TEMP/factory-artifact" -SourceSha $env:SOURCE_SHA '
                    '-ManifestSha256 $env:MANIFEST_SHA256 `\n'
@@ -240,7 +242,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
                    '  -SnapshotId ([Guid]$env:NELOMAI_WORKER_SNAPSHOT_ID) -SnapshotName '
                    '$env:NELOMAI_WORKER_SNAPSHOT_NAME `\n'
                    '  -CredentialFile $env:NELOMAI_WORKER_CREDENTIAL_FILE -PeerAddress '
-                   '$env:NELOMAI_WORKER_PEER_ADDRESS -OutputDirectory $env:RUNNER_TEMP\n'},
+                   '$peerAddresses[0].IPAddress -OutputDirectory $env:RUNNER_TEMP\n'},
            {'name': 'Retain exact worker VM and peer evidence',
             'if': 'always()',
             'uses': 'actions/upload-artifact@v4',
