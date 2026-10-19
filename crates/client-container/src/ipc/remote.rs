@@ -504,14 +504,15 @@ impl RemoteOwner {
     /// Explicit startup/control admission. Read-only state/access never binds a
     /// missing runtime scope. The actual child record is the only full writer.
     pub async fn admit_empty_current(&self, broker: &AuthBroker) -> Result<(), PrivateError> {
-        self.admit_current_after(broker, || Ok(())).await
+        self.admit_current_after(broker, Instant::now() + REQUEST_BUDGET, || Ok(()))
+            .await
     }
     pub(crate) async fn admit_current_after(
         &self,
         broker: &AuthBroker,
+        deadline: Instant,
         finish: impl FnOnce() -> Result<(), PrivateError> + Send,
     ) -> Result<(), PrivateError> {
-        let deadline = Instant::now() + REQUEST_BUDGET;
         timeout_at(deadline, async {
             // RuntimeReady is also used by UI retries. Keep an already admitted
             // exact scope live while schedulers have access requests in flight.
@@ -573,6 +574,7 @@ impl RemoteOwner {
         &self,
         broker: &AuthBroker,
         coordinator: &crate::SwitchCoordinator,
+        deadline: Instant,
     ) -> Result<(), PrivateError> {
         let _execution = coordinator.lock_logout_cleanup().await;
         let Some(receipt) = broker
@@ -582,7 +584,6 @@ impl RemoteOwner {
         else {
             return Ok(());
         };
-        let deadline = Instant::now() + REQUEST_BUDGET;
         let lease = self.prepare(deadline).await?;
         let _held = AdmissionLease {
             owner: self,
@@ -633,7 +634,9 @@ impl RemoteOwner {
                     .commands
                     .as_ref()
                     .ok_or(PrivateError::RecoveryRequired)?;
-                let response = commands.dispatch(&self.binding.target, request).await?;
+                let response = commands
+                    .dispatch(&self.binding.target, request, deadline)
+                    .await?;
                 self.live(deadline)?;
                 AuthResponseV1::Owner { response }
             }
@@ -834,6 +837,7 @@ impl RemoteOwner {
                         .dispatch(
                             &self.binding.target,
                             crate::host::HostRequestV1::RuntimeReady,
+                            deadline,
                         )
                         .await?;
                 }

@@ -16,6 +16,7 @@ use nelomai_contracts::{RuntimeIdentity, VerifiedContainerManifest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
+    future::Future,
     io::{self, Read},
     path::PathBuf,
     sync::{
@@ -23,6 +24,7 @@ use std::{
         Arc,
     },
 };
+use tokio::time::{timeout_at, Instant};
 use uuid::Uuid;
 
 const SWITCH_SCHEMA_VERSION: u32 = 1;
@@ -418,13 +420,14 @@ impl SwitchCoordinator {
         target_slot: nelomai_contracts::RuntimeSlot,
     ) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
-        self.request_locked(target_slot, false).await
+        self.request_locked(target_slot, false, None).await
     }
 
     async fn request_locked(
         &self,
         target_slot: nelomai_contracts::RuntimeSlot,
         recovering_installed_update: bool,
+        deadline: Option<Instant>,
     ) -> Result<SwitchProgress, SwitchError> {
         if !recovering_installed_update && crate::update_barrier_pending(&self.owner)? {
             return Err(SwitchError::RecoveryRequired);
@@ -488,13 +491,13 @@ impl SwitchCoordinator {
         journal.runtime_snapshot = Some(runtime_snapshot);
         self.begin_requested(journal)?;
         self.stop_handoff(control, handoff).await?;
-        self.recover_locked(broker, control).await
+        self.recover_locked(broker, control, deadline).await
     }
 
     pub async fn recover(&self) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
         let (broker, control) = self.components()?;
-        self.recover_locked(broker, control).await
+        self.recover_locked(broker, control, None).await
     }
 
     pub(crate) fn installed_container_version(&self) -> &str {
@@ -629,14 +632,21 @@ impl SwitchCoordinator {
     pub(crate) async fn cancel_update_stop(
         &self,
         operation_id: &str,
+        deadline: Option<Instant>,
     ) -> Result<SwitchProgress, SwitchError> {
-        let _execution = self.execution.lock().await;
-        self.cancel_update_stop_locked(operation_id).await
+        let _execution = match deadline {
+            Some(deadline) => timeout_at(deadline, self.execution.lock())
+                .await
+                .map_err(|_| SwitchError::RecoveryRequired)?,
+            None => self.execution.lock().await,
+        };
+        self.cancel_update_stop_locked(operation_id, deadline).await
     }
 
     async fn cancel_update_stop_locked(
         &self,
         operation_id: &str,
+        deadline: Option<Instant>,
     ) -> Result<SwitchProgress, SwitchError> {
         let Some(journal) = self.snapshot()? else {
             return Ok(SwitchProgress::Ready);
@@ -656,7 +666,7 @@ impl SwitchCoordinator {
         }
         let (broker, control) = self.components()?;
         self.update(|journal| journal.cancel_requested = true)?;
-        self.recover_locked(broker, control).await
+        self.recover_locked(broker, control, deadline).await
     }
 
     pub(crate) fn restore_update_selection(
@@ -734,17 +744,30 @@ impl SwitchCoordinator {
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
-        self.before_tunnel_start_locked_for(None).await
+        self.before_tunnel_start_locked_for(None, None).await
     }
 
     pub async fn before_tunnel_start_for(&self, active: &RuntimeTarget) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
-        self.before_tunnel_start_locked_for(Some(active)).await
+        self.before_tunnel_start_locked_for(Some(active), None)
+            .await
+    }
+
+    pub(crate) async fn before_tunnel_start_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), SwitchError> {
+        let _execution = timeout_at(deadline, self.execution.lock())
+            .await
+            .map_err(|_| SwitchError::RecoveryRequired)?;
+        self.before_tunnel_start_locked_for(None, Some(deadline))
+            .await
     }
 
     async fn before_tunnel_start_locked_for(
         &self,
         active: Option<&RuntimeTarget>,
+        deadline: Option<Instant>,
     ) -> Result<(), SwitchError> {
         if active.is_some_and(|target| {
             self.status_for(target)
@@ -754,9 +777,14 @@ impl SwitchCoordinator {
             return Err(SwitchError::RecoveryRequired);
         }
         match crate::update_start_recovery(self)? {
-            crate::UpdateStartRecovery::None => self.before_tunnel_start_locked(false).await,
+            crate::UpdateStartRecovery::None => {
+                self.before_tunnel_start_locked(false, deadline).await
+            }
             crate::UpdateStartRecovery::Blocked => Err(SwitchError::RecoveryRequired),
-            recovery => self.recover_update_for_start_locked(recovery).await,
+            recovery => {
+                self.recover_update_for_start_locked(recovery, deadline)
+                    .await
+            }
         }
     }
 
@@ -775,12 +803,12 @@ impl SwitchCoordinator {
         if !status.restart_required() {
             return Err(SwitchError::RecoveryRequired);
         }
-        if status
-            .phase
-            .is_some_and(|phase| phase != SwitchPhase::Complete)
-        {
+        // The successor completes server reconciliation before start admission.
+        // A durable local Stop already permits process handoff; retrying HTTP
+        // here can exhaust the IPC deadline before native relaunch is reached.
+        if !status.local_stop_confirmed() {
             let (broker, control) = self.components()?;
-            let recovered = self.recover_locked(broker, control).await;
+            let recovered = self.recover_locked(broker, control, None).await;
             if recovered.is_err() {
                 let status = self.status_for(active)?;
                 if !status.restart_required() || !status.local_stop_confirmed() {
@@ -800,18 +828,28 @@ impl SwitchCoordinator {
         Ok(status)
     }
 
-    pub(crate) async fn recover_installed_update(&self) -> Result<(), SwitchError> {
-        let _execution = self.execution.lock().await;
+    pub(crate) async fn recover_installed_update(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(), SwitchError> {
+        let _execution = match deadline {
+            Some(deadline) => timeout_at(deadline, self.execution.lock())
+                .await
+                .map_err(|_| SwitchError::RecoveryRequired)?,
+            None => self.execution.lock().await,
+        };
         let recovery = crate::update_start_recovery(self)?;
         if !matches!(recovery, crate::UpdateStartRecovery::Installed { .. }) {
             return Err(SwitchError::RecoveryRequired);
         }
-        self.recover_update_for_start_locked(recovery).await
+        self.recover_update_for_start_locked(recovery, deadline)
+            .await
     }
 
     async fn recover_update_for_start_locked(
         &self,
         recovery: crate::UpdateStartRecovery,
+        deadline: Option<Instant>,
     ) -> Result<(), SwitchError> {
         let operation_id = match recovery {
             crate::UpdateStartRecovery::Cancel {
@@ -819,7 +857,8 @@ impl SwitchCoordinator {
                 previous_slot,
             } => {
                 if matches!(
-                    self.cancel_update_stop_locked(&operation_id).await?,
+                    self.cancel_update_stop_locked(&operation_id, deadline)
+                        .await?,
                     SwitchProgress::Pending { .. }
                 ) {
                     return Err(SwitchError::RecoveryRequired);
@@ -828,7 +867,7 @@ impl SwitchCoordinator {
                 operation_id
             }
             crate::UpdateStartRecovery::Installed { operation_id } => {
-                self.before_tunnel_start_locked(true).await?;
+                self.before_tunnel_start_locked(true, deadline).await?;
                 operation_id
             }
             crate::UpdateStartRecovery::None | crate::UpdateStartRecovery::Blocked => {
@@ -883,10 +922,11 @@ impl SwitchCoordinator {
     async fn before_tunnel_start_locked(
         &self,
         recovering_installed_update: bool,
+        deadline: Option<Instant>,
     ) -> Result<(), SwitchError> {
         let (broker, control) = self.components()?;
         if matches!(
-            self.recover_locked(broker, control).await?,
+            self.recover_locked(broker, control, deadline).await?,
             SwitchProgress::Pending { .. }
         ) {
             return Err(SwitchError::RecoveryRequired);
@@ -900,7 +940,7 @@ impl SwitchCoordinator {
             .required_initial_target
             .ok_or(SwitchError::RecoveryRequired)?;
         match self
-            .request_locked(target, recovering_installed_update)
+            .request_locked(target, recovering_installed_update, deadline)
             .await?
         {
             SwitchProgress::Ready => {
@@ -967,7 +1007,7 @@ impl SwitchCoordinator {
         }
         let (broker, control) = self.components()?;
         self.update(|journal| journal.cancel_requested = true)?;
-        self.recover_locked(broker, control).await
+        self.recover_locked(broker, control, None).await
     }
 
     pub async fn cancel_pending_for(
@@ -998,11 +1038,11 @@ impl SwitchCoordinator {
             // A completed Apply is immutable. Returning to the still-active
             // runtime is a fresh reverse transition with its own authority,
             // never a replay of the completed operation as Cancel.
-            return self.request_locked(active.runtime_slot, false).await;
+            return self.request_locked(active.runtime_slot, false, None).await;
         }
         self.update(|journal| journal.cancel_requested = true)?;
         let (broker, control) = self.components()?;
-        self.recover_locked(broker, control).await
+        self.recover_locked(broker, control, None).await
     }
 
     fn components(
@@ -1018,6 +1058,7 @@ impl SwitchCoordinator {
         &self,
         broker: &AuthBroker,
         control: &Arc<dyn RuntimeSwitchControl>,
+        deadline: Option<Instant>,
     ) -> Result<SwitchProgress, SwitchError> {
         loop {
             let journal = match self.snapshot()? {
@@ -1107,16 +1148,19 @@ impl SwitchCoordinator {
                             Some(&journal.request_fingerprint),
                         )?
                     };
-                    let receipt = match broker.reconcile_transition(frozen.clone()).await {
-                        Ok(receipt) => receipt,
-                        Err(BrokerError::Timeout)
-                        | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
-                            return Ok(SwitchProgress::Pending {
-                                retry_after_seconds: delay,
-                            });
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
+                    let receipt =
+                        match broker_before(deadline, broker.reconcile_transition(frozen.clone()))
+                            .await
+                        {
+                            Ok(receipt) => receipt,
+                            Err(BrokerError::Timeout)
+                            | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                                return Ok(SwitchProgress::Pending {
+                                    retry_after_seconds: delay,
+                                });
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
                     if receipt.state == RuntimeSwitchState::Retry {
                         let delay = receipt
                             .retry_after_seconds
@@ -1167,13 +1211,15 @@ impl SwitchCoordinator {
                                     operation_id
                                 }
                             };
-                            let superseded = match broker
-                                .supersede_transition(
+                            let superseded = match broker_before(
+                                deadline,
+                                broker.supersede_transition(
                                     &supersede_operation_id,
                                     frozen,
                                     desired.clone(),
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
                                 Ok(response) => response,
                                 Err(BrokerError::Timeout)
@@ -1302,8 +1348,9 @@ impl SwitchCoordinator {
                                 .ok_or(SwitchError::RecoveryRequired)?,
                         ),
                     };
-                    let resumed = broker
-                        .resume_transition_for_installed_target(
+                    let resumed = broker_before(
+                        deadline,
+                        broker.resume_transition_for_installed_target(
                             ResumeArguments {
                                 operation_id: journal
                                     .resume_operation_id
@@ -1324,8 +1371,9 @@ impl SwitchCoordinator {
                                     .or(journal.expected_session_generation),
                             },
                             self.installed_target.as_ref(),
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     if decision == SwitchDecision::Apply {
                         let selection = current_selection(&self.owner, &self.manifest)
                             .map_err(SwitchJournalError::Io)?;
@@ -1505,6 +1553,25 @@ impl SwitchJournalV1 {
                 .map(|operation| operation.operation_id.clone())
                 .collect(),
         }
+    }
+}
+
+// Only protected broker/HTTP waits use the earlier cutoff. The caller reserves
+// time for native cleanup/admission acknowledgements and the IPC reply.
+async fn broker_before<T>(
+    deadline: Option<Instant>,
+    work: impl Future<Output = Result<T, BrokerError>>,
+) -> Result<T, BrokerError> {
+    match deadline {
+        Some(deadline) => {
+            if Instant::now() >= deadline {
+                return Err(BrokerError::Timeout);
+            }
+            timeout_at(deadline, work)
+                .await
+                .map_err(|_| BrokerError::Timeout)?
+        }
+        None => work.await,
     }
 }
 

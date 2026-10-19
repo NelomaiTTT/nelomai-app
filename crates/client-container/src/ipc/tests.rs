@@ -619,6 +619,7 @@ impl crate::host::PrivateOwnerCommands for HeldRuntimeRestart {
         &self,
         _: &RuntimeTarget,
         request: crate::host::HostRequestV1,
+        _: Instant,
     ) -> Result<crate::host::HostResponseV1, PrivateError> {
         assert!(matches!(
             request,
@@ -2252,10 +2253,14 @@ async fn readmission_survives_same_scope_refresh_after_scope_check() {
         .unwrap();
     let old = fixture.client.access(None).await.unwrap();
     let finishes = AtomicUsize::new(0);
-    let ready = fixture.parent.admit_current_after(&fixture.broker, || {
-        finishes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    });
+    let ready = fixture.parent.admit_current_after(
+        &fixture.broker,
+        Instant::now() + REQUEST_BUDGET,
+        || {
+            finishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
     tokio::pin!(ready);
     // Capture token A and reach the real CheckScope wait. Do not poll Ready
     // again until a concurrent access request has completed its HTTP refresh.
@@ -2302,10 +2307,14 @@ async fn readmission_rejects_changed_authority_after_scope_check() {
             .await
             .unwrap();
         let finishes = AtomicUsize::new(0);
-        let ready = fixture.parent.admit_current_after(&fixture.broker, || {
-            finishes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let ready = fixture.parent.admit_current_after(
+            &fixture.broker,
+            Instant::now() + REQUEST_BUDGET,
+            || {
+                finishes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
         tokio::pin!(ready);
         poll_pending(ready.as_mut()).await;
         // Round trip ensures the child's prior scope ACK was emitted. Change

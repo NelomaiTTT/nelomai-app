@@ -23,7 +23,7 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const REQUEST_BUDGET: Duration = Duration::from_secs(10);
 // Keep the V1 wire allowance unchanged. Reserve time from that SAME deadline
 // for the post-HTTP scope control and reply, including on refresh timeout.
-const AUTH_REPLY_MARGIN: Duration = Duration::from_secs(2);
+pub(crate) const AUTH_REPLY_MARGIN: Duration = Duration::from_secs(2);
 pub const MAX_PENDING: usize = 8;
 pub const OUTBOX_CAPACITY: usize = 32;
 

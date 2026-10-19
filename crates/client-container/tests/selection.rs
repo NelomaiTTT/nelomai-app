@@ -527,31 +527,78 @@ fn first_start_persists_latest_only_after_real_storage_startup_succeeds() {
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_admits_real_private_child_and_preserves_generation_without_access() {
-    common_host_restart_case(false, false, false, false).await;
+    common_host_restart_case(false, false, false, false, None).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_cancels_prepared_apply_before_restart_without_resurrecting_stable() {
-    common_host_restart_case(true, false, false, false).await;
+    common_host_restart_case(true, false, false, false, None).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_retries_selected_binding_when_exact_old_source_clear_failed() {
-    common_host_restart_case(false, true, false, false).await;
+    common_host_restart_case(false, true, false, false, None).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_rejects_changed_source_before_binding_selected_empty_runtime() {
-    common_host_restart_case(false, false, true, false).await;
+    common_host_restart_case(false, false, true, false, None).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_recovers_pending_refresh_before_real_runtime_ready_admission() {
-    common_host_restart_case(false, false, false, true).await;
+    common_host_restart_case(false, false, false, true, None).await;
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum PendingRuntimeReadyHttp {
+    Reconcile,
+    Resume,
+    ReconcileThenNative,
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_pending_reconcile_after_restart_keeps_ipc_and_start_barrier() {
+    common_host_restart_case(
+        false,
+        false,
+        false,
+        false,
+        Some(PendingRuntimeReadyHttp::Reconcile),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_pending_resume_after_restart_keeps_ipc_and_replays_exact_ticket() {
+    common_host_restart_case(
+        false,
+        false,
+        false,
+        false,
+        Some(PendingRuntimeReadyHttp::Resume),
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_pending_reconcile_leaves_time_for_native_completion() {
+    common_host_restart_case(
+        false,
+        false,
+        false,
+        false,
+        Some(PendingRuntimeReadyHttp::ReconcileThenNative),
+    )
+    .await;
 }
 
 #[cfg(unix)]
@@ -560,6 +607,7 @@ async fn common_host_restart_case(
     fail_source_clear: bool,
     change_source: bool,
     pending_refresh: bool,
+    pending_http: Option<PendingRuntimeReadyHttp>,
 ) {
     use axum::{routing::post, Json, Router};
     use nelomai_client_container::{host::*, ipc::*};
@@ -575,6 +623,19 @@ async fn common_host_restart_case(
     let counted = resume_calls.clone();
     let refresh_calls = Arc::new(AtomicUsize::new(0));
     let refresh_counted = refresh_calls.clone();
+    let http_phase = Arc::new(AtomicUsize::new(0));
+    let reconcile_phase = http_phase.clone();
+    let resume_phase = http_phase.clone();
+    let release_http = Arc::new(tokio::sync::Notify::new());
+    let release_reconcile = release_http.clone();
+    let release_resume = release_http.clone();
+    let completed_http = Arc::new(tokio::sync::Notify::new());
+    let completed_reconcile = completed_http.clone();
+    let completed_resume = completed_http.clone();
+    let reconcile_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_reconcile = reconcile_requests.clone();
+    let resume_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_resume = resume_requests.clone();
     let router = Router::new()
         .route("/api/client/v1/auth/refresh-recoverable", post(move |Json(body): Json<Value>| {
             let count = refresh_counted.clone();
@@ -594,18 +655,47 @@ async fn common_host_restart_case(
         }))
         .route(
             "/api/client/v1/connections/runtime-switch/reconcile",
-            post(|Json(body): Json<Value>| async move {
-                Json(json!({"state":"clean", "operation_id":body["operation_id"],
-                "retired_lease_ids":[], "retired_session_ids":[], "retired_operation_ids":[],
-                "retry_after_seconds":null}))
+            post(move |Json(body): Json<Value>| {
+                let phase = reconcile_phase.clone();
+                let release = release_reconcile.clone();
+                let completed = completed_reconcile.clone();
+                let captured = captured_reconcile.clone();
+                async move {
+                    captured.lock().unwrap().push(body.clone());
+                    match phase.load(Ordering::SeqCst) {
+                        1 => return Json(json!({"state":"retry", "operation_id":body["operation_id"],
+                            "retired_lease_ids":[], "retired_session_ids":[], "retired_operation_ids":[],
+                            "retry_after_seconds":1})),
+                        2 => { tokio::spawn(async move {
+                            release.notified().await;
+                            completed.notify_one();
+                        }).await.unwrap(); },
+                        4 => tokio::time::sleep(std::time::Duration::from_millis(7_300)).await,
+                        _ => {},
+                    }
+                    Json(json!({"state":"clean", "operation_id":body["operation_id"],
+                    "retired_lease_ids":[], "retired_session_ids":[], "retired_operation_ids":[],
+                    "retry_after_seconds":null}))
+                }
             }),
         )
         .route(
             "/api/client/v1/auth/runtime/resume",
             post(move |Json(body): Json<Value>| {
                 let counted = counted.clone();
+                let phase = resume_phase.clone();
+                let release = release_resume.clone();
+                let completed = completed_resume.clone();
+                let captured = captured_resume.clone();
                 async move {
                     counted.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().unwrap().push(body.clone());
+                    if phase.load(Ordering::SeqCst) == 3 {
+                        tokio::spawn(async move {
+                            release.notified().await;
+                            completed.notify_one();
+                        }).await.unwrap();
+                    }
                     let mut identity = body["target_identity"].clone();
                     identity["session_generation"] =
                         json!(body["expected_session_generation"].as_u64().unwrap() + 1);
@@ -791,6 +881,12 @@ async fn common_host_restart_case(
         }
     }
     assert!(record.cleanup_snapshot().unwrap().auth_scope.is_some());
+    if matches!(
+        pending_http,
+        Some(PendingRuntimeReadyHttp::Reconcile | PendingRuntimeReadyHttp::ReconcileThenNative)
+    ) {
+        http_phase.store(1, Ordering::SeqCst);
+    }
     let installed = host.native_target().clone();
     let _reply = client
         .owner_request(HostRequestV1::RuntimeSelect {
@@ -837,6 +933,26 @@ async fn common_host_restart_case(
             .status_for(host.native_target())
             .unwrap()
             .restart_required());
+    }
+    if let Some(pending) = pending_http {
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        http_phase.store(
+            match pending {
+                PendingRuntimeReadyHttp::Reconcile => 2,
+                PendingRuntimeReadyHttp::Resume => 3,
+                PendingRuntimeReadyHttp::ReconcileThenNative => 4,
+            },
+            Ordering::SeqCst,
+        );
+        let prepared = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            host.coordinator().prepare_runtime_restart(&installed),
+        )
+        .await
+        .expect("runtime restart must not wait for pending server work")
+        .unwrap();
+        assert!(prepared.local_stop_confirmed());
+        assert_eq!(prepared.selected_slot, RuntimeSlot::Stable);
     }
     let expected_slot = if cancel_before_restart {
         RuntimeSlot::Latest
@@ -919,9 +1035,10 @@ async fn common_host_restart_case(
         });
         record.operational().save(&state).unwrap();
     }
+    let ready_gates = Arc::new(RuntimeWriterGates::default());
     let child = Arc::new(ChildAdmission::new(
         view.incarnation.clone(),
-        Arc::new(RuntimeWriterGates::default()),
+        ready_gates.clone(),
         Arc::new(RuntimeRecordInventory::new(selected, owners)),
     ));
     let (parent, child_socket) = private_socketpair().unwrap();
@@ -967,6 +1084,57 @@ async fn common_host_restart_case(
         assert_eq!(resume_calls.load(Ordering::SeqCst), 1);
         assert!(client.check_start_barrier().is_err());
     }
+    if matches!(
+        pending_http,
+        Some(PendingRuntimeReadyHttp::ReconcileThenNative)
+    ) {
+        let held = ready_gates.lifecycle().lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(8_300)).await;
+            drop(held);
+        });
+        let ready = client.owner_request(HostRequestV1::RuntimeReady).await;
+        assert!(
+            matches!(ready, Ok(HostResponseV1::Done)),
+            "completed HTTP must retain the reply margin for native proof: {ready:?}"
+        );
+        release.await.unwrap();
+        http_phase.store(0, Ordering::SeqCst);
+    } else if let Some(pending) = pending_http {
+        let ready = client.owner_request(HostRequestV1::RuntimeReady).await;
+        assert!(
+            matches!(ready, Err(PrivateError::RecoveryRequired)),
+            "pending server work must return before the IPC deadline: {ready:?}"
+        );
+        assert!(
+            client
+                .owner_request(HostRequestV1::RuntimeStatus)
+                .await
+                .is_ok(),
+            "pending admission must leave the same channel usable"
+        );
+        assert!(client.check_start_barrier().is_err());
+        assert_eq!(auth.load().unwrap().unwrap().session_generation, Some(7));
+        match pending {
+            PendingRuntimeReadyHttp::Reconcile => {
+                assert_eq!(resume_calls.load(Ordering::SeqCst), 0)
+            }
+            PendingRuntimeReadyHttp::Resume => assert_eq!(resume_calls.load(Ordering::SeqCst), 1),
+            PendingRuntimeReadyHttp::ReconcileThenNative => unreachable!(),
+        }
+        // A response arriving after the bounded wait cannot grant admission.
+        http_phase.store(0, Ordering::SeqCst);
+        release_http.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed_http.notified())
+            .await
+            .unwrap();
+        assert!(client
+            .owner_request(HostRequestV1::RuntimeStatus)
+            .await
+            .is_ok());
+        assert!(client.check_start_barrier().is_err());
+        assert_eq!(auth.load().unwrap().unwrap().session_generation, Some(7));
+    }
     for _ in 0..2 {
         let ready = client.owner_request(HostRequestV1::RuntimeReady).await;
         assert!(
@@ -981,8 +1149,26 @@ async fn common_host_restart_case(
         assert_eq!(access.identity().session_generation, Some(8));
         assert_eq!(
             resume_calls.load(Ordering::SeqCst),
-            1,
-            "new incarnation must apply exactly once"
+            if matches!(pending_http, Some(PendingRuntimeReadyHttp::Resume)) {
+                2
+            } else {
+                1
+            },
+            "new incarnation must replay an unknown resume without a new operation"
+        );
+    }
+    if let Some(pending) = pending_http {
+        let captured = match pending {
+            PendingRuntimeReadyHttp::Reconcile | PendingRuntimeReadyHttp::ReconcileThenNative => {
+                reconcile_requests.lock().unwrap()
+            }
+            PendingRuntimeReadyHttp::Resume => resume_requests.lock().unwrap(),
+        };
+        assert!(captured.len() >= 2);
+        assert_eq!(
+            captured.first(),
+            captured.last(),
+            "retry must replay the exact durable operation"
         );
     }
     server.abort();

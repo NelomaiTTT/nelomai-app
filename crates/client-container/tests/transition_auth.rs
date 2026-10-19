@@ -429,6 +429,7 @@ struct Panel {
     bootstrap_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     reconcile_calls: AtomicUsize,
+    hold_reconcile: AtomicUsize,
     headers: Mutex<Vec<HeaderMap>>,
     reject_bootstrap_access: AtomicUsize,
     fail_bootstrap: AtomicUsize,
@@ -502,6 +503,9 @@ async fn reconcile(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+    if state.hold_reconcile.load(Ordering::SeqCst) == 1 {
+        std::future::pending::<()>().await;
+    }
     state.headers.lock().unwrap().push(headers);
     state.reconcile_bodies.lock().unwrap().push(body.clone());
     if state
@@ -3291,5 +3295,65 @@ async fn unknown_legacy_refresh_is_durable_and_never_automatically_resent() {
         Err(BrokerError::RecoveryRequired)
     ));
     assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn restart_after_durable_local_stop_does_not_wait_for_server_cleanup() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest.clone())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    assert!(matches!(
+        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    let journal = coordinator.snapshot().unwrap().unwrap();
+    assert_eq!(journal.phase(), SwitchPhase::ServerReconciling);
+    assert!(coordinator
+        .status_for(&active)
+        .unwrap()
+        .local_stop_confirmed());
+
+    // Let retry backoff expire: a slow cleanup endpoint must not delay the
+    // local process handoff once its Stop receipt is already durable.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    state.hold_reconcile.store(1, Ordering::SeqCst);
+    let restart = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.prepare_runtime_restart(&active),
+    )
+    .await
+    .expect("durable local Stop must allow restart without another HTTP wait")
+    .unwrap();
+    assert_eq!(restart.active_slot, RuntimeSlot::Latest);
+    assert_eq!(restart.selected_slot, RuntimeSlot::Stable);
+    assert_eq!(restart.pending_slot, None);
+    assert_eq!(restart.phase, Some(SwitchPhase::ServerReconciling));
+    assert_eq!(coordinator.snapshot().unwrap().unwrap(), journal);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.stops.load(Ordering::SeqCst), 1);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&coordinator).is_err());
+
+    // The successor still has to obtain CLEAN and resume authorization;
+    // relaunch alone never grants permission to start a tunnel.
+    drop(coordinator);
+    let successor = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker, control);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_err());
+    state.hold_reconcile.store(0, Ordering::SeqCst);
+    assert_eq!(successor.recover().await.unwrap(), SwitchProgress::Ready);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_ok());
     server.abort();
 }

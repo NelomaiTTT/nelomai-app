@@ -140,9 +140,12 @@ impl HostUpdater {
             refresh_error: Mutex::new(None),
         })
     }
-    pub async fn recover(&self) -> Result<(), PrivateError> {
+    pub async fn recover(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), PrivateError> {
         self.barrier
-            .recover(&self.version)
+            .recover_before(&self.version, deadline)
             .await
             .map_err(|_| PrivateError::RecoveryRequired)
     }

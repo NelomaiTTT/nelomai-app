@@ -4,6 +4,7 @@ pub use crate::host_updater::HostUpdateStatusV1;
 use crate::host_updater::HostUpdater;
 use crate::ipc::{
     LaunchBinding, OwnerService, PrivateBackgroundDispatcher, PrivateError, RemoteOwner,
+    AUTH_REPLY_MARGIN,
 };
 use crate::{
     AuthBroker, BrokerError, LocalAuthStop, LocalStopReceiptV1, RuntimeCleanupHandoff,
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
 use std::{path::PathBuf, sync::Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::{timeout_at, Instant};
 
 /// Startup transfers the prepared runtime records to their runtime owner; the
 /// common broker retains only auth and its owner lock. This value is not Clone.
@@ -231,6 +233,7 @@ pub trait PrivateOwnerCommands: Send + Sync {
         &self,
         target: &RuntimeTarget,
         request: HostRequestV1,
+        deadline: Instant,
     ) -> Result<HostResponseV1, PrivateError>;
 }
 struct HostCommands {
@@ -248,6 +251,7 @@ impl PrivateOwnerCommands for HostCommands {
         &self,
         target: &RuntimeTarget,
         request: HostRequestV1,
+        deadline: Instant,
     ) -> Result<HostResponseV1, PrivateError> {
         if target != &self.target {
             return Err(PrivateError::Cancelled);
@@ -274,7 +278,12 @@ impl PrivateOwnerCommands for HostCommands {
                 return Ok(HostResponseV1::Done);
             }
             HostRequestV1::RuntimeReady => {
-                let _ready = self.ready_gate.lock().await;
+                // Reuse the caller's budget. Pending HTTP must leave time to
+                // reply without closing IPC; admission still needs its own proof.
+                let recovery_deadline = deadline - AUTH_REPLY_MARGIN;
+                let _ready = timeout_at(recovery_deadline, self.ready_gate.lock())
+                    .await
+                    .map_err(|_| PrivateError::RecoveryRequired)?;
                 let bridge = self.bridge.upgrade().ok_or(PrivateError::Closed)?;
                 let broker = bridge
                     .broker
@@ -282,32 +291,39 @@ impl PrivateOwnerCommands for HostCommands {
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(PrivateError::Closed)?;
                 let peer = bridge.peer().map_err(|_| PrivateError::Closed)?;
-                peer.recover_logout(&broker, &self.coordinator).await?;
+                peer.recover_logout(&broker, &self.coordinator, deadline)
+                    .await?;
+                if Instant::now() >= recovery_deadline {
+                    return Err(PrivateError::RecoveryRequired);
+                }
+                timeout_at(
+                    recovery_deadline,
+                    self.coordinator.recover_refresh_before_start(),
+                )
+                .await
+                .map_err(|_| PrivateError::RefreshPending)?
+                .map_err(|error| match error {
+                    crate::SwitchError::Broker(crate::BrokerError::RefreshPending) => {
+                        PrivateError::RefreshPending
+                    }
+                    crate::SwitchError::Broker(crate::BrokerError::RefreshRejected) => {
+                        PrivateError::RefreshRejected
+                    }
+                    _ => PrivateError::RecoveryRequired,
+                })?;
+                self.updater.recover(Some(recovery_deadline)).await?;
                 self.coordinator
-                    .recover_refresh_before_start()
-                    .await
-                    .map_err(|error| match error {
-                        crate::SwitchError::Broker(crate::BrokerError::RefreshPending) => {
-                            PrivateError::RefreshPending
-                        }
-                        crate::SwitchError::Broker(crate::BrokerError::RefreshRejected) => {
-                            PrivateError::RefreshRejected
-                        }
-                        _ => PrivateError::RecoveryRequired,
-                    })?;
-                self.updater.recover().await?;
-                self.coordinator
-                    .before_tunnel_start()
+                    .before_tunnel_start_until(recovery_deadline)
                     .await
                     .map_err(|_| PrivateError::RecoveryRequired)?;
-                if broker
-                    .observe()
+                let active = timeout_at(deadline, broker.observe())
                     .await
                     .map_err(|_| PrivateError::RecoveryRequired)?
+                    .map_err(|_| PrivateError::RecoveryRequired)?
                     .state
-                    == crate::BrokerAuthState::Active
-                {
-                    peer.admit_current_after(&broker, || {
+                    == crate::BrokerAuthState::Active;
+                if active {
+                    peer.admit_current_after(&broker, deadline, || {
                         if let Some(migration) = &self.migration {
                             migration
                                 .acknowledge()
@@ -392,7 +408,7 @@ impl PrivateOwnerCommands for HostCommands {
                 return Ok(HostResponseV1::RuntimeStatus { status });
             }
             HostRequestV1::BeforeTunnelStart => {
-                self.updater.recover().await?;
+                self.updater.recover(None).await?;
                 self.coordinator
                     .before_tunnel_start_for(target)
                     .await
