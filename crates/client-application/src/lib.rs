@@ -377,11 +377,11 @@ impl ProbeCache {
         }
     }
 
-    fn set(&mut self, layer: Layer, egress_mode: EgressMode, value: CachedProbes) {
+    fn set(&mut self, layer: Layer, egress_mode: EgressMode, value: Option<CachedProbes>) {
         match (layer, egress_mode) {
-            (Layer::Tic, EgressMode::Ipv4) => self.tic_ipv4 = Some(value),
-            (Layer::Tic, EgressMode::PreferIpv6) => self.tic_ipv6 = Some(value),
-            (Layer::Stray, _) => self.stray = Some(value),
+            (Layer::Tic, EgressMode::Ipv4) => self.tic_ipv4 = value,
+            (Layer::Tic, EgressMode::PreferIpv6) => self.tic_ipv6 = value,
+            (Layer::Stray, _) => self.stray = value,
         }
     }
 }
@@ -882,18 +882,37 @@ where
         now_unix: i64,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
     {
-        let probes = match self.core.desktop_redundancy_probe_context().await? {
+        let used = match self.core.desktop_redundancy_probe_context().await? {
             Some((layer, egress_mode)) => {
-                self.refresh_probes(layer, egress_mode, now_unix)
-                    .await?
-                    .probes
+                Some(self.refresh_probes(layer, egress_mode, now_unix).await?)
             }
-            None => Vec::new(),
+            None => None,
         };
-        self.core
-            .desktop_redundancy_tick(probes)
-            .await
-            .map_err(Into::into)
+        let result = self
+            .core
+            .desktop_redundancy_tick(
+                used.as_ref()
+                    .map(|used| used.probes.clone())
+                    .unwrap_or_default(),
+            )
+            .await;
+        if matches!(&result, Err(CoreError::Api(CoreApiError::Rejected { code, .. })) if code == "standby_unavailable")
+        {
+            if let Some(used) =
+                used.filter(|used| used.probes.iter().any(|p| p.latency_ms.is_none()))
+            {
+                // A delayed rejection must not discard a concurrent refresh.
+                if let Ok(mut cache) = self.probe_cache.lock() {
+                    if cache
+                        .get(used.layer, used.egress_mode)
+                        .is_some_and(|cached| cached.results == used)
+                    {
+                        cache.set(used.layer, used.egress_mode, None);
+                    }
+                }
+            }
+        }
+        result.map_err(Into::into)
     }
 
     pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
@@ -1273,11 +1292,11 @@ where
             .set(
                 layer,
                 egress_mode,
-                CachedProbes {
+                Some(CachedProbes {
                     measured_at_unix: now_unix,
                     valid_until_unix,
                     results: results.clone(),
-                },
+                }),
             );
         Ok(results)
     }

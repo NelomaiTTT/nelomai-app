@@ -688,6 +688,7 @@ fn preserves_structured_recovery_error(code: &str) -> bool {
             | "connection_stall_verification_unavailable"
             | "operation_in_progress"
             | "device_operation_busy"
+            | "standby_unavailable"
     )
 }
 
@@ -6275,19 +6276,46 @@ mod tests {
 
     #[test]
     fn structured_recovery_service_error_keeps_its_stable_code() {
-        let error = ClientApiError::Api {
-            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            request_id: "req".to_string(),
-            code: "connection_stall_verification_unavailable".to_string(),
-            message: "Retry later".to_string(),
-            retry_after_seconds: None,
-        };
+        for (status, code, expected) in [
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "connection_stall_verification_unavailable",
+                CoreApiError::Rejected {
+                    code: "connection_stall_verification_unavailable".to_string(),
+                    message: "Retry later".to_string(),
+                    retry_after_seconds: Some(15),
+                },
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "standby_unavailable",
+                CoreApiError::Rejected {
+                    code: "standby_unavailable".to_string(),
+                    message: "Retry later".to_string(),
+                    retry_after_seconds: Some(15),
+                },
+            ),
+            (
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                CoreApiError::Retryable,
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                "standby_unavailable",
+                CoreApiError::Unauthorized,
+            ),
+        ] {
+            let error = ClientApiError::Api {
+                status,
+                request_id: "req".to_string(),
+                code: code.to_string(),
+                message: "Retry later".to_string(),
+                retry_after_seconds: Some(15),
+            };
 
-        assert!(matches!(
-            CoreApiError::from(error),
-            CoreApiError::Rejected { ref code, .. }
-                if code == "connection_stall_verification_unavailable"
-        ));
+            assert_eq!(CoreApiError::from(error), expected, "{status}: {code}");
+        }
     }
 
     #[test]

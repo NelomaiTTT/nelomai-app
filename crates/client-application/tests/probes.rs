@@ -26,10 +26,18 @@ struct ProbeApi {
     candidate_calls: AtomicUsize,
     probe_calls: AtomicUsize,
     all_probes_fail: AtomicBool,
+    down_recovered: AtomicBool,
     start_request: Mutex<Option<ConnectionStartRequest>>,
     candidate_modes: Mutex<Vec<EgressMode>>,
     candidate_failure: AtomicBool,
     acquire_requests: Mutex<Vec<nelomai_contracts::RedundantStandbyAcquireRequest>>,
+    acquire_error: Mutex<CoreApiError>,
+    pause_acquire: AtomicBool,
+    acquire_entered: tokio::sync::Notify,
+    acquire_release: tokio::sync::Notify,
+    pause_candidates: AtomicBool,
+    candidates_entered: tokio::sync::Notify,
+    candidates_release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -40,7 +48,11 @@ impl CoreApi for ProbeApi {
         request: &nelomai_contracts::RedundantStandbyAcquireRequest,
     ) -> Result<nelomai_contracts::RedundantStandbyAcquireResponse, CoreApiError> {
         self.acquire_requests.lock().unwrap().push(request.clone());
-        Err(CoreApiError::Retryable)
+        if self.pause_acquire.load(Ordering::SeqCst) {
+            self.acquire_entered.notify_one();
+            self.acquire_release.notified().await;
+        }
+        Err(self.acquire_error.lock().unwrap().clone())
     }
     async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         unreachable!("bootstrap is not used by this test")
@@ -133,6 +145,10 @@ impl ApplicationApi for ProbeApi {
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
         self.candidate_calls.fetch_add(1, Ordering::SeqCst);
         self.candidate_modes.lock().unwrap().push(egress_mode);
+        if self.pause_candidates.load(Ordering::SeqCst) {
+            self.candidates_entered.notify_one();
+            self.candidates_release.notified().await;
+        }
         if self.candidate_failure.load(Ordering::SeqCst) {
             return Err(CoreApiError::Retryable);
         }
@@ -148,7 +164,9 @@ impl ApplicationApi for ProbeApi {
 
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.probe_calls.fetch_add(1, Ordering::SeqCst);
-        (!self.all_probes_fail.load(Ordering::SeqCst) && probe_url.contains("fast")).then_some(24.5)
+        (!self.all_probes_fail.load(Ordering::SeqCst)
+            && (probe_url.contains("fast") || self.down_recovered.load(Ordering::SeqCst)))
+        .then_some(24.5)
     }
 }
 
@@ -521,6 +539,268 @@ mod desktop_reserve_probes {
         );
     }
     #[tokio::test]
+    async fn rejected_reserve_remeasures_recovered_candidate_on_next_allowed_tick() {
+        let (app, api, store, _) = pair_application();
+        *api.acquire_error.lock().unwrap() =
+            CoreApiError::from(nelomai_client_api::ClientApiError::Api {
+                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                request_id: "standby-unavailable-regression".into(),
+                code: "standby_unavailable".into(),
+                message: "Suitable reserve is unavailable".into(),
+                retry_after_seconds: Some(15),
+            });
+        let mut expected_request = None;
+        for (attempt, now) in [1_800_000_000, 1_800_000_015].into_iter().enumerate() {
+            if attempt == 1 {
+                // B recovers during backoff, before the next permitted tick.
+                api.down_recovered.store(true, Ordering::SeqCst);
+            }
+            let result = app.desktop_redundancy_tick(now).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                        ref code,
+                        ref message,
+                        retry_after_seconds: Some(15),
+                    }))) if code == "standby_unavailable" && message == "Suitable reserve is unavailable"
+                ),
+                "expected structured standby rejection, got {result:?}"
+            );
+            let requests = api.acquire_requests.lock().unwrap();
+            assert_eq!(requests.len(), attempt + 1);
+            let request = &requests[attempt];
+            let expected = expected_request.get_or_insert_with(|| request.clone());
+            // Only measurements may change: retain operation identity and scope.
+            expected.probes = request.probes.clone();
+            assert_eq!(request, expected);
+            let state = store.state.lock().unwrap();
+            let pair = state.desktop_redundancy.as_ref().unwrap();
+            assert_eq!(pair.pending_acquire.as_ref(), Some(request));
+            assert!(pair.candidate.is_none());
+            assert_eq!(request.probes.len(), 2);
+            let a = request
+                .probes
+                .iter()
+                .find(|p| p.candidate_id == "candidate-fast")
+                .unwrap();
+            let b = request
+                .probes
+                .iter()
+                .find(|p| p.candidate_id == "candidate-down")
+                .unwrap();
+            assert_eq!(a.latency_ms, Some(24.5));
+            assert_eq!(a.failure_code, None);
+            if attempt == 0 {
+                assert_eq!(b.latency_ms, None);
+                assert_eq!(
+                    b.failure_code,
+                    Some(nelomai_contracts::ProbeFailureCode::Unknown)
+                );
+                assert_eq!(b.measured_at, "2027-01-15T08:00:00Z");
+            } else {
+                assert_eq!(b.latency_ms, Some(24.5), "recovered B must be remeasured");
+                assert_eq!(b.failure_code, None);
+                assert_eq!(b.measured_at, "2027-01-15T08:00:15Z");
+            }
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), attempt + 1);
+            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2 * (attempt + 1));
+            assert_eq!(
+                *api.candidate_modes.lock().unwrap(),
+                vec![pair.connection.egress_mode; attempt + 1]
+            );
+        }
+        assert!(api.start_request.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn reserve_errors_invalidate_only_unavailable_with_failed_probes() {
+        for error in [
+            CoreApiError::Retryable,
+            CoreApiError::Unauthorized,
+            CoreApiError::Rejected {
+                code: "other_rejection".into(),
+                message: "Other rejection".into(),
+                retry_after_seconds: Some(37),
+            },
+            CoreApiError::from(nelomai_client_api::ClientApiError::Api {
+                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                request_id: "standby-unavailable-error-table".into(),
+                code: "standby_unavailable".into(),
+                message: "Suitable reserve is unavailable".into(),
+                retry_after_seconds: Some(15),
+            }),
+        ] {
+            for all_positive in [false, true] {
+                let (app, api, _, _) = pair_application();
+                *api.acquire_error.lock().unwrap() = error.clone();
+                api.down_recovered.store(all_positive, Ordering::SeqCst);
+                let measured = app
+                    .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+                    .await
+                    .unwrap();
+                let result = app.desktop_redundancy_tick(1_800_000_001).await;
+                assert!(
+                    match (&error, &result) {
+                        (
+                            CoreApiError::Unauthorized,
+                            Err(ApplicationError::Core(CoreError::SignedOut)),
+                        ) => true,
+                        (expected, Err(ApplicationError::Core(CoreError::Api(actual)))) =>
+                            expected == actual,
+                        _ => false,
+                    },
+                    "error={error:?}, all_positive={all_positive}: {result:?}"
+                );
+                assert_eq!(api.acquire_requests.lock().unwrap().len(), 1);
+                assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 1);
+                let cached = app
+                    .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_002)
+                    .await
+                    .unwrap();
+                let invalidated = !all_positive
+                    && matches!(&error, CoreApiError::Rejected { code, .. } if code == "standby_unavailable");
+                assert_eq!(cached == measured, !invalidated);
+                assert_eq!(
+                    api.candidate_calls.load(Ordering::SeqCst),
+                    1 + usize::from(invalidated)
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn rejected_reserve_invalidates_only_its_logical_cache_slot() {
+        for (layer, mode) in [
+            (Layer::Tic, EgressMode::Ipv4),
+            (Layer::Tic, EgressMode::PreferIpv6),
+            (Layer::Stray, EgressMode::Ipv4),
+            (Layer::Stray, EgressMode::PreferIpv6),
+        ] {
+            let (app, api, store, _) = pair_application();
+            {
+                let mut state = store.state.lock().unwrap();
+                let connection = &mut state.desktop_redundancy.as_mut().unwrap().connection;
+                connection.layer = layer;
+                connection.egress_mode = mode;
+            }
+            *api.acquire_error.lock().unwrap() = CoreApiError::Rejected {
+                code: "standby_unavailable".into(),
+                message: "Suitable reserve is unavailable".into(),
+                retry_after_seconds: Some(15),
+            };
+            let mut measured = Vec::new();
+            for (scope_layer, scope_mode) in [
+                (Layer::Tic, EgressMode::Ipv4),
+                (Layer::Tic, EgressMode::PreferIpv6),
+                (Layer::Stray, EgressMode::Ipv4),
+            ] {
+                measured.push(
+                    app.refresh_probes(scope_layer, scope_mode, 1_800_000_000)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert!(matches!(
+                app.desktop_redundancy_tick(1_800_000_001).await,
+                Err(ApplicationError::Core(CoreError::Api(CoreApiError::Rejected { ref code, .. })))
+                    if code == "standby_unavailable"
+            ));
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 3);
+            for original in measured {
+                let same_slot = original.layer == layer
+                    && (layer == Layer::Stray || original.egress_mode == mode);
+                // Stray's two modes must both address the shared slot.
+                let scope_mode = if original.layer == Layer::Stray {
+                    EgressMode::PreferIpv6
+                } else {
+                    original.egress_mode
+                };
+                let cached = app
+                    .refresh_probes(original.layer, scope_mode, 1_800_000_002)
+                    .await
+                    .unwrap();
+                assert_eq!(cached == original, !same_slot);
+            }
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 4);
+            assert_eq!(api.acquire_requests.lock().unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn delayed_reserve_rejection_preserves_fresher_same_slot_probes() {
+        for (layer, mode) in [
+            (Layer::Tic, EgressMode::Ipv4),
+            (Layer::Tic, EgressMode::PreferIpv6),
+            (Layer::Stray, EgressMode::Ipv4),
+            (Layer::Stray, EgressMode::PreferIpv6),
+        ] {
+            let (app, api, store, _) = pair_application();
+            {
+                let mut state = store.state.lock().unwrap();
+                let connection = &mut state.desktop_redundancy.as_mut().unwrap().connection;
+                connection.layer = layer;
+                connection.egress_mode = mode;
+            }
+            *api.acquire_error.lock().unwrap() = CoreApiError::Rejected {
+                code: "standby_unavailable".into(),
+                message: "Delayed reserve rejection".into(),
+                retry_after_seconds: Some(15),
+            };
+            api.pause_acquire.store(true, Ordering::SeqCst);
+            let used = app
+                .refresh_probes(layer, mode, 1_800_000_000)
+                .await
+                .unwrap();
+            let (result, fresher) =
+                tokio::join!(app.desktop_redundancy_tick(1_800_000_001), async {
+                    api.acquire_entered.notified().await;
+                    assert_eq!(api.acquire_requests.lock().unwrap()[0].probes, used.probes);
+                    // Keep IDs and outcomes identical: the full measurements must match.
+                    let refresh_mode = if layer == Layer::Stray && mode == EgressMode::Ipv4 {
+                        EgressMode::PreferIpv6
+                    } else if layer == Layer::Stray {
+                        EgressMode::Ipv4
+                    } else {
+                        mode
+                    };
+                    let fresher = app
+                        .refresh_probes(layer, refresh_mode, 1_800_000_300)
+                        .await
+                        .unwrap();
+                    assert_ne!(fresher.probes, used.probes);
+                    api.acquire_release.notify_one();
+                    fresher
+                });
+            assert!(matches!(
+                result,
+                Err(ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                    ref code, ref message, retry_after_seconds: Some(15),
+                }))) if code == "standby_unavailable" && message == "Delayed reserve rejection"
+            ));
+            assert_eq!(
+                app.refresh_probes(layer, mode, 1_800_000_301)
+                    .await
+                    .unwrap(),
+                fresher
+            );
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 4);
+            assert_eq!(api.acquire_requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .desktop_redundancy
+                    .as_ref()
+                    .unwrap()
+                    .pending_acquire
+                    .as_ref()
+                    .unwrap()
+                    .probes,
+                used.probes
+            );
+        }
+    }
+    #[tokio::test]
     async fn pending_acquire_replay_refreshes_measurements_but_keeps_operation_identity() {
         let (app, api, store, _) = pair_application();
         let measured = app
@@ -561,72 +841,132 @@ mod desktop_reserve_probes {
     }
     #[tokio::test]
     async fn healthy_absent_stopping_and_candidate_pairs_never_refresh() {
-        for case in ["healthy", "absent", "stopping", "candidate"] {
+        for (case, delayed_candidate) in [
+            ("healthy", false),
+            ("absent", false),
+            ("stopping", false),
+            ("candidate", false),
+            ("candidate", true),
+        ] {
             let (app, api, store, tunnel) = pair_application();
-            app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+            let measured = app
+                .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
                 .await
                 .unwrap();
-            {
-                let mut state = store.state.lock().unwrap();
-                let mut native = tunnel.0.lock().unwrap();
-                let pair = state.desktop_redundancy.as_mut().unwrap();
-                match case {
-                    "healthy" => {
-                        let response: ConnectionStartResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-start-redundant-response.json")).unwrap();
-                        pair.session.standby = response.redundancy.unwrap().standby;
-                        let lease = pair
-                            .session
-                            .standby
-                            .as_ref()
-                            .unwrap()
-                            .connection
-                            .lease_id
-                            .clone();
-                        native.leases[1] = Some(lease.clone());
-                        native.current_leases[1] = Some(lease);
-                        native.session.installed[1] = true;
-                        native.session.committed[1] = true;
-                        native.standby_ready = true;
-                    }
-                    "absent" => state.desktop_redundancy = None,
-                    "stopping" => {
-                        pair.stop = Some(nelomai_client_storage::StoredDesktopRedundantStop {
-                            background_cleanup: false,
-                            operation_id: "30000000-0000-4000-8000-000000000002".into(),
-                            active_lease_id: pair.connection.lease_id.clone(),
-                            role_generation: 0,
-                            membership_generation: 0,
-                            committed_leases: native.current_leases.clone(),
-                            retain_active_peer: false,
-                            role_confirmed: true,
-                        });
-                        native.session.phase =
-                            nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping;
-                        native.primary_ready = false;
-                    }
-                    "candidate" => {
-                        let mut candidate: nelomai_contracts::RedundantStandbyAcquireResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-redundant-standby-acquire-response.json")).unwrap();
-                        candidate.candidate_slot = nelomai_contracts::RedundancyMemberSlot::B;
-                        candidate.session.active_lease_id = Some(pair.connection.lease_id.clone());
-                        candidate.session.slot_b_lease_id = None;
-                        candidate.session.role_generation = 0;
-                        candidate.session.membership_generation = 0;
-                        native.leases[1] = Some(candidate.candidate_lease_id.clone());
-                        native.session.installed[1] = true;
-                        pair.candidate = Some(candidate);
-                    }
-                    _ => unreachable!(),
+            api.pause_candidates
+                .store(delayed_candidate, Ordering::SeqCst);
+            let update = async {
+                if delayed_candidate {
+                    api.candidates_entered.notified().await;
                 }
-            }
-            // An unconditional refresh would now fail instead of coordinating.
-            api.candidate_failure.store(true, Ordering::SeqCst);
-            assert!(
-                app.desktop_redundancy_tick(1_800_000_600).await.is_ok(),
-                "{case}"
-            );
-            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 1, "{case}");
-            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2, "{case}");
+                let candidate = {
+                    let mut state = store.state.lock().unwrap();
+                    let mut native = tunnel.0.lock().unwrap();
+                    let pair = state.desktop_redundancy.as_mut().unwrap();
+                    match case {
+                        "healthy" => {
+                            let response: ConnectionStartResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-start-redundant-response.json")).unwrap();
+                            pair.session.standby = response.redundancy.unwrap().standby;
+                            let lease = pair
+                                .session
+                                .standby
+                                .as_ref()
+                                .unwrap()
+                                .connection
+                                .lease_id
+                                .clone();
+                            native.leases[1] = Some(lease.clone());
+                            native.current_leases[1] = Some(lease);
+                            native.session.installed[1] = true;
+                            native.session.committed[1] = true;
+                            native.standby_ready = true;
+                        }
+                        "absent" => state.desktop_redundancy = None,
+                        "stopping" => {
+                            pair.stop = Some(nelomai_client_storage::StoredDesktopRedundantStop {
+                                background_cleanup: false,
+                                operation_id: "30000000-0000-4000-8000-000000000002".into(),
+                                active_lease_id: pair.connection.lease_id.clone(),
+                                role_generation: 0,
+                                membership_generation: 0,
+                                committed_leases: native.current_leases.clone(),
+                                retain_active_peer: false,
+                                role_confirmed: true,
+                            });
+                            native.session.phase =
+                                nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping;
+                            native.primary_ready = false;
+                        }
+                        "candidate" => {
+                            let mut candidate: nelomai_contracts::RedundantStandbyAcquireResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-redundant-standby-acquire-response.json")).unwrap();
+                            candidate.candidate_slot = nelomai_contracts::RedundancyMemberSlot::B;
+                            candidate.session.active_lease_id =
+                                Some(pair.connection.lease_id.clone());
+                            candidate.session.slot_b_lease_id = None;
+                            candidate.session.role_generation = 0;
+                            candidate.session.membership_generation = 0;
+                            native.leases[1] = Some(candidate.candidate_lease_id.clone());
+                            native.session.installed[1] = true;
+                            pair.candidate = Some(candidate);
+                        }
+                        _ => unreachable!(),
+                    }
+                    state
+                        .desktop_redundancy
+                        .as_ref()
+                        .and_then(|pair| pair.candidate.clone())
+                };
+                if delayed_candidate {
+                    api.candidates_release.notify_one();
+                }
+                candidate
+            };
+            let expected_candidate = if delayed_candidate {
+                // Candidate installation wins between probe-context selection and Core tick.
+                let (result, candidate) =
+                    tokio::join!(app.desktop_redundancy_tick(1_800_000_600), update);
+                assert!(result.is_ok(), "{result:?}");
+                api.pause_candidates.store(false, Ordering::SeqCst);
+                app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_601)
+                    .await
+                    .unwrap();
+                candidate
+            } else {
+                let candidate = update.await;
+                // Check successful coordination preserves the fresh cache, then an expired one.
+                api.candidate_failure.store(true, Ordering::SeqCst);
+                assert!(
+                    app.desktop_redundancy_tick(1_800_000_001).await.is_ok(),
+                    "{case}"
+                );
+                assert_eq!(
+                    app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_002)
+                        .await
+                        .unwrap(),
+                    measured
+                );
+                assert!(
+                    app.desktop_redundancy_tick(1_800_000_600).await.is_ok(),
+                    "{case}"
+                );
+                candidate
+            };
+            let calls = 1 + usize::from(delayed_candidate);
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), calls, "{case}");
+            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2 * calls, "{case}");
             assert!(api.acquire_requests.lock().unwrap().is_empty(), "{case}");
+            let state = store.state.lock().unwrap();
+            assert_eq!(
+                state
+                    .desktop_redundancy
+                    .as_ref()
+                    .and_then(|pair| pair.candidate.clone()),
+                expected_candidate
+            );
+            assert!(state
+                .desktop_redundancy
+                .as_ref()
+                .is_none_or(|pair| pair.pending_acquire.is_none()));
         }
     }
 }
@@ -905,10 +1245,18 @@ fn application_with_preflight(
         candidate_calls: AtomicUsize::new(0),
         probe_calls: AtomicUsize::new(0),
         all_probes_fail: AtomicBool::new(false),
+        down_recovered: AtomicBool::new(false),
         start_request: Mutex::new(None),
         candidate_modes: Mutex::new(Vec::new()),
         candidate_failure: AtomicBool::new(false),
         acquire_requests: Mutex::new(Vec::new()),
+        acquire_error: Mutex::new(CoreApiError::Retryable),
+        pause_acquire: AtomicBool::new(false),
+        acquire_entered: tokio::sync::Notify::new(),
+        acquire_release: tokio::sync::Notify::new(),
+        pause_candidates: AtomicBool::new(false),
+        candidates_entered: tokio::sync::Notify::new(),
+        candidates_release: tokio::sync::Notify::new(),
     });
     let store = Arc::new(MemoryStore::default());
     let mut auth = StoredAuth::new_install();
