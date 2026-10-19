@@ -27,6 +27,7 @@ struct ProbeApi {
     probe_calls: AtomicUsize,
     all_probes_fail: AtomicBool,
     down_recovered: AtomicBool,
+    down_listed: AtomicBool,
     start_request: Mutex<Option<ConnectionStartRequest>>,
     candidate_modes: Mutex<Vec<EgressMode>>,
     candidate_failure: AtomicBool,
@@ -158,7 +159,13 @@ impl ApplicationApi for ProbeApi {
             candidates: vec![
                 candidate("candidate-fast", layer, "https://fast.example/probe"),
                 candidate("candidate-down", layer, "https://down.example/probe"),
-            ],
+            ]
+            .into_iter()
+            .filter(|candidate| {
+                candidate.candidate_id != "candidate-down"
+                    || self.down_listed.load(Ordering::SeqCst)
+            })
+            .collect(),
         })
     }
 
@@ -540,80 +547,102 @@ mod desktop_reserve_probes {
     }
     #[tokio::test]
     async fn rejected_reserve_remeasures_recovered_candidate_on_next_allowed_tick() {
-        let (app, api, store, _) = pair_application();
-        *api.acquire_error.lock().unwrap() =
-            CoreApiError::from(nelomai_client_api::ClientApiError::Api {
-                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                request_id: "standby-unavailable-regression".into(),
-                code: "standby_unavailable".into(),
-                message: "Suitable reserve is unavailable".into(),
-                retry_after_seconds: Some(15),
-            });
-        let mut expected_request = None;
-        for (attempt, now) in [1_800_000_000, 1_800_000_015].into_iter().enumerate() {
-            if attempt == 1 {
-                // B recovers during backoff, before the next permitted tick.
-                api.down_recovered.store(true, Ordering::SeqCst);
-            }
-            let result = app.desktop_redundancy_tick(now).await;
-            assert!(
-                matches!(
-                    result,
-                    Err(ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                        ref code,
-                        ref message,
-                        retry_after_seconds: Some(15),
-                    }))) if code == "standby_unavailable" && message == "Suitable reserve is unavailable"
-                ),
-                "expected structured standby rejection, got {result:?}"
-            );
-            let requests = api.acquire_requests.lock().unwrap();
-            assert_eq!(requests.len(), attempt + 1);
-            let request = &requests[attempt];
-            let expected = expected_request.get_or_insert_with(|| request.clone());
-            // Only measurements may change: retain operation identity and scope.
-            expected.probes = request.probes.clone();
-            assert_eq!(request, expected);
-            let state = store.state.lock().unwrap();
-            let pair = state.desktop_redundancy.as_ref().unwrap();
-            assert_eq!(pair.pending_acquire.as_ref(), Some(request));
-            assert!(pair.candidate.is_none());
-            assert_eq!(request.probes.len(), 2);
-            let a = request
-                .probes
-                .iter()
-                .find(|p| p.candidate_id == "candidate-fast")
-                .unwrap();
-            let b = request
-                .probes
-                .iter()
-                .find(|p| p.candidate_id == "candidate-down")
-                .unwrap();
-            assert_eq!(a.latency_ms, Some(24.5));
-            assert_eq!(a.failure_code, None);
-            if attempt == 0 {
-                assert_eq!(b.latency_ms, None);
-                assert_eq!(
-                    b.failure_code,
-                    Some(nelomai_contracts::ProbeFailureCode::Unknown)
+        for initially_listed in [true, false] {
+            let (app, api, store, _) = pair_application();
+            api.down_listed.store(initially_listed, Ordering::SeqCst);
+            *api.acquire_error.lock().unwrap() =
+                CoreApiError::from(nelomai_client_api::ClientApiError::Api {
+                    status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    request_id: "standby-unavailable-regression".into(),
+                    code: "standby_unavailable".into(),
+                    message: "Suitable reserve is unavailable".into(),
+                    retry_after_seconds: Some(15),
+                });
+            let mut expected_request = None;
+            for (attempt, now) in [1_800_000_000, 1_800_000_015].into_iter().enumerate() {
+                if attempt == 1 {
+                    // B becomes listed and reachable during backoff.
+                    api.down_listed.store(true, Ordering::SeqCst);
+                    api.down_recovered.store(true, Ordering::SeqCst);
+                }
+                let result = app.desktop_redundancy_tick(now).await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                            ref code,
+                            ref message,
+                            retry_after_seconds: Some(15),
+                        }))) if code == "standby_unavailable" && message == "Suitable reserve is unavailable"
+                    ),
+                    "expected structured standby rejection, got {result:?}"
                 );
-                assert_eq!(b.measured_at, "2027-01-15T08:00:00Z");
-            } else {
-                assert_eq!(b.latency_ms, Some(24.5), "recovered B must be remeasured");
-                assert_eq!(b.failure_code, None);
-                assert_eq!(b.measured_at, "2027-01-15T08:00:15Z");
+                let requests = api.acquire_requests.lock().unwrap();
+                assert_eq!(requests.len(), attempt + 1);
+                let request = &requests[attempt];
+                let expected = expected_request.get_or_insert_with(|| request.clone());
+                // Only measurements may change: retain operation identity and scope.
+                expected.probes = request.probes.clone();
+                assert_eq!(request, expected);
+                let state = store.state.lock().unwrap();
+                let pair = state.desktop_redundancy.as_ref().unwrap();
+                assert_eq!(pair.pending_acquire.as_ref(), Some(request));
+                assert!(pair.candidate.is_none());
+                assert_eq!(
+                    request.probes.len(),
+                    if attempt == 0 && !initially_listed { 1 } else { 2 },
+                    "initially_listed={initially_listed}, attempt={attempt}: fresh discovery must include B"
+                );
+                let a = request
+                    .probes
+                    .iter()
+                    .find(|p| p.candidate_id == "candidate-fast")
+                    .unwrap();
+                assert_eq!(a.latency_ms, Some(24.5));
+                assert_eq!(a.failure_code, None);
+                assert_eq!(
+                    a.measured_at,
+                    if attempt == 0 {
+                        "2027-01-15T08:00:00Z"
+                    } else {
+                        "2027-01-15T08:00:15Z"
+                    }
+                );
+                let b = request
+                    .probes
+                    .iter()
+                    .find(|p| p.candidate_id == "candidate-down");
+                if attempt == 0 && !initially_listed {
+                    assert!(b.is_none());
+                } else if attempt == 0 {
+                    let b = b.unwrap();
+                    assert_eq!(b.latency_ms, None);
+                    assert_eq!(
+                        b.failure_code,
+                        Some(nelomai_contracts::ProbeFailureCode::Unknown)
+                    );
+                    assert_eq!(b.measured_at, "2027-01-15T08:00:00Z");
+                } else {
+                    let b = b.unwrap();
+                    assert_eq!(b.latency_ms, Some(24.5), "recovered B must be remeasured");
+                    assert_eq!(b.failure_code, None);
+                    assert_eq!(b.measured_at, "2027-01-15T08:00:15Z");
+                }
+                assert_eq!(api.candidate_calls.load(Ordering::SeqCst), attempt + 1);
+                assert_eq!(
+                    api.probe_calls.load(Ordering::SeqCst),
+                    1 + usize::from(initially_listed) + 2 * attempt
+                );
+                assert_eq!(
+                    *api.candidate_modes.lock().unwrap(),
+                    vec![pair.connection.egress_mode; attempt + 1]
+                );
             }
-            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), attempt + 1);
-            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2 * (attempt + 1));
-            assert_eq!(
-                *api.candidate_modes.lock().unwrap(),
-                vec![pair.connection.egress_mode; attempt + 1]
-            );
+            assert!(api.start_request.lock().unwrap().is_none());
         }
-        assert!(api.start_request.lock().unwrap().is_none());
     }
     #[tokio::test]
-    async fn reserve_errors_invalidate_only_unavailable_with_failed_probes() {
+    async fn reserve_errors_invalidate_only_exact_unavailable() {
         for error in [
             CoreApiError::Retryable,
             CoreApiError::Unauthorized,
@@ -657,8 +686,7 @@ mod desktop_reserve_probes {
                     .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_002)
                     .await
                     .unwrap();
-                let invalidated = !all_positive
-                    && matches!(&error, CoreApiError::Rejected { code, .. } if code == "standby_unavailable");
+                let invalidated = matches!(&error, CoreApiError::Rejected { code, .. } if code == "standby_unavailable");
                 assert_eq!(cached == measured, !invalidated);
                 assert_eq!(
                     api.candidate_calls.load(Ordering::SeqCst),
@@ -1246,6 +1274,7 @@ fn application_with_preflight(
         probe_calls: AtomicUsize::new(0),
         all_probes_fail: AtomicBool::new(false),
         down_recovered: AtomicBool::new(false),
+        down_listed: AtomicBool::new(true),
         start_request: Mutex::new(None),
         candidate_modes: Mutex::new(Vec::new()),
         candidate_failure: AtomicBool::new(false),

@@ -898,9 +898,7 @@ where
             .await;
         if matches!(&result, Err(CoreError::Api(CoreApiError::Rejected { code, .. })) if code == "standby_unavailable")
         {
-            if let Some(used) =
-                used.filter(|used| used.probes.iter().any(|p| p.latency_ms.is_none()))
-            {
+            if let Some(used) = used {
                 // A delayed rejection must not discard a concurrent refresh.
                 if let Ok(mut cache) = self.probe_cache.lock() {
                     if cache
