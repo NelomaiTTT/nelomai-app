@@ -706,7 +706,7 @@ impl DesktopConnectionIntent {
                 }
             }
             let preflight = self
-                .run_initial_desktop_preflight(&options, &initial_preflight)
+                .run_initial_desktop_preflight(&options, &initial_preflight, reserve_requested)
                 .await;
             // An explicit eligible reserve request cannot fall through to an
             // ordinary Start merely because an old capability chose Legacy.
@@ -942,7 +942,10 @@ impl DesktopConnectionIntent {
         &self,
         options: &ConnectOptions,
         preflight: &InitialDesktopPreflight,
+        reserve_requested: bool,
     ) -> Result<(), ApplicationError> {
+        #[cfg(not(windows))]
+        let _ = reserve_requested;
         if let Some(binding_request) = preflight.binding_request.as_ref() {
             self.application.bind_peer(binding_request.clone()).await?;
         }
@@ -960,7 +963,9 @@ impl DesktopConnectionIntent {
             }
         }
         #[cfg(windows)]
-        if options.layer == nelomai_contracts::Layer::Stray {
+        if options.layer == nelomai_contracts::Layer::Stray
+            && !desktop_reserve_eligible(options, reserve_requested)
+        {
             crate::commands::ensure_defender_ready_for_awg(&self.diagnostics).await?;
         }
         crate::commands::refresh_installed_applications_before_start(

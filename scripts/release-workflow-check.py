@@ -29,6 +29,26 @@ def assert_amneziawg_go_workflow_revision(workflow: str, label: str) -> None:
         raise RuntimeError(f"{label} uses another AmneziaWG Go revision")
 
 
+def assert_windows_defender_preflight_routing(intent: str, commands: str) -> None:
+    """Structural wiring check; native execution remains a separate VM gate."""
+    intent = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", intent))
+    commands = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", commands))
+    attempt = intent.split("asyncfnrun_attempt(", 1)[1].split("asyncfnresolve_initial_desktop_start(", 1)[0]
+    preflight = intent.split("asyncfnrun_initial_desktop_preflight(", 1)[1].split("asyncfnabandon_initial_intent_for_legacy(", 1)[0]
+    saved = commands.split("pubasyncfnapp_start_saved_stray(", 1)[1].split("#[tauri::command]", 1)[0]
+    if not (
+        "state.initial_preflight.clone(),state.reserve_requested," in attempt
+        and ".run_initial_desktop_preflight(&options,&initial_preflight,reserve_requested)" in attempt
+        and "preflight:&InitialDesktopPreflight,reserve_requested:bool," in preflight
+        and preflight.count("ensure_defender_ready_for_awg(") == 1
+        and "#[cfg(windows)]ifoptions.layer==nelomai_contracts::Layer::Stray"
+            "&&!desktop_reserve_eligible(options,reserve_requested){"
+            "crate::commands::ensure_defender_ready_for_awg(&self.diagnostics).await?;}" in preflight
+        and "#[cfg(windows)]ensure_defender_ready_for_awg(&diagnostics).await?;" in saved
+    ):
+        raise RuntimeError("Windows Defender preflight must follow captured reserve routing and retain saved-Stray guard")
+
+
 def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     """Require the actual producer/consumer graph and its critical programs."""
     def require(condition, message):
@@ -553,6 +573,8 @@ def run() -> None:
     ):
         if token not in windows_commands:
             raise RuntimeError(f"Windows Defender app integration misses {token}")
+    assert_windows_defender_preflight_routing(
+        (ROOT / "src-tauri/src/connection_intent.rs").read_text(encoding="utf-8"), windows_commands)
     for command in ("app_windows_defender_status", "app_windows_defender_repair"):
         if command not in app_entrypoint:
             raise RuntimeError(f"Windows Defender command is not registered: {command}")

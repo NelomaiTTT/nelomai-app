@@ -17,6 +17,26 @@ from scripts.tests.test_runtime_artifact import ROOT, module
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_windows_defender_preflight_uses_captured_reserve_route_and_keeps_saved_guard(self):
+        checker = module("release-workflow-check")
+        intent = (ROOT / "src-tauri/src/connection_intent.rs").read_text()
+        commands = (ROOT / "src-tauri/src/commands.rs").read_text()
+        checker.assert_windows_defender_preflight_routing(intent, commands)
+        mutations = (
+            (intent.replace("&initial_preflight, reserve_requested)", "&initial_preflight, false)"), commands),
+            (intent.replace("state.reserve_requested,", "false,"), commands),
+            (intent.replace("&& !desktop_reserve_eligible(options, reserve_requested)", ""), commands),
+            (intent.replace("&& !desktop_reserve_eligible(options, reserve_requested)",
+                            "&& desktop_reserve_eligible(options, reserve_requested)"), commands),
+            (intent.replace("options.layer == nelomai_contracts::Layer::Stray", "true"), commands),
+            (intent, commands.replace("    ensure_defender_ready_for_awg(&diagnostics).await?;", "")),
+        )
+        for index, (changed_intent, changed_commands) in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual((changed_intent, changed_commands), (intent, commands))
+                with self.assertRaisesRegex(RuntimeError, "captured reserve routing"):
+                    checker.assert_windows_defender_preflight_routing(changed_intent, changed_commands)
+
     def test_windows_build_artifact_is_source_bound_and_every_byte_is_checked(self):
         artifact = module("windows/carrier-factory-artifact")
         self.assertIn("nelomai-windows-worker.exe", artifact.RUNTIME_FILES)
