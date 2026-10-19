@@ -1216,6 +1216,17 @@ struct DesktopPairTunnel {
 }
 #[async_trait]
 impl TunnelController for DesktopPairTunnel {
+    async fn capabilities(&self) -> Result<nelomai_client_tunnel::TunnelCapabilities, TunnelError> {
+        Ok(nelomai_client_tunnel::TunnelCapabilities {
+            platform: nelomai_client_tunnel::TunnelPlatform::Windows,
+            address_split_tunnel: true,
+            ..Default::default()
+        })
+    }
+    async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        self.commands.lock().unwrap().push("fingerprint".into());
+        Err(TunnelError::Backend("redundant_actor_failed".into()))
+    }
     async fn desktop_redundancy_absent(&self) -> Result<bool, TunnelError> {
         self.commands.lock().unwrap().push("absent".into());
         if self.fail_absence.load(Ordering::SeqCst) {
@@ -2346,6 +2357,88 @@ fn desktop_pair_fixture() -> (
         Arc::new(MemoryLogger::default()),
     );
     (core, api, store, tunnel)
+}
+
+#[tokio::test]
+async fn desktop_pair_physical_poll_skips_legacy_fingerprint_and_reconnect() {
+    use nelomai_client_storage::{
+        MemorySplitTunnelStore, SplitTunnelStore, StoredSplitTunnelState,
+    };
+    let (_, api, store, tunnel) = desktop_pair_fixture();
+    let split_store = Arc::new(MemorySplitTunnelStore::default());
+    let policy = serde_json::from_str(include_str!(
+        "../../../contracts/fixtures/valid/split-tunnel-policy.json"
+    ))
+    .unwrap();
+    split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(policy),
+            ..Default::default()
+        })
+        .unwrap();
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(support::TestOwner::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        local.clone(),
+    ));
+    let core = PairCore::with_split_tunnel_store(
+        api.clone(),
+        store.clone(),
+        split_store,
+        owner,
+        local,
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.desktop_connection_intent_attempt_with_cancellation_epoch(
+        options(),
+        1_700_000_000,
+        true,
+        epoch,
+    )
+    .await
+    .unwrap();
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    let pair = store.value.lock().unwrap().desktop_redundancy.clone();
+    assert!(pair.is_some());
+    tunnel.commands.lock().unwrap().clear();
+    let starts = api.start_calls.load(Ordering::SeqCst);
+    for now in [1_700_000_030, 1_700_000_060] {
+        assert_eq!(
+            core.poll_physical_network_guarded(now, || true)
+                .await
+                .unwrap(),
+            nelomai_client_core::PhysicalNetworkPollOutcome::Skipped
+        );
+    }
+    assert!(tunnel.commands.lock().unwrap().is_empty());
+    assert_eq!(tunnel.legacy.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.legacy.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), starts);
+    assert_eq!(store.value.lock().unwrap().desktop_redundancy, pair);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test]
+async fn physical_poll_propagates_unreadable_runtime_before_legacy_discovery() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(ToggleLoadStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api,
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    store.fail_load.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        core.poll_physical_network(1_700_000_030).await,
+        Err(CoreError::Storage)
+    ));
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
 }
 
 async fn missing_desktop_reserve() -> (

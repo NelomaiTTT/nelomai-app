@@ -25,7 +25,7 @@ use nelomai_client_tunnel::{
         session::{SessionPhase, SessionSnapshot},
         ProbeDatagram, SessionScope, Slot,
     },
-    DesktopTunnelOptions,
+    DesktopTunnelOptions, TunnelMetrics,
 };
 use nelomai_contracts::{
     dispatcher::{EngineIdentity, MutationGuard},
@@ -1821,6 +1821,56 @@ fn uapi(configuration: &str, mtu: u32) -> io::Result<Zeroizing<String>> {
 }
 
 impl PairControl for Control {
+    fn metrics(&self, slot: Slot) -> io::Result<TunnelMetrics> {
+        let index = slot_index(slot);
+        if !self.ready
+            || self.fenced
+            || self.stopped
+            || self.members[index].is_none()
+            || self.routes.as_ref().and_then(NetworkOwner::active) != Some(slot)
+        {
+            return Err(failed());
+        }
+        let generation = self.generations[index]
+            .filter(|value| *value > 0)
+            .ok_or_else(failed)?;
+        let interface = self.original.interface.get().ok_or_else(failed)?;
+        self.authorize()?;
+        checked(
+            self.guard
+                .as_ref()
+                .ok_or_else(failed)?
+                .borrow_mut()
+                .verify(|| self.original.verify_live()),
+        )?;
+        let reply = self.call(json!({"op":"sample","slot":index}), Duration::from_secs(1))?;
+        self.authorize()?;
+        let identity = &reply["identity"];
+        let stats = &reply["slot_stats"][index];
+        if self.original.interface.get() != Some(interface)
+            || identity["guid"].as_str().map(str::to_ascii_lowercase)
+                != Some(guid_text(interface.guid))
+            || identity["luid"].as_u64() != Some(interface.luid)
+            || identity["index"].as_u64() != Some(u64::from(interface.index))
+            || reply["closed"].as_bool() != Some(false)
+            || stats["closed"].as_bool() != Some(false)
+            || stats["generation"].as_u64() != Some(generation)
+        {
+            return Err(failed());
+        }
+        let handshake = reply["handshakes"][index].as_u64().ok_or_else(failed)?;
+        Ok(TunnelMetrics {
+            // The sole TUN's user IP byte totals survive active-slot changes.
+            received_bytes: reply["counters"]["InboundBytes"]
+                .as_u64()
+                .ok_or_else(failed)?,
+            sent_bytes: reply["counters"]["OutboundBytes"]
+                .as_u64()
+                .ok_or_else(failed)?,
+            latest_handshake_epoch_millis: (handshake > 0).then_some(handshake),
+            probe_target: None,
+        })
+    }
     fn prepare_session(&mut self, scope: &SessionScope) -> io::Result<()> {
         if scope != &self.scope || self.session.borrow().is_some() {
             return Err(failed());

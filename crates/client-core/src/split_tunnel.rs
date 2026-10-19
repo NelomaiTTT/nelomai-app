@@ -765,6 +765,11 @@ where
             self.physical_network_change.lock().await.reset();
             return Ok(PhysicalNetworkPollOutcome::Skipped);
         };
+        if self.load_runtime()?.desktop_redundancy.is_some() {
+            // Legacy stop/start must not replace a retained pair owner.
+            self.physical_network_change.lock().await.reset();
+            return Ok(PhysicalNetworkPollOutcome::Skipped);
+        }
         let options = self.split_tunnel_options.lock().await.clone();
         if options.policy_hash.is_none()
             || (!options.exclude_local_networks && options.excluded_ipv4_cidrs.is_empty())

@@ -578,6 +578,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         }
         // Extend the same actual actor route; no direct private Native calls.
         // These configured real Go devices need not be Healthy or handshaken.
+        let starting_metrics = started.as_ref().ok().map(|_| actor.metrics(false));
         let attached = if round == 0 {
             Some(
                 started
@@ -604,6 +605,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let mut promoted_network = None;
         let mut replacement = None;
         let mut before_network = None;
+        let mut primary_metrics = None;
+        let mut promoted_metrics = None;
         if round == 0 && attached.as_ref().is_some_and(|result| result.is_ok()) {
             let clock = Instant::now();
             loop {
@@ -627,6 +630,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                     .as_ref()
                     .is_ok_and(|state| state.primary_ready && state.standby_ready)
             }) {
+                // Retain diagnostics failures until AFTER exact scoped cleanup.
+                primary_metrics = Some(actor.metrics(false));
                 before_network =
                     super::member_carrier_factory_test_os::state().and_then(|directory| {
                         let value: serde_json::Value = serde_json::from_slice(
@@ -681,6 +686,9 @@ fn worker_factory_start_stop_fresh_child_repeat() {
                         std::thread::sleep(Duration::from_millis(25));
                     }
                 })());
+                if promotion.as_ref().is_some_and(|result| result.is_ok()) {
+                    promoted_metrics = Some(actor.metrics(false));
+                }
                 replacement = Some((|| -> std::io::Result<_> {
                     let promoted = promotion
                         .as_ref()
@@ -943,6 +951,13 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         assert_eq!(interface_mtu, Some(1280), "actual owned Windows MTU");
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        starting_metrics
+            .expect("A-only metrics attempted after Start")
+            .expect("actual worker A-only metrics");
+        assert!(
+            actor.metrics(false).is_err(),
+            "stopped pair exposed metrics"
+        );
         let repeated = actor
             .redundant(Command::Stop {
                 scope: scope.clone(),
@@ -958,6 +973,24 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             assert_eq!(attached.session.membership_generation, 2);
         }
         if round == 0 {
+            let primary_metrics = primary_metrics
+                .expect("A metrics attempted before promotion")
+                .expect("actual worker A metrics");
+            let promoted_metrics = promoted_metrics
+                .expect("B metrics attempted after promotion")
+                .expect("actual worker B metrics");
+            assert!(primary_metrics
+                .latest_handshake_epoch_millis
+                .is_some_and(|value| value > 0));
+            assert!(promoted_metrics
+                .latest_handshake_epoch_millis
+                .is_some_and(|value| value > 0));
+            // One retained TUN: user IP byte totals survive the A -> B switch.
+            assert!(promoted_metrics.received_bytes >= primary_metrics.received_bytes);
+            assert!(promoted_metrics.sent_bytes >= primary_metrics.sent_bytes);
+            assert!(
+                primary_metrics.probe_target.is_none() && promoted_metrics.probe_target.is_none()
+            );
             let readiness = readiness
                 .expect("health/probe tick completed")
                 .expect("production actor health tick");
