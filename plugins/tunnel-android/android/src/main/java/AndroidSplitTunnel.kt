@@ -210,6 +210,19 @@ internal object AndroidSplitTunnel {
         source.responsePacketMagicHeader.ifPresent(builder::setResponsePacketMagicHeader)
         source.underloadPacketMagicHeader.ifPresent(builder::setUnderloadPacketMagicHeader)
         source.transportPacketMagicHeader.ifPresent(builder::setTransportPacketMagicHeader)
+        // Only AWG3 without an explicit preamble gets the tested ASCII prefix.
+        // Keep panel-provided/custom I packets as one configuration, including gaps.
+        if (source.headerProtectionKey.isPresent && listOf(
+                source.specialJunkI1, source.specialJunkI2, source.specialJunkI3,
+                source.specialJunkI4, source.specialJunkI5,
+            ).none { it.isPresent }) {
+            val prefix = (0 until 278).joinToString("") { (97 + it % 26).toString(16) }
+            builder.setSpecialJunkI1("<b 0x${prefix}4931>")
+            builder.setSpecialJunkI2("<b 0x${prefix}4932>")
+            builder.setSpecialJunkI3("<b 0x${prefix}4933>")
+            builder.setSpecialJunkI4("<b 0x${prefix}4934>")
+            builder.setSpecialJunkI5("<b 0x${prefix}4935>")
+        }
         source.specialJunkI1.ifPresent(builder::setSpecialJunkI1)
         source.specialJunkI2.ifPresent(builder::setSpecialJunkI2)
         source.specialJunkI3.ifPresent(builder::setSpecialJunkI3)

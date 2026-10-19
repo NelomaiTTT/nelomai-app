@@ -324,7 +324,7 @@ index 0000000000000000000000000000000000000000..7db9eeac3a8d1dbbc3dae9bd3da26ff3
 +	}
 +}
 diff --git a/device/peer.go b/device/peer.go
-index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff4076dfc9 100644
+index e9ef5ee..7292bbf 100644
 --- a/device/peer.go
 +++ b/device/peer.go
 @@ -25,6 +25,12 @@ type Peer struct {
@@ -373,6 +373,37 @@ index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff
  func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
  	if device.isClosed() {
  		return nil, errors.New("device closed")
+@@ -115,6 +147,10 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ }
+ 
+ func (peer *Peer) SendBuffers(buffers [][]byte) error {
++	return peer.sendBuffers(buffers, 0)
++}
++
++func (peer *Peer) sendBuffers(buffers [][]byte, preambleCount int) error {
+ 	peer.device.net.RLock()
+ 	defer peer.device.net.RUnlock()
+ 
+@@ -134,7 +170,18 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
+ 	}
+ 	peer.endpoint.Unlock()
+ 
+-	err := peer.device.net.bind.Send(buffers, endpoint)
++	var err error
++	// Admission-aware transports must retain the complete startup batch until
++	// socket protection succeeds, including its preamble boundary.
++	if sender, ok := peer.device.net.bind.(interface {
++		SendHandshake([][]byte, conn.Endpoint, int, func() bool) error
++	}); ok && preambleCount > 0 {
++		err = sender.SendHandshake(buffers, endpoint, preambleCount, func() bool {
++			return peer.device.isUp() && peer.isRunning.Load()
++		})
++	} else {
++		err = peer.device.net.bind.Send(buffers, endpoint)
++	}
+ 	if err == nil {
+ 		var totalLen uint64
+ 		for _, b := range buffers {
 diff --git a/device/receive.go b/device/receive.go
 index fc2e2da303d2c264423ba4a47990f28dbf03169f..d6bc92cce65e08b73d7ef144211b5da3af87ad3d 100644
 --- a/device/receive.go
@@ -386,7 +417,7 @@ index fc2e2da303d2c264423ba4a47990f28dbf03169f..d6bc92cce65e08b73d7ef144211b5da3
  			peer.SendKeepalive()
  		}
 diff --git a/device/send.go b/device/send.go
-index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..238c0cf1d4897ef7b62e5c20db21d27d71bb0a8c 100644
+index 5c22d97..86b57fb 100644
 --- a/device/send.go
 +++ b/device/send.go
 @@ -104,6 +104,21 @@ func (peer *Peer) SendKeepalive() {
@@ -421,7 +452,24 @@ index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..238c0cf1d4897ef7b62e5c20db21d27d
  
  	var sendBuffer [][]byte
  
-@@ -318,13 +336,22 @@ func (device *Device) RoutineReadFromTUN() {
+@@ -144,6 +162,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 		}
+ 	}
+ 
++	preambleCount := len(sendBuffer)
+ 	sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
+ 
+ 	padding := peer.device.paddings.init.Load()
+@@ -169,7 +188,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 	}
+ 
+ 	sendBuffer = append(sendBuffer, buf)
+-	err = peer.SendBuffers(sendBuffer)
++	err = peer.sendBuffers(sendBuffer, preambleCount)
+ 	if err != nil {
+ 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+ 	}
+@@ -318,13 +337,22 @@ func (device *Device) RoutineReadFromTUN() {
  
  		// read packets
  		count, readErr = device.tun.device.Read(bufs, sizes, offset)

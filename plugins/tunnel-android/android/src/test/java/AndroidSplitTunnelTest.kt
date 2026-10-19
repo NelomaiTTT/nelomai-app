@@ -475,6 +475,59 @@ class AndroidSplitTunnelTest {
         )
     }
 
+    @Test
+    fun awg3WithoutExplicitPreambleGetsFiveAsciiPackets() {
+        val original = preambleConfig(true)
+        val updated = AndroidSplitTunnel.applyOptions(original,
+            AndroidSplitTunnel.resolveOptions(33, TunnelOptionsArgs()), "ru.nelomai.client")
+        val actual = updated.getInterface()
+        val packets = listOf(actual.specialJunkI1, actual.specialJunkI2, actual.specialJunkI3,
+            actual.specialJunkI4, actual.specialJunkI5)
+        packets.forEachIndexed { index, packet ->
+            val ascii = (0 until 278).map { ('a'.code + it % 26).toChar() }.joinToString("") + "I${index + 1}"
+            val hex = ascii.map { "%02x".format(it.code) }.joinToString("")
+            assertEquals("<b 0x$hex>", packet.orElse(""))
+        }
+        assertEquals(original.peers, updated.peers)
+        assertEquals(original.getInterface().keyPair, actual.keyPair)
+        assertEquals(original.getInterface().rekeyTimeout, actual.rekeyTimeout)
+        assertEquals(original.getInterface().maxHandshakeAttempts, actual.maxHandshakeAttempts)
+    }
+
+    @Test
+    fun explicitPreambleIsPreservedAsAWhole() {
+        val original = preambleConfig(true, "I3 = <b 0x010203>")
+        val actual = AndroidSplitTunnel.applyOptions(original,
+            AndroidSplitTunnel.resolveOptions(33, TunnelOptionsArgs()), "ru.nelomai.client").getInterface()
+        assertEquals(original.getInterface().specialJunkI3, actual.specialJunkI3)
+        assertTrue(listOf(actual.specialJunkI1, actual.specialJunkI2, actual.specialJunkI4,
+            actual.specialJunkI5).none { it.isPresent })
+    }
+
+    @Test
+    fun plainWireGuardDoesNotGetAwgPreamble() {
+        val actual = AndroidSplitTunnel.applyOptions(preambleConfig(false),
+            AndroidSplitTunnel.resolveOptions(33, TunnelOptionsArgs()), "ru.nelomai.client").getInterface()
+        assertTrue(listOf(actual.specialJunkI1, actual.specialJunkI2, actual.specialJunkI3,
+            actual.specialJunkI4, actual.specialJunkI5).none { it.isPresent })
+    }
+
+    private fun preambleConfig(awg3: Boolean, extra: String = ""): Config = parseConfig(
+        """
+        [Interface]
+        PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        Address = 10.8.1.2/32
+        ${if (awg3) "HeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=" else ""}
+        RekeyTimeout = 5
+        MaxHandshakeAttempts = 18
+        $extra
+        [Peer]
+        PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+        AllowedIPs = 0.0.0.0/0
+        Endpoint = 127.0.0.1:10001
+        """.trimIndent(),
+    )
+
     private fun parseConfig(value: String): Config =
         Config.parse(ByteArrayInputStream(value.encodeToByteArray()))
 

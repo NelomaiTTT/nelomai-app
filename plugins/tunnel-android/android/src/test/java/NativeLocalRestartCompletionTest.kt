@@ -317,7 +317,9 @@ class CompletionNative {
             events += "up"; onUp(); return 41
         }
         @JvmStatic @Implementation fun awgTurnOff(handle: Int) { events += "down" }
-        @JvmStatic @Implementation fun awgGetSocketV4(handle: Int) = -1
+        @JvmStatic @Implementation fun awgPreparedSocketToken(handle: Int) = 1L
+        @JvmStatic @Implementation fun awgAdmitSockets(handle: Int, token: Long) = 0
+        @JvmStatic @Implementation fun awgGetSocketV4(handle: Int) = 101
         @JvmStatic @Implementation fun awgGetSocketV6(handle: Int) = -1
         @JvmStatic @Implementation fun awgGetConfig(handle: Int) = "last_handshake_time_sec=1\n"
     }

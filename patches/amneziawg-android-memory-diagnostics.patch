@@ -135,10 +135,12 @@ index 80c51be4cb03381b80952cf52fb542493fdf4007..13125bdc533b0242d43c9518260c6bdd
  	tag := cstring("AmneziaWG/" + interfaceName)
  	logger := &device.Logger{
  		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
-@@ -732,11 +822,12 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+@@ -732,13 +822,14 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	diagnosticTun := &diagnosticTun{Device: nativeTun, telemetry: telemetry}
- 	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
- 	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
+ 	bind := newAdmissionBind(func() conn.Bind {
+ 		return &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
+ 	})
+ 	device := device.NewDevice(diagnosticTun, bind, logger)
 +	goDeviceStarts.Add(1)
  
  	err = device.IpcSet(settings)
@@ -188,7 +190,7 @@ index 80c51be4cb03381b80952cf52fb542493fdf4007..13125bdc533b0242d43c9518260c6bdd
 +	releaseUnusedGoMemory()
  }
  
- //export awgGetSocketV4
+ //export awgPreparedSocketToken
 diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libwg-go/redundant_metrics_test.go
 index cc37b9f52e8254000006eb2f45c1d1eb289dab0b..126c7f7f8d9845a735a54d9a83f0b322c25a3e13 100644
 --- a/tunnel/tools/libwg-go/redundant_metrics_test.go
