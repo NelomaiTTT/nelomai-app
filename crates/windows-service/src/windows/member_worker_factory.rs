@@ -490,6 +490,40 @@ impl PairFactory for WorkerPairFactory {
                             }
                             journal.borrow_mut().verify()?;
                         }
+                        if before.is_some() && !member_worker::absent(proof.guid, Some(proof))? {
+                            // DIF_REMOVE can leave the exact old MIB row pending
+                            // while the trigger-start cleanup service is idle.
+                            // Same authority as removal; never wake for an
+                            // unproven mapping or an already absent interface.
+                            journal.borrow_mut().verify()?;
+                            use windows_service::service::{ServiceAccess, ServiceState};
+                            use windows_service::service_manager::{
+                                ServiceManager, ServiceManagerAccess,
+                            };
+                            let manager = ServiceManager::local_computer(
+                                None::<&str>,
+                                ServiceManagerAccess::CONNECT,
+                            )
+                            .map_err(io::Error::other)?;
+                            let service = manager
+                                .open_service(
+                                    "NetSetupSvc",
+                                    ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+                                )
+                                .map_err(io::Error::other)?;
+                            match service.query_status().map_err(io::Error::other)?.current_state {
+                                ServiceState::Running | ServiceState::StartPending => {}
+                                ServiceState::Stopped => match service.start::<&str>(&[]) {
+                                    Ok(()) => {}
+                                    Err(windows_service::Error::Winapi(error))
+                                        if error.raw_os_error()
+                                            == Some(windows_sys::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING as i32) => {}
+                                    Err(error) => return Err(io::Error::other(error)),
+                                },
+                                _ => return Err(io::Error::other("worker_cold_cleanup_service")),
+                            }
+                            journal.borrow_mut().verify()?;
+                        }
                     }
                     let deadline = Instant::now() + Duration::from_secs(7);
                     loop {
@@ -508,7 +542,10 @@ impl PairFactory for WorkerPairFactory {
                             break;
                         }
                         if Instant::now() >= deadline {
-                            return Err(io::Error::other("worker_cold_MIB_pending"));
+                            return Err(crate::member_diagnostic::context(
+                                "worker_cold_MIB_absence",
+                                io::Error::new(io::ErrorKind::TimedOut, "worker_cold_MIB_pending"),
+                            ));
                         }
                         std::thread::sleep(Duration::from_millis(5));
                     }

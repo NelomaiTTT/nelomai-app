@@ -322,6 +322,50 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             unsafe { WaitForSingleObject(engine.as_raw_handle(), 0) },
             WAIT_TIMEOUT
         );
+        // Reproduce cold cleanup while the trigger-start service is naturally
+        // idle. Query only: this test never stops or reconfigures the service.
+        let idle = (|| -> std::io::Result<Duration> {
+            use windows_service::service::{ServiceAccess, ServiceState};
+            use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+            let manager =
+                ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+                    .map_err(std::io::Error::other)?;
+            let service = manager
+                .open_service("NetSetupSvc", ServiceAccess::QUERY_STATUS)
+                .map_err(std::io::Error::other)?;
+            let waiting = Instant::now();
+            while service
+                .query_status()
+                .map_err(std::io::Error::other)?
+                .current_state
+                != ServiceState::Stopped
+            {
+                if engine.try_wait()?.is_some() {
+                    return Err(std::io::Error::other("original engine exited before idle"));
+                }
+                if waiting.elapsed() >= Duration::from_secs(300) {
+                    return Err(std::io::Error::other("NetSetupSvc natural idle deadline"));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if engine.try_wait()?.is_some()
+                || unsafe { WaitForSingleObject(worker.1.as_raw_handle(), 0) } != WAIT_TIMEOUT
+            {
+                return Err(std::io::Error::other("original pair exited before idle"));
+            }
+            Ok(waiting.elapsed())
+        })();
+        let idle = idle.unwrap_or_else(|error| {
+            let _ = engine.kill();
+            let _ = engine.wait();
+            panic!("cannot establish cold cleanup idle precondition: {error}");
+        });
+        eprintln!("NetSetupSvc naturally stopped before engine death after {idle:?}");
+        assert_eq!(
+            unsafe { WaitForSingleObject(engine.as_raw_handle(), 0) },
+            WAIT_TIMEOUT
+        );
+        let clock = Instant::now();
         engine
             .kill()
             .expect("terminate only our original engine Child");

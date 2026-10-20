@@ -113,7 +113,7 @@ try {
         try {
             # Retain the handle so Windows PowerShell preserves ExitCode after the redirected child exits.
             $processHandle = $process.Handle
-            if (-not $process.WaitForExit(90000)) { $process.Kill(); [void]$process.WaitForExit(5000); throw 'Native worker scenario exceeded 90 seconds' }
+            if (-not $process.WaitForExit(450000)) { $process.Kill(); [void]$process.WaitForExit(5000); throw 'Native worker scenario exceeded 450 seconds' }
             $output = [string](Get-Content -LiteralPath $out -Raw) + [string](Get-Content -LiteralPath $err -Raw)
             $worker = @(Get-CimInstance Win32_Process -Filter "Name='nelomai-windows-worker.exe'")
             $adapters = @(Get-NetAdapter -IncludeHidden | Where-Object Name -like 'NeloWorker-*')
