@@ -515,6 +515,7 @@ import json,struct,sys,os,fcntl,time,signal
 root=sys.argv[2]
 lease=open(root+'/engine-owner.lock','a')
 fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+with open(root+'/engine-pid','w') as pid: pid.write(str(os.getpid()))
 while True:
     size=sys.stdin.buffer.read(4)
     if not size: break
@@ -525,7 +526,11 @@ while True:
         size=sys.stdin.buffer.read(4)
         ack=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
         value['probe']=ack.get('primitive_ok')
-    if value.get('command')=='crash': os._exit(1)
+    if value.get('command')=='crash':
+        if os.path.exists(root+'/hold-crash-exit'):
+            os.close(1)
+            while os.path.exists(root+'/hold-crash-exit'): time.sleep(0.001)
+        os._exit(1)
     if value.get('command')=='hang':
         signal.alarm(10)
         if os.fork()==0:
@@ -1037,6 +1042,35 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
     let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
     let identity = dispatcher.layout.identity.clone();
     let mut primitive = |_, _: &Path| Err(io::Error::other("no SCM"));
+    // WNOWAIT observes the exact original child without reaping the Child
+    // still retained by ProcessDispatcher. Never retry Start to hide an exit race.
+    let wait_for_exit = |pid: libc::pid_t| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    )
+                },
+                0,
+                "exact original child waitid: {}",
+                io::Error::last_os_error()
+            );
+            if unsafe { status.si_pid() } == pid {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "original child {pid} did not exit"
+            );
+            std::thread::yield_now();
+        }
+    };
     assert!(
         dispatcher
             .handle(
@@ -1048,6 +1082,11 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
             )
             .ok
     );
+    let original_pid: libc::pid_t = fs::read_to_string(target.path().join("engine-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    fs::write(target.path().join("hold-crash-exit"), "hold original exit").unwrap();
     fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
     assert!(dispatcher
         .relay(
@@ -1066,6 +1105,43 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
         "a crashed child must not be reported as running"
     );
     assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
+    let mut original_status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                original_pid as libc::id_t,
+                &mut original_status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        },
+        0,
+        "exact original child waitid: {}",
+        io::Error::last_os_error()
+    );
+    assert_eq!(
+        unsafe { original_status.si_pid() },
+        0,
+        "EOF precedes original exit"
+    );
+    let still_live = dispatcher.handle(
+        DispatcherRequest::Start {
+            contract_version: 1,
+            identity: identity.clone(),
+        },
+        &mut primitive,
+    );
+    assert!(
+        !still_live.ok && !still_live.running,
+        "EOF must not authorize recovery while original child is alive: {still_live:?}"
+    );
+    assert!(target.path().join("persisted-tunnel").exists());
+    assert_eq!(
+        fs::read_to_string(target.path().join("engine-controls")).unwrap(),
+        "ready\n"
+    );
+    fs::remove_file(target.path().join("hold-crash-exit")).unwrap();
+    wait_for_exit(original_pid);
     let restarted = dispatcher.handle(
         DispatcherRequest::Start {
             contract_version: 1,
@@ -1075,7 +1151,7 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
     );
     assert!(
         restarted.ok && restarted.running,
-        "direct Start must recover the exited original engine"
+        "direct Start must recover the exited original engine; response={restarted:?}"
     );
     assert!(!target.path().join("persisted-tunnel").exists());
     assert_eq!(
@@ -1097,12 +1173,17 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
         };
         assert!(dispatcher.handle(start(), &mut primitive).ok);
         fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
+        let original_pid = fs::read_to_string(target.path().join("engine-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!(dispatcher
             .relay(
                 &encode_frame(&json!({"command":"crash"})).unwrap(),
                 &mut primitive
             )
             .is_err());
+        wait_for_exit(original_pid);
         let marker = target.path().join(ACTIVE_ENGINE_NAME);
         let marker_bytes = fs::read(&marker).unwrap();
         fs::write(target.path().join("fail-stop"), mode).unwrap();
