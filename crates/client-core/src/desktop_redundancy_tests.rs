@@ -775,3 +775,398 @@ fn canonical_role_ack_same_generation_is_action_fenced_for_running_and_stopped()
     assert!(!stop.role_confirmed);
     assert!(stop.retain_active_peer);
 }
+
+mod live_split_refresh {
+    use super::*;
+    use crate::{CoreApi, CoreApiError, CoreError, CoreLocalStop, CoreLogger, RuntimeAuthProvider};
+    use async_trait::async_trait;
+    use nelomai_client_api::{AccessSnapshot, RuntimeAuthState, RuntimeLogin};
+    use nelomai_client_storage::{
+        MemorySplitTunnelStore, RuntimeAuthScope, RuntimePaths, RuntimeStateStore, RuntimeStateV1,
+        SplitTunnelStore, StorageError, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
+    };
+    use nelomai_client_tunnel::{
+        DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelOptions,
+        TunnelPlatform, TunnelStartRequest, TunnelStatus,
+    };
+    use nelomai_contracts::{
+        Bootstrap, ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
+        RuntimeIdentity, SplitTunnelAddressRule, SplitTunnelAddressRuleKind,
+        SplitTunnelAddressRuleScope, SplitTunnelMode, SplitTunnelPolicy,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Api {
+        policy: Mutex<Option<SplitTunnelPolicy>>,
+        offline: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl CoreApi for Api {
+        async fn bootstrap(&self, _: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
+            panic!("no panel fetch")
+        }
+        async fn start_connection(
+            &self,
+            _: &AccessSnapshot,
+            _: &ConnectionStartRequest,
+        ) -> Result<ConnectionStartResponse, CoreApiError> {
+            panic!("no Start")
+        }
+        async fn stop_connection(
+            &self,
+            _: &AccessSnapshot,
+            _: &ConnectionOperationRequest,
+        ) -> Result<ConnectionOperationResponse, CoreApiError> {
+            panic!("no Stop")
+        }
+        async fn pin_stray(
+            &self,
+            _: &AccessSnapshot,
+            _: &ConnectionOperationRequest,
+        ) -> Result<ConnectionOperationResponse, CoreApiError> {
+            unreachable!()
+        }
+        async fn unpin_stray(
+            &self,
+            _: &AccessSnapshot,
+            _: &ConnectionOperationRequest,
+        ) -> Result<ConnectionOperationResponse, CoreApiError> {
+            unreachable!()
+        }
+        async fn split_tunnel_revision(
+            &self,
+            _: &AccessSnapshot,
+        ) -> Result<nelomai_contracts::SplitTunnelRevision, CoreApiError> {
+            if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoreApiError::Retryable);
+            }
+            let p = self.policy.lock().unwrap();
+            let p = p.as_ref().expect("unexpected panel fetch");
+            Ok(nelomai_contracts::SplitTunnelRevision {
+                enabled: p.enabled,
+                revision: p.revision,
+                force_revision: p.force_revision,
+                address_revision: p.address_revision,
+            })
+        }
+        async fn split_tunnel_policy(
+            &self,
+            _: &AccessSnapshot,
+        ) -> Result<SplitTunnelPolicy, CoreApiError> {
+            Ok(self
+                .policy
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("unexpected full fetch"))
+        }
+        async fn report_split_tunnel_apply_result(
+            &self,
+            _: &AccessSnapshot,
+            _: &nelomai_contracts::SplitTunnelApplyResult,
+        ) -> Result<(), CoreApiError> {
+            Ok(())
+        }
+    }
+    struct Auth(AccessSnapshot);
+    #[async_trait]
+    impl RuntimeAuthProvider for Auth {
+        async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
+            unreachable!()
+        }
+        async fn login(&self, _: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+            unreachable!()
+        }
+        async fn access(&self, _: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+            Ok(self.0.clone())
+        }
+        async fn logout(&self) -> Result<(), CoreError> {
+            unreachable!()
+        }
+    }
+    struct Runtime {
+        paths: RuntimePaths,
+        value: Mutex<RuntimeStateV1>,
+    }
+    impl RuntimeStateStore for Runtime {
+        fn paths(&self) -> &RuntimePaths {
+            &self.paths
+        }
+        fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+            Ok(Some(self.value.lock().unwrap().clone()))
+        }
+        fn save(&self, v: &RuntimeStateV1) -> Result<(), StorageError> {
+            *self.value.lock().unwrap() = v.clone();
+            Ok(())
+        }
+    }
+    struct Log;
+    impl CoreLogger for Log {
+        fn record(&self, _: crate::CoreLogEvent) {}
+    }
+    struct Tunnel {
+        snapshot: Mutex<Snapshot>,
+        applied: Mutex<Vec<DesktopTunnelOptions>>,
+    }
+    #[async_trait]
+    impl TunnelController for Tunnel {
+        async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
+            Ok(TunnelCapabilities {
+                platform: TunnelPlatform::Windows,
+                address_split_tunnel: true,
+                ..Default::default()
+            })
+        }
+        async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+            panic!("retained pair must not Start")
+        }
+        async fn stop(&self) -> Result<(), TunnelError> {
+            panic!("retained pair must not Stop")
+        }
+        async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+            Ok(TunnelStatus::Running)
+        }
+        async fn desktop_redundancy_command(
+            &self,
+            command: Command,
+        ) -> Result<Snapshot, TunnelError> {
+            let wire = serde_json::to_value(command).unwrap();
+            let mut snapshot = self.snapshot.lock().unwrap();
+            match wire["action"].as_str().unwrap() {
+                "status" => (),
+                "refresh_split_tunnel" => {
+                    assert_eq!(wire["expected_revision"], snapshot.session.local_revision);
+                    assert_eq!(
+                        wire["expected_network_epoch"],
+                        snapshot.session.network_epoch
+                    );
+                    assert_eq!(
+                        wire["expected_role_generation"],
+                        snapshot.session.role_generation
+                    );
+                    assert_eq!(
+                        wire["expected_membership_generation"],
+                        snapshot.session.membership_generation
+                    );
+                    self.applied
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::from_value(wire["options"].clone()).unwrap());
+                    snapshot.session.local_revision += 1;
+                }
+                other => panic!("unexpected pair command {other}"),
+            }
+            Ok(snapshot.clone())
+        }
+    }
+    #[tokio::test]
+    async fn expired_domain_refresh_updates_retained_pair_before_revision_gate_without_saved_config(
+    ) {
+        let pair = pair();
+        let before = both(&pair);
+        let identity = RuntimeIdentity {
+            slot: RT,
+            runtime_version: "0.4.0".into(),
+            container_version: "0.4.0".into(),
+            runtime_contract_version: 2,
+            session_generation: Some(7),
+        };
+        let access =
+            AccessSnapshot::new("access".into(), identity.clone(), 1, "family".into()).unwrap();
+        let paths = RuntimePaths::new("/synthetic-no-filesystem", RT, "0.4.0").unwrap();
+        let mut runtime = RuntimeStateV1::empty(&paths, false);
+        runtime.auth_scope = Some(RuntimeAuthScope {
+            auth_epoch: 1,
+            family: "family".into(),
+            identity,
+        });
+        runtime.desktop_redundancy = Some(pair.clone());
+        assert!(runtime.saved_connection.is_none() && runtime.pinned_connection.is_none());
+        let policy = SplitTunnelPolicy {
+            format_version: 2,
+            enabled: true,
+            revision: 1,
+            force_revision: 0,
+            address_revision: 1,
+            policy_hash: format!("sha256:{}", "a".repeat(64)),
+            mode: SplitTunnelMode::ExcludeSelected,
+            exclude_local_networks: true,
+            mandatory_excluded_packages: vec![],
+            suggested_name_fragments: vec![],
+            selected_packages: vec![],
+            excluded_ipv4_cidrs: vec![],
+            address_rules: vec![SplitTunnelAddressRule {
+                id: 1,
+                scope: SplitTunnelAddressRuleScope::ThisDevice,
+                kind: SplitTunnelAddressRuleKind::Domain,
+                value: "cached.example".into(),
+            }],
+            generated_at: "2026-07-31T12:00:00Z".into(),
+        };
+        let split = Arc::new(MemorySplitTunnelStore::default());
+        split
+            .save(&StoredSplitTunnelState {
+                cached_policy: Some(policy.clone()),
+                working_policy_hash: Some(policy.policy_hash.clone()),
+                last_revision_check_unix: Some(100),
+                domain_resolutions: vec![StoredSplitTunnelDomainResolution {
+                    domain: "cached.example".into(),
+                    ipv4_cidrs: vec!["198.51.100.10/32".into()],
+                    resolved_at_unix: 100,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+        let tunnel = Arc::new(Tunnel {
+            snapshot: Mutex::new(before.clone()),
+            applied: Mutex::new(vec![]),
+        });
+        let api = Arc::new(Api::default());
+        let core = Arc::new(crate::ClientCore::with_split_tunnel_store(
+            api.clone(),
+            Arc::new(Runtime {
+                paths,
+                value: Mutex::new(runtime),
+            }),
+            split.clone(),
+            Arc::new(Auth(access)),
+            CoreLocalStop::new(tunnel.clone()),
+            Arc::new(Log),
+        ));
+        *core.state.lock().await = crate::CoreState {
+            phase: crate::Phase::Connected,
+            connection: Some(pair.connection.clone()),
+        };
+        *core.split_tunnel_options.lock().await = TunnelOptions {
+            excluded_ipv4_cidrs: vec!["198.51.100.10/32".into()],
+            exclude_local_networks: true,
+            policy_hash: Some(policy.policy_hash.clone()),
+            ..Default::default()
+        };
+        let outcome = core
+            .synchronize_split_tunnel_with_resolver(161, false, |_| async {
+                Some(vec!["203.0.113.9/32".into()])
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
+        );
+        {
+            let applied = tunnel.applied.lock().unwrap();
+            assert_eq!(applied.len(), 1);
+            assert_eq!(
+                applied[0].excluded_ipv4_cidrs,
+                ["198.51.100.10/32", "203.0.113.9/32"]
+            );
+            let after = tunnel.snapshot.lock().unwrap();
+            assert_eq!(after.session.scope, before.session.scope);
+            assert_eq!(after.session.active, before.session.active);
+            assert_eq!(after.session.network_epoch, before.session.network_epoch);
+            assert_eq!(
+                after.session.local_revision,
+                before.session.local_revision + 1
+            );
+            assert_eq!(
+                split.load().unwrap().domain_resolutions[0].resolved_at_unix,
+                161
+            );
+        }
+
+        assert_eq!(
+            core.synchronize_split_tunnel_with_resolver(162, false, |_| async {
+                panic!("not expired")
+            })
+            .await
+            .unwrap(),
+            crate::SplitTunnelSyncOutcome::Skipped
+        );
+        assert_eq!(tunnel.applied.lock().unwrap().len(), 1);
+        // A new policy with identical effective routes still publishes its
+        // identity; the subsequent DNS rotation must union within that policy.
+        let mut next = policy.clone();
+        next.policy_hash = format!("sha256:{}", "b".repeat(64));
+        next.excluded_ipv4_cidrs = vec!["198.51.100.10/32".into()];
+        let mut cached = split.load().unwrap();
+        cached.cached_policy = Some(next.clone());
+        split.save(&cached).unwrap();
+        let same = core
+            .refresh_retained_split_tunnel(
+                &mut cached,
+                163,
+                |_| async { Some(vec!["203.0.113.9/32".into()]) },
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            same.session.local_revision,
+            before.session.local_revision + 1
+        );
+        assert_eq!(
+            cached.working_policy_hash.as_deref(),
+            Some(next.policy_hash.as_str())
+        );
+        assert_eq!(
+            core.split_tunnel_options
+                .lock()
+                .await
+                .policy_hash
+                .as_deref(),
+            Some(next.policy_hash.as_str())
+        );
+        split.save(&cached).unwrap();
+        core.synchronize_split_tunnel_with_resolver(224, false, |_| async {
+            Some(vec!["203.0.113.10/32".into()])
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            tunnel.applied.lock().unwrap()[1].excluded_ipv4_cidrs,
+            ["198.51.100.10/32", "203.0.113.10/32", "203.0.113.9/32"]
+        );
+        // A Stop epoch wins while the system resolver is awaiting its response.
+        let cancel = core.clone();
+        api.offline.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            core.synchronize_split_tunnel_with_resolver(401, false, move |_| {
+                let cancel = cancel.clone();
+                async move {
+                    cancel
+                        .start_cancel_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(vec!["203.0.113.10/32".into()])
+                }
+            })
+            .await
+            .unwrap(),
+            crate::SplitTunnelSyncOutcome::CachedOffline
+        );
+        assert_eq!(tunnel.applied.lock().unwrap().len(), 2);
+        assert_eq!(
+            split.load().unwrap().domain_resolutions[0].resolved_at_unix,
+            224
+        );
+        api.offline
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // An explicit policy removal must remove the retained domain union and
+        // still never require saved configuration or Stop/Start.
+        let mut removed = policy;
+        removed.enabled = false;
+        removed.address_rules[0].value = "uncached.invalid".into();
+        removed.policy_hash = format!("sha256:{}", "c".repeat(64));
+        removed.revision += 1;
+        *api.policy.lock().unwrap() = Some(removed);
+        assert_eq!(
+            core.synchronize_split_tunnel(402, true).await.unwrap(),
+            crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
+        );
+        let applied = tunnel.applied.lock().unwrap();
+        assert_eq!(applied.len(), 3);
+        assert!(applied[2].excluded_ipv4_cidrs.is_empty());
+    }
+}

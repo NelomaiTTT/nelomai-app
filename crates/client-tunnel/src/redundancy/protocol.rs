@@ -109,6 +109,14 @@ pub enum Command {
     Stop {
         scope: SessionScope,
     },
+    RefreshSplitTunnel {
+        scope: SessionScope,
+        expected_revision: u64,
+        expected_network_epoch: u64,
+        expected_role_generation: u64,
+        expected_membership_generation: u64,
+        options: DesktopTunnelOptions,
+    },
     NetworkChanged {
         scope: SessionScope,
     },
@@ -133,6 +141,7 @@ impl Command {
             | Self::PrepareStop { scope }
             | Self::PrepareRecoveryStop { scope, .. }
             | Self::NetworkChanged { scope }
+            | Self::RefreshSplitTunnel { scope, .. }
             | Self::ConfirmRole { scope, .. } => scope,
         }
     }
@@ -144,6 +153,23 @@ impl Command {
             return Err(invalid());
         }
         match self {
+            Self::RefreshSplitTunnel {
+                expected_revision,
+                expected_network_epoch,
+                expected_role_generation,
+                expected_membership_generation,
+                options,
+                ..
+            } => {
+                if *expected_revision == 0
+                    || *expected_network_epoch == 0
+                    || *expected_role_generation > i64::MAX as u64
+                    || *expected_membership_generation > i64::MAX as u64
+                {
+                    return Err(invalid());
+                }
+                options.validate().map_err(|_| invalid())?;
+            }
             Self::PrepareRecoveryStop {
                 expected_revision,
                 expected_network_epoch,

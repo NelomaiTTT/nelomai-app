@@ -376,6 +376,14 @@ impl SessionState {
         (self.state.role_confirmed && self.state.phase != SessionPhase::Starting)
             .then_some(self.state.active)
     }
+    pub(super) fn routes_refreshed(&mut self, scope: &SessionScope) -> Result<(), SessionFenced> {
+        self.check_running(scope)?;
+        if !self.state.role_confirmed || !self.state.committed[self.state.active.index()] {
+            return Err(SessionFenced);
+        }
+        self.state.local_revision = self.next_revision()?;
+        Ok(())
+    }
     pub fn network_changed(&mut self, scope: &SessionScope) -> Result<(), SessionFenced> {
         self.check_running(scope)?;
         let next = self

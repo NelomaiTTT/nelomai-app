@@ -37,11 +37,24 @@ const DNS_CONCURRENCY: usize = 8;
 const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_BATCH_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_ADDRESS_RULE_INPUT_LENGTH: usize = 2_048;
+#[cfg(not(target_os = "android"))]
+const DOMAIN_REFRESH_SECONDS: i64 = 60;
 const REVISION_POLL_SECONDS: i64 = 5 * 60;
 const FULL_SYNC_SECONDS: i64 = 24 * 60 * 60;
 const FAILED_POLICY_RETRY_SECONDS: i64 = 60 * 60;
 const PHYSICAL_NETWORK_RETRY_SECONDS: i64 = 5 * 60;
 const UNKNOWN_PHYSICAL_NETWORK: &str = "restore_requires_network_revalidation";
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DesktopDomainRefresh {
+    scope: nelomai_client_tunnel::redundancy::SessionScope,
+    role: u64,
+    network: u64,
+    membership: u64,
+    policy: String,
+    next_attempt: i64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalNetworkPollOutcome {
@@ -537,7 +550,7 @@ async fn resolve_policy_domains(
     resolve_policy_domains_with(policy, state, now_unix, refresh, resolve_domain_ipv4).await
 }
 
-async fn resolve_domain_ipv4(domain: String) -> Option<Vec<String>> {
+pub(crate) async fn resolve_domain_ipv4(domain: String) -> Option<Vec<String>> {
     tokio::time::timeout(
         DNS_LOOKUP_TIMEOUT,
         tokio::net::lookup_host((domain.as_str(), 0)),
@@ -1155,22 +1168,264 @@ where
         Ok(())
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub(crate) async fn refresh_retained_split_tunnel<F, Fut>(
+        &self,
+        state: &mut StoredSplitTunnelState,
+        now_unix: i64,
+        resolver: F,
+        observation: Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+        force: bool,
+    ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, CoreError>
+    where
+        F: Fn(String) -> Fut + Clone,
+        Fut: Future<Output = Option<Vec<String>>>,
+    {
+        use crate::desktop_redundancy;
+        use nelomai_client_tunnel::redundancy::{protocol::Command, session::SessionPhase};
+        let stored = self.load_runtime()?;
+        let Some(pair) = stored.desktop_redundancy.as_ref() else {
+            return Ok(None);
+        };
+        let Some(policy) = state.cached_policy.clone() else {
+            return Ok(None);
+        };
+        if pair.stop.is_some()
+            || stored.pending_compensation_stop.is_some()
+            || (!force
+                && (!policy.enabled
+                    || !policy
+                        .address_rules
+                        .iter()
+                        .any(|r| r.kind == SplitTunnelAddressRuleKind::Domain)))
+            || self.tunnel.capabilities().await?.platform != TunnelPlatform::Windows
+        {
+            return Ok(None);
+        }
+        let cancel = crate::StartCancellationEpoch(
+            self.start_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        let snapshot = match observation {
+            Some(value) => value,
+            None => {
+                let _writer = self.connection_gate.lock().await;
+                self.tunnel
+                    .desktop_redundancy_command(Command::Status {
+                        scope: desktop_redundancy::scope(pair, stored.slot)?,
+                    })
+                    .await?
+            }
+        };
+        desktop_redundancy::validate_snapshot(pair, stored.slot, &snapshot)?;
+        if snapshot.session.phase != SessionPhase::Running
+            || !snapshot.session.role_confirmed
+            || snapshot.cleanup_pending
+            || snapshot.retirement_pending
+        {
+            return Ok(None);
+        }
+        let context = DesktopDomainRefresh {
+            scope: snapshot.session.scope.clone(),
+            role: snapshot.session.role_generation,
+            network: snapshot.session.network_epoch,
+            membership: snapshot.session.membership_generation,
+            policy: policy.policy_hash.clone(),
+            next_attempt: now_unix.saturating_add(DOMAIN_REFRESH_SECONDS),
+        };
+        let previous = self.desktop_domain_refresh.lock().await.clone();
+        let same_context = previous.as_ref().is_some_and(|old| {
+            old.scope == context.scope
+                && old.role == context.role
+                && old.network == context.network
+                && old.membership == context.membership
+                && old.policy == context.policy
+        });
+        if !force
+            && same_context
+            && previous
+                .as_ref()
+                .is_some_and(|old| now_unix < old.next_attempt)
+        {
+            return Ok(None);
+        }
+        let access = self.access_snapshot().await?;
+        if stored.auth_scope.as_ref()
+            != Some(&nelomai_client_storage::RuntimeAuthScope {
+                auth_epoch: access.auth_epoch(),
+                family: access.family().into(),
+                identity: access.identity().clone(),
+            })
+        {
+            return Err(CoreError::Storage);
+        }
+        *self.desktop_domain_refresh.lock().await = Some(context);
+        let capabilities = self.tunnel.capabilities().await?;
+        let active = capabilities.address_split_tunnel
+            && split_tunnel_active(SplitTunnelContext {
+                global_enabled: policy.enabled,
+                platform: capabilities.platform,
+                android_api_level: capabilities.android_api_level,
+                layer: pair.connection.layer,
+                route_mode: pair.connection.route_mode,
+            });
+        let mut resolved_state = state.clone();
+        let resolved = if active {
+            resolve_policy_domains_with(&policy, &mut resolved_state, now_unix, true, resolver)
+                .await
+        } else {
+            DomainResolutionOutcome {
+                ipv4_cidrs: Vec::new(),
+                had_failures: false,
+                missing_cache: false,
+            }
+        };
+        if resolved.missing_cache {
+            return Err(CoreError::SplitTunnel(
+                "split_tunnel_domain_resolution_unavailable".into(),
+            ));
+        }
+        let packages = self
+            .split_tunnel_packages
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let mut options = self.with_dns_servers(
+            EffectiveSplitTunnelPolicy::build_with_resolved_domains(
+                &policy,
+                &packages,
+                capabilities,
+                pair.connection.layer,
+                pair.connection.route_mode,
+                &resolved.ipv4_cidrs,
+            )
+            .map_err(|e| CoreError::SplitTunnel(e.stable_code().into()))?
+            .options,
+        );
+        let previous_options = self.split_tunnel_options.lock().await.clone();
+        if previous_options.policy_hash == options.policy_hash {
+            let mut retained = previous_options.excluded_ipv4_cidrs.clone();
+            let mut seen = retained.iter().cloned().collect::<HashSet<_>>();
+            for cidr in &options.excluded_ipv4_cidrs {
+                if retained.len() >= MAX_IPV4_CIDRS {
+                    break;
+                }
+                if seen.insert(cidr.clone()) {
+                    retained.push(cidr.clone());
+                }
+            }
+            retained.sort();
+            options.excluded_ipv4_cidrs = retained;
+            options
+                .validate()
+                .map_err(|e| CoreError::SplitTunnel(e.stable_code().into()))?;
+        }
+        let _writer = self.connection_gate.lock().await;
+        let current = self.load_runtime()?;
+        if self.ensure_start_not_cancelled(cancel).is_err()
+            || current.auth_scope != stored.auth_scope
+            || current.desktop_redundancy != stored.desktop_redundancy
+            || current.pending_compensation_stop.is_some()
+            || self
+                .split_tunnel_store
+                .load()
+                .map_err(|_| CoreError::Storage)?
+                .cached_policy
+                .as_ref()
+                .map(|p| &p.policy_hash)
+                != Some(&policy.policy_hash)
+        {
+            return Ok(None);
+        }
+        let fresh = self
+            .tunnel
+            .desktop_redundancy_command(Command::Status {
+                scope: snapshot.session.scope.clone(),
+            })
+            .await?;
+        if fresh != snapshot {
+            return Ok(None);
+        }
+        if previous_options.has_same_effective_routes(&options) {
+            *self.split_tunnel_options.lock().await = options;
+            state.working_policy_hash = Some(policy.policy_hash);
+            state.domain_resolutions = resolved_state.domain_resolutions;
+            return Ok(Some(fresh));
+        }
+        let updated = self
+            .tunnel
+            .desktop_redundancy_command(Command::RefreshSplitTunnel {
+                scope: fresh.session.scope.clone(),
+                expected_revision: fresh.session.local_revision,
+                expected_network_epoch: fresh.session.network_epoch,
+                expected_role_generation: fresh.session.role_generation,
+                expected_membership_generation: fresh.session.membership_generation,
+                options: DesktopTunnelOptions::from_tunnel_options(&options),
+            })
+            .await?;
+        let mut expected = fresh.clone();
+        expected.session.local_revision = expected
+            .session
+            .local_revision
+            .checked_add(1)
+            .ok_or(CoreError::Storage)?;
+        if updated != expected {
+            return Err(CoreError::Tunnel("split_tunnel_refresh_unconfirmed".into()));
+        }
+        *self.split_tunnel_options.lock().await = options;
+        state.working_policy_hash = Some(policy.policy_hash);
+        state.domain_resolutions = resolved_state.domain_resolutions;
+        Ok(Some(updated))
+    }
+
     pub async fn synchronize_split_tunnel(
         &self,
         now_unix: i64,
         force_full: bool,
     ) -> Result<SplitTunnelSyncOutcome, CoreError> {
+        self.synchronize_split_tunnel_with_resolver(now_unix, force_full, resolve_domain_ipv4)
+            .await
+    }
+
+    pub(crate) async fn synchronize_split_tunnel_with_resolver<F, Fut>(
+        &self,
+        now_unix: i64,
+        force_full: bool,
+        resolver: F,
+    ) -> Result<SplitTunnelSyncOutcome, CoreError>
+    where
+        F: Fn(String) -> Fut + Clone,
+        Fut: Future<Output = Option<Vec<String>>>,
+    {
         let _guard = self.split_tunnel_gate.lock().await;
         let mut state = self
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
+        #[cfg(not(target_os = "android"))]
+        let refreshed = self
+            .refresh_retained_split_tunnel(&mut state, now_unix, resolver, None, false)
+            .await?;
+        #[cfg(target_os = "android")]
+        let refreshed: Option<()> = {
+            let _ = resolver;
+            None
+        };
+        if refreshed.is_some() {
+            self.split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage)?;
+        }
         if !force_full
             && state
                 .last_revision_check_unix
                 .is_some_and(|last| now_unix.saturating_sub(last) < REVISION_POLL_SECONDS)
         {
-            return Ok(SplitTunnelSyncOutcome::Skipped);
+            return Ok(if refreshed.is_some() {
+                SplitTunnelSyncOutcome::Updated { reconnected: false }
+            } else {
+                SplitTunnelSyncOutcome::Skipped
+            });
         }
 
         let mut access_token = self.access_snapshot().await?;
@@ -1673,6 +1928,35 @@ where
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         };
         let stored = self.load_runtime()?;
+        #[cfg(not(target_os = "android"))]
+        if stored.desktop_redundancy.is_some()
+            && self.tunnel.capabilities().await?.platform == TunnelPlatform::Windows
+        {
+            if self
+                .refresh_retained_split_tunnel(state, now_unix, resolve_domain_ipv4, None, true)
+                .await?
+                .is_none()
+            {
+                return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+            }
+            clear_policy_failure(state);
+            self.report_or_queue_apply_result(
+                access_token,
+                state,
+                SplitTunnelApplyResult {
+                    format_version: policy.format_version,
+                    revision: policy.revision,
+                    force_revision: policy.force_revision,
+                    address_revision: policy.address_revision,
+                    policy_hash: policy.policy_hash.clone(),
+                    status: SplitTunnelApplyStatus::Applied,
+                    error_code: None,
+                    applied_at: rfc3339(now_unix)?,
+                },
+            )
+            .await;
+            return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
+        }
         let configuration = stored
             .saved_connection
             .as_ref()

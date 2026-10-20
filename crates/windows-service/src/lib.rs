@@ -1072,6 +1072,24 @@ fn redundant_command_eq(
                 expected_network_epoch: be,
             },
         ) => (ar, ae) == (br, be),
+        (
+            RefreshSplitTunnel {
+                scope: _,
+                expected_revision: ar,
+                expected_network_epoch: ae,
+                expected_role_generation: ag,
+                expected_membership_generation: am,
+                options: a,
+            },
+            RefreshSplitTunnel {
+                scope: _,
+                expected_revision: br,
+                expected_network_epoch: be,
+                expected_role_generation: bg,
+                expected_membership_generation: bm,
+                options: b,
+            },
+        ) => (ar, ae, ag, am, a) == (br, be, bg, bm, b),
         (Status { scope: _ }, Status { scope: _ })
         | (Stop { scope: _ }, Stop { scope: _ })
         | (PrepareStop { scope: _ }, PrepareStop { scope: _ })
@@ -1086,6 +1104,7 @@ fn redundant_command_eq(
             | RetireInactive { .. }
             | CommitCandidate { .. }
             | ConfirmRole { .. }
+            | RefreshSplitTunnel { .. }
             | Status { .. }
             | Stop { .. }
             | PrepareStop { .. }

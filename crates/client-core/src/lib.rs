@@ -1307,6 +1307,8 @@ pub struct ClientCore<A, S, T, L> {
     dns_servers: RwLock<Vec<IpAddr>>,
     split_tunnel_warning: Mutex<SplitTunnelWarnings>,
     physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
+    #[cfg(not(target_os = "android"))]
+    desktop_domain_refresh: Mutex<Option<split_tunnel::DesktopDomainRefresh>>,
     offline_connection_quarantine: RwLock<HashSet<String>>,
     retry_policy: RetryPolicy,
 }
@@ -1374,6 +1376,8 @@ where
             split_tunnel_options: Mutex::new(TunnelOptions::default()),
             dns_servers: RwLock::new(Vec::new()),
             split_tunnel_warning: Mutex::new(SplitTunnelWarnings::default()),
+            #[cfg(not(target_os = "android"))]
+            desktop_domain_refresh: Mutex::new(None),
             physical_network_change: Mutex::new(
                 split_tunnel::PhysicalNetworkChangeDetector::default(),
             ),

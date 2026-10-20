@@ -169,6 +169,14 @@ impl NativePair for Pair {
     }
 }
 impl PairControl for Pair {
+    fn refresh_split_tunnel(
+        &mut self,
+        _: &SessionScope,
+        _: &DesktopTunnelOptions,
+    ) -> io::Result<()> {
+        self.0.borrow_mut().events.push("refresh split".into());
+        Ok(())
+    }
     fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
         let mut world = self.0.borrow_mut();
         let saved = world.saved.last().unwrap();
@@ -2894,4 +2902,66 @@ fn ambiguous_candidate_removal_retains_lease_and_fences_pair_for_cleanup() {
         assert_eq!(world.borrow().native, [false; 2]);
         assert!(!owner.snapshot().cleanup_pending);
     }
+}
+
+fn refresh_command(snapshot: &Snapshot) -> Command {
+    Command::RefreshSplitTunnel {
+        scope: snapshot.session.scope.clone(),
+        expected_revision: snapshot.session.local_revision,
+        expected_network_epoch: snapshot.session.network_epoch,
+        expected_role_generation: snapshot.session.role_generation,
+        expected_membership_generation: snapshot.session.membership_generation,
+        options: DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.9/32".into()],
+            policy_hash: Some("sha256:policy".into()),
+            ..Default::default()
+        },
+    }
+}
+#[test]
+fn live_split_refresh_keeps_original_pair_network_and_health() {
+    let (mut owner, world) = running();
+    let before = owner.snapshot();
+    world.borrow_mut().events.clear();
+    let after = owner.execute(refresh_command(&before), 1).unwrap();
+    let mut expected = before;
+    expected.session.local_revision += 1;
+    assert_eq!(after, expected);
+    assert_eq!(world.borrow().events, vec!["refresh split", "save Running"]);
+    assert!(world.borrow().closed_scopes.is_empty());
+}
+#[test]
+fn stale_live_split_refresh_has_no_native_or_session_effect() {
+    let (mut owner, world) = running();
+    let before = owner.snapshot();
+    let mut stale = refresh_command(&before);
+    if let Command::RefreshSplitTunnel {
+        expected_membership_generation,
+        ..
+    } = &mut stale
+    {
+        *expected_membership_generation += 1;
+    }
+    world.borrow_mut().events.clear();
+    assert!(owner.execute(stale, 1).is_err());
+    assert_eq!(owner.snapshot(), before);
+    assert!(world.borrow().events.is_empty());
+}
+
+#[test]
+fn lost_live_refresh_save_ack_retains_exact_cleanup_without_pair_restart() {
+    let (mut owner, world) = running();
+    let before = owner.snapshot();
+    world.borrow_mut().lose_save_ack = true;
+    world.borrow_mut().events.clear();
+    assert!(owner.execute(refresh_command(&before), 1).is_err());
+    let after = owner.snapshot();
+    assert!(after.cleanup_pending);
+    assert_eq!(after.session, before.session);
+    assert_eq!(world.borrow().events, vec!["refresh split", "save Running"]);
+    assert!(world.borrow().closed_scopes.is_empty());
+    assert!(owner.execute(refresh_command(&before), 2).is_err());
+    world.borrow_mut().lose_save_ack = false;
+    owner.execute(Command::Stop { scope: scope() }, 3).unwrap();
+    assert_eq!(world.borrow().closed_scopes, vec![scope()]);
 }

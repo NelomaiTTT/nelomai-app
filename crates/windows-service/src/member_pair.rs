@@ -1324,9 +1324,11 @@ fn remember<T>(first: &mut Option<io::Error>, result: io::Result<T>) {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct MemberParameters {
     pub source: Ipv4Addr,
     pub endpoint: IpAddr,
+    pub endpoint_port: u16,
     pub peer: [u8; 32],
     pub allowed: Vec<ipnet::IpNet>,
     pub dns: Vec<IpAddr>,
@@ -1429,6 +1431,7 @@ impl MemberParameters {
         Ok(Self {
             source: sources[0],
             endpoint: endpoint.ip(),
+            endpoint_port: endpoint.port(),
             peer: decode_peer(get("publickey")?)?,
             allowed,
             dns,

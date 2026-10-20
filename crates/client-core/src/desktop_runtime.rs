@@ -205,6 +205,30 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             }
             (stored, pair, snapshot, access)
         };
+        // The existing coordinator observes Start/role/network contexts. Refresh
+        // outside the writer; the helper revalidates the exact snapshot at CAS.
+        if let Ok(_split) = self.split_tunnel_gate.try_lock() {
+            let mut policy = self
+                .split_tunnel_store
+                .load()
+                .map_err(|_| CoreError::Storage)?;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if let Some(updated) = self
+                .refresh_retained_split_tunnel(
+                    &mut policy,
+                    now,
+                    crate::split_tunnel::resolve_domain_ipv4,
+                    Some(snapshot.clone()),
+                    false,
+                )
+                .await?
+            {
+                self.split_tunnel_store
+                    .save(&policy)
+                    .map_err(|_| CoreError::Storage)?;
+                return Ok(Some(updated));
+            }
+        }
         if pair.candidate.is_some()
             && snapshot.standby_failed
             && snapshot.primary_ready

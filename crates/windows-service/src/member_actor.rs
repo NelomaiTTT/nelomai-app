@@ -220,6 +220,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
             Command::Stop { .. } => "stop",
             Command::NetworkChanged { .. } => "network_changed",
             Command::ConfirmRole { .. } => "confirm_role",
+            Command::RefreshSplitTunnel { .. } => "refresh_split_tunnel",
         };
         let result = if let Command::Start {
             primary, options, ..

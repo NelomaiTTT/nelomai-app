@@ -1,4 +1,5 @@
-//! Owned IPv4 interface DNS. No global DNS, registry, PowerShell or WMI access.
+//! Owned IPv4 interface DNS and a separate dynamic ALE DNS-only policy.
+//! Physical DNS settings stay unchanged; no registry, PowerShell or WMI writes.
 //!
 //! Get uses Version1/Flags0. Set uses ONLY DNS_SETTING_NAMESERVER; IPv6 DNS-server
 //! configuration is deliberately unimplemented (IPv6 data traffic is unrelated).
@@ -203,5 +204,250 @@ mod tests {
             unsafe { copy_string([0xd800, 0].as_ptr()) },
             Err(DnsError::Unsupported)
         );
+    }
+}
+
+// DNS-only ALE policy has its own original dynamic BFE engine. The existing
+// static index/TUN guard and its SessionKind/lifetime remain independent.
+use super::member_carrier_guard::{
+    arbitration_for_engine, decode_dns_filter, decode_sublayer, guid as wfp_guid,
+    validate_arbitration_keys, EncodedFilter, NAME,
+};
+use crate::{
+    member_carrier_guard::{Key, Snapshot as GuardSnapshot},
+    member_dns::DnsPolicy,
+};
+use nelomai_client_tunnel::redundancy::SessionScope;
+use std::{collections::BTreeMap, io, net::IpAddr, os::windows::ffi::OsStrExt, path::Path};
+use windows_sys::Win32::{Foundation::HANDLE, NetworkManagement::WindowsFilteringPlatform::*};
+
+pub(crate) struct DnsPolicyOwner {
+    scope: SessionScope,
+    original: Option<HANDLE>,
+    app_id: Vec<u8>,
+    current: Option<DnsPolicy>,
+    ids: BTreeMap<Key, u64>,
+    failed: bool,
+}
+fn dns_status(code: u32) -> io::Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(code as i32))
+    }
+}
+fn dns_checked<T>(
+    value: impl Into<std::result::Result<T, crate::member_carrier_guard::GuardError>>,
+) -> io::Result<T> {
+    value
+        .into()
+        .map_err(|_| io::Error::other("worker_dns_policy_conflict"))
+}
+struct BfeMemory<T>(*mut T);
+impl<T> Drop for BfeMemory<T> {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { FwpmFreeMemory0(&mut self.0 as *mut _ as _) }
+        }
+    }
+}
+struct DnsTransaction(HANDLE, bool);
+impl Drop for DnsTransaction {
+    fn drop(&mut self) {
+        if !self.1 {
+            unsafe { FwpmTransactionAbort0(self.0) };
+        }
+    }
+}
+impl DnsPolicyOwner {
+    /// No filters in construction. Caller retains this owner before replace.
+    /// The path must come from the original verified pinned worker image.
+    pub(crate) fn open(scope: SessionScope, worker_image: &Path) -> io::Result<Self> {
+        let path = worker_image
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut app = ptr::null_mut();
+        dns_status(unsafe { FwpmGetAppIdFromFileName0(path.as_ptr(), &mut app) })?;
+        let memory = BfeMemory(app);
+        let blob =
+            unsafe { memory.0.as_ref() }.ok_or_else(|| io::Error::other("worker_dns_app_id"))?;
+        if blob.size == 0 || blob.size > 65536 || blob.data.is_null() {
+            return Err(io::Error::other("worker_dns_app_id"));
+        }
+        let app_id = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) }.to_vec();
+        let session = FWPM_SESSION0 {
+            flags: FWPM_SESSION_FLAG_DYNAMIC,
+            ..Default::default()
+        };
+        let mut handle = ptr::null_mut();
+        dns_status(unsafe {
+            FwpmEngineOpen0(ptr::null(), 10, ptr::null(), &session, &mut handle)
+        })?;
+        if handle.is_null() {
+            return Err(io::Error::other("worker_dns_engine"));
+        }
+        Ok(Self {
+            scope,
+            original: Some(handle),
+            app_id,
+            current: None,
+            ids: BTreeMap::new(),
+            failed: false,
+        })
+    }
+    fn handle(&self) -> io::Result<HANDLE> {
+        self.original
+            .ok_or_else(|| io::ErrorKind::NotConnected.into())
+    }
+    fn read_policy(&self, policy: &DnsPolicy) -> io::Result<()> {
+        let handle = self.handle()?;
+        let mut sub = ptr::null_mut();
+        dns_status(unsafe {
+            FwpmSubLayerGetByKey0(handle, &wfp_guid(policy.sublayer.key), &mut sub)
+        })?;
+        let memory = BfeMemory(sub);
+        let raw =
+            unsafe { memory.0.as_ref() }.ok_or_else(|| io::Error::other("worker_dns_sublayer"))?;
+        if dns_checked(unsafe { decode_sublayer(raw, policy.sublayer.key) })? != policy.sublayer {
+            return Err(io::Error::other("worker_dns_sublayer"));
+        }
+        for filter in &policy.filters {
+            let mut raw = ptr::null_mut();
+            dns_status(unsafe {
+                FwpmFilterGetByKey0(handle, &wfp_guid(filter.policy.key), &mut raw)
+            })?;
+            let memory = BfeMemory(raw);
+            let raw = unsafe { memory.0.as_ref() }
+                .ok_or_else(|| io::Error::other("worker_dns_filter"))?;
+            let actual = dns_checked(unsafe { decode_dns_filter(raw, filter) })?;
+            if self.ids.get(&filter.policy.key) != Some(&actual.id) {
+                return Err(io::Error::other("worker_dns_filter_id"));
+            }
+        }
+        let snapshot = GuardSnapshot {
+            version: 2,
+            scope: self.scope.clone(),
+            carrier: None,
+            egress: [None, None],
+            sublayer: Some(policy.sublayer.clone()),
+            filters: policy.filters.iter().map(|f| f.policy.clone()).collect(),
+        };
+        let keys = policy
+            .filters
+            .iter()
+            .map(|f| f.policy.key)
+            .collect::<Vec<_>>();
+        let inventory = dns_checked(arbitration_for_engine(handle))?;
+        dns_checked(validate_arbitration_keys(
+            &self.scope,
+            &snapshot,
+            &self.ids,
+            &inventory,
+            &[],
+            policy.sublayer.key,
+            &keys,
+        ))
+    }
+    pub(crate) fn replace(
+        &mut self,
+        tun_luid: u64,
+        bypasses: &[ipnet::Ipv4Net],
+        endpoints: &[(IpAddr, u64)],
+    ) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("worker_dns_cleanup_pending"));
+        }
+        let desired = crate::member_dns::dns_policy(
+            &self.scope,
+            tun_luid,
+            bypasses,
+            endpoints,
+            &self.app_id,
+        )?;
+        let handle = self.handle()?;
+        self.failed = true; // retain original even if any native ACK is lost
+        dns_status(unsafe { FwpmTransactionBegin0(handle, 0) })?;
+        let mut tx = DnsTransaction(handle, false);
+        if let Some(current) = &self.current {
+            self.read_policy(current)?;
+            for filter in &current.filters {
+                dns_status(unsafe {
+                    FwpmFilterDeleteByKey0(handle, &wfp_guid(filter.policy.key))
+                })?;
+            }
+        } else {
+            let mut name = NAME.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let sub = FWPM_SUBLAYER0 {
+                subLayerKey: wfp_guid(desired.sublayer.key),
+                weight: desired.sublayer.weight,
+                displayData: FWPM_DISPLAY_DATA0 {
+                    name: name.as_mut_ptr(),
+                    description: ptr::null_mut(),
+                },
+                ..Default::default()
+            };
+            dns_status(unsafe { FwpmSubLayerAdd0(handle, &sub, ptr::null_mut()) })?;
+        }
+        self.ids.clear();
+        for filter in &desired.filters {
+            let encoded = dns_checked(EncodedFilter::dns(filter))?;
+            let mut id = 0;
+            dns_status(unsafe { FwpmFilterAdd0(handle, &encoded.raw, ptr::null_mut(), &mut id) })?;
+            if id == 0 {
+                return Err(io::Error::other("worker_dns_filter_id"));
+            }
+            self.ids.insert(filter.policy.key, id);
+        }
+        self.read_policy(&desired)?;
+        dns_status(unsafe { FwpmTransactionCommit0(handle) })?;
+        tx.1 = true;
+        self.current = Some(desired);
+        #[cfg(test)]
+        if super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+            if fault.get()
+                == Some(super::member_worker_factory_native_tests::StopFault::DnsCommitAck)
+            {
+                fault.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err(io::Error::other("worker_dns_commit_ack_lost"));
+        }
+        self.failed = false;
+        self.verify()
+    }
+    pub(crate) fn verify(&mut self) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other("worker_dns_cleanup_pending"));
+        }
+        self.failed = true;
+        let handle = self.handle()?;
+        dns_status(unsafe { FwpmTransactionBegin0(handle, FWPM_TXN_READ_ONLY) })?;
+        let mut tx = DnsTransaction(handle, false);
+        self.read_policy(
+            self.current
+                .as_ref()
+                .ok_or_else(|| io::Error::other("worker_dns_not_installed"))?,
+        )?;
+        dns_status(unsafe { FwpmTransactionCommit0(handle) })?;
+        tx.1 = true;
+        self.failed = false;
+        Ok(())
+    }
+    pub(crate) fn close(&mut self) -> io::Result<()> {
+        if let Some(handle) = self.original {
+            dns_status(unsafe { FwpmEngineClose0(handle) })?;
+            self.original = None;
+        }
+        Ok(())
+    }
+}
+impl Drop for DnsPolicyOwner {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }

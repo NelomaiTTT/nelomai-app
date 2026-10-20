@@ -3341,3 +3341,31 @@ fn adapter_retired_base_cleanup_after_rundown_never_revives_forward_writes() {
         }
     }
 }
+
+#[test]
+fn dns_sdk_extensions_roundtrip_without_widening_the_foreign_decoder() {
+    let policy = crate::member_dns::dns_policy(
+        &scope(),
+        100,
+        &["8.8.4.0/24".parse().unwrap()],
+        &[("203.0.113.8".parse().unwrap(), 200)],
+        b"pinned-image",
+    )
+    .unwrap();
+    for filter in &policy.filters {
+        let mut encoded = EncodedFilter::dns(filter).unwrap();
+        encoded.raw.filterId = 17;
+        encoded.raw.effectiveWeight = encoded.raw.weight;
+        let actual = unsafe { decode_dns_filter(&encoded.raw, filter) }.unwrap();
+        let mut expected = filter.policy.clone();
+        expected.conditions.sort();
+        assert_eq!(actual.policy, expected);
+        assert_eq!(actual.id, 17);
+        if filter.prefix.is_some() || filter.app_id.is_some() {
+            assert!(unsafe {
+                decode_filter(&encoded.raw, filter.policy.key, filter.policy.sublayer)
+            }
+            .is_err());
+        }
+    }
+}

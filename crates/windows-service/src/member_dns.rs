@@ -1,7 +1,8 @@
-//! Private IPv4 DNS-server adapter for an already-owned member interface.
+//! Owned IPv4 interface DNS and ephemeral Windows DNS traffic policy.
 //!
 //! IPv6 DNS-server configuration is NOT implemented. This has no bearing on IPv6
-//! data routes/traffic. Nothing here changes routes or global/physical DNS.
+//! data routes/traffic. Physical DNS settings stay unchanged. The DNS-only
+//! ALE policy is tied to one original dynamic BFE engine and expires on crash.
 //! The enclosing owner must durably journal the baseline, expected and desired
 //! snapshots BEFORE apply, and serialize its lifecycle/writes. Windows offers no
 //! atomic DNS compare-exchange: another writer can race the final read and write.
@@ -806,5 +807,196 @@ mod tests {
             Err(DnsError::Indeterminate)
         );
         assert_eq!(s.borrow().writes, 1);
+    }
+}
+
+/// Ephemeral ALE DNS policy. These keys belong only to one original dynamic
+/// BFE handle; they are never persisted, adopted or used for foreign cleanup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DnsFilter {
+    pub policy: crate::member_carrier_guard::Filter,
+    pub prefix: Option<ipnet::Ipv4Net>,
+    pub app_id: Option<Vec<u8>>,
+}
+pub(crate) struct DnsPolicy {
+    pub sublayer: crate::member_carrier_guard::Sublayer,
+    pub filters: Vec<DnsFilter>,
+}
+pub(crate) fn dns_policy(
+    scope: &SessionScope,
+    tun_luid: u64,
+    bypasses: &[ipnet::Ipv4Net],
+    endpoints: &[(IpAddr, u64)],
+    app_id: &[u8],
+) -> std::io::Result<DnsPolicy> {
+    use crate::member_carrier_guard::{Action, Condition, Filter, Key, Layer, Sublayer};
+    use sha2::{Digest, Sha256};
+    if !scope.validate()
+        || tun_luid == 0
+        || bypasses.len() > 16384
+        || endpoints.len() > 2
+        || app_id.len() > 65536
+        || (!endpoints.is_empty() && app_id.is_empty())
+        || endpoints
+            .iter()
+            .any(|(ip, luid)| *luid == 0 || ip.is_unspecified() || ip.is_multicast())
+    {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let scope = serde_json::to_vec(scope).map_err(std::io::Error::other)?;
+    let key = |ordinal: u32| {
+        let mut hash = Sha256::new();
+        hash.update(b"nelomai-worker-dns/v1\0");
+        hash.update(&scope);
+        hash.update(ordinal.to_be_bytes());
+        Key(hash.finalize()[..16].try_into().expect("SHA256 prefix"))
+    };
+    let sublayer = Sublayer {
+        key: key(0),
+        weight: 65534,
+        flags: 0,
+    };
+    let mut filters = Vec::new();
+    let mut push = |layer, action, conditions, prefix, app_id| {
+        let ordinal = u32::try_from(filters.len() + 1).expect("bounded DNS filters");
+        filters.push(DnsFilter {
+            policy: Filter {
+                key: key(ordinal),
+                sublayer: sublayer.key,
+                layer,
+                weight: if action == Action::Permit { 2 } else { 1 },
+                flags: 0,
+                action,
+                conditions,
+            },
+            prefix,
+            app_id,
+        });
+    };
+    for layer in [Layer::AleConnectV4, Layer::AleConnectV6] {
+        for protocol in [6, 17] {
+            push(
+                layer,
+                Action::Block,
+                vec![Condition::RemotePort(53), Condition::Protocol(protocol)],
+                None,
+                None,
+            );
+        }
+        // One soft port permit covers TCP and UDP, reducing the global filter
+        // inventory below the existing cap even at the address-policy limit.
+        push(
+            layer,
+            Action::Permit,
+            vec![Condition::RemotePort(53), Condition::NextHopLuid(tun_luid)],
+            None,
+            None,
+        );
+    }
+    for prefix in ipnet::Ipv4Net::aggregate(&bypasses.to_vec()) {
+        push(
+            Layer::AleConnectV4,
+            Action::Permit,
+            vec![Condition::RemotePort(53)],
+            Some(prefix),
+            None,
+        );
+    }
+    for (ip, luid) in endpoints {
+        push(
+            if ip.is_ipv4() {
+                Layer::AleConnectV4
+            } else {
+                Layer::AleConnectV6
+            },
+            Action::Permit,
+            vec![
+                Condition::RemotePort(53),
+                Condition::Protocol(17),
+                Condition::DestinationAddress(*ip),
+                Condition::NextHopLuid(*luid),
+            ],
+            None,
+            Some(app_id.to_vec()),
+        );
+    }
+    Ok(DnsPolicy { sublayer, filters })
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::member_carrier_guard::{Action, Condition, Layer};
+    fn scope() -> SessionScope {
+        SessionScope {
+            runtime: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_generation: 10,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            connection_generation: 7,
+        }
+    }
+    #[test]
+    fn dns_policy_blocks_physical_dns_but_preserves_tun_explicit_bypass_and_pinned_crypto() {
+        let policy = dns_policy(
+            &scope(),
+            100,
+            &["8.8.4.4/32".parse().unwrap()],
+            &[("203.0.113.8".parse().unwrap(), 200)],
+            b"pinned-worker",
+        )
+        .unwrap();
+        let allowed = |ip: &str, luid: u64, proto: u8, app: &[u8]| {
+            policy
+                .filters
+                .iter()
+                .filter(|f| f.policy.layer == Layer::AleConnectV4)
+                .filter(|f| {
+                    f.prefix
+                        .is_none_or(|p| p.contains(&ip.parse::<std::net::Ipv4Addr>().unwrap()))
+                })
+                .filter(|f| f.app_id.as_deref().is_none_or(|a| a == app))
+                .filter(|f| {
+                    f.policy.conditions.iter().all(|c| match c {
+                        Condition::RemotePort(p) => *p == 53,
+                        Condition::Protocol(p) => *p == proto,
+                        Condition::NextHopLuid(l) => *l == luid,
+                        Condition::DestinationAddress(a) => a.to_string() == ip,
+                        _ => false,
+                    })
+                })
+                .max_by_key(|f| f.policy.weight)
+                .is_some_and(|f| f.policy.action == Action::Permit)
+        };
+        for proto in [6, 17] {
+            assert!(!allowed("1.1.1.1", 200, proto, b"ordinary"));
+            assert!(allowed("1.1.1.1", 100, proto, b"ordinary"));
+            assert!(allowed("8.8.4.4", 200, proto, b"ordinary"));
+            assert!(!allowed("172.20.0.1", 200, proto, b"ordinary")); // no automatic LAN DNS exemption
+        }
+        assert!(allowed("203.0.113.8", 200, 17, b"pinned-worker"));
+        assert!(!allowed("203.0.113.8", 200, 17, b"ordinary"));
+        assert!(!allowed("203.0.113.8", 201, 17, b"pinned-worker"));
+        assert!(!allowed("203.0.113.8", 200, 6, b"pinned-worker"));
+        assert!(policy.filters.iter().all(|f| f.policy.flags == 0)); // soft permits only
+        assert_eq!(
+            policy
+                .filters
+                .iter()
+                .filter(|f| f.policy.action == Action::Block)
+                .count(),
+            4
+        );
+        let other = dns_policy(
+            &SessionScope {
+                connection_generation: 8,
+                ..scope()
+            },
+            100,
+            &[],
+            &[],
+            b"pinned-worker",
+        )
+        .unwrap();
+        assert_ne!(policy.sublayer.key, other.sublayer.key);
     }
 }

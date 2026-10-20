@@ -48,6 +48,9 @@ use tauri_plugin_tunnel_android::TunnelAndroidExt;
 use tokio::sync::Mutex;
 
 const PANEL_BASE: &str = "https://nelomai.ru";
+#[cfg(windows)]
+const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(not(windows))]
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PENDING_STOP_RETRY_INTERVAL: Duration = Duration::from_secs(10);

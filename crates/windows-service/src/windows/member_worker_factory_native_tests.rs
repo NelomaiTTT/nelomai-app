@@ -35,6 +35,7 @@ pub(crate) enum StopFault {
     RoutesCleanup,
     StopReply,
     GuardWithdrawal,
+    DnsCommitAck,
 }
 thread_local! {
     pub(crate) static STOP_FAULT: std::cell::Cell<Option<StopFault>> = const { std::cell::Cell::new(None) };
@@ -481,7 +482,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
     let rounds = match role.as_deref() {
         Some("engine") => 1..2,
         Some("recover") => 2..4,
-        _ => 0..3,
+        _ => 0..4,
     };
     for round in rounds {
         let scope = SessionScope {
@@ -531,7 +532,10 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             probe: primary.probe.clone(),
         };
         let start_at = Instant::now();
-        let started = actor.redundant(Command::Start {
+        if round == 3 {
+            STOP_FAULT.with(|fault| fault.set(Some(StopFault::DnsCommitAck)));
+        }
+        let mut started = actor.redundant(Command::Start {
             scope: scope.clone(),
             primary,
             role_generation: 1,
@@ -540,6 +544,114 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             options: DesktopTunnelOptions::default(),
         });
         eprintln!("round={round} Start={:?}", start_at.elapsed());
+        if round == 3 {
+            let fault_reached = STOP_FAULT.with(|fault| fault.take().is_none());
+            let stopped = actor.redundant(Command::Stop {
+                scope: scope.clone(),
+            });
+            assert!(
+                fault_reached && started.is_err(),
+                "DNS commit ACK fault was not observed"
+            );
+            assert!(
+                !stopped
+                    .expect("same original partial DNS scope cleanup")
+                    .cleanup_pending
+            );
+            // Independent BFE lookup after original-handle close. Never remove
+            // by key or reopen a replacement policy to make this assertion pass.
+            use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+            let model = crate::member_dns::dns_policy(&scope, 1, &[], &[], &[]).unwrap();
+            let mut engine = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    FwpmEngineOpen0(
+                        std::ptr::null(),
+                        10,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        &mut engine,
+                    )
+                },
+                0
+            );
+            let mut raw = std::ptr::null_mut();
+            let code = unsafe {
+                FwpmSubLayerGetByKey0(
+                    engine,
+                    &super::member_carrier_guard::guid(model.sublayer.key),
+                    &mut raw,
+                )
+            };
+            if !raw.is_null() {
+                unsafe { FwpmFreeMemory0(&mut raw as *mut _ as _) }
+            };
+            let close = unsafe { FwpmEngineClose0(engine) };
+            assert_eq!(close, 0);
+            assert_eq!(
+                code,
+                windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND as u32
+            );
+            continue;
+        }
+        let live_refresh = (|| -> Result<(), String> {
+            let original = started.as_ref().map_err(|_| "Start failed")?.clone();
+            let directory =
+                super::member_carrier_factory_test_os::state().ok_or("private state missing")?;
+            let record = || -> Result<serde_json::Value, String> {
+                serde_json::from_slice(
+                    &std::fs::read(directory.join("nelomai-redundant-worker.json"))
+                        .map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())
+            };
+            let before = record()?;
+            let options = DesktopTunnelOptions {
+                excluded_ipv4_cidrs: vec!["203.0.113.111/32".into()],
+                policy_hash: Some("native-live-policy".into()),
+                ..Default::default()
+            };
+            let mut current = original.clone();
+            for (n, options) in [options, DesktopTunnelOptions::default()]
+                .into_iter()
+                .enumerate()
+            {
+                let updated = actor
+                    .redundant(Command::RefreshSplitTunnel {
+                        scope: scope.clone(),
+                        expected_revision: current.session.local_revision,
+                        expected_network_epoch: current.session.network_epoch,
+                        expected_role_generation: current.session.role_generation,
+                        expected_membership_generation: current.session.membership_generation,
+                        options,
+                    })
+                    .map_err(|_| "native live refresh failed")?;
+                let mut expected = current.clone();
+                expected.session.local_revision += 1;
+                if updated != expected {
+                    return Err("live refresh changed pair identity/health/epoch".into());
+                }
+                let after = record()?;
+                if before["process"] != after["process"]
+                    || before["interface"] != after["interface"]
+                {
+                    return Err("live refresh replaced original process/TUN".into());
+                }
+                let network: nelomai_client_tunnel::redundancy::network::NetworkJournal =
+                    serde_json::from_value(after["network"].clone()).map_err(|e| e.to_string())?;
+                let added=network.read_view().map_err(|e|e.to_string())?.current().any(|value|matches!(value,nelomai_client_tunnel::redundancy::network::NetworkValue::Route(r) if r.destination.to_string()=="203.0.113.111/32"));
+                if added != (n == 0) {
+                    return Err("live refresh route add/remove missing".into());
+                }
+                if n == 1 && before["network"] != after["network"] {
+                    return Err("live refresh lost original endpoint/data routes".into());
+                }
+                current = updated;
+            }
+            started = Ok(current);
+            Ok(())
+        })();
+
         if role.as_deref() == Some("engine") {
             assert_eq!(
                 started.as_ref().expect("actual engine Start").session.phase,
@@ -962,6 +1074,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         );
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
+        live_refresh.expect("same process/TUN live route add/remove through actual actor");
         starting_metrics
             .expect("A-only metrics attempted after Start")
             .expect("actual worker A-only metrics");

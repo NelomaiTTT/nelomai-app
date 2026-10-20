@@ -998,6 +998,7 @@ pub(crate) struct Control {
     common_physical: Vec<crate::member_physical::PhysicalRoute>,
     physical: Rc<RefCell<Vec<crate::member_physical::PhysicalRoute>>>,
     options: Option<DesktopTunnelOptions>,
+    dns_policy: Option<super::member_dns::DnsPolicyOwner>,
 }
 pub(crate) struct WorkerIdentity {
     pub(crate) original: Option<Rc<Original>>,
@@ -1264,6 +1265,7 @@ pub(crate) fn prepare(
             common_physical: Vec::new(),
             physical: Rc::new(RefCell::new(Vec::new())),
             options: None,
+            dns_policy: None,
         },
         Store {
             session,
@@ -1568,6 +1570,81 @@ impl Control {
         }
         Ok(())
     }
+    fn replace_dns_policy(
+        &mut self,
+        options: &DesktopTunnelOptions,
+        additional: Option<(&MemberParameters, &crate::member_physical::PhysicalRoute)>,
+    ) -> io::Result<()> {
+        self.authorize()?;
+        let p = self.original.interface.get().ok_or_else(failed)?;
+        let owned = [crate::member_physical::InterfaceIdentity {
+            index: p.index,
+            luid: p.luid,
+            guid: p.guid,
+        }];
+        let mut endpoints = Vec::new();
+        for (params, path) in self
+            .parameters
+            .iter()
+            .zip(self.bindings.iter())
+            .filter_map(|(params, path)| Some((params.as_ref()?, path.as_ref()?)))
+            .chain(additional)
+        {
+            super::member_physical::verify(path, &owned)?;
+            if params.endpoint_port == 53 {
+                endpoints.push((params.endpoint, path.proof.identity.luid));
+            }
+        }
+        endpoints.sort();
+        endpoints.dedup();
+        let bypasses = options
+            .excluded_ipv4_cidrs
+            .iter()
+            .map(|s| s.parse::<ipnet::Ipv4Net>().map_err(|_| failed()))
+            .collect::<io::Result<Vec<_>>>()?;
+        if self.dns_policy.is_none() {
+            // Retain the actual engine BEFORE the first filter effect/ACK.
+            self.dns_policy = Some(super::member_dns::DnsPolicyOwner::open(
+                self.scope.clone(),
+                &checked(self.original.source.path())?,
+            )?);
+        }
+        self.authorize()?;
+        self.dns_policy
+            .as_mut()
+            .ok_or_else(failed)?
+            .replace(p.luid, &bypasses, &endpoints)?;
+        self.authorize()
+    }
+    fn physical_snapshot(
+        &self,
+        owned: &[crate::member_physical::InterfaceIdentity],
+    ) -> io::Result<crate::member_physical::PhysicalSnapshot> {
+        let captured = super::member_physical::capture(owned)?;
+        let mut excluded = Vec::new();
+        for route in self.routes.as_ref().ok_or_else(failed)?.excluded_routes() {
+            if owned.iter().any(|p| p.index == route.interface) {
+                continue;
+            }
+            let physical = self.physical.borrow();
+            let retained = physical
+                .iter()
+                .find(|path| path.proof.identity.index == route.interface)
+                .ok_or_else(failed)?;
+            let identity = super::member_physical::read_identity(route.interface)?;
+            if identity != retained.proof.identity {
+                return Err(failed());
+            }
+            excluded.push(crate::member_routes::Row::static_route(
+                route,
+                crate::member_routes::NativeProof {
+                    index: identity.index,
+                    luid: identity.luid,
+                },
+            ));
+        }
+        captured.without_owned_rows(&excluded).map_err(|_| failed())
+    }
     fn route_values(
         &mut self,
         params: &MemberParameters,
@@ -1582,7 +1659,11 @@ impl Control {
             luid: p.luid,
             guid: p.guid,
         }];
-        let physical = super::member_physical::capture(&owned)?;
+        let physical = if self.routes.is_some() {
+            self.physical_snapshot(&owned)?
+        } else {
+            super::member_physical::capture(&owned)?
+        };
         let mut exclusions = options
             .excluded_ipv4_cidrs
             .iter()
@@ -1593,6 +1674,12 @@ impl Control {
         }
         let common = exclusions.clone();
         exclusions.push(ipnet::IpNet::from(params.endpoint));
+        exclusions.extend(
+            self.parameters
+                .iter()
+                .flatten()
+                .map(|p| ipnet::IpNet::from(p.endpoint)),
+        );
         exclusions.sort();
         exclusions.dedup();
         let mut paths = Vec::new();
@@ -2022,6 +2109,7 @@ impl PairControl for Control {
         let mut admitted = deny;
         admitted.admitted = true;
         self.guard_transition(admitted, false)?;
+        self.replace_dns_policy(options, Some((&params, &binding)))?;
         self.attach_device(member, params, &binding)?;
         self.call(
             json!({"op":"switch","slot":slot_index(member.slot)}),
@@ -2069,32 +2157,8 @@ impl PairControl for Control {
             luid: p.luid,
             guid: p.guid,
         }];
-        let captured = super::member_physical::capture(&owned)?;
-        let mut excluded = Vec::new();
-        for route in self.routes.as_ref().ok_or_else(failed)?.excluded_routes() {
-            if route.interface == p.index {
-                continue;
-            }
-            let physical = self.physical.borrow();
-            let retained = physical
-                .iter()
-                .find(|path| path.proof.identity.index == route.interface)
-                .ok_or_else(failed)?;
-            let identity = super::member_physical::read_identity(route.interface)?;
-            if identity != retained.proof.identity {
-                return Err(failed());
-            }
-            excluded.push(crate::member_routes::Row::static_route(
-                route,
-                crate::member_routes::NativeProof {
-                    index: identity.index,
-                    luid: identity.luid,
-                },
-            ));
-        }
-        let path = captured
-            .without_owned_rows(&excluded)
-            .map_err(|_| failed())?
+        let path = self
+            .physical_snapshot(&owned)?
             .resolve_host(params.endpoint)
             .map_err(|_| failed())?
             .path;
@@ -2148,8 +2212,65 @@ impl PairControl for Control {
             .as_mut()
             .ok_or_else(failed)?
             .select(active, values)?;
+        self.replace_dns_policy(
+            &self.options.clone().ok_or_else(failed)?,
+            Some((&params, &path)),
+        )?;
         self.attach_device(member, params, &path)?;
         self.check_integrity()?;
+        self.fenced = false;
+        Ok(())
+    }
+    fn refresh_split_tunnel(
+        &mut self,
+        scope: &SessionScope,
+        options: &DesktopTunnelOptions,
+    ) -> io::Result<()> {
+        if scope != &self.scope || !self.ready || self.fenced || self.stopped {
+            return Err(failed());
+        }
+        options.validate().map_err(|_| failed())?;
+        self.check_integrity()?;
+        let active = {
+            let journal = self.journal.borrow();
+            let network = journal.current.network.read_view()?;
+            if network.pending().is_some() || network.stopping() {
+                return Err(failed());
+            }
+            network.recorded_active().ok_or_else(failed)?
+        };
+        let params = self.parameters[slot_index(active)]
+            .clone()
+            .ok_or_else(failed)?;
+        // Build from fresh physical rows with our deletable bypass rows removed.
+        // Both installed crypto endpoints and the ordinary TUN data routes stay.
+        self.fenced = true;
+        let (values, paths) = self.route_values(&params, options)?;
+        {
+            let mut retained = self.physical.borrow_mut();
+            for path in paths {
+                if retained.iter().any(|old| {
+                    old.proof.identity.index == path.proof.identity.index
+                        && old.proof.identity != path.proof.identity
+                }) {
+                    return Err(failed());
+                }
+                if !retained.contains(&path) {
+                    retained.push(path);
+                }
+            }
+            if retained.len() > crate::member_plan::MAX_ROUTES {
+                return Err(failed());
+            }
+        }
+        self.fenced = true;
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .select(active, values)?;
+        self.check_integrity()?;
+        self.replace_dns_policy(options, None)?;
+        self.options = Some(options.clone());
         self.fenced = false;
         Ok(())
     }
@@ -2238,6 +2359,7 @@ impl PairControl for Control {
         self.probes[index] = None;
         self.generations[index] = None;
         self.bindings[index] = None;
+        self.replace_dns_policy(&self.options.clone().ok_or_else(failed)?, None)?;
         if !self
             .bindings
             .iter()
@@ -2266,6 +2388,9 @@ impl NativePair for Control {
     type Socket = WorkerProbe;
     fn check_integrity(&mut self) -> io::Result<()> {
         self.authorize()?;
+        if let Some(dns) = &mut self.dns_policy {
+            dns.verify()?;
+        }
         checked(
             self.guard
                 .as_ref()
@@ -2543,6 +2668,15 @@ impl NativePair for Control {
                 }
             }
         }
+        // DNS NextHop filters can pin MIB rundown too. Close this original
+        // engine with ACK before waiting for exact interface absence.
+        let mut dns_closed = true;
+        if let Some(dns) = &mut self.dns_policy {
+            if let Err(e) = dns.close() {
+                dns_closed = false;
+                error = Some(e);
+            }
+        }
         if let Some(routes) = &mut self.routes {
             #[cfg(test)]
             let interrupted = super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
@@ -2615,6 +2749,9 @@ impl NativePair for Control {
             if let Err(e) = self.original.wait_exit(deadline) {
                 error = Some(e);
             }
+        }
+        if !dns_closed {
+            return Err(error.take().unwrap_or_else(failed));
         }
         // Static index filters may themselves pin MIB rundown. Original Child
         // exit (not interface absence) authorizes exact owned filter retirement.

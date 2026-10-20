@@ -306,6 +306,27 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         self.state = confirmed;
         Ok(())
     }
+    pub(super) fn refresh_routes(
+        &mut self,
+        scope: &SessionScope,
+        apply: impl FnOnce(&mut N) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_preparation()?;
+        if !self.network_validated() {
+            return Err(fenced());
+        }
+        let mut next = self.state.clone();
+        next.routes_refreshed(scope).map_err(|_| fenced())?;
+        // An ambiguous native/CAS acknowledgement retains these originals for
+        // exact cleanup. Never restart, adopt or report the old revision as ACK.
+        self.fence_preparation();
+        apply(&mut self.native)?;
+        self.store.save(&next.snapshot())?;
+        self.state = next;
+        self.preparation_acknowledged = true;
+        self.validated = true;
+        Ok(())
+    }
     pub fn standby_installed(
         &mut self,
         ticket: MemberTicket,

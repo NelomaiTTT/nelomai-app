@@ -120,3 +120,14 @@ fn remove_standby_is_bounded_scoped_and_round_trips_without_configuration() {
             .is_err());
     }
 }
+
+#[test]
+fn live_split_refresh_has_exact_scope_generations_and_no_configuration() {
+    let wire = json!({"action":"refresh_split_tunnel", "scope":start()["scope"],
+        "expected_revision":3,"expected_network_epoch":7,"expected_role_generation":1,
+        "expected_membership_generation":2,
+        "options":{"excludedIpv4Cidrs":["203.0.113.9/32"],"excludeLocalNetworks":true,"policyHash":"sha256:policy"}});
+    let command: Command = serde_json::from_value(wire.clone()).expect("live scoped route refresh");
+    command.validate(RuntimeSlot::Latest).unwrap();
+    assert_eq!(serde_json::to_value(command).unwrap(), wire);
+}

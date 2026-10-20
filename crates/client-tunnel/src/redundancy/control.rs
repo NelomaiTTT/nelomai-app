@@ -68,6 +68,14 @@ pub trait PairControl: NativePair {
     /// before health is resumed. Native providers must join that ACK to their
     /// retained validated rebind, not infer authorization from its epoch value.
     fn complete_rebind(&mut self, scope: &SessionScope) -> io::Result<()>;
+    /// Live address policy only; no member, WFP, endpoint or uplink replacement.
+    fn refresh_split_tunnel(
+        &mut self,
+        _scope: &SessionScope,
+        _options: &DesktopTunnelOptions,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     fn cleanup_pending(&self) -> bool;
 }
 
@@ -573,6 +581,29 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
                         }
                     }
                 }
+            }
+            Command::RefreshSplitTunnel {
+                scope,
+                expected_revision,
+                expected_network_epoch,
+                expected_role_generation,
+                expected_membership_generation,
+                options,
+            } => {
+                check_fence(&state, expected_revision, expected_network_epoch)?;
+                if state.role_generation != expected_role_generation
+                    || state.membership_generation != expected_membership_generation
+                    || state.phase != SessionPhase::Running
+                    || !state.role_confirmed
+                    || !state.committed[index(state.active)]
+                    || self.stalled
+                    || self.driver.native().cleanup_pending()
+                {
+                    return Err(fenced());
+                }
+                self.driver.refresh_routes(&scope, |native| {
+                    native.refresh_split_tunnel(&scope, &options)
+                })?;
             }
             Command::NetworkChanged { scope } => {
                 self.clear_readiness();

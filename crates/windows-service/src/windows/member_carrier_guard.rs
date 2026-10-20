@@ -54,8 +54,74 @@ pub(crate) struct EncodedFilter {
 struct Backing {
     words: Vec<Box<u64>>,
     addresses: Vec<Box<FWP_BYTE_ARRAY16>>,
+    prefixes: Vec<Box<FWP_V4_ADDR_AND_MASK>>,
+    blobs: Vec<Box<FWP_BYTE_BLOB>>,
+    bytes: Vec<Vec<u8>>,
 }
 impl EncodedFilter {
+    /// DNS-only writer extension. The existing model and foreign decoder keep
+    /// rejecting these fields; only exact expected DNS rows may decode them.
+    pub(crate) fn dns(filter: &crate::member_dns::DnsFilter) -> Result<Self> {
+        if !matches!(
+            filter.policy.layer,
+            Layer::AleConnectV4 | Layer::AleConnectV6
+        ) || (filter.prefix.is_some() && filter.policy.layer != Layer::AleConnectV4)
+        {
+            return Err(GuardError::Invalid);
+        }
+        let mut encoded = Self::new(&filter.policy)?;
+        if let Some(prefix) = filter.prefix {
+            let mut value = Box::new(FWP_V4_ADDR_AND_MASK {
+                addr: u32::from_be_bytes(prefix.network().octets()),
+                mask: u32::from_be_bytes(prefix.netmask().octets()),
+            });
+            encoded._conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_V4_ADDR_MASK,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v4AddrMask: &mut *value,
+                    },
+                },
+            });
+            encoded._backing.prefixes.push(value);
+        }
+        if let Some(app_id) = &filter.app_id {
+            if app_id.is_empty() || app_id.len() > 65536 {
+                return Err(GuardError::Invalid);
+            }
+            let mut bytes = app_id.clone();
+            let mut value = Box::new(FWP_BYTE_BLOB {
+                size: bytes.len() as u32,
+                data: bytes.as_mut_ptr(),
+            });
+            encoded._conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_BLOB_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: &mut *value,
+                    },
+                },
+            });
+            encoded._backing.bytes.push(bytes);
+            encoded._backing.blobs.push(value);
+        }
+        if encoded._conditions.len() > 8
+            || encoded._conditions.iter().enumerate().any(|(i, c)| {
+                encoded._conditions[..i]
+                    .iter()
+                    .any(|p| key(p.fieldKey) == key(c.fieldKey))
+            })
+        {
+            return Err(GuardError::Invalid);
+        }
+        encoded.raw.numFilterConditions = encoded._conditions.len() as u32;
+        encoded.raw.filterCondition = encoded._conditions.as_mut_ptr();
+        Ok(encoded)
+    }
     pub(crate) fn new(filter: &Filter) -> Result<Self> {
         validate_action(filter.action, filter.flags, filter.weight)?;
         let mut backing = Backing::default();
@@ -172,6 +238,76 @@ pub(crate) unsafe fn decode_filter(
         },
         id: raw.filterId,
     })
+}
+/// Safety: same BFE-owned pointer contract as decode_filter. Extended fields
+/// are accepted ONLY with their exact original expected bytes/prefix.
+pub(crate) unsafe fn decode_dns_filter(
+    raw: &FWPM_FILTER0,
+    expected: &crate::member_dns::DnsFilter,
+) -> Result<NativeFilter> {
+    if raw.numFilterConditions == 0 || raw.numFilterConditions > 8 || raw.filterCondition.is_null()
+    {
+        return Err(GuardError::Conflict);
+    }
+    let conditions = unsafe {
+        std::slice::from_raw_parts(raw.filterCondition, raw.numFilterConditions as usize)
+    };
+    let mut base = Vec::new();
+    let mut prefix_seen = false;
+    let mut app_seen = false;
+    for condition in conditions {
+        let value = &condition.conditionValue;
+        if key(condition.fieldKey) == key(FWPM_CONDITION_ALE_APP_ID) {
+            let wanted = expected.app_id.as_ref().ok_or(GuardError::Conflict)?;
+            if app_seen
+                || condition.matchType != FWP_MATCH_EQUAL
+                || value.r#type != FWP_BYTE_BLOB_TYPE
+            {
+                return Err(GuardError::Conflict);
+            }
+            let blob = unsafe { value.Anonymous.byteBlob.as_ref() }.ok_or(GuardError::Conflict)?;
+            if blob.size as usize != wanted.len()
+                || blob.data.is_null()
+                || unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) } != wanted
+            {
+                return Err(GuardError::Conflict);
+            }
+            app_seen = true;
+        } else if key(condition.fieldKey) == key(FWPM_CONDITION_IP_REMOTE_ADDRESS)
+            && expected.prefix.is_some()
+        {
+            let wanted = expected.prefix.ok_or(GuardError::Conflict)?;
+            if prefix_seen
+                || condition.matchType != FWP_MATCH_EQUAL
+                || value.r#type != FWP_V4_ADDR_MASK
+            {
+                return Err(GuardError::Conflict);
+            }
+            let mask =
+                unsafe { value.Anonymous.v4AddrMask.as_ref() }.ok_or(GuardError::Conflict)?;
+            if mask.addr != u32::from_be_bytes(wanted.network().octets())
+                || mask.mask != u32::from_be_bytes(wanted.netmask().octets())
+            {
+                return Err(GuardError::Conflict);
+            }
+            prefix_seen = true;
+        } else {
+            base.push(*condition);
+        }
+    }
+    if prefix_seen != expected.prefix.is_some() || app_seen != expected.app_id.is_some() {
+        return Err(GuardError::Conflict);
+    }
+    let mut copy = *raw;
+    copy.numFilterConditions = base.len() as u32;
+    copy.filterCondition = base.as_mut_ptr();
+    let actual = unsafe { decode_filter(&copy, expected.policy.key, expected.policy.sublayer) }?;
+    let mut wanted = expected.policy.clone();
+    wanted.conditions.sort();
+    if actual.policy != wanted {
+        return Err(GuardError::Conflict);
+    }
+    Ok(actual)
 }
 /// Safety: display strings must be valid NUL-terminated BFE-owned memory.
 pub(crate) unsafe fn decode_sublayer(raw: &FWPM_SUBLAYER0, expected_key: Key) -> Result<Sublayer> {
@@ -1405,9 +1541,28 @@ pub(crate) fn validate_arbitration_with_keys(
     service_domains: &[crate::member_owner::ServiceDomain],
     keys: &crate::member_carrier_guard::ResourceKeys,
 ) -> Result<()> {
+    validate_arbitration_keys(
+        scope,
+        snapshot,
+        ids,
+        filters,
+        service_domains,
+        keys.sublayer,
+        &keys.filters,
+    )
+}
+pub(super) fn validate_arbitration_keys(
+    scope: &SessionScope,
+    snapshot: &Snapshot,
+    ids: &BTreeMap<Key, u64>,
+    filters: &[ArbitrationFilter],
+    service_domains: &[crate::member_owner::ServiceDomain],
+    sublayer_key: Key,
+    filter_keys: &[Key],
+) -> Result<()> {
     let sub = snapshot.sublayer.as_ref().ok_or(GuardError::Conflict)?;
     if snapshot.scope != *scope
-        || sub.key != keys.sublayer
+        || sub.key != sublayer_key
         || sub.flags != 0
         || filters.len() > MAX_ARBITRATION_FILTERS
     {
@@ -1442,7 +1597,7 @@ pub(crate) fn validate_arbitration_with_keys(
             seen_owned.insert(f.key);
         } else {
             // No own key may be crossbound into another provider's sublayer.
-            if keys.filters.contains(&f.key) {
+            if filter_keys.contains(&f.key) {
                 return Err(GuardError::Conflict);
             }
             if f.flags & FWPM_FILTER_FLAG_DISABLED == 0 && f.sublayer_weight >= sub.weight {
@@ -3030,6 +3185,88 @@ mod bfe {
             Ok(actual)
         }
     }
+    pub(crate) fn arbitration_for_engine(engine: HANDLE) -> Result<Vec<ArbitrationFilter>> {
+        let mut result = Vec::new();
+        let mut weights = BTreeMap::new();
+        for layer in [
+            Layer::TransportV4,
+            Layer::TransportV6,
+            Layer::PacketV4,
+            Layer::PacketV6,
+            Layer::ForwardV4,
+            Layer::ForwardV6,
+            Layer::AleConnectV4,
+            Layer::AleConnectV6,
+        ] {
+            let template = FWPM_FILTER_ENUM_TEMPLATE0 {
+                layerKey: layer_guid(layer),
+                enumType: FWP_FILTER_ENUM_FULLY_CONTAINED,
+                flags: FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME
+                    | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
+                actionMask: u32::MAX,
+                ..Default::default()
+            };
+            let mut enumeration = Enumeration::open(engine, &template)?;
+            loop {
+                let mut raw = ptr::null_mut();
+                let mut count = 0;
+                let code = unsafe {
+                    FwpmFilterEnum0(engine, enumeration.handle, 256, &mut raw, &mut count)
+                };
+                let memory = Memory(raw);
+                status(code)?;
+                if count > 256
+                    || (count != 0 && memory.0.is_null())
+                    || result.len() + count as usize > MAX_ARBITRATION_FILTERS
+                {
+                    return Err(GuardError::Conflict);
+                }
+                let page = if count == 0 {
+                    &[][..]
+                } else {
+                    unsafe { std::slice::from_raw_parts(memory.0, count as usize) }
+                };
+                for raw in page {
+                    let f = unsafe { raw.as_ref() }.ok_or(GuardError::Conflict)?;
+                    if key(f.layerKey) != key(template.layerKey) {
+                        return Err(GuardError::Conflict);
+                    }
+                    let subkey = key(f.subLayerKey);
+                    let weight = match weights.get(&subkey) {
+                        Some(weight) => *weight,
+                        None => {
+                            let mut raw = ptr::null_mut();
+                            let code =
+                                unsafe { FwpmSubLayerGetByKey0(engine, &f.subLayerKey, &mut raw) };
+                            let memory = Memory(raw);
+                            status(code)?;
+                            let sub = unsafe { memory.0.as_ref() }.ok_or(GuardError::Conflict)?;
+                            if key(sub.subLayerKey) != subkey {
+                                return Err(GuardError::Conflict);
+                            }
+                            weights.insert(subkey, sub.weight);
+                            sub.weight
+                        }
+                    };
+                    result.push(ArbitrationFilter {
+                        service_domain: service_filter_domain(f, layer),
+                        key: key(f.filterKey),
+                        id: f.filterId,
+                        layer,
+                        sublayer: subkey,
+                        sublayer_weight: weight,
+                        flags: f.flags,
+                        action: f.action.r#type,
+                    });
+                }
+                if count < 256 {
+                    break;
+                }
+            }
+            enumeration.close()?;
+        }
+        Ok(result)
+    }
     impl NativeApi for Wfp {
         fn begin(&mut self, kind: SessionKind, readonly: bool) -> Result<()> {
             status(unsafe {
@@ -3093,89 +3330,9 @@ mod bfe {
             // The guard already holds THIS engine's write transaction. Do not
             // open a second engine/transaction or query conditions selectively.
             let engine = self.engine(kind).handle()?;
-            let mut result = Vec::new();
-            let mut weights = BTreeMap::new();
-            for layer in [
-                Layer::TransportV4,
-                Layer::TransportV6,
-                Layer::PacketV4,
-                Layer::PacketV6,
-                Layer::ForwardV4,
-                Layer::ForwardV6,
-                Layer::AleConnectV4,
-                Layer::AleConnectV6,
-            ] {
-                let template = FWPM_FILTER_ENUM_TEMPLATE0 {
-                    layerKey: layer_guid(layer),
-                    enumType: FWP_FILTER_ENUM_FULLY_CONTAINED,
-                    flags: FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME
-                        | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
-                    actionMask: u32::MAX,
-                    ..Default::default()
-                };
-                let mut enumeration = Enumeration::open(engine, &template)?;
-                loop {
-                    let mut raw = ptr::null_mut();
-                    let mut count = 0;
-                    let code = unsafe {
-                        FwpmFilterEnum0(engine, enumeration.handle, 256, &mut raw, &mut count)
-                    };
-                    let memory = Memory(raw);
-                    status(code)?;
-                    if count > 256
-                        || (count != 0 && memory.0.is_null())
-                        || result.len() + count as usize > MAX_ARBITRATION_FILTERS
-                    {
-                        return Err(GuardError::Conflict);
-                    }
-                    let page = if count == 0 {
-                        &[][..]
-                    } else {
-                        unsafe { std::slice::from_raw_parts(memory.0, count as usize) }
-                    };
-                    for raw in page {
-                        let f = unsafe { raw.as_ref() }.ok_or(GuardError::Conflict)?;
-                        if key(f.layerKey) != key(template.layerKey) {
-                            return Err(GuardError::Conflict);
-                        }
-                        let subkey = key(f.subLayerKey);
-                        let weight = match weights.get(&subkey) {
-                            Some(weight) => *weight,
-                            None => {
-                                let mut raw = ptr::null_mut();
-                                let code = unsafe {
-                                    FwpmSubLayerGetByKey0(engine, &f.subLayerKey, &mut raw)
-                                };
-                                let memory = Memory(raw);
-                                status(code)?;
-                                let sub =
-                                    unsafe { memory.0.as_ref() }.ok_or(GuardError::Conflict)?;
-                                if key(sub.subLayerKey) != subkey {
-                                    return Err(GuardError::Conflict);
-                                }
-                                weights.insert(subkey, sub.weight);
-                                sub.weight
-                            }
-                        };
-                        result.push(ArbitrationFilter {
-                            service_domain: service_filter_domain(f, layer),
-                            key: key(f.filterKey),
-                            id: f.filterId,
-                            layer,
-                            sublayer: subkey,
-                            sublayer_weight: weight,
-                            flags: f.flags,
-                            action: f.action.r#type,
-                        });
-                    }
-                    if count < 256 {
-                        break;
-                    }
-                }
-                enumeration.close()?;
-            }
-            Ok(result)
+            arbitration_for_engine(engine)
         }
+
         fn add_sublayer(&mut self, sub: &Sublayer) -> Result<()> {
             self.subkey(sub.key)?;
             if sub.flags != 0 {
@@ -3349,7 +3506,8 @@ mod bfe {
 }
 #[cfg(windows)]
 pub(crate) use bfe::{
-    NativeGuardTerminalClose, NativeGuardTerminalFence, NativeGuardTerminalInput, Wfp,
+    arbitration_for_engine, NativeGuardTerminalClose, NativeGuardTerminalFence,
+    NativeGuardTerminalInput, Wfp,
 };
 
 #[cfg(windows)]

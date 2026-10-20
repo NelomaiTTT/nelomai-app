@@ -51,6 +51,7 @@ fn command_stage(command: &Command) -> Stage {
         Command::CommitCandidate { .. } => Stage::CommitCandidate,
         Command::ConfirmRole { .. } => Stage::ConfirmRole,
         Command::NetworkChanged { .. } => Stage::NetworkChanged,
+        Command::RefreshSplitTunnel { .. } => Stage::Policy,
     }
 }
 
