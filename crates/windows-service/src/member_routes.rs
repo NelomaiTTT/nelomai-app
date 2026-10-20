@@ -106,8 +106,13 @@ impl<R: RowIo, I: IdentityCheck> MemberRoutes<R, I> {
         }
         Ok(proof)
     }
-    fn read_proven(&mut self, destination: IpNet, proof: NativeProof) -> io::Result<Option<Row>> {
-        self.verify(proof.index, Some(proof))?;
+    fn read_proven(
+        &mut self,
+        destination: IpNet,
+        index: u32,
+        expected: Option<NativeProof>,
+    ) -> io::Result<(NativeProof, Option<Row>)> {
+        let proof = self.verify(index, expected)?;
         let rows = self.rows.read(destination, proof.index);
         self.verify(proof.index, Some(proof))?;
         let rows = rows?;
@@ -121,7 +126,7 @@ impl<R: RowIo, I: IdentityCheck> MemberRoutes<R, I> {
                 return Err(conflict());
             }
         }
-        Ok(row)
+        Ok((proof, row))
     }
     fn write(
         &mut self,
@@ -139,10 +144,8 @@ impl<R: RowIo, I: IdentityCheck> MemberRoutes<R, I> {
 impl<R: RowIo, I: IdentityCheck> NetworkSystem for MemberRoutes<R, I> {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         let (destination, index) = route_key(key)?;
-        let proof = self.verify(index, None)?;
-        Ok(self
-            .read_proven(destination, proof)?
-            .map(|r| NetworkValue::Route(r.route)))
+        let (_, row) = self.read_proven(destination, index, None)?;
+        Ok(row.map(|r| NetworkValue::Route(r.route)))
     }
     fn compare_exchange(
         &mut self,
@@ -153,8 +156,7 @@ impl<R: RowIo, I: IdentityCheck> NetworkSystem for MemberRoutes<R, I> {
         let (destination, index) = route_key(key)?;
         let before = route_value(before, destination, index)?;
         let after = route_value(after, destination, index)?;
-        let proof = self.verify(index, None)?;
-        let current = self.read_proven(destination, proof)?;
+        let (proof, current) = self.read_proven(destination, index, None)?;
         if current.as_ref().map(|r| &r.route) != before {
             return Err(conflict());
         }
@@ -172,7 +174,8 @@ impl<R: RowIo, I: IdentityCheck> NetworkSystem for MemberRoutes<R, I> {
                 self.write(proof, old, R::delete)?;
                 // A gateway is part of the native key, unlike the stable journal
                 // key. An intervening writer must not gain a second next hop.
-                if self.read_proven(destination, proof)?.is_some() {
+                let (_, remaining) = self.read_proven(destination, index, Some(proof))?;
+                if remaining.is_some() {
                     return Err(conflict());
                 }
                 self.write(proof, new, R::create)
@@ -233,6 +236,7 @@ mod tests {
     struct State {
         rows: Vec<Row>,
         writes: Vec<&'static str>,
+        events: Vec<&'static str>,
         lost_ack: Option<&'static str>,
         fail_read: bool,
     }
@@ -242,6 +246,7 @@ mod tests {
         fn finish(&self, name: &'static str) -> io::Result<()> {
             let mut s = self.0.borrow_mut();
             s.writes.push(name);
+            s.events.push(name);
             if s.lost_ack == Some(name) {
                 s.lost_ack = None;
                 return Err(io::Error::other("lost_ack"));
@@ -251,7 +256,8 @@ mod tests {
     }
     impl RowIo for Fake {
         fn read(&mut self, destination: IpNet, index: u32) -> io::Result<Vec<Row>> {
-            let s = self.0.borrow();
+            let mut s = self.0.borrow_mut();
+            s.events.push("read");
             if s.fail_read {
                 return Err(io::Error::other("query_failed"));
             }
@@ -435,10 +441,24 @@ mod tests {
         for v6 in [false, true] {
             let r = value(&route(v6));
             let key = r.key();
-            let (mut m, f) = setup(None);
+            let f = Fake::default();
+            let observed = f.clone();
+            let mut m = MemberRoutes::new(f.clone(), move |_| {
+                observed.0.borrow_mut().events.push("verify");
+                Ok(PROOF)
+            });
             assert_eq!(m.read(&key).unwrap(), None);
             m.compare_exchange(&key, None, Some(&r)).unwrap();
             assert_eq!(m.read(&key).unwrap(), Some(r.clone()));
+            assert_eq!(
+                f.0.borrow().events,
+                [
+                    "verify", "read", "verify", // independent read
+                    "verify", "read", "verify", "verify", "create", "verify", // CAS
+                    "verify", "read", "verify", // applied readback
+                ],
+                "one retained identity check before and after each native IO"
+            );
             m.compare_exchange(&key, Some(&r), None).unwrap();
             assert_eq!(m.read(&key).unwrap(), None);
             assert_eq!(f.0.borrow().writes, ["create", "delete"]);
@@ -446,18 +466,58 @@ mod tests {
     }
     #[test]
     fn metric_replacement_uses_set_gateway_replacement_delete_create() {
-        let old = route(false);
-        let (mut m, f) = setup(Some(old.clone()));
-        let mut new = old.clone();
-        new.metric = 50;
-        m.compare_exchange(&value(&old).key(), Some(&value(&old)), Some(&value(&new)))
-            .unwrap();
-        assert_eq!(f.0.borrow().writes, ["set"]);
-        let mut next = new.clone();
-        next.gateway = Some("10.0.0.1".parse().unwrap());
-        m.compare_exchange(&value(&old).key(), Some(&value(&new)), Some(&value(&next)))
-            .unwrap();
-        assert_eq!(f.0.borrow().writes, ["set", "delete", "create"]);
+        for change_after_delete in [false, true] {
+            let old = route(false);
+            let f = Fake::default();
+            f.0.borrow_mut()
+                .rows
+                .push(Row::static_route(old.clone(), PROOF));
+            let observed = f.clone();
+            let mut recycled = false;
+            let mut m = MemberRoutes::new(f.clone(), move |_| {
+                let mut state = observed.0.borrow_mut();
+                if change_after_delete && state.events.ends_with(&["delete", "verify"]) {
+                    recycled = true;
+                }
+                state.events.push("verify");
+                Ok(NativeProof {
+                    luid: if recycled { 701 } else { PROOF.luid },
+                    ..PROOF
+                })
+            });
+            let mut new = old.clone();
+            new.metric = 50;
+            m.compare_exchange(&value(&old).key(), Some(&value(&old)), Some(&value(&new)))
+                .unwrap();
+            assert_eq!(f.0.borrow().writes, ["set"]);
+            f.0.borrow_mut().events.clear();
+            let mut next = new.clone();
+            next.gateway = Some("10.0.0.1".parse().unwrap());
+            let result =
+                m.compare_exchange(&value(&old).key(), Some(&value(&new)), Some(&value(&next)));
+            if change_after_delete {
+                assert!(result.is_err());
+                assert_eq!(f.0.borrow().writes, ["set", "delete"]);
+                assert!(f.0.borrow().rows.is_empty());
+                assert_eq!(
+                    f.0.borrow().events,
+                    ["verify", "read", "verify", "verify", "delete", "verify", "verify"],
+                    "retained proof must reject reuse before the gateway read"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(f.0.borrow().writes, ["set", "delete", "create"]);
+                assert_eq!(
+                    f.0.borrow().events,
+                    [
+                        "verify", "read", "verify", // initial row
+                        "verify", "delete", "verify", // old gateway
+                        "verify", "read", "verify", // absence under original proof
+                        "verify", "create", "verify", // new gateway
+                    ]
+                );
+            }
+        }
     }
     #[test]
     fn expected_absence_never_adopts_even_identical_static_row() {
@@ -539,9 +599,15 @@ mod tests {
         assert!(m.read(&r.key()).is_err());
         assert!(m.compare_exchange(&r.key(), None, Some(&r)).is_err());
         assert!(f.0.borrow().writes.is_empty());
-        let (mut m, f) = setup(None);
+        let f = Fake::default();
+        let observed = f.clone();
+        let mut m = MemberRoutes::new(f.clone(), move |_| {
+            observed.0.borrow_mut().events.push("verify");
+            Ok(PROOF)
+        });
         f.0.borrow_mut().fail_read = true;
         assert!(m.read(&r.key()).is_err());
+        assert_eq!(f.0.borrow().events, ["verify", "read", "verify"]);
     }
     #[test]
     fn wrong_family_noncanonical_and_wrong_scope_have_no_effects() {
@@ -561,17 +627,28 @@ mod tests {
     }
     #[test]
     fn identity_change_after_read_is_not_published() {
-        let f = Fake::default();
-        let mut calls = 0;
-        let mut m = MemberRoutes::new(f.clone(), move |_| {
-            calls += 1;
-            Ok(NativeProof {
-                luid: if calls == 1 { 700 } else { 701 },
-                ..PROOF
-            })
-        });
-        assert!(m.read(&value(&route(false)).key()).is_err());
-        assert!(f.0.borrow().writes.is_empty());
+        for compare_exchange in [false, true] {
+            let f = Fake::default();
+            let observed = f.clone();
+            let mut m = MemberRoutes::new(f.clone(), move |_| {
+                Ok(NativeProof {
+                    luid: if observed.0.borrow().events.contains(&"read") {
+                        701
+                    } else {
+                        PROOF.luid
+                    },
+                    ..PROOF
+                })
+            });
+            let r = value(&route(false));
+            if compare_exchange {
+                assert!(m.compare_exchange(&r.key(), None, Some(&r)).is_err());
+            } else {
+                assert!(m.read(&r.key()).is_err());
+            }
+            assert_eq!(f.0.borrow().events, ["read"]);
+            assert!(f.0.borrow().writes.is_empty());
+        }
     }
     #[test]
     fn changed_identity_after_write_is_error_with_effect_retained_for_readback() {
