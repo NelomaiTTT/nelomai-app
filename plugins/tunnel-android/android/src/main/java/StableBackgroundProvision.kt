@@ -2,6 +2,7 @@ package ru.nelomai.tunnel
 
 import android.content.Context
 import org.json.JSONObject
+import java.util.UUID
 
 /** Container compatibility for the immutable 0.2.20 credential store. Run in
  * :vpn, before constructing its engine, so no old executor or preferences cache
@@ -18,7 +19,8 @@ object StableBackgroundProvision {
         engineLoaded: Boolean, nowMillis: Long): Boolean {
         require(request.toByteArray().size <= 65536)
         val input = JSONObject(request)
-        val operation = NativeOwnerOperation.fromJson(JSONObject(input.getString("owner_operation")))
+        val owner = JSONObject(input.getString("owner_operation"))
+        val operation = NativeOwnerOperation.fromJson(owner)
         val scope = operation.scope
         require(scope.slot == "stable" && scope.runtimeVersion == "0.2.20")
         require(operation.expiresAtUnixMs > nowMillis)
@@ -43,13 +45,26 @@ object StableBackgroundProvision {
         require(input.getString("access_token").isNotBlank())
         require(current.installSecret != null && current.installSecret == input.getString("install_secret"))
         require(operation.attempt > current.ownerAttempt)
-        require(current.ownerCancelEpoch == null && current.logoutState == null &&
-            current.pending == null && current.reservation == null && current.cleanupCredential == null)
+        require(current.ownerCancelEpoch == null && current.logoutState == null && current.cleanupCredential == null)
+        if (current.pending != null || current.reservation != null) {
+            // These IDs come only from the protected common owner's exact CLEAN
+            // receipt + completed resume. That server transaction revokes all
+            // old normal tokens and staged issuance. A local slot change, timeout
+            // or predecessor scope alone does not authorize dropping a mutation.
+            val proof = owner.getJSONObject("provision_predecessor")
+            for (field in listOf("reconcile_operation_id", "resume_operation_id")) {
+                val id = proof.optString(field)
+                require(UUID.fromString(id).toString() == id)
+            }
+            require(retained.runtimeContractVersion == scope.runtimeContractVersion)
+        }
         if (engineLoaded) return false
-        // The completed transition revoked the predecessor's tokens. Drop only
-        // settled token projections; provisioning must issue with the new bearer.
+        // Only after physical engine exit can no late old HTTP executor write
+        // its revoked result. Retire the confirmed old projections atomically;
+        // immutable stable must provision again with the current bearer.
         val prepared = current.copy(revision = Math.addExact(current.revision, 1),
-            ownerScope = scope, ownerOperation = null, active = null, previous = null)
+            ownerScope = scope, ownerOperation = null, active = null, previous = null,
+            pending = null, reservation = null)
         val bytes = BackgroundCredentialEnvelopeCodec.encode(prepared)
         try { check(backend.write(bytes)) { "background_credential_persist_failed" } }
         finally { bytes.fill(0) }

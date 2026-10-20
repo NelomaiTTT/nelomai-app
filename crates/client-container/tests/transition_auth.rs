@@ -678,6 +678,14 @@ async fn resumed_native_provision_carries_only_the_owner_confirmed_predecessor()
     let source = broker.transition_source().await.unwrap();
     let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
     broker.reconcile_transition(frozen.clone()).await.unwrap();
+    // CLEAN alone did not yet revoke normal credentials: no resume proof may
+    // be issued until the exact server resume is durably confirmed.
+    assert!(port(broker.clone(), &store, root.path())
+        .provision_background(|_| async move {
+            panic!("native issuance before confirmed runtime resume")
+        })
+        .await
+        .is_err());
     broker
         .resume_transition(ResumeArguments {
             operation_id: "22222222-2222-4222-8222-222222222222".into(),
@@ -692,7 +700,9 @@ async fn resumed_native_provision_carries_only_the_owner_confirmed_predecessor()
     drop(broker);
     let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
     let expected = json!({"auth_epoch":source.auth_epoch(), "family":source.family(),
-        "device_id":source.device_id(), "identity":source.identity()});
+        "device_id":source.device_id(), "identity":source.identity(),
+        "reconcile_operation_id":frozen.request().operation_id,
+        "resume_operation_id":"22222222-2222-4222-8222-222222222222"});
     let resumed_port = port(broker.clone(), &store, root.path());
     for _ in 0..2 {
         resumed_port

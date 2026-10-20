@@ -40,6 +40,8 @@ struct NativeProvisionPredecessor {
     family: String,
     device_id: String,
     identity: nelomai_contracts::RuntimeIdentity,
+    reconcile_operation_id: String,
+    resume_operation_id: String,
 }
 
 impl NativeProvisionPredecessor {
@@ -52,6 +54,8 @@ impl NativeProvisionPredecessor {
             .iter()
             .find(|entry| entry.reconcile_operation_id == resume.reconcile_operation_id)?;
         let source = authority.source_identity.as_ref()?;
+        let receipt = authority.reconcile_receipt.as_ref()?;
+        let evidence = authority.resume_evidence.as_ref()?;
         // All records were validated by the protected store. Additionally bind
         // the retained receipt to this current login, device and exact resume.
         if done.request.auth_epoch != auth.auth_epoch
@@ -59,7 +63,11 @@ impl NativeProvisionPredecessor {
             || meta.confirmed_device_id.as_deref() != Some(authority.source_device_id.as_str())
             || auth.confirmed_identity.as_ref() != Some(&done.identity)
             || authority.resume_ticket.as_ref() != Some(&done.request)
-            || authority.resume_evidence.as_ref()?.identity != done.identity
+            || evidence.identity != done.identity
+            || evidence.operation_id != done.request.operation_id
+            || evidence.reconcile_operation_id != authority.reconcile_operation_id
+            || receipt.state != "clean"
+            || receipt.operation_id != authority.reconcile_operation_id
             || authority.superseded_by.is_some()
             || source.session_generation? >= done.identity.session_generation?
         {
@@ -70,6 +78,10 @@ impl NativeProvisionPredecessor {
             family: authority.source_family.clone(),
             device_id: authority.source_device_id.clone(),
             identity: source.clone(),
+            // Native-only proof that normal credentials and staged issuance
+            // were revoked by this completed server resume, not a local toggle.
+            reconcile_operation_id: receipt.operation_id.clone(),
+            resume_operation_id: evidence.operation_id.clone(),
         })
     }
 }

@@ -72,6 +72,29 @@ class StableBackgroundDispatcherTest {
         controller.destroy()
     }
 
+    @Test fun completedResumeCanRetireAnOldReservationBeforeLoadingStable() {
+        val retained = JSONObject(String(StableEnvelopeIoShadow.bytes!!))
+        retained.put("reservation", JSONObject().put("mutationId", "old-prepare")
+            .put("activationOperationId", "old-activate").put("deviceId", device)
+            .put("expiresAtUnix", 3000))
+        StableEnvelopeIoShadow.bytes = retained.toString().toByteArray()
+        val input = JSONObject(request())
+        val operation = JSONObject(input.getString("owner_operation"))
+        operation.getJSONObject("provision_predecessor")
+            .put("reconcile_operation_id", "44444444-4444-4444-8444-444444444444")
+            .put("resume_operation_id", "55555555-5555-4555-8555-555555555555")
+        input.put("owner_operation", operation.toString())
+        val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        val (code, data) = dispatch(controller.get(), input.toString())
+        assertEquals(1, code)
+        assertFalse(data!!.getBoolean("restart_required"))
+        val saved = JSONObject(String(StableEnvelopeIoShadow.bytes!!))
+        assertEquals(9L, saved.getJSONObject("ownerScope").getJSONObject("identity").getLong("session_generation"))
+        assertFalse(saved.has("reservation"))
+        assertFalse(saved.has("active"))
+        controller.destroy()
+    }
+
     @Test fun staleSelectionAndPendingTransitionNeverMutateTheRecord() {
         val before = StableEnvelopeIoShadow.bytes!!.clone()
         val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
