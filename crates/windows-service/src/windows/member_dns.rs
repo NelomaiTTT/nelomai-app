@@ -315,7 +315,7 @@ impl DnsPolicyOwner {
         if self.failed {
             return Err(io::Error::other("worker_dns_cleanup_pending"));
         }
-        let desired = crate::member_dns::dns_policy(
+        let mut desired = crate::member_dns::dns_policy(
             &self.scope,
             tun_luid,
             bypasses,
@@ -328,6 +328,7 @@ impl DnsPolicyOwner {
         let mut tx = DnsTransaction(handle, false);
         if let Some(current) = &self.current {
             self.read_policy(current)?;
+            desired.sublayer.weight = current.sublayer.weight;
             for filter in &current.filters {
                 dns_status(unsafe {
                     FwpmFilterDeleteByKey0(handle, &wfp_guid(filter.policy.key))
@@ -345,6 +346,29 @@ impl DnsPolicyOwner {
                 ..Default::default()
             };
             dns_status(unsafe { FwpmSubLayerAdd0(handle, &sub, ptr::null_mut()) })?;
+            // Capture BFE's assigned priority only after creating this original
+            // sublayer, inside the same write transaction. Later reads remain
+            // exact comparisons against this retained native value.
+            let mut raw = ptr::null_mut();
+            dns_status(unsafe {
+                FwpmSubLayerGetByKey0(handle, &wfp_guid(desired.sublayer.key), &mut raw)
+            })?;
+            let memory = BfeMemory(raw);
+            let actual = dns_checked(unsafe {
+                decode_sublayer(
+                    memory
+                        .0
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("worker_dns_sublayer"))?,
+                    desired.sublayer.key,
+                )
+            })?;
+            #[cfg(test)]
+            super::member_carrier_factory_test_os::trace_step(&format!(
+                "worker DNS created sublayer requested_weight={} assigned_weight={}",
+                desired.sublayer.weight, actual.weight,
+            ));
+            desired.sublayer = actual;
         }
         self.ids.clear();
         for filter in &desired.filters {
