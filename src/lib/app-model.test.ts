@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   bindingPreferenceUpdateRequest,
-  bindingPreferencesMatch,
   bindingRequest,
   connectionEgressMode,
   connectionView,
@@ -72,7 +71,7 @@ describe("bindingRequest", () => {
   });
 });
 
-describe("bindingPreferencesMatch", () => {
+describe("bindingPreferenceUpdateRequest", () => {
   const binding = {
     id: "binding-1",
     peer_id: "peer-15",
@@ -84,30 +83,6 @@ describe("bindingPreferencesMatch", () => {
     route_mode: "via_tak",
     egress_mode: "ipv4",
   } as const;
-
-  it("does not synchronize a dynamic egress preference through the personal peer binding", () => {
-    expect(
-      bindingPreferencesMatch(
-        binding,
-        "tic",
-        "dynamic",
-        "via_tak",
-        "prefer_ipv6",
-      ),
-    ).toBe(true);
-  });
-
-  it("still requires an exact egress mode for a personal Tic binding", () => {
-    expect(
-      bindingPreferencesMatch(
-        { ...binding, tic_connection_mode: "personal" },
-        "tic",
-        "personal",
-        "via_tak",
-        "prefer_ipv6",
-      ),
-    ).toBe(false);
-  });
 
   it("hands a changed binding to the connection start owner instead of applying it early", () => {
     expect(
@@ -126,15 +101,25 @@ describe("bindingPreferencesMatch", () => {
       route_mode: "via_tak",
       egress_mode: "prefer_ipv6",
     });
+  });
+
+  it("reasserts unchanged preferences with the existing binding ID", () => {
     expect(
       bindingPreferenceUpdateRequest(
         binding,
         "tic",
         "dynamic",
         "via_tak",
-        "prefer_ipv6",
+        "ipv4",
       ),
-    ).toBeNull();
+    ).toEqual({
+      peer_id: "peer-15",
+      expected_binding_id: binding.id,
+      preferred_layer: "tic",
+      tic_connection_mode: "dynamic",
+      route_mode: "via_tak",
+      egress_mode: "ipv4",
+    });
   });
 });
 

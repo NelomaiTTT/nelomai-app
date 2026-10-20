@@ -6,6 +6,7 @@ import { beginConnectionStart, beginConnectionStop, initialConnectionActionState
   beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction,
   finishConnectionStart, finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
+import { bindingPreferenceUpdateRequest, connectionEgressMode } from "./app-model";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -242,6 +243,197 @@ describe("binding changed outside the open UI", () => {
   });
 });
 
+
+describe("binding preferences across native Start", () => {
+  function bindingFixture() {
+    const { context } = fixture();
+    let server = { id: "binding-1", peer_id: "peer-1", preferred_layer: "stray",
+      tic_connection_mode: "dynamic", route_mode: "standalone", egress_mode: "ipv4" };
+    const requests: any[] = [];
+    const c: any = Object.assign(context, {
+      startupRetry: { cancel: () => {} }, pinnedStray: null,
+      bootstrap: { device: { id: "own-device", platform: "android" }, binding: { ...server } },
+      connectionAction: "start", runtimeStatus: null, splitTunnelBlocksStart: false,
+      runtimeStartBlocked: () => false, selectedLayer: "tic", ticConnectionMode: "dynamic",
+      routeMode: "via_tak", selectedEgressMode: "ipv4", antivirusStartFailure: false,
+      appPreferences: { dynamicTicEgressMode: "ipv4", personalTicEgressMode: "ipv4" },
+      prepareConnectionStartForPlatform, canBeginConnectionAction, beginConnectionStart,
+      beginConnectionStop, finishConnectionStart, finishConnectionStop,
+      connectionEgressMode, bindingPreferenceUpdateRequest,
+      waitForSettlement: async () => {}, START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS: 10,
+      restore: async () => {},
+    });
+    c.pendingBindingPreferenceRequest = () => executePageFunction("pendingBindingPreferenceRequest", c);
+    Object.assign(c.nativeClient, {
+      prepareTunnel: async () => {},
+      start: async (request: any) => {
+        requests.push(request);
+        if (request.bindingRequest) {
+          expect(request.bindingRequest.expected_binding_id).toBe(server.id);
+          expect(request.bindingRequest.peer_id).toBe(server.peer_id);
+          server = { ...server, ...request.bindingRequest };
+        }
+        return { status: "connected", connection: { layer: request.layer }, nextRetryAtUnix: null };
+      },
+      stop: async () => null,
+      state: async () => ({ phase: "ready", connection: null, connectionIntentStatus: "none" }),
+      queueStartFailureDiagnostics: async () => {},
+    });
+    return { c, requests, get server() { return server; } };
+  }
+
+  it.each(["connected", "recovering", "failed"])("saves the return to Stray after %s Start", async (outcome) => {
+    const f = bindingFixture();
+    const start = f.c.nativeClient.start;
+    f.c.nativeClient.start = async (request: any) => {
+      const result = await start(request); // Binding can commit before the tunnel outcome.
+      if (f.requests.length !== 1) return result;
+      if (outcome === "failed") throw { code: "temporarily_unavailable" };
+      return { ...result, status: outcome };
+    };
+    await toggle(f.c);
+    expect(f.server.preferred_layer).toBe("tic");
+    f.c.connectionAction = "stop";
+    await toggle(f.c);
+    f.c.connectionAction = "start";
+    f.c.selectedLayer = "stray";
+    f.c.routeMode = "standalone";
+    await toggle(f.c);
+    expect(f.requests[1].bindingRequest).toMatchObject({ preferred_layer: "stray",
+      expected_binding_id: "binding-1", peer_id: "peer-1" });
+    expect(f.server.preferred_layer).toBe("stray");
+    expect(f.c.error).toBeNull();
+  });
+
+  it("does not skip restoring dynamic Tic after a personal Start", async () => {
+    const f = bindingFixture();
+    Object.assign(f.c.bootstrap.binding, { preferred_layer: "tic", route_mode: "via_tak" });
+    f.c.ticConnectionMode = "personal";
+    await toggle(f.c);
+    f.c.connectionAction = "stop";
+    await toggle(f.c);
+    f.c.connectionAction = "start";
+    f.c.ticConnectionMode = "dynamic";
+    await toggle(f.c);
+    expect(f.requests[1].bindingRequest?.tic_connection_mode).toBe("dynamic");
+    expect(f.server.tic_connection_mode).toBe("dynamic");
+  });
+
+  it("saves the desired mode even when a native bind changed it after bootstrap", async () => {
+    const f = bindingFixture();
+    f.server.preferred_layer = "tic";
+    f.server.route_mode = "via_tak";
+    f.c.selectedLayer = "stray";
+    f.c.routeMode = "standalone";
+    await toggle(f.c);
+    expect(f.server.preferred_layer).toBe("stray");
+    expect(f.requests[0].bindingRequest).toMatchObject({ expected_binding_id: "binding-1",
+      peer_id: "peer-1", preferred_layer: "stray" });
+  });
+
+  it("does not dispatch Start if preparation was cancelled", async () => {
+    const f = bindingFixture();
+    f.c.nativeClient.prepareTunnel = async () => {
+      f.c.connectionActionState = beginConnectionStop(f.c.connectionActionState).state;
+    };
+    await toggle(f.c);
+    expect(f.requests).toHaveLength(0);
+  });
+
+  it.each([
+    ["connecting", "recovering"], ["connected", "none"],
+    ["error", "blocked_terminal"], ["ready", "none"],
+  ])("restores Stray after UI recreation while native state is %s/%s", async (phase, intentStatus) => {
+    const first = bindingFixture();
+    const commitBinding = first.c.nativeClient.start;
+    let pendingRequest: any;
+    first.c.nativeClient.start = async (request: any) => {
+      pendingRequest = request;
+      return { status: "recovering", connection: null, nextRetryAtUnix: 42 };
+    };
+    await toggle(first.c);
+    expect(first.server.preferred_layer).toBe("stray");
+
+    // A different page instance bootstraps before the independent native bind
+    // commits. The state reply alone cannot prove which preferences were saved.
+    const second = bindingFixture();
+    let nativePhase = phase;
+    Object.assign(second.c, { startupPending: false,
+      refreshUpdateStatus: () => {}, refreshNotifications: () => {},
+      refreshRuntimeStatus: async () => {}, refreshProbes: async () => {},
+    });
+    second.c.nativeClient.state = async () => ({ phase: nativePhase, connection: null,
+      connectionIntentStatus: intentStatus, nextRetryAtUnix: null });
+    await executePageFunction("applyBootstrap", second.c, {
+      ...second.c.bootstrap, defaults: { layer: "stray", tic_connection_mode: "dynamic", route_mode: "standalone" },
+      access: { can_connect: true, state: "active" }, update: { required: false }, pinned_stray: null,
+    });
+    await commitBinding(pendingRequest);
+    expect(first.server.preferred_layer).toBe("tic");
+    second.c.nativeClient.stop = async () => { nativePhase = "ready"; return null; };
+    second.c.connectionAction = "stop";
+    await toggle(second.c);
+    let repeatedRequest: any;
+    second.c.nativeClient.start = async (request: any) => {
+      repeatedRequest = request;
+      nativePhase = "connected";
+      return commitBinding(request);
+    };
+    second.c.connectionAction = "start";
+    await toggle(second.c);
+    expect(first.server.preferred_layer).toBe("stray");
+    expect(repeatedRequest.bindingRequest).toMatchObject({ expected_binding_id: "binding-1",
+      peer_id: "peer-1", preferred_layer: "stray" });
+    expect(second.c.error).toBeNull();
+  });
+
+  it("retries the desired preferences even if a rejected Start did not commit the bind", async () => {
+    const f = bindingFixture();
+    const start = f.c.nativeClient.start;
+    f.c.nativeClient.start = async () => { throw { code: "temporarily_unavailable" }; };
+    await toggle(f.c);
+    expect(f.server.preferred_layer).toBe("stray");
+    f.c.nativeClient.start = start;
+    f.c.selectedLayer = "stray";
+    f.c.routeMode = "standalone";
+    await toggle(f.c);
+    expect(f.requests[0].bindingRequest).toMatchObject({ preferred_layer: "stray",
+      expected_binding_id: "binding-1" });
+  });
+
+  it("never constructs a new binding or reuses an old binding ID from uncertain preferences", async () => {
+    const f = bindingFixture();
+    await toggle(f.c);
+    f.c.bootstrap = { device: { id: "another-device", platform: "android" }, binding: null };
+    expect(f.c.pendingBindingPreferenceRequest()).toBeNull();
+    f.c.bootstrap.binding = { ...f.server, id: "binding-2", peer_id: "peer-2" };
+    expect(f.c.pendingBindingPreferenceRequest()).toMatchObject({ expected_binding_id: "binding-2",
+      peer_id: "peer-2" });
+  });
+
+  it("does not trust the old snapshot after Stop overtakes a dispatched Start", async () => {
+    const f = bindingFixture();
+    let finish!: (value: unknown) => void;
+    let dispatched!: () => void;
+    const started = new Promise<void>(resolve => { dispatched = resolve; });
+    const start = f.c.nativeClient.start;
+    f.c.nativeClient.start = async (request: any) => {
+      await start(request);
+      return new Promise(resolve => { finish = resolve; dispatched(); });
+    };
+    const pending = toggle(f.c);
+    await started;
+    f.c.connectionActionState = beginConnectionStop(f.c.connectionActionState).state;
+    f.c.phase = "stopping";
+    finish({ status: "connected", connection: { layer: "tic" }, nextRetryAtUnix: null });
+    await pending;
+    expect(f.c.phase).toBe("stopping");
+    f.c.selectedLayer = "stray";
+    f.c.routeMode = "standalone";
+    expect(f.c.pendingBindingPreferenceRequest()).toMatchObject({ preferred_layer: "stray",
+      expected_binding_id: "binding-1" });
+  });
+});
 
 describe("desktop async Stop", () => {
   it("keeps stopping until the authoritative state reply", async () => {
