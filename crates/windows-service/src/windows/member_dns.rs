@@ -163,50 +163,6 @@ fn status(code: u32) -> Result<()> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Pure construction/copy tests only: no Get/Set/conversion/Free calls.
-    #[test]
-    fn requests_never_select_ipv6_or_populate_unrelated_fields() {
-        let read = read_request();
-        assert_eq!(read.Version, 1);
-        assert_eq!(read.Flags, 0);
-        assert!(read.NameServer.is_null());
-        let mut text = [b'9' as u16, 0];
-        let write = write_request(text.as_mut_ptr());
-        assert_eq!(write.Version, 1);
-        assert_eq!(write.Flags, 2);
-        assert_eq!(write.NameServer, text.as_mut_ptr());
-        assert!(write.Domain.is_null());
-        assert!(write.SearchList.is_null());
-        assert!(write.ProfileNameServer.is_null());
-        assert_eq!(write.RegistrationEnabled, 0);
-        assert_eq!(write.RegisterAdapterName, 0);
-        assert_eq!(write.EnableLLMNR, 0);
-        assert_eq!(write.QueryAdapterName, 0);
-    }
-
-    #[test]
-    fn copies_null_empty_and_unicode_without_owning_the_source() {
-        assert_eq!(unsafe { copy_string(ptr::null()) }.unwrap(), None);
-        assert_eq!(
-            unsafe { copy_string([0].as_ptr()) }.unwrap(),
-            Some(String::new())
-        );
-        let text: Vec<u16> = "пример.invalid".encode_utf16().chain(Some(0)).collect();
-        assert_eq!(
-            unsafe { copy_string(text.as_ptr()) }.unwrap().as_deref(),
-            Some("пример.invalid")
-        );
-        assert_eq!(
-            unsafe { copy_string([0xd800, 0].as_ptr()) },
-            Err(DnsError::Unsupported)
-        );
-    }
-}
-
 // DNS-only ALE policy has its own original dynamic BFE engine. The existing
 // static index/TUN guard and its SessionKind/lifetime remain independent.
 use super::member_carrier_guard::{
@@ -449,5 +405,49 @@ impl DnsPolicyOwner {
 impl Drop for DnsPolicyOwner {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure construction/copy tests only: no Get/Set/conversion/Free calls.
+    #[test]
+    fn requests_never_select_ipv6_or_populate_unrelated_fields() {
+        let read = read_request();
+        assert_eq!(read.Version, 1);
+        assert_eq!(read.Flags, 0);
+        assert!(read.NameServer.is_null());
+        let mut text = [b'9' as u16, 0];
+        let write = write_request(text.as_mut_ptr());
+        assert_eq!(write.Version, 1);
+        assert_eq!(write.Flags, 2);
+        assert_eq!(write.NameServer, text.as_mut_ptr());
+        assert!(write.Domain.is_null());
+        assert!(write.SearchList.is_null());
+        assert!(write.ProfileNameServer.is_null());
+        assert_eq!(write.RegistrationEnabled, 0);
+        assert_eq!(write.RegisterAdapterName, 0);
+        assert_eq!(write.EnableLLMNR, 0);
+        assert_eq!(write.QueryAdapterName, 0);
+    }
+
+    #[test]
+    fn copies_null_empty_and_unicode_without_owning_the_source() {
+        assert_eq!(unsafe { copy_string(ptr::null()) }.unwrap(), None);
+        assert_eq!(
+            unsafe { copy_string([0].as_ptr()) }.unwrap(),
+            Some(String::new())
+        );
+        let text: Vec<u16> = "пример.invalid".encode_utf16().chain(Some(0)).collect();
+        assert_eq!(
+            unsafe { copy_string(text.as_ptr()) }.unwrap().as_deref(),
+            Some("пример.invalid")
+        );
+        assert_eq!(
+            unsafe { copy_string([0xd800, 0].as_ptr()) },
+            Err(DnsError::Unsupported)
+        );
     }
 }

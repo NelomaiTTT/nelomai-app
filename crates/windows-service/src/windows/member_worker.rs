@@ -1606,7 +1606,7 @@ impl Control {
             // Retain the actual engine BEFORE the first filter effect/ACK.
             self.dns_policy = Some(super::member_dns::DnsPolicyOwner::open(
                 self.scope.clone(),
-                &checked(self.original.source.path())?,
+                checked(self.original.source.path())?,
             )?);
         }
         self.authorize()?;
