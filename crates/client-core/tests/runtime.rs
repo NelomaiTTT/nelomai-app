@@ -2402,6 +2402,15 @@ async fn desktop_pair_physical_poll_skips_legacy_fingerprint_and_reconnect() {
     assert_eq!(core.state().await.phase, Phase::Connected);
     let pair = store.value.lock().unwrap().desktop_redundancy.clone();
     assert!(pair.is_some());
+    assert!(
+        !tunnel
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call == "fingerprint"),
+        "desktop pair Start must not query the legacy fingerprint"
+    );
     tunnel.commands.lock().unwrap().clear();
     let starts = api.start_calls.load(Ordering::SeqCst);
     for now in [1_700_000_030, 1_700_000_060] {

@@ -2746,9 +2746,13 @@ where
                 return Err(compensation_error.unwrap_or(error));
             }
         }
-        let applied_physical_network_fingerprint = self
-            .initialize_physical_network_detector(&tunnel_options)
-            .await;
+        let applied_physical_network_fingerprint = if start_policy.desktop_pair {
+            self.physical_network_change.lock().await.reset();
+            None
+        } else {
+            self.initialize_physical_network_detector(&tunnel_options)
+                .await
+        };
         let mut state = self.state.lock().await;
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             drop(state);
