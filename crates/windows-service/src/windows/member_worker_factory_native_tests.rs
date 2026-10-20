@@ -530,6 +530,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             ),
             probe: primary.probe.clone(),
         };
+        let start_at = Instant::now();
         let started = actor.redundant(Command::Start {
             scope: scope.clone(),
             primary,
@@ -538,6 +539,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             warm_stop_v1: true,
             options: DesktopTunnelOptions::default(),
         });
+        eprintln!("round={round} Start={:?}", start_at.elapsed());
         if role.as_deref() == Some("engine") {
             assert_eq!(
                 started.as_ref().expect("actual engine Start").session.phase,
@@ -836,7 +838,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             .ok()?;
             Some((identity, network))
         });
-        let interface_mtu = retained.as_ref().and_then(|(proof, _)| {
+        let interface_settings = retained.as_ref().and_then(|(proof, _)| {
             let mut row = MIB_IPINTERFACE_ROW::default();
             unsafe { InitializeIpInterfaceEntry(&mut row) };
             row.Family = AF_INET;
@@ -845,7 +847,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             (unsafe { GetIpInterfaceEntry(&mut row) } == 0
                 && row.InterfaceIndex == proof.index
                 && unsafe { row.InterfaceLuid.Value } == proof.luid)
-                .then_some(row.NlMtu)
+                .then_some((row.NlMtu, row.DadTransmits))
         });
         // Read-only independent observer. This HANDLE cannot authorize cleanup;
         // production retains its OWN original Child HANDLE from process creation.
@@ -948,7 +950,16 @@ fn worker_factory_start_stop_fresh_child_repeat() {
             "local Stop elapsed {elapsed:?}"
         );
         assert_eq!(started.session.phase, SessionPhase::Running);
-        assert_eq!(interface_mtu, Some(1280), "actual owned Windows MTU");
+        assert_eq!(
+            interface_settings.map(|value| value.0),
+            Some(1280),
+            "actual owned Windows MTU"
+        );
+        assert_eq!(
+            interface_settings.map(|value| value.1),
+            Some(0),
+            "actual owned Windows IPv4 DadTransmits"
+        );
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
         assert!(!stopped.cleanup_pending);
         starting_metrics

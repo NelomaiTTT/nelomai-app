@@ -1370,6 +1370,7 @@ impl Control {
         }
         self.authorize()?;
         interface.NlMtu = mtu;
+        interface.DadTransmits = 0;
         interface.SitePrefixLength = 0; // Required for IPv4 SetIpInterfaceEntry.
         if unsafe { SetIpInterfaceEntry(&mut interface) } != 0 {
             return Err(failed());
@@ -1379,6 +1380,7 @@ impl Control {
             || interface.InterfaceIndex != p.index
             || unsafe { interface.InterfaceLuid.Value } != p.luid
             || interface.NlMtu != mtu
+            || interface.DadTransmits != 0
         {
             return Err(failed());
         }
