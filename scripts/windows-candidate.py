@@ -150,6 +150,9 @@ def source(sha, *, root=builder.ROOT, environment=None, native=False):
         raise ValueError("Windows candidate repository/ref/full source mismatch")
     if native and any(env.get(n) for n in PRIVATE_ENV):
         raise ValueError("native Windows job must be private-keyless")
+    # Preserve the compile-time updater backend in both native build phases.
+    if native and env.get("NELOMAI_UPDATER_PUBLIC_KEY") != UPDATER_PUBLIC:
+        raise ValueError("native Windows updater public pin missing or mismatch")
     import tomllib
     versions = [json.loads((root / p).read_bytes())["version"] for p in ("package.json", "src-tauri/tauri.conf.json")]
     versions.append(tomllib.loads((root / "src-tauri/Cargo.toml").read_text())["package"]["version"])

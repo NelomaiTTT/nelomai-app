@@ -145,9 +145,13 @@ class WindowsCandidateTest(ArtifactFixture):
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "-m", "fixture")):
             subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
         sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-        env = dict(GITHUB_REPOSITORY=self.candidate.REPOSITORY, GITHUB_REF=self.candidate.REF, GITHUB_SHA=sha)
+        env = dict(GITHUB_REPOSITORY=self.candidate.REPOSITORY, GITHUB_REF=self.candidate.REF, GITHUB_SHA=sha,
+                   NELOMAI_UPDATER_PUBLIC_KEY=self.candidate.UPDATER_PUBLIC)
         with patch.object(self.candidate.gates, "BASE", sha):
             self.candidate.source(sha, root=root, environment=env, native=True)
+            for pin in (None, "wrong public pin"):
+                with self.subTest(updater_public_key=pin), self.assertRaisesRegex(ValueError, "updater"):
+                    self.candidate.source(sha, root=root, environment={**env, "NELOMAI_UPDATER_PUBLIC_KEY": pin}, native=True)
             for changes in ({"GITHUB_REF": "refs/heads/main"}, {"GITHUB_REPOSITORY": "fork/app"},
                             {"GITHUB_SHA": "c" * 40}, {"TAURI_SIGNING_PRIVATE_KEY": "must not reach native"}):
                 with self.assertRaises(ValueError):

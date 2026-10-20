@@ -19,6 +19,7 @@ env:
   SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.source_sha }}
   GH_TOKEN: ${{ github.token }}
   NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+  NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
 jobs:
   build:
     runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
