@@ -399,39 +399,15 @@ export function bindingRequest(
   };
 }
 
-export function bindingPreferencesMatch(
-  binding: PeerBinding,
-  layer: Layer,
-  ticConnectionMode: TicConnectionMode,
-  routeMode: RouteMode,
-  egressMode: EgressMode,
-): boolean {
-  return (
-    binding.preferred_layer === layer &&
-    binding.tic_connection_mode === ticConnectionMode &&
-    binding.route_mode === routeMode &&
-    (ticConnectionMode === "dynamic" || binding.egress_mode === egressMode)
-  );
-}
-
 export function bindingPreferenceUpdateRequest(
   binding: PeerBinding,
   layer: Layer,
   ticConnectionMode: TicConnectionMode,
   routeMode: RouteMode,
   egressMode: EgressMode,
-): BindPeerRequest | null {
-  if (
-    bindingPreferencesMatch(
-      binding,
-      layer,
-      ticConnectionMode,
-      routeMode,
-      egressMode,
-    )
-  ) {
-    return null;
-  }
+): BindPeerRequest {
+  // Native Start may save preferences after this UI snapshot was read, even
+  // across a page reload. Reassert the desired settings with the existing CAS.
   return {
     peer_id: binding.peer_id,
     expected_binding_id: binding.id,
