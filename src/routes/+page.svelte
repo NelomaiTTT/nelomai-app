@@ -141,6 +141,7 @@
   let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
+  let bootstrapPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
   let runtimeStateSync = $state(initialRuntimeStateSync());
@@ -599,6 +600,7 @@
     let isStartupCurrent = startupRetry.checkpoint();
     startupPending = false;
     refreshPending = false;
+    bootstrapPending = true;
     busy = true;
     localStopPendingCleanup = false;
     error = null;
@@ -651,7 +653,10 @@
     } finally {
       const ownsStartup = startupTimer === timer;
       window.clearTimeout(timer);
-      if (ownsStartup) startupTimer = null;
+      if (ownsStartup) {
+        startupTimer = null;
+        bootstrapPending = false;
+      }
       if (ownsStartup && isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
     }
   }
@@ -673,16 +678,19 @@
     void refreshNotifications(false, true);
 
     if (response.update.required) {
+      bootstrapPending = false;
       phase = "update_required";
       view = "update_required";
       return;
     }
     if (!response.access.can_connect || response.access.state === "expired") {
+      bootstrapPending = false;
       phase = "access_expired";
       view = "access_expired";
       return;
     }
     if (!response.binding) {
+      bootstrapPending = false;
       phase = "needs_peer_binding";
       view = "peer_selection";
       await loadPeers();
@@ -692,6 +700,7 @@
     const state = await nativeClient.state();
     if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== observedBootstrap ||
       !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+    bootstrapPending = false;
     phase = state.phase;
     localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
@@ -1419,9 +1428,11 @@
       <span>Nelomai</span>
     </a>
     <div class="header-actions">
-      <span class="status" data-phase={phase}>
+      <span class="status" data-phase={!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable")) ? "preparing" : phase}>
         <span aria-hidden="true"></span>
-        {startupPending ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения") : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
+        {!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable"))
+          ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения")
+          : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -2060,7 +2071,10 @@
     {:else}
       <div class="panel message-panel">
         <p class="eyebrow">{runtimeChannelClosed ? "Служба подключения" : "Подключение к панели"}</p>
-        <h1>{startupPending ? (refreshPending ? "Восстанавливаем соединение с аккаунтом" : "Завершаем подготовку приложения") : "Сейчас сервис недоступен"}</h1>
+        <h1>{!runtimeChannelClosed && (startupPending || bootstrapPending)
+          ? (refreshPending ? "Восстанавливаем соединение с аккаунтом"
+            : startupPending ? "Завершаем подготовку приложения" : "Подключаемся к панели")
+          : "Сейчас сервис недоступен"}</h1>
         {#if runtimeChannelClosed}
           <p class="error-message">Потеряна связь со службой подключения. Статус защиты неизвестен.</p>
           <p>Полностью завершите Nelomai и заново откройте приложение. На Android: Настройки → Приложения → Nelomai → Остановить. Данные очищать не нужно.</p>

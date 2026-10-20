@@ -1,9 +1,11 @@
 import page from "../routes/+page.svelte?raw";
 import ts from "typescript";
+import { parse } from "svelte/compiler";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StartupRetry } from "./startup-retry";
 import { beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction } from "./connection-action";
 import { commandCode, commandMessage } from "./native-client";
+import { viewForAppState } from "./app-model";
 
 // Exercise the page's real restore/retry and lifecycle callbacks, with only the
 // native boundary replaced by controlled responses.
@@ -14,6 +16,35 @@ const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
   { target: ts.ScriptTarget.ES2022 })}; return { ${names.join(",")} }; }`);
+
+// Evaluate the page's real presentation while native replies are still pending.
+function elementsWithClass(node: any, className: string): any[] {
+  if (!node || typeof node !== "object") return [];
+  const matches = node.type === "RegularElement" && node.attributes.some((attribute: any) =>
+    attribute.name === "class" && attribute.value?.some((value: any) =>
+      value.data?.split(" ").includes(className))) ? [node] : [];
+  for (const child of Object.values(node)) {
+    for (const value of Array.isArray(child) ? child : [child]) {
+      matches.push(...elementsWithClass(value, className));
+    }
+  }
+  return matches;
+}
+
+function presentationExpression(element: any) {
+  const expression = element.fragment.nodes.find((node: any) => node.type === "ExpressionTag").expression;
+  return new Function("context", `with (context) { return ${page.slice(expression.start, expression.end)}; }`);
+}
+
+const template = parse(page, { modern: true });
+const messagePanels = elementsWithClass(template.fragment, "message-panel");
+const unavailableHeading = presentationExpression(messagePanels[messagePanels.length - 1].fragment.nodes
+  .find((node: any) => node.type === "RegularElement" && node.name === "h1"));
+const statusElement = elementsWithClass(template.fragment, "status")[0];
+const headerStatus = presentationExpression(statusElement);
+const statusPhase = statusElement.attributes.find((attribute: any) => attribute.name === "data-phase")
+  .value.expression;
+const headerPhase = new Function("context", `with (context) { return ${page.slice(statusPhase.start, statusPhase.end)}; }`);
 const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
   update: { required: false }, access: { can_connect: true }, binding: {}, device: { id: "own-device" } };
 
@@ -21,17 +52,20 @@ function fixture(bootstrap: () => Promise<unknown>) {
   const context: Record<string, any> = {
     busy: false, bootstrap: null, runtimeChannelClosed: false, runtimeSelectionBusy: false,
     connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(),
-    startupPending: false, refreshPending: false, startupSlow: false, startupTimer: null,
+    startupPending: false, bootstrapPending: false, refreshPending: false, startupSlow: false, startupTimer: null,
     localStopPendingCleanup: false, diagnosticsStatus: null, error: null, view: "unavailable",
     phase: "server_unavailable", pinnedStray: null, selectedLayer: "tic", ticConnectionMode: "personal",
     routeMode: "via_tak", connection: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
     connectionMetrics: null, reserveState: null, runtimeWarning: null, splitTunnelOpen: false,
     ownedConnectionIntentNotice: null, runtimeStatus: null,
+    phaseLabels: { server_unavailable: "Сервер недоступен", error: "Ошибка" },
     window: { setTimeout, clearTimeout }, commandCode, commandMessage, isCurrentConnectionAction,
-    viewForAppState: () => "connection", loadSplitTunnel: async () => {}, refreshProbes: async () => {},
+    viewForAppState, loadSplitTunnel: async () => {}, refreshProbes: async () => {},
     refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
     scheduleRuntimeStatusRefresh: () => {}, runtimeStatusRefresher: { commit: () => {} },
-    nativeClient: { bootstrap, state: async () => ({ phase: "ready", warning: null }),
+    nativeClient: { bootstrap, state: async () => ({ phase: "ready", connection: null, warning: null,
+      metrics: null, reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
+      localStopPendingCleanup: false }),
       recordStartupStage: () => {}, runtimeSelect: async () => ({}), restartRuntime: async () => {},
       logout: async () => {} },
     peers: [], selectedPeerId: "", password: "", updateStatus: null, splitTunnelState: null,
@@ -45,6 +79,91 @@ function fixture(bootstrap: () => Promise<unknown>) {
 describe("bounded bootstrap recovery", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("shows preparation instead of an outage while bootstrap is in flight", async () => {
+    let finish!: (value: unknown) => void;
+    const f = fixture(() => new Promise((resolve) => { finish = resolve; }));
+    const running = f.page.restore();
+    expect(f.context.busy).toBe(true);
+    expect(f.context.view).toBe("unavailable");
+    expect(unavailableHeading(f.context)).toBe("Подключаемся к панели");
+    expect(headerStatus(f.context)).toBe("Подготовка приложения");
+    expect(headerPhase(f.context)).toBe("preparing");
+    finish(response);
+    await running;
+    expect(f.context.view).toBe("connection");
+    expect(f.context.busy).toBe(false);
+  });
+
+  it("keeps preparation visible until authoritative runtime state arrives", async () => {
+    let finish!: (value: unknown) => void;
+    const f = fixture(async () => response);
+    f.context.nativeClient.state = () => new Promise((resolve) => { finish = resolve; });
+    const running = f.page.restore();
+    await Promise.resolve();
+    expect(f.context.busy).toBe(true);
+    expect(f.context.view).toBe("unavailable");
+    expect(unavailableHeading(f.context)).toBe("Подключаемся к панели");
+    expect(headerStatus(f.context)).toBe("Подготовка приложения");
+    expect(headerPhase(f.context)).toBe("preparing");
+    finish({ phase: "ready", connection: null, warning: null, metrics: null,
+      reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
+      localStopPendingCleanup: false });
+    await running;
+    expect(f.context.view).toBe("connection");
+    expect(f.context.phase).toBe("ready");
+    expect(f.context.busy).toBe(false);
+  });
+
+  for (const stage of ["bootstrap", "state"]) {
+    it(`shows an actual ${stage} failure after the request settles`, async () => {
+      const f = fixture(async () => response);
+      f.context.nativeClient[stage] = async () => { throw { code: "temporarily_unavailable" }; };
+      await f.page.restore();
+      expect(f.context.busy).toBe(false);
+      expect(f.context.view).toBe("unavailable");
+      expect(unavailableHeading(f.context)).toBe("Сейчас сервис недоступен");
+      expect(headerStatus(f.context)).toBe("Сервер недоступен");
+      expect(headerPhase(f.context)).toBe("server_unavailable");
+      expect(f.context.error).toBeTruthy();
+    });
+  }
+
+  for (const terminalPhase of ["error", "server_unavailable"]) {
+    for (const ancillary of ["refreshRuntimeStatus", "loadSplitTunnel"]) {
+      it(`shows returned ${terminalPhase} while ${ancillary} is pending`, async () => {
+        const f = fixture(async () => response);
+        f.context.nativeClient.state = async () => ({ phase: terminalPhase, connection: null,
+          warning: null, metrics: null, reserveState: null, connectionIntentStatus: "none",
+          nextRetryAtUnix: null, localStopPendingCleanup: false });
+        let finish!: () => void;
+        f.context[ancillary] = () => new Promise<void>((resolve) => { finish = resolve; });
+        const running = f.page.restore();
+        await vi.advanceTimersByTimeAsync(0);
+        try {
+          expect(f.context.phase).toBe(terminalPhase);
+          expect(f.context.view).toBe("unavailable");
+          expect(f.context.busy).toBe(true);
+          expect(unavailableHeading(f.context)).toBe("Сейчас сервис недоступен");
+          expect(headerStatus(f.context)).toBe(terminalPhase === "error" ? "Ошибка" : "Сервер недоступен");
+          expect(headerPhase(f.context)).toBe(terminalPhase);
+        } finally {
+          finish();
+          await running;
+        }
+      });
+    }
+  }
+
+  it("does not let a pending startup hide confirmed owner channel closure", () => {
+    const f = fixture(async () => response);
+    Object.assign(f.context, { startupPending: true, bootstrapPending: true, refreshPending: true, busy: true });
+    f.page.applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
+    expect(unavailableHeading(f.context)).toBe("Сейчас сервис недоступен");
+    expect(headerStatus(f.context)).toBe("Ошибка");
+    expect(headerPhase(f.context)).toBe("error");
+    expect(f.context.connectionIntentStatus).toBe("blocked_terminal");
+  });
 
   it("recovers a temporary startup failure without a second click", async () => {
     let calls = 0;
@@ -118,6 +237,7 @@ describe("bounded bootstrap recovery", () => {
     pending[0].reject({ code: "temporarily_unavailable" });
     await first;
     expect(f.context.busy).toBe(true);
+    expect(unavailableHeading(f.context)).toBe("Подключаемся к панели");
     pending[1].finish(response);
     await second;
     expect(f.context.busy).toBe(false);

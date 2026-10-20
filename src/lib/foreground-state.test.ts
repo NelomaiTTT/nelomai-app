@@ -68,7 +68,7 @@ function fixture() {
   let reject!: (reason: unknown) => void;
   const response = new Promise((resolve, fail) => { reply = resolve; reject = fail; });
   const context = {
-    busy: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
+    busy: false, bootstrapPending: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
     runtimeChannelClosed: false, runtimeSelectionBusy: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
