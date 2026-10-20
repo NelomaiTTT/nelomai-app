@@ -1376,7 +1376,8 @@ impl MemberParameters {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if sources.len() != 1
+        if addresses.len() != 1
+            || sources.len() != 1
             || sources[0].is_unspecified()
             || sources[0].is_loopback()
             || sources[0].is_multicast()
@@ -1400,7 +1401,9 @@ impl MemberParameters {
             .collect::<io::Result<Vec<_>>>()?;
         if allowed.is_empty()
             || allowed.len() > crate::member_plan::MAX_ROUTES
-            || allowed.iter().any(|n| *n != n.trunc())
+            || allowed
+                .iter()
+                .any(|n| !n.addr().is_ipv4() || *n != n.trunc())
         {
             return Err(failed());
         }

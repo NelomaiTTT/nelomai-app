@@ -1029,13 +1029,34 @@ fn scope_mismatch_and_durable_failure_prevent_native_effects() {
     assert!(s.borrow().owners.iter().all(Option::is_none));
 }
 #[test]
+fn native_parameters_reject_unsupported_tun_address_and_route_families() {
+    // Actual worker Start/Attach use this parser before native dataplane effects.
+    // A single IPv4 source cannot admit hidden IPv6 addresses or data routes.
+    let accepted = [
+        ("10.2.0.2/32, 2001:db8::2/128", "0.0.0.0/0"),
+        ("10.2.0.2/32", "::/0"),
+        ("10.2.0.2/32", "0.0.0.0/0, ::/0"),
+    ]
+    .map(|(address, allowed)| {
+        let config = format!("[Interface]\nPrivateKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nAddress = {address}\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nEndpoint = 192.0.2.5:51820\nAllowedIPs = {allowed}\n");
+        MemberParameters::parse(&config).is_ok()
+    });
+    assert_eq!(accepted, [false, false, false]);
+}
+#[test]
 fn native_parameters_are_literal_bounded_and_reject_duplicate_or_ipv6_dns() {
-    let config="[Interface]\nPrivateKey = secret\nAddress = 10.2.0.2/32\nDNS = 9.9.9.9\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nEndpoint = 192.0.2.5:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n";
+    let config="[Interface]\nPrivateKey = secret\nAddress = 10.2.0.2/32\nDNS = 9.9.9.9\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nEndpoint = 192.0.2.5:51820\nAllowedIPs = 0.0.0.0/0\n";
     let p = MemberParameters::parse(config).unwrap();
     assert_eq!(p.peer, [1; 32]);
     assert_eq!(p.source, Ipv4Addr::new(10, 2, 0, 2));
-    assert_eq!(p.allowed.len(), 2);
+    assert_eq!(p.allowed.len(), 1);
     assert_eq!(p.mtu, 1420);
+    // Outer transport family is independent of the IPv4 TUN/data contract.
+    let outer_v6 =
+        MemberParameters::parse(&config.replace("192.0.2.5:51820", "[2001:db8::5]:51820")).unwrap();
+    assert_eq!(outer_v6.endpoint, "2001:db8::5".parse::<IpAddr>().unwrap());
+    assert_eq!(outer_v6.endpoint_port, 51820);
+
     let explicit = config.replace("[Peer]", "MTU = 1280\n[Peer]");
     assert_eq!(MemberParameters::parse(&explicit).unwrap().mtu, 1280);
     for mtu in ["575", "65536", "invalid", "1280\nMTU = 1280"] {
