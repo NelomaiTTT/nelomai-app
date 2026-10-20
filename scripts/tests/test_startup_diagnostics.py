@@ -1,5 +1,6 @@
 """Exercise the real Rust startup logger without compiling the application."""
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,26 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class StartupDiagnosticsTests(unittest.TestCase):
+    def test_windows_login_admission_platform_wiring(self):
+        commands = (ROOT / "src-tauri/src/commands.rs").read_text()
+        login = commands.split("pub async fn app_login(", 1)[1].split("#[tauri::command]", 1)[0]
+        gate = re.search(r'#\[cfg\(([^]]+)\)\]\s*\{\s*let owner =.*?PrivateRuntimeAuthClient.*?RuntimeStartup.*?\.ensure_ready',
+                         login, re.DOTALL).group(1)
+        # Compile the actual command's cfg expression, not a copied platform
+        # predicate. This is wiring coverage; RuntimeStartup behavior is Rust-tested.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "login-cfg.rs"
+            source.write_text(f'''#[cfg({gate})] fn admits() -> bool {{ true }}
+#[cfg(not({gate}))] fn admits() -> bool {{ false }}
+fn main() {{ assert!(admits(), "Windows login skipped runtime admission"); }}
+''')
+            binary = Path(directory) / ("probe.exe" if os.name == "nt" else "probe")
+            subprocess.run(["rustc", "--edition=2021", "--cfg", "windows", "--allow",
+                            "explicit_builtin_cfgs_in_flags", str(source), "-o", str(binary)],
+                           check=True, capture_output=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_diagnostic_build_preserves_stage_and_error_even_on_panic(self):
         self.exercise(True)
 

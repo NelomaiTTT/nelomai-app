@@ -105,6 +105,33 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
     #[tokio::test]
+    async fn login_admission_after_terminal_auth_recovery_launches_schedulers_once() {
+        let (startup, starts) = fixture();
+        let mut attempts = 0;
+        assert_eq!(
+            startup
+                .recover(|| {
+                    attempts += 1;
+                    async { Err(PrivateError::RefreshRejected) }
+                })
+                .await,
+            Err(PrivateError::RefreshRejected)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        // Successful authentication still needs positive original-owner admission.
+        assert_eq!(
+            startup
+                .ensure_ready(async { Err(PrivateError::Closed) })
+                .await,
+            Err(PrivateError::Closed)
+        );
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        startup.ensure_ready(async { Ok(()) }).await.unwrap();
+        startup.ensure_ready(async { Ok(()) }).await.unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
     async fn automatic_recovery_polls_pending_admission_until_ready() {
         let (startup, starts) = fixture();
         let mut attempts = 0;

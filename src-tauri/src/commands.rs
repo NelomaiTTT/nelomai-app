@@ -2804,7 +2804,7 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", windows))]
     {
         let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
         app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
