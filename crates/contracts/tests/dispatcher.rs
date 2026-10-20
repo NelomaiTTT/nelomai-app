@@ -534,6 +534,8 @@ while True:
             os._exit(0)
         open(root+'/persisted-tunnel','w').write('needs recovery')
         time.sleep(60)
+    if value.get('dispatcher_control') in ['ready','stop']:
+        with open(root+'/engine-controls','a') as controls: controls.write(value['dispatcher_control']+'\n')
     if value.get('dispatcher_control')=='ready':
         if os.path.exists(root+'/fail-ready'):
             mode=open(root+'/fail-ready').read()
@@ -548,6 +550,11 @@ while True:
         reply={'engine_tick':True}
         if INVALID_TICK_ACK: reply['extra']=True
     elif value.get('dispatcher_control')=='stop':
+        if os.path.exists(root+'/fail-stop'):
+            mode=open(root+'/fail-stop').read()
+            data={'negative':b'{"engine_stopped":false}', 'malformed':b'not json'}[mode]
+            sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
+            continue
         if os.path.exists(root+'/persisted-tunnel'): os.unlink(root+'/persisted-tunnel')
         reply={'engine_stopped':True}
     else: reply={'private_operation':value['command'],'preserved':value.get('probe')}
@@ -1009,7 +1016,7 @@ fn failed_ready_never_reports_running_and_preserves_marker_until_acknowledged_cl
 
 #[cfg(unix)]
 #[test]
-fn crashed_engine_status_is_not_running_and_cleanup_keeps_recovery_marker_until_stopped() {
+fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() {
     let (source, key) = process_fixture();
     let target = tempfile::tempdir().unwrap();
     let installation = Installation::for_owner(
@@ -1041,6 +1048,7 @@ fn crashed_engine_status_is_not_running_and_cleanup_keeps_recovery_marker_until_
             )
             .ok
     );
+    fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
     assert!(dispatcher
         .relay(
             &encode_frame(&json!({"command":"crash"})).unwrap(),
@@ -1058,6 +1066,68 @@ fn crashed_engine_status_is_not_running_and_cleanup_keeps_recovery_marker_until_
         "a crashed child must not be reported as running"
     );
     assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
+    let restarted = dispatcher.handle(
+        DispatcherRequest::Start {
+            contract_version: 1,
+            identity: identity.clone(),
+        },
+        &mut primitive,
+    );
+    assert!(
+        restarted.ok && restarted.running,
+        "direct Start must recover the exited original engine"
+    );
+    assert!(!target.path().join("persisted-tunnel").exists());
+    assert_eq!(
+        fs::read_to_string(target.path().join("engine-controls")).unwrap(),
+        "ready\nready\nstop\nready\n",
+        "owned recovery must acknowledge Stop before fresh engine readiness"
+    );
+    assert_eq!(
+        serde_json::from_slice::<EngineIdentity>(
+            &fs::read(target.path().join(ACTIVE_ENGINE_NAME)).unwrap()
+        )
+        .unwrap(),
+        identity
+    );
+    for mode in ["negative", "malformed"] {
+        let start = || DispatcherRequest::Start {
+            contract_version: 1,
+            identity: identity.clone(),
+        };
+        assert!(dispatcher.handle(start(), &mut primitive).ok);
+        fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
+        assert!(dispatcher
+            .relay(
+                &encode_frame(&json!({"command":"crash"})).unwrap(),
+                &mut primitive
+            )
+            .is_err());
+        let marker = target.path().join(ACTIVE_ENGINE_NAME);
+        let marker_bytes = fs::read(&marker).unwrap();
+        fs::write(target.path().join("fail-stop"), mode).unwrap();
+        assert!(!dispatcher.handle(start(), &mut primitive).ok, "{mode}");
+        assert!(target.path().join("persisted-tunnel").exists());
+        assert!(
+            !dispatcher.handle(start(), &mut primitive).ok,
+            "Start must not accept the live recovery child after {mode} cleanup ACK"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+        fs::remove_file(target.path().join("fail-stop")).unwrap();
+        assert!(
+            dispatcher
+                .handle(
+                    DispatcherRequest::Cleanup {
+                        contract_version: 1,
+                        identity: identity.clone(),
+                    },
+                    &mut primitive
+                )
+                .ok
+        );
+        assert!(!marker.exists());
+        assert!(!target.path().join("persisted-tunnel").exists());
+    }
     assert!(
         dispatcher
             .handle(

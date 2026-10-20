@@ -1437,6 +1437,11 @@ impl ProcessDispatcher {
         &mut self,
         primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            if child.try_wait()?.is_some() {
+                self.stop(primitive)?;
+            }
+        }
         if self.channel_failed {
             return Err(blocked());
         }
@@ -1577,6 +1582,8 @@ impl ProcessDispatcher {
             &encode_frame(&serde_json::json!({"dispatcher_control":"stop"}))?,
             primitive,
         )?;
+        // A live recovery child is not reusable until owned cleanup completes.
+        self.channel_failed = true;
         let response: serde_json::Value =
             serde_json::from_slice(frame_body(&response, MAX_ENGINE_FRAME)?)
                 .map_err(|_| blocked())?;
@@ -1603,6 +1610,7 @@ impl ProcessDispatcher {
             self.tree_owner = None;
         }
         fs::remove_file(marker)?;
+        self.channel_failed = false;
         Ok(())
     }
     pub fn supports_idle_tick(&self) -> bool {
