@@ -1,0 +1,237 @@
+name: Windows test candidate
+on:
+  push:
+    branches: [Future/windows-hot-standby-0.4.0]
+    paths:
+      - .github/workflows/windows-candidate.yml
+      - scripts/windows-candidate.py
+      - scripts/tests/test_windows_candidate.py
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full source SHA, equal to the selected branch HEAD
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+env:
+  SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.source_sha }}
+  GH_TOKEN: ${{ github.token }}
+  NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Exact repository/ref/source before local code
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/windows-hot-standby-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
+          $head = @(git rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate HEAD' }
+          $status = @(git status --porcelain --untracked-files=normal --ignore-submodules=none)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify candidate worktree' }
+          if ($head.Count -ne 1 -or $head[0] -cne $env:SOURCE_SHA -or $status.Count -ne 0) { throw 'Candidate checkout mismatch/dirt' }
+          foreach ($name in @('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64','TAURI_SIGNING_PRIVATE_KEY','ANDROID_KEYSTORE_PATH','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_PASSWORD')) { if ([Environment]::GetEnvironmentVariable($name)) { throw 'Native runner must be private-keyless' } }
+      - uses: ./.github/actions/release-native-host
+        with:
+          platform: windows
+          target: x86_64-pc-windows-msvc
+      - name: Keyless Windows runtime draft
+        run: |
+          python scripts/windows-candidate.py source --source-sha "$env:SOURCE_SHA" --keyless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$env:RUNNER_TEMP/runtime-public.raw"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/build-release-platform.py --mode sign_candidate --source-sha "$env:SOURCE_SHA" --platform windows --architecture x86_64 --public-key "$env:RUNNER_TEMP/runtime-public.raw" --output "$env:RUNNER_TEMP/windows-draft" --work "$env:RUNNER_TEMP/windows-build"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-candidate-draft
+          path: |
+            ${{ runner.temp }}/windows-draft/latest/
+            ${{ runner.temp }}/windows-draft/draft-public-key.raw
+            ${{ runner.temp }}/windows-draft/runtime-public-key.raw
+            ${{ runner.temp }}/windows-draft/windows-x86_64.sizes.json
+          if-no-files-found: error
+          retention-days: 7
+  sign:
+    needs: build
+    environment: release-candidate-signing
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Exact repository/ref/source before local code
+        run: |
+          test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
+          test "$GITHUB_REF" = refs/heads/Future/windows-hot-standby-0.4.0
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=normal --ignore-submodules=none)"
+      - uses: ./.github/actions/release-native-host
+        with:
+          purpose: signing
+          platform: linux
+          target: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Focused crypto tests and Windows checks before private keys
+        run: |
+          python scripts/windows-candidate.py source --source-sha "$SOURCE_SHA"
+          cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
+          cargo build --locked -p nelomai-client-updater --example verify-updater-signature
+          # Final updater fixture invokes the existing pinned Tauri CLI.
+          npm ci
+          python -m unittest scripts.tests.test_windows_candidate
+          python scripts/windows-candidate.py gate --source-sha "$SOURCE_SHA"
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-candidate-draft
+          path: ${{ runner.temp }}/draft
+      - name: Sign Windows latest and existing stable container only
+        env:
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: ${{ secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 }}
+        run: |
+          trap 'rm -f "$RUNNER_TEMP/runtime-private.raw"' EXIT
+          python scripts/prepare-release-trust.py --mode sign_candidate --phase signing --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw"
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/stable-public.raw"
+          python scripts/download-confirmed-stable.py --output "$RUNNER_TEMP/confirmed-stable" --public-key "$RUNNER_TEMP/stable-public.raw"
+          python scripts/windows-candidate.py sign --source-sha "$SOURCE_SHA" --draft "$RUNNER_TEMP/draft" --stable "$RUNNER_TEMP/confirmed-stable" --output "$RUNNER_TEMP/signed" --private-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw" --stable-public-key "$RUNNER_TEMP/stable-public.raw"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-candidate-signed-runtime
+          path: ${{ runner.temp }}/signed/
+          if-no-files-found: error
+          retention-days: 7
+  package:
+    needs: sign
+    runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Exact repository/ref/source before local code
+        run: |
+          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/windows-hot-standby-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
+          $head = @(git rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate HEAD' }
+          $status = @(git status --porcelain --untracked-files=normal --ignore-submodules=none)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify candidate worktree' }
+          if ($head.Count -ne 1 -or $head[0] -cne $env:SOURCE_SHA -or $status.Count -ne 0) { throw 'Candidate checkout mismatch/dirt' }
+          foreach ($name in @('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64','TAURI_SIGNING_PRIVATE_KEY','ANDROID_KEYSTORE_PATH','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_PASSWORD')) { if ([Environment]::GetEnvironmentVariable($name)) { throw 'Native runner must be private-keyless' } }
+      - uses: ./.github/actions/release-native-host
+        with:
+          purpose: packaging
+          platform: windows
+          target: x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-candidate-signed-runtime
+          path: ${{ runner.temp }}/signed
+      - name: Keyless native package and re-extraction
+        run: |
+          python scripts/windows-candidate.py source --source-sha "$env:SOURCE_SHA" --keyless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$env:RUNNER_TEMP/package-public.raw"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/windows-candidate.py package --source-sha "$env:SOURCE_SHA" --signed "$env:RUNNER_TEMP/signed" --output "$env:RUNNER_TEMP/windows-package" --public-key "$env:RUNNER_TEMP/package-public.raw"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-candidate-package
+          path: |
+            ${{ runner.temp }}/windows-package/shipping/
+            ${{ runner.temp }}/windows-package/package-digests.json
+          if-no-files-found: error
+          retention-days: 7
+  finalize:
+    needs: package
+    environment: release-candidate-finalization
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Exact repository/ref/source before local code
+        run: |
+          test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
+          test "$GITHUB_REF" = refs/heads/Future/windows-hot-standby-0.4.0
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=normal --ignore-submodules=none)"
+      - uses: ./.github/actions/release-native-host
+        with:
+          purpose: signing
+          platform: linux
+          target: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Exact source Windows gate and public verifiers
+        run: |
+          npm ci
+          python scripts/windows-candidate.py source --source-sha "$SOURCE_SHA"
+          python scripts/windows-candidate.py gate --source-sha "$SOURCE_SHA"
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/runtime-public.raw"
+          cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
+          cargo build --locked -p nelomai-client-updater --example verify-updater-signature
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-candidate-signed-runtime
+          path: ${{ runner.temp }}/signed
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-candidate-package
+          path: ${{ runner.temp }}/packages
+      - name: Final Tauri signature without rebuilding installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
+        run: |
+          python scripts/windows-candidate.py finalize --source-sha "$SOURCE_SHA" --signed "$RUNNER_TEMP/signed" --packages "$RUNNER_TEMP/packages" --output "$RUNNER_TEMP/windows-candidate" --public-key "$RUNNER_TEMP/runtime-public.raw"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-candidate-0.4.0
+          path: ${{ runner.temp }}/windows-candidate/
+          if-no-files-found: error
+          retention-days: 14
