@@ -83,6 +83,16 @@ Primary ready 1158 ms, reserve another 15029 ms, quiet-to-B 9591 ms, Stop 760 ms
 repeat Start 1191 ms and repeat Stop 442 ms; both cleanup baselines matched again.
 Real-panel/installed-GUI acceptance, AWG3 and crash recovery remain unproven.
 
+The Linux-only self-hosted diagnostic workflow packaged and re-extracted `50654a6`
+and `153fb06` successfully. Delivery SHA256, test-trust container signature, all 28
+runtime files and dispatcher identity were verified inside the Linux VM. An actual
+installation with umask 0077 exposed unreadable root-owned AppDir content; native
+`chmod a+rX,go-w` restores access without changing signed 0755/0644 payload modes.
+The installed runtime also needs Linux XAUTHORITY alongside DISPLAY: a custom Xvfb
+cookie was stripped by the launch whitelist, causing GTK authorization failure.
+Using the standard cookie path on the same AppImage admitted real WebKit login
+controls. This diagnostic startup does not establish panel or tunnel acceptance.
+
 ## Primary documentation reviewed
 
 * Kernel rtnetlink route API: https://www.kernel.org/doc/html/latest/netlink/specs/rt-route.html

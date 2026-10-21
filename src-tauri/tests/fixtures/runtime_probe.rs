@@ -35,6 +35,8 @@ fn main() {
             "PATH",
             "TMPDIR",
             "DISPLAY",
+            #[cfg(target_os = "linux")]
+            "XAUTHORITY",
             "WAYLAND_DISPLAY",
             "XDG_RUNTIME_DIR",
             "DBUS_SESSION_BUS_ADDRESS",
@@ -43,6 +45,11 @@ fn main() {
         ]
         .contains(&name.as_str())
     }) as u8;
-    native.write_all(&[extra_args, unexpected_env]).unwrap();
+    let changed_xauthority = (cfg!(target_os = "linux")
+        && std::env::var("XAUTHORITY").as_deref()
+            != Ok("/tmp/nelomai-runtime-fixture.Xauthority")) as u8;
+    native
+        .write_all(&[extra_args, unexpected_env | changed_xauthority])
+        .unwrap();
     let _ = auth.read(&mut [0; 1]);
 }

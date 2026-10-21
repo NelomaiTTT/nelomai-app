@@ -267,6 +267,8 @@ mod unix {
         "PATH",
         "TMPDIR",
         "DISPLAY",
+        #[cfg(target_os = "linux")]
+        "XAUTHORITY",
         "WAYLAND_DISPLAY",
         "XDG_RUNTIME_DIR",
         "DBUS_SESSION_BUS_ADDRESS",

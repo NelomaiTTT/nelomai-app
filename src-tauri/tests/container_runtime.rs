@@ -147,6 +147,8 @@ fn actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_f
                 Ok(())
             });
         }
+        #[cfg(target_os = "linux")]
+        command.env("XAUTHORITY", "/tmp/nelomai-runtime-fixture.Xauthority");
         assert!(command
             .args([
                 "--exact",
