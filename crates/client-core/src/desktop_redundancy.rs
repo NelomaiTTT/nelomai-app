@@ -356,7 +356,7 @@ pub(crate) fn stop_record(
     }
     Ok(StoredDesktopRedundantStop {
         background_cleanup: cfg!(any(target_os = "windows", target_os = "linux"))
-            && ordinary
+            && (ordinary || cfg!(target_os = "linux") && pair.primary_reported)
             && pair.session.async_stop_v1,
         operation_id: operation.into(),
         active_lease_id: active(snapshot)?.into(),

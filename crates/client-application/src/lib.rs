@@ -822,9 +822,19 @@ where
     ) -> CoreState {
         // Do not acquire lifecycle_gate: bootstrap/restoration may be waiting
         // on the panel while the foreground needs the native owner's state.
-        self.core
+        #[cfg(target_os = "linux")]
+        let was_connected = observation.phase() == Phase::Connected;
+        let state = self
+            .core
             .foreground_state_guarded(observation, intent, allowed)
-            .await
+            .await;
+        #[cfg(target_os = "linux")]
+        if was_connected && state.phase == Phase::Stopping {
+            // Advisory only: the existing worker revalidates auth, the exact
+            // protected owner and native cleanup before contacting the panel.
+            self.pending_stop_wake.notify_one();
+        }
+        state
     }
 
     pub async fn refresh_update_state(&self) -> Result<UpdateState, ApplicationError> {
@@ -1494,13 +1504,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_wrapper_does_not_wait_for_bootstrap_lifecycle_gate() {
+    async fn foreground_wrapper_bypasses_lifecycle_and_wakes_linux_cleanup_once_per_crash() {
         use super::*;
         use nelomai_client_api::RuntimeAuthState;
         use nelomai_client_storage::{RuntimePaths, RuntimeStateV1, StorageError};
         use nelomai_client_tunnel::{TunnelError, TunnelStartRequest, TunnelStatus};
         use nelomai_contracts::RuntimeSlot;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicU8, Ordering};
 
         struct RuntimeStore(RuntimePaths);
         impl RuntimeStateStore for RuntimeStore {
@@ -1533,25 +1543,25 @@ mod tests {
                 panic!("no logout")
             }
         }
-        struct NativeTunnel(AtomicBool);
+        struct NativeTunnel(AtomicU8);
         #[async_trait]
         impl TunnelController for NativeTunnel {
             async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
                 panic!("no start")
             }
             async fn stop(&self) -> Result<(), TunnelError> {
-                self.0.store(false, Ordering::SeqCst);
+                self.0.store(0, Ordering::SeqCst);
                 Ok(())
             }
             async fn status(&self) -> Result<TunnelStatus, TunnelError> {
-                Ok(if self.0.load(Ordering::SeqCst) {
-                    TunnelStatus::Running
-                } else {
-                    TunnelStatus::Stopped
+                Ok(match self.0.load(Ordering::SeqCst) {
+                    1 => TunnelStatus::Running,
+                    2 => TunnelStatus::Failed,
+                    _ => TunnelStatus::Stopped,
                 })
             }
         }
-        let tunnel = Arc::new(NativeTunnel(AtomicBool::new(false)));
+        let tunnel = Arc::new(NativeTunnel(AtomicU8::new(0)));
         let local = CoreLocalStop::new(tunnel.clone());
         local.stop_local_for_transition().await.unwrap();
         let application = ClientApplication::new(
@@ -1569,7 +1579,7 @@ mod tests {
             Arc::new(nelomai_client_core::NoopLogger),
         );
         let _stalled_bootstrap = application.lifecycle_gate.lock().await;
-        tunnel.0.store(true, Ordering::SeqCst);
+        tunnel.0.store(1, Ordering::SeqCst);
         let observation = application.begin_foreground_observation().await;
         let state = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -1586,5 +1596,66 @@ mod tests {
         .expect("foreground must bypass stalled bootstrap");
         assert_eq!(state.phase, Phase::Connected);
         assert!(state.connection.is_none());
+        for status in [0, 2] {
+            tunnel.0.store(1, Ordering::SeqCst);
+            let observation = application.begin_foreground_observation().await;
+            assert_eq!(
+                application
+                    .foreground_state_guarded(observation, None, || true)
+                    .await
+                    .phase,
+                Phase::Connected
+            );
+            tunnel.0.store(status, Ordering::SeqCst);
+            let stale = application.begin_foreground_observation().await;
+            let current = application.begin_foreground_observation().await;
+            assert_eq!(
+                application
+                    .foreground_state_guarded(stale, None, || true)
+                    .await
+                    .phase,
+                Phase::Connected
+            );
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                application.wait_for_pending_stop()
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                application
+                    .foreground_state_guarded(current, None, || true)
+                    .await
+                    .phase,
+                Phase::Stopping
+            );
+            let wake = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                application.wait_for_pending_stop(),
+            )
+            .await;
+            assert_eq!(
+                wake.is_ok(),
+                cfg!(target_os = "linux"),
+                "accepted stopped/failed observation must wake Linux cleanup once"
+            );
+            let observation = application.begin_foreground_observation().await;
+            assert_eq!(
+                application
+                    .foreground_state_guarded(observation, None, || true)
+                    .await
+                    .phase,
+                Phase::Stopping
+            );
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    application.wait_for_pending_stop()
+                )
+                .await
+                .is_err(),
+                "Stopping polls must not wake cleanup again"
+            );
+        }
     }
 }

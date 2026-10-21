@@ -561,6 +561,7 @@ struct MockApi {
     desktop_commit_responses: Mutex<VecDeque<nelomai_contracts::RedundantSessionResponse>>,
     desktop_role_block: AtomicBool,
     desktop_role_calls: AtomicUsize,
+    desktop_role_required_transport_resets: AtomicUsize,
     stop_failures: AtomicUsize,
     stop_error: Mutex<Option<CoreApiError>>,
     stop_apply_then_fail_once: AtomicBool,
@@ -625,6 +626,7 @@ impl MockApi {
             desktop_commit_responses: Mutex::new(VecDeque::new()),
             desktop_role_block: AtomicBool::new(false),
             desktop_role_calls: AtomicUsize::new(0),
+            desktop_role_required_transport_resets: AtomicUsize::new(0),
             stop_failures: AtomicUsize::new(0),
             stop_error: Mutex::new(None),
             stop_apply_then_fail_once: AtomicBool::new(false),
@@ -930,6 +932,13 @@ impl CoreApi for MockApi {
         request: &nelomai_contracts::RedundantRoleRequest,
     ) -> Result<nelomai_contracts::RedundantRoleResponse, CoreApiError> {
         self.desktop_role_calls.fetch_add(1, Ordering::SeqCst);
+        if self.transport_resets.load(Ordering::SeqCst)
+            < self
+                .desktop_role_required_transport_resets
+                .load(Ordering::SeqCst)
+        {
+            return Err(CoreApiError::Retryable);
+        }
         if self.desktop_role_block.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
@@ -1449,6 +1458,22 @@ impl TunnelController for DesktopPairTunnel {
                 pair.standby_failed = false;
                 pair.standby_ready = false;
             }
+            Command::ConfirmRole {
+                scope,
+                expected_revision,
+                expected_network_epoch,
+                response,
+            } => {
+                let mut guard = self.pair.lock().unwrap();
+                let pair = guard.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                assert_eq!(pair.session.local_revision, expected_revision);
+                assert_eq!(pair.session.network_epoch, expected_network_epoch);
+                pair.session.role_generation = response.session.role_generation;
+                pair.session.role_confirmed = true;
+                pair.session.local_revision += 1;
+                self.commands.lock().unwrap().push("confirm_role".into());
+            }
             Command::Stop { scope } => {
                 self.commands.lock().unwrap().push("stop_pair".into());
                 if self.fail_pair_close.load(Ordering::SeqCst) {
@@ -1550,6 +1575,16 @@ async fn desktop_failed_start_stop_retries_exact_cold_cleanup_without_legacy_sto
             "failed desktop Start must close the persisted scope, not a freshly discovered owner"
         );
         assert_eq!(core.state().await.phase, Phase::Stopping);
+        // Even negotiated async cleanup cannot upgrade failed-Start compensation.
+        store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_mut()
+            .unwrap()
+            .session
+            .async_stop_v1 = true;
         let stored = store.value.lock().unwrap().clone();
         let pending = stored
             .pending_compensation_stop
@@ -1657,7 +1692,8 @@ async fn desktop_failed_start_stop_retries_exact_cold_cleanup_without_legacy_sto
             .all(|r| r.operation_id == pending.operation_id
                 && r.lease_id == pending.lease_id
                 && r.session_id == scope.session_id
-                && !r.retain_active_peer));
+                && !r.retain_active_peer
+                && !r.background_cleanup));
     }
 }
 
@@ -2487,6 +2523,138 @@ async fn missing_desktop_reserve() -> (
 }
 
 #[tokio::test(start_paused = true)]
+async fn desktop_promotion_reports_role_through_a_fresh_linux_transport() {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    core.finish_start_attempt();
+    {
+        let mut stored = store.value.lock().unwrap();
+        stored.desktop_redundancy.as_mut().unwrap().session.standby = Some(member.clone());
+        let mut guard = tunnel.pair.lock().unwrap();
+        let native = guard.as_mut().unwrap();
+        native.leases[1] = Some(member.connection.lease_id.clone());
+        native.current_leases[1] = Some(member.connection.lease_id.clone());
+        native.session.installed = [true; 2];
+        native.session.committed = [true; 2];
+        native.session.active = nelomai_client_tunnel::redundancy::Slot::B;
+        native.session.role_confirmed = false;
+        native.session.local_revision += 1;
+        native.session.network_epoch += 1;
+    }
+    let mut response = canonical_pair_role(&tunnel);
+    response.action = nelomai_contracts::RedundantRoleAction::Accepted;
+    response.session.role_generation += 1;
+    let generation = response.session.role_generation;
+    api.desktop_role_responses
+        .lock()
+        .unwrap()
+        .push_back(response);
+    let resets_before = api.transport_resets.load(Ordering::SeqCst);
+    api.desktop_role_required_transport_resets.store(
+        resets_before + usize::from(cfg!(target_os = "linux")),
+        Ordering::SeqCst,
+    );
+    let confirmed = core
+        .desktop_redundancy_tick(Vec::new())
+        .await
+        .expect("first promoted role request must use the new route's transport")
+        .unwrap();
+    assert!(confirmed.session.role_confirmed);
+    assert_eq!(confirmed.session.role_generation, generation);
+    assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.transport_resets.load(Ordering::SeqCst),
+        resets_before + usize::from(cfg!(target_os = "linux"))
+    );
+    assert_eq!(
+        store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .session
+            .role_generation,
+        generation
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_cold_recovery_negotiates_async_cleanup_only_for_a_reported_linux_pair() {
+    for (primary_reported, async_stop_v1) in [(true, true), (true, false), (false, true)] {
+        let (core, api, store, tunnel, _) = missing_desktop_reserve().await;
+        core.finish_start_attempt();
+        {
+            let mut saved = store.value.lock().unwrap();
+            let pair = saved.desktop_redundancy.as_mut().unwrap();
+            pair.primary_reported = primary_reported;
+            pair.session.async_stop_v1 = async_stop_v1;
+            pair.session.warm_stop_v1 = true;
+        }
+        let observed = {
+            let mut guard = tunnel.pair.lock().unwrap();
+            let native = guard.as_mut().unwrap();
+            native.stalled = true;
+            native.primary_ready = false;
+            native.warm_stop_v1 = true;
+            native.clone()
+        };
+        assert!(core.prepare_desktop_recovery(&observed).await.unwrap());
+        let frozen = store.value.lock().unwrap().clone();
+        let stop = frozen
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .stop
+            .as_ref()
+            .unwrap();
+        let expected_async = cfg!(target_os = "linux") && primary_reported && async_stop_v1;
+        assert_eq!(stop.background_cleanup, expected_async);
+        assert!(!stop.retain_active_peer);
+        assert!(api.redundant_stop_requests.lock().unwrap().is_empty());
+        if expected_async {
+            let mut active = connection(&stop.active_lease_id);
+            active.session_id = Some(
+                frozen
+                    .desktop_redundancy
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .session_id
+                    .clone(),
+            );
+            let accepted = serde_json::json!({
+                "api_version": "1", "request_id": "cold-accepted", "connection": active,
+                "stop_acceptance": { "operation_id": stop.operation_id,
+                    "session_id": active.session_id, "lease_id": stop.active_lease_id,
+                    "accepted": true, "cleanup_pending": true }
+            });
+            tunnel.fail_pair_close.store(true, Ordering::SeqCst);
+            assert!(core.stop().await.is_err());
+            assert!(api.redundant_stop_requests.lock().unwrap().is_empty());
+            assert_eq!(*store.value.lock().unwrap(), frozen);
+            tunnel.fail_pair_close.store(false, Ordering::SeqCst);
+            api.async_stop_responses.lock().unwrap().push_back(accepted);
+        }
+        // A later capability/role observation cannot rewrite this frozen request.
+        {
+            let mut saved = store.value.lock().unwrap();
+            let pair = saved.desktop_redundancy.as_mut().unwrap();
+            pair.primary_reported = true;
+            pair.session.async_stop_v1 = true;
+        }
+        core.stop().await.unwrap();
+        assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        let requests = api.redundant_stop_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].background_cleanup, expected_async);
+        assert!(!requests[0].retain_active_peer);
+        assert_eq!(requests[0].operation_id, stop.operation_id);
+        assert_eq!(requests[0].lease_id, stop.active_lease_id);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn desktop_primary_invalid_endpoint_is_rejected_before_native_start_and_compensated() {
     let (core, api, store, tunnel) = desktop_pair_fixture();
     *api.desktop_endpoint_override.lock().unwrap() = Some("invalid/name:20004".into());
@@ -2997,7 +3165,13 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_session() {
-    for reconstruct in [false, true] {
+    for (reconstruct, primary_reported, async_stop_v1) in [
+        (false, true, true),
+        (true, true, true),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let expected_async = cfg!(target_os = "linux") && primary_reported && async_stop_v1;
         let api = Arc::new(MockApi::new(0));
         api.redundant_start.store(true, Ordering::SeqCst);
         let tunnel = Arc::new(DesktopPairTunnel::default());
@@ -3046,7 +3220,8 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         let original = {
             let mut stored = store.value.lock().unwrap();
             let pair = stored.desktop_redundancy.as_mut().unwrap();
-            pair.session.async_stop_v1 = true;
+            pair.session.async_stop_v1 = async_stop_v1;
+            pair.primary_reported = primary_reported;
             pair.clone()
         };
         let original_native = tunnel.pair.lock().unwrap().clone().unwrap();
@@ -3092,7 +3267,7 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
             .stop
             .clone()
             .unwrap();
-        assert!(!cold.background_cleanup);
+        assert_eq!(cold.background_cleanup, expected_async);
         assert_eq!(cold.active_lease_id, original.connection.lease_id);
         assert_eq!(
             cold.committed_leases,
@@ -3121,6 +3296,19 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         // Local Stop does not race an auth request; only the durable worker
         // contacts the panel after native cleanup/absence is confirmed.
         assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        if expected_async {
+            let mut active = connection(&cold.active_lease_id);
+            active.session_id = Some(original.session.session_id.clone());
+            api.async_stop_responses
+                .lock()
+                .unwrap()
+                .push_back(serde_json::json!({
+                    "api_version": "1", "request_id": "absent-cold-accepted", "connection": active,
+                    "stop_acceptance": { "operation_id": cold.operation_id,
+                        "session_id": original.session.session_id, "lease_id": cold.active_lease_id,
+                        "accepted": true, "cleanup_pending": true }
+                }));
+        }
         if reconstruct {
             let replay_local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
             let replay_owner = Arc::new(support::TestOwner::new(
@@ -3170,9 +3358,9 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 0);
         assert!(tunnel.scopes.lock().unwrap().iter().all(|s| s == &scope));
         let requests = api.redundant_stop_requests.lock().unwrap();
-        assert!(requests.len() >= 2);
+        assert!(requests.len() >= if expected_async { 1 } else { 2 });
         assert!(requests.iter().all(|r| !r.retain_active_peer
-            && !r.background_cleanup
+            && r.background_cleanup == expected_async
             && r.lease_id == original.connection.lease_id
             && r.session_id == original.session.session_id
             && r.operation_id == cold.operation_id));

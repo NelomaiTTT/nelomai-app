@@ -1274,6 +1274,12 @@ pub struct ForegroundObservation {
     state: CoreState,
 }
 
+impl ForegroundObservation {
+    pub fn phase(&self) -> Phase {
+        self.state.phase
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeConnectionIntent {
     pub generation: u64,

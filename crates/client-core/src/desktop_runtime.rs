@@ -367,6 +367,10 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             self.store.save(&current).map_err(|_| CoreError::Storage)?;
         } else if !snapshot.session.role_confirmed {
             let request = desktop_redundancy::role_request(&snapshot)?;
+            // Native promotion can change the external route while preserving
+            // the VIP. Pooled connections still belong to the previous route.
+            #[cfg(target_os = "linux")]
+            self.api.reset_transport()?;
             let response = self.api.report_redundant_role(&access, &request).await?;
             let _writer = self.connection_gate.lock().await;
             let mut current = self.load_runtime()?;
@@ -662,7 +666,9 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                         // server Stop accepts a historical member of this exact
                         // session; never infer a WARM role from protected metadata.
                         nelomai_client_storage::StoredDesktopRedundantStop {
-                            background_cleanup: false,
+                            background_cleanup: cfg!(target_os = "linux")
+                                && pair.primary_reported
+                                && pair.session.async_stop_v1,
                             operation_id: Uuid::new_v4().to_string(),
                             active_lease_id: pair.connection.lease_id.clone(),
                             role_generation: pair.session.role_generation,
