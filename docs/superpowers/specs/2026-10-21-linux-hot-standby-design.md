@@ -93,6 +93,27 @@ cookie was stripped by the launch whitelist, causing GTK authorization failure.
 Using the standard cookie path on the same AppImage admitted real WebKit login
 controls. This diagnostic startup does not establish panel or tunnel acceptance.
 
+Installed `c9d8e27` subsequently passed real-panel GUI login and binding in the VM:
+primary ready 5309 ms, repeat Start 4133 ms, both kernel WG members ready. Dropping
+only A's encrypted UDP selected B after 8490 ms; the same VIP and B route carried
+ordinary HTTPS successfully. Both ordinary Stops removed interfaces in 409 ms and
+exactly restored the independent links/routes/rules/resolved baseline. Full Stop
+still took 14760/11915 ms: Linux disabled the existing negotiated async Stop flag
+and waited for the ten-second reconciliation retry. Enable that existing path
+only for ordinary Linux Stop with the panel capability; retain cold cleanup and
+exact operation/session/lease acceptance checks.
+
+An exact root-engine SIGKILL exposed a separate false-absence path: native members
+survived while a passive dispatcher response reported stopped. Normal helper
+recovery cleaned the original journals and restored the same network baseline.
+Linux passive success must therefore follow the existing owned Stop/recovery ACK
+after an exited child or failed channel. Cleanup uses the original Child handle,
+kernel lifetime lease and mutation lock; negative READY/Stop ACK retains the marker
+and returns failure. Do not re-poll child exit when publishing a successful reply:
+retained child presence conservatively reports running until cleanup is confirmed.
+Other platforms retain their existing behavior. The two fixes extend existing
+regression scenarios; packaged acceptance must be repeated on the new exact SHA.
+
 ## Primary documentation reviewed
 
 * Kernel rtnetlink route API: https://www.kernel.org/doc/html/latest/netlink/specs/rt-route.html

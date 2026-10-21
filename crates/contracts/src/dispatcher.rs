@@ -1388,6 +1388,11 @@ impl ProcessDispatcher {
     ) -> DispatcherResponse {
         match self.handle_inner(request, primitive) {
             Ok(()) => {
+                // A child exiting after Linux read-side cleanup checks must not
+                // turn this reply into an unacknowledged absence.
+                #[cfg(target_os = "linux")]
+                let running = !self.channel_failed && self.child.is_some();
+                #[cfg(not(target_os = "linux"))]
                 let running = !self.channel_failed
                     && self
                         .child
@@ -1407,6 +1412,26 @@ impl ProcessDispatcher {
             return Err(blocked());
         }
         if !request.is_mutation() {
+            // A dead owned engine may leave native tunnel state. Passive replies
+            // must wait for its existing cleanup acknowledgement.
+            #[cfg(target_os = "linux")]
+            if self.channel_failed
+                || self
+                    .child
+                    .as_mut()
+                    .map(|child| child.try_wait())
+                    .transpose()?
+                    .flatten()
+                    .is_some()
+            {
+                self.handle_inner(
+                    DispatcherRequest::Stop {
+                        contract_version: 1,
+                        identity: self.layout.identity.clone(),
+                    },
+                    primitive,
+                )?;
+            }
             return Ok(());
         }
         let _guard = MutationGuard::acquire(&self.installation.root)?;

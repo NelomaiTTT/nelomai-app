@@ -995,6 +995,11 @@ fn failed_ready_never_reports_running_and_preserves_marker_until_acknowledged_cl
             !status.running,
             "failed READY must not report running: {mode}"
         );
+        #[cfg(target_os = "linux")]
+        assert!(
+            !status.ok,
+            "failed recovery must not confirm absence: {mode}"
+        );
         assert!(!dispatcher.supports_idle_tick());
         assert!(!dispatcher.handle(start(), &mut primitive).ok);
         assert!(dispatcher
@@ -1094,16 +1099,19 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
             &mut primitive
         )
         .is_err());
-    let status = dispatcher.handle(
-        DispatcherRequest::Status {
-            contract_version: 1,
-        },
-        &mut primitive,
-    );
-    assert!(
-        !status.running,
-        "a crashed child must not be reported as running"
-    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status = dispatcher.handle(
+            DispatcherRequest::Status {
+                contract_version: 1,
+            },
+            &mut primitive,
+        );
+        assert!(
+            !status.running,
+            "a crashed child must not be reported as running"
+        );
+    }
     assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
     let mut original_status: libc::siginfo_t = unsafe { std::mem::zeroed() };
     assert_eq!(
@@ -1166,6 +1174,29 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
         .unwrap(),
         identity
     );
+    #[cfg(target_os = "linux")]
+    {
+        let original_pid = fs::read_to_string(target.path().join("engine-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
+        assert_eq!(unsafe { libc::kill(original_pid, libc::SIGKILL) }, 0);
+        wait_for_exit(original_pid);
+        let stopped = dispatcher.handle(
+            DispatcherRequest::Version {
+                contract_version: 1,
+            },
+            &mut primitive,
+        );
+        assert!(stopped.ok && !stopped.running);
+        assert_eq!(stopped.identity.as_ref(), Some(&identity));
+        assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+        assert!(!target.path().join("persisted-tunnel").exists());
+        assert!(fs::read_to_string(target.path().join("engine-controls"))
+            .unwrap()
+            .ends_with("ready\nready\nstop\n"));
+    }
     for mode in ["negative", "malformed"] {
         let start = || DispatcherRequest::Start {
             contract_version: 1,
@@ -1188,6 +1219,21 @@ fn crashed_engine_direct_start_acknowledges_cleanup_before_fresh_engine_ready() 
         let marker_bytes = fs::read(&marker).unwrap();
         fs::write(target.path().join("fail-stop"), mode).unwrap();
         assert!(!dispatcher.handle(start(), &mut primitive).ok, "{mode}");
+        #[cfg(target_os = "linux")]
+        for request in [
+            DispatcherRequest::Version {
+                contract_version: 1,
+            },
+            DispatcherRequest::Status {
+                contract_version: 1,
+            },
+        ] {
+            let stopped = dispatcher.handle(request, &mut primitive);
+            assert!(
+                !stopped.ok && !stopped.running,
+                "failed cleanup ACK must not confirm absence: {mode}"
+            );
+        }
         assert!(target.path().join("persisted-tunnel").exists());
         assert!(
             !dispatcher.handle(start(), &mut primitive).ok,

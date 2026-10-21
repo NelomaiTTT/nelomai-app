@@ -2823,7 +2823,8 @@ async fn desktop_candidate_cleanup_rejects_foreign_canonical_state_without_nativ
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
-    for direct_stop in [false, true] {
+    for (direct_stop, async_stop_v1) in [(false, false), (true, false), (false, true), (true, true)]
+    {
         for role_confirmed in [true, false] {
             let api = Arc::new(MockApi::new(0));
             api.redundant_start.store(true, Ordering::SeqCst);
@@ -2874,7 +2875,7 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
                 let mut stored = store.value.lock().unwrap();
                 let pair = stored.desktop_redundancy.as_mut().unwrap();
                 pair.session.warm_stop_v1 = true;
-                pair.session.async_stop_v1 = true;
+                pair.session.async_stop_v1 = async_stop_v1;
                 pair.primary_reported = true;
                 let id = pair
                     .session
@@ -2966,13 +2967,17 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
                 .unwrap();
             assert_eq!(frozen.active_lease_id, last_active);
             assert!(frozen.retain_active_peer);
-            assert_eq!(frozen.background_cleanup, cfg!(target_os = "windows"));
+            assert_eq!(
+                frozen.background_cleanup,
+                async_stop_v1 && cfg!(any(target_os = "windows", target_os = "linux"))
+            );
             assert_eq!(core.state().await.connection.unwrap().lease_id, last_active);
             assert!(core.local_stop_pending_cleanup().await);
             core.stop().await.unwrap();
             let requests = api.redundant_stop_requests.lock().unwrap();
             assert!(requests.len() >= 2);
             assert!(requests.iter().all(|r| r.retain_active_peer
+                && r.background_cleanup == frozen.background_cleanup
                 && r.lease_id == last_active
                 && r.operation_id == frozen.operation_id));
             assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
@@ -3028,13 +3033,12 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         .await
         .unwrap();
         core.finish_start_attempt();
-        let original = store
-            .value
-            .lock()
-            .unwrap()
-            .desktop_redundancy
-            .clone()
-            .unwrap();
+        let original = {
+            let mut stored = store.value.lock().unwrap();
+            let pair = stored.desktop_redundancy.as_mut().unwrap();
+            pair.session.async_stop_v1 = true;
+            pair.clone()
+        };
         let original_native = tunnel.pair.lock().unwrap().clone().unwrap();
         let scope = original_native.session.scope.clone();
         // Helper restart already cleaned native resources and retains no owner.
@@ -3078,6 +3082,7 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
             .stop
             .clone()
             .unwrap();
+        assert!(!cold.background_cleanup);
         assert_eq!(cold.active_lease_id, original.connection.lease_id);
         assert_eq!(
             cold.committed_leases,
@@ -3157,6 +3162,7 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         let requests = api.redundant_stop_requests.lock().unwrap();
         assert!(requests.len() >= 2);
         assert!(requests.iter().all(|r| !r.retain_active_peer
+            && !r.background_cleanup
             && r.lease_id == original.connection.lease_id
             && r.session_id == original.session.session_id
             && r.operation_id == cold.operation_id));
