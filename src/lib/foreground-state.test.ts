@@ -49,6 +49,30 @@ describe("foreground native state callback", () => {
     expect(context.runtimeStateSync.blocking).toBe(false);
   });
 
+  it.each([true, false])("reconciles a recovering intent after an error on foreground=%s", async (foreground) => {
+    const { context, reply, state } = fixture();
+    context.phase = "error";
+    context.connectionIntentStatus = "recovering";
+    const pending = synchronize(context, foreground);
+    reply(state);
+    await pending;
+    expect(context.phase).toBe("connected");
+    expect(context.connectionIntentStatus).toBe("none");
+    expect(context.runtimeStateSync.pending).toBe(false);
+  });
+
+  it.each(["none", "blocked_terminal"])("does not poll an error with intent status %s", async (status) => {
+    const { context, reply, state } = fixture();
+    context.phase = "error";
+    context.connectionIntentStatus = status;
+    const pending = synchronize(context);
+    reply(state);
+    await pending;
+    expect(context.phase).toBe("error");
+    expect(context.connectionIntentStatus).toBe(status);
+    expect(context.runtimeStateSync.pending).toBe(false);
+  });
+
   it("does not disable Start on periodic polls, and ignores a late poll after Start", async () => {
     const { context, reply, state } = fixture();
     const pending = synchronize(context, false);

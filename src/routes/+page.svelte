@@ -500,7 +500,8 @@
     if (
       busy ||
       !bootstrap?.binding ||
-      !["ready", "connecting", "connected", "stopping"].includes(phase)
+      (!["ready", "connecting", "connected", "stopping"].includes(phase) &&
+        !(phase === "error" && connectionIntentStatus === "recovering"))
     ) {
       return;
     }
