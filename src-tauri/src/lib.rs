@@ -734,6 +734,15 @@ where
                 Ok(Ok(_)) => None,
                 result => Some(
                     match result {
+                        #[cfg(target_os = "linux")]
+                        Ok(Err(ApplicationError::Core(CoreError::Tunnel(code))))
+                            if matches!(
+                                code.as_str(),
+                                "endpoint_resolution_timeout" | "endpoint_resolution_failed"
+                            ) =>
+                        {
+                            Some(1)
+                        }
                         Ok(Err(
                             ApplicationError::Api(CoreApiError::Rejected {
                                 retry_after_seconds,
@@ -1900,6 +1909,64 @@ mod tests {
             .owns_tunnel
         );
         assert_eq!(tick_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_retries_only_linux_endpoint_resolution_errors_after_one_second() {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let resolution_retry = if cfg!(target_os = "linux") { 1 } else { 15 };
+        for (error, delay) in [
+            (
+                CoreError::Tunnel("endpoint_resolution_timeout".into()),
+                resolution_retry,
+            ),
+            (
+                CoreError::Tunnel("endpoint_resolution_failed".into()),
+                resolution_retry,
+            ),
+            (CoreError::Tunnel("endpoint_invalid".into()), 15),
+            (CoreError::Tunnel("redundant_actor_failed".into()), 15),
+            (CoreError::Storage, 15),
+            (CoreError::AuthRecoveryRequired, 15),
+        ] {
+            let mut schedule = DesktopCoordinationSchedule::default();
+            let tick_calls = Arc::new(AtomicUsize::new(0));
+            let calls = tick_calls.clone();
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                100,
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(ApplicationError::Core(error))
+                },
+                || async { Ok(None) },
+            )
+            .await;
+            assert_eq!(schedule.retry_at_unix, 100 + delay);
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                100 + delay - 1,
+                || async { panic!("no retry before the delay expires") },
+                || async { Ok(None) },
+            )
+            .await;
+            assert_eq!(tick_calls.load(Ordering::SeqCst), 1);
+            let calls = tick_calls.clone();
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                100 + delay,
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                },
+                || async { Ok(None) },
+            )
+            .await;
+            assert_eq!(tick_calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[cfg(not(target_os = "android"))]
