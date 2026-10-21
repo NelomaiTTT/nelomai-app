@@ -13,6 +13,7 @@ use defguard_wireguard_rs::{host::Host, Kernel, Userspace, WGApi, WireguardInter
 use nelomai_client_tunnel::redundancy::SessionScope;
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
 use nelomai_contracts::dispatcher::TunnelSlot;
+use std::cell::RefCell;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,6 +26,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct LinuxBackend {
     mode: ResourceMode,
     member_owner: Option<LinuxOwner>,
+    member_receive: RefCell<Option<crate::member_network::counters::ReceiveCounter>>,
     wireguard_api: WGApi<Kernel>,
     amneziawg_api: WGApi<Userspace>,
     amneziawg_go: PathBuf,
@@ -142,6 +144,7 @@ impl LinuxBackend {
         Ok(Self {
             mode,
             member_owner,
+            member_receive: RefCell::new(None),
             wireguard_api,
             amneziawg_api,
             amneziawg_go,
@@ -272,6 +275,8 @@ impl LinuxBackend {
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        // Monitoring never grants cleanup authority and must not pin the link.
+        self.member_receive.get_mut().take();
         if let Some(owner) = &mut self.member_owner {
             let boot = boot_identity()?;
             owner
@@ -596,6 +601,32 @@ impl ServiceTunnelBackend for LinuxBackend {
             .ok_or_else(|| backend_error("member_interface_unavailable"))?;
         owner.owned(&actual).map_err(backend_error)?;
         Ok(actual.index)
+    }
+    fn member_data_counters(
+        &self,
+    ) -> Result<crate::member_network::counters::DataCounters, ServiceError> {
+        // The unretained trait fallback cannot exclude WG control RX on Linux.
+        // Retain this monitor only behind the original member ownership proof.
+        use crate::member_network::counters::{read_owned, ReceiveCounter};
+        let index = self.member_interface_index()?;
+        read_owned(
+            index,
+            || self.member_interface_index().map_err(std::io::Error::other),
+            |index| {
+                let mut receive = self
+                    .member_receive
+                    .try_borrow_mut()
+                    .map_err(|_| std::io::Error::other("member_counter_busy"))?;
+                if receive.is_none() {
+                    *receive = Some(ReceiveCounter::open(index)?);
+                }
+                receive
+                    .as_mut()
+                    .expect("initialized receive counter")
+                    .read(index)
+            },
+        )
+        .map_err(|_| ServiceError::Backend("member_counters_unavailable".into()))
     }
     fn start(
         &mut self,

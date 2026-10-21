@@ -68,7 +68,20 @@ observed interfaces, IPv4/IPv6 routes/rules and resolved state. Lab peers and ro
 do not establish panel/installed-GUI acceptance. Linux TX failure evidence includes native
 `tx_dropped`: local OUTPUT loss freezes successful `tx_packets`, so using only that counter
 prevented corroboration and promotion. Shared health thresholds remain unchanged.
-Kernel WG receive-counter semantics, AWG3, real panel and crash recovery remain to be verified.
+Kernel WG sysfs RX also advances on handshakes/keepalives: an isolated no-inner-IP probe
+confirmed that on this kernel. Linux now retains one AF_PACKET statistics socket on each
+proved member, subscribes only after filter configuration and exact-index bind, excludes
+outgoing/control traffic and accumulates IP packet counts with checked arithmetic. There is
+no receive/forward loop or persistent kernel rule. Stop closes this monitor before link
+deletion; the existing owner proof remains authoritative. The helper's family whitelist adds
+only AF_PACKET, using its existing CAP_NET_RAW permission.
+
+The strengthened same factory scenario drops primary DNS inside the lab peer namespace:
+9 seconds of real TCP keeps A active; after TCP stops, control keepalives cannot mask the
+failure. Old sysfs RX failed this case after 75.90 s; the new counter passed in 37.29 s.
+Primary ready 1158 ms, reserve another 15029 ms, quiet-to-B 9591 ms, Stop 760 ms,
+repeat Start 1191 ms and repeat Stop 442 ms; both cleanup baselines matched again.
+Real-panel/installed-GUI acceptance, AWG3 and crash recovery remain unproven.
 
 ## Primary documentation reviewed
 
@@ -76,6 +89,7 @@ Kernel WG receive-counter semantics, AWG3, real panel and crash recovery remain 
 * WireGuard routing and bound outer socket: https://www.wireguard.com/netns/
 * Kernel TUN lifecycle (only if a userspace transport needs it): https://docs.kernel.org/networking/tuntap.html
 * Kernel RPF and source marks: https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html
+* Device-bound packet socket statistics: https://man7.org/linux/man-pages/man7/packet.7.html
 * Resolved per-link API: https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.resolve1.html
 * Resolved VPN integration: https://systemd.io/RESOLVED-VPNS/
 * iproute2 route commands: https://man7.org/linux/man-pages/man8/ip-route.8.html

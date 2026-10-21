@@ -8,6 +8,8 @@
 //! `standby: protocol::Member` (B), `role_generation: u64`,
 //! `membership_generation: u64`, `role_response: RedundantRoleResponse`,
 //! `dns_answer_ipv4: IPv4`, `traffic_address: IPv4:port`, `traffic_response: string`.
+//! `primary_peer_namespace: string` names the external primary peer's netns
+//! (1..64 ASCII alphanumeric/._- characters, starting with alphanumeric).
 //! Configurations contain real kernel WG keys, distinct IPv4 UDP endpoints,
 //! the SAME Address=/32 and DNS, AllowedIPs=0.0.0.0/0, no AWG parameters.
 //! Both external peers serve UDP DNS at probe.target_ipv4:53 and TCP at
@@ -15,6 +17,8 @@
 //! traffic_response immediately. The role response is the panel fixture's
 //! accepted B role: same session/leases, initial role_generation+1 and
 //! membership_generation+1. The test does not contact a panel.
+//! Primary peer uses PersistentKeepalive=1. The test drops only its inner DNS:
+//! real TCP must keep A active, then control-only receive must allow promotion.
 //! Requires iproute2, nftables, systemd-resolved with its working DNS stub.
 //! Runtime journals are retained under the printed /tmp path even on failure.
 
@@ -55,6 +59,7 @@ struct Fixture {
     dns_answer_ipv4: Ipv4Addr,
     traffic_address: SocketAddrV4,
     traffic_response: String,
+    primary_peer_namespace: String,
 }
 
 fn run(program: &str, args: &[&str]) -> String {
@@ -135,7 +140,7 @@ fn wait_for(backend: &mut Backend, clock: Instant, ready: impl Fn(&Snapshot) -> 
     }
 }
 
-fn data_path(fixture: &Fixture, interface: &str) {
+fn data_path(fixture: &Fixture, interface: &str, check_dns: bool) {
     let route: serde_json::Value = serde_json::from_str(&run(
         "ip",
         &[
@@ -166,19 +171,21 @@ fn data_path(fixture: &Fixture, interface: &str) {
     let mut bytes = vec![0; fixture.traffic_response.len()];
     stream.read_exact(&mut bytes).unwrap();
     assert_eq!(bytes, fixture.traffic_response.as_bytes());
-    let dns = run(
-        "resolvectl",
-        &[
-            "query",
-            "--cache=no",
-            "--type=A",
-            &fixture.primary.probe.query_name,
-        ],
-    );
-    assert!(
-        dns.contains(&fixture.dns_answer_ipv4.to_string()),
-        "system DNS: {dns}"
-    );
+    if check_dns {
+        let dns = run(
+            "resolvectl",
+            &[
+                "query",
+                "--cache=no",
+                "--type=A",
+                &fixture.primary.probe.query_name,
+            ],
+        );
+        assert!(
+            dns.contains(&fixture.dns_answer_ipv4.to_string()),
+            "system DNS: {dns}"
+        );
+    }
 }
 
 #[test]
@@ -199,6 +206,15 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
         !fixture.traffic_response.is_empty(),
         "fixture must require a nonempty TCP response"
     );
+    assert!(
+        (1..=64).contains(&fixture.primary_peer_namespace.len())
+            && fixture.primary_peer_namespace.as_bytes()[0].is_ascii_alphanumeric()
+            && fixture
+                .primary_peer_namespace
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+        "fixture must name a safe primary peer namespace"
+    );
     assert_eq!(fixture.primary.slot, Slot::A);
     assert_eq!(fixture.standby.slot, Slot::B);
     let primary = parse_configuration(fixture.primary.configuration.expose()).unwrap();
@@ -214,10 +230,6 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
     assert!(!primary.dns.is_empty());
     assert_eq!(primary.dns, standby.dns);
     let vip: Ipv4Addr = primary.addresses[0].addr().to_string().parse().unwrap();
-    let endpoint = SocketAddrV4::new(
-        primary.peers[0].endpoint.host().parse().unwrap(),
-        primary.peers[0].endpoint.port(),
-    );
     assert_ne!(primary.peers[0].endpoint, standby.peers[0].endpoint);
     let baseline = network_state();
     let root = tempfile::Builder::new()
@@ -239,6 +251,16 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
     let clock = Instant::now();
     let table = format!("nlm_native_{}", std::process::id());
     let mut fault_installed = false;
+    let nft = |args: &[&str]| {
+        let mut command = vec![
+            "netns",
+            "exec",
+            fixture.primary_peer_namespace.as_str(),
+            "nft",
+        ];
+        command.extend_from_slice(args);
+        run("ip", &command)
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let start = |scope: SessionScope| Command::Start {
             scope,
@@ -256,7 +278,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             "stage=Start primary_ready_ms={}",
             started.elapsed().as_millis()
         );
-        data_path(&fixture, "nlm-wga");
+        data_path(&fixture, "nlm-wga", true);
         let before = backend.current_redundancy_snapshot().unwrap();
         let started = Instant::now();
         let attached = execute(
@@ -303,7 +325,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
                 &member.probe.query_name,
                 index as u16,
                 0,
-                u64::from(member.probe.timeout_ms),
+                member.probe.timeout_ms,
             )
             .unwrap();
             loop {
@@ -316,43 +338,69 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             assert!(counter() > received, "no decrypted DNS data on {name}");
         }
         assert_ne!(indexes[0], indexes[1]);
-        data_path(&fixture, "nlm-wga");
-        run("nft", &["create", "table", "inet", &table]);
+        data_path(&fixture, "nlm-wga", true);
+        nft(&["create", "table", "inet", &table]);
         fault_installed = true;
-        run(
-            "nft",
-            &[
-                "add",
-                "chain",
-                "inet",
-                &table,
-                "output",
-                "{ type filter hook output priority 0; policy accept; }",
-            ],
-        );
+        nft(&[
+            "add",
+            "chain",
+            "inet",
+            &table,
+            "input",
+            "{ type filter hook input priority 0; policy accept; }",
+        ]);
         let fault_started = Instant::now();
-        run(
-            "nft",
-            &[
-                "add",
-                "rule",
-                "inet",
-                &table,
-                "output",
-                "ip",
-                "daddr",
-                &endpoint.ip().to_string(),
-                "udp",
-                "dport",
-                &endpoint.port().to_string(),
-                "counter",
-                "drop",
-            ],
+        nft(&[
+            "add",
+            "rule",
+            "inet",
+            &table,
+            "input",
+            "ip",
+            "daddr",
+            &fixture.primary.probe.target_ipv4.to_string(),
+            "udp",
+            "dport",
+            "53",
+            "counter",
+            "drop",
+        ]);
+        let mut last_tcp = fault_started;
+        while fault_started.elapsed() < Duration::from_secs(9) {
+            data_path(&fixture, "nlm-wga", false);
+            last_tcp = Instant::now();
+            backend.tick(clock.elapsed().as_millis() as u64).unwrap();
+            assert_eq!(
+                backend
+                    .current_redundancy_snapshot()
+                    .unwrap()
+                    .session
+                    .active,
+                Slot::A,
+                "real receive progress must keep A active despite failed DNS"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!(
+            "stage=FaultWithData active_a_ms={}",
+            fault_started.elapsed().as_millis()
+        );
+        let fault: serde_json::Value =
+            serde_json::from_str(&nft(&["-j", "list", "table", "inet", &table])).unwrap();
+        assert!(
+            fault["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.get("rule"))
+                .flat_map(|rule| rule["expr"].as_array().unwrap())
+                .any(|expr| expr["counter"]["packets"].as_u64().unwrap_or(0) > 0),
+            "DNS fault never dropped a probe"
         );
         let promoted = wait_for(&mut backend, clock, |s| s.session.active == Slot::B);
         eprintln!(
-            "stage=Promotion fault_to_local_b_ms={}",
-            fault_started.elapsed().as_millis()
+            "stage=Promotion quiet_to_local_b_ms={}",
+            last_tcp.elapsed().as_millis()
         );
         assert!(!promoted.session.role_confirmed);
         assert_eq!(promoted.session.role_generation, fixture.role_generation);
@@ -390,7 +438,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             confirmed.session.role_generation,
             fixture.role_generation + 1
         );
-        data_path(&fixture, "nlm-wgb");
+        data_path(&fixture, "nlm-wgb", true);
         let started = Instant::now();
         let stopped = execute(
             &mut backend,
@@ -406,7 +454,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             baseline,
             "Stop leaked interfaces/routes/rules/DNS"
         );
-        run("nft", &["delete", "table", "inet", &table]);
+        nft(&["delete", "table", "inet", &table]);
         fault_installed = false;
         let mut next = fixture.scope.clone();
         next.connection_generation += 1;
@@ -425,7 +473,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
                 .is_err(),
             "old generation stopped the new session"
         );
-        data_path(&fixture, "nlm-wga");
+        data_path(&fixture, "nlm-wga", true);
         let started = Instant::now();
         let stopped = execute(&mut backend, Command::Stop { scope: next });
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
@@ -443,7 +491,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
     // Preserve journals and still request exact production cleanup after RED.
     let cleanup = backend.shutdown();
     if fault_installed {
-        run("nft", &["delete", "table", "inet", &table]);
+        nft(&["delete", "table", "inet", &table]);
     }
     if let Err(panic) = result {
         eprintln!("cleanup after failed native lifecycle: {cleanup:?}");

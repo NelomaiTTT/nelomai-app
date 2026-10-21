@@ -611,7 +611,12 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     if "CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW" not in linux_installer:
         raise RuntimeError("Linux helper cannot assign its socket to the app user")
-    for token in ("Environment=PATH=$INSTALL_DIR:", "install-layout", "--dispatcher"):
+    for token in (
+        "Environment=PATH=$INSTALL_DIR:",
+        "install-layout",
+        "--dispatcher",
+        "RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET",
+    ):
         if token not in linux_installer:
             raise RuntimeError(f"Linux helper DNS integration misses {token}")
     unix_prepare = (ROOT / "scripts/unix/prepare-runtime.sh").read_text(encoding="utf-8")

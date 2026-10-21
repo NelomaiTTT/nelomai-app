@@ -109,6 +109,13 @@ class LinuxWorkflowTest(unittest.TestCase):
         steps = self.workflow()['jobs']['linux-package-diagnostic']['steps']
         native = next(step for step in steps if step.get('uses') == './.github/actions/release-native-host')
         self.assertEqual(native['with'], {'platform': 'linux', 'target': 'x86_64-unknown-linux-gnu'})
+        opener = next((step for step in steps if ['sudo', 'apt-get', 'install', '-y', 'xdg-utils'] in [
+            shlex.split(line) for line in step.get('run', '').splitlines()
+            if line.strip().startswith('sudo apt-get install')]), None)
+        self.assertIsNotNone(opener, 'headless Linux needs xdg-open before AppImage packaging')
+        self.assertLess(steps.index(native), steps.index(opener))
+        self.assertLess(steps.index(opener), next(index for index, step in enumerate(steps)
+            if 'scripts/package-linux-test.py' in step.get('run', '')))
         commands = [shlex.split(line) for step in steps for line in step.get('run', '').replace('\\\n', ' ').splitlines()
                     if line.strip().startswith('python scripts/')]
         build = next(command for command in commands if command[1] == 'scripts/build-release-platform.py')

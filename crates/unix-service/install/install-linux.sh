@@ -86,7 +86,7 @@ ReadWritePaths=$INSTALL_DIR
 PrivateTmp=true
 # Required to resolve /proc/<unprivileged-peer-pid>/exe for broker identity.
 CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
 
 [Install]
 WantedBy=multi-user.target
