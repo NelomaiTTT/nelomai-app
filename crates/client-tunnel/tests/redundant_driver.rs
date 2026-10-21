@@ -590,6 +590,39 @@ fn primary_start_success_is_not_yet_data_plane_ready() {
     assert!(d.tick(100).unwrap().primary_ready);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn candidate_timeout_recovery_keeps_three_successes_and_fifteen_second_dwell() {
+    // One initial timeout can recover by the existing dwell boundary. Longer
+    // loss must still wait for a third successful DNS response after that dwell.
+    for (replies_resume_at, ready_at) in [(2300, 15200), (9000, 16500)] {
+        let (mut d, w) = setup();
+        d.tick(0).unwrap();
+        assert!(d.tick(100).unwrap().primary_ready);
+        let ticket = d.state().install_ticket(&scope(), Slot::B).unwrap();
+        d.candidate_installed(ticket, 200).unwrap();
+        w.borrow_mut().lost[1] = true;
+        for now in (200..=ready_at).step_by(100) {
+            if now == replies_resume_at {
+                w.borrow_mut().lost[1] = false;
+            }
+            let result = d.tick(now).unwrap();
+            assert!(result.primary_ready);
+            assert_eq!(
+                result.standby_ready,
+                now == ready_at,
+                "at {now}ms, replies resume at {replies_resume_at}ms"
+            );
+            if now < 15200 || w.borrow().rx[1] < 3 {
+                assert!(!result.standby_ready);
+            }
+        }
+        assert_eq!(w.borrow().rx[1], 3);
+        assert!(w.borrow().selects.is_empty());
+        assert_eq!(d.state().snapshot().committed, [true, false]);
+    }
+}
+
 #[test]
 fn healthy_candidate_is_probed_but_cannot_receive_user_traffic_until_commit() {
     let (mut d, w) = setup();

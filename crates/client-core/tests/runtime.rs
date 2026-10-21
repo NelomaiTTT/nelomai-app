@@ -557,6 +557,9 @@ struct MockApi {
     desktop_role_responses: Mutex<VecDeque<nelomai_contracts::RedundantRoleResponse>>,
     desktop_acquire_responses: Mutex<VecDeque<nelomai_contracts::RedundantStandbyAcquireResponse>>,
     desktop_acquire_errors: Mutex<VecDeque<CoreApiError>>,
+    desktop_acquire_block: AtomicBool,
+    desktop_acquire_entered: Notify,
+    desktop_acquire_release: Notify,
     desktop_acquire_requests: Mutex<Vec<nelomai_contracts::RedundantStandbyAcquireRequest>>,
     desktop_commit_responses: Mutex<VecDeque<nelomai_contracts::RedundantSessionResponse>>,
     desktop_role_block: AtomicBool,
@@ -622,6 +625,9 @@ impl MockApi {
             desktop_role_responses: Mutex::new(VecDeque::new()),
             desktop_acquire_responses: Mutex::new(VecDeque::new()),
             desktop_acquire_errors: Mutex::new(VecDeque::new()),
+            desktop_acquire_block: AtomicBool::new(false),
+            desktop_acquire_entered: Notify::new(),
+            desktop_acquire_release: Notify::new(),
             desktop_acquire_requests: Mutex::new(Vec::new()),
             desktop_commit_responses: Mutex::new(VecDeque::new()),
             desktop_role_block: AtomicBool::new(false),
@@ -965,6 +971,10 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.clone());
+        if self.desktop_acquire_block.load(Ordering::SeqCst) {
+            self.desktop_acquire_entered.notify_one();
+            self.desktop_acquire_release.notified().await;
+        }
         if let Some(error) = self.desktop_acquire_errors.lock().unwrap().pop_front() {
             return Err(error);
         }
@@ -1218,6 +1228,7 @@ struct DesktopPairTunnel {
     commands: Mutex<Vec<String>>,
     pair: Mutex<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>>,
     scopes: Mutex<Vec<nelomai_client_tunnel::redundancy::SessionScope>>,
+    stage_store: Mutex<Option<Arc<PairRuntime>>>,
     fail_absence: AtomicBool,
     fail_pair_close: AtomicBool,
     fail_primary_after_install: AtomicBool,
@@ -1370,6 +1381,17 @@ impl TunnelController for DesktopPairTunnel {
                 pair.session.local_revision += 1;
             }
             Command::StageCandidate { scope, member, .. } => {
+                if let Some(store) = self.stage_store.lock().unwrap().as_ref() {
+                    let stored = store.value.lock().unwrap();
+                    let candidate = stored
+                        .desktop_redundancy
+                        .as_ref()
+                        .unwrap()
+                        .candidate
+                        .as_ref()
+                        .expect("candidate must be protected before native Stage");
+                    assert_eq!(candidate.candidate_lease_id, member.lease_id);
+                }
                 self.commands.lock().unwrap().push("stage_candidate".into());
                 let mut pair = self.pair.lock().unwrap();
                 let pair = pair.as_mut().unwrap();
@@ -2303,7 +2325,17 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
                     reused: false,
                 },
             );
-            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            *tunnel.stage_store.lock().unwrap() = Some(store.clone());
+            let acquired = core
+                .desktop_redundancy_tick(Vec::new())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                acquired.session.installed,
+                [true, cfg!(target_os = "linux")]
+            );
+            assert_eq!(acquired.session.committed, [true, false]);
             assert_eq!(
                 store
                     .value
@@ -2325,8 +2357,9 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
                     .unwrap()
                     .session
                     .installed,
-                [true, false]
+                [true, cfg!(target_os = "linux")]
             );
+            #[cfg(not(target_os = "linux"))]
             core.desktop_redundancy_tick(Vec::new()).await.unwrap();
             assert_eq!(
                 tunnel.commands.lock().unwrap().last().unwrap(),
@@ -2760,17 +2793,21 @@ async fn desktop_replacement_invalid_endpoint_preserves_candidate_for_cleanup_wi
             reused: false,
         },
     );
-    core.desktop_redundancy_tick(reserve_probe("fresh"))
-        .await
-        .unwrap();
-    let result = core.desktop_redundancy_tick(Vec::new()).await;
+    let acquired = core.desktop_redundancy_tick(reserve_probe("fresh")).await;
+    #[cfg(target_os = "linux")]
+    let result = acquired;
+    #[cfg(not(target_os = "linux"))]
+    let result = {
+        acquired.unwrap();
+        core.desktop_redundancy_tick(Vec::new()).await
+    };
     assert!(matches!(result, Err(CoreError::Tunnel(code)) if code == "endpoint_invalid"));
     assert!(!tunnel
         .commands
         .lock()
         .unwrap()
         .iter()
-        .any(|c| c == "stage" || c == "stop"));
+        .any(|c| c == "stage_candidate" || c == "stop"));
     assert!(store
         .value
         .lock()
@@ -2839,6 +2876,234 @@ async fn stage_test_candidate(
         .await
         .unwrap();
     core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_acquired_candidate_save_failure_never_submits_native_stage_and_retry_keeps_owner()
+{
+    for lost_ack in [false, true] {
+        let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+        assert!(core.desktop_redundancy_tick(Vec::new()).await.is_err());
+        let operation = store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .pending_acquire
+            .clone()
+            .unwrap();
+        let response = nelomai_contracts::RedundantStandbyAcquireResponse {
+            api_version: ApiVersion::V1,
+            request_id: "candidate".into(),
+            session: canonical_pair_role(&tunnel).session,
+            candidate_lease_id: member.connection.lease_id.clone(),
+            candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+            connection: member.connection,
+            configuration: member.configuration,
+            health_probe: member.health_probe,
+            reused: false,
+        };
+        api.desktop_acquire_responses
+            .lock()
+            .unwrap()
+            .push_back(response.clone());
+        *tunnel.stage_store.lock().unwrap() = Some(store.clone());
+        if lost_ack {
+            store.lose_next_save_ack.store(true, Ordering::SeqCst);
+        } else {
+            store.reject_next_save.store(true, Ordering::SeqCst);
+        }
+        assert!(matches!(
+            core.desktop_redundancy_tick(Vec::new()).await,
+            Err(CoreError::Storage)
+        ));
+        assert_eq!(
+            tunnel
+                .pair
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .session
+                .installed,
+            [true, false]
+        );
+        assert!(!tunnel
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "stage_candidate"));
+        let saved = store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .clone()
+            .unwrap();
+        assert_eq!(saved.pending_acquire.as_ref(), Some(&operation));
+        assert_eq!(saved.candidate.is_some(), lost_ack);
+        if !lost_ack {
+            api.desktop_acquire_responses
+                .lock()
+                .unwrap()
+                .push_back(response);
+        }
+        let staged = core
+            .desktop_redundancy_tick(Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(staged.session.installed, [true, true]);
+        assert_eq!(staged.session.committed, [true, false]);
+        assert_eq!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .pending_acquire
+                .as_ref(),
+            Some(&operation)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_delayed_acquire_after_stop_cannot_save_or_stage_candidate() {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    let core = Arc::new(core);
+    api.desktop_acquire_responses.lock().unwrap().push_back(
+        nelomai_contracts::RedundantStandbyAcquireResponse {
+            api_version: ApiVersion::V1,
+            request_id: "candidate".into(),
+            session: canonical_pair_role(&tunnel).session,
+            candidate_lease_id: member.connection.lease_id.clone(),
+            candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+            connection: member.connection,
+            configuration: member.configuration,
+            health_probe: member.health_probe,
+            reused: false,
+        },
+    );
+    api.desktop_acquire_block.store(true, Ordering::SeqCst);
+    let acquired = {
+        let core = core.clone();
+        tokio::spawn(async move { core.desktop_redundancy_tick(Vec::new()).await })
+    };
+    api.desktop_acquire_entered.notified().await;
+    core.stop_locally().await.unwrap();
+    api.desktop_acquire_release.notify_one();
+    assert!(acquired.await.unwrap().unwrap().is_none());
+    {
+        let stored = store.value.lock().unwrap();
+        let pair = stored.desktop_redundancy.as_ref().unwrap();
+        assert!(pair.stop.is_some());
+        assert!(pair.candidate.is_none());
+    }
+    assert!(!tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "stage_candidate"));
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_delayed_acquire_keeps_candidate_unstaged_until_primary_is_ready_again() {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    let core = Arc::new(core);
+    let lease_id = member.connection.lease_id.clone();
+    api.desktop_acquire_responses.lock().unwrap().push_back(
+        nelomai_contracts::RedundantStandbyAcquireResponse {
+            api_version: ApiVersion::V1,
+            request_id: "candidate".into(),
+            session: canonical_pair_role(&tunnel).session,
+            candidate_lease_id: lease_id.clone(),
+            candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+            connection: member.connection,
+            configuration: member.configuration,
+            health_probe: member.health_probe,
+            reused: false,
+        },
+    );
+    *tunnel.stage_store.lock().unwrap() = Some(store.clone());
+    api.desktop_acquire_block.store(true, Ordering::SeqCst);
+    let acquired = {
+        let core = core.clone();
+        tokio::spawn(async move { core.desktop_redundancy_tick(Vec::new()).await })
+    };
+    api.desktop_acquire_entered.notified().await;
+    let operation = store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .pending_acquire
+        .clone()
+        .unwrap();
+    {
+        let mut native = tunnel.pair.lock().unwrap();
+        let native = native.as_mut().unwrap();
+        native.stalled = true;
+        native.primary_ready = false;
+    }
+    api.desktop_acquire_release.notify_one();
+    acquired.await.unwrap().unwrap();
+    {
+        let stored = store.value.lock().unwrap();
+        let pair = stored.desktop_redundancy.as_ref().unwrap();
+        assert_eq!(
+            pair.candidate.as_ref().unwrap().candidate_lease_id,
+            lease_id
+        );
+        assert_eq!(pair.pending_acquire.as_ref(), Some(&operation));
+    }
+    {
+        let native = tunnel.pair.lock().unwrap();
+        let native = native.as_ref().unwrap();
+        assert!(!native.primary_ready);
+        assert_eq!(native.session.installed, [true, false]);
+        assert_eq!(native.leases[1], None);
+    }
+    assert!(!tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "stage_candidate"));
+    tunnel.pair.lock().unwrap().as_mut().unwrap().stalled = false;
+    let staged = core
+        .desktop_redundancy_tick(Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(staged.primary_ready);
+    assert_eq!(staged.session.installed, [true, true]);
+    assert_eq!(staged.session.committed, [true, false]);
+    assert_eq!(staged.leases[1].as_deref(), Some(lease_id.as_str()));
+    assert_eq!(
+        store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .pending_acquire
+            .as_ref(),
+        Some(&operation)
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

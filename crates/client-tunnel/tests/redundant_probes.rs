@@ -26,6 +26,12 @@ fn healthy_primary_run(fail_reserve_number: Option<usize>) -> Vec<u64> {
 
 #[test]
 fn healthy_standby_is_probed_during_warmup_then_every_fifteen_seconds_from_completion() {
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        healthy_primary_run(None),
+        vec![0, 3_100, 6_200, 21_300, 36_400]
+    );
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(
         healthy_primary_run(None),
         vec![0, 5_100, 10_200, 25_300, 40_400]
@@ -34,6 +40,12 @@ fn healthy_standby_is_probed_during_warmup_then_every_fifteen_seconds_from_compl
 
 #[test]
 fn failed_background_probe_returns_reserve_to_warmup_cadence() {
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        healthy_primary_run(Some(3)),
+        vec![0, 3_100, 6_200, 9_300, 12_400, 15_500, 30_600]
+    );
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(
         healthy_primary_run(Some(3)),
         vec![0, 5_100, 10_200, 15_300, 20_400, 25_500, 40_600]
@@ -69,13 +81,17 @@ fn normal_reserve_timeout_retries_after_completion_and_never_delays_primary() {
     assert_eq!(batch.timed_out[0].slot(), Slot::B);
     assert_eq!(batch.started.len(), 1);
     schedule.complete(batch.started[0], true, 2000);
-    for now in [4000, 6000] {
+    #[cfg(target_os = "linux")]
+    let (primary_ticks, before_retry, retry) = ([4000], 4999, 5000);
+    #[cfg(not(target_os = "linux"))]
+    let (primary_ticks, before_retry, retry) = ([4000, 6000], 6999, 7000);
+    for now in primary_ticks {
         let batch = schedule.poll(now);
         assert_eq!(batch.started.len(), 1);
         schedule.complete(batch.started[0], true, now);
     }
-    assert!(schedule.poll(6999).started.is_empty());
-    assert_eq!(schedule.poll(7000).started[0].slot(), Slot::B);
+    assert!(schedule.poll(before_retry).started.is_empty());
+    assert_eq!(schedule.poll(retry).started[0].slot(), Slot::B);
 }
 
 #[test]
@@ -92,7 +108,7 @@ fn repeated_failure_in_same_episode_keeps_its_fresh_reserve_probe() {
 }
 
 #[test]
-fn new_network_resets_previously_successful_reserve_to_five_second_warmup() {
+fn new_network_resets_previously_successful_reserve_to_warmup() {
     let mut schedule = ProbeSchedule::new(Slot::A, 0);
     schedule.set_standby_available(true);
     for now in (0..=10_000).step_by(100) {
@@ -100,7 +116,7 @@ fn new_network_resets_previously_successful_reserve_to_five_second_warmup() {
             assert!(schedule.complete(ticket, true, now));
         }
     }
-    // Three background successes at 0/5000/10000 had extended the next gap.
+    // Three background successes had extended the next gap.
     schedule.network_changed(11_000);
     let mut reserves = vec![];
     for now in (11_000..=16_000).step_by(100) {
@@ -111,6 +127,9 @@ fn new_network_resets_previously_successful_reserve_to_five_second_warmup() {
             assert!(schedule.complete(ticket, true, now));
         }
     }
+    #[cfg(target_os = "linux")]
+    assert_eq!(reserves, vec![11_000, 14_000]);
+    #[cfg(not(target_os = "linux"))]
     assert_eq!(reserves, vec![11_000, 16_000]);
 }
 

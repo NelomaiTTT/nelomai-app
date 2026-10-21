@@ -6,6 +6,9 @@ const PHASE_MS: u64 = 1_000;
 // Same response budget as Android. The one-second standby phase is not a
 // one-second DNS timeout; slow-but-valid replies must not create false failures.
 const TIMEOUT_MS: u64 = 2_000;
+#[cfg(target_os = "linux")]
+const WARMUP_MS: u64 = 3_000;
+#[cfg(not(target_os = "linux"))]
 const WARMUP_MS: u64 = 5_000;
 const BACKGROUND_READY_MS: u64 = 15_000;
 // Tickets are process-local, never persisted. A new helper process has no live

@@ -461,10 +461,18 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                     .await?;
                 let mut next = pair.clone();
                 next.candidate = Some(response.clone());
-                // Validate before persistence; Stage happens on a later step.
-                desktop_redundancy::stage_command(&next, current.slot, &fresh, &response)?;
+                // Validate before persistence; native Stage requires a protected candidate.
+                let _command =
+                    desktop_redundancy::stage_command(&next, current.slot, &fresh, &response)?;
                 current.desktop_redundancy = Some(next);
                 self.store.save(&current).map_err(|_| CoreError::Storage)?;
+                #[cfg(target_os = "linux")]
+                if fresh.primary_ready {
+                    return self
+                        .send_desktop_member(_command, cancel_epoch)
+                        .await
+                        .map(Some);
+                }
             }
         } else if pair.primary_reported && pair.candidate.is_some() && snapshot.standby_ready {
             let request = desktop_redundancy::commit_request(&pair, stored.slot, &snapshot)?;
