@@ -807,7 +807,17 @@ where
     }
 
     pub async fn state(&self) -> CoreState {
-        self.core.state().await
+        #[cfg(target_os = "linux")]
+        let was_connected =
+            self.core.begin_foreground_observation().await.phase() == Phase::Connected;
+        let state = self.core.state().await;
+        #[cfg(target_os = "linux")]
+        if was_connected && state.phase == Phase::Stopping {
+            // Advisory only: the existing worker revalidates auth, the exact
+            // protected owner and native cleanup before contacting the panel.
+            self.pending_stop_wake.notify_one();
+        }
+        state
     }
 
     pub async fn begin_foreground_observation(&self) -> nelomai_client_core::ForegroundObservation {
@@ -822,19 +832,9 @@ where
     ) -> CoreState {
         // Do not acquire lifecycle_gate: bootstrap/restoration may be waiting
         // on the panel while the foreground needs the native owner's state.
-        #[cfg(target_os = "linux")]
-        let was_connected = observation.phase() == Phase::Connected;
-        let state = self
-            .core
+        self.core
             .foreground_state_guarded(observation, intent, allowed)
-            .await;
-        #[cfg(target_os = "linux")]
-        if was_connected && state.phase == Phase::Stopping {
-            // Advisory only: the existing worker revalidates auth, the exact
-            // protected owner and native cleanup before contacting the panel.
-            self.pending_stop_wake.notify_one();
-        }
-        state
+            .await
     }
 
     pub async fn refresh_update_state(&self) -> Result<UpdateState, ApplicationError> {
@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_wrapper_bypasses_lifecycle_and_wakes_linux_cleanup_once_per_crash() {
+    async fn desktop_state_bypasses_lifecycle_and_wakes_linux_cleanup_once_per_crash() {
         use super::*;
         use nelomai_client_api::RuntimeAuthState;
         use nelomai_client_storage::{RuntimePaths, RuntimeStateV1, StorageError};
@@ -1622,13 +1622,11 @@ mod tests {
             )
             .await
             .is_err());
-            assert_eq!(
-                application
-                    .foreground_state_guarded(current, None, || true)
+            let state =
+                tokio::time::timeout(std::time::Duration::from_millis(100), application.state())
                     .await
-                    .phase,
-                Phase::Stopping
-            );
+                    .expect("desktop state must bypass stalled bootstrap");
+            assert_eq!(state.phase, Phase::Stopping);
             let wake = tokio::time::timeout(
                 std::time::Duration::from_millis(10),
                 application.wait_for_pending_stop(),
@@ -1637,16 +1635,27 @@ mod tests {
             assert_eq!(
                 wake.is_ok(),
                 cfg!(target_os = "linux"),
-                "accepted stopped/failed observation must wake Linux cleanup once"
+                "desktop state observing stopped/failed native must wake Linux cleanup once"
             );
-            let observation = application.begin_foreground_observation().await;
+            // This captured Connected observation is now stale. The guarded
+            // wrapper must not send a second cleanup hint for its late reply.
             assert_eq!(
                 application
-                    .foreground_state_guarded(observation, None, || true)
+                    .foreground_state_guarded(current, None, || true)
                     .await
                     .phase,
                 Phase::Stopping
             );
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    application.wait_for_pending_stop()
+                )
+                .await
+                .is_err(),
+                "late guarded observations must not duplicate the desktop state wake"
+            );
+            assert_eq!(application.state().await.phase, Phase::Stopping);
             assert!(
                 tokio::time::timeout(
                     std::time::Duration::from_millis(10),
