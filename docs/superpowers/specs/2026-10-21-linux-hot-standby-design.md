@@ -61,6 +61,15 @@ readiness separately from reserve readiness; measure detection separately from r
 Local cleanup should stay near the previous 4–5 second target; no arbitrary multi-second sleeps
 or deadline inflation to hide failures. End-to-end timings remain measured results, not promises.
 
+Initial real-factory run in Ubuntu 24.04 / kernel 6.8.0-147: primary ready 1160 ms,
+standby ready another 15027 ms, primary UDP loss to local B selection 8342 ms, Stop 774 ms,
+repeat Start 1288 ms and repeat Stop 432 ms. Both Stop checks restored the independently
+observed interfaces, IPv4/IPv6 routes/rules and resolved state. Lab peers and role ACK fixture
+do not establish panel/installed-GUI acceptance. Linux TX failure evidence includes native
+`tx_dropped`: local OUTPUT loss freezes successful `tx_packets`, so using only that counter
+prevented corroboration and promotion. Shared health thresholds remain unchanged.
+Kernel WG receive-counter semantics, AWG3, real panel and crash recovery remain to be verified.
+
 ## Primary documentation reviewed
 
 * Kernel rtnetlink route API: https://www.kernel.org/doc/html/latest/netlink/specs/rt-route.html

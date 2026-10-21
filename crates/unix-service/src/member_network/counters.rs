@@ -1,9 +1,11 @@
-//! Decrypted interface progress. UAPI RX includes keepalives/handshakes and
+//! Native interface evidence. UAPI RX includes keepalives/handshakes and
 //! must not be used as proof that an IP data path is healthy.
 use std::io;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DataCounters {
+    /// Transmission attempts for failure evidence; Linux includes native drops.
+    /// Growth alone does not prove successful delivery or readiness.
     pub sent_packets: u64,
     pub received_packets: u64,
 }
@@ -58,7 +60,9 @@ pub fn native(index: u32) -> io::Result<DataCounters> {
         parse_counter(&text)
     };
     Ok(DataCounters {
-        sent_packets: read("tx_packets")?,
+        sent_packets: read("tx_packets")?
+            .checked_add(read("tx_dropped")?)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?,
         received_packets: read("rx_packets")?,
     })
 }
