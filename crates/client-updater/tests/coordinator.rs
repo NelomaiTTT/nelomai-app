@@ -467,6 +467,61 @@ async fn android_installer_state_is_stable_until_the_app_is_replaced() {
 }
 
 #[tokio::test]
+async fn cancelled_android_install_requires_manual_retry_or_a_new_offer() {
+    struct CancelledInstaller(AtomicUsize);
+    #[async_trait]
+    impl UpdateBackend for CancelledInstaller {
+        async fn install(
+            &self,
+            _: &AccessSnapshot,
+            _: &str,
+            _: UpdateBarrierPhase,
+            _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<InstallResult, UpdateBackendError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(UpdateBackendError::new("apk_install_cancelled"))
+        }
+    }
+    let backend = Arc::new(CancelledInstaller(AtomicUsize::new(0)));
+    let (coordinator, barrier) = coordinator(backend.clone());
+    coordinator.observe(Some(offer()));
+    assert!(coordinator.install_now(&access()).await.is_err());
+    assert!(!barrier.blocked.load(Ordering::SeqCst));
+    assert_eq!(
+        coordinator.phase(),
+        UpdatePhase::Failed {
+            version: "0.2.0".into(),
+            code: "apk_install_cancelled".into(),
+        }
+    );
+    coordinator.observe(Some(offer()));
+    let _ = coordinator
+        .install_automatically(&access(), UpdatePreferences::default())
+        .await;
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        1,
+        "cancel must not reopen system UI"
+    );
+    assert!(coordinator.install_now(&access()).await.is_err());
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        2,
+        "explicit retry is permitted"
+    );
+    coordinator.observe(Some(offer_for("0.3.0")));
+    assert!(coordinator
+        .install_automatically(&access(), UpdatePreferences::default())
+        .await
+        .is_err());
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        3,
+        "new version has a new decision"
+    );
+}
+
+#[tokio::test]
 async fn backend_waits_until_the_shutdown_barrier_reports_local_stopped() {
     let backend = Arc::new(RecordingBackend::new(Duration::ZERO));
     let barrier = Arc::new(RecordingBarrier::default());
@@ -602,4 +657,41 @@ async fn rollback_failure_replaces_the_backend_error_in_the_failed_phase() {
             code: "update_recovery_failed".into(),
         }
     );
+}
+
+#[tokio::test]
+async fn cancelled_offer_stays_cancelled_when_rollback_initially_fails() {
+    struct CancelledInstaller(AtomicUsize);
+    #[async_trait]
+    impl UpdateBackend for CancelledInstaller {
+        async fn install(
+            &self,
+            _: &AccessSnapshot,
+            _: &str,
+            _: UpdateBarrierPhase,
+            _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<InstallResult, UpdateBackendError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(UpdateBackendError::new("apk_install_cancelled"))
+        }
+    }
+    let backend = Arc::new(CancelledInstaller(AtomicUsize::new(0)));
+    let (coordinator, barrier) = coordinator(backend.clone());
+    coordinator.observe(Some(offer()));
+    barrier.reject_failed.store(true, Ordering::SeqCst);
+    assert!(coordinator.install_now(&access()).await.is_err());
+    assert!(
+        barrier.blocked.load(Ordering::SeqCst),
+        "pending recovery must remain blocked"
+    );
+    assert!(
+        matches!(coordinator.phase(), UpdatePhase::Failed { code, .. } if code == "update_recovery_failed")
+    );
+    barrier.reject_failed.store(false, Ordering::SeqCst);
+    coordinator.observe(Some(offer()));
+    let _ = coordinator
+        .install_automatically(&access(), UpdatePreferences::default())
+        .await;
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1,
+        "the same user-cancelled offer must not auto reopen just because journal recovery initially failed");
 }

@@ -235,7 +235,7 @@ impl UpdateBackend for AndroidUpdateBackend {
             .install_apk(&apk, &update.version, &update.signer_sha256)
             .await?;
         if !installer_opened {
-            return Err(UpdateBackendError::new("apk_installer_unavailable"));
+            return Err(UpdateBackendError::new("apk_install_cancelled"));
         }
         Ok(InstallResult::InstallerOpened(InstalledUpdate {
             version: update.version,
@@ -284,6 +284,88 @@ async fn cleanup_stale_updates(directory: &Path, current: &Path) -> Result<(), U
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn installer_cancellation_is_distinct_from_open_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        struct Installer(u8);
+        #[async_trait]
+        impl AndroidApkInstaller for Installer {
+            async fn install_apk(
+                &self,
+                path: &Path,
+                version: &str,
+                signer: &str,
+            ) -> Result<bool, UpdateBackendError> {
+                assert_eq!(std::fs::read(path).unwrap(), b"abc");
+                assert_eq!(version, "0.3.7");
+                assert_eq!(signer, "a".repeat(64));
+                match self.0 {
+                    0 => Ok(false),
+                    1 => Err(UpdateBackendError::new("apk_installer_unavailable")),
+                    _ => Ok(true),
+                }
+            }
+        }
+        for mode in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let manifest = serde_json::json!({
+                "version":"0.3.7", "url":format!("{origin}/api/client/v1/updates/artifacts/update.apk"),
+                "signature":"a".repeat(64), "sha256":format!("{:x}", Sha256::digest(b"abc")), "size_bytes":3,
+            }).to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{manifest}",manifest.len()).unwrap();
+            });
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("nelomai-0.3.7.apk"), b"abc").unwrap();
+            let mut backend = AndroidUpdateBackend::new(
+                directory.path().into(),
+                "0.3.6".into(),
+                Arc::new(Installer(mode)),
+            )
+            .unwrap();
+            // A private loopback policy keeps this test offline. Production's
+            // public constructor still requires HTTPS and the trusted origin.
+            backend.endpoint_policy = UpdateEndpointPolicy {
+                panel_origin: origin.parse().unwrap(),
+            };
+            let access = AccessSnapshot::new(
+                "synthetic".into(),
+                nelomai_contracts::RuntimeIdentity {
+                    container_version: "0.3.6".into(),
+                    runtime_version: "0.3.6".into(),
+                    runtime_contract_version: 1,
+                    slot: nelomai_contracts::RuntimeSlot::Latest,
+                    session_generation: Some(1),
+                },
+                1,
+                "synthetic-family".into(),
+            )
+            .unwrap();
+            let result = backend
+                .install(
+                    &access,
+                    "0.3.7",
+                    UpdateBarrierPhase::LocalStopped,
+                    Arc::new(|_| {}),
+                )
+                .await;
+            server.join().unwrap();
+            match mode {
+                0 => assert_eq!(result.unwrap_err().code(), "apk_install_cancelled"),
+                1 => assert_eq!(result.unwrap_err().code(), "apk_installer_unavailable"),
+                _ => assert!(matches!(result.unwrap(), InstallResult::InstallerOpened(_))),
+            }
+        }
+    }
+
     struct NoInstaller;
     #[async_trait::async_trait]
     impl AndroidApkInstaller for NoInstaller {

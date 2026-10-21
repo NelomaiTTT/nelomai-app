@@ -6,7 +6,8 @@ import { beginConnectionStart, beginConnectionStop, initialConnectionActionState
   beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction, finishConnectionStart,
   finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
-import { commandCode, commandMessage } from "./native-client";
+import { commandCode, commandMessage, waitForSettlement,
+  START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS } from "./native-client";
 import { bindingPreferenceUpdateRequest, connectionEgressMode, primaryAction,
   type Phase, type ConnectionIntentStatus } from "./app-model";
 
@@ -102,6 +103,126 @@ function logoutFixture() {
   });
   return result;
 }
+
+describe("retired Start cancellation", () => {
+  function startFixture() {
+    const { context, state } = fixture();
+    const current = { ...state, connection: { leaseId: "own-lease" }, reserveState: "ready" };
+    Object.assign(context, {
+      bootstrap: { device: { id: "own-device", platform: "android" }, binding: {} },
+      connectionAction: "start", runtimeStatus: null, splitTunnelBlocksStart: false,
+      runtimeStartBlocked: () => false, selectedLayer: "stray", ticConnectionMode: "dynamic",
+      routeMode: "standalone", selectedEgressMode: "ipv4", antivirusStartFailure: false,
+      canBeginConnectionAction, beginConnectionStart, beginConnectionStop,
+      finishConnectionStart, finishConnectionStop, prepareConnectionStartForPlatform,
+      pendingBindingPreferenceRequest: () => null,
+      waitForSettlement, START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS,
+    });
+    Object.assign(context.nativeClient, {
+      prepareTunnel: async () => {}, state: async () => current,
+      start: async () => { throw { code: "connection_intent_cancelled" }; },
+      queueStartFailureDiagnostics: async () => {},
+    });
+    return { context, current };
+  }
+
+  // Execute the registered listener itself, including its authoritative poll.
+  let listener: ts.Node | undefined;
+  function visit(node: ts.Node) {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+      && node.expression.text === "listen" && ts.isStringLiteral(node.arguments[0])
+      && node.arguments[0].text === "native-connection-changed") listener = node.arguments[1];
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  const notify = new Function("context", "event", `with (context) {
+    ${ts.transpile("const handler = " + listener!.getText(ast), { target: ts.ScriptTarget.ES2022 })};
+    return handler(event);
+  }`);
+
+  it.each(["connected", "connecting"])("does not show cancellation over %s recovery", async (phase) => {
+    const { context, current } = startFixture();
+    current.phase = phase;
+    await toggle(context);
+    expect(context.phase).toBe(phase);
+    expect(context.error).toBeNull();
+    expect(context.busy).toBe(false);
+  });
+
+  it.each(["invalid_access_token", "preferences_unavailable"])(
+    "preserves a newer %s error while the old Start reply was pending", async (code) => {
+      const { context } = startFixture();
+      let fail!: (reason: unknown) => void;
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      Object.assign(context.nativeClient, { start: () => {
+        entered(); return new Promise((_, reject) => { fail = reject; });
+      } });
+      const pending = toggle(context);
+      await started;
+      const notice = commandMessage({ code }, "preferences");
+      context.error = notice as any;
+      fail({ code: "connection_intent_cancelled" });
+      await pending;
+      expect(context.error).toBe(notice);
+      expect(context.phase).toBe("connected");
+    },
+  );
+
+  it("discards an old Start rejection after a newer Stop", async () => {
+    const { context } = startFixture();
+    let fail!: (reason: unknown) => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    Object.assign(context.nativeClient, { start: () => {
+      entered(); return new Promise((_, reject) => { fail = reject; });
+    } });
+    const pending = toggle(context);
+    await started;
+    context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+    context.phase = "stopping";
+    context.error = "Current Stop error" as any;
+    fail({ code: "connection_intent_cancelled" });
+    await pending;
+    expect(context.phase).toBe("stopping");
+    expect(context.error).toBe("Current Stop error");
+  });
+
+  it("still presents a genuine failure of the current Start", async () => {
+    const { context, current } = startFixture();
+    current.phase = "error";
+    Object.assign(context.nativeClient, { start: async () => { throw { code: "tunnel_handshake_timeout" }; } });
+    await toggle(context);
+    expect(context.phase).toBe("error");
+    expect(context.error).toBe(commandMessage({ code: "tunnel_handshake_timeout" }, "start"));
+  });
+
+  it.each([
+    ["start", "connection_intent_cancelled", "Current settings error"],
+    ["start", "tunnel_failed", null],
+    ["stop", "connection_intent_cancelled", null],
+  ] as const)("keeps cancellation filtering scoped to a Start event: %s/%s", async (action, code, preserved) => {
+    const { context } = startFixture();
+    context.phase = "connected";
+    context.error = "Current settings error" as any;
+    let pending!: Promise<unknown>;
+    Object.assign(context, { synchronizeRuntimeState: () => { pending = synchronize(context); } });
+    const failure = { code };
+    notify(context, { payload: { action, error: failure } });
+    await pending;
+    expect(context.error).toBe(preserved ?? commandMessage(failure, action));
+    expect(context.phase).toBe("connected");
+  });
+
+  it("keeps confirmed channel closure after a cancelled Start", async () => {
+    const { context } = startFixture();
+    Object.assign(context.nativeClient, { state: async () => { throw { code: "runtime_channel_closed" }; } });
+    await toggle(context);
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.view).toBe("unavailable");
+    expect(context.error).toContain("службой подключения");
+  });
+});
 
 describe("async Stop presentation", () => {
   function stopFixture() {

@@ -244,12 +244,14 @@
     void listen<NativeConnectionChangedEvent>("native-connection-changed", (event) => {
       if (event.payload.error) {
         const code = commandCode(event.payload.error);
-        error = commandMessage(event.payload.error, event.payload.action, {
-          personalPeer:
-            event.payload.action === "start" &&
-            selectedLayer === "tic" &&
-            ticConnectionMode === "personal",
-        });
+        if (event.payload.action !== "start" || code !== "connection_intent_cancelled") {
+          error = commandMessage(event.payload.error, event.payload.action, {
+            personalPeer:
+              event.payload.action === "start" &&
+              selectedLayer === "tic" &&
+              ticConnectionMode === "personal",
+          });
+        }
         if (
           code === "defender_exclusion_missing" ||
           code === "amneziawg_component_missing" ||
@@ -896,15 +898,14 @@
       connectionMetrics = current?.metrics ?? connectionMetrics;
       reserveState = current?.reserveState ?? reserveState;
       runtimeWarning = current?.warning ?? runtimeWarning;
-      error =
-        failureCode === "connection_intent_cancelled"
-          ? null
-          : commandMessage(reason, stopping ? "stop" : "start", {
-              personalPeer:
-                !stopping &&
-                selectedLayer === "tic" &&
-                ticConnectionMode === "personal",
-            });
+      if (failureCode !== "connection_intent_cancelled") {
+        error = commandMessage(reason, stopping ? "stop" : "start", {
+          personalPeer:
+            !stopping &&
+            selectedLayer === "tic" &&
+            ticConnectionMode === "personal",
+        });
+      }
       if (
         failureCode === "defender_exclusion_missing" ||
         failureCode === "amneziawg_component_missing" ||
@@ -1525,8 +1526,10 @@
           <strong>Подтвердите установку Nelomai {updateStatus.version}</strong>
           <span>Завершите обновление в системном окне Android.</span>
         {:else if updateStatus.phase === "failed"}
-          <strong>Не удалось установить Nelomai {updateStatus.version}</strong>
-          <span>Можно повторить загрузку сейчас.</span>
+          <strong>{updateStatus.errorCode === "apk_install_cancelled"
+            ? `Установка Nelomai ${updateStatus.version} отменена`
+            : `Не удалось установить Nelomai ${updateStatus.version}`}</strong>
+          <span>Можно повторить установку сейчас.</span>
         {:else}
           <strong>Доступна версия {updateStatus.version}</strong>
           <span>

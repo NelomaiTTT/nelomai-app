@@ -1144,6 +1144,9 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
+                "tunnel_start_cancelled" => {
+                    Self::new("connection_intent_cancelled", "Подключение отменено")
+                }
                 "tunnel_start_timeout" => Self::new(
                     "tunnel_start_timeout",
                     "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
@@ -4680,6 +4683,21 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_native_start_is_presented_as_cancellation_without_hiding_other_failures() {
+        use nelomai_client_core::CoreError;
+
+        for (native, expected) in [
+            ("tunnel_start_cancelled", "connection_intent_cancelled"),
+            ("tunnel_start_timeout", "tunnel_start_timeout"),
+            ("tunnel_handshake_timeout", "tunnel_handshake_timeout"),
+            ("unknown_native_failure", "tunnel_failed"),
+        ] {
+            let error = super::CommandError::from_core(CoreError::Tunnel(native.into()));
+            assert_eq!(error.code(), expected, "native error: {native}");
+        }
+    }
+
     fn support_records(directory: &std::path::Path) -> Vec<serde_json::Value> {
         std::fs::read_to_string(directory.join("application.jsonl"))
             .unwrap()

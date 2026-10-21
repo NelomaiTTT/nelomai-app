@@ -66,7 +66,6 @@ enum Call {
     Revoke(u64),
     Stop(bool),
     Background(String, String),
-    Install(String, String, String),
     Storage(String, String, bool, bool),
     StorageAck,
     PushCleanup,
@@ -74,6 +73,29 @@ enum Call {
     ReleaseOwnerReload(u32, bool),
 }
 impl Callbacks {
+    fn install_apk(&self, path: &str, version: &str, signer: &str) -> Result<bool, ()> {
+        let mut env = self.vm.attach_current_thread().map_err(|_| ())?;
+        let path = env.new_string(path).map_err(|_| ())?;
+        let version = env.new_string(version).map_err(|_| ())?;
+        let signer = env.new_string(signer).map_err(|_| ())?;
+        let result = env
+            .call_method(
+                self.object.as_obj(),
+                "installApk",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
+                &[
+                    JValue::Object(&path),
+                    JValue::Object(&version),
+                    JValue::Object(&signer),
+                ],
+            )
+            .and_then(|value| value.z());
+        if result.is_err() {
+            let _ = env.exception_clear();
+        }
+        result.map_err(|_| ())
+    }
+
     fn call(&self, call: Call) -> Result<Option<String>, ()> {
         let mut env = self.vm.attach_current_thread().map_err(|_| ())?;
         let result = match call {
@@ -102,23 +124,6 @@ impl Callbacks {
                 .call_method(self.object.as_obj(), "acknowledgeNativeStorage", "()Z", &[])
                 .and_then(|v| v.z())
                 .map(|ok| ok.then_some(None)),
-            Call::Install(path, version, signer) => {
-                let path = env.new_string(path).map_err(|_| ())?;
-                let version = env.new_string(version).map_err(|_| ())?;
-                let signer = env.new_string(signer).map_err(|_| ())?;
-                env.call_method(
-                    self.object.as_obj(),
-                    "installApk",
-                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
-                    &[
-                        JValue::Object(&path),
-                        JValue::Object(&version),
-                        JValue::Object(&signer),
-                    ],
-                )
-                .and_then(|v| v.z())
-                .map(|ok| ok.then_some(None))
-            }
             Call::Revoke(epoch) => env
                 .call_method(
                     self.object.as_obj(),
@@ -217,14 +222,19 @@ impl nelomai_client_updater::AndroidApkInstaller for Native {
         version: &str,
         signer: &str,
     ) -> Result<bool, nelomai_client_updater::UpdateBackendError> {
-        self.call(Call::Install(
-            path.to_string_lossy().into_owned(),
-            version.into(),
-            signer.into(),
-        ))
-        .await
-        .map(|_| true)
-        .map_err(|_| nelomai_client_updater::UpdateBackendError::new("apk_installer_unavailable"))
+        // Preserve false (user cancellation) separately from a JNI/opening error.
+        let callback = self.0.clone();
+        let path = path.to_string_lossy().into_owned();
+        let version = version.to_owned();
+        let signer = signer.to_owned();
+        tokio::task::spawn_blocking(move || callback.install_apk(&path, &version, &signer))
+            .await
+            .map_err(|_| {
+                nelomai_client_updater::UpdateBackendError::new("apk_installer_unavailable")
+            })?
+            .map_err(|_| {
+                nelomai_client_updater::UpdateBackendError::new("apk_installer_unavailable")
+            })
     }
 }
 impl Native {

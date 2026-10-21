@@ -87,6 +87,7 @@ pub(crate) struct HostUpdater {
     barrier: Arc<UpdateBarrier>,
     version: String,
     operation: Mutex<UpdateOperation>,
+    install_recovery_gate: tokio::sync::Mutex<()>,
     refresh_error: Mutex<Option<String>>,
 }
 impl HostUpdater {
@@ -137,6 +138,7 @@ impl HostUpdater {
             barrier,
             version,
             operation: Mutex::new(UpdateOperation::Idle),
+            install_recovery_gate: tokio::sync::Mutex::new(()),
             refresh_error: Mutex::new(None),
         })
     }
@@ -144,6 +146,12 @@ impl HostUpdater {
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), PrivateError> {
+        // A live installer owns its Stop journal until Android returns a result.
+        // Never let startup/preflight recovery infer cancellation in that window.
+        let _gate = self
+            .install_recovery_gate
+            .try_lock()
+            .map_err(|_| PrivateError::RecoveryRequired)?;
         self.barrier
             .recover_before(&self.version, deadline)
             .await
@@ -413,6 +421,7 @@ impl HostUpdater {
     }
 
     async fn run_install(&self, kind: InstallKind) {
+        let _gate = self.install_recovery_gate.lock().await;
         let Ok(access) = self.broker.access_token(None).await else {
             return;
         };
@@ -469,12 +478,16 @@ mod tests {
         LocalAuthStop, RuntimeRecordSwitchControl, SlotSelectionV1, UnavailableRuntimeForceStop,
     };
     use async_trait::async_trait;
-    use axum::{extract::State, routing::get, Json, Router};
+    use axum::{
+        extract::State,
+        routing::{get, post},
+        Json, Router,
+    };
     use ed25519_dalek::{Signer, SigningKey};
     use nelomai_client_storage::{
         AuthStore, AuthStoreV1, BrokerMetadataV1, ContainerOwnerLock, ProtectedAuthStore,
-        ProtectedRecordStore, ProtectedRuntimeStore, RuntimePaths, RuntimeRecordOwner,
-        RuntimeStateStore, RuntimeStateV1, StorageError, StoredAuth,
+        ProtectedRecordStore, ProtectedRuntimeStore, RuntimeAuthScope, RuntimePaths,
+        RuntimeRecordOwner, RuntimeStateStore, RuntimeStateV1, StorageError, StoredAuth,
     };
     use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
     use nelomai_contracts::{
@@ -602,6 +615,36 @@ mod tests {
         fail: AtomicBool,
         version: Mutex<String>,
         release: Notify,
+        reconciles: AtomicUsize,
+        resumes: AtomicUsize,
+        fail_resume: AtomicBool,
+    }
+
+    async fn reconcile(
+        State(panel): State<Arc<Panel>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        panel.reconciles.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"state":"clean","operation_id":body["operation_id"],
+            "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
+            "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}))
+    }
+    async fn resume(
+        State(panel): State<Arc<Panel>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+        panel.resumes.fetch_add(1, Ordering::SeqCst);
+        if panel.fail_resume.swap(false, Ordering::SeqCst) {
+            return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(body["decision"], "cancel");
+        Ok(Json(json!({"identity":{
+            "container_version":body["target_identity"]["container_version"],
+            "runtime_version":body["target_identity"]["runtime_version"],
+            "runtime_contract_version":body["target_identity"]["runtime_contract_version"],
+            "runtime_slot":body["target_identity"]["runtime_slot"],
+            "session_generation":body["expected_session_generation"].as_u64().unwrap()+1},
+            "access_token":"resumed-access","token_type":"Bearer","access_expires_in":900})))
     }
 
     async fn bootstrap(
@@ -647,11 +690,28 @@ mod tests {
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
     ) {
+        updater_with_installer(fail_first, None).await
+    }
+
+    async fn updater_with_installer(
+        fail_first: bool,
+        installer: Option<Arc<dyn UpdateBackend>>,
+    ) -> (
+        Arc<HostUpdater>,
+        Arc<Panel>,
+        Arc<RecordingBackend>,
+        Arc<Tunnel>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
         let panel = Arc::new(Panel {
             calls: AtomicUsize::new(0),
             fail: AtomicBool::new(fail_first),
             version: Mutex::new("0.2.21".into()),
             release: Notify::new(),
+            reconciles: AtomicUsize::new(0),
+            resumes: AtomicUsize::new(0),
+            fail_resume: AtomicBool::new(false),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap()))
@@ -660,6 +720,11 @@ mod tests {
             .unwrap();
         let router = Router::new()
             .route("/api/client/v1/bootstrap", get(bootstrap))
+            .route(
+                "/api/client/v1/connections/runtime-switch/reconcile",
+                post(reconcile),
+            )
+            .route("/api/client/v1/auth/runtime/resume", post(resume))
             .with_state(panel.clone());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
@@ -704,13 +769,18 @@ mod tests {
             pending_push_cleanup_epoch: None,
             transition_authorities: Vec::new(),
         });
+        let scope = RuntimeAuthScope {
+            auth_epoch: stored.auth_epoch,
+            family: stored.broker.as_ref().unwrap().family.clone(),
+            identity: stored.confirmed_identity.clone().unwrap(),
+        };
         auth.save(&stored).unwrap();
         let broker = Arc::new(AuthBroker::new(api.clone(), auth, Arc::new(Stop)).unwrap());
         let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.20").unwrap();
         let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
-        runtime
-            .save(&RuntimeStateV1::empty(runtime.paths(), false))
-            .unwrap();
+        let mut state = RuntimeStateV1::empty(runtime.paths(), false);
+        state.auth_scope = Some(scope);
+        runtime.save(&state).unwrap();
         let tunnel = Arc::new(Tunnel::default());
         let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
         let control = Arc::new(RuntimeRecordSwitchControl::new(
@@ -732,7 +802,7 @@ mod tests {
                 broker,
                 coordinator,
                 "0.2.20".into(),
-                Some(backend.clone()),
+                Some(installer.unwrap_or_else(|| backend.clone())),
             )
             .unwrap(),
         );
@@ -935,6 +1005,163 @@ mod tests {
         panel.release.notify_one();
         wait_for_idle(&updater).await;
         assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    struct CancelledInstaller {
+        calls: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+        wait_for_result: bool,
+    }
+    impl CancelledInstaller {
+        fn new(wait_for_result: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                entered: Notify::new(),
+                release: Notify::new(),
+                wait_for_result,
+            })
+        }
+    }
+    #[async_trait]
+    impl UpdateBackend for CancelledInstaller {
+        async fn install(
+            &self,
+            _: &AccessSnapshot,
+            _: &str,
+            _: UpdateBarrierPhase,
+            _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<InstallResult, UpdateBackendError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            if self.wait_for_result {
+                self.release.notified().await;
+            }
+            Err(UpdateBackendError::new("apk_install_cancelled"))
+        }
+    }
+
+    #[tokio::test]
+    async fn live_installer_keeps_recovery_and_start_blocked_until_its_result() {
+        let installer = CancelledInstaller::new(true);
+        let (updater, panel, _, _, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        panel.release.notify_one();
+        updater.install(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), installer.entered.notified())
+            .await
+            .unwrap();
+        let path = root.path().join("common/update-journal-v1.json");
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&before).unwrap()["phase"],
+            "local_stopped"
+        );
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(2),
+            updater.recover(Some(
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&path).ok(),
+            Some(before),
+            "recovery must not start cancelling a live installer journal"
+        );
+        assert!(
+            recovered.is_err(),
+            "live system installer must retain the update barrier"
+        );
+        assert!(updater.native_start_blocked().unwrap());
+        assert_eq!(panel.reconciles.load(Ordering::SeqCst), 0);
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), 0);
+        installer.release.notify_one();
+        wait_for_idle(&updater).await;
+        assert_eq!(
+            updater.status().unwrap().error_code.as_deref(),
+            Some("apk_install_cancelled")
+        );
+        assert!(!path.exists());
+        updater.recover(None).await.unwrap();
+        assert!(!updater.native_start_blocked().unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_offer_survives_a_real_resume_failure_and_later_recovery() {
+        let installer = CancelledInstaller::new(false);
+        let (updater, panel, _, _, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        panel.fail_resume.store(true, Ordering::SeqCst);
+        panel.release.notify_one();
+        updater.install(false).unwrap();
+        wait_for_idle(&updater).await;
+        assert_eq!(
+            updater.status().unwrap().error_code.as_deref(),
+            Some("update_recovery_failed")
+        );
+        let path = root.path().join("common/update-journal-v1.json");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()
+                ["phase"],
+            "cancel_requested"
+        );
+        updater.recover(None).await.unwrap();
+        assert!(!path.exists());
+        updater.set_automatic(true).unwrap();
+        updater.start_refresh().unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        assert_eq!(
+            installer.calls.load(Ordering::SeqCst),
+            1,
+            "same cancelled offer must not reopen after recovery"
+        );
+        assert_eq!(
+            updater.status().unwrap().error_code.as_deref(),
+            Some("update_recovery_failed"),
+            "automatic refresh must not hide the recovery error"
+        );
+        panel.release.notify_one();
+        updater.install(false).unwrap();
+        wait_for_idle(&updater).await;
+        assert_eq!(
+            installer.calls.load(Ordering::SeqCst),
+            2,
+            "manual retry stays permitted"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn interrupted_install_task_releases_recovery_without_losing_its_journal() {
+        let installer = CancelledInstaller::new(true);
+        let (updater, panel, _, _, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        updater.start_refresh().unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_refresh(&updater).await;
+        let owner = updater.clone();
+        let install = tokio::spawn(async move { owner.run_install(InstallKind::Manual).await });
+        tokio::time::timeout(Duration::from_secs(2), installer.entered.notified())
+            .await
+            .unwrap();
+        let path = root.path().join("common/update-journal-v1.json");
+        assert!(path.exists());
+        install.abort();
+        assert!(install.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(2), updater.recover(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
+        assert!(!updater.native_start_blocked().unwrap());
         server.abort();
     }
 

@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import java.io.File
+import java.lang.ref.WeakReference
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -63,14 +64,17 @@ internal object RuntimeApkInstaller {
             context.startActivity(Intent(context, RuntimeApkInstallerActivity::class.java)
                 .putExtra("request", request.nonce).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             StartupDiagnostics.record(context, "update.android.installer_activity_dispatched")
-            request.result.get(15, TimeUnit.MINUTES).also { opened ->
+            request.result.get(15, TimeUnit.MINUTES).also { installed ->
                 StartupDiagnostics.record(
                     context,
-                    if (opened) "update.android.installer_intent_acknowledged"
-                    else "update.android.installer_intent_rejected",
+                    if (installed) "update.android.installer_succeeded"
+                    else "update.android.installer_cancelled",
                 )
             }
         } catch (error: Throwable) {
+            // Invalidate the request before recovery can resume the old runtime.
+            // A late permission/result callback must not dispatch another install.
+            request.result.completeExceptionally(error)
             StartupDiagnostics.recordCode(
                 context,
                 "update.android.install_failed",
@@ -95,6 +99,16 @@ class RuntimeApkInstallerActivity : Activity() {
             finish()
             return
         }
+        val activity = WeakReference(this)
+        request!!.result.whenComplete { _, failure ->
+            if (failure != null) activity.get()?.let { host -> host.runOnUiThread {
+                if (!host.isDestroyed && !host.isFinishing) {
+                    host.finishActivity(2)
+                    host.finishActivity(1)
+                    host.finish()
+                }
+            } }
+        }
         if (state != null) {
             StartupDiagnostics.record(this, "update.android.installer_activity_recreated")
             return
@@ -112,12 +126,25 @@ class RuntimeApkInstallerActivity : Activity() {
     @Deprecated("Android callback")
     override fun onActivityResult(code: Int, result: Int, data: Intent?) {
         super.onActivityResult(code, result, data)
-        if (code != 1) return
-        StartupDiagnostics.record(this, "update.android.unknown_sources_returned")
-        if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
-            StartupDiagnostics.recordCode(this, "update.android.installer_activity_failed", "unknown_sources_denied")
-            complete(false)
-        } else try { openInstaller() } catch (error: Throwable) { fail(error) }
+        if (code != 1 && code != 2) return
+        try {
+            val value = activeRequest()
+            if (code == 1) {
+                StartupDiagnostics.record(this, "update.android.unknown_sources_returned")
+                if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+                    StartupDiagnostics.recordCode(this, "update.android.installer_cancelled", "unknown_sources_denied")
+                    complete(false)
+                } else openInstaller()
+            } else when (result) {
+                RESULT_CANCELED -> complete(false)
+                RESULT_OK -> {
+                    validate(value)
+                    check(packageInfo(packageName, false)?.versionName == value.version) { "installed_version_mismatch" }
+                    complete(true)
+                }
+                else -> error("installer_result_failed")
+            }
+        } catch (error: Throwable) { fail(error) }
     }
     private fun complete(opened: Boolean) { request?.result?.complete(opened); finish() }
     private fun fail(error: Throwable) {
@@ -126,7 +153,8 @@ class RuntimeApkInstallerActivity : Activity() {
             "update.android.installer_activity_failed",
             installerFailureCode(error),
         )
-        complete(false)
+        request?.result?.completeExceptionally(error)
+        finish()
     }
     override fun onPause() {
         installerLifecycle.onPause()
@@ -135,10 +163,8 @@ class RuntimeApkInstallerActivity : Activity() {
     override fun onResume() {
         super.onResume()
         if (installerLifecycle.onResume()) {
-            // Android does not reliably distinguish install, cancellation and a
-            // system-dialog dismissal here. Record only that control returned.
+            // Returning alone is not an install result. Wait for Android's callback.
             StartupDiagnostics.record(this, "update.android.installer_activity_returned")
-            finish()
         }
     }
     override fun onDestroy() {
@@ -168,21 +194,23 @@ class RuntimeApkInstallerActivity : Activity() {
         return values.mapTo(mutableSetOf()) { signature -> MessageDigest.getInstance("SHA-256")
             .digest(signature.toByteArray()).joinToString("") { "%02x".format(it) } }
     }
+    private fun activeRequest(): RuntimeApkInstaller.Request = requireNotNull(request).also {
+        check(RuntimeApkInstaller.request(it.nonce) === it && !it.result.isDone) { "request_expired" }
+    }
+    @Suppress("DEPRECATION")
     private fun openInstaller() {
         // Revalidate after unknown-sources permission UI; no stale package proof.
-        val file = validate(requireNotNull(request))
+        val file = validate(activeRequest())
         val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
+        val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")
             clipData = ClipData.newRawUri("Nelomai update", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            putExtra(Intent.EXTRA_RETURN_RESULT, true)
         }
-        check(intent.resolveActivity(packageManager) != null) { "installer_unavailable" }
-        startActivity(intent)
+        activeRequest()
+        startActivityForResult(intent, 2)
         installerLifecycle.markDispatched()
         StartupDiagnostics.record(this, "update.android.installer_intent_dispatched")
-        // The backend needs an acknowledgement that Android accepted the
-        // installer Intent, not a guessed result of the system UI.
-        request?.result?.complete(true)
     }
 }
