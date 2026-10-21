@@ -246,6 +246,21 @@ impl LinuxBackend {
 
         let configured_routes: Result<(), ServiceError> = if !self.mode.owns_network() {
             self.member_interface_index().and_then(|index| {
+                if configuration.transport == TunnelTransport::AmneziaWg3 {
+                    // Userspace creates a DOWN TUN; members skip ordinary routing.
+                    let status = status_with_timeout(
+                        Command::new(ip_command().map_err(backend_error)?)
+                            .args(["link", "set", "dev", interface_name, "up"])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null()),
+                        COMMAND_TIMEOUT,
+                    )
+                    .map_err(backend_error)?;
+                    if !status.success() || self.member_interface_index()? != index {
+                        return Err(backend_error("member_interface_up_unconfirmed"));
+                    }
+                }
                 super::member_rpf::enable_member_reply_path(interface_name, index)
                     .map_err(backend_error)
             })

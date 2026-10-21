@@ -10,8 +10,11 @@
 //! `dns_answer_ipv4: IPv4`, `traffic_address: IPv4:port`, `traffic_response: string`.
 //! `primary_peer_namespace: string` names the external primary peer's netns
 //! (1..64 ASCII alphanumeric/._- characters, starting with alphanumeric).
-//! Configurations contain real kernel WG keys, distinct IPv4 UDP endpoints,
-//! the SAME Address=/32 and DNS, AllowedIPs=0.0.0.0/0, no AWG parameters.
+//! Optional `binaries_directory: absolute path` is required for AWG3 and contains
+//! the real bundled root-owned amneziawg-go. Kernel WG needs no userspace binary.
+//! Configurations contain real keys, distinct IPv4 UDP endpoints, the SAME
+//! Address=/32 and DNS, AllowedIPs=0.0.0.0/0, and the same transport. AWG3 peers
+//! use the same bundled binary and matching nonzero AWG3 parameters.
 //! Both external peers serve UDP DNS at probe.target_ipv4:53 and TCP at
 //! traffic_address. DNS answers probe.query_name with dns_answer_ipv4; TCP sends
 //! traffic_response immediately. The role response is the panel fixture's
@@ -29,6 +32,7 @@ use nelomai_client_tunnel::redundancy::{
     session::SessionPhase,
     DnsProbe, NativeProbeSocket, ProbePoll, SessionScope, Slot,
 };
+use nelomai_client_tunnel::TunnelTransport;
 use nelomai_contracts::RedundantRoleResponse;
 use nelomai_unix_service::{
     member_network::{actor::CompositeBackend, runtime::NativePairFactory},
@@ -60,6 +64,7 @@ struct Fixture {
     traffic_address: SocketAddrV4,
     traffic_response: String,
     primary_peer_namespace: String,
+    binaries_directory: Option<std::path::PathBuf>,
 }
 
 fn run(program: &str, args: &[&str]) -> String {
@@ -219,11 +224,20 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
     assert_eq!(fixture.standby.slot, Slot::B);
     let primary = parse_configuration(fixture.primary.configuration.expose()).unwrap();
     let standby = parse_configuration(fixture.standby.configuration.expose()).unwrap();
-    assert_eq!(
-        primary.transport,
-        nelomai_client_tunnel::TunnelTransport::WireGuard
-    );
     assert_eq!(standby.transport, primary.transport);
+    let (primary_interface, standby_interface) = match primary.transport {
+        TunnelTransport::WireGuard => ("nlm-wga", "nlm-wgb"),
+        TunnelTransport::AmneziaWg3 => {
+            assert!(
+                fixture
+                    .binaries_directory
+                    .as_ref()
+                    .is_some_and(|path| path.is_absolute()),
+                "AWG3 requires an absolute bundled binaries directory"
+            );
+            ("nlm-awga", "nlm-awgb")
+        }
+    };
     assert_eq!(primary.addresses, standby.addresses);
     assert_eq!(primary.addresses.len(), 1);
     assert_eq!(primary.addresses[0].prefix_len(), 32);
@@ -245,8 +259,12 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
     fs::create_dir(&pair_root).unwrap();
     fs::set_permissions(&pair_root, fs::Permissions::from_mode(0o700)).unwrap();
     // Kernel WG must not execute a substitute userspace/AWG binary.
-    let single = PlatformBackend::new(root.join("absent-amneziawg-go"), &single_root).unwrap();
-    let factory = NativePairFactory::new(&pair_root, fixture.scope.runtime, &root).unwrap();
+    let binaries = match primary.transport {
+        TunnelTransport::WireGuard => root.as_path(),
+        TunnelTransport::AmneziaWg3 => fixture.binaries_directory.as_deref().unwrap(),
+    };
+    let single = PlatformBackend::new(binaries.join("amneziawg-go"), &single_root).unwrap();
+    let factory = NativePairFactory::new(&pair_root, fixture.scope.runtime, binaries).unwrap();
     let mut backend = CompositeBackend::new(fixture.scope.runtime, single, factory).unwrap();
     let clock = Instant::now();
     let table = format!("nlm_native_{}", std::process::id());
@@ -273,12 +291,25 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
         };
         let started = Instant::now();
         execute(&mut backend, start(fixture.scope.clone()));
+        let link: serde_json::Value = serde_json::from_str(&run(
+            "ip",
+            &["-j", "link", "show", "dev", primary_interface],
+        ))
+        .unwrap();
+        assert!(
+            link[0]["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|flag| flag == "UP"),
+            "{primary_interface} lacks IFF_UP: {link}"
+        );
         wait_for(&mut backend, clock, |s| s.primary_ready);
         eprintln!(
             "stage=Start primary_ready_ms={}",
             started.elapsed().as_millis()
         );
-        data_path(&fixture, "nlm-wga", true);
+        data_path(&fixture, primary_interface, true);
         let before = backend.current_redundancy_snapshot().unwrap();
         let started = Instant::now();
         let attached = execute(
@@ -294,6 +325,19 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             },
         );
         assert_eq!(attached.session.active, Slot::A);
+        let link: serde_json::Value = serde_json::from_str(&run(
+            "ip",
+            &["-j", "link", "show", "dev", standby_interface],
+        ))
+        .unwrap();
+        assert!(
+            link[0]["flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|flag| flag == "UP"),
+            "{standby_interface} lacks IFF_UP: {link}"
+        );
         wait_for(&mut backend, clock, |s| s.primary_ready && s.standby_ready);
         eprintln!(
             "stage=Attach standby_ready_ms={}",
@@ -302,7 +346,10 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
         // Actual device-bound DNS over each crypto path, same VIP. An unbound
         // fallback through A cannot pass B's decrypted receive-counter check.
         let mut indexes = Vec::new();
-        for (name, member) in [("nlm-wga", &fixture.primary), ("nlm-wgb", &fixture.standby)] {
+        for (name, member) in [
+            (primary_interface, &fixture.primary),
+            (standby_interface, &fixture.standby),
+        ] {
             let index: u32 = fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
                 .unwrap()
                 .trim()
@@ -338,7 +385,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             assert!(counter() > received, "no decrypted DNS data on {name}");
         }
         assert_ne!(indexes[0], indexes[1]);
-        data_path(&fixture, "nlm-wga", true);
+        data_path(&fixture, primary_interface, true);
         nft(&["create", "table", "inet", &table]);
         fault_installed = true;
         nft(&[
@@ -367,7 +414,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
         ]);
         let mut last_tcp = fault_started;
         while fault_started.elapsed() < Duration::from_secs(9) {
-            data_path(&fixture, "nlm-wga", false);
+            data_path(&fixture, primary_interface, false);
             last_tcp = Instant::now();
             backend.tick(clock.elapsed().as_millis() as u64).unwrap();
             assert_eq!(
@@ -438,7 +485,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             confirmed.session.role_generation,
             fixture.role_generation + 1
         );
-        data_path(&fixture, "nlm-wgb", true);
+        data_path(&fixture, standby_interface, true);
         let started = Instant::now();
         let stopped = execute(
             &mut backend,
@@ -473,7 +520,7 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
                 .is_err(),
             "old generation stopped the new session"
         );
-        data_path(&fixture, "nlm-wga", true);
+        data_path(&fixture, primary_interface, true);
         let started = Instant::now();
         let stopped = execute(&mut backend, Command::Stop { scope: next });
         assert_eq!(stopped.session.phase, SessionPhase::Stopped);
