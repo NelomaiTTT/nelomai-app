@@ -1543,6 +1543,7 @@ async fn desktop_failed_start_stop_retries_exact_cold_cleanup_without_legacy_sto
             .await
             .is_err());
         core.finish_start_attempt();
+        assert_eq!(api.transport_resets.load(Ordering::SeqCst), 0);
         assert_eq!(
             tunnel.legacy.stops.load(Ordering::SeqCst),
             0,
@@ -2037,6 +2038,10 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
         .unwrap();
         assert_eq!(core.state().await.phase, Phase::Connected);
         assert_eq!(
+            api.transport_resets.load(Ordering::SeqCst),
+            usize::from(cfg!(target_os = "linux"))
+        );
+        assert_eq!(
             tunnel.commands.lock().unwrap().as_slice(),
             ["primary", "status"]
         );
@@ -2105,6 +2110,11 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
             },
         );
         core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+        assert_eq!(
+            api.transport_resets.load(Ordering::SeqCst),
+            usize::from(cfg!(target_os = "linux")),
+            "primary reporting must reuse the transport reset after native readiness"
+        );
         assert!(
             store
                 .value

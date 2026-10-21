@@ -887,6 +887,8 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 return Err(CoreError::Tunnel("redundancy_primary_stopped".into()));
             }
             if snapshot.primary_ready {
+                #[cfg(target_os = "linux")]
+                self.api.reset_transport()?;
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
