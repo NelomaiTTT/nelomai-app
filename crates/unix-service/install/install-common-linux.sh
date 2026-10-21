@@ -27,7 +27,9 @@ find "$APPDIR" -type l -print | while IFS= read -r link; do
   case "$resolved" in "$APPDIR"/*) ;; *) exit 1 ;; esac
 done
 chown -R root:root "$APPDIR"
-chmod -R go-w "$APPDIR"
+# Extraction honors the caller's umask; users need readable files and directory
+# traversal. X preserves non-executable files; signed 0755/0644 modes stay exact.
+chmod -R a+rX,go-w "$APPDIR"
 # linuxdeploy can package this launcher as 0770. Once root owns the AppDir,
 # the desktop user still needs to read and execute it.
 if [ -f "$APPDIR/AppRun.wrapped" ]; then chmod 0755 "$APPDIR/AppRun.wrapped"; fi
