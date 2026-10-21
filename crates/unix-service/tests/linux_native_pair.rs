@@ -287,7 +287,10 @@ fn native_pair_promotes_with_real_evidence_and_leaves_no_network_state_after_res
             role_generation: fixture.role_generation,
             membership_generation: fixture.membership_generation,
             warm_stop_v1: false,
-            options: Default::default(),
+            options: nelomai_client_tunnel::DesktopTunnelOptions {
+                exclude_local_networks: true,
+                ..Default::default()
+            },
         };
         let started = Instant::now();
         execute(&mut backend, start(fixture.scope.clone()));
