@@ -2122,6 +2122,44 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
             api.start_requests.lock().unwrap()[0].reserve_enabled,
             Some(true)
         );
+        #[cfg(target_os = "linux")]
+        {
+            // A retryable failure leaves the initial report pending for the
+            // next coordinator tick, without authorizing reserve work.
+            assert!(core
+                .desktop_redundancy_tick(Vec::new())
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store.value.lock().unwrap().desktop_redundancy.as_ref(),
+                Some(pair)
+            );
+            assert!(api.desktop_acquire_requests.lock().unwrap().is_empty());
+            assert_eq!(
+                tunnel
+                    .pair
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .installed,
+                [true, false]
+            );
+            assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 1);
+
+            // Readiness must be observed again before retrying the report.
+            tunnel.pair.lock().unwrap().as_mut().unwrap().stalled = true;
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                store.value.lock().unwrap().desktop_redundancy.as_ref(),
+                Some(pair)
+            );
+            assert!(api.desktop_acquire_requests.lock().unwrap().is_empty());
+            tunnel.pair.lock().unwrap().as_mut().unwrap().stalled = false;
+        }
         api.desktop_role_responses.lock().unwrap().push_back(
             nelomai_contracts::RedundantRoleResponse {
                 api_version: ApiVersion::V1,

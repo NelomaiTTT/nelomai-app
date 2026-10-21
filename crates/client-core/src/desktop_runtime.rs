@@ -324,7 +324,13 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 reason: Some("primary_ready".into()),
                 observed_at: None,
             };
-            let response = self.api.report_redundant_role(&access, &request).await?;
+            let response = match self.api.report_redundant_role(&access, &request).await {
+                Ok(response) => response,
+                // Retry on the next coordinator tick, revalidating its guards.
+                #[cfg(target_os = "linux")]
+                Err(CoreApiError::Retryable) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
             // Initial B can already be CURRENT in the panel without being
             // locally installed yet. Validate against protected issuance, not
             // the native installed map used for subsequent role transitions.
