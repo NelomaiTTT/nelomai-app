@@ -38,7 +38,13 @@ the Windows carrier, a proxy, network namespaces for user applications, or a cus
   supported resolved stub mode; report that boundary explicitly rather than silently falling back.
 * Reply-path filtering changes only owned member links to loose mode; no machine-wide sysctl.
 * The existing root systemd service, owner-authenticated Unix socket, boot identity, native
-  interface alias/index and write-ahead ownership records remain the recovery authority.
+  interface group/index and write-ahead ownership records remain the recovery authority.
+  Kernel WG creation uses exclusive RTM_NEWLINK with a nonzero random group in the same
+  request. Linux 6.8 does not apply IFLA_IFALIAS during link creation; the real factory test
+  exposed that unsupported assumption. Group is a correlation marker, not a credential;
+  the original launcher, private scoped journal, boot and exact ifindex still authorize use.
+  Keep groups within INT_MAX for iproute2 compatibility. Old unfinished alias journals
+  remain fenced; do not migrate them by adopting a same-named interface.
 
 ## First executable check
 

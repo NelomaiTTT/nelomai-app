@@ -16,7 +16,7 @@ pub(super) enum MemberTransport {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(super) enum NativeProof {
-    Kernel { alias: String },
+    Kernel { group: u32 },
     Userspace(SocketIdentity),
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,7 +32,7 @@ pub(super) struct LinuxIdentity {
 struct Intent {
     boot: String,
     transport: MemberTransport,
-    alias: String,
+    group: u32,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -66,10 +66,10 @@ impl LinuxOwner {
         &mut self,
         transport: MemberTransport,
         boot: &str,
-        launch: impl FnOnce(&str) -> io::Result<LinuxIdentity>,
+        launch: impl FnOnce(u32) -> io::Result<LinuxIdentity>,
     ) -> io::Result<()> {
-        let alias = self.begin(transport, boot)?;
-        let identity = match launch(&alias) {
+        let group = self.begin(transport, boot)?;
+        let identity = match launch(group) {
             Ok(identity) => identity,
             Err(error) => {
                 self.launching = false;
@@ -128,23 +128,24 @@ impl LinuxOwner {
             Ok(())
         }
     }
-    pub(super) fn begin(&mut self, transport: MemberTransport, boot: &str) -> io::Result<String> {
+    pub(super) fn begin(&mut self, transport: MemberTransport, boot: &str) -> io::Result<u32> {
         self.ensure_fresh()?;
         if !valid_boot(boot) {
             return Err(invalid());
         }
-        // Local opaque marker only: no configuration, key or credential input.
-        let mut nonce = [0u8; 16];
+        // Birth correlation marker, not a credential. Scope and launch authority
+        // remain in the private journal; Linux applies IFLA_GROUP during create.
+        let mut nonce = [0u8; 4];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        hash.update(serde_json::to_vec(&(&self.scope, self.slot, boot)).map_err(io::Error::other)?);
-        hash.update(nonce);
-        let alias = format!("nlm-owner-{:x}", hash.finalize());
+        // Existing iproute2 parses group through a nonnegative signed int.
+        let group = u32::from_ne_bytes(nonce) & i32::MAX as u32;
+        if group == 0 {
+            return Err(invalid());
+        }
         let phase = Phase::Starting(Intent {
             boot: boot.into(),
             transport,
-            alias: alias.clone(),
+            group,
         });
         if let Err(error) = self.save(phase.clone()) {
             // An fsync error may occur after rename: never allow a second launch.
@@ -152,7 +153,7 @@ impl LinuxOwner {
             return Err(error);
         }
         self.launching = true;
-        Ok(alias)
+        Ok(group)
     }
     pub(super) fn capture(&mut self, identity: LinuxIdentity) -> io::Result<()> {
         let Some(Phase::Starting(intent)) = &self.state else {
@@ -250,11 +251,7 @@ fn valid_boot(boot: &str) -> bool {
     !boot.is_empty() && boot.len() <= 128 && !boot.chars().any(char::is_control)
 }
 fn valid_intent(intent: &Intent) -> bool {
-    valid_boot(&intent.boot)
-        && intent
-            .alias
-            .strip_prefix("nlm-owner-")
-            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    valid_boot(&intent.boot) && intent.group != 0
 }
 fn valid_identity(identity: &LinuxIdentity, intent: &Intent, slot: TunnelSlot) -> bool {
     use nelomai_client_tunnel::TunnelTransport;
@@ -268,7 +265,7 @@ fn valid_identity(identity: &LinuxIdentity, intent: &Intent, slot: TunnelSlot) -
         && identity.interface
             == super::redundancy::ResourceMode::Member(slot).linux_interface(transport)
         && match (&identity.proof, intent.transport) {
-            (NativeProof::Kernel { alias }, MemberTransport::WireGuard) => alias == &intent.alias,
+            (NativeProof::Kernel { group }, MemberTransport::WireGuard) => *group == intent.group,
             (NativeProof::Userspace(socket), MemberTransport::AmneziaWg3) => socket.inode > 0,
             _ => false,
         }
@@ -299,8 +296,11 @@ pub(super) fn trusted_ip_file(regular: bool, uid: u32, mode: u32) -> bool {
 pub(super) fn kernel_create_command(
     ip: &str,
     interface: &str,
-    alias: &str,
-) -> std::process::Command {
+    group: u32,
+) -> io::Result<std::process::Command> {
+    if group == 0 || group > i32::MAX as u32 {
+        return Err(invalid());
+    }
     let mut command = std::process::Command::new(ip);
     command
         .args([
@@ -308,8 +308,8 @@ pub(super) fn kernel_create_command(
             "add",
             "name",
             interface,
-            "alias",
-            alias,
+            "group",
+            &group.to_string(),
             "up",
             "type",
             "wireguard",
@@ -317,5 +317,5 @@ pub(super) fn kernel_create_command(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    command
+    Ok(command)
 }

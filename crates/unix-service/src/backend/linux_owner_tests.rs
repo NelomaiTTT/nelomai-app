@@ -24,8 +24,12 @@ fn directory() -> tempfile::TempDir {
 }
 
 #[test]
-fn kernel_creation_is_exclusive_with_alias_and_up_in_the_creation_request() {
-    let command = kernel_create_command("/sbin/ip", "nlm-wga", "opaque-owner");
+fn kernel_creation_is_exclusive_with_group_and_up_in_the_creation_request() {
+    let command = kernel_create_command("/sbin/ip", "nlm-wga", 42).unwrap();
+    assert!(kernel_create_command("/sbin/ip", "nlm-wga", 0).is_err());
+    assert!(kernel_create_command("/sbin/ip", "nlm-wga", i32::MAX as u32).is_ok());
+    assert!(kernel_create_command("/sbin/ip", "nlm-wga", i32::MAX as u32 + 1).is_err());
+    assert!(kernel_create_command("/sbin/ip", "nlm-wga", u32::MAX).is_err());
     let args: Vec<_> = command.get_args().map(|s| s.to_str().unwrap()).collect();
     assert_eq!(
         args,
@@ -34,8 +38,8 @@ fn kernel_creation_is_exclusive_with_alias_and_up_in_the_creation_request() {
             "add",
             "name",
             "nlm-wga",
-            "alias",
-            "opaque-owner",
+            "group",
+            "42",
             "up",
             "type",
             "wireguard"
@@ -69,7 +73,8 @@ fn open(dir: &Path) -> LinuxOwner {
 }
 fn started(dir: &Path, transport: MemberTransport) -> (LinuxOwner, LinuxIdentity) {
     let mut owner = open(dir);
-    let alias = owner.begin(transport, "boot-one").unwrap();
+    let group = owner.begin(transport, "boot-one").unwrap();
+    assert!((1..=i32::MAX as u32).contains(&group));
     let identity = LinuxIdentity {
         boot: "boot-one".into(),
         index: 42,
@@ -79,7 +84,7 @@ fn started(dir: &Path, transport: MemberTransport) -> (LinuxOwner, LinuxIdentity
         }
         .into(),
         proof: match transport {
-            MemberTransport::WireGuard => NativeProof::Kernel { alias },
+            MemberTransport::WireGuard => NativeProof::Kernel { group },
             MemberTransport::AmneziaWg3 => NativeProof::Userspace(SocketIdentity {
                 device: 1,
                 inode: 2,
@@ -94,7 +99,7 @@ fn started(dir: &Path, transport: MemberTransport) -> (LinuxOwner, LinuxIdentity
 fn begin_is_durable_and_reopened_launch_cannot_replay_or_capture() {
     let dir = directory();
     let mut owner = open(dir.path());
-    let alias = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
+    let group = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
     let mut recovered = open(dir.path());
     assert!(recovered.cleanup_pending());
     assert_eq!(recovered.scope, scope());
@@ -106,7 +111,7 @@ fn begin_is_durable_and_reopened_launch_cannot_replay_or_capture() {
             boot: "boot-one".into(),
             interface: "nlm-wga".into(),
             index: 42,
-            proof: NativeProof::Kernel { alias }
+            proof: NativeProof::Kernel { group }
         })
         .is_err());
     assert!(recovered
@@ -124,7 +129,7 @@ fn launch_persists_intent_before_io_and_proof_before_returning_for_configuration
     let dir = directory();
     let mut owner = open(dir.path());
     owner
-        .launch(MemberTransport::WireGuard, "boot-one", |alias| {
+        .launch(MemberTransport::WireGuard, "boot-one", |group| {
             let pending = open(dir.path());
             assert!(pending.cleanup_pending());
             assert!(pending.identity().is_none());
@@ -132,9 +137,7 @@ fn launch_persists_intent_before_io_and_proof_before_returning_for_configuration
                 boot: "boot-one".into(),
                 interface: "nlm-wga".into(),
                 index: 42,
-                proof: NativeProof::Kernel {
-                    alias: alias.into(),
-                },
+                proof: NativeProof::Kernel { group },
             })
         })
         .unwrap();
@@ -187,11 +190,11 @@ fn persisted_proof_rejects_other_scopes_slots_and_replaced_native_identity() {
                 1 => wrong.index += 1,
                 2 => wrong.interface = "nlm-wgb".into(),
                 3 => match &mut wrong.proof {
-                    NativeProof::Kernel { alias } => alias.push('x'),
+                    NativeProof::Kernel { group } => *group = group.wrapping_add(1),
                     NativeProof::Userspace(socket) => socket.inode += 1,
                 },
                 4 => match &mut wrong.proof {
-                    NativeProof::Kernel { alias } => alias.clear(),
+                    NativeProof::Kernel { group } => *group = 0,
                     NativeProof::Userspace(socket) => socket.device += 1,
                 },
                 _ => {
@@ -200,9 +203,7 @@ fn persisted_proof_rejects_other_scopes_slots_and_replaced_native_identity() {
                             device: 1,
                             inode: 2,
                         }),
-                        MemberTransport::AmneziaWg3 => NativeProof::Kernel {
-                            alias: "foreign".into(),
-                        },
+                        MemberTransport::AmneziaWg3 => NativeProof::Kernel { group: 0 },
                     }
                 }
             }
@@ -228,26 +229,27 @@ fn persisted_proof_rejects_other_scopes_slots_and_replaced_native_identity() {
 }
 
 #[test]
-fn capture_rejects_wrong_boot_name_transport_and_alias_without_losing_intent() {
-    for field in 0..5 {
+fn capture_rejects_wrong_boot_name_transport_and_group_without_losing_intent() {
+    for field in 0..6 {
         let dir = directory();
         let mut owner = open(dir.path());
-        let alias = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
+        let group = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
         let mut identity = LinuxIdentity {
             boot: "boot-one".into(),
             interface: "nlm-wga".into(),
             index: 42,
-            proof: NativeProof::Kernel { alias },
+            proof: NativeProof::Kernel { group },
         };
         match field {
             0 => identity.boot = "boot-two".into(),
             1 => identity.interface = "nlm-wgb".into(),
             2 => identity.index = 0,
             3 => {
-                identity.proof = NativeProof::Kernel {
-                    alias: "foreign".into(),
+                if let NativeProof::Kernel { group } = &mut identity.proof {
+                    *group = group.wrapping_add(1);
                 }
             }
+            4 => identity.proof = NativeProof::Kernel { group: 0 },
             _ => {
                 identity.proof = NativeProof::Userspace(SocketIdentity {
                     device: 1,
@@ -373,7 +375,7 @@ fn failed_capture_write_preserves_starting_and_stop_write_failure_preserves_proo
 
     let dir = directory();
     let mut owner = open(dir.path());
-    let alias = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
+    let group = owner.begin(MemberTransport::WireGuard, "boot-one").unwrap();
     let path = dir.path().join("redundant-linux-member.json");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(owner
@@ -381,7 +383,7 @@ fn failed_capture_write_preserves_starting_and_stop_write_failure_preserves_proo
             boot: "boot-one".into(),
             interface: "nlm-wga".into(),
             index: 42,
-            proof: NativeProof::Kernel { alias }
+            proof: NativeProof::Kernel { group }
         })
         .is_err());
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -442,9 +444,7 @@ fn failed_stop_persistence_never_authorizes_deleting_replacement() {
     let dir = directory();
     let (mut owner, identity) = started(dir.path(), MemberTransport::WireGuard);
     let mut replacement = identity.clone();
-    replacement.proof = NativeProof::Kernel {
-        alias: "foreign".into(),
-    };
+    replacement.proof = NativeProof::Kernel { group: 0 };
     std::fs::set_permissions(
         dir.path().join("redundant-linux-member.json"),
         std::fs::Permissions::from_mode(0o644),
@@ -470,7 +470,7 @@ fn failed_capture_keeps_live_proof_for_cleanup_but_restart_remains_starting() {
         let mut owner = open(dir.path());
         let live = RefCell::new(None);
         assert!(owner
-            .launch(transport, "boot-one", |alias| {
+            .launch(transport, "boot-one", |group| {
                 let identity = LinuxIdentity {
                     boot: "boot-one".into(),
                     index: 42,
@@ -480,9 +480,7 @@ fn failed_capture_keeps_live_proof_for_cleanup_but_restart_remains_starting() {
                     }
                     .into(),
                     proof: match transport {
-                        MemberTransport::WireGuard => NativeProof::Kernel {
-                            alias: alias.into(),
-                        },
+                        MemberTransport::WireGuard => NativeProof::Kernel { group },
                         MemberTransport::AmneziaWg3 => NativeProof::Userspace(SocketIdentity {
                             device: 1,
                             inode: 2,

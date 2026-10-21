@@ -187,14 +187,14 @@ impl LinuxBackend {
                 TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
             };
             owner
-                .launch(transport, &boot, |alias| {
+                .launch(transport, &boot, |group| {
                     launch_member_native(
                         &self.amneziawg_go,
                         &self.runtime_directory,
                         interface_name,
                         transport,
                         &boot,
-                        alias,
+                        group,
                     )
                 })
                 .map_err(backend_error)?;
@@ -401,7 +401,7 @@ fn launch_member_native(
     interface: &str,
     transport: MemberTransport,
     boot: &str,
-    alias: &str,
+    group: u32,
 ) -> std::io::Result<LinuxIdentity> {
     use std::io::{Error, ErrorKind};
     if boot_identity().map_err(Error::other)? != boot
@@ -418,10 +418,10 @@ fn launch_member_native(
     match transport {
         MemberTransport::WireGuard => {
             // The vendor's create_interface swallows EEXIST. `ip link add`
-            // fails on collisions and installs the alias in the SAME RTM_NEWLINK
-            // request as exclusive creation; never set an alias on an old link.
+            // fails on collisions and installs IFLA_GROUP in the SAME RTM_NEWLINK
+            // request as exclusive creation; never mark an existing link.
             let status = status_with_timeout(
-                &mut super::linux_owner::kernel_create_command(ip_command()?, interface, alias),
+                &mut super::linux_owner::kernel_create_command(ip_command()?, interface, group)?,
                 COMMAND_TIMEOUT,
             )?;
             if !status.success() {
@@ -451,11 +451,14 @@ fn capture_member(
     }
     let proof = match transport {
         MemberTransport::WireGuard => NativeProof::Kernel {
-            alias: std::fs::read_to_string(
-                Path::new("/sys/class/net").join(interface).join("ifalias"),
+            group: std::fs::read_to_string(
+                Path::new("/sys/class/net")
+                    .join(interface)
+                    .join("netdev_group"),
             )?
             .trim_end_matches('\n')
-            .into(),
+            .parse()
+            .map_err(|_| Error::other("slot_interface_group_invalid"))?,
         },
         MemberTransport::AmneziaWg3 => NativeProof::Userspace(
             super::redundancy::capture_userspace_member(interface).map_err(Error::other)?,
