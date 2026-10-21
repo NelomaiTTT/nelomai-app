@@ -1,0 +1,115 @@
+name: Linux diagnostic build
+
+on:
+  push:
+    branches: [Future/linux-hot-standby-0.4.0]
+    paths:
+      - .github/workflows/linux-build.yml
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-hex HEAD of Future/linux-hot-standby-0.4.0; diagnostic 0.4.0 only
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-package-diagnostic:
+    if: >-
+      github.repository == 'NelomaiTTT/nelomai-app' &&
+      github.ref == 'refs/heads/Future/linux-hot-standby-0.4.0' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha))
+    name: Linux 0.4.0 test AppImage (not a release)
+    runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+      - name: Guard exact source and keyless runner before local code
+        id: guard
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
+          test "$GITHUB_REF" = refs/heads/Future/linux-hot-standby-0.4.0
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$SOURCE_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse refs/remotes/origin/Future/linux-hot-standby-0.4.0)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          for name in NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 \
+            TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+            ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD \
+            NELOMAI_MACOS_SIGNING_P12_BASE64 NELOMAI_MACOS_SIGNING_P12_PASSWORD \
+            APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_API_KEY APPLE_API_KEY_PATH; do
+            if [[ -n "${!name:-}" ]]; then
+              echo "Private signing environment is forbidden on this diagnostic runner: $name" >&2
+              exit 1
+            fi
+          done
+      - uses: ./.github/actions/release-native-host
+        with:
+          platform: linux
+          target: x86_64-unknown-linux-gnu
+      - name: Verify exact 0.4.0 source and Linux regressions
+        run: |
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode build_only
+          cargo fmt --all --check
+          cargo test --locked -p nelomai-unix-service
+          cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
+          python -m unittest scripts.tests.test_linux_test_package
+      - name: Allocate ephemeral diagnostic work
+        run: |
+          root="$(mktemp -d "$RUNNER_TEMP/nelomai-linux-040.XXXXXX")"
+          echo "RUN_ROOT=$root" >> "$GITHUB_ENV"
+      - name: Build fresh Linux runtime and helper with test trust
+        run: |
+          python scripts/prepare-release-trust.py --mode build_only --phase signing \
+            --public-key "$RUN_ROOT/runtime-public.raw" --private-key "$RUN_ROOT/runtime-private.raw"
+          python scripts/build-release-platform.py --mode build_only --source-sha "$SOURCE_SHA" \
+            --platform linux --architecture x86_64 --public-key "$RUN_ROOT/runtime-public.raw" \
+            --output "$RUN_ROOT/draft" --work "$RUN_ROOT/native-work"
+      - name: Package and re-extract Linux only with test trust
+        run: |
+          python scripts/package-linux-test.py --source-sha "$SOURCE_SHA" \
+            --draft "$RUN_ROOT/draft" --output "$RUN_ROOT/packages-linux" --work "$RUN_ROOT/package-work" \
+            --public-key "$RUN_ROOT/runtime-public.raw" --private-key "$RUN_ROOT/runtime-private.raw"
+      - name: Verify nonpublishable diagnostic output
+        id: verify-package
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          report = json.loads((Path(os.environ['RUN_ROOT']) / 'packages-linux/package-digests.json').read_text())
+          assert report['source_sha'] == os.environ['SOURCE_SHA']
+          assert report['platform'] == 'linux' and report['architecture'] == 'x86_64'
+          assert report['mode'] == 'build_only' and report['publishable'] is False
+          assert report['full_acceptance'] == 'UNRUN'
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nelomai-test-0.4.0-linux-x86_64-${{ env.SOURCE_SHA }}
+          path: ${{ env.RUN_ROOT }}/packages-linux/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove ephemeral test trust and build work
+        if: always()
+        run: |
+          if [[ -n "${RUN_ROOT:-}" && "$RUN_ROOT" == "$RUNNER_TEMP"/nelomai-linux-040.* ]]; then
+            rm -rf -- "$RUN_ROOT"
+          fi

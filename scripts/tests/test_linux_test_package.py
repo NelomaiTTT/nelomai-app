@@ -1,8 +1,142 @@
 """Single-platform diagnostic staging; fixtures are not executable acceptance."""
 import json
+import os
+from pathlib import Path
+import shlex
 import shutil
 import subprocess
-from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, module
+import tempfile
+from types import SimpleNamespace
+import unittest
+import yaml
+from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, ROOT, module
+
+
+class LinuxWorkflowTest(unittest.TestCase):
+    def workflow(self):
+        path = ROOT / '.github/workflows/linux-build.yml'
+        self.assertTrue(path.is_file(), 'standalone Linux workflow is missing')
+        return yaml.safe_load(path.read_text())
+
+    def test_only_owner_branch_exact_source_can_schedule_linux_runner(self):
+        workflow = self.workflow()
+        triggers = workflow.get('on', workflow.get(True))
+        self.assertEqual(set(triggers), {'push', 'workflow_dispatch'})
+        self.assertEqual(triggers['push'], {'branches': ['Future/linux-hot-standby-0.4.0'],
+            'paths': ['.github/workflows/linux-build.yml']})
+        self.assertTrue(triggers['workflow_dispatch']['inputs']['source_sha']['required'])
+        self.assertEqual(workflow['permissions'], {'contents': 'read'})
+        self.assertEqual(list(workflow['jobs']), ['linux-package-diagnostic'])
+        job = workflow['jobs']['linux-package-diagnostic']
+        self.assertEqual(job['runs-on'], ['self-hosted', 'Linux', 'X64', 'nelomai-040-linux-vm'])
+        self.assertNotIn('environment', job)
+        self.assertNotIn('strategy', job)
+        expression = job['if'].removeprefix('${{').removesuffix('}}').replace('&&', ' and ').replace('||', ' or ').strip()
+        source_expression = job['env']['SOURCE_SHA'].removeprefix('${{').removesuffix('}}').replace(
+            '&&', ' and ').replace('||', ' or ').strip()
+        allowed = dict(event_name='workflow_dispatch', repository='NelomaiTTT/nelomai-app',
+            ref='refs/heads/Future/linux-hot-standby-0.4.0', sha=SOURCE)
+        for override, expected in (({}, True), ({'event_name': 'push'}, True),
+                         ({'event_name': 'push', 'sha': 'b' * 40}, True),
+                         ({'event_name': 'pull_request'}, False),
+                         ({'repository': 'foreign/nelomai-app'}, False), ({'ref': 'refs/heads/main'}, False),
+                         ({'ref': 'refs/heads/Future/windows-hot-standby-0.4.0'}, False),
+                         ({'ref': 'refs/tags/v0.4.0'}, False), ({'sha': 'b' * 40}, False)):
+            with self.subTest(override=override):
+                context = {
+                    'github': SimpleNamespace(**{**allowed, **override}),
+                    'inputs': SimpleNamespace(source_sha=SOURCE)}
+                selected = eval(expression, {'__builtins__': {}}, context)
+                self.assertEqual(bool(selected), expected)
+                if expected:
+                    self.assertEqual(eval(source_expression, {'__builtins__': {}}, context), context['github'].sha)
+        checkout = next(step for step in job['steps'] if step.get('uses', '').startswith('actions/checkout@'))
+        self.assertEqual(checkout['with']['ref'], '${{ env.SOURCE_SHA }}')
+        self.assertIs(checkout['with']['persist-credentials'], False)
+        self.assertEqual(checkout['with']['fetch-depth'], 0)
+        uploads = [step for step in job['steps'] if step.get('uses', '').startswith('actions/upload-artifact@')]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]['with']['name'], 'nelomai-test-0.4.0-linux-x86_64-${{ env.SOURCE_SHA }}')
+        self.assertEqual(uploads[0]['with']['path'], '${{ env.RUN_ROOT }}/packages-linux/')
+        self.assertNotIn('secrets.', yaml.safe_dump(workflow))
+
+    def test_guard_rejects_dirty_foreign_or_private_key_runner_before_local_code(self):
+        steps = self.workflow()['jobs']['linux-package-diagnostic']['steps']
+        guard_index = next(index for index, step in enumerate(steps) if step.get('id') == 'guard')
+        local_index = next(index for index, step in enumerate(steps) if step.get('uses', '').startswith('./'))
+        self.assertLess(guard_index, local_index)
+        self.assertFalse(any('scripts/' in step.get('run', '') for step in steps[:guard_index]))
+        guard = steps[guard_index]['run']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(['git', 'init', '-q', root], check=True)
+            (root / 'tracked').write_text('clean')
+            subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture', '-c',
+                            'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+            source = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
+            subprocess.run(['git', '-C', str(root), 'update-ref',
+                'refs/remotes/origin/Future/linux-hot-standby-0.4.0', source], check=True)
+            env = {'PATH': os.environ['PATH'], 'HOME': temporary, 'SOURCE_SHA': source,
+                'GITHUB_SHA': source, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                'GITHUB_REPOSITORY': 'NelomaiTTT/nelomai-app',
+                'GITHUB_REF': 'refs/heads/Future/linux-hot-standby-0.4.0'}
+            cases = [{}, {'GITHUB_EVENT_NAME': 'push'}, {'SOURCE_SHA': 'b' * 40}, {'SOURCE_SHA': source[:12]},
+                {'GITHUB_SHA': 'b' * 40}, {'GITHUB_EVENT_NAME': 'pull_request'},
+                {'GITHUB_REPOSITORY': 'foreign/repo'}, {'GITHUB_REF': 'refs/heads/main'},
+                {'GITHUB_REF': 'refs/heads/Future/windows-hot-standby-0.4.0'},
+                *({name: 'private-test-value'} for name in (
+                    'NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64', 'TAURI_SIGNING_PRIVATE_KEY',
+                    'TAURI_SIGNING_PRIVATE_KEY_PASSWORD', 'ANDROID_KEYSTORE_PATH',
+                    'ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_KEY_PASSWORD',
+                    'NELOMAI_MACOS_SIGNING_P12_BASE64', 'NELOMAI_MACOS_SIGNING_P12_PASSWORD'))]
+            for override in cases:
+                with self.subTest(override=list(override)):
+                    result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', guard],
+                        cwd=root, env={**env, **override}, capture_output=True, text=True)
+                    expected = not override or override == {'GITHUB_EVENT_NAME': 'push'}
+                    self.assertEqual(result.returncode == 0, expected, result.stderr)
+                    self.assertNotIn('private-test-value', result.stdout + result.stderr)
+            for dirty in ('tracked', 'untracked'):
+                with self.subTest(dirty=dirty):
+                    (root / dirty).write_text('dirty')
+                    result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', guard],
+                        cwd=root, env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    (root / 'tracked').write_text('clean')
+
+    def test_build_and_package_use_existing_linux_only_nonpublishing_chain(self):
+        steps = self.workflow()['jobs']['linux-package-diagnostic']['steps']
+        native = next(step for step in steps if step.get('uses') == './.github/actions/release-native-host')
+        self.assertEqual(native['with'], {'platform': 'linux', 'target': 'x86_64-unknown-linux-gnu'})
+        commands = [shlex.split(line) for step in steps for line in step.get('run', '').replace('\\\n', ' ').splitlines()
+                    if line.strip().startswith('python scripts/')]
+        build = next(command for command in commands if command[1] == 'scripts/build-release-platform.py')
+        package = next(command for command in commands if command[1] == 'scripts/package-linux-test.py')
+        source = next(command for command in commands if command[1] == 'scripts/release-candidate-gates.py')
+        for command in (build, package, source):
+            self.assertEqual(command[command.index('--source-sha') + 1], '$SOURCE_SHA')
+        self.assertEqual(build[build.index('--platform') + 1], 'linux')
+        self.assertEqual(build[build.index('--mode') + 1], 'build_only')
+        self.assertEqual(source[source.index('--version') + 1], '0.4.0')
+        self.assertEqual(source[source.index('--mode') + 1], 'build_only')
+        trust = next(command for command in commands if command[1] == 'scripts/prepare-release-trust.py')
+        self.assertEqual(trust[trust.index('--mode') + 1], 'build_only')
+        report_step = next(step for step in steps if step.get('id') == 'verify-package')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'packages-linux').mkdir()
+            report = dict(source_sha=SOURCE, platform='linux', architecture='x86_64',
+                mode='build_only', publishable=False, full_acceptance='UNRUN')
+            path = root / 'packages-linux/package-digests.json'
+            for override in ({}, {'source_sha': 'b' * 40}, {'platform': 'windows'},
+                             {'publishable': True}, {'full_acceptance': 'PASS'}, {'mode': 'sign_candidate'}):
+                with self.subTest(override=override):
+                    path.write_text(json.dumps({**report, **override}))
+                    result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', report_step['run']],
+                        cwd=root, env={'PATH': os.environ['PATH'], 'RUN_ROOT': str(root), 'SOURCE_SHA': SOURCE},
+                        capture_output=True, text=True)
+                    self.assertEqual(result.returncode == 0, not override, result.stderr)
 
 
 class LinuxTestPackageTest(ArtifactFixture):
