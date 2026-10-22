@@ -28,7 +28,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -45,6 +45,7 @@ jobs:
           foreach ($name in @('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64','TAURI_SIGNING_PRIVATE_KEY','ANDROID_KEYSTORE_PATH','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_PASSWORD')) { if ([Environment]::GetEnvironmentVariable($name)) { throw 'Native runner must be private-keyless' } }
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           platform: windows
           target: x86_64-pc-windows-msvc
       - name: Keyless Windows runtime draft
@@ -74,7 +75,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -90,10 +91,11 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=normal --ignore-submodules=none)"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: signing
           platform: linux
           target: x86_64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -133,7 +135,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -150,6 +152,7 @@ jobs:
           foreach ($name in @('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64','TAURI_SIGNING_PRIVATE_KEY','ANDROID_KEYSTORE_PATH','ANDROID_KEYSTORE_PASSWORD','ANDROID_KEY_PASSWORD')) { if ([Environment]::GetEnvironmentVariable($name)) { throw 'Native runner must be private-keyless' } }
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: packaging
           platform: windows
           target: x86_64-pc-windows-msvc
@@ -184,7 +187,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -200,10 +203,11 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=normal --ignore-submodules=none)"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: signing
           platform: linux
           target: x86_64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm

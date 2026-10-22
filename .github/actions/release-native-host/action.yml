@@ -13,11 +13,19 @@ inputs:
   android-fixtures:
     default: 'false'
     description: Provision mandatory compiled Android fixture dependencies on the verifier host
+  node24:
+    default: 'false'
+    description: Opt in to Node 24 actions on compatible runners
 runs:
   using: composite
   steps:
     - uses: actions/setup-node@v4
-      if: inputs.purpose != 'signing'
+      if: inputs.purpose != 'signing' && inputs.node24 != 'true'
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+    - uses: actions/setup-node@v7.1.0
+      if: inputs.purpose != 'signing' && inputs.node24 == 'true'
       with:
         node-version-file: .nvmrc
         cache: npm
