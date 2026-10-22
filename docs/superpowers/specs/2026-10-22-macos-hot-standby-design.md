@@ -67,3 +67,30 @@ The signed UI recovery check is PASS at the starting source. The earlier Linux
 `E0384` exact trigger remains unresolved; neither this macOS foundation nor the
 UI result closes it. The PC is now shut down, so no further PC verification is
 claimed. Existing platform workflows and all product versions remain unchanged.
+
+## Authorization acceptance (22 October)
+
+VM acceptance must count administrator authorization, Keychain access and
+Gatekeeper/background approval separately, alongside hot standby and primary
+ready timings. Cover fresh install, new-path signed update, old-updater migration,
+Start/Stop, IPC outage, automatic recovery and cancellation.
+
+Target: one administrator authorization for a new-path install/update, no
+installer elevation from runtime Start/Stop/recovery, no re-prompt after cancel
+within one startup/install operation. The original user UID crosses elevation
+explicitly; common and helper installation share the authorization and preserve
+rollback. Original Linux preparation behavior remains unchanged.
+
+Initial common application startup retains one bounded repair/migration attempt
+after read-only readiness checks. This is deliberately different from runtime
+Prepare: the old updater replaces the common broker before updating the helper,
+and the old helper rejects that broker before answering Version. Thus this first
+legacy migration can require an additional authorization. An unavailable service
+at a fresh application startup can also invoke that one repair; runtime polling
+and automatic reconnect cannot. Cancellation exits the startup instead of looping.
+Do not claim one dialog for legacy migration or zero dialogs under every fault.
+
+Keychain stays with the existing common process and pinned certificate identity;
+no relaxed ACL, new credential daemon or Developer ID dependency. Continuity and
+actual dialog counts require VM evidence. Hosted CI executes shell fixture and
+Rust regressions without touching the user's Mac install or Keychain.

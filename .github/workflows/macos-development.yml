@@ -67,6 +67,9 @@ jobs:
         run: npm run build
       # Independent checks retain every failure and still expose compile/test
       # diagnostics when formatting fails. Guards and setup must have succeeded.
+      - name: macOS installation and identity regressions without privilege
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' }}
+        run: python3 -m unittest discover -s scripts/tests -p 'test_macos_common_*.py'
       - name: Rust formatting
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}
         run: cargo fmt --all --check
@@ -88,6 +91,9 @@ jobs:
       - name: Check desktop application and runtime targets
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: cargo check --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --features desktop-runtime --all-targets
+      - name: macOS updater authorization argument tests
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
+        run: cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib platform::updater::macos_tests
       - name: Clippy desktop application and runtime targets
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: cargo clippy --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --features desktop-runtime --all-targets -- -D warnings

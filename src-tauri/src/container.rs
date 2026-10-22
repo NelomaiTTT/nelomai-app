@@ -325,7 +325,7 @@ pub fn run() {
                 // initialized. This also gives shutdown an actual native stop peer on
                 // the first launch, before the user ever connects a tunnel.
                 startup::stage("native.prepare");
-                tauri::async_runtime::block_on(prepare_native(app.handle().clone()))?;
+                tauri::async_runtime::block_on(prepare_native(app.handle().clone(), true))?;
                 startup::stage("common.public_key");
                 let key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
                     .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
@@ -508,7 +508,7 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                                         "native preparation fenced by update",
                                     ));
                                 }
-                                tauri::async_runtime::block_on(prepare_native(app.clone()))?;
+                                tauri::async_runtime::block_on(prepare_native(app.clone(), false))?;
                             }
                             NativeReply::Done
                         }
@@ -745,12 +745,12 @@ pub(crate) async fn handoff_windows_installer<R: tauri::Runtime>(
         )
         .await
 }
-async fn prepare_native(app: tauri::AppHandle) -> io::Result<()> {
+async fn prepare_native(app: tauri::AppHandle, allow_install: bool) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let result = platform::unix::prepare_tunnel(app).await;
+    let result = platform::unix::prepare_tunnel(app, allow_install).await;
     #[cfg(windows)]
     let result = {
-        let _ = app;
+        let _ = (app, allow_install);
         platform::windows::prepare_tunnel().await
     };
     result
@@ -836,11 +836,14 @@ fn pre_auth_handoff() -> io::Result<bool> {
             } else {
                 source
             };
-            let resources = selected.join("Contents/Resources");
+            // The executing bundle defines the installer argument protocol;
+            // installed data may still contain the previous installer version.
+            let resources = source.join("Contents/Resources");
             let status = platform::unix::installer_status(
                 std::process::Command::new("/usr/bin/osascript")
                     .arg(resources.join("install-common-macos.applescript"))
                     .arg(resources.join("install-common-macos.sh"))
+                    .arg(unsafe { libc::getuid() }.to_string())
                     .arg(selected),
             )
             .map_err(|_| io::Error::other("common installation failed"))?;

@@ -20,6 +20,7 @@ pub fn common_tunnel_controller(
 
 pub async fn prepare_tunnel(
     app: tauri::AppHandle<tauri::Wry>,
+    allow_install: bool,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
     let resources = app
         .path()
@@ -31,11 +32,38 @@ pub async fn prepare_tunnel(
     if helper_is_current(&expected).await {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    {
+        // launchctl bootstrap can return before the service socket is ready.
+        let readiness_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < readiness_deadline {
+            sleep(Duration::from_millis(100)).await;
+            if helper_is_current(&expected).await {
+                return Ok(());
+            }
+        }
+        // Only initial application startup may repair/migrate once. An old
+        // helper rejects an updated broker before even serving Version, so
+        // that migration cannot be distinguished from IPC failure here.
+        if !allow_install {
+            return Err(tunnel_error("helper_update_required"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = allow_install;
     tauri::async_runtime::spawn_blocking(move || install_helper(&resources))
         .await
         .map_err(|_| tunnel_error("helper_installer_failed"))??;
 
+    #[cfg(target_os = "macos")]
+    let readiness_deadline = Instant::now() + Duration::from_secs(3);
     for _ in 0..30 {
+        // An IPC call already has a bounded timeout. Do not multiply a stalled
+        // macOS service timeout by thirty while waiting for launchd readiness.
+        #[cfg(target_os = "macos")]
+        if Instant::now() >= readiness_deadline {
+            break;
+        }
         if helper_is_current(&expected).await {
             return Ok(());
         }
@@ -101,7 +129,6 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
             Err(tunnel_error("helper_install_cancelled"))
         }
     }
-
     #[cfg(target_os = "macos")]
     {
         let installer = required_resource(resources, "install-macos.sh")?;

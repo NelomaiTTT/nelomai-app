@@ -165,7 +165,7 @@ async fn install_macos_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> 
                 .map_err(|_| UpdateBackendError::new("common_installer_untrusted"))?;
         }
     }
-    let (staging, mut command) = stage_macos_update(&bytes, resources)?;
+    let (staging, mut command) = stage_macos_update(&bytes, resources, unsafe { libc::getuid() })?;
     tauri::async_runtime::spawn_blocking(move || {
         let _staging = staging;
         let status = super::unix::installer_status(&mut command)
@@ -186,11 +186,15 @@ async fn install_macos_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> 
 fn stage_macos_update(
     bytes: &[u8],
     resources: &std::path::Path,
+    owner_uid: libc::uid_t,
 ) -> Result<(tempfile::TempDir, std::process::Command), UpdateBackendError> {
     use std::{
         io::Write,
         os::unix::fs::{OpenOptionsExt, PermissionsExt},
     };
+    if owner_uid == 0 {
+        return Err(UpdateBackendError::new("helper_owner_is_root"));
+    }
     let staging = tempfile::Builder::new()
         .prefix("nelomai-verified-update-")
         .permissions(std::fs::Permissions::from_mode(0o700))
@@ -210,6 +214,7 @@ fn stage_macos_update(
     command
         .arg(resources.join("install-common-macos.applescript"))
         .arg(resources.join("install-common-macos.sh"))
+        .arg(owner_uid.to_string())
         .arg(archive)
         .arg(nelomai_contracts::dispatcher::digest(bytes));
     Ok((staging, command))
@@ -270,7 +275,7 @@ mod macos_tests {
     fn macos_update_handoff_pins_private_bytes_and_installed_installer() {
         let resources =
             Path::new("/Library/Application Support/Nelomai/common/Nelomai.app/Contents/Resources");
-        let (staging, command) = stage_macos_update(b"abc", resources).unwrap();
+        let (staging, command) = stage_macos_update(b"abc", resources, 501).unwrap();
         let archive = staging.path().join("Nelomai.app.tar.gz");
         assert_eq!(std::fs::read(&archive).unwrap(), b"abc");
         assert_eq!(
@@ -293,11 +298,17 @@ mod macos_tests {
                     .join("install-common-macos.applescript")
                     .into_os_string(),
                 resources.join("install-common-macos.sh").into_os_string(),
+                OsString::from("501"),
                 archive.clone().into_os_string(),
                 OsString::from("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
             ]
         );
         drop(staging);
         assert!(!archive.exists());
+    }
+
+    #[test]
+    fn macos_update_rejects_root_owner_before_authorization() {
+        assert!(stage_macos_update(b"abc", Path::new("/unused"), 0).is_err());
     }
 }
