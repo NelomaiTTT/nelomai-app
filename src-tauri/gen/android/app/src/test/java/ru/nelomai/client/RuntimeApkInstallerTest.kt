@@ -8,12 +8,14 @@ import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.content.pm.Signature
 import android.content.pm.SigningInfo
+import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
@@ -27,12 +29,28 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
+import org.robolectric.shadows.ShadowApplicationPackageManager
 import org.robolectric.util.ReflectionHelpers
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 @Suppress("DEPRECATION")
 class RuntimeApkInstallerTest {
+    // AOSP Android 9/10 only collects archive certificates with GET_SIGNATURES.
+    // The default Robolectric shadow returns the fixture regardless of flags.
+    @Implements(className = "android.app.ApplicationPackageManager", isInAndroidSdk = false)
+    class ArchivePackageManager : ShadowApplicationPackageManager() {
+        @Implementation
+        override fun getPackageArchiveInfo(path: String, flags: Int): PackageInfo? =
+            super.getPackageArchiveInfo(path, flags)?.also {
+                if (Build.VERSION.SDK_INT in 28..29 && flags and PackageManager.GET_SIGNATURES == 0) {
+                    it.signingInfo = null
+                }
+            }
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun pending() = RuntimeApkInstaller::class.java.getDeclaredField("pending").let {
         it.isAccessible = true
@@ -57,7 +75,7 @@ class RuntimeApkInstallerTest {
         val installed = shadowOf(context.packageManager).getInternalMutablePackageInfo(context.packageName)
         installed.versionName = "0.3.6"
         installed.signatures = arrayOf(signature)
-        installed.signingInfo = signing(signature)
+        if (Build.VERSION.SDK_INT >= 28) installed.signingInfo = signing(signature)
         val file = File(context.cacheDir, "updates/update.apk").canonicalFile.apply {
             parentFile!!.mkdirs()
             writeBytes(byteArrayOf(1))
@@ -66,7 +84,7 @@ class RuntimeApkInstallerTest {
             packageName = context.packageName
             versionName = "0.3.7"
             signatures = arrayOf(signature)
-            signingInfo = signing(signature)
+            if (Build.VERSION.SDK_INT >= 28) signingInfo = signing(signature)
         })
         manager.setCanRequestPackageInstalls(permission)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
@@ -88,6 +106,48 @@ class RuntimeApkInstallerTest {
         RuntimeApkInstallerActivity::class.java, Intent().putExtra("request", request.nonce),
     ).setup()
 
+    @Test
+    @Config(sdk = [24, 28, 29, 33], shadows = [ArchivePackageManager::class])
+    fun matchingArchiveOpensInstallerWhenCertificateCollectionRequiresLegacyFlag() {
+        val request = request()
+        val activity = launch(request).get()
+        assertNotNull("matching APK must reach the system installer", shadowOf(activity).nextStartedActivityForResult)
+        assertFalse(request.result.isDone)
+    }
+
+    @Test fun missingArchiveSignerMetadataHasItsOwnFailureAndDoesNotUseLegacySignatures() {
+        val request = request()
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context.packageManager).setPackageArchiveInfo(request.path, PackageInfo().apply {
+            packageName = context.packageName
+            versionName = request.version
+            signatures = arrayOf(Signature(byteArrayOf(1, 2, 3)))
+            signingInfo = null
+        })
+        val activity = launch(request).get()
+        val failure = assertThrows(ExecutionException::class.java) { request.result.get(1, TimeUnit.SECONDS) }
+        assertEquals("archive_signers_missing", failure.cause?.message)
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+    }
+
+    @Test fun missingInstalledSignerMetadataHasItsOwnFailureAndDoesNotOpenInstaller() {
+        val request = request()
+        val context = RuntimeEnvironment.getApplication()
+        shadowOf(context.packageManager).getInternalMutablePackageInfo(context.packageName).signingInfo = null
+        val activity = launch(request).get()
+        val failure = assertThrows(ExecutionException::class.java) { request.result.get(1, TimeUnit.SECONDS) }
+        assertEquals("installed_signers_missing", failure.cause?.message)
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+    }
+
+    @Test fun matchingPackageSignersMustAlsoMatchTheExpectedReleaseCertificate() {
+        val request = request().copy(signer = "0".repeat(64)).also { pending().set(it) }
+        val activity = launch(request).get()
+        val failure = assertThrows(ExecutionException::class.java) { request.result.get(1, TimeUnit.SECONDS) }
+        assertEquals("signer_mismatch", failure.cause?.message)
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+    }
+
     @Test fun installerDispatchWaitsForSystemResultAndCancelCompletesOnlyItsRequest() {
         val request = request()
         val controller = launch(request)
@@ -104,7 +164,9 @@ class RuntimeApkInstallerTest {
         controller.pause().stop().destroy()
     }
 
-    @Test fun permissionReturnRevalidatesApkAndDoesNotDispatchIfSignerChanged() {
+    @Test
+    @Config(sdk = [28, 29], shadows = [ArchivePackageManager::class])
+    fun permissionReturnRevalidatesApkAndDoesNotDispatchIfSignerChanged() {
         val request = request(permission = false)
         val activity = launch(request).get()
         val permission = shadowOf(activity).nextStartedActivityForResult
@@ -115,11 +177,13 @@ class RuntimeApkInstallerTest {
         manager.setPackageArchiveInfo(request.path, PackageInfo().apply {
             packageName = context.packageName
             versionName = request.version
-            signatures = arrayOf(Signature(byteArrayOf(9)))
+            // Matching legacy data must not replace the current signer check.
+            signatures = arrayOf(Signature(byteArrayOf(1, 2, 3)))
             signingInfo = signing(Signature(byteArrayOf(9)))
         })
         shadowOf(activity).callOnActivityResult(permission.requestCode, Activity.RESULT_OK, null)
-        assertTrue(request.result.isCompletedExceptionally)
+        val failure = assertThrows(ExecutionException::class.java) { request.result.get(1, TimeUnit.SECONDS) }
+        assertEquals("signer_mismatch", failure.cause?.message)
         assertNull(shadowOf(activity).nextStartedActivityForResult)
     }
 

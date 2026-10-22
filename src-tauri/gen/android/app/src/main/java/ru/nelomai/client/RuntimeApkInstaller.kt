@@ -180,12 +180,18 @@ class RuntimeApkInstallerActivity : Activity() {
         val archive = requireNotNull(packageInfo(file.absolutePath, true)) { "archive_info_missing" }
         require(archive.packageName == packageName && archive.versionName == value.version) { "package_mismatch" }
         val installed = requireNotNull(packageInfo(packageName, false)) { "installed_info_missing" }
-        require(RuntimeApkValidation.signers(signers(archive), signers(installed), value.signer.trim().lowercase())) { "signer_mismatch" }
+        val archiveSigners = signers(archive)
+        require(archiveSigners.isNotEmpty()) { "archive_signers_missing" }
+        val installedSigners = signers(installed)
+        require(installedSigners.isNotEmpty()) { "installed_signers_missing" }
+        require(RuntimeApkValidation.signers(archiveSigners, installedSigners, value.signer.trim().lowercase())) { "signer_mismatch" }
         return file
     }
     @Suppress("DEPRECATION")
     private fun packageInfo(value: String, archive: Boolean): PackageInfo? {
-        val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        var flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        // Android 9/10 only collect archive certificates when GET_SIGNATURES is set.
+        if (archive && Build.VERSION.SDK_INT in 28..29) flags = flags or PackageManager.GET_SIGNATURES
         return if (archive) packageManager.getPackageArchiveInfo(value, flags) else packageManager.getPackageInfo(value, flags)
     }
     @Suppress("DEPRECATION")
