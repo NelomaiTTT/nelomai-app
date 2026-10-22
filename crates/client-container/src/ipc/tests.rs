@@ -1934,6 +1934,7 @@ async fn nlm071_bounded_refresh(expired_replay: bool) {
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let pause = Arc::new(AdmissionPause {
         after_commit: false,
+        delay_access: false,
         scope_delay: Duration::from_millis(600),
         entered: tokio::sync::Notify::new(),
         release: tokio::sync::Notify::new(),
@@ -2115,6 +2116,7 @@ async fn pending_auth_cleanup_is_not_mislabeled_as_pristine_logout() {
 
 struct AdmissionPause {
     after_commit: bool,
+    delay_access: bool,
     scope_delay: Duration,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -2128,6 +2130,8 @@ impl AdmissionPause {
         let (mut from_child, mut to_child) = downstream.into_split();
         let observe = self.clone();
         tokio::spawn(async move {
+            let mut delayed_access = None;
+            let mut access_seen = false;
             loop {
                 let Ok(frame) = read_frame(&mut from_owner, Instant::now() + REQUEST_BUDGET).await
                 else {
@@ -2136,6 +2140,34 @@ impl AdmissionPause {
                 let deadline = Instant::now() + Duration::from_millis(frame.remaining_ms);
                 if matches!(frame.message, MessageV1::Control(ControlV1::Grant { .. })) {
                     observe.grants.fetch_add(1, Ordering::SeqCst);
+                }
+                // Reproduce an Access response overtaken by recovery Prepare,
+                // after its owner's final CheckScope already succeeded. Both
+                // endpoints and every frame are real; only delivery is delayed.
+                if observe.delay_access
+                    && !access_seen
+                    && matches!(
+                        frame.message,
+                        MessageV1::Response(AuthResponseV1::Access { .. })
+                    )
+                {
+                    access_seen = true;
+                    delayed_access = Some((frame, deadline));
+                    observe.entered.notify_one();
+                    continue;
+                }
+                if matches!(
+                    frame.message,
+                    MessageV1::Control(ControlV1::ValidateScope { .. })
+                ) {
+                    if let Some((access, access_deadline)) = delayed_access.take() {
+                        if write_frame(&mut to_child, access, access_deadline)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
                 if matches!(
                     frame.message,
@@ -2161,7 +2193,7 @@ impl AdmissionPause {
                     && pause.after_commit
                     || matches!(frame.message, MessageV1::Ack(ControlAckV1::Prepared { .. }))
                         && !pause.after_commit;
-                if boundary && !held && pause.scope_delay.is_zero() {
+                if boundary && !held && !pause.delay_access && pause.scope_delay.is_zero() {
                     held = true;
                     pause.entered.notify_one();
                     pause.release.notified().await;
@@ -2181,6 +2213,7 @@ async fn logout_at_prepared_or_committed_ack_prevents_final_grant() {
         let (api, _, server) = logout_panel().await;
         let pause = Arc::new(AdmissionPause {
             after_commit,
+            delay_access: false,
             scope_delay: Duration::ZERO,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
@@ -3909,4 +3942,242 @@ async fn inherited_socket_drives_auth_and_actual_record_in_separate_child_proces
         LogoutState::LoggedOut
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn nlm092_delayed_access_does_not_abort_background_recovery() {
+    // Success, known refusal (fallback permitted), and unknown issuance
+    // (must stay fenced) all survive rejection of the concurrent old reply.
+    for outcome in ["success", "refused", "unknown"] {
+        let native: Arc<dyn PrivateBackgroundDispatcher> = match outcome {
+            "success" => Arc::new(Recover(AtomicUsize::new(0))),
+            _ => Arc::new(RefuseRecovery(outcome == "unknown")),
+        };
+        let pause = Arc::new(AdmissionPause {
+            after_commit: false,
+            delay_access: true,
+            scope_delay: Duration::ZERO,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            grants: AtomicUsize::new(0),
+        });
+        let fixture = Fixture::with_pause(
+            ClientApi::new("http://127.0.0.1:9").unwrap(),
+            true,
+            Some(native),
+            Some(pause.clone()),
+        );
+        let mut original = fixture.auth.load().unwrap().unwrap();
+        original.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+        fixture.auth.save(&original).unwrap();
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        fixture.client.state().await.unwrap();
+        let client = fixture.client.clone();
+        let access = tokio::spawn(async move { client.access(None).await });
+        tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+            .await
+            .unwrap();
+        let recovery = fixture.client.background(BackgroundAction::Recover).await;
+        assert!(
+            matches!(
+                access.await.unwrap(),
+                Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            ),
+            "old access must be rejected without closing the channel: {outcome}"
+        );
+        assert!(!fixture.client.is_channel_closed(), "{outcome}");
+        assert!(fixture.parent.is_connected(), "{outcome}");
+        let current = fixture.client.access(None).await;
+        match outcome {
+            "success" => {
+                assert!(
+                    matches!(recovery, Ok(AuthResponseV1::Access { .. })),
+                    "{recovery:?}"
+                );
+                assert_eq!(current.unwrap().access_token(), "recovered-access");
+            }
+            "refused" => {
+                assert!(matches!(recovery, Err(PrivateError::RecoveryRequired)));
+                assert_eq!(current.unwrap().access_token(), "synthetic-access");
+            }
+            _ => {
+                assert!(matches!(recovery, Err(PrivateError::RecoveryRequired)));
+                assert!(current.is_err());
+                assert_eq!(
+                    fixture.client.state().await.unwrap(),
+                    RuntimeAuthState::RecoveryRequired
+                );
+                assert!(fixture
+                    .auth
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .broker
+                    .unwrap()
+                    .pending_recovery
+                    .is_some());
+                assert_eq!(
+                    fixture.auth.load().unwrap().unwrap().refresh_token,
+                    original.refresh_token
+                );
+                assert!(fixture.client.check_start_barrier().is_err());
+            }
+        }
+        assert!(
+            !fixture.client.is_channel_closed(),
+            "channel also survives subsequent requests"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nlm092_rejected_access_preserves_admission_and_protocol_fences() {
+    for case in [
+        "revoke",
+        "foreign_scope",
+        "stamp_mismatch",
+        "unknown_id",
+        "duplicate",
+    ] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+        let access = fixture.broker.access_token(None).await.unwrap();
+        let scope = transport::scope(&access);
+        let child = Arc::new(ChildAdmission::new(
+            "access-fences".into(),
+            fixture.local.runtime_writer_gates(),
+            fixture.record.clone(),
+        ));
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = child.prepare(1, "access-fences", deadline).await.unwrap();
+        child.commit(&lease, &scope).unwrap();
+        child.grant(&lease, &scope).unwrap();
+        let (mut peer, socket) = private_socketpair().unwrap();
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            socket,
+            child.clone(),
+            fixture.local.clone(),
+        ));
+        let old_stamp = ScopeStamp::from_access(&access);
+        let request_client = client.clone();
+        let stamp = old_stamp.clone();
+        let request = tokio::spawn(async move {
+            request_client
+                .request(
+                    AuthRequestV1::AccessToken {
+                        stamp: Some(stamp),
+                        stale: None,
+                    },
+                    deadline,
+                )
+                .await
+        });
+        let sent = read_frame(&mut peer, deadline).await.unwrap();
+        if case != "foreign_scope" {
+            // A rejected reply must not reopen admission or erase logout history.
+            write_frame(
+                &mut peer,
+                FrameV1::new(900, MessageV1::Control(ControlV1::Revoke)),
+                deadline,
+            )
+            .await
+            .unwrap();
+        }
+        let foreign = AccessSnapshot::new(
+            "synthetic-foreign".into(),
+            access.identity().clone(),
+            access.auth_epoch(),
+            "another-family".into(),
+        )
+        .unwrap();
+        let reply_access = if matches!(case, "foreign_scope" | "stamp_mismatch") {
+            foreign
+        } else {
+            access.clone()
+        };
+        let stamp = if case == "stamp_mismatch" {
+            old_stamp
+        } else {
+            ScopeStamp::from_access(&reply_access)
+        };
+        let id = if case == "unknown_id" {
+            sent.id + 1
+        } else {
+            sent.id
+        };
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                id,
+                MessageV1::Response(AuthResponseV1::Access {
+                    stamp,
+                    access: reply_access,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        let result = request.await.unwrap();
+        if matches!(case, "stamp_mismatch" | "unknown_id") {
+            assert!(result.is_err(), "{case}");
+            assert!(
+                client.is_channel_closed(),
+                "protocol error must still close channel: {case}"
+            );
+            continue;
+        }
+        assert!(
+            matches!(result, Err(PrivateError::RecoveryRequired)),
+            "{case}: {result:?}"
+        );
+        assert!(!client.is_channel_closed(), "{case}");
+        if case == "foreign_scope" {
+            child.check(&scope).unwrap(); // Failed foreign response cannot alter current admission.
+        } else {
+            assert!(child.check(&scope).is_err());
+        }
+        if case == "duplicate" {
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    sent.id,
+                    MessageV1::Response(AuthResponseV1::Access {
+                        stamp: ScopeStamp::from_access(&access),
+                        access,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), client.wait_for_channel_close())
+                .await
+                .unwrap();
+            assert!(client.is_channel_closed());
+        } else {
+            // Rejection completed just that request; another RPC remains usable.
+            let state_client = client.clone();
+            let state = tokio::spawn(async move { state_client.state().await });
+            let query = read_frame(&mut peer, deadline).await.unwrap();
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    query.id,
+                    MessageV1::Response(AuthResponseV1::State {
+                        stamp: ScopeStamp::from_access(&access),
+                        state: RuntimeAuthState::LoggedOut,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.await.unwrap().unwrap(), RuntimeAuthState::LoggedOut);
+            assert!(!client.is_channel_closed());
+        }
+    }
 }

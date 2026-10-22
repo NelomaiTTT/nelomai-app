@@ -1150,10 +1150,24 @@ impl PrivateRuntimeAuthClient {
                 match frame.message {
                     MessageV1::Response(response) => {
                         if let AuthResponseV1::Access { stamp, access } = &response {
-                            if *stamp != ScopeStamp::from_access(access)
-                                || client_child.check(&scope(access)).is_err()
-                            {
+                            if *stamp != ScopeStamp::from_access(access) {
                                 break;
+                            }
+                            if let Err(error) = client_child.check(&scope(access)) {
+                                if error != PrivateError::RecoveryRequired {
+                                    break;
+                                }
+                                // Prepare/Revoke can overtake the owner's checked
+                                // reply. Never deliver access without admission,
+                                // but let recovery finish on this same channel.
+                                // Unknown/duplicate replies still close the peer.
+                                if client_pending
+                                    .finish(frame.id, AuthResponseV1::Error { error })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
                             }
                             confirmed_logout = false;
                             observed_logout = false;
