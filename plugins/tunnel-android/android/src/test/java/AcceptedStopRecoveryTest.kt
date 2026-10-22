@@ -5,6 +5,38 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class AcceptedStopRecoveryTest {
+    @Test fun retiredStopUsesFreshCredentialOnlyForSameDeviceAndPanel() {
+        val old = BackgroundCredential("device", "https://panel.example", "retired", 1)
+        val fresh = old.copy(token = "current", expiresAtUnix = 100)
+        assertEquals(fresh, acceptedStopReconcileCredential(old, fresh))
+        assertEquals(old, acceptedStopReconcileCredential(old, null))
+        assertEquals(old, acceptedStopReconcileCredential(old, fresh.copy(deviceId = "other")))
+        assertEquals(old, acceptedStopReconcileCredential(old, fresh.copy(panelBase = "https://other.example")))
+    }
+
+    @Test fun unauthorizedCleanupWaitsForNewCredentialWithoutLosingReceiptOrRetrying401() {
+        val store = prepared(Backend())
+        assertTrue(coordinator(store, { true }, { acceptedReply() }).revoke())
+        val original = (store.read() as RecoveryStoreResult.Success).value.acceptedStops.single()
+        var current: BackgroundCredential? = null
+        val rejected = mutableMapOf<String, BackgroundCredential>()
+        var calls = 0
+        fun tick() = reconcileAcceptedStops(store, { current }, rejected) { sent ->
+            calls++
+            assertEquals(original.operationId, sent.operationId)
+            assertEquals(original.requestFingerprint, sent.requestFingerprint)
+            if (sent.credential.token == "token") throw BackgroundConnectionException("invalid_background_token")
+            BackgroundReconcileResult("terminal", false, sent.leaseId, "released", 0, null,
+                StopAcceptance(sent.operationId, sent.sessionId, sent.leaseId, false))
+        }
+        repeat(5) { tick() }
+        assertEquals(1, calls)
+        assertEquals(listOf(original), (store.read() as RecoveryStoreResult.Success).value.acceptedStops)
+        current = original.credential.copy(token = "fresh")
+        tick()
+        assertEquals(2, calls)
+        assertTrue((store.read() as RecoveryStoreResult.Success).value.acceptedStops.isEmpty())
+    }
     private class Backend : EncryptedRecordBackend {
         var bytes: ByteArray? = null
         var failWrites = false

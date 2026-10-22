@@ -322,21 +322,46 @@ internal fun awaitAcceptedStopCapacity(
 }
 
 // Retired callbacks can only remove their own immutable record, never mutate the live intent.
+internal fun acceptedStopReconcileCredential(
+    saved: BackgroundCredential,
+    current: BackgroundCredential?,
+): BackgroundCredential = current?.takeIf {
+    it.deviceId == saved.deviceId && it.panelBase == saved.panelBase
+} ?: saved
+
 internal fun reconcileAcceptedStops(
     store: AndroidRecoveryStore,
+    currentCredential: () -> BackgroundCredential? = { null },
+    rejectedCredentials: MutableMap<String, BackgroundCredential> = mutableMapOf(),
     reconcile: (AcceptedStopCleanup) -> BackgroundReconcileResult,
 ) {
     val snapshot = (store.read() as? RecoveryStoreResult.Success)?.value ?: return
+    rejectedCredentials.keys.retainAll(snapshot.acceptedStops.map { it.operationId }.toSet())
     snapshot.acceptedStops.forEach { entry ->
         runCatching {
-            val reply = reconcile(entry)
+            val credential = acceptedStopReconcileCredential(entry.credential, currentCredential())
+            if (rejectedCredentials[entry.operationId] == credential) return@runCatching
+            val reply = try {
+                reconcile(entry.copy(credential = credential))
+            } catch (error: BackgroundConnectionException) {
+                if (error.code in setOf("invalid_background_token", "stale_background_runtime", "background_token_expired")) {
+                    // A rejected secret cannot become valid through polling. Keep
+                    // the exact durable Stop and resume after credential renewal.
+                    rejectedCredentials[entry.operationId] = credential
+                    TunnelLog.warning("background.accepted_stop_auth_rejected", error.code)
+                }
+                throw error
+            }
             val acceptance = reply.stopAcceptance ?: return@runCatching
             // Released/failed leases project an applied Stop as terminal.
             // The exact final receipt, not the lease status alone, is proof.
             if (reply.state in setOf("applied", "terminal") && !acceptance.cleanupPending &&
                 acceptance.operationId == entry.operationId && acceptance.sessionId == entry.sessionId &&
                 acceptance.leaseId == entry.leaseId
-            ) store.completeAcceptedCleanup(entry)
+            ) {
+                store.completeAcceptedCleanup(entry)
+                rejectedCredentials.remove(entry.operationId)
+            }
         }
     }
 }

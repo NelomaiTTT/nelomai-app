@@ -10,6 +10,7 @@ import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -777,6 +778,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         cancel = restoreHandler::removeCallbacks,
     )
     private var restoreRetryAttempt = 0
+    private var logoutRetryAttempt = 0
+    @Volatile private var logoutRetryAtMillis = 0L
+    private val logoutAttemptInFlight = AtomicBoolean(false)
     @Volatile private var lastHandledStartId = 0
     private lateinit var recoveryStore: AndroidRecoveryStore
     private lateinit var redundantCancelTombstones: RedundantCancelTombstoneStore
@@ -812,6 +816,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     @Volatile private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
     private var nextRetiredReconcileAtMillis = 0L
+    // Accessed only by the serial cleanup executor; at most eight retired Stops.
+    private val rejectedRetiredStopCredentials = mutableMapOf<String, BackgroundCredential>()
     private val redundantHealthTick = object : Runnable {
         override fun run() {
             if (redundantVpnOwner != null && !redundantStartBlocked()) {
@@ -982,6 +988,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             recovery = recoveryStore::read,
             beginRedundantStop = ::beginBackgroundLogoutRedundantStop,
             runLogout = ::runBackgroundLogoutAttempt,
+            canRunLogout = {
+                !logoutAttemptInFlight.get() && SystemClock.elapsedRealtime() >= logoutRetryAtMillis
+            },
             scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
             stopIfIdle = ::stopIfIdle,
         )
@@ -4431,7 +4440,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         if ((recoveryStore.read() as? RecoveryStoreResult.Success)?.value?.acceptedStops.isNullOrEmpty()) return
         // The existing process cleanup executor is independent of foreground Start/native owner work.
         VPN_PROCESS_CLEANUP_WORK.tick {
-            reconcileAcceptedStops(recoveryStore) { old ->
+            reconcileAcceptedStops(recoveryStore, currentCredential = {
+                (AndroidBackgroundCredentialStores.open(applicationContext).read()
+                    as? CredentialStoreResult.Success)?.value?.active
+            }, rejectedCredentials = rejectedRetiredStopCredentials) { old ->
                 BackgroundConnectionClient.reconcile(old.credential, old.operationId,
                     "redundant_stop", 2, old.requestFingerprint, false)
             }
@@ -4517,8 +4529,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             return
         }
         restoreHandler.removeCallbacks(logoutRetry)
-        if (delayMillis > 0) {
-            restoreHandler.postDelayed(logoutRetry, delayMillis)
+        if (delayMillis > 0 && logoutRetryAtMillis <= SystemClock.elapsedRealtime()) {
+            logoutRetryAtMillis = SystemClock.elapsedRealtime() + delayMillis
+        }
+        val remaining = logoutRetryAtMillis - SystemClock.elapsedRealtime()
+        if (remaining > 0) {
+            restoreHandler.postDelayed(logoutRetry, remaining)
             return
         }
         backgroundLogoutLifecycle.resumeOrStopIfIdle()
@@ -4546,14 +4562,20 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             scheduleIdleProcessRecycle(null)
             return
         }
-        submitCredentialTask {
-            val step = logoutCoordinator.runOnce(
-                ServiceConnectionIntentPanel(),
-                ServiceConnectionIntentRuntime(),
-                activate = BackgroundConnectionClient::activateToken,
-                finalize = BackgroundConnectionClient::finalizeLogout,
-            )
+        if (!logoutAttemptInFlight.compareAndSet(false, true)) return
+        if (!submitCredentialTask {
+            val step = try {
+                logoutCoordinator.runOnce(
+                    ServiceConnectionIntentPanel(),
+                    ServiceConnectionIntentRuntime(),
+                    activate = BackgroundConnectionClient::activateToken,
+                    finalize = BackgroundConnectionClient::finalizeLogout,
+                )
+            } catch (_: Throwable) {
+                AndroidLogoutStep.RETRY
+            }
             postServiceCallback {
+                logoutAttemptInFlight.set(false)
                 handleBackgroundLogoutAttemptCompletion(
                     ownerServiceGeneration = attemptServiceGeneration,
                     currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
@@ -4561,22 +4583,27 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     step = step,
                     scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
                     complete = {
-                        restoreRetryAttempt = 0
+                        logoutRetryAttempt = 0
+                        logoutRetryAtMillis = 0L
                         stopIfIdle()
                     },
                     completeAfterDestroy = { scheduleIdleProcessRecycle(null) },
                 )
             }
-        }
+        }) logoutAttemptInFlight.set(false)
     }
 
     private fun scheduleNextBackgroundLogoutRetry() {
+        if (logoutRetryAtMillis > SystemClock.elapsedRealtime()) {
+            scheduleLogoutAttempt()
+            return
+        }
         val delay = RESTORE_RETRY_DELAYS_MILLIS[
-            restoreRetryAttempt.coerceAtMost(
+            logoutRetryAttempt.coerceAtMost(
                 RESTORE_RETRY_DELAYS_MILLIS.lastIndex,
             )
         ]
-        restoreRetryAttempt += 1
+        logoutRetryAttempt = (logoutRetryAttempt + 1).coerceAtMost(RESTORE_RETRY_DELAYS_MILLIS.lastIndex)
         scheduleLogoutAttempt(delay)
     }
 
@@ -6292,6 +6319,7 @@ internal class BackgroundLogoutServiceLifecycle(
     private val recovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
     private val beginRedundantStop: (AndroidRedundantTransaction) -> Unit,
     private val runLogout: () -> Unit,
+    private val canRunLogout: () -> Boolean = { true },
     private val scheduleRetry: () -> Unit,
     private val stopIfIdle: () -> Unit,
 ) {
@@ -6325,7 +6353,7 @@ internal class BackgroundLogoutServiceLifecycle(
             is RecoveryStoreResult.Failure -> scheduleRetry()
             is RecoveryStoreResult.Success -> current.value.redundantTransaction?.let {
                 beginRedundantStop(it)
-            } ?: runLogout()
+            } ?: if (canRunLogout()) runLogout() else Unit
         }
         return true
     }

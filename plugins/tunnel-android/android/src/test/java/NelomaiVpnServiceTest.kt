@@ -4400,6 +4400,27 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun logoutIdleAndEnsureCallbacksRespectPendingRetryAndInflightAttempt() {
+        var allowed = false
+        var attempts = 0
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.PENDING },
+            recovery = { RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1)) },
+            beginRedundantStop = { error("no redundant work") },
+            runLogout = { attempts++; allowed = false },
+            canRunLogout = { allowed },
+            scheduleRetry = { error("must keep existing retry") },
+            stopIfIdle = { error("logout remains pending") },
+        )
+        repeat(5) { assertTrue(lifecycle.onIdleCheck()); lifecycle.resumeOrStopIfIdle() }
+        assertEquals(0, attempts)
+        allowed = true
+        lifecycle.resumeOrStopIfIdle()
+        repeat(5) { lifecycle.onIdleCheck(); lifecycle.onRedundantStopCompleted() }
+        assertEquals(1, attempts)
+    }
+
+    @Test
     fun logoutLifecycleRetriesWhenCredentialStoreIsUnreadable() {
         val events = mutableListOf<String>()
         val lifecycle = BackgroundLogoutServiceLifecycle(
