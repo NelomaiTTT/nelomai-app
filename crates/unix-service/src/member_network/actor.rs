@@ -289,7 +289,13 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
             if stage != Stage::Status {
                 let failure = PairFailure::io(stage, error);
                 #[cfg(target_os = "macos")]
-                eprintln!("nelomai_pair_failure: {failure}");
+                if let Ok(message) =
+                    std::ffi::CString::new(format!("nelomai_pair_failure: {failure}"))
+                {
+                    unsafe {
+                        libc::syslog(libc::LOG_ERR, c"%s".as_ptr(), message.as_ptr());
+                    }
+                }
                 self.diagnostic
                     .as_mut()
                     .expect("operation initialized")
