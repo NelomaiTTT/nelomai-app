@@ -402,7 +402,7 @@ fn table_destination(text: &str, ipv4: bool) -> Option<IpNet> {
         .map(|n| IpNet::V4(n.trunc()))
 }
 fn table_gateway(text: &str, interface: &str) -> io::Result<Option<IpAddr>> {
-    if text.starts_with("link#") {
+    if text.starts_with("link#") || text == interface {
         return Ok(None);
     }
     let address = if let Some((address, scope)) = text.split_once('%') {
@@ -512,6 +512,33 @@ mod tests {
             gateway: None,
             metric: 0,
         })
+    }
+    #[test]
+    fn named_link_gateway_preserves_exact_interface_scope_and_duplicate_guards() {
+        let mut native = MacNetwork {
+            commands: Commands {
+                table: "198.18.0.1 utun10 UHS utun10\n198.18.0.1 utun20 UHSI utun20\n".into(),
+                ..Default::default()
+            },
+        };
+        for expected in [
+            route("198.18.0.1/32", RouteScope::Global, 10),
+            route("198.18.0.1/32", RouteScope::Member(20), 20),
+        ] {
+            assert_eq!(native.read(&expected.key()).unwrap(), Some(expected));
+        }
+        let absent = route("198.18.0.1/32", RouteScope::Member(10), 10);
+        assert_eq!(native.read(&absent.key()).unwrap(), None);
+        let scoped = route("198.18.0.1/32", RouteScope::Member(20), 20);
+        native
+            .commands
+            .table
+            .push_str("198.18.0.1 utun20 UHSI utun20\n");
+        assert!(native.read(&scoped.key()).is_err());
+        for gateway in ["utun10", "00:11:22:33:44:55", "fe80::1%utun10"] {
+            native.commands.table = format!("198.18.0.1 {gateway} UHSI utun20\n");
+            assert!(native.read(&scoped.key()).is_err(), "gateway {gateway}");
+        }
     }
     #[test]
     fn probe_route_remains_scoped_to_reserve_and_never_replaces_global_dns_route() {
