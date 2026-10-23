@@ -237,7 +237,10 @@ fn attest_channel<P: LaunchProbe>(
 // alignment NULs, argc terminated argv strings, terminated environment strings.
 // https://github.com/apple-oss-distributions/adv_cmds/blob/main/ps/print.c
 // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c
-// Missing/omitted environment or unfamiliar trailing data is not proof.
+// XNU can append Apple auxiliary strings after the environment's terminating
+// NUL/alignment. Like ps, stop at that boundary; auxiliary data is not evidence.
+// https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exec.c
+// Missing/omitted or unterminated environment is not proof.
 fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     if bytes.len() < 4 || bytes.len() >= MAX_ARGS {
@@ -275,7 +278,7 @@ fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> 
             name = true;
         }
     }
-    if !nonce || !name || rest.iter().any(|b| *b != 0) {
+    if !nonce || !name || rest.first() != Some(&0) {
         return Err(invalid());
     }
     Ok(())
@@ -1114,10 +1117,34 @@ pub(super) mod tests {
         assert!(check_arguments(&argv_only, &r, Path::new(STATE)).is_err());
     }
     #[test]
+    fn procargs_apple_vector_after_environment_is_not_launch_authority() {
+        let r = receipt(MemberTransport::WireGuard);
+        let mut b = args(&[]);
+        b.extend_from_slice(b"\0\0ptr_munge=0x1234\0main_stack=0x1,0x2,0x3,0x4\0executable_file=0x1,0x2\0dyld_file=0x3,0x4\0executable_cdhash=0123456789abcdef\0executable_boothash=abcdef0123456789\0th_port=0x103\0security_config=0x0\0");
+        // Auxiliary strings cannot override the already verified environment.
+        b.extend_from_slice(b"NELOMAI_MEMBER_LAUNCH_NONCE=wrong\0WG_TUN_NAME_FILE=/foreign\0");
+        assert!(check_arguments(&b, &r, Path::new(STATE)).is_ok());
+    }
+    #[test]
+    fn procargs_apple_vector_cannot_supply_missing_environment_evidence() {
+        let r = receipt(MemberTransport::WireGuard);
+        for environment in [
+            b"".as_slice(),
+            b"NELOMAI_MEMBER_LAUNCH_NONCE=72cc17e2-0000-4000-8000-000000000001\0",
+            b"WG_TUN_NAME_FILE=/private/var/run/nelomai/slot-a/interface-name\0",
+        ] {
+            let mut b = 2i32.to_ne_bytes().to_vec();
+            b.extend_from_slice(b"/Library/Nelomai/awg\0\0\0awg\0-f\0");
+            b.extend_from_slice(environment);
+            b.extend_from_slice(b"\0ptr_munge=0x1234\0NELOMAI_MEMBER_LAUNCH_NONCE=72cc17e2-0000-4000-8000-000000000001\0WG_TUN_NAME_FILE=/private/var/run/nelomai/slot-a/interface-name\0");
+            assert!(check_arguments(&b, &r, Path::new(STATE)).is_err());
+        }
+    }
+    #[test]
     fn malformed_and_truncated_procargs_rejected_without_panics() {
         let r = receipt(MemberTransport::WireGuard);
         let b = args(&[]);
-        for n in 0..b.len() - 1 {
+        for n in 0..b.len() {
             assert!(
                 check_arguments(&b[..n], &r, Path::new(STATE)).is_err(),
                 "len {n}"
