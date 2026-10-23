@@ -204,11 +204,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-native"]["steps"][-1]["with"].update(
                 name="windows-native-result"),
             lambda jobs: jobs["windows-native"]["steps"].pop(),
-            lambda jobs: jobs["windows-build"]["steps"][4].update(run="cargo check -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"][5].update(run="cargo check -p nelomai-windows-service"),
             lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),
-            lambda jobs: jobs["windows-build"]["steps"][7].update(run="cargo build -p nelomai-windows-service"),
-            lambda jobs: jobs["windows-build"]["steps"].insert(7, jobs["windows-build"]["steps"].pop(
+            lambda jobs: jobs["windows-build"]["steps"][8].update(run="cargo build -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"].insert(8, jobs["windows-build"]["steps"].pop(
                 next(index for index, step in enumerate(jobs["windows-build"]["steps"])
                      if step.get("name") == "Actual factory runtime input"))),
             lambda jobs: jobs["contracts-python"].update(steps=[
@@ -222,7 +222,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-native"].update(**{"if": "github.event_name != 'workflow_dispatch'"}),
             lambda jobs: jobs["windows-native"].update(**{"runs-on": "nelomai-040-worker-host"}),
             lambda jobs: jobs["windows-native"]["strategy"]["matrix"]["case"].__setitem__(1, "primary"),
-            lambda jobs: jobs["windows-build"]["steps"][2]["with"].update(**{"go-version": "latest"}),
+            lambda jobs: jobs["windows-build"]["steps"][3]["with"].update(**{"go-version": "latest"}),
             lambda jobs: jobs["windows-worker-native"].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-worker-native"].update(**{"runs-on": "windows-2022"}),
             lambda jobs: jobs["windows-worker-native"]["concurrency"].update(**{"cancel-in-progress": True}),
@@ -493,7 +493,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         go = next(step for step in setup if step.get("uses") == "actions/setup-go@v5")
         self.assertEqual(go["if"], "inputs.purpose == 'build'",
                          "Windows candidate worker build must use the pinned Go toolchain")
-        self.assertEqual(go["with"]["go-version"], "1.25.0")
+        self.assertEqual(go["with"]["go-version"], "1.26.10")
         self.assertIn("\ngo 1.25.0\n", (ROOT / "workers/windows-go/go.mod").read_text())
         for prefix in ("actions/setup-java@", "android-actions/setup-android@"):
             step = next(step for step in setup if step.get("uses", "").startswith(prefix))
