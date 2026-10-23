@@ -73,7 +73,7 @@ $amneziaBuildText = Get-Content -LiteralPath $amneziaBuild -Raw
 $amneziaBuildOriginal = $amneziaBuildText
 $amneziaBuildText = $amneziaBuildText.Replace(
     "go1.24.4.windows-amd64.zip b751a1136cb9d8a2e7ebb22c538c4f02c09b98138c7c8bfb78a54a4566c013b1",
-    "go1.25.0.windows-amd64.zip 89efb4f9b30812eee083cc1770fdd2913c14d301064f6454851428f9707d190b"
+    "go1.26.10.windows-amd64.zip 7ecd2d7260e82c59bcbd7f1077a07cee2dea607295b858df67195a1e4e09629b"
 )
 if ($amneziaBuildText -eq $amneziaBuildOriginal) {
     throw "Pinned AmneziaWG build script no longer contains the expected Go toolchain"
