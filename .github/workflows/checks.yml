@@ -77,7 +77,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - name: Update Rustup trust before toolchain downloads
         shell: bash
-        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
@@ -102,7 +102,7 @@ jobs:
           go-version: "1.26.10"
       - name: Update Rustup trust before toolchain downloads
         shell: bash
-        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
@@ -211,7 +211,7 @@ jobs:
           submodules: recursive
       - name: Update Rustup trust before toolchain downloads
         shell: bash
-        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
@@ -448,7 +448,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Update Rustup trust before toolchain downloads
         shell: bash
-        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
@@ -475,7 +475,7 @@ jobs:
         run: echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"
       - name: Update Rustup trust before toolchain downloads
         shell: bash
-        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0

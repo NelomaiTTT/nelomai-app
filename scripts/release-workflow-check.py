@@ -127,7 +127,7 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
     checkout = {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "submodules": "recursive"}}
     require(build["steps"][0] == native["steps"][0] == checkout, "Producer and consumer checkouts must use exact current SHA")
     require(build["steps"][1] == {"name": "Update Rustup trust before toolchain downloads",
-        "shell": "bash", "run": 'if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi'},
+        "shell": "bash", "run": 'if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi'},
         "Rustup trust must be updated before downloading the compiler")
     require(build["steps"][2] == {"uses": "dtolnay/rust-toolchain@master", "with": {
         "toolchain": "1.88.0", "components": "rustfmt, clippy"}}, "Common build must retain the audited toolchain")
