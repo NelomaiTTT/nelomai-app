@@ -37,7 +37,8 @@ requested SHA, checkout and fetched branch HEAD to agree; a mismatch fails
 explicitly. Checkout credentials are not persisted and repository permissions
 are read-only.
 
-The single hosted `macos-15` Apple Silicon job uses Rust `1.88.0`, rustfmt,
+The single dedicated local macOS VM job (`nelomai-040-macos-vm`, ARM64) uses
+Rust `1.88.0`, rustfmt,
 clippy and target `aarch64-apple-darwin`. It checks formatting, checks/clippies
 Unix service and real desktop application targets, builds the locked frontend,
 and compiles/links all service and app binaries including the feature-gated

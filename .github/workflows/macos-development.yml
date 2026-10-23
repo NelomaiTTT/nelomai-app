@@ -23,7 +23,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/macos-hot-standby-0.4.0' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: macos-15
+    runs-on: [self-hosted, macOS, ARM64, nelomai-040-macos-vm]
     timeout-minutes: 60
     env:
       SOURCE_SHA: ${{ github.event_name == 'push' && github.sha || inputs.source_sha }}
