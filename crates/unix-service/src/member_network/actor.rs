@@ -287,10 +287,13 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         self.refresh();
         result.map_err(|error| {
             if stage != Stage::Status {
+                let failure = PairFailure::io(stage, error);
+                #[cfg(target_os = "macos")]
+                eprintln!("nelomai_pair_failure: {failure}");
                 self.diagnostic
                     .as_mut()
                     .expect("operation initialized")
-                    .failure = Some(PairFailure::io(stage, error));
+                    .failure = Some(failure);
             }
             preflight_error.unwrap_or_else(failed)
         })
