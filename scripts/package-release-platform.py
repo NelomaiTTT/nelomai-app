@@ -16,6 +16,7 @@ spec = importlib.util.spec_from_file_location("builder", Path(__file__).with_nam
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 verifier = builder.verifier
+VERSION = builder.gates.VERSION
 container = verifier.load_script("build-runtime-acceptance-container.py")
 
 
@@ -73,7 +74,7 @@ def main():
         packages[kind] = {"name": name, "sha256": verifier.digest(destination), "size_bytes": destination.stat().st_size}
     if args.platform == "android":
         for suffix in (".tar.gz", ".tar.gz.sha256"):
-            name = "nelomai-0.2.20-amneziawg-android-source" + suffix
+            name = f"nelomai-{VERSION}-amneziawg-android-source" + suffix
             shutil.copyfile(args.draft / name, args.output / "shipping" / name)
     (args.output / "package-digests.json").write_text(json.dumps(dict(source_sha=args.source_sha,
         release_set_sha256=args.release_set_sha256, platform=args.platform, architecture=args.architecture,

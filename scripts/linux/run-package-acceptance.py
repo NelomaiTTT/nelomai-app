@@ -18,6 +18,12 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+_spec = importlib.util.spec_from_file_location(
+    "release_gates", Path(__file__).resolve().parents[1] / "release-candidate-gates.py")
+gates = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(gates)
+VERSION = gates.VERSION
+
 ISOLATED = Path("/opt/nelomai-acceptance")
 APP = Path("/usr/local/libexec/nelomai/common/AppDir")
 
@@ -70,7 +76,7 @@ def session(kind):
         return run(ISOLATED / "linux-runtime-acceptance", ISOLATED / "acceptance-resources",
                    ISOLATED / "inputs/public-key.raw", "http://127.0.0.1:56590")
     common = APP / "usr/bin/nelomai-app"
-    expected = APP / "usr/lib/Nelomai/runtime/engines/latest/0.2.20/nelomai-runtime"
+    expected = APP / f"usr/lib/Nelomai/runtime/engines/latest/{VERSION}/nelomai-runtime"
     with subprocess.Popen([str(common)]) as child:
         try:
             deadline = time.monotonic() + 30
@@ -92,7 +98,7 @@ def session(kind):
                 time.sleep(0.2)
             if engine is None or not str(engine[1]).startswith("/usr/local/libexec/nelomai/"):
                 raise RuntimeError("ordinary dispatcher did not execute its real installed engine")
-            source_engine = APP / "usr/lib/Nelomai/runtime/engines/latest/0.2.20/nelomai-unix-service"
+            source_engine = APP / f"usr/lib/Nelomai/runtime/engines/latest/{VERSION}/nelomai-unix-service"
             if digest(engine[1]) != digest(source_engine):
                 raise RuntimeError("ordinary installed engine bytes differ from final package")
             print(json.dumps(dict(scope="ordinary-installed-latest-startup", common_sha256=digest(common),
@@ -168,6 +174,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="nelomai-linux-acceptance-") as temporary:
         context = Path(temporary)
         shutil.copytree(ROOT / "scripts", context / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copyfile(ROOT / "package.json", context / "package.json")
         for source, name in ((ROOT / "target/debug/verify-runtime-manifest", "verify-runtime-manifest"),
                              (ROOT / "target/debug/examples/linux-runtime-acceptance", "linux-runtime-acceptance")):
             shutil.copy2(source, context / name)

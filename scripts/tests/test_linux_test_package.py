@@ -2,7 +2,7 @@
 import json
 import shutil
 import subprocess
-from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, module
+from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, module, VERSION
 
 
 class LinuxTestPackageTest(ArtifactFixture):
@@ -29,7 +29,7 @@ class LinuxTestPackageTest(ArtifactFixture):
         self.key.public_key().verify((staged / 'runtime/container-manifest-v1.sig').read_bytes(),
             b'nelomai-container-manifest-v1\0' + (staged / 'runtime/container-manifest-v1.json').read_bytes())
         for name in ('nelomai-runtime', 'nelomai-unix-service', 'amneziawg-go'):
-            self.assertEqual((staged / 'runtime/engines/latest/0.2.20' / name).read_bytes(),
+            self.assertEqual((staged / f'runtime/engines/latest/{VERSION}' / name).read_bytes(),
                 (self.payload / name).read_bytes())
         self.assertEqual((staged / 'dispatcher/1/nelomai-unix-service').read_bytes(),
             (self.payload / 'nelomai-unix-service').read_bytes())

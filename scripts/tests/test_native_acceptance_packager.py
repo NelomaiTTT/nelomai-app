@@ -13,7 +13,7 @@ import unittest
 import zipfile
 from unittest.mock import patch
 
-from scripts.tests.test_runtime_artifact import ArtifactFixture, ROOT, SOURCE, module
+from scripts.tests.test_runtime_artifact import ArtifactFixture, ROOT, SOURCE, module, VERSION
 from scripts.tests.test_android_runtime_collisions import native_tools
 import scripts.tests.test_runtime_release_set as release_set_fixture
 
@@ -28,7 +28,7 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
             (folder / "latest").mkdir()
             shutil.copyfile(self.public, folder / "draft-public-key.raw")
             shutil.copyfile(self.public, folder / "runtime-public-key.raw")
-            prefix = f"nelomai-runtime-0.2.20-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-{VERSION}-{platform}-{architecture}"
             for suffix in (".zip", ".manifest.json", ".manifest.sig"):
                 for slot in ("latest", "stable"):
                     shutil.copyfile(candidates / (prefix + suffix), folder / slot / (prefix + suffix))
@@ -43,11 +43,11 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
 
     def candidates(self, platform, architecture, payload, readelf=None):
         candidates = release_set_fixture.RuntimeReleaseSetTest.four_candidates(self)
-        module("build-runtime-manifest").package(payload, self.root / "native", "0.2.20", SOURCE,
+        module("build-runtime-manifest").package(payload, self.root / "native", VERSION, SOURCE,
             platform, architecture, self.keyfile, readelf)
         for path in (self.root / "native").iterdir():
             shutil.copyfile(path, candidates / path.name)
-        digest = module("build-runtime-release-set").build(candidates, self.root / "root", "0.2.20", SOURCE,
+        digest = module("build-runtime-release-set").build(candidates, self.root / "root", VERSION, SOURCE,
             self.keyfile, self.public)
         for path in (self.root / "root").iterdir():
             shutil.copyfile(path, candidates / path.name)

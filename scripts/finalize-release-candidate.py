@@ -18,6 +18,7 @@ spec = importlib.util.spec_from_file_location("builder", Path(__file__).with_nam
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 gates, verifier = builder.gates, builder.verifier
+VERSION = gates.VERSION
 
 
 def apk_payload(archive):
@@ -42,7 +43,7 @@ def main():
     identities = {}
     if args.output.exists() or args.work.exists():
         raise ValueError("immutable installer finalization output exists")
-    gates.verify_runtime_release(args.signed / "release", "0.2.20", args.source_sha, args.release_set_sha256, args.public_key)
+    gates.verify_runtime_release(args.signed / "release", VERSION, args.source_sha, args.release_set_sha256, args.public_key)
     args.work.mkdir(parents=True)
     environment = builder.updater_environment(args.mode, args.work, os.environ)
     cli = builder.ROOT / "node_modules/.bin/tauri"
@@ -76,23 +77,23 @@ def main():
             if len(matches) != 1 or (args.mode == "sign_candidate" and matches[0] != os.environ["ANDROID_SIGNER_SHA256"]):
                 raise ValueError("final APK signer differs from explicit release certificate pin")
             builder.script("collect-android-release-artifact.py", "--apk", destination, "--output-dir", final_inputs,
-                "--version", "0.2.20", "--signer-sha256", matches[0])
+                "--version", VERSION, "--signer-sha256", matches[0])
         else:
             before = verifier.digest(destination)
             builder.run(cli, "signer", "sign", destination, env=environment, capture=True)
             if verifier.digest(destination) != before:
                 raise ValueError("updater signing changed final installer bytes")
             builder.script("collect-release-artifact.py", "--search-root", args.work, "--output-dir", final_inputs,
-                "--version", "0.2.20", "--platform", platform, "--architecture", architecture,
+                "--version", VERSION, "--platform", platform, "--architecture", architecture,
                 "--package-kind", {"linux": "appimage", "macos": "app", "windows": "nsis"}[platform])
     environment["NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64"] = base64.b64encode(args.private_key.read_bytes()).decode()
     candidate = args.output / "candidate"
     builder.script("build-release-manifest.py", "--input-dir", final_inputs, "--output-dir", candidate,
-                   "--version", "0.2.20", env=environment)
+                   "--version", VERSION, env=environment)
     for path in (args.signed / "release").iterdir():
         shutil.copyfile(path, candidate / path.name)
     for suffix in (".tar.gz", ".tar.gz.sha256"):
-        name = "nelomai-0.2.20-amneziawg-android-source" + suffix
+        name = f"nelomai-{VERSION}-amneziawg-android-source" + suffix
         shutil.copyfile(args.packages / "android/shipping" / name, candidate / name)
     if {path.name for path in candidate.iterdir()} != gates.PUBLISH_ASSETS:
         raise ValueError("final candidate must match the exact ordinary shipping asset allowlist")

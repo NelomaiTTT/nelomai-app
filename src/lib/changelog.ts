@@ -30,6 +30,10 @@ export function defineChangelog(
 
 export const CHANGELOG = defineChangelog([
   {
+    version: "0.2.21",
+    items: ["Обновлена проверка безопасности защищённых соединений."],
+  },
+  {
     version: "0.2.20",
     items: [
       "Исправлена недоступная кнопка запуска VPN после обновления приложения.",

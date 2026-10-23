@@ -22,6 +22,8 @@ $WireGuardNtArchiveSha256 = "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc
 $AmneziaWgWindowsCommit = "575626d8f8aa5b64114cf378a08e54bf852d909b"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
+$releaseVersion = (& python (Join-Path $root "scripts/set-release-version.py") --check)
+if ($LASTEXITCODE -ne 0) { throw "Release version metadata is inconsistent" }
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $root "src-tauri/windows/runtime"
 }
@@ -166,7 +168,7 @@ if (-not (Test-Path -LiteralPath $ServiceExecutable -PathType Leaf)) {
     throw "Versioned Windows service executable is required: $ServiceExecutable"
 }
 Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $OutputDirectory "nelomai-windows-service.exe") -Force
-$engineDirectory = Join-Path $OutputDirectory "engines/latest/0.2.20"
+$engineDirectory = Join-Path $OutputDirectory "engines/latest/$releaseVersion"
 $dispatcherDirectory = Join-Path $OutputDirectory "dispatcher/1"
 New-Item -ItemType Directory -Force $engineDirectory, $dispatcherDirectory | Out-Null
 Get-ChildItem -LiteralPath $OutputDirectory -File | ForEach-Object {

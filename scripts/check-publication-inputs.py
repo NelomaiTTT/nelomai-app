@@ -8,12 +8,13 @@ import os
 spec = importlib.util.spec_from_file_location("gates", Path(__file__).with_name("release-candidate-gates.py"))
 gates = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gates)
+VERSION = gates.VERSION
 
 
 def select_candidate(repository, run_id, source_sha, version, fetch=gates.github_get):
     """Resolve a unique retained shipping artifact; re-runs are ordinary builds."""
     gates.full_source(source_sha)
-    if not str(run_id).isdigit() or version != "0.2.20":
+    if not str(run_id).isdigit() or version != VERSION:
         raise ValueError("invalid candidate run or version")
     endpoint = f"repos/{repository}/actions/runs/{run_id}"
     run = fetch(endpoint)
@@ -57,7 +58,7 @@ if __name__ == "__main__":
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--select", action="store_true")
     parser.add_argument("--repository")
-    parser.add_argument("--version", default="0.2.20")
+    parser.add_argument("--version", default=VERSION)
     parser.add_argument("--inventory-sha256")
     for name in ("source-sha", "run-id"):
         parser.add_argument("--" + name, required=True)

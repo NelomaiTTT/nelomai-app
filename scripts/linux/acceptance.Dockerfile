@@ -4,6 +4,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libayatana-appindicator3-1 librsvg2-2 libssl3t64 ca-certificates fonts-dejavu-core \
     procps util-linux libglib2.0-bin gsettings-desktop-schemas \
     && useradd --create-home acceptance
+COPY --chown=0:0 package.json /opt/nelomai-acceptance/package.json
 COPY --chown=0:0 scripts /opt/nelomai-acceptance/scripts
 COPY --chown=0:0 scripts/linux/check-runtime-webview.py /opt/nelomai-acceptance/check-runtime-webview.py
 COPY --chown=0:0 verify-runtime-manifest /opt/nelomai-acceptance/verify-runtime-manifest
