@@ -39,7 +39,7 @@ runs:
         python -m pip install "certifi==2026.10.19"
     - name: Update Rustup trust before toolchain downloads
       shell: bash
-      run: if command -v rustup >/dev/null; then rustup self update; fi
+      run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew upgrade rustup; else rustup self update; fi; fi
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: 1.88.0
