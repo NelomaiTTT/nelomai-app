@@ -94,3 +94,23 @@ Keychain stays with the existing common process and pinned certificate identity;
 no relaxed ACL, new credential daemon or Developer ID dependency. Continuity and
 actual dialog counts require VM evidence. Hosted CI executes shell fixture and
 Rust regressions without touching the user's Mac install or Keychain.
+
+## 0.4.x certificate incident acceptance (23 October)
+
+Before the next signed 0.4.x candidate, audit build and runtime TLS trust for the
+eMudhra/emSign incident. Source: https://discuss.python.org/t/109576
+User reference: https://x.com/L4UR3N7/status/2113291274664976774
+This is a required verification item, not a claim of remediation or compromise.
+
+- Python tooling minimums from the advisory: pip 26.2.2, certifi 2026.10.19;
+  uv >=0.13.4 and sigstore >=4.5.1 if used. Bootstrap pip using the advisory's
+  exact wheel SHA256, not an unverified upgrade through the affected trust store.
+- Check existing venvs, self-hosted runners and container CA bundles separately;
+  updating system roots alone does not remove pip's vendored roots.
+- client-api uses reqwest rustls-tls. Audit/update resolved webpki-roots and
+  rustls-webpki against upstream advisories, including updater TLS dependencies;
+  an OS certificate update alone is not proof the shipped binary is remediated.
+- Retain signed manifests, artifact hashes, updater signature checks and pinned
+  macOS common identity. Never disable TLS verification or trust arbitrary CAs.
+- Apply and verify changes within 0.4.x branches only; do not alter 0.3.x, HA,
+  production panel or host-wide trust stores as part of this recorded requirement.
