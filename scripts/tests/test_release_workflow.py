@@ -214,10 +214,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["contracts-python"].update(steps=[
                 step for step in jobs["contracts-python"]["steps"]
                 if step.get("name") != "Isolated contracts Rustup home"]),
-            lambda jobs: jobs["contracts-python"]["steps"][3].update(
+            lambda jobs: jobs["contracts-python"]["steps"][4].update(
                 run='echo "RUSTUP_HOME=/home/runner/.rustup" >> "$GITHUB_ENV"'),
             lambda jobs: jobs["contracts-python"]["steps"].append(
-                jobs["contracts-python"]["steps"].pop(3)),
+                jobs["contracts-python"]["steps"].pop(4)),
             lambda jobs: jobs["contracts-python"].update(env={"RUSTUP_HOME": "${{ runner.temp }}/nelomai-contracts-rustup"}),
             lambda jobs: jobs["windows-native"].update(**{"if": "github.event_name != 'workflow_dispatch'"}),
             lambda jobs: jobs["windows-native"].update(**{"runs-on": "nelomai-040-worker-host"}),

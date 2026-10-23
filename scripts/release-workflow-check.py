@@ -83,10 +83,10 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
         and all("RUSTUP_HOME" not in step.get("env", {}) for step in contracts["steps"]),
             "Contracts Python cannot override its isolated Rustup home through workflow/job/step env")
-    require(len(contracts["steps"]) == 8 and contracts["steps"][3] == {
+    require(len(contracts["steps"]) == 9 and contracts["steps"][4] == {
         "name": "Isolated contracts Rustup home",
         "run": 'echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"'}
-        and contracts["steps"][4] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
+        and contracts["steps"][5] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
             "Contracts Python must export its runner-temp Rustup home before installing the unchanged toolchain")
     require(build["runs-on"] ==
             "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' "
