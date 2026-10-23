@@ -8,6 +8,8 @@ from unittest.mock import patch
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SCRIPTS, module
 
 
+VERSION = module("release-candidate-gates").VERSION
+
 class ReleasePlatformTest(ArtifactFixture):
     def test_desktop_draft_uses_current_version_for_archive_and_signed_manifest(self):
         builder = module("build-release-platform")
@@ -37,12 +39,12 @@ class ReleasePlatformTest(ArtifactFixture):
             ]}) if command[:2] == ("cargo", "metadata") else "")
         with patch.object(builder, "ROOT", self.root), patch.object(builder, "run", side_effect=compiled):
             manifest = builder.desktop(args, work, {})
-        self.assertEqual(manifest["runtime_version"], "0.3.7")
+        self.assertEqual(manifest["runtime_version"], VERSION)
         for slot in ("stable", "latest"):
             self.assertEqual(sorted(path.name for path in (output / slot).iterdir()), [
-                "nelomai-runtime-0.3.7-linux-x86_64.manifest.json",
-                "nelomai-runtime-0.3.7-linux-x86_64.manifest.sig",
-                "nelomai-runtime-0.3.7-linux-x86_64.zip",
+                f"nelomai-runtime-{VERSION}-linux-x86_64.manifest.json",
+                f"nelomai-runtime-{VERSION}-linux-x86_64.manifest.sig",
+                f"nelomai-runtime-{VERSION}-linux-x86_64.zip",
             ])
 
     def test_build_capture_decodes_utf8_independently_of_windows_locale(self):

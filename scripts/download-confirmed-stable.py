@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Download the pinned published stable; authenticate before exposing output."""
+"""Download the pinned stable candidate; authenticate before exposing output."""
 import argparse
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,10 +16,20 @@ def download(output, public_key):
     if output.exists() or output.is_symlink():
         raise ValueError("immutable confirmed stable output exists")
     output.parent.mkdir(parents=True, exist_ok=True)
+    repository = "NelomaiTTT/nelomai-app"
+    run = json.loads(subprocess.run(
+        ["gh", "api", f"repos/{repository}/actions/runs/{gates.STABLE_RUN_ID}"],
+        check=True, capture_output=True, text=True,
+    ).stdout)
+    if (str(run.get("id")) != gates.STABLE_RUN_ID
+            or run.get("head_sha") != gates.STABLE_SOURCE
+            or run.get("path") != ".github/workflows/release.yml"
+            or run.get("status") != "completed" or run.get("conclusion") != "success"):
+        raise ValueError("pinned stable candidate is not a successful build of the expected source")
     with tempfile.TemporaryDirectory(prefix=".confirmed-stable-", dir=output.parent) as temporary:
         staged = Path(temporary) / "release"
-        subprocess.run(["gh", "release", "download", "v" + gates.STABLE_VERSION,
-            "--repo", "NelomaiTTT/nelomai-app", "--pattern", "nelomai-runtime-*", "--dir", str(staged)], check=True)
+        subprocess.run(["gh", "run", "download", gates.STABLE_RUN_ID,
+            "--repo", repository, "--name", "signed-runtime", "--dir", temporary], check=True)
         gates.verify_runtime_release(staged, gates.STABLE_VERSION, gates.STABLE_SOURCE,
                                      gates.STABLE_ROOT_SHA256, public_key)
         staged.rename(output)

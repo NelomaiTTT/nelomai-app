@@ -22,10 +22,11 @@ import tempfile
 import zipfile
 
 BASE = "632cc4b40872c559a75e5d7104b72bae17ac91c3"
-VERSION = "0.3.7"
-STABLE_VERSION = "0.2.20"
-STABLE_SOURCE = "ae13a022d91a68d25f441a586ac4e9dc363f1952"
-STABLE_ROOT_SHA256 = "09ec87f51f0f0b7dc6203e4a28026216fa7d5aaef43e1b14400ddc83eb2ee984"
+VERSION = json.loads((Path(__file__).resolve().parents[1] / "package.json").read_text())["version"]
+STABLE_VERSION = "0.2.21"
+STABLE_SOURCE = "1e0ec39711111333d0c5cdcd5298f453f9b5cfa9"
+STABLE_ROOT_SHA256 = "007a1d823e7f113502ebfa9f74d712c9c13b1716a5b906f60dca157db1730bb6"
+STABLE_RUN_ID = "39945653209"
 SIGNING_ENVIRONMENT = "release-candidate-signing"
 FINALIZATION_ENVIRONMENT = "release-candidate-finalization"
 ACCEPTANCE_ENVIRONMENT = "release-candidate-acceptance"
