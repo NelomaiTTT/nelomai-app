@@ -72,6 +72,8 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
             allowed = {"name", "uses", "with", "run", "id", "env", "timeout-minutes"}
             if name == "windows-native" and step is job["steps"][-1] and step.get("uses") == "actions/upload-artifact@v4":
                 allowed.add("if")
+            if name == "windows-build" and step is job["steps"][1]:
+                allowed.add("shell")  # Exact bootstrap command/shell is checked below.
             require(set(step) <= allowed,
                     f"{name} steps must execute unconditionally and fail normally")
     for name in ("frontend", "rust", "android-plugin", "windows-build", "macos", "contracts-python"):
@@ -83,10 +85,10 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
         and all("RUSTUP_HOME" not in step.get("env", {}) for step in contracts["steps"]),
             "Contracts Python cannot override its isolated Rustup home through workflow/job/step env")
-    require(len(contracts["steps"]) == 9 and contracts["steps"][4] == {
+    require(len(contracts["steps"]) == 10 and contracts["steps"][4] == {
         "name": "Isolated contracts Rustup home",
         "run": 'echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"'}
-        and contracts["steps"][5] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
+        and contracts["steps"][6] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
             "Contracts Python must export its runner-temp Rustup home before installing the unchanged toolchain")
     require(build["runs-on"] ==
             "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' "
@@ -124,10 +126,13 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
             and set(selected) == set(cases), "Native matrix must cover every actual factory case exactly once")
     checkout = {"uses": "actions/checkout@v4", "with": {"ref": "${{ github.sha }}", "submodules": "recursive"}}
     require(build["steps"][0] == native["steps"][0] == checkout, "Producer and consumer checkouts must use exact current SHA")
-    require(build["steps"][1] == {"uses": "dtolnay/rust-toolchain@master", "with": {
+    require(build["steps"][1] == {"name": "Update Rustup trust before toolchain downloads",
+        "shell": "bash", "run": "if command -v rustup >/dev/null; then rustup self update; fi"},
+        "Rustup trust must be updated before downloading the compiler")
+    require(build["steps"][2] == {"uses": "dtolnay/rust-toolchain@master", "with": {
         "toolchain": "1.88.0", "components": "rustfmt, clippy"}}, "Common build must retain the audited toolchain")
-    require(build["steps"][2] == {"uses": "actions/setup-go@v5", "with": {
-        "go-version": "1.25.0", "cache-dependency-path": "workers/windows-go/go.sum"}},
+    require(build["steps"][3] == {"uses": "actions/setup-go@v5", "with": {
+        "go-version": "1.26.10", "cache-dependency-path": "workers/windows-go/go.sum"}},
         "Worker build must retain pinned Go and checksum-locked module cache")
     build_programs = [
         'cargo check -p nelomai-windows-service --all-targets',
@@ -172,10 +177,10 @@ python scripts/windows/carrier-factory-artifact.py create `
 --output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     ]
-    require(len(build["steps"]) == 13 and [program(step) for step in build["steps"][3:-1]] == build_programs,
+    require(len(build["steps"]) == 14 and [program(step) for step in build["steps"][4:-1]] == build_programs,
             "Common build must run ordinary/security/TxR gates before factory runtime preparation and retain all strict gates before artifact assembly")
-    require(all("env" not in step for step in build["steps"][:11]), "Common gates cannot override their source/runtime environment")
-    require(build["steps"][8].get("timeout-minutes") == build["steps"][9].get("timeout-minutes") == 2,
+    require(all("env" not in step for step in build["steps"][:12]), "Common gates cannot override their source/runtime environment")
+    require(build["steps"][9].get("timeout-minutes") == build["steps"][10].get("timeout-minutes") == 2,
             "Native readonly and isolated TxR gate budgets must remain unchanged")
     artifact = build["steps"][-2]
     require(artifact.get("id") == "artifact" and artifact.get("env") == {

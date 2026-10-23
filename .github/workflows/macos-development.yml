@@ -49,6 +49,9 @@ jobs:
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || fail 'Source checkout is not clean'
           [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || fail 'Expected native macOS arm64'
           [[ "$(id -u)" != 0 ]] || fail 'Development checks must run without root'
+      - name: Update Rustup trust before toolchain downloads
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup self update; fi
       - uses: dtolnay/rust-toolchain@master
         id: rust
         with:

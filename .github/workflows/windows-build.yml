@@ -72,13 +72,16 @@ jobs:
         with:
           node-version-file: .nvmrc
           cache: npm
+      - name: Update Rustup trust before toolchain downloads
+        shell: bash
+        run: if command -v rustup >/dev/null; then rustup self update; fi
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
           targets: x86_64-pc-windows-msvc
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25.0'
+          go-version: '1.26.10'
       - run: npm ci
       - name: Проверить интерфейс приложения
         run: npm test
