@@ -124,6 +124,13 @@ impl LocalAuthStop for NativeStop {
             .stop()
             .await
             .map_err(|_| BrokerError::RecoveryRequired)?;
+        // Scoped pair cleanup leaves a reusable engine. Common's macOS stop
+        // receipt also requires the dispatcher to retire that engine.
+        #[cfg(target_os = "macos")]
+        self.tunnel
+            .stop_if_unowned()
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)?;
         operation.observed_helper_stop = true;
         Ok(())
     }
@@ -183,7 +190,14 @@ impl CommonState {
                     .tunnel
                     .stop()
                     .await
-                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))
+                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))?;
+                #[cfg(target_os = "macos")]
+                self.stop
+                    .tunnel
+                    .stop_if_unowned()
+                    .await
+                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))?;
+                Ok(())
             },
         )
         .await;
@@ -609,7 +623,10 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
 }
 async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>> {
     let request: Request = serde_json::from_slice(body)?;
-    if matches!(request, Request::Start { .. }) {
+    if matches!(request, Request::Start { .. })
+        || cfg!(target_os = "macos")
+            && matches!(&request, Request::Redundant { request, .. } if request.is_start())
+    {
         state
             .host
             .before_native_tunnel_start()
@@ -617,7 +634,13 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
             .map_err(|_| io::Error::other("common start rejected"))?;
     }
     let mut operation = state.stop.operation.lock().await;
-    if matches!(request, Request::Start { .. } | Request::RebindUdp { .. }) {
+    // A bound macOS capability query may start an idle engine, so it must
+    // invalidate the same stop receipt and respect the update fence.
+    if matches!(request, Request::Start { .. } | Request::RebindUdp { .. })
+        || cfg!(target_os = "macos")
+            && (matches!(request, Request::Version { .. })
+                || matches!(&request, Request::Redundant { request, .. } if request.is_start()))
+    {
         operation.begin_start(
             state
                 .host
@@ -933,7 +956,156 @@ fn pre_auth_handoff() -> io::Result<bool> {
 mod lifecycle_tests {
     use super::*;
     #[tokio::test]
-    async fn queued_native_start_is_checked_after_the_inflight_operation_releases() {
+    async fn common_stop_receipt_and_queued_native_start_require_completed_native_operations() {
+        #[cfg(target_os = "macos")]
+        for fault in [
+            "unbound",
+            "pending",
+            "scoped_error",
+            "stale_scope",
+            "final_error",
+            "none",
+        ] {
+            use nelomai_client_tunnel::redundancy::{
+                protocol::Snapshot,
+                session::{SessionPhase, SessionState},
+                SessionScope, Slot,
+            };
+            use nelomai_contracts::{dispatcher as d, RuntimeSlot};
+            use nelomai_unix_service::{Response, ServiceTunnelState};
+            use std::{
+                io::Write,
+                os::unix::net::{UnixListener, UnixStream},
+            };
+
+            let root = tempfile::tempdir().unwrap();
+            let paths = [
+                root.path().join("lifecycle.sock"),
+                root.path().join("private.sock"),
+            ];
+            let identity = d::EngineIdentity {
+                slot: RuntimeSlot::Latest,
+                runtime_version: "test".into(),
+                runtime_contract_version: 1,
+                container_version: "test".into(),
+                manifest_sha256: "ab".repeat(32),
+            };
+            let scope = SessionScope {
+                runtime: RuntimeSlot::Latest,
+                runtime_generation: 10,
+                session_id: "11111111-1111-4111-8111-111111111111".into(),
+                connection_generation: 3,
+            };
+            let mut native = Snapshot {
+                session: SessionState::new(scope, Slot::A, 1, 1).unwrap().snapshot(),
+                leases: [None, None],
+                current_leases: [None, None],
+                primary_ready: false,
+                standby_ready: false,
+                standby_failed: false,
+                stalled: false,
+                cleanup_pending: false,
+                retirement_pending: false,
+                warm_stop_v1: false,
+            };
+            native.session.phase = SessionPhase::Stopped;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let done = Arc::new(AtomicBool::new(false));
+            let mut threads = Vec::new();
+            for (index, path) in paths.iter().enumerate() {
+                let listener = UnixListener::bind(path).unwrap();
+                let calls = calls.clone();
+                let done = done.clone();
+                let identity = identity.clone();
+                let native = native.clone();
+                threads.push(std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let mut stream = stream.unwrap();
+                        stream
+                            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                            .unwrap();
+                        let input = d::read_frame(&mut stream, d::MAX_ENGINE_FRAME).unwrap();
+                        let value: serde_json::Value = serde_json::from_slice(
+                            d::frame_body(&input, d::MAX_ENGINE_FRAME).unwrap(),
+                        )
+                        .unwrap();
+                        let output = if index == 0 {
+                            let label = value["command"].as_str().unwrap();
+                            calls.lock().unwrap().push(format!("dispatcher:{label}"));
+                            let reply = if label == "stop" && fault == "final_error" {
+                                d::DispatcherResponse::failure()
+                            } else {
+                                d::DispatcherResponse::success(identity.clone(), label != "stop")
+                            };
+                            d::encode_frame(&reply).unwrap()
+                        } else {
+                            let label = value["request"]["action"]
+                                .as_str()
+                                .or_else(|| value["command"].as_str())
+                                .unwrap();
+                            calls.lock().unwrap().push(format!("engine:{label}"));
+                            let mut reply = Response::success(Some(ServiceTunnelState::Stopped));
+                            let mut snapshot = native.clone();
+                            if label == "stop" {
+                                if fault == "scoped_error" {
+                                    reply = Response::failure("scoped_stop_failed");
+                                } else if fault == "stale_scope" {
+                                    snapshot.session.scope.connection_generation += 1;
+                                } else if fault == "pending" {
+                                    snapshot.cleanup_pending = true;
+                                }
+                            }
+                            reply.redundancy = Some(snapshot);
+                            nelomai_unix_service::encode_response(&reply).unwrap()
+                        };
+                        stream.write_all(&output).unwrap();
+                    }
+                }));
+            }
+            let binding = d::CommonEngineBinding::default();
+            if fault != "unbound" {
+                binding.bind(identity).unwrap();
+            }
+            let stop = NativeStop {
+                child: Mutex::new(None),
+                exit_owner: Default::default(),
+                tunnel: Arc::new(nelomai_unix_service::UnixTunnelController::new(
+                    nelomai_unix_service::UnixSocketTransport::with_dispatcher(
+                        &paths[1], &paths[0],
+                    )
+                    .for_common(binding),
+                )),
+                operation: tokio::sync::Mutex::new(NativeOperationState {
+                    observed_helper_stop: true,
+                    ..Default::default()
+                }),
+            };
+            let result = stop.stop_local().await;
+            done.store(true, Ordering::Release);
+            for path in paths {
+                let _ = UnixStream::connect(path);
+            }
+            for thread in threads {
+                thread.join().unwrap();
+            }
+            assert_eq!(result.is_ok(), fault == "none", "{fault}");
+            assert_eq!(
+                stop.operation.lock().await.observed_helper_stop,
+                fault == "none",
+                "{fault}"
+            );
+            let mut expected = vec!["dispatcher:version", "engine:status"];
+            if fault != "unbound" {
+                expected.extend(["dispatcher:version", "engine:stop"]);
+                if fault == "none" || fault == "final_error" {
+                    expected.extend(["dispatcher:version", "dispatcher:stop"]);
+                }
+            }
+            assert_eq!(*calls.lock().unwrap(), expected, "{fault}");
+        }
         let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState::default()));
         let pending = Arc::new(AtomicBool::new(false));
         let inflight = operation.lock().await;
