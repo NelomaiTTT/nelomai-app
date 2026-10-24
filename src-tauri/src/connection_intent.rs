@@ -26,7 +26,10 @@ use nelomai_contracts::{
     ConnectionIntentCapability, LeaseStatus,
 };
 use serde::Serialize;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{Mutex, Notify};
@@ -678,11 +681,19 @@ impl DesktopConnectionIntent {
             )
         };
         if let Some(initial_preflight) = initial_preflight {
-            let (start_mode, resolved_options) =
-                match self.resolve_initial_desktop_start(&initial_preflight).await {
-                    Ok(resolved) => resolved,
-                    Err(error) => return self.complete_error(generation, error).await,
-                };
+            let resolve_started = Instant::now();
+            let resolved = self.resolve_initial_desktop_start(&initial_preflight).await;
+            self.diagnostics.record_timed_named(
+                "connection.initial_desktop_resolve",
+                None,
+                None,
+                None,
+                resolve_started.elapsed(),
+            );
+            let (start_mode, resolved_options) = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => return self.complete_error(generation, error).await,
+            };
             {
                 let mut state = self.state.lock().await;
                 if !attempt_is_current_after_async_boundary(&mut state.coordinator, generation) {
@@ -705,9 +716,17 @@ impl DesktopConnectionIntent {
                     options = resolved_options;
                 }
             }
+            let preflight_started = Instant::now();
             let preflight = self
                 .run_initial_desktop_preflight(&options, &initial_preflight, reserve_requested)
                 .await;
+            self.diagnostics.record_timed_named(
+                "connection.initial_desktop_preflight",
+                None,
+                None,
+                None,
+                preflight_started.elapsed(),
+            );
             // An explicit eligible reserve request cannot fall through to an
             // ordinary Start merely because an old capability chose Legacy.
             let start_mode = if desktop_reserve_eligible(&options, reserve_requested) {
