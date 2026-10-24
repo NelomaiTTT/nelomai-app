@@ -327,7 +327,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             let response = match self.api.report_redundant_role(&access, &request).await {
                 Ok(response) => response,
                 // Retry on the next coordinator tick, revalidating its guards.
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 Err(CoreApiError::Retryable) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
@@ -907,7 +907,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 return Err(CoreError::Tunnel("redundancy_primary_stopped".into()));
             }
             if snapshot.primary_ready {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 self.api.reset_transport()?;
                 return Ok(());
             }

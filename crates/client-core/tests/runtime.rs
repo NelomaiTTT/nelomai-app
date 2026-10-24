@@ -2097,7 +2097,7 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
         assert_eq!(core.state().await.phase, Phase::Connected);
         assert_eq!(
             api.transport_resets.load(Ordering::SeqCst),
-            usize::from(cfg!(target_os = "linux"))
+            usize::from(cfg!(any(target_os = "linux", target_os = "macos")))
         );
         assert_eq!(
             tunnel.commands.lock().unwrap().as_slice(),
@@ -2144,7 +2144,7 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
             api.start_requests.lock().unwrap()[0].reserve_enabled,
             Some(true)
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // A retryable failure leaves the initial report pending for the
             // next coordinator tick, without authorizing reserve work.
@@ -2208,7 +2208,7 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
         core.desktop_redundancy_tick(Vec::new()).await.unwrap();
         assert_eq!(
             api.transport_resets.load(Ordering::SeqCst),
-            usize::from(cfg!(target_os = "linux")),
+            usize::from(cfg!(any(target_os = "linux", target_os = "macos"))),
             "primary reporting must reuse the transport reset after native readiness"
         );
         assert!(
