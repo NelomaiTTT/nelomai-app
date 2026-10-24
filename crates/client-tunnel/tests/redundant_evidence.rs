@@ -64,7 +64,7 @@ fn no_transmit_growth_or_missing_baseline_cannot_corroborate_dns_failure() {
 }
 
 #[test]
-fn receive_progress_clears_urgent_evidence_and_fences_inflight_completion() {
+fn receive_progress_clears_urgent_evidence_and_fences_failed_completion() {
     let mut e = ProbeEvidence::new(Slot::A, 0);
     complete(&mut e, 0, 0, 0, false);
     let t = ticket(Slot::A, 2000);
@@ -75,6 +75,104 @@ fn receive_progress_clears_urgent_evidence_and_fences_inflight_completion() {
     assert!(!o.probe_failed && !o.independent_failure_signal);
     assert_eq!(o.soft_failure_started_at_ms, None);
     assert_eq!(o.corroborated_probe_failures, 0);
+}
+
+#[test]
+fn standby_successes_reach_ready_regardless_of_receive_sample_order() {
+    for progress_at in ["before_completion", "completion", "after_completion"] {
+        let mut schedule = ProbeSchedule::new(Slot::A, 0);
+        schedule.set_standby_available(true);
+        let mut e = ProbeEvidence::new(Slot::B, 0);
+        let initial = schedule.poll(0);
+        assert!(schedule.complete(initial.started[0], true, 300));
+        let initial = initial.started[1];
+        e.probe_started(initial, metrics(0, 0));
+        assert!(schedule.complete(initial, false, 300));
+        e.probe_finished(initial, false, 300, metrics(1, 0));
+
+        for (at, successes) in [(7000, 1), (12300, 2), (17600, 3)] {
+            let batch = schedule.poll(at);
+            assert!(schedule.complete(batch.started[0], true, at + 300));
+            let t = batch
+                .started
+                .into_iter()
+                .find(|t| t.slot() == Slot::B)
+                .expect("standby warmup probe");
+            e.probe_started(t, metrics(successes, successes - 1));
+            if progress_at == "before_completion" {
+                e.sample(metrics(successes + 1, successes), at + 200);
+            }
+            let rx = if progress_at == "after_completion" {
+                successes - 1
+            } else {
+                successes
+            };
+            assert!(schedule.complete(t, true, at + 300));
+            e.probe_finished(t, true, at + 300, metrics(successes + 1, rx));
+            e.sample(metrics(successes + 1, successes), at + 400);
+            let o = e.observation(false, at + 400, Some(at));
+            assert_eq!(
+                o.consecutive_probe_successes, successes as u32,
+                "{progress_at}"
+            );
+            assert!(!o.probe_failed && !o.independent_failure_signal);
+            assert_eq!(o.standby_probe_state, StandbyProbeState::Succeeded);
+        }
+        assert_eq!(
+            e.observation(false, 18000, None).health,
+            BackendHealth::Ready
+        );
+        assert!(!schedule
+            .poll(32899)
+            .started
+            .iter()
+            .any(|t| t.slot() == Slot::B));
+    }
+}
+
+#[test]
+fn receive_progress_at_urgent_expiry_cannot_rescue_inflight_success() {
+    for sample_before_completion in [false, true] {
+        let mut e = ProbeEvidence::new(Slot::A, 0);
+        complete(&mut e, 0, 0, 0, false);
+        let t = ticket(Slot::A, 8000);
+        e.probe_started(t, metrics(1, 0));
+        if sample_before_completion {
+            e.sample(metrics(2, 1), 8100);
+        }
+        e.probe_finished(t, true, 8100, metrics(2, 1));
+        let o = e.observation(false, 8100, Some(8000));
+        assert_eq!(o.consecutive_probe_successes, 0);
+        assert_eq!(o.standby_probe_state, StandbyProbeState::Pending);
+    }
+}
+
+#[test]
+fn receive_progress_cannot_rescue_invalidated_success() {
+    for invalidation in ["cancel", "epoch_reset", "counter_reset", "deadline"] {
+        let mut e = ProbeEvidence::new(Slot::A, 0);
+        complete(&mut e, 0, 0, 0, false);
+        let t = ticket(Slot::A, 2000);
+        e.probe_started(t, metrics(1, 0));
+        e.sample(metrics(2, 1), 2100);
+        match invalidation {
+            "cancel" => e.probe_cancelled(t),
+            "epoch_reset" => e.reset(2200),
+            "counter_reset" => e.sample(metrics(0, 1), 2200),
+            "deadline" => {}
+            _ => unreachable!(),
+        }
+        let now = if invalidation == "deadline" {
+            4000
+        } else {
+            2300
+        };
+        e.probe_finished(t, true, now, metrics(3, 1));
+        let o = e.observation(false, now, Some(2000));
+        assert_eq!(o.consecutive_probe_successes, 0, "{invalidation}");
+        assert_eq!(o.standby_probe_state, StandbyProbeState::Pending);
+        assert!(!o.probe_failed && !o.independent_failure_signal);
+    }
 }
 
 #[test]
