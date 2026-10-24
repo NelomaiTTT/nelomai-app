@@ -2651,7 +2651,7 @@ async fn desktop_promotion_reports_role_through_a_fresh_linux_transport() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn desktop_cold_recovery_negotiates_async_cleanup_only_for_a_reported_linux_pair() {
+async fn desktop_cold_recovery_negotiates_async_cleanup_only_for_a_reported_linux_or_macos_pair() {
     for (primary_reported, async_stop_v1) in [(true, true), (true, false), (false, true)] {
         let (core, api, store, tunnel, _) = missing_desktop_reserve().await;
         core.finish_start_attempt();
@@ -2679,7 +2679,9 @@ async fn desktop_cold_recovery_negotiates_async_cleanup_only_for_a_reported_linu
             .stop
             .as_ref()
             .unwrap();
-        let expected_async = cfg!(target_os = "linux") && primary_reported && async_stop_v1;
+        let expected_async = cfg!(any(target_os = "linux", target_os = "macos"))
+            && primary_reported
+            && async_stop_v1;
         assert_eq!(stop.background_cleanup, expected_async);
         assert!(!stop.retain_active_peer);
         assert!(api.redundant_stop_requests.lock().unwrap().is_empty());
@@ -3450,7 +3452,12 @@ async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
             assert!(frozen.retain_active_peer);
             assert_eq!(
                 frozen.background_cleanup,
-                async_stop_v1 && cfg!(any(target_os = "windows", target_os = "linux"))
+                async_stop_v1
+                    && cfg!(any(
+                        target_os = "windows",
+                        target_os = "linux",
+                        target_os = "macos"
+                    ))
             );
             assert_eq!(core.state().await.connection.unwrap().lease_id, last_active);
             assert!(core.local_stop_pending_cleanup().await);
@@ -3474,7 +3481,9 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
         (false, true, false),
         (false, false, true),
     ] {
-        let expected_async = cfg!(target_os = "linux") && primary_reported && async_stop_v1;
+        let expected_async = cfg!(any(target_os = "linux", target_os = "macos"))
+            && primary_reported
+            && async_stop_v1;
         let api = Arc::new(MockApi::new(0));
         api.redundant_start.store(true, Ordering::SeqCst);
         let tunnel = Arc::new(DesktopPairTunnel::default());
@@ -11703,8 +11712,8 @@ impl support::TestAuthApi for MockApi {
     }
 }
 
-// Exercise the real journal/replay path on every host without changing native
-// Windows-only negotiation. This is an already-frozen Windows journal.
+// Exercise negotiated desktop Stop on supported hosts, and the already-frozen
+// journal/replay path on other hosts.
 async fn frozen_async_desktop_stop() -> (
     PairCore,
     Arc<MockApi>,
@@ -11714,10 +11723,29 @@ async fn frozen_async_desktop_stop() -> (
 ) {
     let (core, api, store, tunnel, _) = missing_desktop_reserve().await;
     core.finish_start_attempt();
+    store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_mut()
+        .unwrap()
+        .session
+        .async_stop_v1 = true;
     core.stop_locally().await.unwrap();
     let mut journal = serde_json::to_value(store.value.lock().unwrap().clone()).unwrap();
-    journal["desktop_redundancy"]["session"]["async_stop_v1"] = true.into();
-    journal["desktop_redundancy"]["stop"]["background_cleanup"] = true.into();
+    if cfg!(any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos"
+    )) {
+        assert_eq!(
+            journal["desktop_redundancy"]["stop"]["background_cleanup"],
+            true
+        );
+    } else {
+        journal["desktop_redundancy"]["stop"]["background_cleanup"] = true.into();
+    }
     *store.value.lock().unwrap() =
         serde_json::from_value(journal).expect("load negotiated Stop journal");
     let pending = store

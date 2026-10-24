@@ -680,7 +680,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                         // server Stop accepts a historical member of this exact
                         // session; never infer a WARM role from protected metadata.
                         nelomai_client_storage::StoredDesktopRedundantStop {
-                            background_cleanup: cfg!(target_os = "linux")
+                            background_cleanup: cfg!(any(target_os = "linux", target_os = "macos"))
                                 && pair.primary_reported
                                 && pair.session.async_stop_v1,
                             operation_id: Uuid::new_v4().to_string(),
