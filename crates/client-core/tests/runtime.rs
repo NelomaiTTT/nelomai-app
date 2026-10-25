@@ -2594,7 +2594,7 @@ async fn missing_desktop_reserve() -> (
 }
 
 #[tokio::test(start_paused = true)]
-async fn desktop_promotion_reports_role_through_a_fresh_linux_transport() {
+async fn desktop_promotion_reports_role_through_a_fresh_linux_or_macos_transport() {
     let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
     core.finish_start_attempt();
     {
@@ -2621,7 +2621,7 @@ async fn desktop_promotion_reports_role_through_a_fresh_linux_transport() {
         .push_back(response);
     let resets_before = api.transport_resets.load(Ordering::SeqCst);
     api.desktop_role_required_transport_resets.store(
-        resets_before + usize::from(cfg!(target_os = "linux")),
+        resets_before + usize::from(cfg!(any(target_os = "linux", target_os = "macos"))),
         Ordering::SeqCst,
     );
     let confirmed = core
@@ -2634,7 +2634,7 @@ async fn desktop_promotion_reports_role_through_a_fresh_linux_transport() {
     assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         api.transport_resets.load(Ordering::SeqCst),
-        resets_before + usize::from(cfg!(target_os = "linux"))
+        resets_before + usize::from(cfg!(any(target_os = "linux", target_os = "macos")))
     );
     assert_eq!(
         store

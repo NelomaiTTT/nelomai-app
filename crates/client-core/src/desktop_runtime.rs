@@ -375,7 +375,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             let request = desktop_redundancy::role_request(&snapshot)?;
             // Native promotion can change the external route while preserving
             // the VIP. Pooled connections still belong to the previous route.
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             self.api.reset_transport()?;
             let response = self.api.report_redundant_role(&access, &request).await?;
             let _writer = self.connection_gate.lock().await;
