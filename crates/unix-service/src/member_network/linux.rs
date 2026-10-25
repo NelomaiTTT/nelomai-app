@@ -168,7 +168,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         scope: RouteScope,
         retained: bool,
     ) -> io::Result<Option<NetworkValue>> {
-        let table = self.table(scope)?;
+        self.table(scope)?;
         let text = self.commands.ip(&[
             "-j".into(),
             "-N".into(),
@@ -180,7 +180,17 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
             "exact".into(),
             destination.to_string(),
         ])?;
-        let rows = rows(&text)?;
+        self.route_from_rows(destination, scope, retained, &rows(&text)?, true)
+    }
+    fn route_from_rows(
+        &self,
+        destination: IpNet,
+        scope: RouteScope,
+        retained: bool,
+        rows: &[Value],
+        exact: bool,
+    ) -> io::Result<Option<NetworkValue>> {
+        let table = self.table(scope)?;
         let mut result = None;
         for row in rows {
             let row = row.as_object().ok_or_else(invalid)?;
@@ -195,7 +205,6 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
             if actual_table != table {
                 continue;
             }
-            // Query was already exact. Unexpected destinations are not absence.
             let dst = string(row, "dst")?;
             let actual = if dst == "default" {
                 if destination.addr().is_ipv4() {
@@ -211,7 +220,12 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                     .map_err(|_| invalid())?
             };
             if actual != destination {
-                return Err(invalid());
+                // Exact queries must not disguise an unexpected row as absence.
+                // A grouped dump legitimately includes unrelated destinations.
+                if exact {
+                    return Err(invalid());
+                }
+                continue;
             }
             let mut accepted = vec![
                 "dst", "dev", "gateway", "protocol", "scope", "metric", "flags", "type", "table",
@@ -574,6 +588,42 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
                 "pair_dns_not_connected",
             )),
         }
+    }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        // These dumps belong only to this read-only call. In particular, CAS
+        // and each post-write read continue to issue fresh exact native reads.
+        let mut snapshots: [Option<Vec<Value>>; 2] = [None, None];
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = if let ResourceKey::Route(destination, scope) = key {
+                self.table(*scope)?;
+                let ipv6 = destination.addr().is_ipv6();
+                let snapshot = &mut snapshots[usize::from(ipv6)];
+                if snapshot.is_none() {
+                    let text = self.commands.ip(&[
+                        "-j".into(),
+                        "-N".into(),
+                        family(ipv6).into(),
+                        "route".into(),
+                        "show".into(),
+                        "table".into(),
+                        "all".into(),
+                    ])?;
+                    *snapshot = Some(rows(&text)?);
+                }
+                self.route_from_rows(
+                    *destination,
+                    *scope,
+                    false,
+                    snapshot.as_ref().ok_or_else(invalid)?,
+                    false,
+                )?
+            } else {
+                self.read(key)?
+            };
+            values.push(value);
+        }
+        Ok(values)
     }
     fn compare_exchange(
         &mut self,

@@ -641,3 +641,103 @@ fn restart_then_stop_cleans_partial_switch_without_recreating_a_dead_interface()
     assert!(owner.system_mut().values.is_empty());
     assert!(!owner.cleanup_pending());
 }
+
+#[derive(Default)]
+struct GroupedSystem {
+    inner: System,
+    batches: Vec<Vec<ResourceKey>>,
+    truncate: bool,
+    replace_after_batch: Option<NetworkValue>,
+}
+impl NetworkSystem for GroupedSystem {
+    fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        self.inner.read(key)
+    }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        self.batches.push(keys.to_vec());
+        let mut values: Vec<_> = keys
+            .iter()
+            .map(|key| self.inner.values.get(&format!("{key:?}")).cloned())
+            .collect();
+        if self.truncate {
+            values.pop();
+        }
+        if let Some(value) = self.replace_after_batch.take() {
+            self.inner
+                .values
+                .insert(format!("{:?}", value.key()), value);
+        }
+        Ok(values)
+    }
+    fn compare_exchange(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+    ) -> io::Result<()> {
+        self.inner.compare_exchange(key, before, after)
+    }
+}
+
+#[test]
+fn grouped_owner_reads_only_preflight_and_reconciliation_together() {
+    let a = route("9.9.9.9/32", 10);
+    let b = route("8.8.8.8/32", 10);
+    let keys = vec![a.key(), b.key()];
+    let mut owner = NetworkOwner::fresh(GroupedSystem::default(), Journal::default());
+    owner.prepare(vec![a.clone(), b.clone()]).unwrap();
+    assert_eq!(owner.system_mut().batches, vec![keys.clone()]);
+    // Each write still has its own immediate readback.
+    assert_eq!(owner.system_mut().inner.reads, keys);
+    owner.prepare(vec![a, b]).unwrap();
+    assert_eq!(owner.system_mut().batches.len(), 2);
+    assert_eq!(owner.system_mut().batches[1].len(), 2);
+    assert_eq!(owner.system_mut().inner.reads.len(), 2);
+    assert_eq!(owner.system_mut().inner.writes, 2);
+}
+
+#[test]
+fn grouped_owner_refuses_incomplete_results_before_journaling_or_writing() {
+    let system = GroupedSystem {
+        truncate: true,
+        ..Default::default()
+    };
+    let mut owner = NetworkOwner::fresh(system, Journal::default());
+    assert!(owner.prepare(vec![route("9.9.9.9/32", 10)]).is_err());
+    assert_eq!(owner.system_mut().inner.writes, 0);
+    assert!(!owner.has_resources());
+    assert!(!owner.cleanup_pending());
+}
+
+#[test]
+fn grouped_preflight_cannot_authorize_a_later_foreign_replacement() {
+    let foreign = route("9.9.9.9/32", 99);
+    let system = GroupedSystem {
+        replace_after_batch: Some(foreign.clone()),
+        ..Default::default()
+    };
+    let mut owner = NetworkOwner::fresh(system, Journal::default());
+    assert!(owner.prepare(vec![route("9.9.9.9/32", 10)]).is_err());
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+    assert_eq!(owner.system_mut().inner.writes, 1);
+    assert!(owner.cleanup_pending());
+}
+
+#[test]
+fn grouped_read_default_preserves_order_and_missing_values() {
+    let a = route("9.9.9.9/32", 10);
+    let b = route("8.8.8.8/32", 20);
+    let missing = route("1.1.1.1/32", 10).key();
+    let mut system = System::default();
+    system.values.insert(format!("{:?}", a.key()), a.clone());
+    system.values.insert(format!("{:?}", b.key()), b.clone());
+    let keys = vec![b.key(), missing, a.key()];
+    assert_eq!(
+        system.read_many(&keys).unwrap(),
+        vec![Some(b), None, Some(a)]
+    );
+    assert_eq!(system.reads, keys);
+}
