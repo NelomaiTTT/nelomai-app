@@ -686,6 +686,7 @@ struct DesktopPairObservation {
 async fn coordinate_desktop_redundancy<T, S, TF, SF>(
     schedule: &mut DesktopCoordinationSchedule,
     now: i64,
+    diagnostics: Option<(&diagnostics::AppDiagnostics, &str)>,
     tick: T,
     status: S,
 ) -> DesktopPairObservation
@@ -717,7 +718,7 @@ where
         // every slow probe/lease preparation halfway through its work.
         if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await {
             schedule.pending = None;
-            let retry = match result {
+            let retry = match &result {
                 Ok(Ok(_)) => None,
                 result => Some(
                     match result {
@@ -730,7 +731,7 @@ where
                                 retry_after_seconds,
                                 ..
                             })),
-                        )) => retry_after_seconds,
+                        )) => *retry_after_seconds,
                         _ => None,
                     }
                     .unwrap_or(15)
@@ -738,8 +739,28 @@ where
                 ),
             };
             if let Some(retry) = retry {
+                let previous_retry_at = schedule.retry_at_unix;
                 schedule.retry_at_unix =
                     now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+                if previous_retry_at != schedule.retry_at_unix {
+                    if let Some((diagnostics, session_id)) = diagnostics {
+                        let (cause, code) = match &result {
+                            Ok(Err(error)) => ("tick_error", automatic_upload_error_code(error)),
+                            Err(_) => ("tick_join_failure", "task_join_failed".into()),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                        diagnostics.record_named(
+                            "desktop.redundancy.retry_scheduled",
+                            Some(session_id),
+                            None,
+                            Some(&format!(
+                                "cause={cause} code={code} scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
+                                schedule.retry_at_unix,
+                                schedule.retry_at_unix.saturating_sub(now),
+                            )),
+                        );
+                    }
+                }
             }
         }
     }
@@ -755,7 +776,22 @@ where
             snapshot: None,
         },
         Err(_) => {
+            let previous_retry_at = schedule.retry_at_unix;
             schedule.retry_at_unix = schedule.retry_at_unix.max(now.saturating_add(15));
+            if previous_retry_at != schedule.retry_at_unix {
+                if let Some((diagnostics, session_id)) = diagnostics {
+                    diagnostics.record_named(
+                        "desktop.redundancy.retry_scheduled",
+                        Some(session_id),
+                        None,
+                        Some(&format!(
+                            "cause=status_timeout scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
+                            schedule.retry_at_unix,
+                            schedule.retry_at_unix.saturating_sub(now),
+                        )),
+                    );
+                }
+            }
             DesktopPairObservation {
                 owns_tunnel: true,
                 snapshot: None,
@@ -815,13 +851,12 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             #[cfg(not(target_os = "android"))]
-            let coordination_retry_before = desktop_coordination.retry_at_unix;
-            #[cfg(not(target_os = "android"))]
             let coordination_now = current_unix_time();
             #[cfg(not(target_os = "android"))]
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
                 coordination_now,
+                Some((&diagnostics, &context.session_id)),
                 || {
                     let application = application.clone();
                     async move {
@@ -833,22 +868,6 @@ fn start_connection_metrics_scheduler(
                 || application.desktop_redundancy_status(),
             )
             .await;
-            #[cfg(not(target_os = "android"))]
-            if coordination_retry_before <= coordination_now
-                && desktop_coordination.retry_at_unix > coordination_now
-            {
-                diagnostics.record_named(
-                    "desktop.redundancy.retry_scheduled",
-                    Some(&context.session_id),
-                    None,
-                    Some(&format!(
-                        "retry_delay_seconds={}",
-                        desktop_coordination
-                            .retry_at_unix
-                            .saturating_sub(coordination_now)
-                    )),
-                );
-            }
             #[cfg(not(target_os = "android"))]
             let pair_owns_tunnel = pair_observation.owns_tunnel;
             #[cfg(not(target_os = "android"))]
@@ -1816,6 +1835,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             100,
+            None,
             move || async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 worker.store(true, Ordering::SeqCst);
@@ -1828,6 +1848,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             102,
+            None,
             || async { panic!("must continue the in-flight probe, not start another") },
             || async { Ok(None) },
         )
@@ -1853,6 +1874,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
+                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1879,6 +1901,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                None,
                 || async { panic!("no retry before panel delay") },
                 || async {
                     status_calls.set(status_calls.get() + 1);
@@ -1894,6 +1917,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 55,
+                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1911,12 +1935,168 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
+    async fn desktop_coordination_transient_error_delays_ready_role_work_until_retry_deadline() {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreApiError;
+        use nelomai_client_tunnel::redundancy::{
+            protocol::Snapshot, session::SessionState, SessionScope, Slot,
+        };
+
+        // Characterize the current gate: a healthy tick can acknowledge an
+        // already-ready local promotion immediately; one unrelated tick error
+        // suppresses that same work until the shared retry deadline.
+        for transient_error in [false, true] {
+            let scope = SessionScope {
+                runtime: nelomai_contracts::RuntimeSlot::Latest,
+                runtime_generation: 1,
+                connection_generation: 1,
+                session_id: "11111111-1111-4111-8111-111111111111".into(),
+            };
+            let mut state = SessionState::new(scope.clone(), Slot::A, 0, 0).unwrap();
+            state.primary_started(&scope).unwrap();
+            let standby = state.install_ticket(&scope, Slot::B).unwrap();
+            state.standby_installed(standby, 1).unwrap();
+            let mut schedule = DesktopCoordinationSchedule::default();
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                10,
+                None,
+                move || async move {
+                    if transient_error {
+                        Err(ApplicationError::Api(CoreApiError::Retryable))
+                    } else {
+                        Ok(None)
+                    }
+                },
+                || async { Ok(None) },
+            )
+            .await;
+
+            // The local owner switches to its committed, ready standby after
+            // the first tick. Only role acknowledgement remains outstanding.
+            let promotion = state.promotion_ticket(&scope, Slot::B).unwrap();
+            state.promote(promotion, || Ok::<_, ()>(())).unwrap();
+            let snapshot = Snapshot {
+                session: state.snapshot(),
+                leases: [Some("a".into()), Some("b".into())],
+                current_leases: [Some("a".into()), Some("b".into())],
+                standby_failed: false,
+                stalled: false,
+                primary_ready: true,
+                standby_ready: true,
+                cleanup_pending: false,
+                retirement_pending: false,
+                warm_stop_v1: false,
+            };
+            let state = Arc::new(std::sync::Mutex::new(state));
+            let role_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for now in [11, 24, 25] {
+                let observation = coordinate_desktop_redundancy(
+                    &mut schedule,
+                    now,
+                    None,
+                    {
+                        let state = state.clone();
+                        let role_calls = role_calls.clone();
+                        move || async move {
+                            let mut state = state.lock().unwrap();
+                            if let Some(update) = state.role_update() {
+                                role_calls.lock().unwrap().push(now);
+                                assert!(state.ack_role(&update, 1));
+                            }
+                            Ok(None)
+                        }
+                    },
+                    || async {
+                        Ok(Some(Snapshot {
+                            session: state.lock().unwrap().snapshot(),
+                            ..snapshot.clone()
+                        }))
+                    },
+                )
+                .await;
+                assert!(observation.owns_tunnel);
+                let observed = observation.snapshot.unwrap();
+                assert_eq!(observed.session.active, Slot::B);
+                assert!(observed.primary_ready && observed.standby_ready);
+                assert_eq!(
+                    observed.session.role_confirmed,
+                    !transient_error || now == 25
+                );
+                if transient_error && now < 25 {
+                    assert!(role_calls.lock().unwrap().is_empty());
+                    assert!(state.lock().unwrap().role_update().is_some());
+                } else {
+                    assert!(state.lock().unwrap().snapshot().role_confirmed);
+                }
+            }
+            assert_eq!(
+                *role_calls.lock().unwrap(),
+                if transient_error { vec![25] } else { vec![11] }
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_retry_diagnostics_distinguish_tick_error_and_status_timeout() {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreApiError;
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let mut schedule = DesktopCoordinationSchedule::default();
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            100,
+            Some((&diagnostics, "experiment-session")),
+            || async {
+                Err(ApplicationError::Api(CoreApiError::Rejected {
+                    code: "rate_limited".into(),
+                    message: "private panel payload".into(),
+                    retry_after_seconds: Some(45),
+                }))
+            },
+            || async { Ok(None) },
+        )
+        .await;
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(log.contains("desktop.redundancy.retry_scheduled"));
+        assert!(log.contains("cause=tick_error code=rate_limited"));
+        assert!(log.contains("scheduler_now_unix=100 retry_at_unix=145"));
+        assert!(!log.contains("private panel payload"));
+
+        // A later local Status timeout extends an existing backoff. It must
+        // carry its own cause rather than inherit the earlier panel failure.
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            140,
+            Some((&diagnostics, "experiment-session")),
+            || async { panic!("backoff must still suppress the tick") },
+            std::future::pending,
+        )
+        .await;
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(log.contains("cause=status_timeout"));
+        assert!(log.contains("scheduler_now_unix=140 retry_at_unix=155"));
+        assert_eq!(schedule.retry_at_unix, 155);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
     async fn desktop_coordination_unknown_status_blocks_legacy_repair_while_tick_remains_pending() {
         let mut schedule = DesktopCoordinationSchedule::default();
         assert!(
-            coordinate_desktop_redundancy(&mut schedule, 100, std::future::pending, || async {
-                Err(nelomai_client_application::ApplicationError::Storage)
-            })
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                100,
+                None,
+                std::future::pending,
+                || async { Err(nelomai_client_application::ApplicationError::Storage) }
+            )
             .await
             .owns_tunnel
         );
@@ -1953,6 +2133,7 @@ mod tests {
         let observation = coordinate_desktop_redundancy(
             &mut schedule,
             10,
+            None,
             || async { Ok(None) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -1965,6 +2146,7 @@ mod tests {
         let fresh = coordinate_desktop_redundancy(
             &mut schedule,
             11,
+            None,
             move || async move { Ok(Some(stale)) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -1974,6 +2156,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                None,
                 || async { Ok(None) },
                 || async { Ok(None) }
             )
