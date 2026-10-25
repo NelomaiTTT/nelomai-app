@@ -163,6 +163,75 @@ mod native_tests {
     }
 
     #[test]
+    fn rejected_poll_preserves_channel_for_later_show_and_quit() {
+        let (client, mut peer) = NativeStream::pair().unwrap();
+        let client = NativeClient::new(client).unwrap();
+        let worker = std::thread::spawn(move || {
+            for rejected in [true, false] {
+                let (tag, body) = read_native_frame(&mut peer).unwrap();
+                assert_eq!(tag, 2);
+                assert!(matches!(
+                    serde_json::from_slice::<NativeControl>(&body).unwrap(),
+                    NativeControl::Poll { .. }
+                ));
+                if rejected {
+                    write_native_frame(&mut peer, 255, b"common operation failed").unwrap();
+                } else {
+                    let body = serde_json::to_vec(&NativeReply::Actions {
+                        actions: vec![RuntimeAction::Show, RuntimeAction::Quit],
+                    })
+                    .unwrap();
+                    write_native_frame(&mut peer, 2, &body).unwrap();
+                }
+            }
+        });
+        tauri::async_runtime::block_on(async {
+            assert!(client
+                .control(NativeControl::Poll {
+                    presentation: TraySnapshot::default(),
+                })
+                .await
+                .is_err());
+            assert!(client.stream.lock().unwrap().is_some());
+            let reply = client
+                .control(NativeControl::Poll {
+                    presentation: TraySnapshot::default(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                reply,
+                NativeReply::Actions { actions }
+                    if matches!(actions.as_slice(), [RuntimeAction::Show, RuntimeAction::Quit])
+            ));
+        });
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn closed_reply_permanently_closes_native_channel() {
+        let (client, mut peer) = NativeStream::pair().unwrap();
+        let client = NativeClient::new(client).unwrap();
+        let worker = std::thread::spawn(move || {
+            read_native_frame(&mut peer).unwrap();
+        });
+        assert!(
+            tauri::async_runtime::block_on(client.control(NativeControl::Poll {
+                presentation: TraySnapshot::default(),
+            }))
+            .is_err()
+        );
+        worker.join().unwrap();
+        assert!(client.stream.lock().unwrap().is_none());
+        assert!(
+            tauri::async_runtime::block_on(client.control(NativeControl::Poll {
+                presentation: TraySnapshot::default(),
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn malformed_reply_permanently_closes_native_channel() {
         let (client, mut peer) = NativeStream::pair().unwrap();
         let client = NativeClient::new(client).unwrap();
@@ -456,7 +525,9 @@ fn setup_desktop(
                 }
                 _ => {
                     desktop::quit_application(handle.clone());
-                    break;
+                    if owner.stream.lock().map_or(true, |stream| stream.is_none()) {
+                        break;
+                    }
                 }
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
