@@ -3504,6 +3504,42 @@ async fn explicit_stop_finishes_failed_start_compensation_with_the_same_stop_id(
         .is_none());
 }
 
+#[tokio::test]
+async fn pending_cancelled_start_without_connection_reports_local_close_during_cleanup() {
+    let mut stored = auth();
+    stored.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        operation_id: "durable-stop".into(),
+        lease_id: "issued-lease".into(),
+        recovery_contract_version: None,
+        redundant_session_id: None,
+        accept_warm: true,
+        failure_code: None,
+    });
+    let api = Arc::new(MockApi::new(0));
+    api.hold_stop.store(true, Ordering::SeqCst);
+    let core = Arc::new(support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(stored)),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let stopping = {
+        let core = core.clone();
+        tokio::spawn(async move { core.stop().await })
+    };
+    api.stop_seen.notified().await;
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert!(core.state().await.connection.is_none());
+    let locally_closed = core.local_stop_pending_cleanup().await;
+    api.release_stop.notify_one();
+    stopping.await.unwrap().unwrap();
+    assert!(
+        locally_closed,
+        "confirmed local close must not require a published connection"
+    );
+    assert!(!core.local_stop_pending_cleanup().await);
+}
+
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
 async fn reconstructed_core_without_authoritative_bootstrap_replays_failed_start_compensation() {

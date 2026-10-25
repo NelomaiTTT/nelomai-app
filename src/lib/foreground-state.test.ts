@@ -241,6 +241,61 @@ describe("async Stop presentation", () => {
     return result;
   }
 
+  it("shows confirmed local closure while Stop is still waiting for panel cleanup", async () => {
+    const { context, state } = stopFixture();
+    let finishStop!: () => void;
+    Object.assign(context.nativeClient, {
+      stop: () => new Promise<void>((resolve) => { finishStop = resolve; }),
+      state: async () => ({ ...state, phase: "stopping", localStopPendingCleanup: true }),
+    });
+    const stopping = toggle(context);
+    await synchronize(context, false);
+    expect(buttonLabel(context)).toBe("Выключен");
+    expect(context.connectionActionState.cancelBusy).toBe(true);
+    expect(canBeginConnectionAction(context.connectionActionState, context.busy, false)).toBe(false);
+    finishStop();
+    await stopping;
+  });
+
+  it("ignores a Stop progress poll that arrives after Stop has completed", async () => {
+    const { context, state } = stopFixture();
+    let finishStop!: () => void;
+    let replyProgress!: (value: unknown) => void;
+    let reads = 0;
+    Object.assign(context.nativeClient, {
+      stop: () => new Promise<void>((resolve) => { finishStop = resolve; }),
+      state: () => ++reads === 1
+        ? new Promise((resolve) => { replyProgress = resolve; })
+        : Promise.resolve({ ...state, phase: "ready", localStopPendingCleanup: false }),
+    });
+    const stopping = toggle(context);
+    const poll = synchronize(context, false);
+    finishStop();
+    await stopping;
+    expect(buttonLabel(context)).toBe("Старт");
+    replyProgress({ ...state, phase: "stopping", localStopPendingCleanup: true });
+    await poll;
+    expect(buttonLabel(context)).toBe("Старт");
+    expect(context.localStopPendingCleanup).toBe(false);
+  });
+
+  it("does not restore a green or connected state from a poll while Stop is pending", async () => {
+    for (const phase of ["ready", "connected"]) {
+      const { context, state } = stopFixture();
+      let finishStop!: () => void;
+      Object.assign(context.nativeClient, {
+        stop: () => new Promise<void>((resolve) => { finishStop = resolve; }),
+        state: async () => ({ ...state, phase, localStopPendingCleanup: false }),
+      });
+      const stopping = toggle(context);
+      await synchronize(context, false);
+      expect(context.phase).toBe("stopping");
+      expect(buttonLabel(context)).toBe("Выключаем");
+      finishStop();
+      await stopping;
+    }
+  });
+
   it("keeps shutdown presentation between Stop acceptance and the authoritative state reply", async () => {
     const { context, reply, state } = stopFixture();
     let acceptStop!: () => void;

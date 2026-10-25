@@ -220,53 +220,60 @@ internal class ServiceRedundantConnectionNative(
         slot: RedundantSlot,
         configuration: ByteArray,
         healthProbe: BackgroundRedundantHealthProbe?,
-    ): Boolean = synchronized(gate) {
-        if (closedForStop) {
-            configuration.fill(0)
-            return@synchronized false
-        }
-        val existing = slots[slot]
-        if (existing?.leaseId == leaseId) {
-            configuration.fill(0)
-            return@synchronized true
+    ): Boolean {
+        synchronized(gate) {
+            if (closedForStop || slots[slot]?.leaseId == leaseId) {
+                configuration.fill(0)
+                return !closedForStop
+            }
         }
         val retained = configuration.copyOf()
+        // DNS/configuration preparation owns no native state. Stop must not wait for it.
         val prepared = try {
             prepare(configuration)
         } catch (_: Throwable) {
             retained.fill(0)
             configuration.fill(0)
-            return@synchronized false
+            return false
         }
         try {
-            val hadSession = session != null
-            val nativeSession = session ?: run {
-                val tunFd = establishTun(prepared.config) ?: return@synchronized false
-                backend.start(tunFd, slot.index, prepared.userspace)?.also { session = it }
-                    ?: return@synchronized false
+            return synchronized(gate) {
+                if (closedForStop) return@synchronized false
+                val existing = slots[slot]
+                if (existing?.leaseId == leaseId) return@synchronized true
+                val hadSession = session != null
+                val nativeSession = session ?: run {
+                    val tunFd = establishTun(prepared.config) ?: return@synchronized false
+                    if (closedForStop) {
+                        runCatching { closeTunFd(tunFd) }
+                        return@synchronized false
+                    }
+                    backend.start(tunFd, slot.index, prepared.userspace)?.also { session = it }
+                        ?: return@synchronized false
+                }
+                existing?.let {
+                    recordTransportLocked("before_slot_replace")
+                    if (!backend.stopSlot(nativeSession, slot.index)) return@synchronized false
+                    existing.configuration.fill(0)
+                    slots.remove(slot)
+                }
+                if (hadSession && !backend.startSlot(nativeSession, slot.index, prepared.userspace)) {
+                    return@synchronized false
+                }
+                val probeTarget = prepared.config.peers.firstOrNull()
+                    ?.endpoint?.orElse(null)?.host
+                slots[slot] = SlotRuntime(
+                    leaseId,
+                    slot,
+                    healthProbe,
+                    probeTarget,
+                    (prepared.baseConfiguration ?: retained).copyOf(),
+                    elapsedNowMs(),
+                )
+                transportDiagnostics.begin(elapsedNowMs())
+                recordTransportLocked("started")
+                true
             }
-            existing?.let {
-                recordTransportLocked("before_slot_replace")
-                if (!backend.stopSlot(nativeSession, slot.index)) return@synchronized false
-                existing.configuration.fill(0)
-                slots.remove(slot)
-            }
-            if (hadSession && !backend.startSlot(nativeSession, slot.index, prepared.userspace)) {
-                return@synchronized false
-            }
-            val probeTarget = prepared.config.peers.firstOrNull()
-                ?.endpoint?.orElse(null)?.host
-            slots[slot] = SlotRuntime(
-                leaseId,
-                slot,
-                healthProbe,
-                probeTarget,
-                (prepared.baseConfiguration ?: retained).copyOf(),
-                elapsedNowMs(),
-            )
-            transportDiagnostics.begin(elapsedNowMs())
-            recordTransportLocked("started")
-            true
         } finally {
             configuration.fill(0)
             prepared.userspace.fill(0)

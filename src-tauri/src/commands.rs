@@ -1874,7 +1874,13 @@ impl AppStateResponse {
                     owner.lease_phase.as_deref(),
                     Some("cleanup_pending" | "stale_cleanup")
                 ));
-        self.with_local_stop_pending_cleanup(owner.local_stop_pending_cleanup || cleanup_pending)
+        let core_cleanup_pending = self.local_stop_pending_cleanup
+            && !owner.desired_active
+            && !owner.redundant_session_owned
+            && owner.lease_phase.is_none();
+        self.with_local_stop_pending_cleanup(
+            owner.local_stop_pending_cleanup || cleanup_pending || core_cleanup_pending,
+        )
     }
 }
 
@@ -2251,6 +2257,12 @@ async fn android_app_state(
             let context = application.connection_metrics_context().await;
             // This reads the cached metrics only; it does not probe the network.
             let current_metrics = current_connection_metrics(&metrics, context.as_ref()).await;
+            let local_cleanup = owner.as_ref().is_some_and(|owner| {
+                !owner.desired_active
+                    && !owner.redundant_session_owned
+                    && owner.lease_phase.is_none()
+            }) && application.has_pending_stop_cleanup().unwrap_or(false)
+                && application.local_stop_pending_cleanup().await;
             if !ANDROID_UI_START_STOP_COORDINATOR.projection_observation_is_current(ticket) {
                 return Err(CommandError::new(
                     "connection_intent_cancelled",
@@ -2268,7 +2280,8 @@ async fn android_app_state(
                 fallback,
             );
             let response =
-                AppStateResponse::new(state, warning, current_metrics, intent, retry, reserve);
+                AppStateResponse::new(state, warning, current_metrics, intent, retry, reserve)
+                    .with_local_stop_pending_cleanup(local_cleanup);
             Ok(match owner.as_ref() {
                 Some(owner) => response.with_android_owner(owner),
                 None => response,
@@ -5260,6 +5273,38 @@ mod tests {
                 ));
                 assert!(response.metrics.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn android_idle_owner_preserves_confirmed_core_cleanup() {
+        for (desired_active, redundant_owned, lease_phase, expected) in [
+            (false, false, None, true),
+            (true, false, None, false),
+            (false, true, None, false),
+            (false, false, Some("start_pending"), false),
+        ] {
+            let owner = tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                desired_active,
+                redundant_session_owned: redundant_owned,
+                lease_phase: lease_phase.map(str::to_owned),
+                status: "none".into(),
+                ..Default::default()
+            };
+            let response = AppStateResponse::new(
+                CoreState {
+                    phase: Phase::Stopping,
+                    connection: None,
+                },
+                None,
+                None,
+                nelomai_client_core::ConnectionIntentStatus::None,
+                None,
+                None,
+            )
+            .with_local_stop_pending_cleanup(true)
+            .with_android_owner(&owner);
+            assert_eq!(response.local_stop_pending_cleanup, expected);
         }
     }
 

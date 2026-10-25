@@ -530,7 +530,7 @@
 
   async function synchronizeRuntimeState(foreground = true) {
     if (
-      runtimeChannelClosed || busy ||
+      runtimeChannelClosed || (busy && !connectionActionState.cancelBusy) ||
       !bootstrap?.binding ||
       !["ready", "connecting", "connected", "stopping"].includes(phase)
     ) {
@@ -541,6 +541,7 @@
     if (!sync.started) return;
     try {
       const previous = phase;
+      const observingStop = connectionActionState.cancelBusy;
       const observedBootstrap = bootstrap;
       const actionEpoch = connectionActionState.epoch;
       let stateError: unknown;
@@ -553,7 +554,14 @@
       // A confirmed EOF outranks unrelated UI busy work, unlike a successful
       // snapshot. Account/action retirement still protects newer user intent.
       if (applyRuntimeChannelClosure(stateError)) return;
-      if (busy || !current) return;
+      if (!current || (observingStop && !connectionActionState.cancelBusy)) return;
+      if (connectionActionState.cancelBusy) {
+        // Observe local closure while the same Stop still awaits server cleanup.
+        // Do not retire the action or enable Start from an intermediate snapshot.
+        localStopPendingCleanup = current.localStopPendingCleanup === true;
+        return;
+      }
+      if (busy) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;

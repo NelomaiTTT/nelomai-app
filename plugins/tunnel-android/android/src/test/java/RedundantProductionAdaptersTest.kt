@@ -14,6 +14,51 @@ import org.junit.Test
 
 class RedundantProductionAdaptersTest {
     @Test
+    fun stopDuringPrepareDoesNotWaitOrAdmitLateSlot() {
+        for (reserve in listOf(false, true)) {
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val workers = Executors.newFixedThreadPool(2)
+            var tunStarts = 0
+            val backend = RecordingSessionBackend()
+            val input = byteArrayOf(2)
+            val preparedBytes = prepared(input)
+            val native = ServiceRedundantConnectionNative(
+                backend = backend,
+                establishTun = { tunStarts += 1; 41 },
+                prepare = { bytes ->
+                    if (bytes[0] == 2.toByte()) {
+                        entered.countDown()
+                        check(release.await(5, TimeUnit.SECONDS))
+                        preparedBytes
+                    } else prepared(bytes)
+                },
+                probeSourceIpv4 = "10.200.0.2/32",
+            )
+            try {
+                if (reserve) assertTrue(native.start("primary", RedundantSlot.A, byteArrayOf(1), probe()))
+                val starting = workers.submit<Boolean> {
+                    native.start("late", if (reserve) RedundantSlot.B else RedundantSlot.A, input, probe())
+                }
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                val stopping = workers.submit<Boolean> { native.closeForStop() }
+                assertTrue("Stop must complete while prepare remains blocked", stopping.get(1, TimeUnit.SECONDS))
+                release.countDown()
+                assertFalse(starting.get(2, TimeUnit.SECONDS))
+                assertEquals(if (reserve) 1 else 0, tunStarts)
+                assertFalse(native.isUsable("late"))
+                assertTrue(input.all { it == 0.toByte() })
+                assertTrue(preparedBytes.userspace.all { it == 0.toByte() })
+            } finally {
+                release.countDown()
+                workers.shutdown()
+                assertTrue(workers.awaitTermination(3, TimeUnit.SECONDS))
+                native.closeForStop()
+            }
+        }
+    }
+
+    @Test
     fun terminalLocalStopRejectsLateNativeStartWithoutReopeningTun() {
         var tunStarts = 0
         val native = ServiceRedundantConnectionNative(
