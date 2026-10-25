@@ -143,6 +143,18 @@ impl NetworkSystem for CheckedRows {
         }
         self.rows.read(key)
     }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        crate::member_routes::read_many_routes(&mut NativeRowIo, keys, |key| {
+            if self.absent_member(key)? {
+                Ok(None)
+            } else {
+                let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
+                    return Err(failed());
+                };
+                self.proofs.verify(*index).map(Some)
+            }
+        })
+    }
     fn compare_exchange(
         &mut self,
         key: &ResourceKey,

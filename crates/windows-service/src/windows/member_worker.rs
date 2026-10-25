@@ -1051,6 +1051,32 @@ impl crate::member_routes::IdentityCheck for WorkerIdentity {
         })
     }
 }
+impl WorkerIdentity {
+    fn batch_read_identity(
+        &mut self,
+        key: &ResourceKey,
+    ) -> io::Result<Option<crate::member_routes::NativeProof>> {
+        if self.original.is_none() {
+            self.journal.borrow_mut().verify()?;
+            let journal = self.journal.borrow();
+            let interface = journal.current.interface;
+            let absence_only = journal.current.version == 1
+                || journal.current.creator.is_none()
+                || journal.current.process.is_none()
+                || journal.current.boot != super::member_boot::boot_id()?
+                || journal.current.runtime != *journal.source.identity();
+            if absence_only
+                || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
+            {
+                return Ok(None);
+            }
+        }
+        let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
+            return Err(failed());
+        };
+        crate::member_routes::IdentityCheck::verify(self, *index).map(Some)
+    }
+}
 impl NetworkSystem for WorkerIdentity {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         if self.original.is_none() {
@@ -1084,6 +1110,13 @@ impl NetworkSystem for WorkerIdentity {
             crate::member_routes::IdentityCheck::verify(self, index)
         })
         .read(key)
+    }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        crate::member_routes::read_many_routes(
+            &mut super::member_routes::NativeRowIo,
+            keys,
+            |key| self.batch_read_identity(key),
+        )
     }
     fn compare_exchange(
         &mut self,

@@ -654,22 +654,26 @@ pub(crate) mod native {
     }
     impl<G: NativeNetworkEffectGate> NetworkSystem for Rows<G> {
         fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+            Ok(self.read_many(std::slice::from_ref(key))?.pop().unwrap())
+        }
+        fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
             let cleanup = self.0.cleanup.get();
             self.0.fence.require(cleanup)?;
-            let call = |window: &NativeBindingsWindow<'_>| -> io::Result<Option<NetworkValue>> {
-                self.0.fence.require(cleanup)?;
-                let b = window.bindings();
-                let result = MemberRoutes::new(
-                    NativeRowIo,
-                    LiveIdentity {
-                        pins: &self.0,
-                        bindings: b,
-                    },
-                )
-                .read(key)?;
-                self.0.fence.require(cleanup)?;
-                Ok(result)
-            };
+            let call =
+                |window: &NativeBindingsWindow<'_>| -> io::Result<Vec<Option<NetworkValue>>> {
+                    self.0.fence.require(cleanup)?;
+                    let b = window.bindings();
+                    let result = MemberRoutes::new(
+                        NativeRowIo,
+                        LiveIdentity {
+                            pins: &self.0,
+                            bindings: b,
+                        },
+                    )
+                    .read_many(keys)?;
+                    self.0.fence.require(cleanup)?;
+                    Ok(result)
+                };
             let run = |window: &NativeBindingsWindow<'_>| {
                 call(window).map_err(|_| crate::windows::member_carrier_wintun::Error::Conflict)
             };

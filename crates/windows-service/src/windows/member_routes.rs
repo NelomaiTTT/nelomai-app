@@ -56,53 +56,56 @@ pub(crate) fn best_route(address: IpAddr) -> io::Result<Row> {
 
 impl RowIo for NativeRowIo {
     fn read(&mut self, destination: IpNet, index: u32) -> io::Result<Vec<Row>> {
-        if index == 0 || destination != destination.trunc() {
+        Ok(self.read_many(&[(destination, index)])?.pop().unwrap())
+    }
+    fn read_many(&mut self, keys: &[(IpNet, u32)]) -> io::Result<Vec<Vec<Row>>> {
+        if keys.iter().any(|(d, i)| *i == 0 || *d != d.trunc()) {
             return Err(conflict());
         }
-        let mut raw = ptr::null_mut();
-        let family = if destination.addr().is_ipv4() {
-            AF_INET
-        } else {
-            AF_INET6
-        };
-        let code = unsafe { GetIpForwardTable2(family, &mut raw) };
-        let memory = TableMemory(raw);
-        if code == ERROR_NOT_FOUND {
-            return Ok(Vec::new());
-        }
-        status(code)?;
-        if memory.0.is_null() {
-            return Err(conflict());
-        }
-        // Access the flexible array through raw pointers: a zero-entry allocation
-        // need not contain even one complete MIB_IPFORWARD_ROW2.
-        let count = unsafe { ptr::addr_of!((*memory.0).NumEntries).read() } as usize;
-        if count > MAX_TABLE_ROWS {
-            return Err(conflict());
-        }
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        // Typed field address and row stride honor the SDK's alignment/padding.
-        let first = unsafe { ptr::addr_of!((*memory.0).Table).cast::<MIB_IPFORWARD_ROW2>() };
-        let rows = unsafe { std::slice::from_raw_parts(first, count) };
-        let mut result = Vec::new();
-        for raw in rows {
-            if raw.InterfaceIndex != index {
+        let mut result = vec![Vec::new(); keys.len()];
+        for ipv4 in [true, false] {
+            if !keys.iter().any(|(d, _)| d.addr().is_ipv4() == ipv4) {
                 continue;
             }
-            let prefix = decode_prefix(raw)?;
-            if prefix.addr().is_ipv4() != destination.addr().is_ipv4() {
-                return Err(conflict());
-            }
-            if prefix != destination {
+            let mut raw = ptr::null_mut();
+            let code =
+                unsafe { GetIpForwardTable2(if ipv4 { AF_INET } else { AF_INET6 }, &mut raw) };
+            let memory = TableMemory(raw);
+            if code == ERROR_NOT_FOUND {
                 continue;
             }
-            result.push(decode_row(raw, prefix)?);
-            // No need to decode/enumerate further: more than one addressed row
-            // is already an ownership conflict, even with identical next hops.
-            if result.len() > 1 {
+            status(code)?;
+            if memory.0.is_null() {
                 return Err(conflict());
+            }
+            // Preserve SDK alignment/padding and the zero-entry allocation contract.
+            let count = unsafe { ptr::addr_of!((*memory.0).NumEntries).read() } as usize;
+            if count > MAX_TABLE_ROWS {
+                return Err(conflict());
+            }
+            if count == 0 {
+                continue;
+            }
+            let first = unsafe { ptr::addr_of!((*memory.0).Table).cast::<MIB_IPFORWARD_ROW2>() };
+            for raw in unsafe { std::slice::from_raw_parts(first, count) } {
+                if !keys
+                    .iter()
+                    .any(|(d, i)| d.addr().is_ipv4() == ipv4 && raw.InterfaceIndex == *i)
+                {
+                    continue;
+                }
+                let prefix = decode_prefix(raw)?;
+                if prefix.addr().is_ipv4() != ipv4 {
+                    return Err(conflict());
+                }
+                for (n, (destination, index)) in keys.iter().enumerate() {
+                    if raw.InterfaceIndex == *index && prefix == *destination {
+                        result[n].push(decode_row(raw, prefix)?);
+                        if result[n].len() > 1 {
+                            return Err(conflict());
+                        }
+                    }
+                }
             }
         }
         Ok(result)

@@ -61,6 +61,11 @@ pub trait RowIo {
     /// Return ALL rows at destination+index, including foreign metadata and
     /// duplicate next hops. Query/malformed-data errors must not become absence.
     fn read(&mut self, destination: IpNet, index: u32) -> io::Result<Vec<Row>>;
+    /// Ordered addressed rows from one fresh read-only batch. Native transport
+    /// enumerates each requested family once; no table survives this call.
+    fn read_many(&mut self, keys: &[(IpNet, u32)]) -> io::Result<Vec<Vec<Row>>> {
+        keys.iter().map(|(d, i)| self.read(*d, *i)).collect()
+    }
     fn create(&mut self, row: &Row) -> io::Result<()>;
     fn delete(&mut self, row: &Row) -> io::Result<()>;
     fn set(&mut self, row: &Row) -> io::Result<()>;
@@ -83,6 +88,69 @@ pub(crate) fn read_absent_route(
         return Err(conflict());
     }
     Ok(None)
+}
+
+/// A `None` proof attests exact interface absence, before and after the
+/// native enumeration. It authorizes only an empty result, never mutation.
+pub(crate) fn read_many_routes(
+    rows: &mut impl RowIo,
+    keys: &[ResourceKey],
+    mut check: impl FnMut(&ResourceKey) -> io::Result<Option<NativeProof>>,
+) -> io::Result<Vec<Option<NetworkValue>>> {
+    let addressed = keys.iter().map(route_key).collect::<io::Result<Vec<_>>>()?;
+    let mut proofs = Vec::with_capacity(keys.len());
+    for (key, (_, index)) in keys.iter().zip(&addressed) {
+        let proof = check(key)?;
+        if proof.is_some_and(|p| p.index != *index || p.luid == 0) {
+            return Err(conflict());
+        }
+        proofs.push(proof);
+    }
+    let current = rows.read_many(&addressed);
+    // Reattest every key even when enumeration failed, just like read_proven.
+    for (key, proof) in keys.iter().zip(&proofs) {
+        if check(key)? != *proof {
+            return Err(conflict());
+        }
+    }
+    let current = current?;
+    if current.len() != keys.len() {
+        return Err(conflict());
+    }
+    current
+        .into_iter()
+        .zip(addressed)
+        .zip(proofs)
+        .map(|((rows, (destination, index)), proof)| {
+            let Some(proof) = proof else {
+                return if rows.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(conflict())
+                };
+            };
+            Ok(owned_row(rows, destination, index, proof)?.map(|r| NetworkValue::Route(r.route)))
+        })
+        .collect()
+}
+
+fn owned_row(
+    rows: Vec<Row>,
+    destination: IpNet,
+    index: u32,
+    proof: NativeProof,
+) -> io::Result<Option<Row>> {
+    if rows.len() > 1 {
+        return Err(conflict());
+    }
+    let row = rows.into_iter().next();
+    if let Some(r) = &row {
+        validate_route(&r.route, destination, index)?;
+        if r != &Row::static_route(r.route.clone(), proof) {
+            return Err(conflict());
+        }
+    }
+    Ok(row)
 }
 
 pub struct MemberRoutes<R, I> {
@@ -115,17 +183,7 @@ impl<R: RowIo, I: IdentityCheck> MemberRoutes<R, I> {
         let proof = self.verify(index, expected)?;
         let rows = self.rows.read(destination, proof.index);
         self.verify(proof.index, Some(proof))?;
-        let rows = rows?;
-        if rows.len() > 1 {
-            return Err(conflict());
-        }
-        let row = rows.into_iter().next();
-        if let Some(r) = &row {
-            validate_route(&r.route, destination, proof.index)?;
-            if r != &Row::static_route(r.route.clone(), proof) {
-                return Err(conflict());
-            }
-        }
+        let row = owned_row(rows?, destination, proof.index, proof)?;
         Ok((proof, row))
     }
     fn write(
@@ -146,6 +204,11 @@ impl<R: RowIo, I: IdentityCheck> NetworkSystem for MemberRoutes<R, I> {
         let (destination, index) = route_key(key)?;
         let (_, row) = self.read_proven(destination, index, None)?;
         Ok(row.map(|r| NetworkValue::Route(r.route)))
+    }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        read_many_routes(&mut self.rows, keys, |key| {
+            self.identity.verify(route_key(key)?.1).map(Some)
+        })
     }
     fn compare_exchange(
         &mut self,
@@ -267,6 +330,23 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        fn read_many(&mut self, keys: &[(IpNet, u32)]) -> io::Result<Vec<Vec<Row>>> {
+            let mut s = self.0.borrow_mut();
+            s.events.push("batch");
+            if s.fail_read {
+                return Err(io::Error::other("query_failed"));
+            }
+            Ok(keys
+                .iter()
+                .map(|(d, i)| {
+                    s.rows
+                        .iter()
+                        .filter(|r| r.route.destination == *d && r.route.interface == *i)
+                        .cloned()
+                        .collect()
+                })
+                .collect())
+        }
         fn create(&mut self, row: &Row) -> io::Result<()> {
             self.0.borrow_mut().rows.push(row.clone());
             self.finish("create")
@@ -312,6 +392,127 @@ mod tests {
             f,
         )
     }
+    #[test]
+    fn batch_uses_one_io_and_keeps_each_identity_check_and_fresh_cas() {
+        let v4 = value(&route(false));
+        let v6 = value(&route(true));
+        let f = Fake::default();
+        f.0.borrow_mut().rows = vec![
+            Row::static_route(route(false), PROOF),
+            Row::static_route(route(true), PROOF),
+        ];
+        let observed = f.clone();
+        let mut m = MemberRoutes::new(f.clone(), move |_| {
+            observed.0.borrow_mut().events.push("verify");
+            Ok(PROOF)
+        });
+        assert_eq!(
+            m.read_many(&[v6.key(), v4.key(), v4.key()]).unwrap(),
+            vec![Some(v6), Some(v4.clone()), Some(v4.clone())]
+        );
+        assert_eq!(
+            f.0.borrow().events,
+            ["verify", "verify", "verify", "batch", "verify", "verify", "verify"]
+        );
+        f.0.borrow_mut().rows.clear();
+        assert!(m.compare_exchange(&v4.key(), Some(&v4), None).is_err());
+        assert!(f.0.borrow().writes.is_empty());
+        assert!(f.0.borrow().events.ends_with(&["verify", "read", "verify"]));
+    }
+
+    #[test]
+    fn batch_rejects_duplicate_foreign_rows_and_identity_changes() {
+        for fault in 0..4 {
+            let r = route(false);
+            let f = Fake::default();
+            let mut row = Row::static_route(r.clone(), PROOF);
+            if fault == 1 {
+                row.protocol = 2;
+            }
+            f.0.borrow_mut().rows.push(row.clone());
+            if fault == 0 {
+                f.0.borrow_mut().rows.push(row);
+            }
+            f.0.borrow_mut().fail_read = fault == 3;
+            let observed = f.clone();
+            let mut m = MemberRoutes::new(f.clone(), move |_| {
+                let mut state = observed.0.borrow_mut();
+                let changed = fault == 2 && state.events.contains(&"batch");
+                state.events.push("verify");
+                Ok(NativeProof {
+                    luid: if changed { 701 } else { 700 },
+                    ..PROOF
+                })
+            });
+            assert!(m.read_many(&[value(&r).key()]).is_err(), "fault {fault}");
+            assert_eq!(f.0.borrow().events, ["verify", "batch", "verify"]);
+            assert!(f.0.borrow().writes.is_empty());
+        }
+    }
+
+    #[test]
+    fn batch_absence_requires_empty_rows_and_unchanged_live_or_absent_proof() {
+        let key = value(&route(false)).key();
+        for transition in 0..4 {
+            let mut rows = Fake::default();
+            let mut calls = 0;
+            let result = read_many_routes(&mut rows, std::slice::from_ref(&key), |_| {
+                calls += 1;
+                Ok(match transition {
+                    0 => None,
+                    1 => Some(PROOF),
+                    2 if calls == 1 => None,
+                    3 if calls == 2 => None,
+                    _ => Some(PROOF),
+                })
+            });
+            if transition < 2 {
+                assert_eq!(result.unwrap(), vec![None]);
+            } else {
+                assert!(result.is_err(), "transition {transition}");
+            }
+            assert_eq!(calls, 2);
+            assert_eq!(rows.0.borrow().events, ["batch"]);
+            assert!(rows.0.borrow().writes.is_empty());
+        }
+        let mut rows = Fake::default();
+        rows.0
+            .borrow_mut()
+            .rows
+            .push(Row::static_route(route(false), PROOF));
+        assert!(read_many_routes(&mut rows, &[key], |_| Ok(None)).is_err());
+        assert!(rows.0.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn batch_rejects_incomplete_transport_results_after_rechecking_identity() {
+        struct Incomplete(Fake);
+        impl RowIo for Incomplete {
+            fn read(&mut self, d: IpNet, i: u32) -> io::Result<Vec<Row>> {
+                self.0.read(d, i)
+            }
+            fn read_many(&mut self, _: &[(IpNet, u32)]) -> io::Result<Vec<Vec<Row>>> {
+                Ok(vec![])
+            }
+            fn create(&mut self, _: &Row) -> io::Result<()> {
+                panic!("read only")
+            }
+            fn delete(&mut self, _: &Row) -> io::Result<()> {
+                panic!("read only")
+            }
+            fn set(&mut self, _: &Row) -> io::Result<()> {
+                panic!("read only")
+            }
+        }
+        let mut checks = 0;
+        let mut m = MemberRoutes::new(Incomplete(Fake::default()), |_| {
+            checks += 1;
+            Ok(PROOF)
+        });
+        assert!(m.read_many(&[value(&route(false)).key()]).is_err());
+        assert_eq!(checks, 2);
+    }
+
     #[test]
     fn absent_member_row_requires_positive_identity_empty_rows_and_second_absence() {
         let key = value(&route(false)).key();
