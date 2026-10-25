@@ -77,13 +77,17 @@ fn library_entry(
 #[cfg(windows)]
 pub(crate) mod native {
     use super::*;
+    use crate::install_recovery::RecoveryExecutable;
     #[cfg(test)]
     use crate::windows::member_carrier_factory_test_os::trace_step;
     use crate::windows::member_files::{
         pin_installed_files, pin_private_directory, pin_runtime_payload, PinnedDirectory,
         PinnedInstalledFiles, PinnedPayload,
     };
-    use nelomai_contracts::dispatcher::{self as d, Installation, MutationGuard, VerifiedLayout};
+    use nelomai_contracts::{
+        dispatcher::{self as d, Installation, MutationGuard, VerifiedLayout},
+        RuntimeSlot,
+    };
     use std::{
         fs::File,
         path::{Path, PathBuf},
@@ -111,6 +115,9 @@ pub(crate) mod native {
         root_path: PathBuf,
         root: PinnedDirectory,
         files: PinnedInstalledFiles,
+        // Present only for a protected staged cleanup process. Engine callers
+        // retain the original engine-only verification path.
+        cleanup: Option<(Installation, RecoveryExecutable)>,
     }
     impl PinnedInstalledRuntime {
         pub(in crate::windows) fn new(
@@ -118,26 +125,42 @@ pub(crate) mod native {
             executable: &Path,
             owner: Arc<MutationGuard>,
             origin: InstalledRuntimeOrigin,
+            cleanup: Option<(&RecoveryExecutable, RuntimeSlot)>,
         ) -> Result<Self> {
             owner
                 .verify_at(&installation.root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
-            let layout = Self::authenticate(installation, executable, origin)?;
-            Self::acquire_after_authentication(installation, executable, owner, layout, origin)
+            let layout = Self::authenticate(installation, executable, origin, cleanup)?;
+            Self::acquire_after_authentication(
+                installation,
+                executable,
+                owner,
+                layout,
+                origin,
+                cleanup,
+            )
         }
         fn authenticate(
             installation: &Installation,
             executable: &Path,
             _origin: InstalledRuntimeOrigin,
+            cleanup: Option<(&RecoveryExecutable, RuntimeSlot)>,
         ) -> Result<VerifiedLayout> {
             #[cfg(test)]
             super::super::member_carrier_factory_test_os::trace_step(match _origin {
                 InstalledRuntimeOrigin::Runtime => "runtime begin installed payload authentication",
                 InstalledRuntimeOrigin::Source => "source begin installed payload authentication",
             });
-            let layout = installation
-                .load_engine(executable)
-                .map_err(|_| Error::Conflict)?;
+            let layout = match cleanup {
+                Some((execution, slot)) => {
+                    execution
+                        .require_bounded_cleanup()
+                        .map_err(|_| Error::Conflict)?;
+                    execution.load(installation, executable, slot)
+                }
+                None => installation.load_engine(executable),
+            }
+            .map_err(|_| Error::Conflict)?;
             #[cfg(test)]
             super::super::member_carrier_factory_test_os::trace_step(match _origin {
                 InstalledRuntimeOrigin::Runtime => "runtime end installed payload authentication",
@@ -151,6 +174,7 @@ pub(crate) mod native {
             owner: Arc<MutationGuard>,
             layout: VerifiedLayout,
             origin: InstalledRuntimeOrigin,
+            cleanup: Option<(&RecoveryExecutable, RuntimeSlot)>,
         ) -> Result<Self> {
             let root = pin_private_directory(&installation.root).map_err(|_error| {
                 #[cfg(test)]
@@ -238,6 +262,15 @@ pub(crate) mod native {
             // original handle's length; final full broker hashing below binds
             // it without imposing the DLL's unrelated 16 MiB ceiling.
             inventory.push((layout.broker.executable.clone(), None));
+            if matches!(cleanup, Some((RecoveryExecutable::StagedInstaller, _))) {
+                // Pin the actual helper and its signed stage as well as the
+                // complete OLD runtime. Never substitute an installed engine
+                // path for the executable that is performing cleanup.
+                let stage = executable.parent().ok_or(Error::Conflict)?;
+                inventory.push((executable.to_owned(), None));
+                inventory.push((stage.join(d::UPDATE_HELPER_MANIFEST_NAME), None));
+                inventory.push((stage.join(d::UPDATE_HELPER_SIGNATURE_NAME), Some(64)));
+            }
             #[cfg(test)]
             trace_step(&format!(
                 "installed acquire inventory count={}",
@@ -248,15 +281,13 @@ pub(crate) mod native {
                 trace_step(&format!("installed acquire inventory: {_error:?}"));
                 Error::Conflict
             })?;
-            let current = Self::authenticate(installation, executable, origin)?;
+            let current = Self::authenticate(installation, executable, origin, cleanup)?;
             if current.identity != layout.identity
                 || current.directory != layout.directory
                 || current.engine_path() != layout.engine_path()
                 || current.dispatcher_path() != layout.dispatcher_path()
                 || current.dispatcher_payload_identity() != layout.dispatcher_payload_identity()
                 || current.broker != layout.broker
-                || std::fs::canonicalize(current.engine_path()).map_err(|_| Error::Native)?
-                    != executable
             {
                 return Err(Error::Conflict);
             }
@@ -267,6 +298,12 @@ pub(crate) mod native {
                 root_path: installation.root.clone(),
                 root,
                 files,
+                cleanup: cleanup.and_then(|(execution, _)| match execution {
+                    RecoveryExecutable::StagedInstaller => {
+                        Some((installation.clone(), execution.clone()))
+                    }
+                    _ => None,
+                }),
             };
             // Check all original/path/security/ancestor facts AFTER the final
             // authentication. Retaining these same read-only handles keeps its
@@ -289,7 +326,20 @@ pub(crate) mod native {
                 .verify_at(&self.root_path.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
             self.root.verify().map_err(|_| Error::Conflict)?;
-            if std::fs::canonicalize(self.layout.engine_path()).map_err(|_| Error::Native)?
+            if let Some((installation, execution)) = &self.cleanup {
+                if actual_executable()? != self.executable {
+                    return Err(Error::Conflict);
+                }
+                let live = execution
+                    .load(installation, &self.executable, self.layout.identity.slot)
+                    .map_err(|_| Error::Conflict)?;
+                if live.identity != self.layout.identity
+                    || live.directory != self.layout.directory
+                    || live.broker != self.layout.broker
+                {
+                    return Err(Error::Conflict);
+                }
+            } else if std::fs::canonicalize(self.layout.engine_path()).map_err(|_| Error::Native)?
                 != self.executable
             {
                 return Err(Error::Conflict);
@@ -316,7 +366,12 @@ pub(crate) mod native {
         kind: LibraryKind,
     }
     impl LibrarySource {
-        fn new(root: &Path, owner: Arc<MutationGuard>, kind: LibraryKind) -> Result<Self> {
+        fn new(
+            root: &Path,
+            owner: Arc<MutationGuard>,
+            kind: LibraryKind,
+            cleanup: Option<(&RecoveryExecutable, RuntimeSlot)>,
+        ) -> Result<Self> {
             owner
                 .verify_at(&root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)?;
@@ -334,6 +389,7 @@ pub(crate) mod native {
                 &executable,
                 owner.clone(),
                 InstalledRuntimeOrigin::Source,
+                cleanup,
             )?;
             let layout = installed.layout();
             let entry = read_signed_entry(&layout.directory, &layout.identity, kind)?;
@@ -359,8 +415,11 @@ pub(crate) mod native {
         fn verify(&self) -> Result<()> {
             #[cfg(test)]
             trace_step("source current check");
+            if self.installed.cleanup.is_some() {
+                self.installed.verify()?;
+            }
             // SAME retained handles keep both slots' signed byte proof alive.
-            // The initial canonical engine binding stays pinned by the original
+            // The authenticated execution role stays bound to original
             // payload/ancestor handles; strict DLL/owner/root checks still run.
             let layout = self.installed.layout();
             if layout.identity != self.identity
@@ -427,9 +486,15 @@ pub(crate) mod native {
         digest: String,
     }
     impl WorkerSource {
-        pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {
-            let worker = LibrarySource::new(root, owner.clone(), LibraryKind::Worker)?;
-            let wintun = LibrarySource::new(root, owner, LibraryKind::Wintun)?;
+        /// No cleanup context means engine-only authentication. Explicit cleanup
+        /// admits only the existing bounded roles and cannot grant a launch path.
+        pub(crate) fn new(
+            root: &Path,
+            owner: Arc<MutationGuard>,
+            cleanup: Option<(&RecoveryExecutable, RuntimeSlot)>,
+        ) -> Result<Self> {
+            let worker = LibrarySource::new(root, owner.clone(), LibraryKind::Worker, cleanup)?;
+            let wintun = LibrarySource::new(root, owner, LibraryKind::Wintun, cleanup)?;
             if worker.identity != wintun.identity || worker.directory != wintun.directory {
                 return Err(Error::Conflict);
             }
@@ -448,6 +513,9 @@ pub(crate) mod native {
             self.wintun.verify()
         }
         pub(crate) fn path(&self) -> Result<&Path> {
+            if let Some((_, execution)) = &self.worker.installed.cleanup {
+                execution.require_engine().map_err(|_| Error::Conflict)?;
+            }
             self.verify()?;
             self.worker.path()
         }
@@ -461,7 +529,7 @@ pub(crate) mod native {
     pub(crate) struct WintunSource(LibrarySource);
     impl WintunSource {
         pub(crate) fn new(root: &Path, owner: Arc<MutationGuard>) -> Result<Self> {
-            LibrarySource::new(root, owner, LibraryKind::Wintun).map(Self)
+            LibrarySource::new(root, owner, LibraryKind::Wintun, None).map(Self)
         }
         pub(crate) fn verify(&self) -> Result<()> {
             self.0.verify()
@@ -592,7 +660,7 @@ pub(crate) mod native {
             let mut libraries = Vec::with_capacity(2);
             for kind in member_libraries(transport) {
                 if kind != LibraryKind::Wintun {
-                    libraries.push(LibrarySource::new(root, owner.clone(), kind)?);
+                    libraries.push(LibrarySource::new(root, owner.clone(), kind, None)?);
                 }
             }
             let source = Self {
@@ -824,6 +892,7 @@ pub(crate) mod native {
                 &executable,
                 owner,
                 InstalledRuntimeOrigin::Source,
+                None,
             )
             .unwrap();
             pinned.verify().unwrap();
@@ -872,6 +941,7 @@ pub(crate) mod native {
                 &executable,
                 owner.clone(),
                 InstalledRuntimeOrigin::Source,
+                None,
             )
             .expect("pristine signed fixture must successfully pin before testing payload drift");
             drop(pristine);
@@ -886,6 +956,7 @@ pub(crate) mod native {
                 owner,
                 layout,
                 InstalledRuntimeOrigin::Source,
+                None,
             )
             .is_err());
             assert!(std::fs::OpenOptions::new().write(true).open(path).is_ok());

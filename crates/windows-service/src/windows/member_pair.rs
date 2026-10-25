@@ -1362,8 +1362,9 @@ impl NativePairFactory<NativeSessionFiles> {
         let root = self.root.clone();
         let owner = self.owner.clone();
         let runtime = self.runtime;
+        let execution = self.execution.clone();
         super::member_worker_factory::WorkerPairFactory::from_legacy(
-            self, files, root, owner, runtime,
+            self, files, root, owner, runtime, execution,
         )
     }
     pub(crate) fn verify_worker_start_context(&self, runtime: RuntimeSlot) -> io::Result<()> {

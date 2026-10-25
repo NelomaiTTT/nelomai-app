@@ -34,6 +34,7 @@ pub(crate) struct WorkerPairFactory {
     root: PathBuf,
     owner: Arc<MutationGuard>,
     runtime: RuntimeSlot,
+    execution: crate::install_recovery::RecoveryExecutable,
     preparation: FactoryPreparationSlot<SessionControl<Control, Store>>,
     recovery: Option<member_worker::SharedJournal>,
     recovery_guard: Option<
@@ -59,6 +60,7 @@ impl WorkerPairFactory {
         root: PathBuf,
         owner: Arc<MutationGuard>,
         runtime: RuntimeSlot,
+        execution: crate::install_recovery::RecoveryExecutable,
     ) -> Self {
         Self {
             legacy,
@@ -66,6 +68,7 @@ impl WorkerPairFactory {
             root,
             owner,
             runtime,
+            execution,
             preparation: FactoryPreparationSlot::default(),
             recovery: None,
             recovery_guard: None,
@@ -159,6 +162,7 @@ impl PairFactory for WorkerPairFactory {
                         super::member_carrier_payload::native::WorkerSource::new(
                             &self.root,
                             self.owner.clone(),
+                            Some((&self.execution, runtime)),
                         )
                         .map_err(|e| context("worker_cold_source", io::Error::other(e)))?,
                     );

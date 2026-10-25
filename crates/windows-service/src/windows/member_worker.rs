@@ -1178,7 +1178,7 @@ pub(crate) fn prepare(
     files: NativeSessionFiles,
     scope: SessionScope,
 ) -> io::Result<(Control, Store)> {
-    let source = Rc::new(checked(WorkerSource::new(root, owner.clone()))?);
+    let source = Rc::new(checked(WorkerSource::new(root, owner.clone(), None))?);
     if source.identity().slot != scope.runtime {
         return Err(failed());
     }
