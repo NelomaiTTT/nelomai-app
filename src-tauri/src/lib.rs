@@ -473,19 +473,6 @@ pub(crate) async fn upload_automatic_diagnostics_once(
 }
 
 #[cfg(desktop)]
-pub(crate) async fn upload_latest_automatic_diagnostics_for_logout(
-    application: &NativeApplication,
-    diagnostics: &diagnostics::AppDiagnostics,
-) {
-    for _ in 0..50 {
-        if upload_automatic_diagnostics(application, diagnostics, true).await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[cfg(desktop)]
 async fn upload_automatic_diagnostics(
     application: &NativeApplication,
     diagnostics: &diagnostics::AppDiagnostics,
@@ -828,9 +815,13 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             #[cfg(not(target_os = "android"))]
+            let coordination_retry_before = desktop_coordination.retry_at_unix;
+            #[cfg(not(target_os = "android"))]
+            let coordination_now = current_unix_time();
+            #[cfg(not(target_os = "android"))]
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
-                current_unix_time(),
+                coordination_now,
                 || {
                     let application = application.clone();
                     async move {
@@ -842,6 +833,22 @@ fn start_connection_metrics_scheduler(
                 || application.desktop_redundancy_status(),
             )
             .await;
+            #[cfg(not(target_os = "android"))]
+            if coordination_retry_before <= coordination_now
+                && desktop_coordination.retry_at_unix > coordination_now
+            {
+                diagnostics.record_named(
+                    "desktop.redundancy.retry_scheduled",
+                    Some(&context.session_id),
+                    None,
+                    Some(&format!(
+                        "retry_delay_seconds={}",
+                        desktop_coordination
+                            .retry_at_unix
+                            .saturating_sub(coordination_now)
+                    )),
+                );
+            }
             #[cfg(not(target_os = "android"))]
             let pair_owns_tunnel = pair_observation.owns_tunnel;
             #[cfg(not(target_os = "android"))]

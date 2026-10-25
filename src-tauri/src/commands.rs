@@ -1521,11 +1521,6 @@ async fn prepare_desktop_logout(
                 );
             }
             queue_desktop_tunnel_stopped(app).await;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                crate::upload_latest_automatic_diagnostics_for_logout(application, diagnostics),
-            )
-            .await;
         }
         Err(error) => diagnostics.record_named(
             "diagnostics.logout_tunnel_stop_failed",
