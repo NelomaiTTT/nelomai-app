@@ -52,41 +52,41 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
                     "/usr/sbin/netstat",
                     &["-rn".into(), "-f".into(), family.into()],
                 )?;
-                let mut result = None;
-                for line in text.lines() {
-                    let fields = line.split_whitespace().collect::<Vec<_>>();
-                    if fields.len() < 4 {
-                        continue;
-                    }
-                    if table_destination(fields[0], destination.addr().is_ipv4())
-                        != Some(*destination)
-                    {
-                        continue;
-                    }
-                    let interface = self.commands.interface_index(fields[3])?;
-                    let actual_scope = if fields[2].contains('I') {
-                        RouteScope::Member(interface)
-                    } else {
-                        RouteScope::Global
-                    };
-                    if actual_scope != *scope {
-                        continue;
-                    }
-                    let gateway = table_gateway(fields[1], fields[3])?;
-                    let value = NetworkValue::Route(RouteValue {
-                        destination: *destination,
-                        scope: *scope,
-                        interface,
-                        gateway,
-                        metric: 0,
-                    });
-                    if result.replace(value).is_some() {
-                        return Err(io::Error::other("ambiguous_owned_route"));
-                    }
-                }
-                Ok(result)
+                self.read_route_table(*destination, *scope, &text)
             }
         }
+    }
+
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        let mut tables = [None, None];
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            match key {
+                ResourceKey::Route(destination, scope) => {
+                    if matches!(scope, RouteScope::WindowsInterface(_)) {
+                        return Err(invalid());
+                    }
+                    let family = usize::from(destination.addr().is_ipv6());
+                    if tables[family].is_none() {
+                        tables[family] = Some(self.commands.run(
+                            "/usr/sbin/netstat",
+                            &[
+                                "-rn".into(),
+                                "-f".into(),
+                                if family == 0 { "inet" } else { "inet6" }.into(),
+                            ],
+                        )?);
+                    }
+                    values.push(self.read_route_table(
+                        *destination,
+                        *scope,
+                        tables[family].as_deref().unwrap(),
+                    )?);
+                }
+                _ => values.push(self.read(key)?),
+            }
+        }
+        Ok(values)
     }
 
     fn compare_exchange(
@@ -147,6 +147,45 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
 }
 
 impl<C: MacNetworkCommands> MacNetwork<C> {
+    fn read_route_table(
+        &self,
+        destination: IpNet,
+        scope: RouteScope,
+        text: &str,
+    ) -> io::Result<Option<NetworkValue>> {
+        let mut result = None;
+        for line in text.lines() {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 4 {
+                continue;
+            }
+            if table_destination(fields[0], destination.addr().is_ipv4()) != Some(destination) {
+                continue;
+            }
+            let interface = self.commands.interface_index(fields[3])?;
+            let actual_scope = if fields[2].contains('I') {
+                RouteScope::Member(interface)
+            } else {
+                RouteScope::Global
+            };
+            if actual_scope != scope {
+                continue;
+            }
+            let gateway = table_gateway(fields[1], fields[3])?;
+            let value = NetworkValue::Route(RouteValue {
+                destination,
+                scope,
+                interface,
+                gateway,
+                metric: 0,
+            });
+            if result.replace(value).is_some() {
+                return Err(io::Error::other("ambiguous_owned_route"));
+            }
+        }
+        Ok(result)
+    }
+
     /// Read-only physical policy discovery. `owned` comes from the session's
     /// durable route journal, never from the application request.
     pub fn resolve_policy(
@@ -513,6 +552,53 @@ mod tests {
             metric: 0,
         })
     }
+    #[test]
+    fn batch_reads_one_fresh_table_per_family_and_preserves_order() {
+        let v4 = route("198.18.0.1/32", RouteScope::Global, 10);
+        let scoped = route("198.18.0.1/32", RouteScope::Member(20), 20);
+        let v6 = route("2001:db8::/32", RouteScope::Global, 10);
+        let mut native = MacNetwork {
+            commands: Commands {
+                table: "198.18.0.1 link#10 UHS utun10\n198.18.0.1 link#20 UHSI utun20\n2001:db8::/32 link#10 USc utun10\n".into(),
+                ..Default::default()
+            },
+        };
+        let expected = vec![
+            Some(scoped.clone()),
+            Some(v6.clone()),
+            Some(v4.clone()),
+            Some(v4.clone()),
+        ];
+        let keys = [scoped.key(), v6.key(), v4.key(), v4.key()];
+        assert_eq!(native.read_many(&keys).unwrap(), expected);
+        assert_eq!(native.commands.calls.len(), 2);
+        native.commands.table.clear();
+        assert_eq!(native.read_many(&keys).unwrap(), vec![None; 4]);
+        assert_eq!(native.commands.calls.len(), 4, "tables last only one batch");
+        native
+            .compare_exchange(&v4.key(), Some(&v4), None)
+            .unwrap_err();
+        assert_eq!(native.commands.calls.len(), 5, "CAS must query again");
+    }
+
+    #[test]
+    fn batch_preserves_duplicate_and_foreign_gateway_guards() {
+        let key = route("198.18.0.1/32", RouteScope::Member(20), 20).key();
+        for table in [
+            "198.18.0.1 link#20 UHSI utun20\n198.18.0.1 link#20 UHSI utun20\n",
+            "198.18.0.1 utun10 UHSI utun20\n",
+        ] {
+            let mut native = MacNetwork {
+                commands: Commands {
+                    table: table.into(),
+                    ..Default::default()
+                },
+            };
+            assert!(native.read_many(&[key.clone(), key.clone()]).is_err());
+            assert_eq!(native.commands.calls.len(), 1);
+        }
+    }
+
     #[test]
     fn named_link_gateway_preserves_exact_interface_scope_and_duplicate_guards() {
         let mut native = MacNetwork {

@@ -39,6 +39,15 @@ impl<C: MacNetworkCommands> NetworkSystem for RoutesOnly<C> {
         }
         self.0.read(key)
     }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        if keys
+            .iter()
+            .any(|key| !matches!(key, ResourceKey::Route(_, RouteScope::Global)))
+        {
+            return Err(invalid());
+        }
+        self.0.read_many(keys)
+    }
     fn compare_exchange(
         &mut self,
         key: &ResourceKey,

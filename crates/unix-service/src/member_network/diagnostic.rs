@@ -226,6 +226,20 @@ impl<N: NetworkSystem> NetworkSystem for DiagnosticNetwork<N> {
             .read(key)
             .map_err(|e| context(resource_stage(key, false), e))
     }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        let mut values = Vec::with_capacity(keys.len());
+        // Keep the same origin as an individual read if a mixed route/DNS
+        // preflight fails, while forwarding native batching for each group.
+        for group in keys.chunk_by(|a, b| resource_stage(a, false) == resource_stage(b, false)) {
+            let stage = resource_stage(&group[0], false);
+            let current = self.0.read_many(group).map_err(|e| context(stage, e))?;
+            if current.len() != group.len() {
+                return Err(context(stage, io::ErrorKind::InvalidData.into()));
+            }
+            values.extend(current);
+        }
+        Ok(values)
+    }
     fn compare_exchange(
         &mut self,
         key: &ResourceKey,
@@ -261,6 +275,60 @@ impl<S: NetworkJournalStore> NetworkJournalStore for DiagnosticJournal<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct BatchNetwork {
+        batches: Vec<Vec<ResourceKey>>,
+        fail_dns: bool,
+    }
+    impl NetworkSystem for BatchNetwork {
+        fn read(&mut self, _: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+            Err(io::Error::other("individual_read_forbidden"))
+        }
+        fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+            self.batches.push(keys.to_vec());
+            if self.fail_dns
+                && keys
+                    .iter()
+                    .any(|key| matches!(key, ResourceKey::LinkDns(_)))
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(vec![None; keys.len()])
+        }
+        fn compare_exchange(
+            &mut self,
+            _: &ResourceKey,
+            _: Option<&NetworkValue>,
+            _: Option<&NetworkValue>,
+        ) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn grouped_diagnostics_forward_native_batches_and_keep_dns_error_origin() {
+        let a = ResourceKey::Route("9.9.9.9/32".parse().unwrap(), RouteScope::Global);
+        let b = ResourceKey::Route("8.8.8.8/32".parse().unwrap(), RouteScope::Global);
+        let dns = ResourceKey::LinkDns(10);
+        let mut network = DiagnosticNetwork(BatchNetwork {
+            batches: Vec::new(),
+            fail_dns: false,
+        });
+        assert_eq!(
+            network
+                .read_many(&[a.clone(), b.clone(), dns.clone()])
+                .unwrap(),
+            vec![None; 3]
+        );
+        assert_eq!(
+            network.0.batches,
+            vec![vec![a.clone(), b.clone()], vec![dns.clone()]]
+        );
+        network.0.fail_dns = true;
+        let failure = PairFailure::io(Stage::Start, network.read_many(&[a, b, dns]).unwrap_err());
+        assert_eq!(failure.origin, Stage::DnsRead);
+        assert_eq!(failure.kind, io::ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn nested_context_preserves_numeric_status_kind_and_first_origin() {

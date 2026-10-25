@@ -173,6 +173,12 @@ pub trait NetworkSystem {
     /// Must fail on ambiguous/multiple native matches, never select an arbitrary
     /// row. Missing resource is None, not a failed query disguised as absence.
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>>;
+    /// Read a group without mutation, preserving input order and result count.
+    /// Overrides may share a fresh native dump only within this call. CAS and
+    /// post-write reads must still inspect the current native state separately.
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        keys.iter().map(|key| self.read(key)).collect()
+    }
     /// Recheck exact native identity, then mutate only that resource. A failure
     /// may have partially applied; the owner will inspect before compensating.
     fn compare_exchange(
@@ -581,9 +587,16 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         }
         let changes = changes(&self.journal.owned, &target);
         // Detect foreign replacement before touching any other resource.
-        for change in &changes {
-            if self.system.read(&change.key)? != change.before {
-                return Err(conflict());
+        if !changes.is_empty() {
+            let keys: Vec<_> = changes.iter().map(|change| change.key.clone()).collect();
+            let current = self.system.read_many(&keys)?;
+            if current.len() != changes.len() {
+                return Err(invalid());
+            }
+            for (change, current) in changes.iter().zip(current) {
+                if current != change.before {
+                    return Err(conflict());
+                }
             }
         }
         let mut pending = self.journal.clone();
@@ -660,10 +673,23 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
     }
 
     fn reconcile_missing_routes(&mut self) -> io::Result<()> {
+        if self.journal.owned.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<_> = self
+            .journal
+            .owned
+            .iter()
+            .map(|entry| entry.current.key())
+            .collect();
+        let current = self.system.read_many(&keys)?;
+        if current.len() != self.journal.owned.len() {
+            return Err(invalid());
+        }
         let mut next = self.journal.clone();
         next.owned.clear();
-        for entry in &self.journal.owned {
-            match self.system.read(&entry.current.key())? {
+        for (entry, current) in self.journal.owned.iter().zip(current) {
+            match current {
                 Some(value) if value == entry.current => next.owned.push(entry.clone()),
                 None if !matches!(entry.current, NetworkValue::Dns(_)) => {
                     if matches!(&entry.current, NetworkValue::Route(r) if r.scope == RouteScope::Global)
