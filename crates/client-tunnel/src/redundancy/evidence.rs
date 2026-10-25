@@ -107,15 +107,14 @@ impl ProbeEvidence {
             self.stable_since_ms = now_ms;
             return;
         }
+        self.expire_urgent(now_ms);
         if self
             .urgent
             .is_some_and(|urgent| current.rx_data_packets > urgent.rx_at_start)
         {
-            self.in_flight = None;
             self.urgent = None;
             self.probe_failed = false;
         }
-        self.expire_urgent(now_ms);
     }
 
     /// Only one query is live per slot. Wrong-slot, old-epoch and overlapping
@@ -151,10 +150,15 @@ impl ProbeEvidence {
             return;
         }
         self.sample(current_sample, now_ms);
-        // Receive progress, counter reset or urgent expiry can fence the probe.
+        // Counter reset or urgent expiry can fence the probe.
         let Some(probe) = self.in_flight.take() else {
             return;
         };
+        // Receive progress clears an urgent failure, but the exact live DNS
+        // ticket can still contribute successful proof in either poll order.
+        if !succeeded && probe.urgent && self.urgent.is_none() {
+            return;
+        }
         let sent_without_receive = probe
             .baseline
             .zip(current_sample)
