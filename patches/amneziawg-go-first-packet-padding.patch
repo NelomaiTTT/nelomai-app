@@ -1,0 +1,174 @@
+diff --git a/device/send.go b/device/send.go
+index 5c22d97..ca4ae96 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -318,13 +318,22 @@ func (device *Device) RoutineReadFromTUN() {
+ 
+ 		// read packets
+ 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
++		// The first Read can already be blocked when IpcSet configures S4.
++		// Keep its input offset, but frame returned packets using the current
++		// padding. copy supports overlap in both directions.
++		padding = device.paddings.transport.Load()
++		packetOffset := MessageTransportHeaderSize + int(padding)
+ 		for i := 0; i < count; i++ {
+-			if sizes[i] < 1 {
++			if sizes[i] < 1 || sizes[i] > len(bufs[i])-offset ||
++				sizes[i] > len(bufs[i])-packetOffset {
+ 				continue
+ 			}
++			if packetOffset != offset {
++				copy(bufs[i][packetOffset:packetOffset+sizes[i]], bufs[i][offset:offset+sizes[i]])
++			}
+ 
+ 			elem := elems[i]
+-			elem.packet = bufs[i][offset : offset+sizes[i]]
++			elem.packet = bufs[i][packetOffset : packetOffset+sizes[i]]
+ 			elem.padding = padding
+ 
+ 			// lookup peer
+diff --git a/device/send_padding_test.go b/device/send_padding_test.go
+new file mode 100644
+index 0000000..f383af9
+--- /dev/null
++++ b/device/send_padding_test.go
+@@ -0,0 +1,139 @@
++/* SPDX-License-Identifier: MIT */
++
++package device
++
++import (
++	"bytes"
++	"fmt"
++	"net/netip"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
++)
++
++// blockedPaddingTUN stops inside Read, after its caller has chosen the offset.
++// All other TUN operations are unused by this reader-only fixture.
++type blockedPaddingTUN struct {
++	tun.Device
++	entered chan struct{}
++	release chan struct{}
++	packets [][]byte
++}
++
++func (tun *blockedPaddingTUN) BatchSize() int { return len(tun.packets) }
++
++func (tun *blockedPaddingTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	close(tun.entered)
++	<-tun.release
++	for i, packet := range tun.packets {
++		sizes[i] = copy(bufs[i][offset:], packet)
++	}
++	return len(tun.packets), os.ErrClosed
++}
++
++func TestReadFromTUNRefreshesTransportPadding(t *testing.T) {
++	// Removing the post-read padding refresh must fail the increase/decrease
++	// cases; changing only the offset must fail the payload assertions.
++	for _, tc := range []struct {
++		name        string
++		before      uint32
++		after       uint32
++		packetSizes []int
++		wantPackets []int
++	}{
++		{"first_packet", 0, 30, []int{64}, []int{0}},
++		{"increase_batch", 4, 30, []int{64, 129}, []int{0, 1}},
++		{"decrease_batch", 30, 0, []int{64, 129}, []int{0, 1}},
++		{"unchanged", 30, 30, []int{64}, []int{0}},
++		{"exact_buffer_limit", 0, 30, []int{MaxMessageSize - MessageTransportHeaderSize - 30}, []int{0}},
++		{"overflow_preserves_next_packet", 0, 30, []int{MaxMessageSize - MessageTransportHeaderSize, 64}, []int{1}},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			tun := &blockedPaddingTUN{
++				entered: make(chan struct{}),
++				release: make(chan struct{}),
++			}
++			for i, size := range tc.packetSizes {
++				packet := bytes.Repeat([]byte{byte(i + 1)}, size)
++				packet[0] = 0x45
++				copy(packet[IPv4offsetDst:], []byte{192, 0, 2, 1})
++				tun.packets = append(tun.packets, packet)
++			}
++
++			// Keep packets staged, without starting encryption or network I/O.
++			device := &Device{log: NewLogger(LogLevelSilent, "")}
++			device.net.bind = conn.NewDefaultBind()
++			device.tun.device = tun
++			device.paddings.transport.Store(tc.before)
++			var header UintRange
++			for i, dst := range []*AtomicUintRange{&device.headers.init, &device.headers.response, &device.headers.cookie, &device.headers.transport} {
++				header.FromUint32(uint32(i+1), uint32(i+1))
++				dst.Store(header)
++			}
++			device.PopulatePools()
++			device.queue.encryption = &outboundQueue{}
++			device.queue.encryption.wg.Add(1)
++			device.state.stopping.Add(1)
++			// The final Read returns os.ErrClosed; avoid starting Device.Close
++			// on this fixture, which owns only the TUN reader's resources.
++			device.state.state.Store(uint32(deviceStateClosed))
++			peer := &Peer{device: device}
++			peer.isRunning.Store(true)
++			peer.queue.staged = make(chan *QueueOutboundElementsContainer, 1)
++			device.allowedips.Insert(netip.MustParsePrefix("192.0.2.1/32"), peer)
++			done := make(chan struct{})
++			go func() {
++				device.RoutineReadFromTUN()
++				close(done)
++			}()
++			deadline := time.NewTimer(5 * time.Second)
++			defer deadline.Stop()
++			select {
++			case <-tun.entered:
++			case <-deadline.C:
++				t.Fatal("TUN reader did not enter Read")
++			}
++			// Apply the same UAPI update used after NewDevice has started its
++			// reader, while the first Read is deterministically blocked.
++			configErr := device.IpcSet(fmt.Sprintf("s4=%d\n", tc.after))
++			close(tun.release)
++			select {
++			case <-done:
++			case <-deadline.C:
++				t.Fatal("TUN reader did not finish")
++			}
++			if configErr != nil {
++				t.Fatal(configErr)
++			}
++			select {
++			case container := <-peer.queue.staged:
++				defer func() {
++					for _, elem := range container.elems {
++						device.PutMessageBuffer(elem.buffer)
++						device.PutOutboundElement(elem)
++					}
++					device.PutOutboundElementsContainer(container)
++				}()
++				if len(container.elems) != len(tc.wantPackets) {
++					t.Fatalf("staged %d packets, want %d", len(container.elems), len(tc.wantPackets))
++				}
++				for i, elem := range container.elems {
++					if elem.padding != tc.after {
++						t.Errorf("packet %d padding = %d, want %d", i, elem.padding, tc.after)
++					}
++					if !bytes.Equal(elem.packet, tun.packets[tc.wantPackets[i]]) {
++						t.Errorf("packet %d payload changed", i)
++					}
++					if &elem.packet[0] != &elem.buffer[MessageTransportHeaderSize+int(tc.after)] {
++						t.Errorf("packet %d has the wrong buffer offset", i)
++					}
++				}
++			default:
++				t.Fatal("TUN reader did not stage packets")
++			}
++		})
++	}
++}
