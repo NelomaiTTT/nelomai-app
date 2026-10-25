@@ -42,8 +42,20 @@ if [ "$(git -C "$ROOT/vendor/amneziawg-go" rev-parse HEAD)" != "$AMNEZIAWG_GO_CO
   echo "Unexpected AmneziaWG Go source revision" >&2
   exit 1
 fi
+# Build the pinned source plus the explicit local fix, never the vendor worktree.
+# Android/Windows already carry this S4 fix in network-recovery.patch; Unix
+# needs only this hunk, without the unrelated platform recovery changes.
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+AMNEZIA_SOURCE=$WORK/amneziawg-go
+mkdir "$AMNEZIA_SOURCE"
+git -C "$ROOT/vendor/amneziawg-go" archive "$AMNEZIAWG_GO_COMMIT" > "$WORK/amneziawg-go.tar"
+tar -xf "$WORK/amneziawg-go.tar" -C "$AMNEZIA_SOURCE"
 (
-  cd "$ROOT/vendor/amneziawg-go"
+  cd "$AMNEZIA_SOURCE"
+  git apply "$ROOT/patches/amneziawg-go-first-packet-padding.patch"
+  export GOWORK=off
+  go test ./device
   go build -trimpath \
     -ldflags="-s -w -X github.com/amnezia-vpn/amneziawg-go/v3/ipc.socketDirectory=/var/run/wireguard" \
     -o "$OUTPUT/amneziawg-go"
@@ -80,8 +92,6 @@ PY
 fi
 
 WIREGUARD_GO_COMMIT=ecfc5a8d54462e18e13c72173e2623d16d8e25a0
-WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
 SOURCE=$WORK/wireguard-go
 
 git init "$SOURCE"
