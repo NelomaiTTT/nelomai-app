@@ -11,6 +11,7 @@ struct Kernel {
     // command construction remain under test.
     rows: BTreeMap<String, String>,
     mutations: Vec<Vec<String>>,
+    netstat_reads: Vec<String>,
     fail_add: Option<String>,
     lost_add_ack: Option<String>,
     no_op_add: Option<String>,
@@ -32,6 +33,7 @@ impl MacNetworkCommands for Commands {
         );
         if program == "/usr/sbin/netstat" {
             assert_eq!(&args[..2], ["-rn", "-f"]);
+            k.netstat_reads.push(args[2].clone());
             let v6 = args[2] == "inet6";
             return Ok(format!(
                 "Routing tables\n\nInternet:\nDestination Gateway Flags Netif Expire\n{}",
@@ -154,6 +156,22 @@ fn endpoints() -> Vec<IpAddr> {
 }
 fn install(owner: &mut OrdinaryRoutes<Commands>) -> io::Result<()> {
     owner.install("utun10", &allowed(), &endpoints())
+}
+
+#[test]
+fn routes_only_forwards_batch_and_rejects_dns_before_any_native_read() {
+    let commands = Commands(Rc::new(RefCell::new(Kernel::default())));
+    let mut routes = RoutesOnly(MacNetwork {
+        commands: commands.clone(),
+    });
+    let keys = ["0.0.0.0/1", "128.0.0.0/1", "::/1"]
+        .map(|cidr| ResourceKey::Route(cidr.parse().unwrap(), RouteScope::Global));
+    assert_eq!(routes.read_many(&keys).unwrap(), vec![None; 3]);
+    assert_eq!(commands.0.borrow().netstat_reads, ["inet", "inet6"]);
+    assert!(routes
+        .read_many(&[keys[0].clone(), ResourceKey::Dns("Wi-Fi".into())])
+        .is_err());
+    assert_eq!(commands.0.borrow().netstat_reads.len(), 2);
 }
 
 #[test]
