@@ -4238,14 +4238,16 @@ async fn cancelled_async_start_reconciles_original_operation_before_native_owner
     ));
     core.finish_start_attempt();
     assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
-    let requests = api.reconcile_requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].operation_id,
-        api.operation_ids.lock().unwrap()[0]
-    );
-    assert!(requests[0].cancel_if_absent);
-    assert_eq!(requests[0].contract_version, 2);
+    {
+        let requests = api.reconcile_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].operation_id,
+            api.operation_ids.lock().unwrap()[0]
+        );
+        assert!(requests[0].cancel_if_absent);
+        assert_eq!(requests[0].contract_version, 2);
+    }
     assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
     assert_eq!(core.state().await.phase, Phase::Ready);
     assert!(!core.has_pending_stop_cleanup().unwrap());
@@ -4255,7 +4257,6 @@ async fn cancelled_async_start_reconciles_original_operation_before_native_owner
         store.load().unwrap().unwrap().saved_connection,
         Some(unrelated_cache)
     );
-    drop(requests);
     api.hold_start.store(false, Ordering::SeqCst);
     core.start_recovery_v2(options(), 1_700_000_001, true)
         .await
