@@ -142,7 +142,7 @@ jobs:
           -
             platform: "macos"
             architecture: "aarch64"
-            runner: "macos-14"
+            runner: "macos-15"
             rust_target: "aarch64-apple-darwin"
     runs-on: "${{ matrix.runner }}"
     env:
@@ -310,7 +310,7 @@ jobs:
           -
             platform: "macos"
             architecture: "aarch64"
-            runner: "macos-14"
+            runner: "macos-15"
             rust_target: "aarch64-apple-darwin"
     runs-on: "${{ matrix.runner }}"
     env:
@@ -401,7 +401,7 @@ jobs:
       - "native_packages"
       - "sign"
     environment: "release-candidate-finalization"
-    runs-on: "macos-14"
+    runs-on: "macos-15"
     env:
       ROOT_SHA256: "${{ needs.sign.outputs.root_sha256 }}"
       NELOMAI_MACOS_SIGNER_SHA1: "${{ vars.NELOMAI_MACOS_SIGNER_SHA1 }}"

@@ -322,7 +322,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         jobs = self.workflow()["jobs"]
         self.assertIn("macos_common_sign", jobs, "missing isolated macOS signing phase")
         job = jobs["macos_common_sign"]
-        self.assertEqual(job["runs-on"], "macos-14")
+        self.assertEqual(job["runs-on"], "macos-15")
         self.assertEqual(job["environment"], "release-candidate-finalization")
         self.assertEqual(set(job["needs"]), {"native_packages", "sign"})
         for mode, enabled in (("publish_approved_candidate", False), ("build_only", True),
@@ -612,6 +612,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
             targets = jobs[name]["strategy"]["matrix"]["include"]
             self.assertEqual({(row["platform"], row["architecture"]) for row in targets},
                 {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64")})
+            macos = next(row for row in targets if row["platform"] == "macos")
+            self.assertEqual(macos["runner"], "macos-15")
         checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         draft_windows = next(row for row in jobs["native_drafts"]["strategy"]["matrix"]["include"]
                              if row["platform"] == "windows")
@@ -675,7 +677,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                          ["python", script, *expected])
         self.assertEqual(jobs["sign"]["runs-on"], "ubuntu-22.04")
         self.assertEqual(jobs["finalize"]["runs-on"], "ubuntu-22.04")
-        self.assertEqual(jobs["macos_common_sign"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["macos_common_sign"]["runs-on"], "macos-15")
         self.assertEqual(jobs["sign"]["environment"], "release-candidate-signing")
         self.assertEqual(jobs["finalize"]["environment"], "release-candidate-finalization")
         for name in ("native_drafts", "native_packages"):
