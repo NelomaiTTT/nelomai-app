@@ -43,8 +43,17 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
         with self.assertRaises(Exception):
             gates.verify_updater_release(candidate, self.public, public, "d" * 64)
         manifest.write_bytes(raw)
-        with self.assertRaisesRegex(ValueError, "certificate"):
-            gates.verify_updater_release(candidate, self.public, public, "e" * 64)
+        # Desktop releases have no APK certificate authority. A signed index
+        # cannot add Android or omit a required desktop target.
+        bad = json.loads(raw)
+        bad["artifacts"].append(dict(platform="android", asset_name="unexpected.apk"))
+        invalid = json.dumps(bad).encode()
+        manifest.write_bytes(invalid)
+        (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(invalid)))
+        with self.assertRaisesRegex(ValueError, "ordinary packages"):
+            gates.verify_updater_release(candidate, self.public, public, "")
+        manifest.write_bytes(raw)
+        (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))
         (candidate / gates.PACKAGE_NAMES["macos"]).write_bytes(b"changed bytes")
         with self.assertRaisesRegex(ValueError, "digest"):
             gates.verify_updater_release(candidate, self.public, public, "d" * 64)

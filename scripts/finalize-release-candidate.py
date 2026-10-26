@@ -40,8 +40,9 @@ def apk_payload(archive):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("packages", "signed", "output", "private-key", "public-key", "work", "sdk"):
+    for name in ("packages", "signed", "output", "private-key", "public-key", "work"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--sdk", type=Path)
     for name in ("source-sha", "release-set-sha256"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
@@ -58,7 +59,7 @@ def main():
     final_inputs = args.work / "collector"
     final_inputs.mkdir()
     macos_common_signature = None
-    for platform, architecture in verifier.TARGETS:
+    for platform, architecture in verifier.release_targets(gates.VERSION):
         folder = args.packages / platform
         index = json.loads((folder / "package-digests.json").read_bytes())
         if (index.get("source_sha") != args.source_sha or index.get("release_set_sha256") != args.release_set_sha256
@@ -104,15 +105,11 @@ def main():
                    "--version", gates.VERSION, env=environment)
     for path in (args.signed / "release").iterdir():
         shutil.copyfile(path, candidate / path.name)
-    for suffix in (".tar.gz", ".tar.gz.sha256"):
-        name = f"nelomai-{gates.VERSION}-amneziawg-android-source" + suffix
-        shutil.copyfile(args.packages / "android/shipping" / name, candidate / name)
     if {path.name for path in candidate.iterdir()} != gates.PUBLISH_ASSETS:
         raise ValueError("final candidate must match the exact ordinary shipping asset allowlist")
     updater_public = args.work / "updater-public.b64"
     updater_public.write_text(environment["NELOMAI_UPDATER_PUBLIC_KEY"])
-    android_metadata = json.loads((final_inputs / "android-aarch64.artifact.json").read_bytes())
-    gates.verify_updater_release(candidate, args.public_key, updater_public, android_metadata["signature"])
+    gates.verify_updater_release(candidate, args.public_key, updater_public, "")
     inventory = dict(source_sha=args.source_sha, release_set_sha256=args.release_set_sha256, mode=args.mode,
         trust=policy["trust"], purpose="shipping", run_id=os.environ["GITHUB_RUN_ID"],
         run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), environment_ids=identities,

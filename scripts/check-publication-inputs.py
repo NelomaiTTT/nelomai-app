@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 from pathlib import Path
 import os
+import json
 
 spec = importlib.util.spec_from_file_location("gates", Path(__file__).with_name("release-candidate-gates.py"))
 gates = importlib.util.module_from_spec(spec)
@@ -42,7 +43,7 @@ def select_candidate(repository, run_id, source_sha, version, fetch=gates.github
     return int(artifact["id"])
 
 
-def check(directory, source_sha, run_id, inventory_sha256=None):
+def check(directory, source_sha, run_id, inventory_sha256=None, *, release_notes=None):
     gates.full_source(source_sha)
     inventory_sha256 = inventory_sha256 or gates.file_hash(directory / "candidate-inventory.json")
     inventory = gates.verify_inventory(directory, directory / "candidate-inventory.json", inventory_sha256)
@@ -50,6 +51,12 @@ def check(directory, source_sha, run_id, inventory_sha256=None):
             or inventory.get("mode") != "sign_candidate" or inventory.get("trust") != "release"
             or inventory.get("purpose") != "shipping" or set(inventory["assets"]) != gates.PUBLISH_ASSETS):
         raise ValueError("selected build is not the requested shipping release")
+    if release_notes is not None:
+        retained_notes = json.loads((directory / "nelomai-release-manifest.json").read_bytes()).get("release_notes", "")
+        requested = [line.strip() for line in release_notes.splitlines() if line.strip()]
+        retained = [line.strip() for line in retained_notes.splitlines() if line.strip()]
+        if not requested or requested != retained:
+            raise ValueError("publication changelog differs from retained release manifest")
 
 
 if __name__ == "__main__":
@@ -71,4 +78,5 @@ if __name__ == "__main__":
     else:
         if args.directory is None:
             parser.error("--directory is required for downloaded build validation")
-        check(args.directory, args.source_sha, args.run_id, args.inventory_sha256)
+        check(args.directory, args.source_sha, args.run_id, args.inventory_sha256,
+              release_notes=os.environ["RELEASE_NOTES"])

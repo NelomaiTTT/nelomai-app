@@ -21,31 +21,31 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         manifest = dict(container_version="0.4.0", stable_release_set_sha256=gates.STABLE_ROOT_SHA256,
             stable_platform_manifest_sha256="d" * 64,
             slots=[dict(slot="latest", manifest=dict(runtime_version="0.4.0")),
-                   dict(slot="stable", manifest=dict(runtime_version="0.2.20", source_commit=gates.STABLE_SOURCE))])
+                   dict(slot="stable", manifest=dict(runtime_version="0.3.8", source_commit=gates.STABLE_SOURCE))])
         checker.verify_slots(manifest, root_digest=gates.STABLE_ROOT_SHA256, stable_digest="d" * 64)
         for change in ({"slots": manifest["slots"][:1]}, {"stable_release_set_sha256": "0" * 64}):
             with self.assertRaises(ValueError):
                 checker.verify_slots({**manifest, **change}, root_digest=gates.STABLE_ROOT_SHA256, stable_digest="d" * 64)
 
     def inputs(self, native_linux=False):
-        stable = RuntimeReleaseSetTest.four_candidates(self)
+        stable = RuntimeReleaseSetTest.four_candidates(self, version="0.3.8")
         if native_linux:
-            module("build-runtime-manifest").package(self.payload, self.root / "linux-native", "0.2.20", SOURCE,
+            module("build-runtime-manifest").package(self.payload, self.root / "linux-native", "0.3.8", SOURCE,
                 "linux", "x86_64", self.keyfile)
             for path in (self.root / "linux-native").iterdir():
                 shutil.copyfile(path, stable / path.name)
         aggregate = module("build-runtime-release-set")
-        digest = aggregate.build(stable, self.root / "root-index", "0.2.20", SOURCE,
+        digest = aggregate.build(stable, self.root / "root-index", "0.3.8", SOURCE,
                                  self.keyfile, self.public)
         for path in (self.root / "root-index").iterdir():
             shutil.copyfile(path, stable / path.name)
         drafts = self.root / "drafts"
-        for platform, architecture in module("verify-runtime-artifact").TARGETS:
+        for platform, architecture in module("verify-runtime-artifact").release_targets("0.4.0"):
             folder = drafts / platform
             folder.mkdir(parents=True)
             for keyname in ("draft-public-key.raw", "runtime-public-key.raw"):
                 shutil.copyfile(self.public, folder / keyname)
-            old = f"nelomai-runtime-0.2.20-{platform}-{architecture}"
+            old = f"nelomai-runtime-0.3.8-{platform}-{architecture}"
             new = f"nelomai-runtime-0.4.0-{platform}-{architecture}"
             for slot in ("stable", "latest"):
                 target = folder / slot
@@ -72,12 +72,12 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
              patch.object(stage.gates, "STABLE_ROOT_SHA256", digest):
             output = self.root / "staged"
             stage.stage_signed(signed, current_digest, output, self.public, "linux", "x86_64", "b" * 40, "shipping")
-            for slot, version in (("latest", "0.4.0"), ("stable", "0.2.20")):
+            for slot, version in (("latest", "0.4.0"), ("stable", "0.3.8")):
                 for path in self.payload.rglob("*"):
                     if path.is_file():
                         self.assertEqual(path.read_bytes(),
                             (output / "runtime/engines" / slot / version / path.relative_to(self.payload)).read_bytes())
-            archive = signed / "confirmed-stable/nelomai-runtime-0.2.20-linux-x86_64.zip"
+            archive = signed / "confirmed-stable/nelomai-runtime-0.3.8-linux-x86_64.zip"
             archive.write_bytes(archive.read_bytes() + b"substitution")
             with self.assertRaises(Exception):
                 stage.stage_signed(signed, current_digest, self.root / "rejected", self.public,
@@ -95,16 +95,16 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         archived = self.root / "signed/confirmed-stable"
         self.assertEqual(before, {p.name: p.read_bytes() for p in archived.iterdir()})
         verifier = module("verify-runtime-artifact")
-        for platform, arch in verifier.TARGETS:
+        for platform, arch in verifier.release_targets("0.4.0"):
             folder = self.root / "signed/containers" / platform / "shipping"
             container = verifier.authenticated("container", folder / "container-manifest-v1.json",
                 folder / "container-manifest-v1.sig", self.public, platform, arch)
             self.assertEqual(container["container_version"], "0.4.0")
             self.assertEqual([(s["slot"], s["manifest"]["runtime_version"], s["manifest"]["source_commit"])
                               for s in container["slots"]],
-                             [("latest", "0.4.0", "b" * 40), ("stable", "0.2.20", SOURCE)])
+                             [("latest", "0.4.0", "b" * 40), ("stable", "0.3.8", SOURCE)])
             self.assertEqual(container["stable_release_set_sha256"], digest)
-            name = f"nelomai-runtime-0.2.20-{platform}-{arch}.manifest.json"
+            name = f"nelomai-runtime-0.3.8-{platform}-{arch}.manifest.json"
             self.assertEqual(container["stable_platform_manifest_sha256"], hashlib.sha256(before[name]).hexdigest())
         self.assertEqual(before, {p.name: p.read_bytes() for p in stable.iterdir()})
 

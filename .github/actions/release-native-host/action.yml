@@ -74,7 +74,7 @@ runs:
         echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
         echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
     - name: Android signing tools only
-      if: inputs.purpose == 'finalization'
+      if: inputs.platform == 'android' && inputs.purpose == 'finalization'
       shell: bash
       run: sdkmanager 'build-tools;36.0.0'
     - name: Fixed Android Go archive

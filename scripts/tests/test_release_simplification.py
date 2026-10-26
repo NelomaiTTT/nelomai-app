@@ -19,13 +19,15 @@ class ReleaseSimplificationTest(ArtifactFixture):
         signed = self.root / "signed"
         consumer = module("finalize-release-candidate")
         release = release_fixtures.RuntimeReleaseSetTest.four_candidates(self, version=consumer.gates.VERSION)
+        for path in release.glob("*android*"):
+            path.unlink()
         shutil.copytree(release, signed / "release")
         digest = module("build-runtime-release-set").build(signed / "release", self.root / "root-index",
             consumer.gates.VERSION, SOURCE, self.keyfile, self.public)
         for path in (self.root / "root-index").iterdir():
             shutil.copyfile(path, signed / "release" / path.name)
         packages = self.root / "packages"
-        for platform, architecture in consumer.verifier.TARGETS:
+        for platform, architecture in consumer.verifier.release_targets(consumer.gates.VERSION):
             folder = packages / platform
             (folder / "shipping").mkdir(parents=True)
             package = folder / "shipping" / consumer.gates.PACKAGE_NAMES[platform]
@@ -38,8 +40,6 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 source_sha=SOURCE, release_set_sha256=digest, mode="build_only", platform=platform,
                 architecture=architecture, packages={"shipping": dict(name=package.name,
                     sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)})))
-        for suffix in (".tar.gz", ".tar.gz.sha256"):
-            (packages / "android/shipping" / (f"nelomai-{consumer.gates.VERSION}-amneziawg-android-source" + suffix)).write_bytes(b"source fixture")
         output, work = self.root / "finalized", self.root / "finalization"
         arguments = ["finalize-release-candidate", "--packages", str(packages), "--signed", str(signed),
                      "--output", str(output), "--private-key", str(self.keyfile), "--public-key", str(self.public),
@@ -135,7 +135,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
         run = dict(id=42, head_sha=SOURCE, path=".github/workflows/release.yml", event="workflow_dispatch",
                    status="completed", conclusion="success", run_attempt=3,
                    repository={"full_name": "owner/repo"}, head_repository={"full_name": "owner/repo"})
-        artifact = dict(id=123, name="candidate-0.2.20", expired=False,
+        artifact = dict(id=123, name="candidate-0.3.8", expired=False,
                         workflow_run={"id": 42, "head_sha": SOURCE})
 
         def fetch(endpoint):
@@ -143,13 +143,13 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 return {"total_count": 1, "artifacts": [artifact]}
             return run
 
-        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.20", fetch), 123)
+        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch), 123)
         for changes in ({"head_sha": "b" * 40}, {"conclusion": "failure"}, {"status": "in_progress"},
                         {"path": ".github/workflows/windows-build.yml"}):
             with patch.dict(run, changes), self.assertRaises(ValueError):
-                consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.20", fetch)
+                consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch)
         with patch.dict(artifact, {"expired": True}), self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.20", fetch)
+            consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch)
         with self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.20", lambda endpoint:
+            consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", lambda endpoint:
                 {"total_count": 2, "artifacts": [artifact, {**artifact, "id": 124}]} if "/artifacts?" in endpoint else run)

@@ -21,6 +21,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TARGETS = (("android", "aarch64"), ("linux", "x86_64"), ("macos", "aarch64"), ("windows", "x86_64"))
 
 
+def release_targets(version):
+    # 0.4.x ships desktop only. Historical signed stable roots retain Android.
+    return tuple(target for target in TARGETS if target[0] != "android") if version.startswith("0.4.") else TARGETS
+
+
 def load_script(relative):
     spec = importlib.util.spec_from_file_location(relative.replace("/", "_").replace("-", "_"), ROOT / "scripts" / relative)
     module = importlib.util.module_from_spec(spec)

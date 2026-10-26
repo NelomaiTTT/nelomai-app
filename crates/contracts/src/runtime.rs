@@ -562,10 +562,7 @@ fn validate_release_set(
     validate_text(&manifest.release_set_id)?;
     validate_runtime_version(&manifest.runtime_version)?;
     validate_source_commit(&manifest.source_commit)?;
-    if manifest.artifacts.len() != 4 {
-        return Err(RuntimeManifestError::InvalidReleaseSet);
-    }
-
+    let desktop_only = manifest.runtime_version.starts_with("0.4.");
     let expected: HashSet<(&str, &str)> = [
         ("linux", "x86_64"),
         ("windows", "x86_64"),
@@ -573,8 +570,12 @@ fn validate_release_set(
         ("android", "aarch64"),
     ]
     .into_iter()
+    .filter(|(platform, _)| !desktop_only || *platform != "android")
     .collect();
-    let mut actual = HashSet::with_capacity(4);
+    if manifest.artifacts.len() != expected.len() {
+        return Err(RuntimeManifestError::InvalidReleaseSet);
+    }
+    let mut actual = HashSet::with_capacity(expected.len());
     for artifact in &manifest.artifacts {
         validate_text(&artifact.platform)?;
         validate_text(&artifact.architecture)?;

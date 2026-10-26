@@ -53,6 +53,7 @@ class MacosCandidateTest(unittest.TestCase):
         name.with_suffix('.manifest.sig').write_bytes(self.old_key.sign(b'nelomai-runtime-release-set-v1\0' + raw))
         self.root_digest = hashlib.sha256(raw).hexdigest()
         self.addCleanup(patch.stopall)
+        patch.object(self.c.gates, 'STABLE_VERSION', '0.2.20').start()
         patch.object(self.c.gates, 'STABLE_SOURCE', self.old_sha).start()
         patch.object(self.c.gates, 'STABLE_ROOT_SHA256', self.root_digest).start()
         # Only the external Rust contract process is replaced. Real Ed25519,

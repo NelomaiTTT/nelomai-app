@@ -289,8 +289,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         expression = expression.replace("&&", " and ").replace("||", " or ")
         expression = re.sub(r"!(?!=)", " not ", expression)
         return eval(expression.strip(), {"__builtins__": {}}, {
-            "inputs": SimpleNamespace(mode=mode, candidate_run_id="42"),
-            "github": SimpleNamespace(run_id="99"),
+            "inputs": SimpleNamespace(mode=mode, candidate_run_id="42", source_sha="a" * 40),
+            "github": SimpleNamespace(run_id="99", repository="NelomaiTTT/nelomai-app", ref="refs/heads/Future/desktop-0.4.0", event_name="workflow_dispatch", sha="a" * 40),
             "needs": SimpleNamespace(finalize=SimpleNamespace(result=result, outputs=SimpleNamespace(
                 artifact_id="123", inventory_sha256="a" * 64))),
             "steps": SimpleNamespace(select=SimpleNamespace(outputs=SimpleNamespace(artifact_id="456"))),
@@ -363,7 +363,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 (p / "marker").write_text(platform)
             subprocess.run(["bash", "-eu", "-c", step["run"]], cwd=tmp, check=True)
             self.assertFalse((Path(tmp) / "packages/macos").exists())
-            for platform in ("linux", "windows", "android"):
+            for platform in ("linux", "windows"):
                 self.assertEqual((Path(tmp) / "packages" / platform / "marker").read_text(), platform)
 
     def test_publication_waits_for_finalization_but_retained_promotion_needs_no_build(self):
@@ -487,8 +487,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # These inputs were provisioned as Secrets for existing releases.
         # A Variables-only binding silently passes an empty value to the runner.
         environment = self.workflow()["env"]
-        for name in ("NELOMAI_UPDATER_PUBLIC_KEY", "NELOMAI_FIREBASE_APPLICATION_ID",
-                     "NELOMAI_FIREBASE_API_KEY", "NELOMAI_FIREBASE_PROJECT_ID"):
+        for name in ("NELOMAI_UPDATER_PUBLIC_KEY",):
             with self.subTest(name=name):
                 self.assertEqual(environment[name], "${{ secrets." + name + " }}")
 
@@ -585,7 +584,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
         self.assertEqual(workflow["permissions"].get("contents"), "read", "default workflow is not read-only")
         jobs = workflow["jobs"]
-        self.assertEqual(jobs["native_drafts"].get("if"), "inputs.mode != 'publish_approved_candidate'",
+        self.assertIn("inputs.mode != 'publish_approved_candidate'", jobs["native_drafts"].get("if"),
                          "publication-only runs must not start native builds")
         writers = [name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"]
         self.assertEqual(writers, ["publish"])
@@ -601,7 +600,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("release-candidate-gates.py tag", body)
         self.assertIn("panel_notification_ready", body)
 
-    def test_every_checkout_is_pinned_and_root_requires_four_native_builds(self):
+    def test_every_checkout_is_pinned_and_root_requires_three_desktop_builds(self):
         workflow = self.workflow()
         jobs = workflow["jobs"]
         for name, job in jobs.items():
@@ -612,7 +611,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for name in ("native_drafts", "native_packages"):
             targets = jobs[name]["strategy"]["matrix"]["include"]
             self.assertEqual({(row["platform"], row["architecture"]) for row in targets},
-                {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64")})
+                {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64")})
         checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         draft_windows = next(row for row in jobs["native_drafts"]["strategy"]["matrix"]["include"]
                              if row["platform"] == "windows")

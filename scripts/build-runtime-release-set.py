@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate four authenticated final runtime archives into one immutable root.
+"""Aggregate the complete version-specific authenticated final runtime archives into one immutable root.
 
 Native re-extraction is mandatory in each platform job. The aggregation host
 repeats signatures, contract, identity and ZIP/file checks for all platforms;
@@ -27,10 +27,10 @@ def canonical(value):
 def collect(input_dir, version, source, public_key):
     manifests = sorted(input_dir.rglob("nelomai-runtime-*.manifest.json"))
     manifests = [path for path in manifests if not path.name.endswith("-release-set.manifest.json")]
-    if len(manifests) != 4:
-        raise ValueError("exactly four successful platform artifacts required")
+    if len(manifests) != len(verifier.release_targets(version)):
+        raise ValueError("exact version-specific platform artifacts required")
     result, seen = [], set()
-    for platform, architecture in verifier.TARGETS:
+    for platform, architecture in verifier.release_targets(version):
         prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
         matches = [path for path in manifests if path.name == prefix + ".manifest.json"]
         if len(matches) != 1:

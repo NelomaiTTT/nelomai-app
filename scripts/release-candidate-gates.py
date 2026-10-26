@@ -23,9 +23,9 @@ import zipfile
 
 BASE = "632cc4b40872c559a75e5d7104b72bae17ac91c3"
 VERSION = "0.4.0"
-STABLE_VERSION = "0.2.20"
-STABLE_SOURCE = "ae13a022d91a68d25f441a586ac4e9dc363f1952"
-STABLE_ROOT_SHA256 = "09ec87f51f0f0b7dc6203e4a28026216fa7d5aaef43e1b14400ddc83eb2ee984"
+STABLE_VERSION = "0.3.8"
+STABLE_SOURCE = "0426492766a68427426d0bc19218d224cfbead96"
+STABLE_ROOT_SHA256 = "c2855299184d3ad061b00cd126c2f094cd1888effdaa5474feb009f9a8395e6f"
 SIGNING_ENVIRONMENT = "release-candidate-signing"
 FINALIZATION_ENVIRONMENT = "release-candidate-finalization"
 ACCEPTANCE_ENVIRONMENT = "release-candidate-acceptance"
@@ -34,13 +34,12 @@ CANDIDATE_ENVIRONMENTS = (SIGNING_ENVIRONMENT, FINALIZATION_ENVIRONMENT, ACCEPTA
 ENVIRONMENTS = (*CANDIDATE_ENVIRONMENTS, PUBLICATION_ENVIRONMENT)
 PACKAGE_NAMES = {
     "linux": f"nelomai-{VERSION}-linux-x86_64.AppImage", "windows": f"nelomai-{VERSION}-windows-x86_64.exe",
-    "macos": f"nelomai-{VERSION}-macos-aarch64.app.tar.gz", "android": f"nelomai-{VERSION}-android-aarch64.apk"}
+    "macos": f"nelomai-{VERSION}-macos-aarch64.app.tar.gz"}
 PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
     "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
-    f"nelomai-{VERSION}-amneziawg-android-source.tar.gz", f"nelomai-{VERSION}-amneziawg-android-source.tar.gz.sha256",
     f"nelomai-runtime-{VERSION}-release-set.manifest.json", f"nelomai-runtime-{VERSION}-release-set.manifest.sig",
     *(f"nelomai-runtime-{VERSION}-{platform}-{architecture}{suffix}"
-      for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64"))
+      for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"))
       for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
 
 
@@ -141,7 +140,7 @@ def require_publishable_inventory(inventory, run_id, source, environment_ids, ru
     if isinstance(assets, dict) and not set(assets) <= PUBLISH_ASSETS:
         raise ValueError("nonpublishable or acceptance-only asset in candidate inventory")
     if not isinstance(assets, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(assets.get(name, ""))) for name in packages):
-        raise ValueError("approved digests for all four exact installer/package names required")
+        raise ValueError("approved digests for all three exact installer/package names required")
 
 
 def github_get(endpoint):
@@ -310,9 +309,9 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
         base64.b64decode(signature.read_bytes().strip(), validate=True), body)
     document = json.loads(body)
     artifacts = document.get("artifacts", [])
-    if (document.get("schema_version") != 1 or document.get("version") != VERSION or len(artifacts) != 4
+    if (document.get("schema_version") != 1 or document.get("version") != VERSION or len(artifacts) != len(PACKAGE_NAMES)
             or {item.get("platform") for item in artifacts} != set(PACKAGE_NAMES)):
-        raise ValueError("signed release index must identify all four ordinary packages")
+        raise ValueError("signed release index must identify all three ordinary packages")
     executable = os.environ.get("NELOMAI_UPDATER_SIGNATURE_VERIFIER", str(Path(__file__).resolve().parents[1]
         / "target/debug/examples" / ("verify-updater-signature.exe" if os.name == "nt" else "verify-updater-signature")))
     with tempfile.TemporaryDirectory(prefix="updater-final-verification-") as temporary:

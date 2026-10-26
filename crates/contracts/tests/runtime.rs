@@ -536,6 +536,41 @@ fn release_set_requires_exact_unique_targets_and_verifies_root_digest_and_domain
 }
 
 #[test]
+fn desktop_04_release_set_requires_exactly_three_desktop_targets() {
+    let mut root = release_set();
+    root.runtime_version = "0.4.0".to_owned();
+    root.artifacts
+        .retain(|artifact| artifact.platform != "android");
+    let verify = |root: &RuntimeReleaseSetManifestV1| {
+        let bytes = canonical(root);
+        let signature = sign(RUNTIME_RELEASE_SET_SIGNATURE_DOMAIN, &bytes);
+        verify_runtime_release_set_manifest(&bytes, &signature, &public_key(), &sha256_hex(&bytes))
+    };
+    assert!(verify(&root).is_ok());
+    root.artifacts.pop();
+    assert_eq!(
+        verify(&root).unwrap_err(),
+        RuntimeManifestError::InvalidReleaseSet
+    );
+    let mut with_android = release_set();
+    with_android.runtime_version = "0.4.1".to_owned();
+    assert_eq!(
+        verify(&with_android).unwrap_err(),
+        RuntimeManifestError::InvalidReleaseSet
+    );
+    let mut stable = release_set();
+    stable.runtime_version = "0.3.8".to_owned();
+    assert!(verify(&stable).is_ok());
+    stable
+        .artifacts
+        .retain(|artifact| artifact.platform != "android");
+    assert_eq!(
+        verify(&stable).unwrap_err(),
+        RuntimeManifestError::InvalidReleaseSet
+    );
+}
+
+#[test]
 fn release_set_schema_cannot_embed_its_own_root_hash() {
     let root = release_set();
     let mut value = serde_json::to_value(root).unwrap();

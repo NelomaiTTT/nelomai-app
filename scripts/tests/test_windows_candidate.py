@@ -50,6 +50,7 @@ class WindowsCandidateTest(ArtifactFixture):
         shutil.copyfile(self.final_public, self.draft / "runtime-public-key.raw")
         self.signed = self.root / "signed"
         self.addCleanup(patch.stopall)
+        patch.object(self.candidate.gates, "STABLE_VERSION", "0.2.20").start()
         patch.object(self.candidate.gates, "STABLE_SOURCE", SOURCE).start()
         patch.object(self.candidate.gates, "STABLE_ROOT_SHA256", self.stable_digest).start()
 

@@ -340,7 +340,7 @@ def run() -> None:
         raise RuntimeError("Android diagnostics use another AmneziaWG Go revision")
     # Authorization is checked as a parsed job graph, not old inline build
     # command tokens that no longer describe the native phase consumers.
-    subprocess.run([sys.executable, "-m", "unittest", "scripts.tests.test_release_workflow"],
+    subprocess.run([sys.executable, "-m", "unittest", "scripts.tests.test_release_workflow", "scripts.tests.test_desktop_release"],
                    cwd=ROOT, check=True)
     consumers = "\n".join((ROOT / name).read_text(encoding="utf-8") for name in (
         "scripts/build-release-platform.py", "scripts/package-release-platform.py",
