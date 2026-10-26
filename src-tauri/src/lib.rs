@@ -473,19 +473,6 @@ pub(crate) async fn upload_automatic_diagnostics_once(
 }
 
 #[cfg(desktop)]
-pub(crate) async fn upload_latest_automatic_diagnostics_for_logout(
-    application: &NativeApplication,
-    diagnostics: &diagnostics::AppDiagnostics,
-) {
-    for _ in 0..50 {
-        if upload_automatic_diagnostics(application, diagnostics, true).await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[cfg(desktop)]
 async fn upload_automatic_diagnostics(
     application: &NativeApplication,
     diagnostics: &diagnostics::AppDiagnostics,
@@ -699,6 +686,7 @@ struct DesktopPairObservation {
 async fn coordinate_desktop_redundancy<T, S, TF, SF>(
     schedule: &mut DesktopCoordinationSchedule,
     now: i64,
+    diagnostics: Option<(&diagnostics::AppDiagnostics, &str)>,
     tick: T,
     status: S,
 ) -> DesktopPairObservation
@@ -724,49 +712,102 @@ where
     if schedule.pending.is_none() && now >= schedule.retry_at_unix {
         schedule.pending = Some(tokio::spawn(tick()));
     }
-    if let Some(pending) = schedule.pending.as_mut() {
+    let completed = if let Some(pending) = schedule.pending.as_mut() {
         // Poll the same task, not a fresh future on each metrics tick. Network
         // calls retain their existing API deadlines; UI polling cannot cancel
         // every slow probe/lease preparation halfway through its work.
         if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await {
             schedule.pending = None;
-            let retry = match result {
-                Ok(Ok(_)) => None,
-                result => Some(
-                    match result {
-                        #[cfg(target_os = "linux")]
-                        Ok(Err(ApplicationError::Core(CoreError::Tunnel(code))))
-                            if matches!(
-                                code.as_str(),
-                                "endpoint_resolution_timeout" | "endpoint_resolution_failed"
-                            ) =>
-                        {
-                            Some(1)
-                        }
-                        Ok(Err(
-                            ApplicationError::Api(CoreApiError::Rejected {
-                                retry_after_seconds,
-                                ..
-                            })
-                            | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                                retry_after_seconds,
-                                ..
-                            })),
-                        )) => retry_after_seconds,
-                        _ => None,
+            Some(result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Always obtain fresh local status, even while the panel request is pending.
+    let step = tokio::time::timeout(std::time::Duration::from_secs(2), status()).await;
+    if let Some(result) = completed {
+        // A committed local promotion can retry its role report next poll.
+        // Confirmed-role member/acquire failures and server rejections keep
+        // their existing backoff; Core rechecks every owner/auth/generation fence.
+        let ready_role_retry = matches!(
+            &result,
+            Ok(Err(ApplicationError::Api(CoreApiError::Retryable)
+                | ApplicationError::Core(CoreError::Api(
+                    CoreApiError::Retryable
+                ))))
+        ) && matches!(
+            &step,
+            Ok(Ok(Some(snapshot))) if {
+                let active = usize::from(
+                    snapshot.session.active == nelomai_client_tunnel::redundancy::Slot::B,
+                );
+                snapshot.session.phase
+                    == nelomai_client_tunnel::redundancy::session::SessionPhase::Running
+                    && !snapshot.session.role_confirmed
+                    && snapshot.primary_ready
+                    && !snapshot.cleanup_pending
+                    && !snapshot.retirement_pending
+                    && snapshot.session.installed[active]
+                    && snapshot.session.committed[active]
+                    && snapshot.leases[active].is_some()
+                    && snapshot.leases[active] == snapshot.current_leases[active]
+            }
+        );
+        let retry = match &result {
+            Ok(Ok(_)) => None,
+            result => Some(
+                match result {
+                    #[cfg(target_os = "linux")]
+                    Ok(Err(ApplicationError::Core(CoreError::Tunnel(code))))
+                        if matches!(
+                            code.as_str(),
+                            "endpoint_resolution_timeout" | "endpoint_resolution_failed"
+                        ) =>
+                    {
+                        Some(1)
                     }
-                    .unwrap_or(15)
-                    .max(1),
-                ),
-            };
-            if let Some(retry) = retry {
-                schedule.retry_at_unix =
-                    now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+                    Ok(Err(
+                        ApplicationError::Api(CoreApiError::Rejected {
+                            retry_after_seconds,
+                            ..
+                        })
+                        | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                            retry_after_seconds,
+                            ..
+                        })),
+                    )) => *retry_after_seconds,
+                    _ => None,
+                }
+                .unwrap_or(if ready_role_retry { 1 } else { 15 })
+                .max(1),
+            ),
+        };
+        if let Some(retry) = retry {
+            let previous_retry_at = schedule.retry_at_unix;
+            schedule.retry_at_unix = now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+            if previous_retry_at != schedule.retry_at_unix {
+                if let Some((diagnostics, session_id)) = diagnostics {
+                    let (cause, code) = match &result {
+                        Ok(Err(error)) => ("tick_error", automatic_upload_error_code(error)),
+                        Err(_) => ("tick_join_failure", "task_join_failed".into()),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    diagnostics.record_named(
+                        "desktop.redundancy.retry_scheduled",
+                        Some(session_id),
+                        None,
+                        Some(&format!(
+                            "cause={cause} code={code} scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
+                            schedule.retry_at_unix,
+                            schedule.retry_at_unix.saturating_sub(now),
+                        )),
+                    );
+                }
             }
         }
     }
-    // Always obtain fresh local status, even while the panel request is pending.
-    let step = tokio::time::timeout(std::time::Duration::from_secs(2), status()).await;
     match step {
         Ok(Ok(snapshot)) => DesktopPairObservation {
             owns_tunnel: snapshot.is_some(),
@@ -777,7 +818,22 @@ where
             snapshot: None,
         },
         Err(_) => {
+            let previous_retry_at = schedule.retry_at_unix;
             schedule.retry_at_unix = schedule.retry_at_unix.max(now.saturating_add(15));
+            if previous_retry_at != schedule.retry_at_unix {
+                if let Some((diagnostics, session_id)) = diagnostics {
+                    diagnostics.record_named(
+                        "desktop.redundancy.retry_scheduled",
+                        Some(session_id),
+                        None,
+                        Some(&format!(
+                            "cause=status_timeout scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
+                            schedule.retry_at_unix,
+                            schedule.retry_at_unix.saturating_sub(now),
+                        )),
+                    );
+                }
+            }
             DesktopPairObservation {
                 owns_tunnel: true,
                 snapshot: None,
@@ -837,9 +893,12 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             #[cfg(not(target_os = "android"))]
+            let coordination_now = current_unix_time();
+            #[cfg(not(target_os = "android"))]
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
-                current_unix_time(),
+                coordination_now,
+                Some((&diagnostics, &context.session_id)),
                 || {
                     let application = application.clone();
                     async move {
@@ -1818,6 +1877,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             100,
+            None,
             move || async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 worker.store(true, Ordering::SeqCst);
@@ -1830,6 +1890,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             102,
+            None,
             || async { panic!("must continue the in-flight probe, not start another") },
             || async { Ok(None) },
         )
@@ -1855,6 +1916,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
+                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1881,6 +1943,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                None,
                 || async { panic!("no retry before panel delay") },
                 || async {
                     status_calls.set(status_calls.get() + 1);
@@ -1896,6 +1959,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 55,
+                None,
                 {
                     let calls = tick_calls.clone();
                     move || async move {
@@ -1938,6 +2002,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100,
+                None,
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Err(ApplicationError::Core(error))
@@ -1949,6 +2014,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100 + delay - 1,
+                None,
                 || async { panic!("no retry before the delay expires") },
                 || async { Ok(None) },
             )
@@ -1958,6 +2024,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100 + delay,
+                None,
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     Ok(None)
@@ -1971,12 +2038,199 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
+    async fn desktop_coordination_retries_ready_role_after_transient_error_without_shortening_other_backoff(
+    ) {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreApiError;
+        use nelomai_client_tunnel::redundancy::{
+            protocol::Snapshot, session::SessionState, SessionScope, Slot,
+        };
+
+        for (case, next_tick_at) in [
+            ("healthy", 11),
+            ("transient_role", 11),
+            ("transient_core_role", 11),
+            ("rate_limited", 55),
+            ("rejected_without_hint", 25),
+            ("unauthorized", 25),
+            ("confirmed_member", 25),
+            ("unknown_status", 25),
+            ("cleanup_pending", 25),
+            ("retirement_pending", 25),
+            ("unready", 25),
+            ("uncommitted", 25),
+            ("wrong_current", 25),
+        ] {
+            let scope = SessionScope {
+                runtime: nelomai_contracts::RuntimeSlot::Latest,
+                runtime_generation: 1,
+                connection_generation: 1,
+                session_id: "11111111-1111-4111-8111-111111111111".into(),
+            };
+            let mut state = SessionState::new(scope.clone(), Slot::A, 0, 0).unwrap();
+            state.primary_started(&scope).unwrap();
+            let standby = state.install_ticket(&scope, Slot::B).unwrap();
+            state.standby_installed(standby, 1).unwrap();
+            let promotion = state.promotion_ticket(&scope, Slot::B).unwrap();
+            state.promote(promotion, || Ok::<_, ()>(())).unwrap();
+            if case == "confirmed_member" {
+                assert!(state.ack_role(&state.role_update().unwrap(), 1));
+            }
+            let mut snapshot = Snapshot {
+                session: state.snapshot(),
+                leases: [Some("a".into()), Some("b".into())],
+                current_leases: [Some("a".into()), Some("b".into())],
+                standby_failed: case == "confirmed_member",
+                stalled: false,
+                primary_ready: case != "unready",
+                standby_ready: true,
+                cleanup_pending: case == "cleanup_pending",
+                retirement_pending: case == "retirement_pending",
+                warm_stop_v1: false,
+            };
+            if case == "uncommitted" {
+                snapshot.session.committed[1] = false;
+            }
+            if case == "wrong_current" {
+                snapshot.current_leases[1] = Some("other".into());
+            }
+            let mut schedule = DesktopCoordinationSchedule::default();
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                10,
+                None,
+                move || async move {
+                    match case {
+                        "healthy" => Ok(None),
+                        "transient_role" => Err(ApplicationError::Api(CoreApiError::Retryable)),
+                        "unauthorized" => Err(ApplicationError::Api(CoreApiError::Unauthorized)),
+                        "rejected_without_hint" => {
+                            Err(ApplicationError::Api(CoreApiError::Rejected {
+                                code: "rate_limited".into(),
+                                message: "private".into(),
+                                retry_after_seconds: None,
+                            }))
+                        }
+                        "rate_limited" => Err(ApplicationError::Api(CoreApiError::Rejected {
+                            code: "rate_limited".into(),
+                            message: "private".into(),
+                            retry_after_seconds: Some(45),
+                        })),
+                        _ => Err(ApplicationError::Core(nelomai_client_core::CoreError::Api(
+                            CoreApiError::Retryable,
+                        ))),
+                    }
+                },
+                || async {
+                    if case == "unknown_status" {
+                        Err(ApplicationError::Storage)
+                    } else {
+                        Ok(Some(snapshot.clone()))
+                    }
+                },
+            )
+            .await;
+
+            let state = Arc::new(std::sync::Mutex::new(state));
+            let tick_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for now in [11, 24, 25, 55] {
+                let observation = coordinate_desktop_redundancy(
+                    &mut schedule,
+                    now,
+                    None,
+                    {
+                        let state = state.clone();
+                        let tick_calls = tick_calls.clone();
+                        move || async move {
+                            tick_calls.lock().unwrap().push(now);
+                            let mut state = state.lock().unwrap();
+                            if let Some(update) = state.role_update() {
+                                assert!(state.ack_role(&update, 1));
+                            }
+                            Ok(None)
+                        }
+                    },
+                    || async {
+                        Ok(Some(Snapshot {
+                            session: state.lock().unwrap().snapshot(),
+                            ..snapshot.clone()
+                        }))
+                    },
+                )
+                .await;
+                assert!(observation.owns_tunnel, "{case} at {now}");
+                let observed = observation.snapshot.unwrap();
+                assert_eq!(observed.session.active, Slot::B);
+                if now < next_tick_at {
+                    assert!(tick_calls.lock().unwrap().is_empty(), "{case} at {now}");
+                } else {
+                    assert!(observed.session.role_confirmed, "{case} at {now}");
+                }
+            }
+            assert_eq!(tick_calls.lock().unwrap()[0], next_tick_at, "{case}");
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_retry_diagnostics_distinguish_tick_error_and_status_timeout() {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreApiError;
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let mut schedule = DesktopCoordinationSchedule::default();
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            100,
+            Some((&diagnostics, "experiment-session")),
+            || async {
+                Err(ApplicationError::Api(CoreApiError::Rejected {
+                    code: "rate_limited".into(),
+                    message: "private panel payload".into(),
+                    retry_after_seconds: Some(45),
+                }))
+            },
+            || async { Ok(None) },
+        )
+        .await;
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(log.contains("desktop.redundancy.retry_scheduled"));
+        assert!(log.contains("cause=tick_error code=rate_limited"));
+        assert!(log.contains("scheduler_now_unix=100 retry_at_unix=145"));
+        assert!(!log.contains("private panel payload"));
+
+        // A later local Status timeout extends an existing backoff. It must
+        // carry its own cause rather than inherit the earlier panel failure.
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            140,
+            Some((&diagnostics, "experiment-session")),
+            || async { panic!("backoff must still suppress the tick") },
+            std::future::pending,
+        )
+        .await;
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(log.contains("cause=status_timeout"));
+        assert!(log.contains("scheduler_now_unix=140 retry_at_unix=155"));
+        assert_eq!(schedule.retry_at_unix, 155);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
     async fn desktop_coordination_unknown_status_blocks_legacy_repair_while_tick_remains_pending() {
         let mut schedule = DesktopCoordinationSchedule::default();
         assert!(
-            coordinate_desktop_redundancy(&mut schedule, 100, std::future::pending, || async {
-                Err(nelomai_client_application::ApplicationError::Storage)
-            })
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                100,
+                None,
+                std::future::pending,
+                || async { Err(nelomai_client_application::ApplicationError::Storage) }
+            )
             .await
             .owns_tunnel
         );
@@ -2013,6 +2267,7 @@ mod tests {
         let observation = coordinate_desktop_redundancy(
             &mut schedule,
             10,
+            None,
             || async { Ok(None) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -2025,6 +2280,7 @@ mod tests {
         let fresh = coordinate_desktop_redundancy(
             &mut schedule,
             11,
+            None,
             move || async move { Ok(Some(stale)) },
             || async { Ok(Some(snapshot.clone())) },
         )
@@ -2034,6 +2290,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                None,
                 || async { Ok(None) },
                 || async { Ok(None) }
             )

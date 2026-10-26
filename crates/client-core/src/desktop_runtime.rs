@@ -377,7 +377,44 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             // the VIP. Pooled connections still belong to the previous route.
             #[cfg(target_os = "linux")]
             self.api.reset_transport()?;
-            let response = self.api.report_redundant_role(&access, &request).await?;
+            let started = Instant::now();
+            self.logger.record(CoreLogEvent {
+                kind: "desktop.redundancy.role_report_started",
+                operation_id: Some(pair.session.session_id.clone()),
+                request_id: None,
+                code: None,
+            });
+            let response = match self.api.report_redundant_role(&access, &request).await {
+                Ok(response) => {
+                    self.logger.record_timed(
+                        CoreLogEvent {
+                            kind: "desktop.redundancy.role_report_succeeded",
+                            operation_id: Some(pair.session.session_id.clone()),
+                            request_id: Some(response.request_id.clone()),
+                            code: None,
+                        },
+                        elapsed_millis(started),
+                    );
+                    response
+                }
+                Err(error) => {
+                    self.logger.record_timed(
+                        CoreLogEvent {
+                            kind: "desktop.redundancy.role_report_failed",
+                            operation_id: Some(pair.session.session_id.clone()),
+                            request_id: None,
+                            code: Some(match &error {
+                                CoreApiError::Unauthorized => "signed_out".into(),
+                                CoreApiError::AccessExpired => "access_expired".into(),
+                                CoreApiError::Retryable => "temporary_network_error".into(),
+                                CoreApiError::Rejected { code, .. } => code.clone(),
+                            }),
+                        },
+                        elapsed_millis(started),
+                    );
+                    return Err(error.into());
+                }
+            };
             let _writer = self.connection_gate.lock().await;
             let mut current = self.load_runtime()?;
             if current.auth_scope != stored.auth_scope
@@ -400,6 +437,15 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             desktop_redundancy::validate_snapshot(&next, current.slot, &confirmed)?;
             current.desktop_redundancy = Some(next);
             self.store.save(&current).map_err(|_| CoreError::Storage)?;
+            self.logger.record_timed(
+                CoreLogEvent {
+                    kind: "desktop.redundancy.role_confirmed",
+                    operation_id: Some(pair.session.session_id.clone()),
+                    request_id: Some(response.request_id.clone()),
+                    code: None,
+                },
+                elapsed_millis(started),
+            );
             return Ok(Some(confirmed));
         } else if pair.primary_reported && snapshot.primary_ready && pair.candidate.is_none() {
             if let Some(request) = pair.pending_acquire.as_ref() {
