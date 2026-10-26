@@ -1,5 +1,11 @@
 # Automatic Connection Intent Recovery Implementation Plan
 
+> Killswitch integration update, 26 October 2026: use the current
+> [scoped killswitch plan](2026-08-23-scoped-kill-switch.md) and its specification
+> for local Stop (independent of server cleanup), 20-second notifications and
+> verified enforcement/unknown-state handling. Historical recovery recipes below
+> do not override those decisions or require a second killswitch coordinator.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Сделать одно пользовательское нажатие `Старт` устойчивым намерением подключения: временные ошибки повторяются автоматически, зависший dynamic AWG3 заменяется без ручного второго запуска, а Android сохраняет безопасное восстановление и cleanup после смерти UI/VPN-процесса.
