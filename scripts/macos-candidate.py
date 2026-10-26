@@ -37,7 +37,7 @@ def source(sha, *, root=builder.ROOT, environment=None, keyless=False):
     gates.full_source(sha)
     if (env.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
             or (env.get('GITHUB_REPOSITORY'), env.get('GITHUB_REF'), env.get('GITHUB_SHA')) != (
-                'NelomaiTTT/nelomai-app', 'refs/heads/Future/macos-hot-standby-0.4.0', sha)):
+                'NelomaiTTT/nelomai-app', 'refs/heads/Future/desktop-0.4.0', sha)):
         raise ValueError('macOS candidate requires exact repository/ref/source and manual event')
     if keyless and any(env.get(name) for name in PRIVATE_ENV):
         raise ValueError('native macOS candidate must be private-keyless')

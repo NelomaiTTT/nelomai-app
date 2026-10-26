@@ -115,7 +115,7 @@ class WindowsCandidateTest(ArtifactFixture):
 
     def test_windows_gate_ignores_global_macos_failure_but_requires_exact_windows_jobs(self):
         run = dict(id=17, run_attempt=1, event="push", head_sha=self.source,
-            head_branch="Future/windows-hot-standby-0.4.0", path=".github/workflows/checks.yml",
+            head_branch="Future/desktop-0.4.0", path=".github/workflows/checks.yml",
             repository={"full_name": self.candidate.REPOSITORY}, head_repository={"full_name": self.candidate.REPOSITORY},
             status="in_progress", conclusion=None)
         jobs = [dict(name=n, status="completed", conclusion="success") for n in ("windows-build", "windows-worker-native", "windows")]
@@ -141,7 +141,7 @@ class WindowsCandidateTest(ArtifactFixture):
         for name in ("package.json", "src-tauri/tauri.conf.json"):
             (root / name).write_text('{"version":"0.4.0"}')
         (root / "src-tauri/Cargo.toml").write_text('[package]\nversion="0.4.0"\n')
-        for args in (("init", "-b", "Future/windows-hot-standby-0.4.0"), ("add", "."),
+        for args in (("init", "-b", "Future/desktop-0.4.0"), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "-m", "fixture")):
             subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
         sha = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()

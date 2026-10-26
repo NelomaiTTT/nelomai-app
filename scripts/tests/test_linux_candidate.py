@@ -140,13 +140,13 @@ class LinuxCandidateTest(ArtifactFixture):
             subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
         sha = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
         env = dict(GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REPOSITORY='NelomaiTTT/nelomai-app',
-            GITHUB_REF='refs/heads/Future/linux-hot-standby-0.4.0', GITHUB_SHA=sha,
+            GITHUB_REF='refs/heads/Future/desktop-0.4.0', GITHUB_SHA=sha,
             NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64=base64.b64encode(self.final_public.read_bytes()).decode(),
             NELOMAI_UPDATER_PUBLIC_KEY=self.candidate.UPDATER_PUBLIC)
         with patch.object(self.candidate.gates, 'BASE', sha):
             self.candidate.source(sha, root=root, environment=env, keyless=True)
             self.candidate.source(sha, root=root, environment={**env, 'GITHUB_EVENT_NAME': 'push'}, keyless=True)
-            for override in ({'GITHUB_REF': 'refs/heads/main'}, {'GITHUB_REF': 'refs/heads/Future/windows-hot-standby-0.4.0'},
+            for override in ({'GITHUB_REF': 'refs/heads/main'}, {'GITHUB_REF': 'refs/heads/Future/unrelated'},
                              {'GITHUB_SHA': 'c' * 40}, {'GITHUB_EVENT_NAME': 'pull_request'},
                              {'GITHUB_REPOSITORY': 'foreign/repo'}, {'NELOMAI_UPDATER_PUBLIC_KEY': 'wrong'},
                              {'NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64': ''},
@@ -210,7 +210,7 @@ class LinuxCandidateWorkflowTest(unittest.TestCase):
         workflow = yaml.safe_load(path.read_text())
         triggers = workflow.get('on', workflow.get(True))
         self.assertEqual(set(triggers), {'push', 'workflow_dispatch'})
-        self.assertEqual(triggers['push'], {'branches': ['Future/linux-hot-standby-0.4.0'],
+        self.assertEqual(triggers['push'], {'branches': ['Future/desktop-0.4.0'],
             'paths': ['.github/workflows/linux-candidate.yml']})
         self.assertTrue(triggers['workflow_dispatch']['inputs']['source_sha']['required'])
         self.assertEqual(workflow['permissions'], {'contents': 'read', 'actions': 'read'})
@@ -227,12 +227,12 @@ class LinuxCandidateWorkflowTest(unittest.TestCase):
                     self.assertEqual(job['environment'], 'release-candidate-' + ('signing' if name == 'sign' else 'finalization'))
                 expression = job['if'].replace('&&', ' and ').replace('||', ' or ').strip()
                 allowed = dict(event_name='workflow_dispatch', repository='NelomaiTTT/nelomai-app',
-                    ref='refs/heads/Future/linux-hot-standby-0.4.0', sha=SOURCE)
-                for override, expected in (({}, True), ({'event_name': 'push'}, True),
-                                 ({'event_name': 'push', 'sha': 'b' * 40}, True),
+                    ref='refs/heads/Future/desktop-0.4.0', sha=SOURCE)
+                for override, expected in (({}, True), ({'event_name': 'push'}, False),
+                                 ({'event_name': 'push', 'sha': 'b' * 40}, False),
                                  ({'event_name': 'pull_request'}, False), ({'repository': 'foreign/repo'}, False),
                                  ({'ref': 'refs/heads/main'}, False), ({'sha': 'b' * 40}, False),
-                                 ({'ref': 'refs/heads/Future/windows-hot-standby-0.4.0'}, False)):
+                                 ({'ref': 'refs/heads/Future/unrelated'}, False)):
                     self.assertEqual(bool(eval(expression, {'__builtins__': {}}, {
                         'github': SimpleNamespace(**{**allowed, **override}),
                         'inputs': SimpleNamespace(source_sha=SOURCE)})), expected)

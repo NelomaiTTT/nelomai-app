@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   pull_request:
   push:
-    branches: [main, 'Future/windows-hot-standby-0.4.0']
+    branches: [main, 'Future/desktop-0.4.0']
 
 jobs:
   linux-package-diagnostic:
@@ -198,7 +198,7 @@ jobs:
 
   windows-build:
     if: github.event_name != 'workflow_dispatch'
-    runs-on: "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' && '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON('windows-latest')) }}"
+    runs-on: "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' && '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON('windows-latest')) }}"
     outputs:
       manifest_sha256: ${{ steps.artifact.outputs.manifest_sha256 }}
       artifact_name: ${{ steps.artifact.outputs.artifact_name }}
@@ -295,7 +295,7 @@ jobs:
   windows-native:
     # The trusted 0.4 push validates its selected worker path below.
     # Main/PR still execute the complete legacy compatibility matrix.
-    if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0')
+    if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0')
     needs: [windows-build]
     name: windows-native (${{ matrix.case }})
     runs-on: windows-2022
@@ -372,7 +372,7 @@ jobs:
           retention-days: 1
 
   windows-worker-native:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0'
     needs: [windows-build]
     runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
     timeout-minutes: 15
@@ -430,7 +430,7 @@ jobs:
           BUILD_RESULT: ${{ needs.windows-build.result }}
           NATIVE_RESULT: ${{ needs.windows-native.result }}
           WORKER_RESULT: ${{ needs.windows-worker-native.result }}
-          WORKER_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' }}
+          WORKER_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}
         run: |
           test "$BUILD_RESULT" = success
           if [ "$WORKER_REQUIRED" = true ]; then

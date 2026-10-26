@@ -79,7 +79,7 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     for name in ("frontend", "rust", "android-plugin", "windows-build", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
-    require(native.get("if") == "github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0')",
+    require(native.get("if") == "github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0')",
             "Legacy compatibility must be explicitly skipped only on the trusted worker push; main/PR remain required")
     contracts = jobs["contracts-python"]
     require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
@@ -91,7 +91,7 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
         and contracts["steps"][6] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
             "Contracts Python must export its runner-temp Rustup home before installing the unchanged toolchain")
     require(build["runs-on"] ==
-            "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' "
+            "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' "
             "&& '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON('windows-latest')) }}"
             and native["runs-on"] == "windows-2022",
             "Only trusted worker pushes may build on the worker host; legacy native cases require fresh Windows 2022 runners")
@@ -226,11 +226,11 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     require(aggregate["steps"][0].get("env") == {'BUILD_RESULT': '${{ needs.windows-build.result }}',
  'NATIVE_RESULT': '${{ needs.windows-native.result }}',
  'WORKER_RESULT': '${{ needs.windows-worker-native.result }}',
- 'WORKER_REQUIRED': "${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0' }}"}
+ 'WORKER_REQUIRED': "${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}"}
         and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\nif [ "$WORKER_REQUIRED" = true ]; then\ntest "$NATIVE_RESULT" = skipped\ntest "$WORKER_RESULT" = success\nelse\ntest "$NATIVE_RESULT" = success\ntest "$WORKER_RESULT" = skipped\nfi',
         "Required Windows check must reject cancelled/skipped/failed producer or matrix")
 
-    require(jobs["windows-worker-native"] == {'if': "github.event_name == 'push' && github.ref == 'refs/heads/Future/windows-hot-standby-0.4.0'",
+    require(jobs["windows-worker-native"] == {'if': "github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0'",
  'needs': ['windows-build'],
  'runs-on': ['self-hosted', 'Windows', 'x64', 'nelomai-040-worker-host'],
  'timeout-minutes': 15,

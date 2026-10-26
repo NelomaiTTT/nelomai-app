@@ -2,13 +2,13 @@ name: Linux signed test candidate
 
 on:
   push:
-    branches: [Future/linux-hot-standby-0.4.0]
+    branches: [Future/desktop-0.4.0]
     paths:
       - .github/workflows/linux-candidate.yml
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex HEAD of Future/linux-hot-standby-0.4.0; nonpublishable Linux 0.4.0 candidate
+        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable Linux 0.4.0 candidate
         type: string
         required: true
 
@@ -30,8 +30,8 @@ jobs:
   build:
     if: >-
       github.repository == 'NelomaiTTT/nelomai-app' &&
-      github.ref == 'refs/heads/Future/linux-hot-standby-0.4.0' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha))
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
+      github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
     runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
     timeout-minutes: 90
     steps:
@@ -47,11 +47,11 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/linux-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse refs/remotes/origin/Future/linux-hot-standby-0.4.0)" = "$SOURCE_SHA"
+          test "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
           for name in NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD NELOMAI_MACOS_SIGNING_P12_BASE64 NELOMAI_MACOS_SIGNING_P12_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_API_KEY APPLE_API_KEY_PATH; do
             test -z "${!name:-}"
@@ -95,8 +95,8 @@ jobs:
     needs: build
     if: >-
       github.repository == 'NelomaiTTT/nelomai-app' &&
-      github.ref == 'refs/heads/Future/linux-hot-standby-0.4.0' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha))
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
+      github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
     environment: release-candidate-signing
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -113,11 +113,11 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/linux-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse refs/remotes/origin/Future/linux-hot-standby-0.4.0)" = "$SOURCE_SHA"
+          test "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
           for name in NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD NELOMAI_MACOS_SIGNING_P12_BASE64 NELOMAI_MACOS_SIGNING_P12_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_API_KEY APPLE_API_KEY_PATH; do
             test -z "${!name:-}"
@@ -174,8 +174,8 @@ jobs:
     needs: sign
     if: >-
       github.repository == 'NelomaiTTT/nelomai-app' &&
-      github.ref == 'refs/heads/Future/linux-hot-standby-0.4.0' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha))
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
+      github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
     runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
     timeout-minutes: 90
     steps:
@@ -191,11 +191,11 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/linux-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse refs/remotes/origin/Future/linux-hot-standby-0.4.0)" = "$SOURCE_SHA"
+          test "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
           for name in NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD NELOMAI_MACOS_SIGNING_P12_BASE64 NELOMAI_MACOS_SIGNING_P12_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_API_KEY APPLE_API_KEY_PATH; do
             test -z "${!name:-}"
@@ -242,8 +242,8 @@ jobs:
     needs: package
     if: >-
       github.repository == 'NelomaiTTT/nelomai-app' &&
-      github.ref == 'refs/heads/Future/linux-hot-standby-0.4.0' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha))
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
+      github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
     environment: release-candidate-finalization
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -260,11 +260,11 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/linux-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse refs/remotes/origin/Future/linux-hot-standby-0.4.0)" = "$SOURCE_SHA"
+          test "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
           for name in NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD ANDROID_KEYSTORE_PATH ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD NELOMAI_MACOS_SIGNING_P12_BASE64 NELOMAI_MACOS_SIGNING_P12_PASSWORD APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_API_KEY APPLE_API_KEY_PATH; do
             test -z "${!name:-}"

@@ -2,11 +2,11 @@ name: macOS development
 
 on:
   push:
-    branches: [Future/macos-hot-standby-0.4.0]
+    branches: [Future/desktop-0.4.0]
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex current HEAD of Future/macos-hot-standby-0.4.0
+        description: Full 40-hex current HEAD of Future/desktop-0.4.0
         type: string
         required: true
 
@@ -21,7 +21,7 @@ jobs:
   macos-development:
     if: >-
       github.repository == 'NelomaiTTT/nelomai-app' &&
-      github.ref == 'refs/heads/Future/macos-hot-standby-0.4.0' &&
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, macOS, ARM64, nelomai-040-macos-vm]
     timeout-minutes: 60
@@ -41,11 +41,11 @@ jobs:
           fail() { echo "::error::$*"; exit 1; }
           [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || fail 'Unsupported event'
           [[ "$GITHUB_REPOSITORY" == NelomaiTTT/nelomai-app ]] || fail 'Unexpected repository'
-          [[ "$GITHUB_REF" == refs/heads/Future/macos-hot-standby-0.4.0 ]] || fail 'Unexpected branch'
+          [[ "$GITHUB_REF" == refs/heads/Future/desktop-0.4.0 ]] || fail 'Unexpected branch'
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'source_sha must be a full lowercase 40-hex commit SHA'
           [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]] || fail 'source_sha differs from the workflow source SHA; dispatch the current branch HEAD'
           [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || fail 'Checkout differs from source_sha'
-          [[ "$(git rev-parse refs/remotes/origin/Future/macos-hot-standby-0.4.0)" == "$SOURCE_SHA" ]] || fail 'Branch HEAD moved; run the current source SHA'
+          [[ "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" == "$SOURCE_SHA" ]] || fail 'Branch HEAD moved; run the current source SHA'
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || fail 'Source checkout is not clean'
           [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || fail 'Expected native macOS arm64'
           [[ "$(id -u)" != 0 ]] || fail 'Development checks must run without root'

@@ -192,7 +192,7 @@ class MacosCandidateTest(unittest.TestCase):
 
     def test_source_rejects_foreign_event_branch_sha_and_private_credentials_before_git(self):
         env = dict(GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REPOSITORY='NelomaiTTT/nelomai-app',
-            GITHUB_REF='refs/heads/Future/macos-hot-standby-0.4.0', GITHUB_SHA=self.sha,
+            GITHUB_REF='refs/heads/Future/desktop-0.4.0', GITHUB_SHA=self.sha,
             NELOMAI_UPDATER_PUBLIC_KEY=self.c.UPDATER_PUBLIC,
             NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64=base64.b64encode(self.public.read_bytes()).decode())
         for change in ({'GITHUB_EVENT_NAME': 'pull_request'}, {'GITHUB_REF': 'refs/heads/main'},
@@ -217,10 +217,10 @@ class MacosCandidateWorkflowTest(unittest.TestCase):
             repo.mkdir()
             def git(*args):
                 return subprocess.check_output(['git', '-C', str(repo), *args], text=True, stderr=subprocess.DEVNULL).strip()
-            git('init', '-b', 'Future/macos-hot-standby-0.4.0')
+            git('init', '-b', 'Future/desktop-0.4.0')
             git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'source')
             sha = git('rev-parse', 'HEAD')
-            remote = 'refs/remotes/origin/Future/macos-hot-standby-0.4.0'
+            remote = 'refs/remotes/origin/Future/desktop-0.4.0'
             git('update-ref', remote, sha)
             envfile = root / 'env'
             tools = root / 'bin'
@@ -233,7 +233,7 @@ class MacosCandidateWorkflowTest(unittest.TestCase):
                 tool.write_text('#!/bin/sh\n' + body + '\n')
                 tool.chmod(0o755)
             env = dict(PATH=str(tools) + os.pathsep + os.environ['PATH'], GITHUB_EVENT_NAME='workflow_dispatch',
-                GITHUB_REPOSITORY='NelomaiTTT/nelomai-app', GITHUB_REF='refs/heads/Future/macos-hot-standby-0.4.0',
+                GITHUB_REPOSITORY='NelomaiTTT/nelomai-app', GITHUB_REF='refs/heads/Future/desktop-0.4.0',
                 GITHUB_SHA=sha, SOURCE_SHA=sha, GITHUB_ENV=str(envfile), RUNNER_TEMP=str(root))
             for name, job in workflow['jobs'].items():
                 guard = next(step['run'] for step in job['steps'] if step.get('id') == 'guard')
@@ -267,7 +267,7 @@ class MacosCandidateWorkflowTest(unittest.TestCase):
         for name, job in jobs.items():
             if name not in ('build', 'package'):
                 self.assertNotIn('self-hosted', str(job['runs-on']))
-            self.assertIn("github.ref == 'refs/heads/Future/macos-hot-standby-0.4.0'", job['if'])
+            self.assertIn("github.ref == 'refs/heads/Future/desktop-0.4.0'", job['if'])
             self.assertIn('github.sha == inputs.source_sha', job['if'])
             checkouts = [s for s in job['steps'] if s.get('uses', '').startswith('actions/checkout@')]
             self.assertEqual(checkouts[0]['with']['ref'], '${{ github.sha }}')

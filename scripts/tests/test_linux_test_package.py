@@ -22,7 +22,7 @@ class LinuxWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
         triggers = workflow.get('on', workflow.get(True))
         self.assertEqual(set(triggers), {'push', 'workflow_dispatch'})
-        self.assertEqual(triggers['push'], {'branches': ['Future/linux-hot-standby-0.4.0'],
+        self.assertEqual(triggers['push'], {'branches': ['Future/desktop-0.4.0'],
             'paths': ['.github/workflows/linux-build.yml']})
         self.assertTrue(triggers['workflow_dispatch']['inputs']['source_sha']['required'])
         self.assertEqual(workflow['permissions'], {'contents': 'read'})
@@ -35,12 +35,12 @@ class LinuxWorkflowTest(unittest.TestCase):
         source_expression = job['env']['SOURCE_SHA'].removeprefix('${{').removesuffix('}}').replace(
             '&&', ' and ').replace('||', ' or ').strip()
         allowed = dict(event_name='workflow_dispatch', repository='NelomaiTTT/nelomai-app',
-            ref='refs/heads/Future/linux-hot-standby-0.4.0', sha=SOURCE)
-        for override, expected in (({}, True), ({'event_name': 'push'}, True),
-                         ({'event_name': 'push', 'sha': 'b' * 40}, True),
+            ref='refs/heads/Future/desktop-0.4.0', sha=SOURCE)
+        for override, expected in (({}, True), ({'event_name': 'push'}, False),
+                         ({'event_name': 'push', 'sha': 'b' * 40}, False),
                          ({'event_name': 'pull_request'}, False),
                          ({'repository': 'foreign/nelomai-app'}, False), ({'ref': 'refs/heads/main'}, False),
-                         ({'ref': 'refs/heads/Future/windows-hot-standby-0.4.0'}, False),
+                         ({'ref': 'refs/heads/Future/unrelated'}, False),
                          ({'ref': 'refs/tags/v0.4.0'}, False), ({'sha': 'b' * 40}, False)):
             with self.subTest(override=override):
                 context = {
@@ -76,15 +76,15 @@ class LinuxWorkflowTest(unittest.TestCase):
                             'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'], check=True)
             source = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
             subprocess.run(['git', '-C', str(root), 'update-ref',
-                'refs/remotes/origin/Future/linux-hot-standby-0.4.0', source], check=True)
+                'refs/remotes/origin/Future/desktop-0.4.0', source], check=True)
             env = {'PATH': os.environ['PATH'], 'HOME': temporary, 'SOURCE_SHA': source,
                 'GITHUB_SHA': source, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
                 'GITHUB_REPOSITORY': 'NelomaiTTT/nelomai-app',
-                'GITHUB_REF': 'refs/heads/Future/linux-hot-standby-0.4.0'}
+                'GITHUB_REF': 'refs/heads/Future/desktop-0.4.0'}
             cases = [{}, {'GITHUB_EVENT_NAME': 'push'}, {'SOURCE_SHA': 'b' * 40}, {'SOURCE_SHA': source[:12]},
                 {'GITHUB_SHA': 'b' * 40}, {'GITHUB_EVENT_NAME': 'pull_request'},
                 {'GITHUB_REPOSITORY': 'foreign/repo'}, {'GITHUB_REF': 'refs/heads/main'},
-                {'GITHUB_REF': 'refs/heads/Future/windows-hot-standby-0.4.0'},
+                {'GITHUB_REF': 'refs/heads/Future/unrelated'},
                 *({name: 'private-test-value'} for name in (
                     'NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64', 'TAURI_SIGNING_PRIVATE_KEY',
                     'TAURI_SIGNING_PRIVATE_KEY_PASSWORD', 'ANDROID_KEYSTORE_PATH',

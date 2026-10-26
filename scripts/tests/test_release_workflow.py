@@ -170,14 +170,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
         })
         build = workflow["jobs"]["windows-build"]
         for event, ref, expected in (
-            ("push", "refs/heads/Future/windows-hot-standby-0.4.0", ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"]),
+            ("push", "refs/heads/Future/desktop-0.4.0", ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"]),
             ("push", "refs/heads/main", "windows-latest"),
             ("push", "refs/heads/Future/another-branch", "windows-latest"),
             ("push", "refs/tags/0.4.0", "windows-latest"),
             ("pull_request", "refs/pull/42/merge", "windows-latest"),
-            ("pull_request", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
-            ("pull_request_target", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
-            ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "windows-latest"),
+            ("pull_request", "refs/heads/Future/desktop-0.4.0", "windows-latest"),
+            ("pull_request_target", "refs/heads/Future/desktop-0.4.0", "windows-latest"),
+            ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", "windows-latest"),
         ):
             with self.subTest(event=event, ref=ref):
                 selected = self.expression(build["runs-on"], mode="build_only", context={
@@ -601,14 +601,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
             for row in jobs[name]["strategy"]["matrix"]["include"]:
                 for mode in ("build_only", "sign_candidate", "build_and_publish", "publish_approved_candidate"):
                     for event, ref, sha in (
-                        ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
-                        ("push", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
-                        ("pull_request", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
-                        ("pull_request_target", "refs/heads/Future/windows-hot-standby-0.4.0", "a" * 40),
+                        ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", "a" * 40),
+                        ("push", "refs/heads/Future/desktop-0.4.0", "a" * 40),
+                        ("pull_request", "refs/heads/Future/desktop-0.4.0", "a" * 40),
+                        ("pull_request_target", "refs/heads/Future/desktop-0.4.0", "a" * 40),
                         ("workflow_dispatch", "refs/heads/main", "a" * 40),
                         ("workflow_dispatch", "refs/heads/Future/another-branch", "a" * 40),
                         ("workflow_dispatch", "refs/tags/0.4.0", "a" * 40),
-                        ("workflow_dispatch", "refs/heads/Future/windows-hot-standby-0.4.0", "b" * 40),
+                        ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", "b" * 40),
                     ):
                         with self.subTest(job=name, platform=row["platform"], mode=mode, event=event, ref=ref, sha=sha):
                             selected = self.expression(jobs[name]["runs-on"], mode=mode, context={
@@ -619,7 +619,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                             expected = ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"] if (
                                 row["platform"] == "windows" and mode == "sign_candidate"
                                 and event == "workflow_dispatch"
-                                and ref == "refs/heads/Future/windows-hot-standby-0.4.0" and sha == "a" * 40
+                                and ref == "refs/heads/Future/desktop-0.4.0" and sha == "a" * 40
                             ) else row["runner"]
                             self.assertEqual(selected, expected)
         for name, script, expected in (

@@ -1,7 +1,7 @@
 name: Windows test candidate
 on:
   push:
-    branches: [Future/windows-hot-standby-0.4.0]
+    branches: [Future/desktop-0.4.0]
     paths:
       - .github/workflows/windows-candidate.yml
       - scripts/windows-candidate.py
@@ -22,6 +22,10 @@ env:
   NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
 jobs:
   build:
+    if: >-
+      github.repository == 'NelomaiTTT/nelomai-app' &&
+      github.ref == 'refs/heads/Future/desktop-0.4.0' &&
+      github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
     runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
     timeout-minutes: 60
     defaults:
@@ -36,7 +40,7 @@ jobs:
           persist-credentials: false
       - name: Exact repository/ref/source before local code
         run: |
-          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/windows-hot-standby-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
+          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/desktop-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
           $head = @(git rev-parse HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate HEAD' }
           $status = @(git status --porcelain --untracked-files=normal --ignore-submodules=none)
@@ -84,7 +88,7 @@ jobs:
       - name: Exact repository/ref/source before local code
         run: |
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/windows-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
@@ -143,7 +147,7 @@ jobs:
           persist-credentials: false
       - name: Exact repository/ref/source before local code
         run: |
-          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/windows-hot-standby-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
+          if ($env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or $env:GITHUB_REF -cne 'refs/heads/Future/desktop-0.4.0' -or $env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$' -or $env:SOURCE_SHA -cne $env:GITHUB_SHA) { throw 'Candidate source context mismatch' }
           $head = @(git rev-parse HEAD)
           if ($LASTEXITCODE -ne 0) { throw 'Cannot read candidate HEAD' }
           $status = @(git status --porcelain --untracked-files=normal --ignore-submodules=none)
@@ -196,7 +200,7 @@ jobs:
       - name: Exact repository/ref/source before local code
         run: |
           test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
-          test "$GITHUB_REF" = refs/heads/Future/windows-hot-standby-0.4.0
+          test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"

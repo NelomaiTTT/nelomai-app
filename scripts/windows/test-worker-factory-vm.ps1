@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Stop'
 # CI-only: a retained host peer child and one explicitly owned, initially OFF
 # disposable VM. No runner registration, firewall changes or runtime fallback.
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_EVENT_NAME -cne 'push' -or
-    $env:GITHUB_REF -cne 'refs/heads/Future/windows-hot-standby-0.4.0') {
+    $env:GITHUB_REF -cne 'refs/heads/Future/desktop-0.4.0') {
     throw 'Worker VM gate requires the trusted branch push aperture'
 }
 if ($env:COMPUTERNAME -cne $HostName -or $VmId -eq [Guid]::Empty -or $SnapshotId -eq [Guid]::Empty -or
