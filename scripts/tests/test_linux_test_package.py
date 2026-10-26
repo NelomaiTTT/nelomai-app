@@ -28,7 +28,7 @@ class LinuxWorkflowTest(unittest.TestCase):
         self.assertEqual(workflow['permissions'], {'contents': 'read'})
         self.assertEqual(list(workflow['jobs']), ['linux-package-diagnostic'])
         job = workflow['jobs']['linux-package-diagnostic']
-        self.assertEqual(job['runs-on'], ['self-hosted', 'Linux', 'X64', 'nelomai-040-linux-vm'])
+        self.assertEqual(job['runs-on'], 'ubuntu-22.04')
         self.assertNotIn('environment', job)
         self.assertNotIn('strategy', job)
         expression = job['if'].removeprefix('${{').removesuffix('}}').replace('&&', ' and ').replace('||', ' or ').strip()

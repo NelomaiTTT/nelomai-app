@@ -218,7 +218,7 @@ class LinuxCandidateWorkflowTest(unittest.TestCase):
         for name, job in workflow['jobs'].items():
             with self.subTest(job=name):
                 if name in ('build', 'package'):
-                    self.assertEqual(job['runs-on'], ['self-hosted', 'Linux', 'X64', 'nelomai-040-linux-vm'])
+                    self.assertEqual(job['runs-on'], 'ubuntu-22.04')
                     self.assertNotIn('environment', job)
                     for secret in ('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64', 'TAURI_SIGNING_PRIVATE_KEY'):
                         self.assertNotIn('secrets.' + secret, yaml.safe_dump(job))

@@ -170,7 +170,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         })
         build = workflow["jobs"]["windows-build"]
         for event, ref, expected in (
-            ("push", "refs/heads/Future/desktop-0.4.0", ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"]),
+            ("push", "refs/heads/Future/desktop-0.4.0", "windows-latest"),
             ("push", "refs/heads/main", "windows-latest"),
             ("push", "refs/heads/Future/another-branch", "windows-latest"),
             ("push", "refs/tags/0.4.0", "windows-latest"),
@@ -279,6 +279,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
             "always": lambda: True, "cancelled": lambda: cancelled,
             "fromJSON": json.loads, "toJSON": json.dumps, **(context or {}),
         })
+
+    def test_windows_candidate_build_and_package_use_hosted_runners(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/windows-candidate.yml").read_text())
+        for name in ("build", "package"):
+            with self.subTest(job=name):
+                self.assertEqual(workflow["jobs"][name]["runs-on"], "windows-latest")
 
     def test_build_and_publish_uses_existing_signed_candidate_pipeline(self):
         workflow = self.workflow()
@@ -596,7 +602,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         package_windows = next(row for row in jobs["native_packages"]["strategy"]["matrix"]["include"]
                                if row["platform"] == "windows")
         self.assertEqual(package_windows["runner"], "windows-2022")
-        # Only an exact-source Windows candidate on the owner branch uses the PC.
+        # Native release builds use their hosted matrix runner in every mode.
         for name in ("native_drafts", "native_packages"):
             for row in jobs[name]["strategy"]["matrix"]["include"]:
                 for mode in ("build_only", "sign_candidate", "build_and_publish", "publish_approved_candidate"):
@@ -616,12 +622,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                 "github": SimpleNamespace(event_name=event, ref=ref, sha=sha),
                                 "matrix": SimpleNamespace(**row),
                             })
-                            expected = ["self-hosted", "Windows", "x64", "nelomai-040-worker-host"] if (
-                                row["platform"] == "windows" and mode == "sign_candidate"
-                                and event == "workflow_dispatch"
-                                and ref == "refs/heads/Future/desktop-0.4.0" and sha == "a" * 40
-                            ) else row["runner"]
-                            self.assertEqual(selected, expected)
+                            self.assertEqual(selected, row["runner"])
         for name, script, expected in (
             ("native_drafts", "scripts/build-release-platform.py", [
                 "--mode", "$RELEASE_MODE", "--source-sha", "$SOURCE_SHA", "--platform", "$PLATFORM",

@@ -90,11 +90,8 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
         "run": 'echo "RUSTUP_HOME=$RUNNER_TEMP/nelomai-contracts-rustup" >> "$GITHUB_ENV"'}
         and contracts["steps"][6] == {"uses": "dtolnay/rust-toolchain@master", "with": {"toolchain": "1.88.0"}},
             "Contracts Python must export its runner-temp Rustup home before installing the unchanged toolchain")
-    require(build["runs-on"] ==
-            "${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' "
-            "&& '[\"self-hosted\",\"Windows\",\"x64\",\"nelomai-040-worker-host\"]' || toJSON('windows-latest')) }}"
-            and native["runs-on"] == "windows-2022",
-            "Only trusted worker pushes may build on the worker host; legacy native cases require fresh Windows 2022 runners")
+    require(build["runs-on"] == "windows-latest" and native["runs-on"] == "windows-2022",
+            "Windows builds require GitHub-hosted runners; legacy native cases require fresh Windows 2022 runners")
     require("strategy" not in build and "needs" not in build, "Windows common build must execute only once")
     require(native.get("needs") == ["windows-build"], "Native execution must require the successful common build")
     require(build.get("env") == {"SOURCE_SHA": "${{ github.sha }}"}, "Build must pin the current source")

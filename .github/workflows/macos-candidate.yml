@@ -2,7 +2,7 @@ name: macOS signed test candidate
 
 on:
   # Registers this branch workflow without building; dispatch after its exact-SHA
-  # macOS development run is green on the single dedicated local VM.
+  # macOS development run is green on a GitHub-hosted Apple Silicon runner.
   push:
     branches: [Future/desktop-0.4.0]
     paths:
@@ -15,7 +15,7 @@ on:
         required: true
 
 concurrency:
-  group: macos-candidate-local-vm
+  group: macos-candidate-hosted
   cancel-in-progress: false
 
 permissions:
@@ -38,7 +38,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    runs-on: [self-hosted, macOS, ARM64, nelomai-040-macos-vm]
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1
@@ -96,7 +96,7 @@ jobs:
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
           cargo build --locked -p nelomai-client-updater --example verify-updater-signature
           python -m unittest scripts.tests.test_macos_candidate scripts.tests.test_macos_common_signing
-      - name: Build macOS latest inside the dedicated local VM with production public pins only
+      - name: Build macOS latest on GitHub-hosted Apple Silicon with production public pins only
         run: |
           python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUN_ROOT/runtime-public.raw"
           python scripts/build-release-platform.py --mode sign_candidate --source-sha "$SOURCE_SHA" \
@@ -201,7 +201,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    runs-on: [self-hosted, macOS, ARM64, nelomai-040-macos-vm]
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1

@@ -204,10 +204,10 @@ class MacosCandidateTest(unittest.TestCase):
 
 
 class MacosCandidateWorkflowTest(unittest.TestCase):
-    def test_development_compilation_routes_only_to_the_same_local_vm(self):
+    def test_development_compilation_uses_hosted_apple_silicon(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/macos-development.yml').read_text())
         self.assertEqual(workflow['jobs']['macos-development']['runs-on'],
-                         ['self-hosted', 'macOS', 'ARM64', 'nelomai-040-macos-vm'])
+                         'macos-15')
 
     def test_shell_guard_rejects_foreign_context_moved_head_dirty_tree_and_keys(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/macos-candidate.yml').read_text())
@@ -261,7 +261,7 @@ class MacosCandidateWorkflowTest(unittest.TestCase):
         self.assertTrue(path.is_file(), 'macOS installable candidate workflow missing')
         workflow = yaml.safe_load(path.read_text())
         self.assertEqual(workflow['permissions'], {'contents': 'read', 'actions': 'read'})
-        self.assertEqual(workflow['concurrency'], {'group': 'macos-candidate-local-vm', 'cancel-in-progress': False})
+        self.assertEqual(workflow['concurrency'], {'group': 'macos-candidate-hosted', 'cancel-in-progress': False})
         jobs = workflow['jobs']
         self.assertEqual(set(jobs), {'build', 'sign', 'package', 'common_sign', 'finalize'})
         for name, job in jobs.items():
@@ -283,7 +283,7 @@ class MacosCandidateWorkflowTest(unittest.TestCase):
                 self.assertLessEqual(private, allowed)
             if name in ('build', 'package'):
                 self.assertNotIn('environment', job)
-                self.assertEqual(job['runs-on'], ['self-hosted', 'macOS', 'ARM64', 'nelomai-040-macos-vm'])
+                self.assertEqual(job['runs-on'], 'macos-15')
         self.assertEqual(jobs['sign']['environment'], 'release-candidate-signing')
         self.assertEqual(jobs['common_sign']['environment'], 'release-candidate-finalization')
         self.assertEqual(jobs['finalize']['environment'], 'release-candidate-finalization')

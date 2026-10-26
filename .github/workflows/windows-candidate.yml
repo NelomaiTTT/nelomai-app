@@ -26,7 +26,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
+    runs-on: windows-latest
     timeout-minutes: 60
     defaults:
       run:
@@ -133,7 +133,7 @@ jobs:
           retention-days: 7
   package:
     needs: sign
-    runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
+    runs-on: windows-latest
     timeout-minutes: 60
     defaults:
       run:

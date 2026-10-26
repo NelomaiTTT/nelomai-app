@@ -32,7 +32,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1
@@ -176,7 +176,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7.0.1
