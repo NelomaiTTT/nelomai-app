@@ -143,6 +143,18 @@ impl NetworkSystem for CheckedRows {
         }
         self.rows.read(key)
     }
+    fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+        crate::member_routes::read_many_routes(&mut NativeRowIo, keys, |key| {
+            if self.absent_member(key)? {
+                Ok(None)
+            } else {
+                let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
+                    return Err(failed());
+                };
+                self.proofs.verify(*index).map(Some)
+            }
+        })
+    }
     fn compare_exchange(
         &mut self,
         key: &ResourceKey,
@@ -1350,8 +1362,9 @@ impl NativePairFactory<NativeSessionFiles> {
         let root = self.root.clone();
         let owner = self.owner.clone();
         let runtime = self.runtime;
+        let execution = self.execution.clone();
         super::member_worker_factory::WorkerPairFactory::from_legacy(
-            self, files, root, owner, runtime,
+            self, files, root, owner, runtime, execution,
         )
     }
     pub(crate) fn verify_worker_start_context(&self, runtime: RuntimeSlot) -> io::Result<()> {

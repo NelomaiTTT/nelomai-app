@@ -222,6 +222,7 @@ impl RuntimeRead {
             &executable,
             owner.clone(),
             InstalledRuntimeOrigin::Runtime,
+            None,
         )?;
         let layout = installed.layout();
         let lock = KeyLock {

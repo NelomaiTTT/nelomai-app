@@ -1166,3 +1166,108 @@ impl Drop for Fixture {
         // exits with its original roots retained; ephemeral CI owns the tree.
     }
 }
+
+#[test]
+fn worker_cleanup_source_authenticates_staged_helper_without_engine_rights() {
+    use super::member_carrier_payload::native::WorkerSource;
+    use crate::install_recovery::RecoveryExecutable;
+    let fixture = Fixture::with_selected_runtime(None, true).unwrap();
+    let owner = Arc::new(MutationGuard::at(&fixture.root.join("engine-owner.lock")).unwrap());
+    let engine = WorkerSource::new(&fixture.root, owner.clone(), None).unwrap();
+    assert_eq!(engine.identity(), &fixture.identity);
+    assert_eq!(
+        std::fs::canonicalize(engine.path().unwrap()).unwrap(),
+        std::fs::canonicalize(
+            fixture
+                .executable
+                .with_file_name("nelomai-windows-worker.exe")
+        )
+        .unwrap()
+    );
+    drop(engine);
+
+    let source = fixture.root.parent().unwrap().join("source");
+    let payload = fixture
+        .installation
+        .update_helper_payload(
+            &std::fs::read(source.join(d::MANIFEST_NAME)).unwrap(),
+            &std::fs::read(source.join(d::SIGNATURE_NAME)).unwrap(),
+            &fixture.executable,
+        )
+        .unwrap();
+    let stage = fixture
+        .root
+        .join("update-recovery")
+        .join("stage-1234567890abcdef");
+    std::fs::create_dir_all(&stage).unwrap();
+    let executable = std::fs::canonicalize(payload.write_stage(&stage).unwrap()).unwrap();
+    INPUTS
+        .with(|inputs| inputs.borrow_mut().as_mut().unwrap().executable = Some(executable.clone()));
+    assert!(WorkerSource::new(&fixture.root, owner.clone(), None).is_err());
+    let role = RecoveryExecutable::StagedInstaller;
+    let cleanup = WorkerSource::new(
+        &fixture.root,
+        owner.clone(),
+        Some((&role, fixture.identity.slot)),
+    )
+    .expect("protected signed helper authenticates the OLD worker source");
+    assert_eq!(cleanup.identity(), &fixture.identity);
+    cleanup.verify().unwrap();
+    assert!(
+        cleanup.path().is_err(),
+        "cleanup source cannot launch or adopt a worker"
+    );
+    for path in [
+        executable.clone(),
+        stage.join(d::UPDATE_HELPER_MANIFEST_NAME),
+        stage.join(d::UPDATE_HELPER_SIGNATURE_NAME),
+        fixture.executable.clone(),
+        fixture.executable.with_file_name("wintun.dll"),
+        fixture
+            .executable
+            .with_file_name("nelomai-windows-worker.exe"),
+    ] {
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::rename(&path, path.with_extension("foreign")).is_err());
+    }
+    let foreign_stage = fixture
+        .root
+        .parent()
+        .unwrap()
+        .join("foreign")
+        .join("update-recovery")
+        .join("stage-1234567890abcdef");
+    std::fs::create_dir_all(&foreign_stage).unwrap();
+    let foreign = std::fs::canonicalize(payload.write_stage(&foreign_stage).unwrap()).unwrap();
+    INPUTS.with(|inputs| inputs.borrow_mut().as_mut().unwrap().executable = Some(foreign));
+    assert!(
+        cleanup.verify().is_err(),
+        "each cleanup edge binds the actual helper"
+    );
+    assert!(WorkerSource::new(
+        &fixture.root,
+        owner.clone(),
+        Some((&role, fixture.identity.slot))
+    )
+    .is_err());
+    INPUTS
+        .with(|inputs| inputs.borrow_mut().as_mut().unwrap().executable = Some(executable.clone()));
+    cleanup.verify().unwrap();
+    drop(cleanup);
+    let incoming = RecoveryExecutable::Installer { source };
+    assert!(WorkerSource::new(
+        &fixture.root,
+        owner.clone(),
+        Some((&incoming, fixture.identity.slot))
+    )
+    .is_err());
+    // Same-length changes in the old signed inventory cannot use a valid stage
+    // as a fallback. The original pins above must first have been released.
+    let worker = fixture
+        .executable
+        .with_file_name("nelomai-windows-worker.exe");
+    let mut bytes = std::fs::read(&worker).unwrap();
+    bytes[0] ^= 1;
+    std::fs::write(worker, bytes).unwrap();
+    assert!(WorkerSource::new(&fixture.root, owner, Some((&role, fixture.identity.slot))).is_err());
+}

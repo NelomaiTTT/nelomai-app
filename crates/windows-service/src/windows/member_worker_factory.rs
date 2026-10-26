@@ -6,7 +6,12 @@ use super::{
     member_worker::{self, Control, Store},
     member_worker_guard::Guard,
 };
-use crate::{member_actor::PairFactory, member_pair::FactoryPreparationSlot, ServiceError};
+use crate::{
+    member_actor::PairFactory,
+    member_diagnostic::{context, PairFailure},
+    member_pair::FactoryPreparationSlot,
+    ServiceError,
+};
 use nelomai_client_tunnel::redundancy::{
     control::SessionControl, protocol::Command, session::SessionPhase,
 };
@@ -29,6 +34,7 @@ pub(crate) struct WorkerPairFactory {
     root: PathBuf,
     owner: Arc<MutationGuard>,
     runtime: RuntimeSlot,
+    execution: crate::install_recovery::RecoveryExecutable,
     preparation: FactoryPreparationSlot<SessionControl<Control, Store>>,
     recovery: Option<member_worker::SharedJournal>,
     recovery_guard: Option<
@@ -54,6 +60,7 @@ impl WorkerPairFactory {
         root: PathBuf,
         owner: Arc<MutationGuard>,
         runtime: RuntimeSlot,
+        execution: crate::install_recovery::RecoveryExecutable,
     ) -> Self {
         Self {
             legacy,
@@ -61,6 +68,7 @@ impl WorkerPairFactory {
             root,
             owner,
             runtime,
+            execution,
             preparation: FactoryPreparationSlot::default(),
             recovery: None,
             recovery_guard: None,
@@ -85,7 +93,9 @@ impl PairFactory for WorkerPairFactory {
     type Store = Store;
     fn recover(&mut self, runtime: RuntimeSlot) -> Result<(), ServiceError> {
         let result = (|| {
-            self.owner.verify_at(&self.root.join("engine-owner.lock"))?;
+            self.owner
+                .verify_at(&self.root.join("engine-owner.lock"))
+                .map_err(|e| context("worker_cold_owner", e))?;
             if runtime != self.runtime {
                 return Err(io::Error::other("worker_recovery_runtime"));
             }
@@ -99,23 +109,29 @@ impl PairFactory for WorkerPairFactory {
                     Ok(())
                 })?;
             }
-            let mut private = MemberFiles::new().map_err(|_| io::Error::other("worker_private"))?;
-            let record = private.transaction(|files| files.read(PrivateFile::Worker))?;
+            let mut private =
+                MemberFiles::new().map_err(|e| PairFailure::owner("worker_cold_read", e))?;
+            let record = private
+                .transaction(|files| files.read(PrivateFile::Worker))
+                .map_err(|e| context("worker_cold_read", e))?;
             if let Some(bytes) = record {
                 if self.recovery.is_some() {
                     return Err(io::Error::other("worker_cold_previous_attempt"));
                 }
-                let data: member_worker::Record = serde_json::from_slice(&bytes)?;
+                let data: member_worker::Record = serde_json::from_slice(&bytes)
+                    .map_err(|e| context("worker_cold_decode", e.into()))?;
                 if data.scope.runtime != runtime || !data.scope.validate() {
                     return Err(io::Error::other("worker_cold_scope"));
                 }
                 let mut files = self
                     .files
-                    .recovery_view(runtime)?
+                    .recovery_view(runtime)
+                    .map_err(|e| context("worker_cold_protected_context", e))?
                     .map(|(files, _)| files)
                     .unwrap_or_else(|| self.files.clone());
-                let selected =
-                    files.inspect_recovery_records(runtime, |facts| Ok(facts.clone()))?;
+                let selected = files
+                    .inspect_recovery_records(runtime, |facts| Ok(facts.clone()))
+                    .map_err(|e| context("worker_cold_protected_context", e))?;
                 if data.stopped || (selected.is_none() && files.verify_completed_worker().is_ok()) {
                     member_worker::terminal_identity(&bytes, !data.stopped)?;
                     files.verify_completed_worker()?;
@@ -137,14 +153,18 @@ impl PairFactory for WorkerPairFactory {
                             *kind != super::member_session::RecordKind::Session && record.is_some()
                         })
                     {
-                        return Err(io::Error::other("worker_cold_protected_context"));
+                        return Err(context(
+                            "worker_cold_protected_context",
+                            io::ErrorKind::Other.into(),
+                        ));
                     }
                     let source = Rc::new(
                         super::member_carrier_payload::native::WorkerSource::new(
                             &self.root,
                             self.owner.clone(),
+                            Some((&self.execution, runtime)),
                         )
-                        .map_err(|e| io::Error::other(format!("worker_cold_source:{e:?}")))?,
+                        .map_err(|e| context("worker_cold_source", io::Error::other(e)))?,
                     );
                     let allow_effects = data.version == 2
                         && data.creator.is_some()
@@ -176,7 +196,10 @@ impl PairFactory for WorkerPairFactory {
                         retained: None,
                     }));
                     self.recovery = Some(journal.clone());
-                    journal.borrow_mut().verify()?;
+                    journal
+                        .borrow_mut()
+                        .verify()
+                        .map_err(|e| context("worker_cold_initial_verify", e))?;
                     let mut routes =
                         nelomai_client_tunnel::redundancy::network::NetworkOwner::recover(
                             member_worker::WorkerIdentity {
@@ -186,19 +209,22 @@ impl PairFactory for WorkerPairFactory {
                             },
                             member_worker::RouteJournal(journal.clone(), physical),
                             journal.borrow().current.network.clone(),
-                        )?;
+                        )
+                        .map_err(|e| context("worker_cold_routes", e))?;
                     routes
                         .cleanup()
-                        .map_err(|e| io::Error::other(format!("worker_cold_routes:{e}")))?;
+                        .map_err(|e| context("worker_cold_routes", e))?;
                     if allow_effects {
-                        member_worker::Control::restore_dns(journal.clone(), None).map_err(
-                            |e| io::Error::other(format!("worker_cold_DNS_restore:{e}")),
-                        )?;
+                        member_worker::Control::restore_dns(journal.clone(), None)
+                            .map_err(|e| context("worker_cold_DNS_restore", e))?;
                     }
-                    journal.borrow_mut().save(|record| {
-                        record.dns = None;
-                        record.address = None;
-                    })?;
+                    journal
+                        .borrow_mut()
+                        .save(|record| {
+                            record.dns = None;
+                            record.address = None;
+                        })
+                        .map_err(|e| context("worker_cold_save", e))?;
                     let scope = journal.borrow().current.scope.clone();
                     let cold = super::member_carrier_guard::issue_cold_static_cleanup(
                         scope,
@@ -208,9 +234,9 @@ impl PairFactory for WorkerPairFactory {
                             Ok(())
                         },
                     )
-                    .map_err(|e| io::Error::other(format!("worker_cold_WFP_open:{e:?}")))?;
+                    .map_err(|e| PairFailure::guard("worker_cold_WFP_open", e))?;
                     cold.cleanup(allow_effects)
-                        .map_err(|e| io::Error::other(format!("worker_cold_WFP_delete:{e:?}")))?;
+                        .map_err(|e| PairFailure::guard("worker_cold_WFP_delete", e))?;
                     if cold.disposition() != (true, true, false) {
                         return Err(io::Error::other("worker_cold_WFP_unconfirmed"));
                     }
@@ -536,7 +562,8 @@ impl PairFactory for WorkerPairFactory {
                                 } else {
                                     journal.current.interface
                                 },
-                            )?
+                            )
+                            .map_err(|e| context("worker_cold_MIB_absence", e))?
                         };
                         if gone {
                             break;
@@ -553,18 +580,24 @@ impl PairFactory for WorkerPairFactory {
                         journal.borrow().current.requested_guid,
                         &name,
                     )
-                    .map_err(|e| io::Error::other(format!("worker_cold_PnP_absence:{e:?}")))?;
+                    .map_err(|_| context("worker_cold_PnP", io::ErrorKind::Other.into()))?;
                     journal.borrow_mut().retirement_verified = true;
-                    journal.borrow_mut().verify()?;
+                    journal
+                        .borrow_mut()
+                        .verify()
+                        .map_err(|e| context("worker_cold_retire", e))?;
                     let selected = files
-                        .inspect_recovery_records(runtime, |facts| Ok(facts.clone()))?
+                        .inspect_recovery_records(runtime, |facts| Ok(facts.clone()))
+                        .map_err(|e| context("worker_cold_retire", e))?
                         .ok_or_else(|| io::Error::other("worker_cold_retirement_snapshot"))?;
                     journal.borrow_mut().retirement =
                         Some((files.read_identity(), selected.clone()));
-                    files.retire_native_empty(&selected, journal.as_ref(), |ack| {
-                        journal.borrow_mut().retirement_ack = Some(ack);
-                        Ok(())
-                    })?;
+                    files
+                        .retire_native_empty(&selected, journal.as_ref(), |ack| {
+                            journal.borrow_mut().retirement_ack = Some(ack);
+                            Ok(())
+                        })
+                        .map_err(|e| context("worker_cold_retire", e))?;
                     let ack =
                         journal.borrow().retirement_ack.clone().ok_or_else(|| {
                             io::Error::other("worker_cold_retirement_unconfirmed")
@@ -572,8 +605,13 @@ impl PairFactory for WorkerPairFactory {
                     if !ack.matches_origin(&files.read_identity()) {
                         return Err(io::Error::other("worker_cold_retirement_origin"));
                     }
-                    journal.borrow_mut().verify()?;
-                    files.verify_completed_worker()?;
+                    journal
+                        .borrow_mut()
+                        .verify()
+                        .map_err(|e| context("worker_cold_retire", e))?;
+                    files
+                        .verify_completed_worker()
+                        .map_err(|e| context("worker_cold_retire", e))?;
                 }
             }
             self.legacy
