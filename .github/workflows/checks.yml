@@ -444,7 +444,7 @@ jobs:
           fi
 
   macos:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch' && !(github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && github.event_name == 'push')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -484,3 +484,92 @@ jobs:
       - run: cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
       - run: python contracts/python/validate_fixtures.py
       - run: python scripts/release-workflow-check.py
+
+  macos-development:
+    if: github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && github.event_name == 'push'
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require exact current source and unprivileged Apple Silicon runner
+        id: guard
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || fail 'Unsupported event'
+          [[ "$GITHUB_REPOSITORY" == NelomaiTTT/nelomai-app ]] || fail 'Unexpected repository'
+          [[ "$GITHUB_REF" == refs/heads/Future/desktop-0.4.0 ]] || fail 'Unexpected branch'
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'source_sha must be a full lowercase 40-hex commit SHA'
+          [[ "$SOURCE_SHA" == "$GITHUB_SHA" ]] || fail 'source_sha differs from the workflow source SHA; dispatch the current branch HEAD'
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]] || fail 'Checkout differs from source_sha'
+          [[ "$(git rev-parse refs/remotes/origin/Future/desktop-0.4.0)" == "$SOURCE_SHA" ]] || fail 'Branch HEAD moved; run the current source SHA'
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || fail 'Source checkout is not clean'
+          [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || fail 'Expected native macOS arm64'
+          [[ "$(id -u)" != 0 ]] || fail 'Development checks must run without root'
+      - name: Update Rustup trust before toolchain downloads
+        shell: bash
+        run: if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi
+      - uses: dtolnay/rust-toolchain@master
+        id: rust
+        with:
+          toolchain: 1.88.0
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v7.1.0
+        id: node
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bootstrap Python trust after emSign incident
+        run: |
+          python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+          python -m pip install "certifi==2026.10.19"
+      - name: Install locked frontend dependencies
+        id: npm
+        run: npm ci
+      - name: Build real frontend for the desktop runtime
+        id: frontend
+        run: npm run build
+      # Independent checks retain every failure and still expose compile/test
+      # diagnostics when formatting fails. Guards and setup must have succeeded.
+      - name: macOS installation and identity regressions without privilege
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' }}
+        run: python3 -m unittest discover -s scripts/tests -p 'test_macos_common_*.py'
+      - name: Clippy Unix service targets
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}
+        run: cargo clippy --locked --target "$CARGO_BUILD_TARGET" -p nelomai-unix-service --all-targets -- -D warnings
+      - name: Existing Unix service tests without privilege
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}
+        run: cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-unix-service
+      - name: Shared contract, tunnel, coordinator and application regressions
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}
+        run: >-
+          cargo test --locked --target "$CARGO_BUILD_TARGET"
+          -p nelomai-contracts -p nelomai-client-tunnel
+          -p nelomai-client-core -p nelomai-client-application
+      - name: macOS updater authorization argument tests
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
+        run: cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib platform::updater::macos_tests
+      - name: Clippy desktop application and runtime targets
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
+        run: cargo clippy --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --features desktop-runtime --all-targets -- -D warnings
+      - name: Compile and link service, application and desktop runtime binaries
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
+        run: >-
+          cargo build --locked --target "$CARGO_BUILD_TARGET"
+          -p nelomai-unix-service -p nelomai-app
+          --features nelomai-app/desktop-runtime --bins

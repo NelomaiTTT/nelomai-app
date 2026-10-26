@@ -283,6 +283,34 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                for name in ("windows-build", "windows-native", "windows-worker-native", "windows", "linux-package-diagnostic"))
                 self.assertEqual(actual, expected)
 
+    def test_desktop_push_uses_one_macos_job_without_changing_other_refs(self):
+        checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        jobs = checks["jobs"]
+        self.assertIn("macos-development", jobs)
+        for event, ref, repository, expected in (
+            ("push", "refs/heads/Future/desktop-0.4.0", "NelomaiTTT/nelomai-app", (False, True)),
+            ("push", "refs/heads/main", "NelomaiTTT/nelomai-app", (True, False)),
+            ("push", "refs/heads/other", "NelomaiTTT/nelomai-app", (True, False)),
+            ("pull_request", "refs/pull/12/merge", "NelomaiTTT/nelomai-app", (True, False)),
+            ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", "NelomaiTTT/nelomai-app", (False, False)),
+            ("push", "refs/heads/Future/desktop-0.4.0", "fork/nelomai-app", (True, False)),
+        ):
+            with self.subTest(event=event, ref=ref, repository=repository):
+                context = {"github": SimpleNamespace(event_name=event, ref=ref, repository=repository)}
+                actual = tuple(bool(self.expression(jobs[name]["if"], mode="build_only", context=context))
+                               for name in ("macos", "macos-development"))
+                self.assertEqual(actual, expected)
+        job = jobs["macos-development"]
+        self.assertEqual(job["permissions"], {"contents": "read"})
+        self.assertEqual(job["defaults"]["run"]["shell"], "bash")
+        commands = [step["run"] for step in job["steps"] if "run" in step]
+        self.assertEqual(len(commands), len(set(commands)))
+        self.assertNotIn("cargo fmt --all --check", commands)
+        self.assertFalse(any(command.startswith("cargo check ") for command in commands))
+        for package in ("nelomai-unix-service", "nelomai-app"):
+            self.assertTrue(any(command.startswith("cargo clippy ") and package in command
+                                and "--all-targets" in command for command in commands))
+
     def expression(self, expression, *, mode, result="success", cancelled=False, context=None):
         """Evaluate the boolean/string expressions used by our dispatch graph."""
         expression = expression.removeprefix("${{").removesuffix("}}").strip()

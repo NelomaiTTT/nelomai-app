@@ -206,7 +206,7 @@ class MacosCandidateTest(unittest.TestCase):
 
 class MacosCandidateWorkflowTest(unittest.TestCase):
     def test_development_compilation_uses_hosted_apple_silicon(self):
-        workflow = yaml.safe_load((ROOT / '.github/workflows/macos-development.yml').read_text())
+        workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
         self.assertEqual(workflow['jobs']['macos-development']['runs-on'],
                          'macos-15')
 

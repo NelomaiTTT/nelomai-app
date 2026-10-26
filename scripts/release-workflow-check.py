@@ -61,7 +61,7 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
 
     jobs = workflow["jobs"]
     require(set(jobs) == {"linux-package-diagnostic", "frontend", "rust", "android-plugin",
-                          "windows-build", "windows-native", "windows-worker-native", "windows", "macos", "contracts-python"},
+                          "windows-build", "windows-native", "windows-worker-native", "windows", "macos", "macos-development", "contracts-python"},
             "Checks must retain all six required checks and the isolated Windows graph")
     require("defaults" not in workflow, "Checks cannot override critical command shells")
     build, native, aggregate = (jobs[name] for name in ("windows-build", "windows-native", "windows"))
@@ -76,9 +76,14 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
                 allowed.add("shell")  # Exact bootstrap command/shell is checked below.
             require(set(step) <= allowed,
                     f"{name} steps must execute unconditionally and fail normally")
-    for name in ("frontend", "rust", "android-plugin", "macos", "contracts-python"):
+    for name in ("frontend", "rust", "android-plugin", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
+    desktop_push = "github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && github.event_name == 'push'"
+    require(jobs["macos-development"].get("if") == desktop_push,
+            "Full macOS checks must run only on the trusted desktop branch push")
+    require(jobs["macos"].get("if") == f"github.event_name != 'workflow_dispatch' && !({desktop_push})",
+            "Legacy macOS checks must remain unchanged outside the desktop branch push")
     require(build.get("if") == "github.event_name != 'workflow_dispatch' || (github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && inputs.windows_worker_native)",
             "Windows build must run for normal checks or the trusted optional worker diagnostic")
     dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]
