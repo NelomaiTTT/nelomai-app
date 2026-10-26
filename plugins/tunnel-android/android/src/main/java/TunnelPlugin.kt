@@ -1584,6 +1584,7 @@ internal object TunnelRuntime {
                 } else {
                     null
                 }
+                completeOperationWatchdog(watchdog)
                 onSuccess(
                     statistics.totalRx(),
                     statistics.totalTx(),
@@ -1591,9 +1592,8 @@ internal object TunnelRuntime {
                     target,
                 )
             } catch (error: Throwable) {
-                onError(errorCode(error))
-            } finally {
                 completeOperationWatchdog(watchdog)
+                onError(errorCode(error))
             }
         }
     }
