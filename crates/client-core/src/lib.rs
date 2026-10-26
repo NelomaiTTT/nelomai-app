@@ -1019,6 +1019,9 @@ impl CoreApi for ClientApi {
             &self.clone().with_access_snapshot(access_token)?,
             access_token.access_token(),
             request,
+            // Core atomically invalidates cancelled v2 caches and fences
+            // offline reuse before accepting logical cleanup without an ACK.
+            true,
         )
         .await
         .map_err(Into::into)
@@ -1199,6 +1202,7 @@ struct FailedStartContext<'a> {
     request_id: &'a str,
     operation_id: &'a str,
     redundant_session_id: Option<&'a str>,
+    async_stop_v1: bool,
     cancel_epoch: StartCancellationEpoch,
 }
 
@@ -2320,7 +2324,12 @@ where
             self.ensure_pending_cleanup_scope(Some((&pending, cancel_epoch)))
                 .await?;
             match self
-                .cancel_pending_start(&mut pending, Some(cancel_epoch), &mut auth_refresh_used)
+                .cancel_pending_start(
+                    &mut pending,
+                    Some(cancel_epoch),
+                    &mut auth_refresh_used,
+                    None,
+                )
                 .await
             {
                 Ok(_) => {
@@ -2632,6 +2641,10 @@ where
             request_id: &response.request_id,
             operation_id: &operation_id,
             redundant_session_id,
+            async_stop_v1: response
+                .redundancy
+                .as_ref()
+                .is_some_and(|r| r.async_stop_v1),
             cancel_epoch,
         };
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
@@ -3083,7 +3096,11 @@ where
 
     pub fn has_pending_stop_cleanup(&self) -> Result<bool, CoreError> {
         match self.load_runtime() {
-            Ok(stored) => Ok(stored.pending_compensation_stop.is_some()),
+            Ok(stored) => Ok(stored.pending_compensation_stop.is_some()
+                || stored.pending_start.as_ref().is_some_and(|pending| {
+                    pending.recovery_contract_version == Some(2)
+                        && pending.cancel_operation_id.is_some()
+                })),
             Err(CoreError::SignedOut) => Ok(false),
             Err(error) => Err(error),
         }
@@ -3098,6 +3115,7 @@ where
 
     pub async fn stop(&self) -> Result<Connection, CoreError> {
         self.signal_start_cancellation();
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
         // Android's service owns its whole-session Stop (including cleanup).
         // A Stopping projection in Rust is not a second cleanup intent.
@@ -3119,14 +3137,30 @@ where
                 .ok_or(CoreError::SavedConnectionUnavailable);
         }
         if self.pending_start_active.load(Ordering::SeqCst) {
-            let pending_is_recovery_v2 = self
+            let pending_start = self
                 .store
                 .load()
                 .ok()
                 .flatten()
-                .and_then(|stored| stored.pending_start)
-                .is_some_and(|pending| pending.recovery_contract_version == Some(2));
-            if pending_is_recovery_v2 {
+                .and_then(|stored| stored.pending_start);
+            if let Some(mut pending) =
+                pending_start.filter(|pending| pending.recovery_contract_version == Some(2))
+            {
+                if pending.cancel_operation_id.is_some() {
+                    let mut auth_refresh_used = false;
+                    let cancelled = self
+                        .cancel_pending_start(
+                            &mut pending,
+                            Some(cancel_epoch),
+                            &mut auth_refresh_used,
+                            None,
+                        )
+                        .await?;
+                    let mut state = self.state.lock().await;
+                    self.ensure_start_not_cancelled(cancel_epoch)?;
+                    state.connection = None;
+                    return cancelled.ok_or(CoreError::SavedConnectionUnavailable);
+                }
                 return Err(unresolved_start_operation_error());
             }
             let current = self.state.lock().await.connection.clone();
@@ -3200,6 +3234,14 @@ where
         let Some(mut pending) = stored.pending_start.clone() else {
             return Ok(());
         };
+        if pending.recovery_contract_version == Some(2) && pending.cancel_operation_id.is_some() {
+            let epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
+            let mut auth_refresh_used = false;
+            return self
+                .cancel_pending_start(&mut pending, Some(epoch), &mut auth_refresh_used, None)
+                .await
+                .map(|_| ());
+        }
         let (contract_version, request_fingerprint) = match (
             pending.recovery_contract_version,
             pending.request_fingerprint.clone(),
@@ -3250,6 +3292,9 @@ where
                     .lease_status
                     .ok_or_else(invalid_operation_reconcile_response)?;
                 if terminal_lease_status(lease_status) {
+                    if contract_version == 2 {
+                        self.pending_cancel_operation_id(&mut pending, Some(&lease_id))?;
+                    }
                     return self.clear_pending_start(&pending.operation_id);
                 }
                 if reconciliation.cancel_requested {
@@ -3270,6 +3315,15 @@ where
                     reconciliation.lease_status,
                 ) {
                     return Err(invalid_operation_reconcile_response());
+                }
+                if contract_version == 2 {
+                    // The server may retire the intent before this client
+                    // persists cancellation. Remove cached authority before
+                    // clearing even an unmarked unresolved v2 Start.
+                    self.pending_cancel_operation_id(
+                        &mut pending,
+                        reconciliation.lease_id.as_deref(),
+                    )?;
                 }
                 self.clear_pending_start(&pending.operation_id)
             }
@@ -3543,10 +3597,12 @@ where
             // accept old cleanup on the strength of a pre-await observation.
             // Complete status IPC normally, then re-attest scope after awaits.
             let native_status = self.tunnel.status().await?;
+            let native_owned = self.tunnel.owns_redundant_session().await?;
             let connected = self.connected_connection().await.is_some();
             self.ensure_start_not_cancelled(epoch)?;
             if self.load_runtime()?.pending_start.as_ref() != Some(pending)
                 || connected
+                || native_owned
                 || native_status != TunnelStatus::Stopped
             {
                 return Err(unresolved_start_operation_error());
@@ -3578,7 +3634,7 @@ where
             return Ok(None);
         };
         let mut auth_refresh_used = false;
-        self.cancel_pending_start(&mut pending, None, &mut auth_refresh_used)
+        self.cancel_pending_start(&mut pending, None, &mut auth_refresh_used, None)
             .await
     }
 
@@ -3587,10 +3643,20 @@ where
         pending: &mut StoredPendingStart,
         cancel_epoch: Option<StartCancellationEpoch>,
         auth_refresh_used: &mut bool,
+        lease_id: Option<&str>,
     ) -> Result<Option<Connection>, CoreError> {
         let stored = self.load_runtime()?;
         if stored.pending_start.as_ref() != Some(pending) {
             return Err(unresolved_start_operation_error());
+        }
+        if let Some(epoch) = cancel_epoch {
+            self.ensure_start_not_cancelled(epoch)?;
+        }
+        if pending.recovery_contract_version == Some(2) {
+            // Cache eviction cannot stop a live native owner. Persist it with
+            // cancellation intent before any await or remote dispatch; native
+            // ownership and the exact epoch still gate all remote cleanup.
+            self.pending_cancel_operation_id(pending, lease_id)?;
         }
         let scope = cancel_epoch.map(|epoch| (&*pending, epoch));
         self.ensure_pending_cleanup_scope(scope).await?;
@@ -3680,7 +3746,10 @@ where
                 if !reconcile_confirms_terminal_or_absent(
                     reconciliation.lease_id.as_deref(),
                     reconciliation.lease_status,
-                ) {
+                ) || (pending.recovery_contract_version == Some(2)
+                    && pending.cancel_operation_id.is_some()
+                    && !reconciliation.cancel_requested)
+                {
                     return Err(invalid_operation_reconcile_response());
                 }
                 self.clear_pending_start(&pending.operation_id)?;
@@ -3780,7 +3849,7 @@ where
     ) -> Result<Connection, CoreError> {
         self.ensure_pending_cleanup_scope(cancel_epoch.map(|epoch| (&*pending, epoch)))
             .await?;
-        let stop_operation_id = self.pending_cancel_operation_id(pending)?;
+        let stop_operation_id = self.pending_cancel_operation_id(pending, Some(lease_id))?;
         let scope = cancel_epoch.map(|epoch| (&*pending, epoch));
         self.ensure_pending_cleanup_scope(scope).await?;
         let response = match self
@@ -4233,7 +4302,12 @@ where
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         let stored = self.load_runtime()?;
-        if stored.pending_compensation_stop.is_some() {
+        if stored.pending_compensation_stop.is_some()
+            || stored
+                .pending_start
+                .as_ref()
+                .is_some_and(|pending| pending.recovery_contract_version == Some(2))
+        {
             return Err(CoreError::SavedConnectionUnavailable);
         }
         if stored
@@ -4727,24 +4801,37 @@ where
     fn pending_cancel_operation_id(
         &self,
         expected: &mut StoredPendingStart,
+        lease_id: Option<&str>,
     ) -> Result<String, CoreError> {
         let mut stored = self.load_runtime()?;
         if stored.pending_start.as_ref() != Some(expected) {
             return Err(unresolved_start_operation_error());
         }
-        let pending = stored
-            .pending_start
-            .as_mut()
-            .ok_or(CoreError::SavedConnectionUnavailable)?;
-        if let Some(cancel_operation_id) = &pending.cancel_operation_id {
-            return Ok(cancel_operation_id.clone());
+        let mut updated = expected.clone();
+        let mut changed = updated.cancel_operation_id.is_none();
+        let cancel_operation_id = updated
+            .cancel_operation_id
+            .get_or_insert_with(|| Uuid::new_v4().to_string())
+            .clone();
+        if updated.recovery_contract_version == Some(2) {
+            for cache in [&mut stored.saved_connection, &mut stored.pinned_connection] {
+                if cache.as_ref().is_some_and(|cached| match lease_id {
+                    Some(lease_id) => cached.lease_id == lease_id,
+                    // Reconstruction may not know the cancelled lease ID.
+                    // Do not retain a cache that could belong to that intent.
+                    None => cached.layer == updated.layer,
+                }) {
+                    *cache = None;
+                    changed = true;
+                }
+            }
         }
-        let cancel_operation_id = Uuid::new_v4().to_string();
-        pending.cancel_operation_id = Some(cancel_operation_id.clone());
-        let updated = pending.clone();
-        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
-        // Advance only after persisting our exact None -> Some Stop-ID change;
-        // never reload an arbitrary successor as the expected pending record.
+        if changed {
+            stored.pending_start = Some(updated.clone());
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        // Advance only after persisting cancellation and cache invalidation
+        // together, including repair of an older partially persisted intent.
         *expected = updated;
         Ok(cancel_operation_id)
     }
@@ -5307,6 +5394,7 @@ where
             request_id,
             operation_id,
             redundant_session_id,
+            async_stop_v1: _,
             cancel_epoch: _,
         } = context;
         self.physical_network_change.lock().await.reset();
@@ -5517,6 +5605,39 @@ where
         stage: FailedStartStage,
     ) -> CoreError {
         let cancellation_error = CoreError::StartCancelled;
+        if context.async_stop_v1 && !stage.local_start_may_be_incomplete() {
+            let cleanup = async {
+                let mut pending = self
+                    .load_runtime()?
+                    .pending_start
+                    .filter(|pending| {
+                        pending.operation_id == context.operation_id
+                            && pending.recovery_contract_version == Some(2)
+                    })
+                    .ok_or_else(unresolved_start_operation_error)?;
+                let epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
+                let mut auth_refresh_used = false;
+                self.cancel_pending_start(
+                    &mut pending,
+                    Some(epoch),
+                    &mut auth_refresh_used,
+                    Some(&context.connection.lease_id),
+                )
+                .await?;
+                let mut state = self.state.lock().await;
+                self.ensure_start_not_cancelled(epoch)?;
+                if state
+                    .connection
+                    .as_ref()
+                    .is_some_and(|current| current.lease_id == context.connection.lease_id)
+                {
+                    state.connection = None;
+                }
+                Ok::<(), CoreError>(())
+            }
+            .await;
+            return cleanup.err().unwrap_or(cancellation_error);
+        }
         let compensation_error = self
             .compensate_failed_start(context, stage, &cancellation_error)
             .await

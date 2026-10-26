@@ -1162,11 +1162,7 @@ impl SwitchCoordinator {
                             Err(error) => return Err(error.into()),
                         };
                     if receipt.state == RuntimeSwitchState::Retry {
-                        let delay = receipt
-                            .retry_after_seconds
-                            .unwrap_or(delay)
-                            .max(delay)
-                            .min(30);
+                        let delay = receipt.retry_after_seconds.unwrap_or(delay).clamp(1, 30);
                         self.update(|journal| {
                             journal.retry = Some(SwitchRetryV1 {
                                 attempt,
@@ -1231,11 +1227,8 @@ impl SwitchCoordinator {
                                 Err(error) => return Err(error.into()),
                             };
                             if superseded.state == RuntimeSwitchState::Retry {
-                                let delay = superseded
-                                    .retry_after_seconds
-                                    .unwrap_or(delay)
-                                    .max(delay)
-                                    .min(30);
+                                let delay =
+                                    superseded.retry_after_seconds.unwrap_or(delay).clamp(1, 30);
                                 self.update(|journal| {
                                     journal.retry = Some(SwitchRetryV1 {
                                         attempt,

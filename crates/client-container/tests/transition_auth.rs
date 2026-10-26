@@ -2762,6 +2762,56 @@ async fn coordinator_persists_bounded_retry_before_an_offline_dispatch() {
 }
 
 #[tokio::test]
+async fn coordinator_honors_repeated_server_retry_hint_after_reconstruction() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, enrolled_store(), Arc::new(Stop)).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Pending {
+            retry_after_seconds: 1
+        }
+    );
+    drop(coordinator);
+    for _ in 0..4 {
+        let path = root.path().join("common/runtime-switch-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        journal["retry"]["retry_not_before_unix_ms"] = json!(1);
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        state.return_retry.store(1, Ordering::SeqCst);
+        let coordinator = SwitchCoordinator::open(owner.clone(), manifest())
+            .unwrap()
+            .attach(broker.clone(), control.clone());
+        assert_eq!(
+            coordinator.recover().await.unwrap(),
+            SwitchProgress::Pending {
+                retry_after_seconds: 1
+            }
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn updated_manifest_supersedes_only_the_clean_predecessor_and_resumes_successor() {
     let state = Arc::new(Panel::default());
     state.return_retry.store(1, Ordering::SeqCst);
