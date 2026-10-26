@@ -35,7 +35,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
@@ -59,6 +59,7 @@ jobs:
           echo "RUN_ROOT=$(mktemp -d "$RUNNER_TEMP/linux-candidate.XXXXXX")" >> "$GITHUB_ENV"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           platform: linux
           target: x86_64-unknown-linux-gnu
       - name: Exact source and native workspace before candidate build
@@ -100,7 +101,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
@@ -124,10 +125,11 @@ jobs:
           echo "RUN_ROOT=$(mktemp -d "$RUNNER_TEMP/linux-candidate.XXXXXX")" >> "$GITHUB_ENV"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: signing
           platform: linux
           target: x86_64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .nvmrc
       - name: Source and crypto security tests before private keys
@@ -177,7 +179,7 @@ jobs:
     runs-on: [self-hosted, Linux, X64, nelomai-040-linux-vm]
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
@@ -201,6 +203,7 @@ jobs:
           echo "RUN_ROOT=$(mktemp -d "$RUNNER_TEMP/linux-candidate.XXXXXX")" >> "$GITHUB_ENV"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: packaging
           platform: linux
           target: x86_64-unknown-linux-gnu
@@ -245,7 +248,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
@@ -269,10 +272,11 @@ jobs:
           echo "RUN_ROOT=$(mktemp -d "$RUNNER_TEMP/linux-candidate.XXXXXX")" >> "$GITHUB_ENV"
       - uses: ./.github/actions/release-native-host
         with:
+          node24: 'true'
           purpose: signing
           platform: linux
           target: x86_64-unknown-linux-gnu
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: .nvmrc
       - name: Source and package security tests before updater private key

@@ -108,7 +108,7 @@ class LinuxWorkflowTest(unittest.TestCase):
     def test_build_and_package_use_existing_linux_only_nonpublishing_chain(self):
         steps = self.workflow()['jobs']['linux-package-diagnostic']['steps']
         native = next(step for step in steps if step.get('uses') == './.github/actions/release-native-host')
-        self.assertEqual(native['with'], {'platform': 'linux', 'target': 'x86_64-unknown-linux-gnu'})
+        self.assertEqual(native['with'], {'platform': 'linux', 'target': 'x86_64-unknown-linux-gnu', 'node24': 'true'})
         opener = next((step for step in steps if ['sudo', 'apt-get', 'install', '-y', 'xdg-utils'] in [
             shlex.split(line) for line in step.get('run', '').splitlines()
             if line.strip().startswith('sudo apt-get install')]), None)

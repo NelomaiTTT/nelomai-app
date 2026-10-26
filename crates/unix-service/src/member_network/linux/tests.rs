@@ -1085,3 +1085,70 @@ fn failed_rule_creation_rolls_back_its_route_through_the_real_owner() {
     assert_eq!(&writes[1][0..3], &["-4", "rule", "add"]);
     assert_eq!(&writes[2][0..4], &["-4", "route", "del", "9.9.9.9/32"]);
 }
+
+#[test]
+fn grouped_route_reads_dump_once_per_family_and_preserve_key_order() {
+    let v4 = r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","scope":"253","metric":42,"flags":[]},{"dst":"8.8.8.8","dev":"nlm-wga","protocol":"4","metric":42},{"dst":"192.0.2.0/24","dev":"eth0","protocol":"2","prefsrc":"192.0.2.1"}]"#;
+    let v6 = r#"[{"dst":"8000::/1","dev":"nlm-wga","protocol":"4","metric":42,"pref":"medium"}]"#;
+    let a = route("9.9.9.9/32", RouteScope::Member(20), 20);
+    let b = route("8.8.8.8/32", RouteScope::Global, 10);
+    let c = route("8000::/1", RouteScope::Global, 10);
+    let absent = route("9.9.9.9/32", RouteScope::Member(10), 10);
+    let mut network = adapter(&[v4, v6]);
+    let values = network
+        .read_many(&[a.key(), c.key(), b.key(), absent.key()])
+        .unwrap();
+    assert_eq!(values, vec![Some(a), Some(c), Some(b), None]);
+    assert_eq!(
+        network.commands.calls,
+        vec![
+            vec!["-j", "-N", "-4", "route", "show", "table", "all"],
+            vec!["-j", "-N", "-6", "route", "show", "table", "all"],
+        ]
+    );
+}
+
+#[test]
+fn grouped_route_reads_keep_strict_metadata_duplicate_and_identity_checks() {
+    let key = route("9.9.9.9/32", RouteScope::Member(20), 20).key();
+    for reply in [
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"2","metric":42}]"#,
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wga","table":"52001","protocol":"4","metric":42}]"#,
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":42,"mtu":1300}]"#,
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":42,"gateway":"::1"}]"#,
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":42},{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":42}]"#,
+        r#"[{"dst":"bad","dev":"nlm-wgb","table":"52001","protocol":"4"}]"#,
+        "[null]",
+        "{}",
+        "command_failure",
+    ] {
+        let mut network = adapter(&[reply]);
+        assert!(
+            network.read_many(std::slice::from_ref(&key)).is_err(),
+            "{reply}"
+        );
+        assert_eq!(network.commands.calls.len(), 1);
+    }
+}
+
+#[test]
+fn grouped_route_snapshot_is_discarded_before_cas_and_the_next_group() {
+    let original =
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":42}]"#;
+    let foreign =
+        r#"[{"dst":"9.9.9.9","dev":"nlm-wgb","table":"52001","protocol":"4","metric":99}]"#;
+    let value = route("9.9.9.9/32", RouteScope::Member(20), 20);
+    let mut network = adapter(&[original, foreign, "[]"]);
+    assert_eq!(
+        network.read_many(&[value.key()]).unwrap(),
+        vec![Some(value.clone())]
+    );
+    assert!(network
+        .compare_exchange(&value.key(), Some(&value), None)
+        .is_err());
+    assert_eq!(network.read_many(&[value.key()]).unwrap(), vec![None]);
+    assert_eq!(network.commands.calls.len(), 3);
+    assert!(!network.commands.calls[0].iter().any(|a| a == "exact"));
+    assert!(network.commands.calls[1].iter().any(|a| a == "exact"));
+    assert!(!network.commands.calls[2].iter().any(|a| a == "exact"));
+}

@@ -463,6 +463,26 @@ class ReleaseWorkflowTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(environment[name], "${{ secrets." + name + " }}")
 
+    def test_native_host_node24_opt_in_preserves_legacy_default_and_signing_exclusion(self):
+        action = yaml.safe_load((ROOT / ".github/actions/release-native-host/action.yml").read_text())
+        default = action["inputs"]["node24"]["default"]
+        self.assertEqual(default, "false")
+        nodes = [step for step in action["runs"]["steps"]
+                 if step.get("uses", "").startswith("actions/setup-node@")]
+        self.assertEqual([step["uses"] for step in nodes],
+                         ["actions/setup-node@v4", "actions/setup-node@v7.1.0"])
+        for step in nodes:
+            self.assertEqual(step["with"], {"node-version-file": ".nvmrc", "cache": "npm"})
+        for purpose in ("build", "packaging", "signing", "finalization"):
+            for node24 in (default, "true"):
+                with self.subTest(purpose=purpose, node24=node24):
+                    selected = [step["uses"] for step in nodes if self.expression(
+                        step["if"], mode="build_only",
+                        context={"inputs": SimpleNamespace(purpose=purpose, node24=node24)})]
+                    expected = [] if purpose == "signing" else [
+                        "actions/setup-node@v7.1.0" if node24 == "true" else "actions/setup-node@v4"]
+                    self.assertEqual(selected, expected)
+
     def test_discovery_host_provisions_mandatory_compiled_android_fixtures(self):
         steps = self.workflow()["jobs"]["verify"]["steps"]
         host = next(step for step in steps if step.get("uses") == "./.github/actions/release-native-host")

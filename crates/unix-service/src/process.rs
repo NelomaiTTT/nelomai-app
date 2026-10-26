@@ -25,27 +25,14 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
     let stdout_reader = thread::spawn(move || read_all(stdout));
     let stderr_reader = thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        #[cfg(target_os = "macos")]
-        let result = wait_for_child_exit(&mut child, deadline);
-        #[cfg(not(target_os = "macos"))]
-        let result = child.try_wait();
-        match result {
-            Ok(Some(status)) => {
-                // A helper may leave a descendant behind with our output pipes open. The
-                // direct child is already reaped, but its process group can still be killed.
-                terminate_process_group_members(child.id());
-                break status;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminate_process_group(&mut child);
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(error);
-            }
+    let status = match wait_for_child_exit(&mut child, deadline) {
+        Ok(Some(status)) => {
+            // A helper may leave a descendant behind with our output pipes open. The
+            // direct child is already reaped, but its process group can still be killed.
+            terminate_process_group_members(child.id());
+            status
         }
-        if Instant::now() >= deadline {
+        Ok(None) => {
             terminate_process_group(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
@@ -54,8 +41,12 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
                 "helper command timed out",
             ));
         }
-        #[cfg(not(target_os = "macos"))]
-        thread::sleep(Duration::from_millis(20));
+        Err(error) => {
+            terminate_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error);
+        }
     };
     Ok(Output {
         status,
@@ -82,33 +73,80 @@ pub(crate) fn status_with_timeout(
     let mut tree_owner = nelomai_contracts::dispatcher::own_process_group(command)?;
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
-    loop {
-        #[cfg(target_os = "macos")]
-        let result = wait_for_child_exit(&mut child, deadline);
-        #[cfg(not(target_os = "macos"))]
-        let result = child.try_wait();
-        match result {
-            Ok(Some(status)) => {
-                // Go daemon startup intentionally outlives this short command.
-                // Its existing persisted-state backend handles later cleanup.
-                tree_owner.write_all(&[1])?;
-                return Ok(status);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                terminate_process_group(&mut child);
-                return Err(error);
-            }
+    match wait_for_child_exit(&mut child, deadline) {
+        Ok(Some(status)) => {
+            // Go daemon startup intentionally outlives this short command.
+            // Its existing persisted-state backend handles later cleanup.
+            tree_owner.write_all(&[1])?;
+            Ok(status)
         }
-        if Instant::now() >= deadline {
+        Ok(None) => {
             terminate_process_group(&mut child);
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "helper command timed out",
-            ));
+            ))
         }
-        #[cfg(not(target_os = "macos"))]
-        thread::sleep(Duration::from_millis(20));
+        Err(error) => {
+            terminate_process_group(&mut child);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> io::Result<Option<ExitStatus>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Child remains the sole owner of reaping and its cached exit status.
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
+    if descriptor == -1 {
+        let error = io::Error::last_os_error();
+        // Kernels before Linux 5.3 have no pidfd_open. Preserve the bounded
+        // polling behavior there; resource and permission errors remain errors.
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return poll_child_exit(child, deadline);
+        }
+        return Err(error);
+    }
+    let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor as libc::c_int) };
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        // poll uses milliseconds: round up so sub-millisecond remainder does
+        // not busy-spin, and recompute from the original deadline after EINTR.
+        let milliseconds =
+            remaining.as_millis() + u128::from(remaining.subsec_nanos() % 1_000_000 != 0);
+        let timeout = milliseconds.min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut event = libc::pollfd {
+            fd: descriptor.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut event, 1, timeout) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if event.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if event.revents & libc::POLLERR != 0 {
+            return Err(io::Error::other("child pidfd polling failed"));
+        }
     }
 }
 
@@ -185,6 +223,31 @@ fn wait_for_child_exit(
             return Err(io::Error::other("unexpected child exit event"));
         }
         exit_observed = true;
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> io::Result<Option<ExitStatus>> {
+    poll_child_exit(child, deadline)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn poll_child_exit(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        thread::sleep(remaining.min(Duration::from_millis(20)));
     }
 }
 
@@ -293,7 +356,7 @@ mod tests {
         assert_eq!(output.stdout, b"ready");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn short_commands_do_not_accumulate_a_polling_interval_per_exit() {
         let mut blocking_elapsed = Duration::ZERO;
@@ -346,7 +409,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interrupted_wait_does_not_restart_the_command_deadline() {
         extern "C" fn interrupt(_: libc::c_int) {}
@@ -394,7 +457,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn child_exit_wait_preserves_status_and_bounds_delayed_children() {
         let mut child = TestRunner(
