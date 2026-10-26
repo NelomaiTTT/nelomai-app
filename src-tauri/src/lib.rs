@@ -712,60 +712,93 @@ where
     if schedule.pending.is_none() && now >= schedule.retry_at_unix {
         schedule.pending = Some(tokio::spawn(tick()));
     }
-    if let Some(pending) = schedule.pending.as_mut() {
+    let completed = if let Some(pending) = schedule.pending.as_mut() {
         // Poll the same task, not a fresh future on each metrics tick. Network
         // calls retain their existing API deadlines; UI polling cannot cancel
         // every slow probe/lease preparation halfway through its work.
         if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await {
             schedule.pending = None;
-            let retry = match &result {
-                Ok(Ok(_)) => None,
-                result => Some(
-                    match result {
-                        Ok(Err(
-                            ApplicationError::Api(CoreApiError::Rejected {
-                                retry_after_seconds,
-                                ..
-                            })
-                            | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                                retry_after_seconds,
-                                ..
-                            })),
-                        )) => *retry_after_seconds,
-                        _ => None,
-                    }
-                    .unwrap_or(15)
-                    .max(1),
-                ),
-            };
-            if let Some(retry) = retry {
-                let previous_retry_at = schedule.retry_at_unix;
-                schedule.retry_at_unix =
-                    now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
-                if previous_retry_at != schedule.retry_at_unix {
-                    if let Some((diagnostics, session_id)) = diagnostics {
-                        let (cause, code) = match &result {
-                            Ok(Err(error)) => ("tick_error", automatic_upload_error_code(error)),
-                            Err(_) => ("tick_join_failure", "task_join_failed".into()),
-                            Ok(Ok(_)) => unreachable!(),
-                        };
-                        diagnostics.record_named(
-                            "desktop.redundancy.retry_scheduled",
-                            Some(session_id),
-                            None,
-                            Some(&format!(
-                                "cause={cause} code={code} scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
-                                schedule.retry_at_unix,
-                                schedule.retry_at_unix.saturating_sub(now),
-                            )),
-                        );
-                    }
+            Some(result)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Always obtain fresh local status, even while the panel request is pending.
+    let step = tokio::time::timeout(std::time::Duration::from_secs(2), status()).await;
+    if let Some(result) = completed {
+        // A committed local promotion can retry its role report next poll.
+        // Confirmed-role member/acquire failures and server rejections keep
+        // their existing backoff; Core rechecks every owner/auth/generation fence.
+        let ready_role_retry = matches!(
+            &result,
+            Ok(Err(ApplicationError::Api(CoreApiError::Retryable)
+                | ApplicationError::Core(CoreError::Api(
+                    CoreApiError::Retryable
+                ))))
+        ) && matches!(
+            &step,
+            Ok(Ok(Some(snapshot))) if {
+                let active = usize::from(
+                    snapshot.session.active == nelomai_client_tunnel::redundancy::Slot::B,
+                );
+                snapshot.session.phase
+                    == nelomai_client_tunnel::redundancy::session::SessionPhase::Running
+                    && !snapshot.session.role_confirmed
+                    && snapshot.primary_ready
+                    && !snapshot.cleanup_pending
+                    && !snapshot.retirement_pending
+                    && snapshot.session.installed[active]
+                    && snapshot.session.committed[active]
+                    && snapshot.leases[active].is_some()
+                    && snapshot.leases[active] == snapshot.current_leases[active]
+            }
+        );
+        let retry = match &result {
+            Ok(Ok(_)) => None,
+            result => Some(
+                match result {
+                    Ok(Err(
+                        ApplicationError::Api(CoreApiError::Rejected {
+                            retry_after_seconds,
+                            ..
+                        })
+                        | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                            retry_after_seconds,
+                            ..
+                        })),
+                    )) => *retry_after_seconds,
+                    _ => None,
+                }
+                .unwrap_or(if ready_role_retry { 1 } else { 15 })
+                .max(1),
+            ),
+        };
+        if let Some(retry) = retry {
+            let previous_retry_at = schedule.retry_at_unix;
+            schedule.retry_at_unix = now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+            if previous_retry_at != schedule.retry_at_unix {
+                if let Some((diagnostics, session_id)) = diagnostics {
+                    let (cause, code) = match &result {
+                        Ok(Err(error)) => ("tick_error", automatic_upload_error_code(error)),
+                        Err(_) => ("tick_join_failure", "task_join_failed".into()),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    diagnostics.record_named(
+                        "desktop.redundancy.retry_scheduled",
+                        Some(session_id),
+                        None,
+                        Some(&format!(
+                            "cause={cause} code={code} scheduler_now_unix={now} retry_at_unix={} retry_delay_seconds={}",
+                            schedule.retry_at_unix,
+                            schedule.retry_at_unix.saturating_sub(now),
+                        )),
+                    );
                 }
             }
         }
     }
-    // Always obtain fresh local status, even while the panel request is pending.
-    let step = tokio::time::timeout(std::time::Duration::from_secs(2), status()).await;
     match step {
         Ok(Ok(snapshot)) => DesktopPairObservation {
             owns_tunnel: snapshot.is_some(),
@@ -1935,17 +1968,29 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
-    async fn desktop_coordination_transient_error_delays_ready_role_work_until_retry_deadline() {
+    async fn desktop_coordination_retries_ready_role_after_transient_error_without_shortening_other_backoff(
+    ) {
         use nelomai_client_application::ApplicationError;
         use nelomai_client_core::CoreApiError;
         use nelomai_client_tunnel::redundancy::{
             protocol::Snapshot, session::SessionState, SessionScope, Slot,
         };
 
-        // Characterize the current gate: a healthy tick can acknowledge an
-        // already-ready local promotion immediately; one unrelated tick error
-        // suppresses that same work until the shared retry deadline.
-        for transient_error in [false, true] {
+        for (case, next_tick_at) in [
+            ("healthy", 11),
+            ("transient_role", 11),
+            ("transient_core_role", 11),
+            ("rate_limited", 55),
+            ("rejected_without_hint", 25),
+            ("unauthorized", 25),
+            ("confirmed_member", 25),
+            ("unknown_status", 25),
+            ("cleanup_pending", 25),
+            ("retirement_pending", 25),
+            ("unready", 25),
+            ("uncommitted", 25),
+            ("wrong_current", 25),
+        ] {
             let scope = SessionScope {
                 runtime: nelomai_contracts::RuntimeSlot::Latest,
                 runtime_generation: 1,
@@ -1956,52 +2001,80 @@ mod tests {
             state.primary_started(&scope).unwrap();
             let standby = state.install_ticket(&scope, Slot::B).unwrap();
             state.standby_installed(standby, 1).unwrap();
+            let promotion = state.promotion_ticket(&scope, Slot::B).unwrap();
+            state.promote(promotion, || Ok::<_, ()>(())).unwrap();
+            if case == "confirmed_member" {
+                assert!(state.ack_role(&state.role_update().unwrap(), 1));
+            }
+            let mut snapshot = Snapshot {
+                session: state.snapshot(),
+                leases: [Some("a".into()), Some("b".into())],
+                current_leases: [Some("a".into()), Some("b".into())],
+                standby_failed: case == "confirmed_member",
+                stalled: false,
+                primary_ready: case != "unready",
+                standby_ready: true,
+                cleanup_pending: case == "cleanup_pending",
+                retirement_pending: case == "retirement_pending",
+                warm_stop_v1: false,
+            };
+            if case == "uncommitted" {
+                snapshot.session.committed[1] = false;
+            }
+            if case == "wrong_current" {
+                snapshot.current_leases[1] = Some("other".into());
+            }
             let mut schedule = DesktopCoordinationSchedule::default();
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
                 None,
                 move || async move {
-                    if transient_error {
-                        Err(ApplicationError::Api(CoreApiError::Retryable))
-                    } else {
-                        Ok(None)
+                    match case {
+                        "healthy" => Ok(None),
+                        "transient_role" => Err(ApplicationError::Api(CoreApiError::Retryable)),
+                        "unauthorized" => Err(ApplicationError::Api(CoreApiError::Unauthorized)),
+                        "rejected_without_hint" => {
+                            Err(ApplicationError::Api(CoreApiError::Rejected {
+                                code: "rate_limited".into(),
+                                message: "private".into(),
+                                retry_after_seconds: None,
+                            }))
+                        }
+                        "rate_limited" => Err(ApplicationError::Api(CoreApiError::Rejected {
+                            code: "rate_limited".into(),
+                            message: "private".into(),
+                            retry_after_seconds: Some(45),
+                        })),
+                        _ => Err(ApplicationError::Core(nelomai_client_core::CoreError::Api(
+                            CoreApiError::Retryable,
+                        ))),
                     }
                 },
-                || async { Ok(None) },
+                || async {
+                    if case == "unknown_status" {
+                        Err(ApplicationError::Storage)
+                    } else {
+                        Ok(Some(snapshot.clone()))
+                    }
+                },
             )
             .await;
 
-            // The local owner switches to its committed, ready standby after
-            // the first tick. Only role acknowledgement remains outstanding.
-            let promotion = state.promotion_ticket(&scope, Slot::B).unwrap();
-            state.promote(promotion, || Ok::<_, ()>(())).unwrap();
-            let snapshot = Snapshot {
-                session: state.snapshot(),
-                leases: [Some("a".into()), Some("b".into())],
-                current_leases: [Some("a".into()), Some("b".into())],
-                standby_failed: false,
-                stalled: false,
-                primary_ready: true,
-                standby_ready: true,
-                cleanup_pending: false,
-                retirement_pending: false,
-                warm_stop_v1: false,
-            };
             let state = Arc::new(std::sync::Mutex::new(state));
-            let role_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-            for now in [11, 24, 25] {
+            let tick_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            for now in [11, 24, 25, 55] {
                 let observation = coordinate_desktop_redundancy(
                     &mut schedule,
                     now,
                     None,
                     {
                         let state = state.clone();
-                        let role_calls = role_calls.clone();
+                        let tick_calls = tick_calls.clone();
                         move || async move {
+                            tick_calls.lock().unwrap().push(now);
                             let mut state = state.lock().unwrap();
                             if let Some(update) = state.role_update() {
-                                role_calls.lock().unwrap().push(now);
                                 assert!(state.ack_role(&update, 1));
                             }
                             Ok(None)
@@ -2015,25 +2088,16 @@ mod tests {
                     },
                 )
                 .await;
-                assert!(observation.owns_tunnel);
+                assert!(observation.owns_tunnel, "{case} at {now}");
                 let observed = observation.snapshot.unwrap();
                 assert_eq!(observed.session.active, Slot::B);
-                assert!(observed.primary_ready && observed.standby_ready);
-                assert_eq!(
-                    observed.session.role_confirmed,
-                    !transient_error || now == 25
-                );
-                if transient_error && now < 25 {
-                    assert!(role_calls.lock().unwrap().is_empty());
-                    assert!(state.lock().unwrap().role_update().is_some());
+                if now < next_tick_at {
+                    assert!(tick_calls.lock().unwrap().is_empty(), "{case} at {now}");
                 } else {
-                    assert!(state.lock().unwrap().snapshot().role_confirmed);
+                    assert!(observed.session.role_confirmed, "{case} at {now}");
                 }
             }
-            assert_eq!(
-                *role_calls.lock().unwrap(),
-                if transient_error { vec![25] } else { vec![11] }
-            );
+            assert_eq!(tick_calls.lock().unwrap()[0], next_tick_at, "{case}");
         }
     }
 
