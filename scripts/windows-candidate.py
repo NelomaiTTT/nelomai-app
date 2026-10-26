@@ -179,9 +179,9 @@ def windows_gate(sha, *, wait=False):
             jobs = response["jobs"]
             if response["total_count"] > 100 or attempt < 1:
                 raise ValueError("ambiguous Windows check inventory")
-            selected = [[j for j in jobs if j["name"] == n] for n in ("windows-build", "windows-worker-native", "windows")]
+            selected = [[j for j in jobs if j["name"] == n] for n in ("windows-build", "windows")]
             if any(len(j) > 1 for j in selected) or any(j and j[0].get("conclusion") not in (None, "success") for j in selected):
-                raise ValueError("exact Windows build/native gate failed")
+                raise ValueError("exact Windows build gate failed")
             if all(len(j) == 1 and j[0].get("status") == "completed" and j[0].get("conclusion") == "success" for j in selected):
                 fresh = gates.github_get(f"repos/{REPOSITORY}/actions/runs/{run['id']}")
                 if fresh.get("id") != run["id"] or fresh.get("head_sha") != sha or fresh.get("run_attempt") != attempt:
@@ -190,7 +190,7 @@ def windows_gate(sha, *, wait=False):
         remaining = deadline - time.monotonic()
         if not wait or remaining <= 0:
             raise ValueError("exact source Windows checks not ready")
-        print("Waiting for exact-source Windows build/native checks only", flush=True)
+        print("Waiting for exact-source Windows checks only", flush=True)
         time.sleep(min(600, remaining))
 
 

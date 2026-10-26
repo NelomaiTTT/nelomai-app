@@ -14,9 +14,10 @@ param(
 $ErrorActionPreference = 'Stop'
 # CI-only: a retained host peer child and one explicitly owned, initially OFF
 # disposable VM. No runner registration, firewall changes or runtime fallback.
-if ($env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_EVENT_NAME -cne 'push' -or
+if ($env:GITHUB_ACTIONS -ne 'true' -or $env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+    $env:GITHUB_REPOSITORY -cne 'NelomaiTTT/nelomai-app' -or
     $env:GITHUB_REF -cne 'refs/heads/Future/desktop-0.4.0') {
-    throw 'Worker VM gate requires the trusted branch push aperture'
+    throw 'Worker VM gate requires the trusted branch manual diagnostic aperture'
 }
 if ($env:COMPUTERNAME -cne $HostName -or $VmId -eq [Guid]::Empty -or $SnapshotId -eq [Guid]::Empty -or
     $PeerAddress.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork -or

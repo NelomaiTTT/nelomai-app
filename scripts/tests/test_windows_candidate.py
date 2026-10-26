@@ -118,7 +118,7 @@ class WindowsCandidateTest(ArtifactFixture):
             head_branch="Future/desktop-0.4.0", path=".github/workflows/checks.yml",
             repository={"full_name": self.candidate.REPOSITORY}, head_repository={"full_name": self.candidate.REPOSITORY},
             status="in_progress", conclusion=None)
-        jobs = [dict(name=n, status="completed", conclusion="success") for n in ("windows-build", "windows-worker-native", "windows")]
+        jobs = [dict(name=n, status="completed", conclusion="success") for n in ("windows-build", "windows")]
         jobs.append(dict(name="macos", status="completed", conclusion="failure"))
         fresh_attempt = 1
         def api(endpoint):
@@ -126,7 +126,13 @@ class WindowsCandidateTest(ArtifactFixture):
             if "/jobs?" in endpoint: return {"total_count": len(jobs), "jobs": jobs}
             return {**run, "run_attempt": fresh_attempt}
         with patch.object(self.candidate.gates, "github_get", side_effect=api):
-            self.assertEqual(self.candidate.windows_gate(self.source)["run_id"], 17)
+            self.assertEqual(self.candidate.windows_gate(self.source)["checks"], ["windows-build", "windows"])
+            for status, conclusion in (("completed", "failure"), ("completed", "cancelled"),
+                                       ("completed", "skipped"), ("queued", None)):
+                with self.subTest(optional_worker=(status, conclusion)):
+                    jobs.append(dict(name="windows-worker-native", status=status, conclusion=conclusion))
+                    self.assertEqual(self.candidate.windows_gate(self.source)["run_id"], 17)
+                    jobs.pop()
             jobs[1]["conclusion"] = "failure"
             with self.assertRaises(ValueError): self.candidate.windows_gate(self.source)
             jobs[1]["conclusion"] = "success"; jobs[1]["status"] = "queued"

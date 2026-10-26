@@ -76,11 +76,19 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
                 allowed.add("shell")  # Exact bootstrap command/shell is checked below.
             require(set(step) <= allowed,
                     f"{name} steps must execute unconditionally and fail normally")
-    for name in ("frontend", "rust", "android-plugin", "windows-build", "macos", "contracts-python"):
+    for name in ("frontend", "rust", "android-plugin", "macos", "contracts-python"):
         require(jobs[name].get("if") == "github.event_name != 'workflow_dispatch'",
                 f"{name} cannot skip normal checks")
+    require(build.get("if") == "github.event_name != 'workflow_dispatch' || (github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && inputs.windows_worker_native)",
+            "Windows build must run for normal checks or the trusted optional worker diagnostic")
+    dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]
+    require(dispatch.get("inputs", {}).get("windows_worker_native") == {
+        "description": "Run the optional Windows worker VM diagnostic instead of Linux packaging",
+        "type": "boolean", "default": False}
+        and jobs["linux-package-diagnostic"].get("if") == "github.event_name == 'workflow_dispatch' && !inputs.windows_worker_native",
+            "Worker diagnostic must be opt-in and exclude Linux packaging")
     require(native.get("if") == "github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0')",
-            "Legacy compatibility must be explicitly skipped only on the trusted worker push; main/PR remain required")
+            "Legacy compatibility must be explicitly skipped only on the unified 0.4 push; main/PR remain required")
     contracts = jobs["contracts-python"]
     require("env" not in contracts and "RUSTUP_HOME" not in workflow.get("env", {})
         and all("RUSTUP_HOME" not in step.get("env", {}) for step in contracts["steps"]),
@@ -217,17 +225,16 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
             "if-no-files-found": "warn", "retention-days": 1}},
         "Every native case must retain only actual SYSTEM outputs even on failure, uniquely bound to source/run/attempt/case for one day")
     require(aggregate.get("if") == "${{ always() && github.event_name != 'workflow_dispatch' }}"
-            and aggregate.get("needs") == ["windows-build", "windows-native", "windows-worker-native"]
+            and aggregate.get("needs") == ["windows-build", "windows-native"]
             and aggregate["runs-on"] == "ubuntu-latest" and len(aggregate["steps"]) == 1,
             "Required Windows check must observe both producer and every native case even on failure")
     require(aggregate["steps"][0].get("env") == {'BUILD_RESULT': '${{ needs.windows-build.result }}',
  'NATIVE_RESULT': '${{ needs.windows-native.result }}',
- 'WORKER_RESULT': '${{ needs.windows-worker-native.result }}',
- 'WORKER_REQUIRED': "${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}"}
-        and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\nif [ "$WORKER_REQUIRED" = true ]; then\ntest "$NATIVE_RESULT" = skipped\ntest "$WORKER_RESULT" = success\nelse\ntest "$NATIVE_RESULT" = success\ntest "$WORKER_RESULT" = skipped\nfi',
+ 'UNIFIED_PUSH': "${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}"}
+        and program(aggregate["steps"][0]) == 'test "$BUILD_RESULT" = success\nif [ "$UNIFIED_PUSH" = true ]; then\ntest "$NATIVE_RESULT" = skipped\nelse\ntest "$NATIVE_RESULT" = success\nfi',
         "Required Windows check must reject cancelled/skipped/failed producer or matrix")
 
-    require(jobs["windows-worker-native"] == {'if': "github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0'",
+    require(jobs["windows-worker-native"] == {'if': "github.event_name == 'workflow_dispatch' && github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && inputs.windows_worker_native",
  'needs': ['windows-build'],
  'runs-on': ['self-hosted', 'Windows', 'x64', 'nelomai-040-worker-host'],
  'timeout-minutes': 15,
@@ -273,7 +280,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
                      'path': '${{ runner.temp }}/worker-factory-vm-*/',
                      'if-no-files-found': 'warn',
                      'retention-days': 1}}]},
-            "Worker gate must retain exact trusted branch, host labels, serial VM and source/cleanup obligations")
+            "Optional worker diagnostic must retain exact trusted repository/branch, host labels, serial VM and source/cleanup obligations")
 
 
 def run() -> None:

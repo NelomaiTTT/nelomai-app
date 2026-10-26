@@ -247,18 +247,41 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 mutate(changed["jobs"])
                 with self.assertRaises((RuntimeError, KeyError, ValueError)):
                     checker.assert_windows_factory_jobs(changed, factory)
-        for required in ("true", "false"):
+        for unified in ("true", "false"):
             for build in ("success", "failure", "skipped", "cancelled"):
                 for native in ("success", "failure", "skipped", "cancelled"):
-                    for worker in ("success", "failure", "skipped", "cancelled"):
-                        result = subprocess.run(["bash", "-e", "-c", workflow["jobs"]["windows"]["steps"][0]["run"]],
-                                                env={**os.environ, "BUILD_RESULT": build, "NATIVE_RESULT": native,
-                                                     "WORKER_RESULT": worker, "WORKER_REQUIRED": required}, capture_output=True)
-                        expected = build == "success" and ((required == "true" and native == "skipped" and worker == "success")
-                                                          or (required == "false" and native == "success" and worker == "skipped"))
-                        self.assertEqual(result.returncode == 0, expected, (required, build, native, worker))
+                    result = subprocess.run(["bash", "-e", "-c", workflow["jobs"]["windows"]["steps"][0]["run"]],
+                                            env={**os.environ, "BUILD_RESULT": build, "NATIVE_RESULT": native,
+                                                 "UNIFIED_PUSH": unified}, capture_output=True)
+                    expected = build == "success" and native == ("skipped" if unified == "true" else "success")
+                    self.assertEqual(result.returncode == 0, expected, (unified, build, native))
         with self.assertRaises(RuntimeError):
             checker.assert_windows_factory_jobs(workflow, factory.replace("None => cases.len() + 4", "None => cases.len()"))
+
+    def test_worker_native_is_opt_in_manual_diagnostic_only(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        inputs = (workflow.get("on", workflow.get(True))["workflow_dispatch"] or {}).get("inputs", {})
+        self.assertIn("windows_worker_native", inputs)
+        self.assertEqual(inputs["windows_worker_native"]["type"], "boolean")
+        self.assertIs(inputs["windows_worker_native"]["default"], False)
+        self.assertEqual(workflow["jobs"]["windows"]["needs"], ["windows-build", "windows-native"])
+        repo = "NelomaiTTT/nelomai-app"
+        for event, ref, repository, opt_in, expected in (
+            ("push", "refs/heads/Future/desktop-0.4.0", repo, False, (True, False, False, True, False)),
+            ("push", "refs/heads/main", repo, False, (True, True, False, True, False)),
+            ("pull_request", "refs/pull/42/merge", repo, False, (True, True, False, True, False)),
+            ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", repo, False, (False, False, False, False, True)),
+            ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", repo, True, (True, False, True, False, False)),
+            ("workflow_dispatch", "refs/heads/main", repo, True, (False, False, False, False, False)),
+            ("workflow_dispatch", "refs/heads/Future/desktop-0.4.0", "fork/app", True, (False, False, False, False, False)),
+            ("push", "refs/heads/Future/desktop-0.4.0", repo, True, (True, False, False, True, False)),
+        ):
+            with self.subTest(event=event, ref=ref, repository=repository, opt_in=opt_in):
+                context = {"github": SimpleNamespace(event_name=event, ref=ref, repository=repository),
+                           "inputs": SimpleNamespace(windows_worker_native=opt_in)}
+                actual = tuple(bool(self.expression(workflow["jobs"][name]["if"], mode="build_only", context=context))
+                               for name in ("windows-build", "windows-native", "windows-worker-native", "windows", "linux-package-diagnostic"))
+                self.assertEqual(actual, expected)
 
     def expression(self, expression, *, mode, result="success", cancelled=False, context=None):
         """Evaluate the boolean/string expressions used by our dispatch graph."""

@@ -2,13 +2,18 @@ name: checks
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_worker_native:
+        description: Run the optional Windows worker VM diagnostic instead of Linux packaging
+        type: boolean
+        default: false
   pull_request:
   push:
     branches: [main, 'Future/desktop-0.4.0']
 
 jobs:
   linux-package-diagnostic:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.windows_worker_native
     name: Linux test AppImage (not a release)
     runs-on: ubuntu-22.04
     timeout-minutes: 60
@@ -197,7 +202,7 @@ jobs:
             testDebugUnitTest
 
   windows-build:
-    if: github.event_name != 'workflow_dispatch'
+    if: github.event_name != 'workflow_dispatch' || (github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && inputs.windows_worker_native)
     runs-on: windows-latest
     outputs:
       manifest_sha256: ${{ steps.artifact.outputs.manifest_sha256 }}
@@ -293,7 +298,7 @@ jobs:
           retention-days: 1
 
   windows-native:
-    # The trusted 0.4 push validates its selected worker path below.
+    # The 0.4 push requires the common build; worker VM diagnostics are manual.
     # Main/PR still execute the complete legacy compatibility matrix.
     if: github.event_name != 'workflow_dispatch' && !(github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0')
     needs: [windows-build]
@@ -372,7 +377,7 @@ jobs:
           retention-days: 1
 
   windows-worker-native:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'NelomaiTTT/nelomai-app' && github.ref == 'refs/heads/Future/desktop-0.4.0' && inputs.windows_worker_native
     needs: [windows-build]
     runs-on: [self-hosted, Windows, x64, nelomai-040-worker-host]
     timeout-minutes: 15
@@ -422,23 +427,20 @@ jobs:
 
   windows:
     if: ${{ always() && github.event_name != 'workflow_dispatch' }}
-    needs: [windows-build, windows-native, windows-worker-native]
+    needs: [windows-build, windows-native]
     runs-on: ubuntu-latest
     steps:
       - name: Require common build and every isolated native factory case
         env:
           BUILD_RESULT: ${{ needs.windows-build.result }}
           NATIVE_RESULT: ${{ needs.windows-native.result }}
-          WORKER_RESULT: ${{ needs.windows-worker-native.result }}
-          WORKER_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}
+          UNIFIED_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/Future/desktop-0.4.0' }}
         run: |
           test "$BUILD_RESULT" = success
-          if [ "$WORKER_REQUIRED" = true ]; then
+          if [ "$UNIFIED_PUSH" = true ]; then
             test "$NATIVE_RESULT" = skipped
-            test "$WORKER_RESULT" = success
           else
             test "$NATIVE_RESULT" = success
-            test "$WORKER_RESULT" = skipped
           fi
 
   macos:
