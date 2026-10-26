@@ -63,7 +63,7 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         return try {
             ru.nelomai.runtime.v1.RuntimeNativeBackgroundReplyV1.await { result ->
                 val selected = RuntimeSelectionStore.decode(context.currentSelection())
-                if (action == "provision" && selected.slot == "stable" && selected.runtimeVersion == "0.2.20") {
+                if (action == "provision" && selected.slot == "stable") {
                     try {
                         prepareStableBackground(request, selected)
                         check(RuntimeSelectionStore.decode(context.currentSelection()) == selected)

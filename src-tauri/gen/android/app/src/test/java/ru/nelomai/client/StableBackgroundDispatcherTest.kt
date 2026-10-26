@@ -21,12 +21,12 @@ import ru.nelomai.runtime.v1.RuntimeServiceIntents
 @Config(sdk = [34], application = android.app.Application::class,
     shadows = [TileSelectionShadow::class, StableEnvelopeIoShadow::class])
 class StableBackgroundDispatcherTest {
-    private val selected = RuntimeSelectionV1("stable", "0.2.20", "0.3.5", 9, null, "stable-test")
+    private var selected = RuntimeSelectionV1("stable", "0.2.20", "0.3.5", 9, null, "stable-test")
     private val device = "11111111-1111-4111-8111-111111111111"
     private fun scope(slot: String, generation: Long) = JSONObject()
         .put("auth_epoch", 3).put("family", "login-family").put("device_id", device)
         .put("identity", JSONObject().put("slot", slot).put("container_version", "0.3.5")
-            .put("runtime_version", if (slot == "stable") "0.2.20" else "0.3.5")
+            .put("runtime_version", if (slot == "stable") selected.runtimeVersion else "0.3.5")
             .put("runtime_contract_version", 1).put("session_generation", generation))
     private fun request(generation: Long = 9) = JSONObject().put("device_id", device)
         .put("access_token", "current-bearer").put("install_secret", "install-secret")
@@ -36,6 +36,7 @@ class StableBackgroundDispatcherTest {
             .put("provision_predecessor", scope("latest", 8)).toString()).toString()
 
     @Before fun setUp() {
+        StableEnvelopeIoShadow.version = selected.runtimeVersion
         TileSelectionShadow.result = Result.success(selected)
         ReflectionHelpers.setStaticField(RuntimeProcessSelection::class.java, "loaded", null)
         ReflectionHelpers.setStaticField(RuntimeProcessSelection::class.java, "admitted", false)
@@ -69,6 +70,28 @@ class StableBackgroundDispatcherTest {
         val saved = JSONObject(String(StableEnvelopeIoShadow.bytes!!))
         assertEquals(9L, saved.getJSONObject("ownerScope").getJSONObject("identity").getLong("session_generation"))
         assertFalse(saved.has("active"))
+        controller.destroy()
+    }
+
+    @Test fun selectedStableVersionControlsPreparationAndStorageNamespace() {
+        for (version in listOf("0.2.21", "9.8.7")) {
+            selected = selected.copy(runtimeVersion = version)
+            setUp()
+            dispatcherPreparesTheRecordBeforeConstructingImmutableStableEngine()
+        }
+    }
+
+    @Test fun anotherRuntimeVersionNeverMutatesSelectedStableStorage() {
+        selected = selected.copy(runtimeVersion = "9.8.7")
+        setUp()
+        val before = StableEnvelopeIoShadow.bytes!!.clone()
+        val input = JSONObject(request())
+        val owner = JSONObject(input.getString("owner_operation"))
+        owner.getJSONObject("ticket").getJSONObject("identity").put("runtime_version", "9.8.6")
+        input.put("owner_operation", owner.toString())
+        val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        assertEquals(2, dispatch(controller.get(), input.toString()).first)
+        assertArrayEquals(before, StableEnvelopeIoShadow.bytes)
         controller.destroy()
     }
 
@@ -124,12 +147,12 @@ class StableBackgroundDispatcherTest {
 class StableEnvelopeIoShadow {
     @RealObject private lateinit var backend: Any
     private fun requireStableNamespace() {
-        val name = "runtime.stable.state.0.2.20.nelomai-background-credential"
+        val name = "runtime.stable.state.$version.nelomai-background-credential"
         require(ReflectionHelpers.getField<String>(backend, "preferenceName") == name)
         require(ReflectionHelpers.getField<String>(backend, "keyAlias") == name)
         require(ReflectionHelpers.getField<String>(backend, "recordName") == "encrypted-envelope-v3")
     }
     @Implementation fun read(): ByteArray? { requireStableNamespace(); return bytes?.clone() }
     @Implementation fun write(value: ByteArray): Boolean { requireStableNamespace(); bytes = value.clone(); return true }
-    companion object { var bytes: ByteArray? = null }
+    companion object { var bytes: ByteArray? = null; var version = "0.2.20" }
 }

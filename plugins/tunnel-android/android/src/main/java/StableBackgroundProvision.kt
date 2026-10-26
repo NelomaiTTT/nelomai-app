@@ -4,12 +4,18 @@ import android.content.Context
 import org.json.JSONObject
 import java.util.UUID
 
-/** Container compatibility for the immutable 0.2.20 credential store. Run in
+/** Container compatibility for the stable contract-v1 credential store. Run in
  * :vpn, before constructing its engine, so no old executor or preferences cache
  * can race this one-record handoff. No stable artifact is patched or rebuilt. */
 object StableBackgroundProvision {
     fun prepare(context: Context, request: String, engineLoaded: Boolean): Boolean {
-        val name = "runtime.stable.state.0.2.20.nelomai-background-credential"
+        require(request.toByteArray().size <= 65536)
+        // The dispatcher has matched this owner identity to the selected runtime.
+        // Use that exact namespace, never a release number baked into the container.
+        val scope = NativeOwnerOperation.fromJson(
+            JSONObject(JSONObject(request).getString("owner_operation"))).scope
+        require(scope.slot == "stable" && scope.runtimeContractVersion == 1L)
+        val name = "runtime.stable.state.${scope.runtimeVersion}.nelomai-background-credential"
         return prepare(AndroidSecureEnvelopeBackend(context, name, "encrypted-envelope-v3",
             name, scoped = false), request, engineLoaded, System.currentTimeMillis())
     }
@@ -22,7 +28,7 @@ object StableBackgroundProvision {
         val owner = JSONObject(input.getString("owner_operation"))
         val operation = NativeOwnerOperation.fromJson(owner)
         val scope = operation.scope
-        require(scope.slot == "stable" && scope.runtimeVersion == "0.2.20")
+        require(scope.slot == "stable" && scope.runtimeContractVersion == 1L)
         require(operation.expiresAtUnixMs > nowMillis)
         val raw = backend.read() ?: return true
         val current = try { BackgroundCredentialEnvelopeCodec.decode(raw) } finally { raw.fill(0) }
@@ -37,7 +43,8 @@ object StableBackgroundProvision {
         val source = requireNotNull(operation.provisionPredecessor)
         require(source.slot == "latest" && source.authEpoch == scope.authEpoch &&
             source.deviceId == scope.deviceId && source.sessionGeneration == scope.sessionGeneration - 1)
-        require(retained.slot == "stable" && retained.runtimeVersion == "0.2.20")
+        require(retained.slot == scope.slot && retained.runtimeVersion == scope.runtimeVersion &&
+            retained.runtimeContractVersion == scope.runtimeContractVersion)
         require(retained.sessionGeneration < source.sessionGeneration)
         require(scope.isSuccessorOf(retained, source))
         require(current.deviceId == scope.deviceId && input.getString("device_id") == scope.deviceId)
@@ -56,7 +63,6 @@ object StableBackgroundProvision {
                 val id = proof.optString(field)
                 require(UUID.fromString(id).toString() == id)
             }
-            require(retained.runtimeContractVersion == scope.runtimeContractVersion)
         }
         if (engineLoaded) return false
         // Only after physical engine exit can no late old HTTP executor write

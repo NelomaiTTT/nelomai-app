@@ -124,8 +124,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
         @Suppress("DEPRECATION")
         val receiver = intent.getParcelableExtra<ResultReceiver>("result_receiver") ?: return
         try {
-            require(RuntimeDispatchPolicy.mayStart(active) && active.slot == "stable" &&
-                active.runtimeVersion == "0.2.20")
+            require(RuntimeDispatchPolicy.mayStart(active) && active.slot == "stable")
             val request = requireNotNull(intent.getStringExtra(
                 ru.nelomai.runtime.v1.RuntimeServiceIntents.STABLE_PROVISION_REQUEST))
             require(request.toByteArray().size <= 65536)

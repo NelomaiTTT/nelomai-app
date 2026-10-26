@@ -32,6 +32,31 @@ class StableBackgroundProvisionTest {
         return input.put("owner_operation", owner.toString()).toString()
     }
 
+    @Test fun retainedStableUsesExactRequestedVersionInsteadOfReleaseLiteral() {
+        for (version in listOf("0.2.21", "9.8.7")) {
+            val old = retained.copy(runtimeVersion = version)
+            val next = target.copy(runtimeVersion = version)
+            val backend = MemoryBackend(seed().copy(ownerScope = old))
+            assertTrue(StableBackgroundProvision.prepare(backend,
+                request(operation.copy(scope = next)), false, 1000))
+            assertEquals(next, backend.envelope().ownerScope)
+            assertNull(backend.envelope().active)
+        }
+    }
+
+    @Test fun retainedVersionAndContractMustStillMatchTarget() {
+        for (wrong in listOf(retained.copy(runtimeVersion = "9.8.6"),
+            retained.copy(runtimeContractVersion = 2))) {
+            val record = seed().copy(ownerScope = wrong)
+            val backend = MemoryBackend(record)
+            assertThrows(IllegalArgumentException::class.java) {
+                StableBackgroundProvision.prepare(backend, request(), false, 1000)
+            }
+            assertEquals(record, backend.envelope())
+            assertEquals(0, backend.writes)
+        }
+    }
+
     @Test fun completedResumeRetiresUnfinishedIssuanceOnlyAfterPhysicalEngineExit() {
         val reservation = BackgroundMutationReservation("old-prepare", "old-activate", device, 3000)
         val pending = BackgroundPendingToken("old-staged", 3000, 2, "old-prepare", "old-activate", 1)
