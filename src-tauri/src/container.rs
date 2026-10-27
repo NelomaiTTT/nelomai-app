@@ -487,10 +487,13 @@ fn show_startup_failure(app: &mut tauri::App) -> Result<(), Box<dyn std::error::
     .resizable(false)
     .build()?;
     window.on_window_event(move |event| {
-        if matches!(event, tauri::WindowEvent::CloseRequested { .. })
-            && !queue_action(&handle, RuntimeAction::Quit)
-        {
-            handle.exit(0);
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // Keep the retry window while guarded child/helper cleanup is
+            // pending or failed; only its successful app.exit may close it.
+            api.prevent_close();
+            if !queue_action(&handle, RuntimeAction::Quit) {
+                handle.exit(0);
+            }
         }
     });
     Ok(())

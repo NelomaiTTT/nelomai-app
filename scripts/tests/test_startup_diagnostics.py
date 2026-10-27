@@ -10,6 +10,49 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class StartupDiagnosticsTests(unittest.TestCase):
+    def test_startup_failure_close_preserves_window_until_guarded_exit(self):
+        container = (ROOT / "src-tauri/src/container.rs").read_text()
+        failure_window = container.split('fn show_startup_failure(', 1)[1]
+        handler = failure_window.split('window.on_window_event(move |event| {', 1)[1].split('\n    });', 1)[0]
+        # Execute the shipping callback. The queued cleanup deliberately stays
+        # pending so a second close also exercises the available retry window.
+        driver = '''use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+#[derive(Clone)] struct Handle { managed: bool, queued: Arc<AtomicUsize>, exited: Arc<AtomicBool> }
+impl Handle { fn exit(&self, _: i32) { self.exited.store(true, Ordering::SeqCst); } }
+struct Api(Arc<AtomicBool>);
+impl Api { fn prevent_close(&self) { self.0.store(true, Ordering::SeqCst); } }
+mod tauri { pub enum WindowEvent { CloseRequested { api: super::Api }, Other } }
+enum RuntimeAction { Quit }
+fn queue_action(handle: &Handle, _: RuntimeAction) -> bool {
+    if handle.managed { handle.queued.fetch_add(1, Ordering::SeqCst); }
+    handle.managed
+}
+fn main() {
+    for managed in [true, false] {
+        let queued = Arc::new(AtomicUsize::new(0));
+        let exited = Arc::new(AtomicBool::new(false));
+        let handle = Handle { managed, queued: queued.clone(), exited: exited.clone() };
+        let callback = move |event: &tauri::WindowEvent| { %s };
+        callback(&tauri::WindowEvent::Other);
+        assert!(!exited.load(Ordering::SeqCst));
+        for attempt in 1..=2 {
+            let prevented = Arc::new(AtomicBool::new(false));
+            callback(&tauri::WindowEvent::CloseRequested { api: Api(prevented.clone()) });
+            assert!(prevented.load(Ordering::SeqCst), "native close must wait for guarded exit");
+            assert_eq!(exited.load(Ordering::SeqCst), !managed, "pending cleanup cannot exit");
+            assert_eq!(queued.load(Ordering::SeqCst), if managed { attempt } else { 0 });
+        }
+    }
+}
+''' % handler
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, binary = root / "close.rs", root / "probe"
+            source.write_text(driver)
+            subprocess.run(["rustc", "--edition=2021", str(source), "-o", str(binary)], check=True, capture_output=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_partial_startup_keeps_native_cleanup_available_after_tray_failure(self):
         container = (ROOT / "src-tauri/src/container.rs").read_text()
         tail = container.split('app.manage(state.clone());', 1)[1].split('\n                Ok(())', 1)[0]
