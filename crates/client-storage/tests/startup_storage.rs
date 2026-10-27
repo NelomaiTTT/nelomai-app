@@ -433,7 +433,7 @@ fn committed_fresh_staging_never_rewinds_same_epoch_auth_metadata() {
 
 #[test]
 fn committed_fresh_inventory_missing_either_owner_is_recovery_not_new_install() {
-    for missing_auth in [false, true] {
+    for (missing_auth, missing_runtime) in [(false, true), (true, false), (true, true)] {
         let root = tempfile::tempdir().unwrap();
         let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
         let records = Records::default();
@@ -447,14 +447,20 @@ fn committed_fresh_inventory_missing_either_owner_is_recovery_not_new_install() 
             &manifest.latest().runtime_version,
         )
         .unwrap();
-        records.values.lock().unwrap().remove(if missing_auth {
-            "auth-v1"
-        } else {
-            path.namespace()
-        });
+        if missing_auth {
+            records.values.lock().unwrap().remove("auth-v1");
+        }
+        if missing_runtime {
+            records.values.lock().unwrap().remove(path.namespace());
+        }
+        let inventory = root.path().join("common/runtime-inventory-v1.json");
+        let original_inventory = std::fs::read(&inventory).unwrap();
+        let remaining_records = records.values.lock().unwrap().clone();
         let writes = records.writes.load(Ordering::SeqCst);
         assert!(prepare_runtime_storage(&lock, &manifest, RuntimeSlot::Latest, &records).is_err());
         assert_eq!(records.writes.load(Ordering::SeqCst), writes);
+        assert_eq!(std::fs::read(&inventory).unwrap(), original_inventory);
+        assert_eq!(*records.values.lock().unwrap(), remaining_records);
         if !missing_auth {
             assert_eq!(ready.auth.load().unwrap(), auth);
         }

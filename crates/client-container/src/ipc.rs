@@ -58,6 +58,9 @@ pub enum AuthRequestV1 {
     Login {
         stamp: Option<ScopeStamp>,
         request: RuntimeLogin,
+        /// Older retained runtimes only understand Error/Service replies.
+        #[serde(default)]
+        supports_login_rejection: bool,
     },
     AccessToken {
         stamp: Option<ScopeStamp>,
@@ -96,6 +99,9 @@ pub enum AuthResponseV1 {
         access: AccessSnapshot,
     },
     Done,
+    LoginRejected {
+        reason: nelomai_client_api::LoginRejection,
+    },
     Error {
         error: PrivateError,
     },

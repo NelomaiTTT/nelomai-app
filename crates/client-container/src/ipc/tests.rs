@@ -86,6 +86,7 @@ async fn queued_remote_issuance_is_cancelled(login: bool, expire: bool) {
     let (stamp, observation) = fixture.broker.observe_stamped().await.unwrap();
     let request = if login {
         AuthRequestV1::Login {
+            supports_login_rejection: false,
             stamp: Some(stamp),
             request: RuntimeLogin {
                 login: "synthetic".into(),
@@ -555,6 +556,7 @@ async fn outbox_rejects_oversize_before_queueing_owned_credentials() {
     let frame = FrameV1::new(
         1,
         MessageV1::Request(AuthRequestV1::Login {
+            supports_login_rejection: false,
             stamp: None,
             request: RuntimeLogin {
                 login: "synthetic".into(),
@@ -2016,9 +2018,146 @@ async fn logout_then_login_refreshes_scope_before_reaching_http() {
     server.abort();
 }
 
+async fn rejected_login_fixture(
+    status: u16,
+    code: &'static str,
+    accept_retry: bool,
+) -> (Fixture, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route("/api/client/v1/auth/login", axum::routing::post(move || {
+        let counted = counted.clone();
+        async move {
+            if counted.fetch_add(1, Ordering::SeqCst) > 0 && accept_retry {
+                return (axum::http::StatusCode::OK, axum::Json(serde_json::json!({
+                    "api_version":"1","request_id":"synthetic","token_type":"Bearer",
+                    "access_token":"new-access","access_expires_in":900,"refresh_token":"new-refresh","refresh_expires_in":3600,
+                    "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                    "device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16",
+                    "runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}
+                })));
+            }
+            (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(serde_json::json!({
+                "request_id":"synthetic", "code":code,"message":"do-not-forward-panel-text"
+            })))
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (Fixture::new(api, false), calls, server)
+}
+
+fn password_login() -> RuntimeLogin {
+    RuntimeLogin {
+        login: "synthetic".into(),
+        password: "synthetic".into(),
+        device_name: "fixture".into(),
+    }
+}
+
+#[tokio::test]
+async fn private_login_preserves_safe_panel_rejection_codes() {
+    for (status, code) in [
+        (401, "invalid_credentials"),
+        (403, "app_access_unavailable"),
+        (409, "device_limit_reached"),
+        (429, "login_rate_limited"),
+        (422, "invalid_request"),
+    ] {
+        let (fixture, calls, server) = rejected_login_fixture(status, code, false).await;
+        let result = fixture.client.login(password_login()).await;
+        assert!(
+            matches!(&result, Err(nelomai_client_core::CoreError::Api(nelomai_client_core::CoreApiError::Rejected { code: actual, message, .. }))
+            if actual == code && !message.contains("do-not-forward-panel-text")),
+            "{code}: {result:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn failed_private_login_refreshes_scope_for_retry_without_bootstrap() {
+    let (fixture, calls, server) = rejected_login_fixture(401, "invalid_credentials", false).await;
+    assert!(fixture.client.login(password_login()).await.is_err());
+    let mut corrected = password_login();
+    corrected.login = "corrected".into();
+    assert!(fixture.client.login(corrected).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "retry must reach the panel with a fresh fence"
+    );
+    fixture.client.logout().await.unwrap();
+    assert_eq!(
+        fixture.broker.auth_state().await.unwrap(),
+        crate::BrokerAuthState::LoggedOut
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn freed_device_slot_allows_private_login_without_restart() {
+    let (fixture, calls, server) = rejected_login_fixture(409, "device_limit_reached", true).await;
+    assert!(fixture.client.login(password_login()).await.is_err());
+    assert_eq!(
+        fixture.broker.auth_state().await.unwrap(),
+        crate::BrokerAuthState::LoggedOut
+    );
+    let access = fixture.client.login(password_login()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    fixture.child.check(&transport::scope(&access)).unwrap();
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::Active
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn retained_runtime_without_login_rejection_opt_in_gets_legacy_error() {
+    let (fixture, _, server) = rejected_login_fixture(409, "device_limit_reached", false).await;
+    let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+    let request: AuthRequestV1 = serde_json::from_value(serde_json::json!({
+        "kind":"login", "stamp":stamp, "request":password_login()
+    }))
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .client
+            .request(request, Instant::now() + REQUEST_BUDGET)
+            .await,
+        Err(PrivateError::Service)
+    ));
+    assert_eq!(
+        fixture.broker.auth_state().await.unwrap(),
+        crate::BrokerAuthState::LoggedOut
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn unknown_private_login_then_logout_can_reauthenticate_same_account() {
+    let (fixture, calls, server) = rejected_login_fixture(502, "unknown_result", true).await;
+    assert!(fixture.client.login(password_login()).await.is_err());
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::AuthenticationOutcomeUnknown
+    );
+    assert!(fixture.client.logout().await.is_err());
+    // Like the user, explicitly return to Login after the failed logout.
+    let access = fixture.client.login(password_login()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    fixture.child.check(&transport::scope(&access)).unwrap();
+    server.abort();
+}
+
 #[tokio::test]
 async fn pre_logout_state_reply_cannot_restore_invalidated_cached_scope() {
-    for logout_reply_first in [false, true] {
+    for (logout_reply_first, logout_fails) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let stamp_fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
         let (old_stamp, _) = stamp_fixture.broker.observe_stamped().await.unwrap();
         let new_stamp_fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
@@ -2171,6 +2310,24 @@ async fn pre_logout_state_reply_cannot_restore_invalidated_cached_scope() {
 
         let second_logout_client = client.clone();
         let second_logout = tokio::spawn(async move { second_logout_client.logout().await });
+        let refreshed = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(
+            matches!(refreshed.message, MessageV1::Request(AuthRequestV1::State)),
+            "failed Login must invalidate its pre-issuance stamp before Logout"
+        );
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                refreshed.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: old_stamp.clone(),
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
         let second_logout_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
         assert!(matches!(
             second_logout_request.message,
@@ -2199,12 +2356,21 @@ async fn pre_logout_state_reply_cannot_restore_invalidated_cached_scope() {
             .unwrap();
         child.commit(&lease, &new_scope).unwrap();
         child.grant(&lease, &new_scope).unwrap();
+        let logout_response = || {
+            if logout_fails {
+                AuthResponseV1::Error {
+                    error: PrivateError::Service,
+                }
+            } else {
+                AuthResponseV1::Done
+            }
+        };
         if logout_reply_first {
             write_frame(
                 &mut owner_socket,
                 FrameV1::new(
                     second_logout_request.id,
-                    MessageV1::Response(AuthResponseV1::Done),
+                    MessageV1::Response(logout_response()),
                 ),
                 deadline(),
             )
@@ -2234,14 +2400,14 @@ async fn pre_logout_state_reply_cannot_restore_invalidated_cached_scope() {
                 &mut owner_socket,
                 FrameV1::new(
                     second_logout_request.id,
-                    MessageV1::Response(AuthResponseV1::Done),
+                    MessageV1::Response(logout_response()),
                 ),
                 deadline(),
             )
             .await
             .unwrap();
         }
-        second_logout.await.unwrap().unwrap();
+        assert_eq!(second_logout.await.unwrap().is_err(), logout_fails);
 
         let next_login_client = client.clone();
         let next_login = tokio::spawn(async move {

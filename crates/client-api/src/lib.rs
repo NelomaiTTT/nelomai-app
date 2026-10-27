@@ -786,6 +786,44 @@ pub enum ClientApiError {
     },
 }
 
+/// Definitive password-login refusals: the panel issued no session for this
+/// attempt. Only these fixed codes may cross private auth IPC, never panel text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginRejection {
+    InvalidCredentials,
+    AppAccessUnavailable,
+    DeviceLimitReached,
+    LoginRateLimited,
+    InvalidRequest,
+}
+
+impl LoginRejection {
+    pub fn from_error(error: &ClientApiError) -> Option<Self> {
+        let ClientApiError::Api { status, code, .. } = error else {
+            return None;
+        };
+        match (status.as_u16(), code.as_str()) {
+            (401, "invalid_credentials") => Some(Self::InvalidCredentials),
+            (403, "app_access_unavailable") => Some(Self::AppAccessUnavailable),
+            (409, "device_limit_reached") => Some(Self::DeviceLimitReached),
+            (429, "login_rate_limited") => Some(Self::LoginRateLimited),
+            (422, "invalid_request") => Some(Self::InvalidRequest),
+            _ => None,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidCredentials => "invalid_credentials",
+            Self::AppAccessUnavailable => "app_access_unavailable",
+            Self::DeviceLimitReached => "device_limit_reached",
+            Self::LoginRateLimited => "login_rate_limited",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
 impl ClientApiError {
     pub fn stable_code(&self) -> Option<&str> {
         match self {

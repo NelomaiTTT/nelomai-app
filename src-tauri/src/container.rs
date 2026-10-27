@@ -330,7 +330,7 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            startup::setup(|| {
+            let result = startup::setup(|| {
                 use base64::Engine;
                 startup::stage("common.resources");
                 let resources = installed_resources(app)?;
@@ -423,20 +423,32 @@ pub fn run() {
                     finishing: AtomicBool::new(false),
                 });
                 app.manage(state.clone());
-                startup::stage("common.tray");
-                desktop::setup_tray(app)?;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
+                // A tray failure still needs the native pump to process Quit
+                // from the failure window and complete guarded child cleanup.
+                startup::stage("common.tray");
+                desktop::setup_tray(app)?;
                 Ok(())
-            })
+            });
+            if result.is_err() {
+                // Tauri panics on setup Err inside macOS didFinishLaunching;
+                // unwinding across that Objective-C callback aborts the process.
+                // Keep protected records intact and show a separate, inert UI.
+                if let Err(error) = show_startup_failure(app) {
+                    startup::error("common.failure_window", error.as_ref());
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
         });
     let mut context = crate::app_context();
     context.config_mut().app.windows.clear();
     startup::stage("common.build");
-    let app = builder
-        .build(context)
-        .inspect_err(|error| startup::error("common.build", error))
-        .expect("common desktop startup failed");
+    let app = builder.build(context).unwrap_or_else(|error| {
+        startup::error("common.build", &error);
+        std::process::exit(1);
+    });
     #[cfg(target_os = "macos")]
     let app = {
         let mut app = app;
@@ -461,6 +473,27 @@ pub fn run() {
             }
         }
     });
+}
+
+fn show_startup_failure(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = app.handle().clone();
+    let window = tauri::WebviewWindowBuilder::new(
+        &*app,
+        "startup-failure",
+        tauri::WebviewUrl::App("startup-failure.html".into()),
+    )
+    .title("Nelomai — ошибка запуска")
+    .inner_size(560.0, 320.0)
+    .resizable(false)
+    .build()?;
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            && !queue_action(&handle, RuntimeAction::Quit)
+        {
+            handle.exit(0);
+        }
+    });
+    Ok(())
 }
 
 fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: NativeStream) {

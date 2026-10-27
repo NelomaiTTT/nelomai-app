@@ -198,6 +198,24 @@ describe("binding changed outside the open UI", () => {
     expect(context.busy).toBe(true);
   });
 
+  it.each(["signed_out", "authentication_outcome_unknown"])("shows explicit Login after bootstrap reports %s", async (code) => {
+    const { context } = fixture();
+    let passwordSubmissions = 0;
+    Object.assign(context, {
+      startupRetry: { cancel: () => {}, schedule: () => {} }, startupPending: false, refreshPending: false,
+      retryPendingStartup: () => {},
+      diagnosticsStatus: null, startupSlow: false, startupTimer: null,
+      window: { setTimeout: () => 1, clearTimeout: () => {} },
+      nativeClient: { bootstrap: async () => { throw { code }; }, recordStartupStage: () => {},
+        login: () => { passwordSubmissions++; } },
+    });
+    await executePageFunction("restore", context);
+    expect(context.view).toBe("sign_in");
+    expect(context.phase).toBe("signed_out");
+    expect(context.error).toBe(code === "signed_out" ? null : commandMessage({ code }, "login"));
+    expect(passwordSubmissions).toBe(0);
+  });
+
   it("discards the bootstrap state read if Stop takes ownership while it waits", async () => {
     const { context, reply, state } = fixture();
     Object.assign(context, {

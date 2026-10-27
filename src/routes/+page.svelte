@@ -588,11 +588,12 @@
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
       startupRetry.schedule(code, retryPendingStartup);
-      if (code === "signed_out") {
+      if (code === "signed_out" || code === "authentication_outcome_unknown") {
         reserveState = null;
         desktopActiveSlot = null;
         phase = "signed_out";
         view = "sign_in";
+        if (code === "authentication_outcome_unknown") error = commandMessage(reason, "login");
         void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       } else if (code === "access_expired") {
         phase = "access_expired";

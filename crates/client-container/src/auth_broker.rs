@@ -2178,11 +2178,8 @@ impl AuthBroker {
                 let mut auth = self.load()?;
                 if Self::owns_ticket(&auth, &ticket) {
                     let known_not_issued = local_not_issued
-                        || matches!(&error,
-                        BrokerError::Api(ClientApiError::Api { status, code, .. })
-                            if matches!((status.as_u16(), code.as_str()),
-                                (401, "invalid_credentials") | (403, "app_access_unavailable")
-                                | (429, "login_rate_limited") | (422, "invalid_request")));
+                        || matches!(&error, BrokerError::Api(error)
+                            if nelomai_client_api::LoginRejection::from_error(error).is_some());
                     let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
                     if known_not_issued && !ticket.prior_login_outcome_unknown {
                         meta.pending_request = None;

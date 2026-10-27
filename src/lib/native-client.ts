@@ -351,6 +351,16 @@ export function commandMessage(
   }
 
   switch (code) {
+    case "invalid_credentials":
+      return "Неверный логин или пароль.";
+    case "app_access_unavailable":
+      return "Вход в приложение недоступен для этого аккаунта. Проверьте доступ в панели.";
+    case "login_rate_limited":
+      return "Слишком много попыток входа. Попробуйте позже.";
+    case "invalid_request":
+      return "Проверьте данные входа и попробуйте снова.";
+    case "authentication_outcome_unknown":
+      return "Исход предыдущего входа неизвестен. Повторите вход с тем же аккаунтом.";
     case "temporarily_unavailable":
       return unavailableMessage(context);
     case "startup_timeout":

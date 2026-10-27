@@ -11,6 +11,13 @@ function commandError(code: string, message = "server message") {
 }
 
 describe("native client", () => {
+  it("explains safe Login refusals and explicit same-account recovery", () => {
+    expect(commandMessage(commandError("invalid_credentials"), "login")).toContain("логин или пароль");
+    expect(commandMessage(commandError("app_access_unavailable"), "login")).toContain("доступ");
+    expect(commandMessage(commandError("login_rate_limited"), "login")).toContain("позже");
+    expect(commandMessage(commandError("invalid_request"), "login")).toContain("данные");
+    expect(commandMessage(commandError("authentication_outcome_unknown"), "login")).toContain("тем же аккаунтом");
+  });
   it("gives network failures an action matching the current operation", () => {
     const error = commandError(
       "temporarily_unavailable",

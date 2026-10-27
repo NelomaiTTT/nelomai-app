@@ -1718,6 +1718,7 @@ async fn pre_http_stop_failure_and_definitive_rejection_allow_corrected_username
         None,
         Some((401, "invalid_credentials")),
         Some((403, "app_access_unavailable")),
+        Some((409, "device_limit_reached")),
         Some((429, "login_rate_limited")),
         Some((422, "invalid_request")),
     ] {
@@ -1824,13 +1825,25 @@ async fn definitive_rejection_does_not_erase_earlier_unknown_login_outcome() {
         broker.auth_state().await.unwrap(),
         BrokerAuthState::AuthenticationOutcomeUnknown
     );
+    *state.login_rejection.lock().unwrap() = Some((409, "device_limit_reached".into()));
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        broker.auth_state().await.unwrap(),
+        BrokerAuthState::AuthenticationOutcomeUnknown
+    );
     let mut other = login_request();
     other.login = "other-account".into();
     assert!(broker
         .login(&other, &RuntimeTarget::from_identity(&identity(8)))
         .await
         .is_err());
-    assert_eq!(state.login_requests.lock().unwrap().len(), 2);
+    assert_eq!(state.login_requests.lock().unwrap().len(), 3);
     server.abort();
 }
 

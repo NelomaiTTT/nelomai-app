@@ -58,6 +58,7 @@ async fn private_frame_roundtrip_and_debug_never_print_password() {
     let frame = FrameV1::new(
         7,
         MessageV1::Request(AuthRequestV1::Login {
+            supports_login_rejection: false,
             stamp: None,
             request: nelomai_client_api::RuntimeLogin {
                 login: "private-login".into(),
