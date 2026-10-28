@@ -32,7 +32,12 @@ while True:
     if not size: break
     value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
     if value.get('dispatcher_control')=='ready': reply={'engine_ready':True}
-    elif value.get('dispatcher_control')=='stop': reply={'engine_stopped':True}
+    elif value.get('dispatcher_control')=='stop':
+        import time
+        if os.path.exists(sys.argv[2]+'/hold-test-stop'):
+            open(sys.argv[2]+'/test-stop-entered','w').close()
+            while os.path.exists(sys.argv[2]+'/hold-test-stop'): time.sleep(.01)
+        reply={'engine_stopped':True}
     else: reply={'protocolVersion':5,'ok':True,'state':'running','serviceVersion':os.path.basename(os.path.dirname(sys.argv[0]))}
     data=json.dumps(reply).encode()
     sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()

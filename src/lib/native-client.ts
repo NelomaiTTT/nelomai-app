@@ -303,7 +303,7 @@ function nativeErrorMessage(error: unknown): string | null {
 function unavailableMessage(context: UserErrorContext): string {
   switch (context) {
     case "login":
-      return "Панель Nelomai не отвечает. Проверьте интернет и попробуйте войти снова.";
+      return "Не удалось войти. Проверьте интернет и попробуйте войти снова.";
     case "startup":
       return "Панель Nelomai не отвечает. Проверьте интернет и нажмите «Повторить».";
     case "start":
@@ -327,7 +327,7 @@ function unavailableMessage(context: UserErrorContext): string {
     case "unbind_peer":
       return "Не удалось сменить пир. Проверьте интернет и повторите действие.";
     case "logout":
-      return "Не удалось выйти из аккаунта. Проверьте интернет и нажмите «Выйти» ещё раз.";
+      return "Не удалось выйти из аккаунта. Проверьте интернет и повторите выход.";
     default:
       return "Панель Nelomai не отвечает. Проверьте интернет и повторите действие.";
   }

@@ -25,7 +25,7 @@ netlink-packet-generic = "0.4"
 netlink-packet-wireguard = "0.4"
 ed25519-dalek = "2.2"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-packet-core = "0.8"

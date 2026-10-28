@@ -127,7 +127,7 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeRecordSwitchControl<S, T>
 }
 
 #[async_trait]
-impl<S: RuntimeStateStore, T: TunnelController> RuntimeSwitchControl
+impl<S: RuntimeStateStore, T: TunnelController + 'static> RuntimeSwitchControl
     for RuntimeRecordSwitchControl<S, T>
 {
     async fn handoff_cleanup(
@@ -577,7 +577,7 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
 }
 
 #[async_trait]
-impl<T: TunnelController> LocalAuthStop for CoreLocalStop<T> {
+impl<T: TunnelController + 'static> LocalAuthStop for CoreLocalStop<T> {
     async fn stop_local(&self) -> Result<(), BrokerError> {
         CoreLocalStop::stop_local(self)
             .await

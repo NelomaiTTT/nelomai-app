@@ -115,7 +115,10 @@ impl UnixSocketTransport {
                 .with_identity(
                     matches!(
                         request,
-                        Request::Stop { .. } | Request::Status { .. } | Request::Version { .. }
+                        Request::Stop { .. }
+                            | Request::StopIfUnowned { .. }
+                            | Request::Status { .. }
+                            | Request::Version { .. }
                     ),
                     |expected| Ok(self.exchange_bound(request, expected)),
                 )
@@ -126,7 +129,7 @@ impl UnixSocketTransport {
 
     fn exchange_bound(
         &self,
-        request: Request,
+        mut request: Request,
         expected: Option<&nelomai_contracts::dispatcher::EngineIdentity>,
     ) -> Result<Response, ServiceError> {
         if request.protocol_version() != crate::PROTOCOL_VERSION {
@@ -185,7 +188,7 @@ impl UnixSocketTransport {
             if !starts_engine {
                 if !version.running {
                     match request {
-                        Request::Status { .. } => {
+                        Request::Status { .. } | Request::StopIfUnowned { .. } => {
                             return Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)));
                         }
                         Request::Version { .. } => {
@@ -213,6 +216,12 @@ impl UnixSocketTransport {
                     return Err(ServiceError::Backend("dispatcher_start_failed".into()));
                 }
             }
+        }
+        // Keep protocol v5 engines (including embedded Stable) compatible.
+        // This translation happens AFTER the lifecycle Stop interception, so
+        // the engine's ordinary Stop retains its pair ownership guard.
+        if matches!(request, Request::StopIfUnowned { .. }) {
+            request = Request::stop();
         }
         let mut stream = UnixStream::connect(&self.path).map_err(transport_error)?;
         configure_stream(&stream)?;

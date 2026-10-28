@@ -8,6 +8,8 @@ mod host_updater;
 mod installed_runtime;
 pub mod ipc;
 mod refresh_diagnostics;
+#[cfg(test)]
+mod login_diagnostics_tests;
 mod runtime_auth;
 mod selection;
 pub mod startup_diagnostics;

@@ -132,7 +132,7 @@ impl<A, S, T> TestOwner<A, S, T> {
     }
 }
 #[async_trait]
-impl<A: TestAuthApi, S: SecretStore, T: TunnelController> RuntimeAuthProvider
+impl<A: TestAuthApi, S: SecretStore, T: TunnelController + 'static> RuntimeAuthProvider
     for TestOwner<A, S, T>
 {
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {

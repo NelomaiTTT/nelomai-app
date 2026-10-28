@@ -329,7 +329,7 @@ impl ServiceTransport for RecordingTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
         let command = match request {
             Request::Start { .. } => "start",
-            Request::Stop { .. } => "stop",
+            Request::Stop { .. } | Request::StopIfUnowned { .. } => "stop",
             Request::Status { .. } => "status",
             Request::Version { .. } => "version",
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",

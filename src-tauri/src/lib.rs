@@ -640,14 +640,23 @@ fn start_physical_network_scheduler(
     });
 }
 
-fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
+fn start_pending_stop_scheduler(
+    application: Arc<NativeApplication>,
+    #[cfg(target_os = "macos")] intent: Arc<connection_intent::DesktopConnectionIntent>,
+) {
     tauri::async_runtime::spawn(async move {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(PENDING_STOP_RETRY_INTERVAL) => {},
                 _ = application.wait_for_pending_stop() => {},
             }
-            let _ = application.retry_pending_stop().await;
+            let completion = application.retry_pending_stop().await;
+            #[cfg(target_os = "macos")]
+            if let Ok(Some(completion)) = completion {
+                intent.pending_stop_completed(completion).await;
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = completion;
         }
     });
 }
@@ -656,6 +665,7 @@ fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
 #[derive(Default)]
 struct DesktopCoordinationSchedule {
     retry_at_unix: i64,
+    last_status_error: Option<&'static str>,
     pending: Option<
         tokio::task::JoinHandle<
             Result<
@@ -809,15 +819,45 @@ where
         }
     }
     match step {
-        Ok(Ok(snapshot)) => DesktopPairObservation {
-            owns_tunnel: snapshot.is_some(),
-            snapshot,
-        },
-        Ok(Err(_)) => DesktopPairObservation {
-            owns_tunnel: true,
-            snapshot: None,
-        },
+        Ok(Ok(snapshot)) => {
+            schedule.last_status_error = None;
+            DesktopPairObservation {
+                owns_tunnel: snapshot.is_some(),
+                snapshot,
+            }
+        }
+        Ok(Err(error)) => {
+            // Error strings may contain private native details. Record only a
+            // small allowlist and emit once per change, without affecting recovery.
+            let code = match &error {
+                ApplicationError::Core(CoreError::Tunnel(code)) if code == "engine_not_running" => {
+                    "engine_not_running"
+                }
+                ApplicationError::Core(CoreError::Tunnel(code))
+                    if code == "service_unavailable" =>
+                {
+                    "service_unavailable"
+                }
+                _ => "status_unavailable",
+            };
+            if schedule.last_status_error != Some(code) {
+                if let Some((diagnostics, session_id)) = diagnostics {
+                    diagnostics.record_named(
+                        "desktop.redundancy.status_failed",
+                        Some(session_id),
+                        None,
+                        Some(code),
+                    );
+                }
+                schedule.last_status_error = Some(code);
+            }
+            DesktopPairObservation {
+                owns_tunnel: true,
+                snapshot: None,
+            }
+        }
         Err(_) => {
+            schedule.last_status_error = None;
             let previous_retry_at = schedule.retry_at_unix;
             schedule.retry_at_unix = schedule.retry_at_unix.max(now.saturating_add(15));
             if previous_retry_at != schedule.retry_at_unix {
@@ -2217,6 +2257,41 @@ mod tests {
         assert!(log.contains("cause=status_timeout"));
         assert!(log.contains("scheduler_now_unix=140 retry_at_unix=155"));
         assert_eq!(schedule.retry_at_unix, 155);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_status_failure_is_recorded_without_disclosing_backend_details() {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::CoreError;
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = diagnostics::AppDiagnostics::new(
+            directory.path().into(),
+            resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let mut schedule = DesktopCoordinationSchedule::default();
+        for code in [
+            "service_unavailable",
+            "service_unavailable",
+            "private backend details",
+        ] {
+            let observation = coordinate_desktop_redundancy(
+                &mut schedule,
+                100,
+                Some((&diagnostics, "session")),
+                || async { Ok(None) },
+                || async { Err(ApplicationError::Core(CoreError::Tunnel(code.into()))) },
+            )
+            .await;
+            assert!(observation.owns_tunnel);
+            assert!(observation.snapshot.is_none());
+        }
+        let log = std::fs::read_to_string(directory.path().join("application.jsonl")).unwrap();
+        assert!(log.contains("service_unavailable"));
+        assert!(log.contains("status_unavailable"));
+        assert!(!log.contains("private backend details"));
+        assert_eq!(log.matches("service_unavailable").count(), 1);
     }
 
     #[cfg(not(target_os = "android"))]

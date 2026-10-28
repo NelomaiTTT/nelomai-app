@@ -72,7 +72,7 @@ struct NativeStop {
     child: Mutex<Option<Child>>,
     exit_owner: nelomai_client_container::desktop::RuntimeExitOwner,
     tunnel: Arc<NativeController>,
-    operation: tokio::sync::Mutex<NativeOperationState>,
+    operation: Arc<tokio::sync::Mutex<NativeOperationState>>,
 }
 #[derive(Default)]
 struct NativeOperationState {
@@ -118,21 +118,26 @@ impl NativeOperationState {
 #[async_trait::async_trait]
 impl LocalAuthStop for NativeStop {
     async fn stop_local(&self) -> Result<(), BrokerError> {
-        let mut operation = self.operation.lock().await;
-        operation.observed_helper_stop = false;
-        self.tunnel
-            .stop()
-            .await
-            .map_err(|_| BrokerError::RecoveryRequired)?;
-        // Scoped pair cleanup leaves a reusable engine. Common's macOS stop
-        // receipt also requires the dispatcher to retire that engine.
-        #[cfg(target_os = "macos")]
-        self.tunnel
-            .stop_if_unowned()
-            .await
-            .map_err(|_| BrokerError::RecoveryRequired)?;
-        operation.observed_helper_stop = true;
-        Ok(())
+        let mut operation = self.operation.clone().lock_owned().await;
+        let tunnel = self.tunnel.clone();
+        tokio::spawn(async move {
+            operation.observed_helper_stop = false;
+            tunnel
+                .stop()
+                .await
+                .map_err(|_| BrokerError::RecoveryRequired)?;
+            // Scoped pair cleanup leaves a reusable engine. Common's macOS stop
+            // receipt also requires the dispatcher to retire that engine.
+            #[cfg(target_os = "macos")]
+            tunnel
+                .retire_engine()
+                .await
+                .map_err(|_| BrokerError::RecoveryRequired)?;
+            operation.observed_helper_stop = true;
+            Ok(())
+        })
+        .await
+        .map_err(|_| BrokerError::RecoveryRequired)?
     }
 }
 #[async_trait::async_trait]
@@ -194,7 +199,7 @@ impl CommonState {
                 #[cfg(target_os = "macos")]
                 self.stop
                     .tunnel
-                    .stop_if_unowned()
+                    .retire_engine()
                     .await
                     .map_err(|_| io::Error::other("helper stop receipt unavailable"))?;
                 Ok(())
@@ -358,7 +363,7 @@ pub fn run() {
                     child: Mutex::new(None),
                     exit_owner: Default::default(),
                     tunnel,
-                    operation: tokio::sync::Mutex::new(NativeOperationState::default()),
+                    operation: Arc::new(tokio::sync::Mutex::new(NativeOperationState::default())),
                 });
                 #[cfg(target_os = "linux")]
                 let fallback = Some(data.join("credentials"));
@@ -1001,6 +1006,7 @@ mod lifecycle_tests {
             "stale_scope",
             "final_error",
             "none",
+            "cancel_waiter",
         ] {
             use nelomai_client_tunnel::redundancy::{
                 protocol::Snapshot,
@@ -1048,12 +1054,16 @@ mod lifecycle_tests {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let done = Arc::new(AtomicBool::new(false));
             let mut threads = Vec::new();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
             for (index, path) in paths.iter().enumerate() {
                 let listener = UnixListener::bind(path).unwrap();
                 let calls = calls.clone();
                 let done = done.clone();
                 let identity = identity.clone();
                 let native = native.clone();
+                let entered = entered.clone();
+                let release = release.clone();
                 threads.push(std::thread::spawn(move || {
                     for stream in listener.incoming() {
                         if done.load(Ordering::Acquire) {
@@ -1083,6 +1093,18 @@ mod lifecycle_tests {
                                 .or_else(|| value["command"].as_str())
                                 .unwrap();
                             calls.lock().unwrap().push(format!("engine:{label}"));
+                            if label == "status" && fault == "cancel_waiter" {
+                                entered.notify_one();
+                                let (lock, wake) = &*release;
+                                let guard = lock.lock().unwrap();
+                                let _guard = wake
+                                    .wait_timeout_while(
+                                        guard,
+                                        std::time::Duration::from_secs(3),
+                                        |released| !*released,
+                                    )
+                                    .unwrap();
+                            }
                             let mut reply = Response::success(Some(ServiceTunnelState::Stopped));
                             let mut snapshot = native.clone();
                             if label == "stop" {
@@ -1105,7 +1127,7 @@ mod lifecycle_tests {
             if fault != "unbound" {
                 binding.bind(identity).unwrap();
             }
-            let stop = NativeStop {
+            let stop = Arc::new(NativeStop {
                 child: Mutex::new(None),
                 exit_owner: Default::default(),
                 tunnel: Arc::new(nelomai_unix_service::UnixTunnelController::new(
@@ -1114,12 +1136,36 @@ mod lifecycle_tests {
                     )
                     .for_common(binding),
                 )),
-                operation: tokio::sync::Mutex::new(NativeOperationState {
+                operation: Arc::new(tokio::sync::Mutex::new(NativeOperationState {
                     observed_helper_stop: true,
                     ..Default::default()
-                }),
+                })),
+            });
+            let result = if fault == "cancel_waiter" {
+                let worker = {
+                    let stop = stop.clone();
+                    tokio::spawn(async move { stop.stop_local().await })
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                    .await
+                    .unwrap();
+                worker.abort();
+                assert!(worker.await.unwrap_err().is_cancelled());
+                assert!(
+                    stop.operation.try_lock().is_err(),
+                    "cancelled waiter must not release native ordering"
+                );
+                *release.0.lock().unwrap() = true;
+                release.1.notify_all();
+                let operation =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), stop.operation.lock())
+                        .await
+                        .unwrap();
+                assert!(operation.observed_helper_stop);
+                Ok(())
+            } else {
+                stop.stop_local().await
             };
-            let result = stop.stop_local().await;
             done.store(true, Ordering::Release);
             for path in paths {
                 let _ = UnixStream::connect(path);
@@ -1127,16 +1173,20 @@ mod lifecycle_tests {
             for thread in threads {
                 thread.join().unwrap();
             }
-            assert_eq!(result.is_ok(), fault == "none", "{fault}");
+            assert_eq!(
+                result.is_ok(),
+                matches!(fault, "none" | "cancel_waiter"),
+                "{fault}"
+            );
             assert_eq!(
                 stop.operation.lock().await.observed_helper_stop,
-                fault == "none",
+                matches!(fault, "none" | "cancel_waiter"),
                 "{fault}"
             );
             let mut expected = vec!["dispatcher:version", "engine:status"];
             if fault != "unbound" {
                 expected.extend(["dispatcher:version", "engine:stop"]);
-                if fault == "none" || fault == "final_error" {
+                if matches!(fault, "none" | "cancel_waiter") || fault == "final_error" {
                     expected.extend(["dispatcher:version", "dispatcher:stop"]);
                 }
             }

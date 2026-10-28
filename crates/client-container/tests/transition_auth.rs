@@ -2978,8 +2978,24 @@ async fn exercise_logout_switch_cleanup(
         )
         .await
         .unwrap();
-        broker.logout().await.unwrap();
+        let epoch = store.load().unwrap().unwrap().auth_epoch;
+        let logout = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.logout().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.load().unwrap().unwrap().auth_epoch == epoch {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable cancellation must not queue behind local cleanup");
+        assert!(
+            !logout.is_finished(),
+            "local cleanup acknowledgement must wait for the earlier stop"
+        );
         tunnel.stop_release.notify_one();
+        logout.await.unwrap().unwrap();
         assert!(
             login.await.unwrap().is_err(),
             "logout must cancel a login already waiting for cleanup"

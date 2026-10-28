@@ -386,6 +386,15 @@ impl ProbeCache {
     }
 }
 
+/// Result of the existing cleanup worker, before any automatic restart.
+/// The source and cancellation epoch are captured under the lifecycle gate.
+#[derive(Debug)]
+pub struct PendingStopCompletion {
+    pub cleaned_pair: Option<nelomai_client_tunnel::redundancy::SessionScope>,
+    pub connection: Connection,
+    pub cancel_epoch: StartCancellationEpoch,
+}
+
 pub struct ClientApplication<A, S, T, L> {
     api: Arc<A>,
     auth: Arc<dyn RuntimeAuthProvider>,
@@ -980,6 +989,19 @@ where
         result
     }
 
+    pub fn start_cancellation_epoch(&self) -> StartCancellationEpoch {
+        self.core.start_cancellation_epoch()
+    }
+
+    pub fn check_start_cancellation(
+        &self,
+        epoch: StartCancellationEpoch,
+    ) -> Result<(), ApplicationError> {
+        self.core
+            .check_start_cancellation(epoch)
+            .map_err(Into::into)
+    }
+
     pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
         self.core.begin_start_attempt()
     }
@@ -1105,15 +1127,38 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn desktop_connection_intent_attempt_guarded(
         &self,
-        mut options: ConnectOptions,
+        options: ConnectOptions,
         now_unix: i64,
         reserve: bool,
         allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<Connection, ApplicationError> {
+        let cancel_epoch = self.core.start_cancellation_epoch();
+        self.desktop_connection_intent_attempt_at_epoch(
+            options,
+            now_unix,
+            reserve,
+            cancel_epoch,
+            allowed,
+        )
+        .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_connection_intent_attempt_at_epoch(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+        reserve: bool,
+        cancel_epoch: StartCancellationEpoch,
+        allowed: impl Fn() -> bool + Send + Sync,
+    ) -> Result<Connection, ApplicationError> {
+        self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.before_tunnel_start().await?;
+        self.core.check_start_cancellation(cancel_epoch)?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.check_start_barrier()?;
-        let cancel_epoch = self.core.begin_start_attempt();
+        self.core.begin_start_attempt();
         options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
@@ -1337,14 +1382,30 @@ where
         self.pending_stop_wake.notified().await;
     }
 
-    pub async fn retry_pending_stop(&self) -> Result<Option<Connection>, ApplicationError> {
+    pub async fn retry_pending_stop(
+        &self,
+    ) -> Result<Option<PendingStopCompletion>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        if self.core.state().await.phase != Phase::Stopping
-            && !self.core.has_pending_stop_cleanup()?
-        {
+        let before = self.core.state().await;
+        if before.phase != Phase::Stopping && !self.core.has_pending_stop_cleanup()? {
             return Ok(None);
         }
-        self.core.stop().await.map(Some).map_err(Into::into)
+        let cancel_epoch = self.core.start_cancellation_epoch();
+        let pair = self.core.desktop_cleanup_scope().ok().flatten();
+        let connection = self.core.complete_pending_stop().await?;
+        // Both a terminal Stop and an explicit accepted background-cleanup
+        // receipt can release local ownership. Core validates the native ACK
+        // and panel response before removing this exact protected pair.
+        let cleaned_pair = pair.filter(|_| {
+            self.core.check_start_cancellation(cancel_epoch).is_ok()
+                && matches!(self.core.desktop_cleanup_scope(), Ok(None))
+                && matches!(self.core.has_pending_stop_cleanup(), Ok(false))
+        });
+        Ok(Some(PendingStopCompletion {
+            cleaned_pair,
+            connection,
+            cancel_epoch,
+        }))
     }
 
     pub async fn stop_for_shutdown(&self) -> Result<Option<Connection>, ApplicationError> {

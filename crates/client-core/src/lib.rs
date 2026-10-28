@@ -92,6 +92,7 @@ pub struct CoreLocalStop<T> {
     epoch: Arc<AtomicU64>,
     wake: Arc<Notify>,
     writers: Arc<RuntimeWriterGates>,
+    stop_gate: Arc<Mutex<()>>,
 }
 impl<T: TunnelController> CoreLocalStop<T> {
     pub fn new(tunnel: Arc<T>) -> Arc<Self> {
@@ -101,35 +102,70 @@ impl<T: TunnelController> CoreLocalStop<T> {
             epoch: Arc::new(AtomicU64::new(0)),
             wake: Arc::new(Notify::new()),
             writers: Arc::new(RuntimeWriterGates::default()),
+            stop_gate: Arc::new(Mutex::new(())),
         })
     }
     pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
         self.writers.clone()
     }
-    pub async fn stop_local(&self) -> Result<(), CoreError> {
+    pub async fn stop_local(&self) -> Result<(), CoreError>
+    where
+        T: 'static,
+    {
         self.stop_local_with_success_phase(Phase::SignedOut).await
     }
-    pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
+    pub async fn stop_local_for_transition(&self) -> Result<(), CoreError>
+    where
+        T: 'static,
+    {
         self.stop_local_with_success_phase(Phase::Ready).await
     }
-    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError>
+    where
+        T: 'static,
+    {
+        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.wake.notify_waiters();
         *self.state.lock().await = CoreState {
             phase: Phase::Stopping,
             connection: None,
         };
-        let result = self.tunnel.stop().await;
-        let mut state = self.state.lock().await;
-        if result.is_ok() {
-            *state = CoreState {
-                phase: success_phase,
+        // Waiting callers can be cancelled without dispatch. Once dispatched,
+        // retain the stop and its ordering gate until the native reply, even if
+        // the owner/IPC waiter disappears. A later stop cannot overtake it.
+        let gate = self.stop_gate.clone().lock_owned().await;
+        let tunnel = self.tunnel.clone();
+        let state = self.state.clone();
+        let current_epoch = self.epoch.clone();
+        tokio::spawn(async move {
+            let _gate = gate;
+            // An earlier stop may have completed while this caller waited.
+            // The retained task now owns the stopping projection and native IO.
+            *state.lock().await = CoreState {
+                phase: Phase::Stopping,
                 connection: None,
             };
-        } else {
-            state.phase = Phase::Error;
-        }
-        result.map_err(Into::into)
+            let result = tunnel.stop().await;
+            let mut state = state.lock().await;
+            // A later cancelled waiter may advance the epoch without ever
+            // dispatching. Complete its orphaned projection too. The held gate
+            // prevents a new Start from succeeding during this native stop.
+            if current_epoch.load(Ordering::SeqCst) == epoch
+                || (state.phase == Phase::Stopping && state.connection.is_none())
+            {
+                if result.is_ok() {
+                    *state = CoreState {
+                        phase: success_phase,
+                        connection: None,
+                    };
+                } else {
+                    state.phase = Phase::Error;
+                }
+            }
+            result.map_err(CoreError::from)
+        })
+        .await
+        .map_err(|_| CoreError::Tunnel("local_stop_task_failed".into()))?
     }
 }
 
@@ -1301,6 +1337,7 @@ pub struct ClientCore<A, S, T, L> {
     foreground_intent: Mutex<Option<(u64, NativeConnectionIntent)>>,
     runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
+    local_stop_gate: Arc<Mutex<()>>,
     start_in_progress: AtomicBool,
     pending_start_active: AtomicBool,
     start_retry_wake: Arc<Notify>,
@@ -1371,6 +1408,7 @@ where
             foreground_intent: Mutex::new(None),
             runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
+            local_stop_gate: local.stop_gate.clone(),
             start_in_progress: AtomicBool::new(false),
             pending_start_active: AtomicBool::new(pending_start_active),
             start_retry_wake: local.wake.clone(),
@@ -2859,6 +2897,14 @@ where
             .await
     }
 
+    pub fn start_cancellation_epoch(&self) -> StartCancellationEpoch {
+        StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst))
+    }
+
+    pub fn check_start_cancellation(&self, epoch: StartCancellationEpoch) -> Result<(), CoreError> {
+        self.ensure_start_not_cancelled(epoch)
+    }
+
     pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
         self.foreground_sequence.fetch_add(1, Ordering::SeqCst);
         self.start_in_progress.store(true, Ordering::SeqCst);
@@ -2881,7 +2927,9 @@ where
         &self,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<(), CoreError> {
-        if self.start_cancel_epoch.load(Ordering::SeqCst) == cancel_epoch.0 {
+        if self.start_cancel_epoch.load(Ordering::SeqCst) == cancel_epoch.0
+            && self.local_stop_gate.try_lock().is_ok()
+        {
             Ok(())
         } else {
             Err(CoreError::StartCancelled)
@@ -2984,6 +3032,24 @@ where
             && matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
     }
 
+    /// Protected identity of the pair being cleaned, independent of the UI's
+    /// last active-member projection. No helper query or mutation occurs here.
+    pub fn desktop_cleanup_scope(
+        &self,
+    ) -> Result<Option<nelomai_client_tunnel::redundancy::SessionScope>, CoreError> {
+        #[cfg(not(target_os = "android"))]
+        {
+            let stored = self.load_runtime()?;
+            stored
+                .desktop_redundancy
+                .as_ref()
+                .map(|pair| desktop_redundancy::scope(pair, stored.slot))
+                .transpose()
+        }
+        #[cfg(target_os = "android")]
+        Ok(None)
+    }
+
     pub fn has_pending_stop_cleanup(&self) -> Result<bool, CoreError> {
         match self.load_runtime() {
             Ok(stored) => Ok(stored.pending_compensation_stop.is_some()),
@@ -3001,6 +3067,12 @@ where
 
     pub async fn stop(&self) -> Result<Connection, CoreError> {
         self.signal_start_cancellation();
+        self.complete_pending_stop().await
+    }
+
+    /// Finish already requested cleanup. This worker does not express a new
+    /// user Stop: the original Start epoch must survive an unexpected outage.
+    pub async fn complete_pending_stop(&self) -> Result<Connection, CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
         // Android's service owns its whole-session Stop (including cleanup).
         // A Stopping projection in Rust is not a second cleanup intent.

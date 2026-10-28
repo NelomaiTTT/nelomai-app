@@ -1,3 +1,4 @@
+use nelomai_client_tunnel::TunnelController;
 use nelomai_client_tunnel::{
     redundancy::{
         protocol::{Command, Snapshot},
@@ -7,6 +8,7 @@ use nelomai_client_tunnel::{
     DesktopTunnelOptions,
 };
 use nelomai_contracts::{dispatcher as d, RuntimeSlot};
+use nelomai_unix_service::UnixTunnelController;
 use nelomai_unix_service::{
     decode_request, decode_response, encode_request, encode_response, ParsedConfiguration, Request,
     Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
@@ -398,6 +400,11 @@ impl FakeTransport {
                         } else {
                             response.redundancy = Some(snapshot.clone());
                         }
+                        if value["command"] == "stop"
+                            && snapshot.session.phase != SessionPhase::Stopped
+                        {
+                            response = Response::failure("redundancy_session_owned");
+                        }
                         encode_response(&response).unwrap()
                     };
                     stream.write_all(&output).unwrap();
@@ -632,4 +639,38 @@ fn ordinary_backend_version_does_not_advertise_redundancy() {
         .unwrap()
         .get("desktopRedundancyV1")
         .is_none());
+}
+
+#[tokio::test]
+async fn unowned_stop_is_checked_by_engine_instead_of_retiring_it_at_dispatcher() {
+    let fake = FakeTransport::new(true, snapshot(SessionPhase::Running, false, false));
+    let controller = UnixTunnelController::new(fake.transport.clone());
+    assert!(controller.stop_if_unowned().await.is_err());
+    assert_eq!(
+        *fake.calls.lock().unwrap(),
+        ["dispatcher:version", "engine:stop"],
+        "unowned cleanup must reach the engine's existing pair ownership guard"
+    );
+}
+
+#[tokio::test]
+async fn unowned_stop_keeps_legacy_single_cleanup_and_absent_engine_passive() {
+    let encoded = encode_request(&Request::stop_if_unowned()).unwrap();
+    assert_eq!(
+        encode_request(&decode_request(&encoded).unwrap()).unwrap(),
+        encoded
+    );
+    for running in [true, false] {
+        let fake = FakeTransport::new(running, snapshot(SessionPhase::Stopped, false, false));
+        UnixTunnelController::new(fake.transport.clone())
+            .stop_if_unowned()
+            .await
+            .unwrap();
+        let expected = if running {
+            vec!["dispatcher:version", "engine:stop"]
+        } else {
+            vec!["dispatcher:version"]
+        };
+        assert_eq!(*fake.calls.lock().unwrap(), expected);
+    }
 }

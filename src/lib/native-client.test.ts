@@ -30,6 +30,18 @@ describe("native client", () => {
     expect(commandMessage(error, "stop")).toContain("Нажмите «Повторить»");
   });
 
+  it("does not attribute an unclassified login failure to the panel", () => {
+    const message = commandMessage(commandError("temporarily_unavailable"), "login");
+    expect(message).toContain("Не удалось войти");
+    expect(message).not.toContain("Панель Nelomai не отвечает");
+  });
+
+  it("does not name a missing button when logout needs retry", () => {
+    const message = commandMessage(commandError("temporarily_unavailable"), "logout");
+    expect(message).not.toContain("нажмите «Выйти»");
+    expect(message).toContain("повторите выход");
+  });
+
   it("explains personal server failures without masking local VPN errors", () => {
     const options = { personalPeer: true };
 

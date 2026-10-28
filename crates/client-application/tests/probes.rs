@@ -1470,3 +1470,42 @@ impl support::TestAuthApi for ProbeApi {
         Ok(())
     }
 }
+
+#[tokio::test]
+async fn desktop_intent_keeps_cancellation_across_preflight_wait() {
+    let preflight = Arc::new(PausedPreflight::default());
+    let (application, api) = application_with_preflight(preflight.clone());
+    let application = Arc::new(application);
+    let task_application = application.clone();
+    let start = tokio::spawn(async move {
+        task_application
+            .desktop_connection_intent_attempt_guarded(
+                ConnectOptions {
+                    layer: Layer::Stray,
+                    tic_connection_mode: TicConnectionMode::Dynamic,
+                    route_mode: RouteMode::Standalone,
+                    egress_mode: EgressMode::Ipv4,
+                    probes: Vec::new(),
+                    allow_alternate: true,
+                },
+                1_800_000_000,
+                true,
+                || true,
+            )
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        preflight.entered.notified(),
+    )
+    .await
+    .unwrap();
+    application.signal_start_cancellation();
+    preflight.release.notify_one();
+    assert!(matches!(
+        start.await.unwrap(),
+        Err(ApplicationError::Core(CoreError::StartCancelled))
+    ));
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
+    assert!(api.start_request.lock().unwrap().is_none());
+}

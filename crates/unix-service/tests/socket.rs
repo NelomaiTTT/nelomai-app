@@ -338,3 +338,108 @@ async fn unix_socket_round_trip_is_owner_only_and_bounded() {
     assert_eq!(response.state, Some(ServiceTunnelState::Stopped));
     server.join().expect("join helper thread");
 }
+
+#[tokio::test]
+async fn timed_out_dispatcher_stop_is_drained_before_retry_ack_and_new_start() {
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::{Request, ServiceTransport};
+    use std::time::Duration;
+    let (root, owner) = owned_dispatcher();
+    {
+        let mut dispatcher = owner.lock().unwrap();
+        let identity = dispatcher.layout.identity.clone();
+        assert!(
+            dispatcher
+                .handle(
+                    d::DispatcherRequest::Start {
+                        contract_version: 1,
+                        identity
+                    },
+                    &mut |_, _| Ok(())
+                )
+                .running
+        );
+    }
+    let hold = root.path().join("hold-test-stop");
+    fs::write(&hold, b"test gate").unwrap();
+    let entered = root.path().join("test-stop-entered");
+    let lifecycle_path = root.path().join("lifecycle.sock");
+    let private_path = root.path().join("private.sock");
+    let listener = bind_listener(&lifecycle_path, unsafe { libc::geteuid() }).unwrap();
+    let private = bind_listener(&private_path, unsafe { libc::geteuid() }).unwrap();
+    let server_owner = owner.clone();
+    let server = std::thread::spawn(move || {
+        // Each Stop and Start performs Version followed by the mutation.
+        // The first Stop finishes after its client has closed the socket.
+        for _ in 0..6 {
+            let _ = nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false);
+        }
+    });
+    let private_owner = owner.clone();
+    let private_server = std::thread::spawn(move || {
+        nelomai_unix_service::serve_dispatcher_one(&private, &private_owner, true).unwrap();
+    });
+    let transport = UnixSocketTransport::with_dispatcher(private_path, lifecycle_path);
+    let first = {
+        let t = transport.clone();
+        tokio::spawn(async move { t.exchange(Request::stop()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(7), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "real socket timeout must occur while the dispatcher is still executing Stop"
+    );
+    assert!(root.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    let mut retry = {
+        let t = transport.clone();
+        tokio::spawn(async move { t.exchange(Request::stop()).await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut retry)
+            .await
+            .is_err(),
+        "retry may not acknowledge cleanup ahead of the previous lifecycle request"
+    );
+    fs::remove_file(hold).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .state,
+        Some(ServiceTunnelState::Stopped)
+    );
+    assert!(!root.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    assert!(
+        transport
+            .exchange(Request::start("synthetic".into()))
+            .await
+            .unwrap()
+            .ok
+    );
+    server.join().unwrap();
+    private_server.join().unwrap();
+    let mut dispatcher = owner.lock().unwrap();
+    assert!(
+        dispatcher
+            .handle(
+                d::DispatcherRequest::Status {
+                    contract_version: 1
+                },
+                &mut |_, _| Ok(())
+            )
+            .running,
+        "new engine survives after all earlier stops and a positive cleanup receipt"
+    );
+}

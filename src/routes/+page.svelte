@@ -6,6 +6,7 @@
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import RuntimeSelector from "$lib/RuntimeSelector.svelte";
+  import LogoutRecovery from "$lib/LogoutRecovery.svelte";
   import { ReleaseHistory } from "$lib/release-history";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import {
@@ -128,6 +129,7 @@
   }
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
+  let logoutRecoveryRequired = $state(false);
   let diagnosticsBusy = $state(false);
   let diagnosticsStatus = $state<string | null>(null);
   let updateStatus = $state<UpdateStatus | null>(null);
@@ -588,12 +590,13 @@
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
       startupRetry.schedule(code, retryPendingStartup);
-      if (code === "signed_out" || code === "authentication_outcome_unknown") {
+      if (code === "signed_out" || code === "authentication_outcome_unknown" || code === "auth_recovery_required") {
         reserveState = null;
         desktopActiveSlot = null;
         phase = "signed_out";
         view = "sign_in";
-        if (code === "authentication_outcome_unknown") error = commandMessage(reason, "login");
+        logoutRecoveryRequired = code === "auth_recovery_required";
+        if (code !== "signed_out") error = commandMessage(reason, "login");
         void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       } else if (code === "access_expired") {
         phase = "access_expired";
@@ -681,10 +684,12 @@
       };
       const response = await nativeClient.login(request);
       password = "";
+      logoutRecoveryRequired = false;
       await applyBootstrap(response);
     } catch (reason) {
       phase = "signed_out";
       view = "sign_in";
+      if (commandCode(reason) === "auth_recovery_required") logoutRecoveryRequired = true;
       void nativeClient.recordStartupStage("sign_in_login_failed");
       error = commandMessage(reason, "login");
     } finally {
@@ -999,6 +1004,7 @@
     error = null;
     try {
       await nativeClient.logout();
+      logoutRecoveryRequired = false;
       startupPending = false;
       localStopPendingCleanup = false;
       bootstrap = null;
@@ -1025,6 +1031,7 @@
       view = "sign_in";
       void nativeClient.recordStartupStage("sign_in_logout_completed");
     } catch (reason) {
+      logoutRecoveryRequired = true;
       error = commandMessage(reason, "logout");
     } finally {
       busy = false;
@@ -1492,6 +1499,7 @@
           <input bind:value={deviceName} maxlength={DEVICE_NAME_MAX_LENGTH} required />
         </label>
         {#if error}<p class="error-message">{error}</p>{/if}
+        <LogoutRecovery required={logoutRecoveryRequired} {busy} onretry={logout} />
         <button class="primary-button" type="submit" disabled={busy}>
           {busy ? "Входим…" : "Войти"}
         </button>

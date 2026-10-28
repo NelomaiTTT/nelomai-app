@@ -953,12 +953,17 @@ fn include_refresh_log(directory: &Path, application_log: String) -> String {
     let previous =
         read_tail(&directory.join("auth-refresh.previous.jsonl"), BUDGET / 2).unwrap_or_default();
     let current = read_tail(&directory.join("auth-refresh.jsonl"), BUDGET).unwrap_or_default();
-    let refresh = tail_string(&format!("{previous}{current}"), BUDGET);
+    let refresh = tail_string(&format!("{previous}{current}"), BUDGET * 3 / 4);
+    let login_previous =
+        read_tail(&directory.join("auth-login.previous.jsonl"), BUDGET / 8).unwrap_or_default();
+    let login_current =
+        read_tail(&directory.join("auth-login.jsonl"), BUDGET / 4).unwrap_or_default();
+    let login = tail_string(&format!("{login_previous}{login_current}"), BUDGET / 4);
     let application = tail_string(
         &application_log,
-        MAX_APPLICATION_REPORT_BYTES - refresh.len(),
+        MAX_APPLICATION_REPORT_BYTES - refresh.len() - login.len(),
     );
-    format!("{application}{refresh}")
+    format!("{application}{refresh}{login}")
 }
 
 #[cfg(target_os = "android")]
@@ -1292,6 +1297,23 @@ mod tests {
             timestamp >= before && timestamp <= after,
             "marker must use epoch milliseconds: {timestamp}"
         );
+    }
+
+    #[test]
+    fn manual_report_includes_owner_login_failure_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let event = "{\"timestamp_unix\":123,\"kind\":\"auth.login.failed\",\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"code\":\"connect_timeout\"}\n";
+        fs::write(directory.path().join("auth-login.jsonl"), event).unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        assert!(diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap()
+            .application_log
+            .contains(event));
     }
 
     #[test]

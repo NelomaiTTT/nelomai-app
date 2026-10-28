@@ -9,6 +9,29 @@ use std::{
 const ROTATE_AT_BYTES: u64 = 64 * 1024;
 
 pub(crate) fn append(directory: &Path, event: &RefreshDiagnosticV1) -> io::Result<()> {
+    append_named(
+        directory,
+        event,
+        "auth-refresh.jsonl",
+        "auth-refresh.previous.jsonl",
+    )
+}
+
+pub(crate) fn append_login(directory: &Path, event: &RefreshDiagnosticV1) -> io::Result<()> {
+    append_named(
+        directory,
+        event,
+        "auth-login.jsonl",
+        "auth-login.previous.jsonl",
+    )
+}
+
+fn append_named(
+    directory: &Path,
+    event: &RefreshDiagnosticV1,
+    current_name: &str,
+    previous_name: &str,
+) -> io::Result<()> {
     let mut encoded = serde_json::to_vec(event)?;
     encoded.push(b'\n');
     fs::create_dir_all(directory)?;
@@ -17,8 +40,8 @@ pub(crate) fn append(directory: &Path, event: &RefreshDiagnosticV1) -> io::Resul
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
-    let current = directory.join("auth-refresh.jsonl");
-    let previous = directory.join("auth-refresh.previous.jsonl");
+    let current = directory.join(current_name);
+    let previous = directory.join(previous_name);
     if current
         .metadata()
         .is_ok_and(|m| m.len().saturating_add(encoded.len() as u64) > ROTATE_AT_BYTES)

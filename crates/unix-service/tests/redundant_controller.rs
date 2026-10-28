@@ -246,7 +246,7 @@ async fn legacy_cleanup_stop_never_acquires_authority_over_current_pair() {
     assert!(controller.stop_if_unowned().await.is_err());
     assert!(matches!(
         controller.transport().requests.lock().unwrap().as_slice(),
-        [Request::Stop { .. }]
+        [Request::StopIfUnowned { .. }]
     ));
 }
 

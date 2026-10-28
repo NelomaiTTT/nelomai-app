@@ -14,7 +14,8 @@ use nelomai_client_core::StallRecoveryPlan;
 use nelomai_client_core::{
     classify_recovery, ConnectOptions, ConnectionIntentCoordinator, ConnectionIntentStatus,
     CoreApiError, CoreError, CoreState, IntentGeneration, Phase, RecoveryDecision,
-    RecoveryPolicyContext, RecoveryTransport, StallTrigger, StartDisposition,
+    RecoveryPolicyContext, RecoveryTransport, StallTrigger, StartCancellationEpoch,
+    StartDisposition,
 };
 #[cfg(target_os = "macos")]
 use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
@@ -52,6 +53,7 @@ impl Default for ConnectionIntentSnapshot {
 struct RuntimeState {
     coordinator: ConnectionIntentCoordinator,
     reserve_requested: bool,
+    cancel_epoch: Option<StartCancellationEpoch>,
     options: Option<ConnectOptions>,
     policy: RecoveryPolicyContext,
     next_retry_at_unix: Option<i64>,
@@ -116,6 +118,7 @@ impl Default for RuntimeState {
         Self {
             coordinator: ConnectionIntentCoordinator::default(),
             reserve_requested: false,
+            cancel_epoch: None,
             options: None,
             policy: RecoveryPolicyContext::default(),
             next_retry_at_unix: None,
@@ -259,6 +262,7 @@ impl DesktopConnectionIntent {
         now_unix: i64,
         initial_preflight: Option<InitialDesktopPreflight>,
     ) -> Result<StartCommandResponse, CommandError> {
+        let cancel_epoch = self.application.start_cancellation_epoch();
         let observed = {
             let state = self.state.lock().await;
             state
@@ -314,6 +318,7 @@ impl DesktopConnectionIntent {
                         now_unix,
                         reserve_requested,
                     );
+                    state.cancel_epoch = Some(cancel_epoch);
                     state.initial_preflight = initial_preflight;
                     StartRuntimeAction::Run(generation)
                 }
@@ -334,6 +339,7 @@ impl DesktopConnectionIntent {
                             now_unix,
                             reserve_requested,
                         );
+                        state.cancel_epoch = Some(cancel_epoch);
                         state.initial_preflight = initial_preflight;
                     }
                     action
@@ -357,6 +363,7 @@ impl DesktopConnectionIntent {
             let generation = state.coordinator.generation();
             let cancelled = state.coordinator.cancel_intent(generation);
             if cancelled {
+                state.cancel_epoch = None;
                 state.options = None;
                 state.reserve_requested = false;
                 state.policy = RecoveryPolicyContext::default();
@@ -381,6 +388,34 @@ impl DesktopConnectionIntent {
             self.wake.notify_one();
         }
         cancelled
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn pending_stop_completed(
+        &self,
+        completion: nelomai_client_application::PendingStopCompletion,
+    ) {
+        if self
+            .application
+            .check_start_cancellation(completion.cancel_epoch)
+            .is_err()
+        {
+            return;
+        }
+        let queued = queue_engine_recovery(
+            &mut *self.state.lock().await,
+            &completion,
+            crate::current_unix_time(),
+        );
+        if queued {
+            self.diagnostics.record_named(
+                "connection.intent.engine_cleanup_complete",
+                None,
+                None,
+                None,
+            );
+            self.wake.notify_one();
+        }
     }
 
     pub(crate) async fn wake_for_network_change(&self) -> bool {
@@ -649,6 +684,7 @@ impl DesktopConnectionIntent {
             refresh_capability_before_attempt,
             initial_preflight,
             reserve_requested,
+            cancel_epoch,
         ) = {
             let mut state = self.state.lock().await;
             let options = state.options.clone().ok_or_else(|| {
@@ -678,6 +714,9 @@ impl DesktopConnectionIntent {
                 state.refresh_capability_before_attempt,
                 state.initial_preflight.clone(),
                 state.reserve_requested,
+                state.cancel_epoch.ok_or_else(|| {
+                    CommandError::new("connection_intent_cancelled", "Подключение отменено")
+                })?,
             )
         };
         if let Some(initial_preflight) = initial_preflight {
@@ -828,10 +867,11 @@ impl DesktopConnectionIntent {
         let result = match attempt_kind {
             AttemptKind::Start => {
                 self.application
-                    .desktop_connection_intent_attempt_guarded(
+                    .desktop_connection_intent_attempt_at_epoch(
                         options,
                         crate::current_unix_time(),
                         reserve_requested,
+                        cancel_epoch,
                         recovery_allowed,
                     )
                     .await
@@ -1008,6 +1048,7 @@ impl DesktopConnectionIntent {
             ));
         }
         state.coordinator.complete_compensation(generation);
+        state.cancel_epoch = None;
         state.options = None;
         state.policy = RecoveryPolicyContext::default();
         state.next_retry_at_unix = None;
@@ -1427,6 +1468,60 @@ where
             Some(pending.generation)
         }
     }
+}
+
+/// Only a completed cleanup of the connected intent can arm a new Start.
+/// An explicit Stop/Logout invalidates its saved epoch before waiting on gates.
+#[cfg(any(target_os = "macos", test))]
+fn queue_engine_recovery(
+    state: &mut RuntimeState,
+    completion: &nelomai_client_application::PendingStopCompletion,
+    now: i64,
+) -> bool {
+    if !state.armed
+        || state.coordinator.status() != ConnectionIntentStatus::None
+        || state.cancel_epoch != Some(completion.cancel_epoch)
+    {
+        return false;
+    }
+    let Some(cleaned) = completion.cleaned_pair.as_ref() else {
+        return false;
+    };
+    let Some(owned) = state.coordinator.completed_connection() else {
+        return false;
+    };
+    // Failover and member replacement can change the lease projected by the
+    // UI. The worker receipt identifies the protected pair that Core retired.
+    if owned.session_id.as_deref() != Some(cleaned.session_id.as_str()) || owned.pinned {
+        return false;
+    }
+    let Some(options) = state.options.clone() else {
+        return false;
+    };
+    let generation = state.coordinator.generation();
+    if state
+        .coordinator
+        .handle_stall(
+            generation,
+            StallTrigger {
+                options,
+                pinned: false,
+                transport: RecoveryTransport::Other,
+            },
+        )
+        .is_err()
+    {
+        return false;
+    }
+    state.pending_redundant_recovery = None;
+    state.attempt_kind = AttemptKind::Start;
+    state.reconcile_before_attempt = true;
+    state.repair_before_attempt = false;
+    state.refresh_capability_before_attempt = true;
+    state.initial_preflight = None;
+    state.retry_not_before_unix = None;
+    state.next_retry_at_unix = Some(now);
+    true
 }
 
 fn initialize_episode(

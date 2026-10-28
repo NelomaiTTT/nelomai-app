@@ -327,7 +327,12 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
         application.logout().await.unwrap();
         tunnel.hold_status.store(false, Ordering::SeqCst);
         tunnel.status_release.notify_one();
-        assert_eq!(poll.await.unwrap().phase, Phase::SignedOut);
+        let late = poll.await.unwrap();
+        assert!(
+            matches!(late.phase, Phase::SignedOut | Phase::Stopping),
+            "{late:?}"
+        );
+        port.recover_logout_cleanup().await.unwrap();
     } else {
         assert!(matches!(
             result,
@@ -357,7 +362,11 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
         panel.proofs.lock().unwrap()[0]["refresh_token"],
         "synthetic-refresh"
     );
-    assert_eq!(panel.proofs.lock().unwrap().len(), 1);
+    {
+        let proofs = panel.proofs.lock().unwrap();
+        assert!((1..=2).contains(&proofs.len()));
+        assert!(proofs.iter().all(|proof| proof == &proofs[0]));
+    }
     assert!(!root
         .path()
         .join("runtime/stable/state/0.2.16/state-v1.json")
@@ -602,6 +611,164 @@ async fn exercise_split_logout(held_start: usize, fail_forward: bool) {
         operational.load().unwrap().unwrap().saved_connection,
         legacy.saved_connection
     );
-    assert_eq!(panel.proofs.lock().unwrap().len(), 1);
+    {
+        let proofs = panel.proofs.lock().unwrap();
+        assert!((1..=2).contains(&proofs.len()));
+        assert!(proofs.iter().all(|proof| proof == &proofs[0]));
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn overlapping_local_stops_drain_before_new_login_start() {
+    let panel = Arc::new(Panel::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api =
+        Arc::new(ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+    let router = Router::new()
+        .route("/api/client/v1/auth/logout-runtime", post(logout))
+        .route("/api/client/v1/connections/pin-stray", post(bearer))
+        .route("/api/client/v1/auth/login", post(|| async { Json(json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"b-access","access_expires_in":900,"refresh_token":"b-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device-b","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})) }))
+        .route("/api/client/v1/bootstrap", get(|| async {
+            let mut value: Value = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/bootstrap.json")).unwrap();
+            value["connection"] = Value::Null;
+            Json(value)
+        }))
+        .with_state(panel.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+    let identity = RuntimeIdentity {
+        slot: RuntimeSlot::Stable,
+        runtime_version: "0.2.16".into(),
+        container_version: "0.2.16".into(),
+        runtime_contract_version: 1,
+        session_generation: Some(7),
+    };
+    let mut legacy = StoredAuth::new_install();
+    legacy.install_secret = "synthetic-install".into();
+    legacy.access_token = Some("synthetic-access".into());
+    legacy.refresh_token = Some("synthetic-refresh".into());
+    legacy.saved_connection = Some(StoredConnection {
+        lease_id: "synthetic-lease".into(),
+        pool_id: None,
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "[Interface]\nPrivateKey = synthetic".into(),
+        valid_until_unix: Some(2000),
+    });
+    let auth = Arc::new(ProtectedAuthStore::new(Record::default()));
+    let mut auth_value = AuthStoreV1::from_legacy(&legacy);
+    auth_value.confirmed_identity = Some(identity.clone());
+    auth_value.session_generation = Some(7);
+    auth.save(&auth_value).unwrap();
+    let tunnel = Arc::new(Tunnel::default());
+    tunnel.hold_start.store(false, Ordering::SeqCst);
+    tunnel.fail_stop.store(false, Ordering::SeqCst);
+    let local = CoreLocalStop::new(tunnel.clone());
+    let broker =
+        Arc::new(AuthBroker::new(api.as_ref().clone(), auth.clone(), local.clone()).unwrap());
+    let mut enrolled = auth.load().unwrap().unwrap();
+    enrolled.broker.as_mut().unwrap().confirmed_device_id = Some("device-a".into());
+    auth.save(&enrolled).unwrap();
+    let access = broker.observe().await.unwrap().access.unwrap();
+    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut runtime_value =
+        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
+    runtime_value.cleanup_only = false;
+    runtime_value.auth_scope = Some(RuntimeAuthScope {
+        auth_epoch: access.auth_epoch(),
+        family: access.family().into(),
+        identity: access.identity().clone(),
+    });
+    runtime.save(&runtime_value).unwrap();
+    let owner = RuntimeRecordOwner::new(runtime);
+    let operational = Arc::new(owner.operational());
+    let split = Arc::new(owner.split());
+    let port = Arc::new(
+        OwnerRuntimeAuth::new(
+            broker,
+            RuntimeTarget::from_identity(&identity),
+            RuntimeClientProfile {
+                platform: Platform::Macos,
+                platform_version: None,
+                architecture: "aarch64".into(),
+            },
+            Arc::new(RuntimeCacheAdmission::new(owner.clone())),
+            local.runtime_writer_gates(),
+        )
+        .unwrap(),
+    );
+    let application = Arc::new(ClientApplication::with_split_tunnel_store(
+        api.clone(),
+        operational.clone(),
+        split,
+        port.clone(),
+        local.clone(),
+        Arc::new(NoopLogger),
+    ));
+    tunnel.hold_next_stop.store(true, Ordering::SeqCst);
+    let old = {
+        let local = local.clone();
+        tokio::spawn(async move { local.stop_local().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), tunnel.stop_entered.notified())
+        .await
+        .unwrap();
+    let mut logout_task = {
+        let app = application.clone();
+        tokio::spawn(async move { app.logout().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while panel.proofs.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("revocation must not wait for the old local stop");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut logout_task)
+            .await
+            .is_err(),
+        "later Logout must not acknowledge local cleanup while an earlier stop is still running"
+    );
+    old.abort();
+    assert!(old.await.unwrap_err().is_cancelled());
+    tunnel.stop_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), logout_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    application
+        .login(
+            nelomai_client_application::LoginParameters {
+                login: "b".into(),
+                password: "synthetic-password".into(),
+                device_name: "synthetic".into(),
+            },
+            1100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        port.state().await.unwrap(),
+        nelomai_client_api::RuntimeAuthState::Active
+    );
+    let mut ready = operational.load().unwrap().unwrap();
+    ready.saved_connection = legacy.saved_connection.clone();
+    operational.save(&ready).unwrap();
+    application.start_saved_stray_offline(1100).await.unwrap();
+    assert_eq!(
+        tunnel.status().await.unwrap(),
+        TunnelStatus::Running,
+        "old stop killed new native session after admitted new login"
+    );
     server.abort();
 }

@@ -1775,6 +1775,57 @@ async fn logout_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle
 }
 
 #[tokio::test]
+async fn logout_ipc_timeout_closes_channel_and_preserves_pending_proof() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let server_entered = entered.clone();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/logout-runtime",
+        axum::routing::post(move || {
+            let entered = server_entered.clone();
+            async move {
+                entered.notify_one();
+                std::future::pending::<axum::Json<serde_json::Value>>().await
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    fixture.client.state().await.unwrap();
+    let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+    let client = fixture.client.clone();
+    let first = tokio::spawn(async move {
+        client
+            .request(
+                AuthRequestV1::Logout {
+                    stamp: Some(stamp),
+                    cancel_login_request: None,
+                },
+                Instant::now() + Duration::from_millis(500),
+            )
+            .await
+    });
+    entered.notified().await;
+    let first_result = first.await.unwrap();
+    assert!(
+        matches!(
+            first_result,
+            Err(PrivateError::Timeout | PrivateError::Closed)
+        ),
+        "{first_result:?}"
+    );
+    let saved = fixture.auth.load().unwrap().unwrap();
+    assert_eq!(saved.logout_state, LogoutState::Pending);
+    assert!(saved.broker.unwrap().pending_logout.is_some());
+    assert!(
+        fixture.client.logout().await.is_err(),
+        "closed private channel cannot retry logout"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn owner_originated_logout_revokes_real_child_latch() {
     let (api, calls, server) = logout_panel().await;
     let fixture = Fixture::new(api, true);

@@ -415,6 +415,7 @@ pub struct AuthBroker {
     refresh_retry: std::sync::Mutex<Option<RefreshRetry>>,
     refresh_events: std::sync::Mutex<std::collections::VecDeque<RefreshDiagnosticV1>>,
     refresh_diagnostics_directory: Option<std::path::PathBuf>,
+    login_diagnostics_gate: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -484,6 +485,7 @@ impl AuthBroker {
             refresh_retry: std::sync::Mutex::new(None),
             refresh_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             refresh_diagnostics_directory: None,
+            login_diagnostics_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -512,6 +514,62 @@ impl AuthBroker {
                 let _ = crate::refresh_diagnostics::append(directory, &event);
             }
             events.push_back(event);
+        }
+    }
+
+    fn record_login_failure(
+        &self,
+        ticket: &BrokerRequestV1,
+        error: &BrokerError,
+        local_not_issued: bool,
+    ) {
+        let Some(directory) = self.refresh_diagnostics_directory.clone() else {
+            return;
+        };
+        let Ok(permit) = self.login_diagnostics_gate.clone().try_acquire_owned() else {
+            return;
+        };
+        let code = if local_not_issued {
+            "local_preflight_failed"
+        } else {
+            match error {
+                BrokerError::Timeout => "owner_timeout",
+                BrokerError::Api(ClientApiError::Transport(error)) if error.is_timeout() => {
+                    "network_timeout"
+                }
+                BrokerError::Api(ClientApiError::Transport(error)) if error.is_connect() => {
+                    "connect_failed"
+                }
+                BrokerError::Api(ClientApiError::Transport(_)) => "transport_failed",
+                BrokerError::Api(ClientApiError::Api { status, .. })
+                    if status.is_server_error() =>
+                {
+                    "http_server_error"
+                }
+                BrokerError::Api(ClientApiError::Api { .. }) => "http_rejected",
+                BrokerError::Api(ClientApiError::InvalidErrorResponse { .. }) => {
+                    "invalid_http_response"
+                }
+                BrokerError::Api(_) => "invalid_response",
+                _ => "local_error",
+            }
+        };
+        let event = RefreshDiagnosticV1 {
+            timestamp_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            kind: "auth.login.failed".into(),
+            operation_id: ticket.operation_id.clone(),
+            code: code.into(),
+        };
+        // One outstanding blocking task at most; logging cannot hold auth locks
+        // or delay a login. A missing runtime, saturated task or IO error drops it.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || {
+                let _permit = permit;
+                let _ = crate::refresh_diagnostics::append_login(&directory, &event);
+            });
         }
     }
 
@@ -2174,6 +2232,7 @@ impl AuthBroker {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                self.record_login_failure(&ticket, &error, local_not_issued);
                 let _state = self.state.lock().await;
                 let mut auth = self.load()?;
                 if Self::owns_ticket(&auth, &ticket) {
@@ -3181,19 +3240,80 @@ impl AuthBroker {
         };
         // Initiate both immediately; physical stop failure must not suppress
         // revocation, and a slow remote server must not delay the stop attempt.
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let (stopped_tx, mut stopped_rx) = tokio::sync::watch::channel(None);
         let (stop, response) = tokio::join!(
-            tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
-            tokio::time::timeout(REQUEST_TIMEOUT, async {
+            async {
+                let stop = tokio::time::timeout_at(deadline, self.stop.stop_local())
+                    .await
+                    .map_err(|_| BrokerError::Timeout)
+                    .and_then(|result| result);
+                stopped_tx.send_replace(Some(stop.is_ok()));
+                stop
+            },
+            tokio::time::timeout_at(deadline, async {
                 self.stop.prepare_revocation(epoch).await?;
+                let already_stopped = *stopped_rx.borrow_and_update();
+                if already_stopped == Some(true) {
+                    self.api.reset_transport()?;
+                }
+                // A socket opened before route removal can hang until its
+                // connect timeout. A confirmed local stop invalidates that
+                // path immediately, even when no transport error has arrived.
+                let first = {
+                    let response = self.api.logout_runtime(&request);
+                    tokio::pin!(response);
+                    if already_stopped.is_some() {
+                        Some(response.await)
+                    } else {
+                        tokio::select! { biased;
+                            result = &mut response => Some(result),
+                            _ = stopped_rx.changed() => {
+                                if *stopped_rx.borrow() == Some(true) {
+                                    // Accept a reply already on its way; otherwise
+                                    // replace the path without spending the 8 s
+                                    // connect timeout. The outer deadline still wins.
+                                    tokio::time::timeout(Duration::from_millis(100), &mut response).await.ok()
+                                } else {
+                                    Some(response.await)
+                                }
+                            }
+                        }
+                    }
+                }; // Drop the obsolete HTTP future before resetting transport.
+                match first {
+                    Some(Ok(response)) => return Ok(response),
+                    Some(Err(ClientApiError::Transport(error))) => {
+                        if stopped_rx.borrow().is_none() {
+                            let _ = stopped_rx.changed().await;
+                        }
+                        if *stopped_rx.borrow() != Some(true) {
+                            return Err(BrokerError::Api(ClientApiError::Transport(error)));
+                        }
+                    }
+                    Some(Err(error)) => return Err(error.into()),
+                    None => {}
+                }
+                // Replay the exact durable operation once, after local cleanup,
+                // and keep both attempts inside the original owner deadline.
+                {
+                    let _state = self.state.lock().await;
+                    let auth = self.load()?;
+                    if auth.auth_epoch != epoch
+                        || auth.logout_state != LogoutState::Pending
+                        || auth.broker.as_ref().and_then(|m| m.pending_logout.as_ref())
+                            != Some(&proof)
+                    {
+                        return Err(BrokerError::Cancelled);
+                    }
+                }
+                self.api.reset_transport()?;
                 self.api
                     .logout_runtime(&request)
                     .await
                     .map_err(BrokerError::from)
             })
         );
-        let stop = stop
-            .map_err(|_| BrokerError::Timeout)
-            .and_then(|result| result);
         let response = response.map_err(|_| BrokerError::Timeout)??;
         if !matches!(
             response.code.as_str(),

@@ -171,6 +171,9 @@ pub enum Request {
     Stop {
         protocol_version: u16,
     },
+    StopIfUnowned {
+        protocol_version: u16,
+    },
     Status {
         protocol_version: u16,
     },
@@ -207,6 +210,12 @@ impl Request {
 
     pub fn stop() -> Self {
         Self::Stop {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn stop_if_unowned() -> Self {
+        Self::StopIfUnowned {
             protocol_version: PROTOCOL_VERSION,
         }
     }
@@ -257,6 +266,7 @@ impl Request {
                 protocol_version, ..
             }
             | Self::Stop { protocol_version }
+            | Self::StopIfUnowned { protocol_version }
             | Self::Status { protocol_version }
             | Self::Version { protocol_version }
             | Self::PhysicalNetworkFingerprint { protocol_version }
@@ -288,6 +298,10 @@ impl fmt::Debug for Request {
                 .field("protocol_version", protocol_version)
                 .field("configuration", &"<redacted>")
                 .field("options", options)
+                .finish(),
+            Self::StopIfUnowned { protocol_version } => formatter
+                .debug_struct("StopIfUnowned")
+                .field("protocol_version", protocol_version)
                 .finish(),
             Self::Stop { protocol_version } => formatter
                 .debug_struct("Stop")
@@ -343,6 +357,10 @@ enum RequestRef<'a> {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    StopIfUnowned {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
     Status {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
@@ -392,6 +410,9 @@ impl Serialize for Request {
                 configuration,
                 options,
             },
+            Self::StopIfUnowned { protocol_version } => RequestRef::StopIfUnowned {
+                protocol_version: *protocol_version,
+            },
             Self::Stop { protocol_version } => RequestRef::Stop {
                 protocol_version: *protocol_version,
             },
@@ -440,6 +461,10 @@ enum RequestOwned {
         options: DesktopTunnelOptions,
     },
     Stop {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    StopIfUnowned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
@@ -493,6 +518,9 @@ impl<'de> Deserialize<'de> for Request {
                 options,
             },
             RequestOwned::Stop { protocol_version } => Self::Stop { protocol_version },
+            RequestOwned::StopIfUnowned { protocol_version } => {
+                Self::StopIfUnowned { protocol_version }
+            }
             RequestOwned::Status { protocol_version } => Self::Status { protocol_version },
             RequestOwned::Version { protocol_version } => Self::Version { protocol_version },
             RequestOwned::PhysicalNetworkFingerprint { protocol_version } => {
@@ -772,7 +800,7 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 })
                 .and_then(|configuration| self.backend.start(&configuration, &options))
                 .map(|state| Response::success(Some(state))),
-            Request::Stop { .. } => self
+            Request::Stop { .. } | Request::StopIfUnowned { .. } => self
                 .backend
                 .stop()
                 .map(|state| Response::success(Some(state))),
@@ -885,6 +913,17 @@ impl<T> UnixTunnelController<T> {
 }
 
 impl<T: ServiceTransport> UnixTunnelController<T> {
+    /// Common-only lifecycle receipt, under its native operation gate. Ordinary
+    /// Core cleanup must use stop_if_unowned, which preserves the engine guard.
+    pub async fn retire_engine(&self) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::stop())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Stopped)
+    }
+
     /// Always ask the authenticated helper at command time. A GUI-cached scope
     /// is not authority to stop/rebind a possibly replaced native session.
     async fn current_redundancy_snapshot(&self) -> Result<Option<Snapshot>, TunnelError> {
@@ -1021,7 +1060,7 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
         // not acquire the currently running pair's scope from a fresh Status.
         let response = self
             .transport
-            .exchange(Request::stop())
+            .exchange(Request::stop_if_unowned())
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Stopped)

@@ -510,6 +510,289 @@ async fn panel(state: Arc<Panel>) -> (ClientApi, tokio::task::JoinHandle<()>) {
     )
 }
 
+async fn read_logout_request(stream: &mut tokio::net::TcpStream) -> Value {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 1024];
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert_ne!(n, 0, "request ended before its complete body");
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .expect("request must include content length");
+            if bytes.len() >= end + 4 + length {
+                return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn logout_replaces_socket_stranded_by_local_stop_without_waiting_for_connect_timeout() {
+    struct StopAfterRequest(Arc<Notify>);
+    #[async_trait]
+    impl LocalAuthStop for StopAfterRequest {
+        async fn stop_local(&self) -> Result<(), BrokerError> {
+            self.0.notified().await;
+            Ok(())
+        }
+    }
+    let state = Arc::new(Panel::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let stopped = Arc::new(Notify::new());
+    let router = Router::new()
+        .route("/api/client/v1/auth/logout-runtime", post(logout))
+        .with_state(state.clone());
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn({
+        let stopped = stopped.clone();
+        async move {
+            let (mut stranded, _) = listener.accept().await.unwrap();
+            first_tx
+                .send(read_logout_request(&mut stranded).await)
+                .unwrap();
+            stopped.notify_one();
+            // Retain the first socket without replying, just as a removed
+            // route can leave the original request waiting for its timeout.
+            let _stranded = stranded;
+            axum::serve(listener, router).await.unwrap();
+        }
+    });
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(StopAfterRequest(stopped))).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), broker.logout())
+        .await
+        .expect("confirmed route removal must replace the stranded request immediately")
+        .unwrap();
+    assert_eq!(
+        first_rx.await.unwrap(),
+        state.logout_requests.lock().unwrap()[0]
+    );
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn logout_retries_broken_connection_after_successful_local_stop() {
+    let state = Arc::new(Panel::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = Router::new()
+        .route("/api/client/v1/auth/logout-runtime", post(logout))
+        .with_state(state.clone());
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let body = read_logout_request(&mut connection).await;
+        first_tx.send(body).unwrap();
+        drop(connection);
+        axum::serve(listener, router).await.unwrap();
+    });
+    let store = auth_store();
+    let stop = Arc::new(Stop::default());
+    let broker = AuthBroker::new(api, store.clone(), stop.clone()).unwrap();
+    broker
+        .logout()
+        .await
+        .expect("retry after local stop must revoke the session");
+    assert_eq!(stop.0.load(Ordering::SeqCst), 1);
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        first_rx.await.unwrap(),
+        state.logout_requests.lock().unwrap()[0]
+    );
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn logout_does_not_retry_connection_when_local_stop_fails() {
+    struct FailedStop;
+    #[async_trait]
+    impl LocalAuthStop for FailedStop {
+        async fn stop_local(&self) -> Result<(), BrokerError> {
+            Err(BrokerError::RecoveryRequired)
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        read_logout_request(&mut connection).await;
+        drop(connection);
+        tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+            .await
+            .is_err()
+    });
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(FailedStop)).unwrap();
+    assert!(broker.logout().await.is_err());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(11), server)
+            .await
+            .expect("test server must finish")
+            .unwrap(),
+        "must not retry before successful local stop"
+    );
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.logout_state, LogoutState::Pending);
+    assert!(saved.broker.unwrap().pending_logout.is_some());
+}
+
+#[tokio::test]
+async fn logout_retry_shares_the_original_deadline_and_keeps_pending_proof() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        read_logout_request(&mut connection).await;
+        drop(connection);
+        let (mut second, _) = listener.accept().await.unwrap();
+        read_logout_request(&mut second).await;
+        std::future::pending::<()>().await;
+    });
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    let start = tokio::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(11), broker.logout())
+        .await
+        .expect("retry must not extend the request budget");
+    assert!(matches!(result, Err(BrokerError::Timeout)));
+    assert!(start.elapsed() < std::time::Duration::from_secs(11));
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.logout_state, LogoutState::Pending);
+    assert!(saved.broker.unwrap().pending_logout.is_some());
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_logout_retry_preserves_proof_for_later_owner() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let server_phase = Arc::new(AtomicUsize::new(0));
+    let phase = server_phase.clone();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        phase.store(1, Ordering::SeqCst);
+        let first = read_logout_request(&mut connection).await;
+        phase.store(2, Ordering::SeqCst);
+        // Read the complete request before dropping the socket. Closing an
+        // unread connection races the client's write and can prevent retry.
+        drop(connection);
+        let (mut second, _) = listener.accept().await.unwrap();
+        phase.store(3, Ordering::SeqCst);
+        let retry = read_logout_request(&mut second).await;
+        phase.store(4, Ordering::SeqCst);
+        entered_tx.send((first, retry)).unwrap();
+        std::future::pending::<()>().await;
+    });
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap());
+    let mut task = tokio::spawn(async move { broker.logout().await });
+    let (first, retry) = tokio::select! {
+        result = &mut task => {
+            let detail = match result {
+                Ok(Err(BrokerError::Api(error))) => format!("api: {error:?}"),
+                other => format!("{other:?}"),
+            };
+            panic!("broker completed before retry, server phase {}: {detail}", server_phase.load(Ordering::SeqCst));
+        }
+        result = tokio::time::timeout(std::time::Duration::from_secs(8), entered_rx) => {
+            result.unwrap_or_else(|_| panic!("server phase {}, broker still pending", server_phase.load(Ordering::SeqCst)))
+                .expect("synthetic server must capture both requests")
+        }
+    };
+    assert_eq!(
+        first, retry,
+        "retry must use the exact same proof and operation"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.logout_state, LogoutState::Pending);
+    let pending = saved.broker.unwrap().pending_logout.unwrap();
+    assert_eq!(first["operation_id"], pending.operation_id);
+    assert_eq!(first["refresh_token"], pending.refresh_proof);
+    server.abort();
+}
+
+#[tokio::test]
+async fn logout_does_not_retry_old_proof_after_another_logout_completed() {
+    struct HeldFirstStop {
+        calls: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+    }
+    #[async_trait]
+    impl LocalAuthStop for HeldFirstStop {
+        async fn stop_local(&self) -> Result<(), BrokerError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+    let state = Arc::new(Panel::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = Router::new()
+        .route("/api/client/v1/auth/logout-runtime", post(logout))
+        .with_state(state.clone());
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        read_logout_request(&mut connection).await;
+        drop(connection);
+        closed_tx.send(()).unwrap();
+        axum::serve(listener, router).await.unwrap();
+    });
+    let stop = Arc::new(HeldFirstStop {
+        calls: AtomicUsize::new(0),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), stop.clone()).unwrap());
+    let first = tokio::spawn({
+        let broker = broker.clone();
+        async move { broker.logout().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(8), stop.entered.notified())
+        .await
+        .expect("first stop must be entered");
+    tokio::time::timeout(std::time::Duration::from_secs(8), closed_rx)
+        .await
+        .expect("first request must be received")
+        .unwrap();
+    broker.logout().await.unwrap();
+    stop.release.notify_one();
+    assert!(matches!(first.await.unwrap(), Err(BrokerError::Cancelled)));
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    server.abort();
+}
+
 async fn recoverable_refresh(
     State(state): State<Arc<Panel>>,
     Json(body): Json<Value>,

@@ -309,6 +309,9 @@ struct MemoryTunnel {
     start_failure_code: Mutex<Option<String>>,
     fail_next_stops: AtomicUsize,
     stop_failure_code: Mutex<Option<String>>,
+    hold_next_stop: AtomicBool,
+    stop_entered: Notify,
+    stop_release: Notify,
     leave_running_on_start_failure: AtomicBool,
     leave_failed_on_start_failure: AtomicBool,
     start_delay_millis: AtomicU64,
@@ -416,6 +419,10 @@ impl TunnelController for MemoryTunnel {
 
     async fn stop(&self) -> Result<(), TunnelError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if self.hold_next_stop.swap(false, Ordering::SeqCst) {
+            self.stop_entered.notify_one();
+            self.stop_release.notified().await;
+        }
         if let Some(events) = self.operation_events.lock().unwrap().as_ref() {
             events.lock().unwrap().push("local_stop");
         }
@@ -9283,6 +9290,113 @@ async fn logout_fences_offline_start_error_and_handshake_cleanup() {
     exercise_offline_failure_after_logout(false).await;
 }
 
+#[tokio::test]
+async fn cancelled_queued_local_stop_cannot_hide_completed_native_stop() {
+    exercise_queued_local_stop_completion(true).await;
+}
+
+#[tokio::test]
+async fn retained_queued_local_stop_publishes_its_own_result_after_cancelled_tail() {
+    exercise_queued_local_stop_completion(false).await;
+}
+
+async fn exercise_queued_local_stop_completion(cancel_second: bool) {
+    for transition in [false, true] {
+        for fail_stop in [false, true] {
+            let api = Arc::new(MockApi::new(0));
+            let store = Arc::new(MemoryStore::new(auth()));
+            let tunnel = Arc::new(MemoryTunnel::default());
+            tunnel.hold_next_stop.store(true, Ordering::SeqCst);
+            tunnel
+                .fail_next_stops
+                .store(usize::from(fail_stop), Ordering::SeqCst);
+            let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+            let core = nelomai_client_core::ClientCore::new(
+                api.clone(),
+                Arc::new(support::LegacyRuntime::new(store.clone())),
+                Arc::new(support::TestOwner::new(api, store, local.clone())),
+                local.clone(),
+                Arc::new(MemoryLogger::default()),
+            );
+            let first = {
+                let local = local.clone();
+                tokio::spawn(async move {
+                    if transition {
+                        local.stop_local_for_transition().await
+                    } else {
+                        local.stop_local().await
+                    }
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(1), tunnel.stop_entered.notified())
+                .await
+                .unwrap();
+            let epoch = core.start_cancellation_epoch();
+            let second = {
+                let local = local.clone();
+                tokio::spawn(async move { local.stop_local().await })
+            };
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while core.start_cancellation_epoch() == epoch {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+            let second = if cancel_second {
+                second.abort();
+                assert!(second.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                // A later cancelled request must not suppress the live retry,
+                // including when the first stop failed or had another phase.
+                let second_epoch = core.start_cancellation_epoch();
+                let third = {
+                    let local = local.clone();
+                    tokio::spawn(async move { local.stop_local().await })
+                };
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while core.start_cancellation_epoch() == second_epoch {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                third.abort();
+                assert!(third.await.unwrap_err().is_cancelled());
+                Some(second)
+            };
+            tunnel.stop_release.notify_one();
+            assert_eq!(first.await.unwrap().is_err(), fail_stop);
+            if let Some(second) = second {
+                second.await.unwrap().unwrap();
+            }
+            let state = core.state().await;
+            assert_eq!(
+                state.phase,
+                if !cancel_second {
+                    Phase::SignedOut
+                } else if fail_stop {
+                    Phase::Error
+                } else if transition {
+                    Phase::Ready
+                } else {
+                    Phase::SignedOut
+                }
+            );
+            assert!(state.connection.is_none());
+            assert_eq!(
+                tunnel.stops.load(Ordering::SeqCst),
+                if cancel_second { 1 } else { 2 }
+            );
+            // A retry remains usable, including after a genuine native error.
+            local.stop_local().await.unwrap();
+            assert_eq!(core.state().await.phase, Phase::SignedOut);
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn logout_fences_offline_handshake_cleanup_success_and_failure() {
     exercise_offline_failure_after_logout(true).await;
@@ -9338,11 +9452,22 @@ async fn exercise_offline_failure_after_logout(handshake: bool) {
         })
         .await
         .unwrap();
+        if handshake {
+            // Cancellation wakes the handshake even while metrics is blocked.
+            // Hold its compensation explicitly so this test exercises cleanup
+            // after the owner's stop, independent of task scheduling.
+            tunnel.hold_next_stop.store(true, Ordering::SeqCst);
+            core.signal_start_cancellation();
+            tokio::time::timeout(Duration::from_secs(2), tunnel.stop_entered.notified())
+                .await
+                .unwrap();
+        }
         core.sign_out().await.unwrap();
         let cleanup = store.load().unwrap().unwrap();
         tunnel
             .fail_next_stops
             .store(usize::from(fail_cleanup), Ordering::SeqCst);
+        tunnel.stop_release.notify_one();
         tunnel.start_release.notify_one();
         tunnel.metrics_release.notify_one();
         let result = tokio::time::timeout(Duration::from_secs(2), pending)
