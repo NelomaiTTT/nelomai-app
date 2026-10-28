@@ -308,8 +308,20 @@ impl RemoteOwner {
                         let broker = broker.clone();
                         let task = async move {
                             let _permit = permit;
+                            // Logout has durable pending proof and is safe to retry.
+                            // Return its timeout while the IPC reply can still be
+                            // delivered; sharing the wire deadline would close the
+                            // entire auth channel before the user can retry. Keep
+                            // fail-closed cancellation for dropped requests/I/O.
+                            let work_deadline = if matches!(request, AuthRequestV1::Logout { .. }) {
+                                deadline
+                                    - Duration::from_secs(1)
+                                        .min(deadline.saturating_duration_since(Instant::now()) / 4)
+                            } else {
+                                deadline
+                            };
                             let result = timeout_at(
-                                deadline,
+                                work_deadline,
                                 owner.request(&broker, frame.id, request, deadline),
                             )
                             .await;

@@ -186,7 +186,8 @@ pub(super) fn broker_error(error: crate::BrokerError) -> PrivateError {
 pub(super) fn core_error(error: PrivateError) -> nelomai_client_core::CoreError {
     use nelomai_client_core::{CoreApiError, CoreError};
     match error {
-        PrivateError::Cancelled | PrivateError::Closed => CoreError::StartCancelled,
+        PrivateError::Cancelled => CoreError::StartCancelled,
+        PrivateError::Closed => CoreError::AuthRecoveryRequired,
         PrivateError::OutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
         PrivateError::AccessUnavailable => CoreError::AccessExpired,
         PrivateError::Timeout | PrivateError::Service | PrivateError::RefreshPending => {

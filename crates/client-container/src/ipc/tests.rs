@@ -38,10 +38,14 @@ async fn dropping_inflight_access_closes_real_auth_channel_but_completed_access_
         if cancel {
             drop(access);
             drop(held);
-            assert!(matches!(
-                fixture.client.access(None).await,
-                Err(nelomai_client_core::CoreError::StartCancelled)
-            ));
+            let result = fixture.client.access(None).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+                ),
+                "{result:?}"
+            );
         } else {
             drop(held);
             access.await.unwrap();
@@ -1774,55 +1778,119 @@ async fn logout_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle
     (api, calls, server)
 }
 
-#[tokio::test]
-async fn logout_ipc_timeout_closes_channel_and_preserves_pending_proof() {
+async fn timed_out_logout_can_retry_and_login(budget: Duration) {
+    use std::sync::atomic::AtomicBool;
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let server_entered = entered.clone();
-    let router = axum::Router::new().route(
-        "/api/client/v1/auth/logout-runtime",
-        axum::routing::post(move || {
-            let entered = server_entered.clone();
+    let accept = Arc::new(AtomicBool::new(false));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let server_accept = accept.clone();
+    let server_requests = requests.clone();
+    let logins = Arc::new(AtomicUsize::new(0));
+    let server_logins = logins.clone();
+    let router = axum::Router::new()
+        .route("/api/client/v1/auth/logout-runtime", axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let accept = server_accept.clone();
+            let requests = server_requests.clone();
             async move {
-                entered.notify_one();
-                std::future::pending::<axum::Json<serde_json::Value>>().await
+                requests.lock().unwrap().push(request);
+                if !accept.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted"}))
             }
-        }),
-    );
+        }))
+        .route("/api/client/v1/auth/login", axum::routing::post(move || {
+            server_logins.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(serde_json::json!({
+                "api_version":"1","request_id":"synthetic","token_type":"Bearer",
+                "access_token":"new-access","access_expires_in":900,"refresh_token":"new-refresh","refresh_expires_in":3600,
+                "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                "device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16",
+                "runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}
+            })) }
+        }));
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let fixture = Fixture::new(api, true);
-    fixture.client.state().await.unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let old_access = fixture.client.access(None).await.unwrap();
     let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
-    let client = fixture.client.clone();
-    let first = tokio::spawn(async move {
-        client
-            .request(
-                AuthRequestV1::Logout {
-                    stamp: Some(stamp),
-                    cancel_login_request: None,
-                },
-                Instant::now() + Duration::from_millis(500),
-            )
-            .await
-    });
-    entered.notified().await;
-    let first_result = first.await.unwrap();
+    let started = Instant::now();
+    let first_result = fixture
+        .client
+        .request(
+            AuthRequestV1::Logout {
+                stamp: Some(stamp),
+                cancel_login_request: None,
+            },
+            started + budget,
+        )
+        .await;
     assert!(
-        matches!(
-            first_result,
-            Err(PrivateError::Timeout | PrivateError::Closed)
-        ),
+        matches!(first_result, Err(PrivateError::Timeout)),
         "{first_result:?}"
+    );
+    assert!(
+        started.elapsed() < budget,
+        "the timeout reply must fit the original IPC budget"
+    );
+    assert!(
+        fixture.parent.is_connected(),
+        "a remote Logout timeout must leave auth usable"
     );
     let saved = fixture.auth.load().unwrap().unwrap();
     assert_eq!(saved.logout_state, LogoutState::Pending);
-    assert!(saved.broker.unwrap().pending_logout.is_some());
-    assert!(
-        fixture.client.logout().await.is_err(),
-        "closed private channel cannot retry logout"
+    let proof = saved.broker.unwrap().pending_logout.unwrap();
+    assert!(fixture.tunnel.0.load(Ordering::SeqCst) > 0);
+    assert!(fixture.child.check(&transport::scope(&old_access)).is_err());
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::LogoutPending
+    );
+    assert!(matches!(
+        fixture.client.login(password_login()).await,
+        Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+    ));
+    assert_eq!(logins.load(Ordering::SeqCst), 0);
+
+    accept.store(true, Ordering::SeqCst);
+    fixture.client.logout().await.unwrap();
+    assert_eq!(
+        fixture.auth.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        for request in requests.iter() {
+            assert_eq!(request["operation_id"], proof.operation_id);
+            assert_eq!(request["refresh_token"], proof.refresh_proof);
+        }
+    }
+    let access = fixture.client.login(password_login()).await.unwrap();
+    assert_eq!(logins.load(Ordering::SeqCst), 1);
+    assert_eq!(access.access_token(), "new-access");
+    fixture.child.check(&transport::scope(&access)).unwrap();
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::Active
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn logout_timeout_preserves_pending_proof_and_allows_retry_then_login() {
+    timed_out_logout_can_retry_and_login(Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn logout_timeout_reply_fits_full_ipc_budget_and_allows_retry_then_login() {
+    timed_out_logout_can_retry_and_login(REQUEST_BUDGET).await;
 }
 
 #[tokio::test]
