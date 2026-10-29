@@ -12,9 +12,24 @@ class LatestRuntimeActivity : TauriActivity() {
   private val ownerConnection by lazy { ru.nelomai.client.RuntimeSelectionStore(this) }
   override val handleBackNavigation: Boolean = true
 
+  private var startupWebView: android.webkit.WebView? = null
+  private var runtimeResumed = false
+  private val bootstrapNetworks by lazy { BootstrapNetworkMonitor(this, ::wakeStartup) }
+
   override fun onWebViewCreate(webView: android.webkit.WebView) {
     super.onWebViewCreate(webView)
     ru.nelomai.runtime.v1.SupportDiagnosticsEntry.install(this, webView)
+    startupWebView = webView
+    if (runtimeResumed) wakeStartup()
+  }
+
+  private fun wakeStartup() {
+    val webView = startupWebView ?: return
+    webView.post {
+      if (runtimeResumed && startupWebView === webView) {
+        webView.evaluateJavascript("window.dispatchEvent(new Event('nelomai-network-restored'))", null)
+      }
+    }
   }
 
   private val startupHandler = Handler(Looper.getMainLooper())
@@ -58,10 +73,15 @@ class LatestRuntimeActivity : TauriActivity() {
   override fun onResume() {
     super.onResume()
     if (!runtimeLifecycleEnabled) return
+    runtimeResumed = true
+    bootstrapNetworks.start()
+    wakeStartup()
     StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("resumed"))
   }
 
   override fun onPause() {
+    runtimeResumed = false
+    bootstrapNetworks.stop()
     if (runtimeLifecycleEnabled) StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("paused"))
     super.onPause()
   }
@@ -79,6 +99,9 @@ class LatestRuntimeActivity : TauriActivity() {
   }
 
   override fun onDestroy() {
+    runtimeResumed = false
+    bootstrapNetworks.stop()
+    startupWebView = null
     if (runtimeLifecycleEnabled) ownerConnection.close()
     startupHandler.removeCallbacks(frontendTimeout)
     super.onDestroy()

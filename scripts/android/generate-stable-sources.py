@@ -44,7 +44,7 @@ def generate(root, output):
     source_dirs = [root / f'plugins/{name}/android/src/main/java' for name in ('tunnel-android', 'push-android', 'updater-android')]
     source_dirs += [deps['tauri'] / 'mobile/android/src/main/java', deps['tauri-plugin-opener'] / 'android/src/main/java']
     source_dirs += [root / 'plugins/amneziawg-android-tunnel/build/generated/runtimeHostJava', app / 'java/ru/nelomai/client/generated']
-    selected = [app / 'java/ru/nelomai/client' / name for name in ('LatestRuntimeActivity.kt', 'StartupDiagnostics.kt', 'RuntimeEntrypoint.kt')]
+    selected = [app / 'java/ru/nelomai/client' / name for name in ('LatestRuntimeActivity.kt', 'BootstrapNetworkMonitor.kt', 'StartupDiagnostics.kt', 'RuntimeEntrypoint.kt')]
     selected += [app / 'java/io/crates/keyring/Keyring.kt']
     for source in source_dirs:
         selected.extend(path for path in source.rglob('*') if path.suffix in ('.kt', '.java'))
