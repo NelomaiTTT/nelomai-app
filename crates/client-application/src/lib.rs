@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use nelomai_client_api::{
-    AccessSnapshot, BackgroundTokenResponse, ClientApi, DiagnosticUploadRequest,
+    AccessSnapshot, BackgroundTokenResponse, ClientApi, ClientApiError, DiagnosticUploadRequest,
     DiagnosticUploadResponse, RuntimeLogin,
 };
 use nelomai_client_core::{
@@ -27,6 +27,45 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 const PROBE_REFRESH_SECONDS: i64 = 300;
 const MAX_CONCURRENT_PROBES: usize = 4;
+
+// Diagnostic uploads retry every failure through their own persistent queue.
+// Preserve a bounded reason here before the general CoreApiError conversion
+// collapses transport failures and HTTP 5xx into Retryable. Never copy URLs,
+// server messages, response bodies or arbitrary server codes into the journal.
+fn diagnostic_upload_error(error: ClientApiError) -> CoreApiError {
+    if matches!(&error, ClientApiError::Api { status, code, .. }
+        if status.as_u16() == 401 || code == "access_expired")
+    {
+        let mut error = CoreApiError::from(error);
+        if let CoreApiError::Rejected { message, .. } = &mut error {
+            *message = "Не удалось отправить диагностику.".into();
+        }
+        return error;
+    }
+    let code = match &error {
+        ClientApiError::Transport(error) if error.is_timeout() => "diagnostics_timeout".into(),
+        ClientApiError::Transport(error) if error.is_connect() => {
+            "diagnostics_connect_failed".into()
+        }
+        ClientApiError::Transport(error) if error.is_decode() => {
+            "diagnostics_response_decode_failed".into()
+        }
+        ClientApiError::Transport(error) if error.is_body() => "diagnostics_body_failed".into(),
+        ClientApiError::Transport(_) => "diagnostics_transport_failed".into(),
+        ClientApiError::Api { status, .. } | ClientApiError::InvalidErrorResponse { status } => {
+            format!("diagnostics_http_{}", status.as_u16())
+        }
+        ClientApiError::InvalidBaseUrl(_)
+        | ClientApiError::InvalidAppVersion(_)
+        | ClientApiError::InvalidPayload { .. }
+        | ClientApiError::PayloadTooLarge { .. } => "diagnostics_invalid_request".into(),
+    };
+    CoreApiError::Rejected {
+        code,
+        message: "Не удалось отправить диагностику.".into(),
+        retry_after_seconds: error.retry_after_seconds(),
+    }
+}
 
 pub type LoginParameters = RuntimeLogin;
 
@@ -266,7 +305,7 @@ impl ApplicationApi for ClientApi {
             request,
         )
         .await
-        .map_err(Into::into)
+        .map_err(diagnostic_upload_error)
     }
 
     async fn notifications(

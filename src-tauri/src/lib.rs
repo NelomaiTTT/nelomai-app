@@ -502,14 +502,24 @@ async fn upload_automatic_diagnostics(
         }
     };
     let expected_report_id = candidate.report.report_id.clone();
-    match application.upload_diagnostics(&candidate.report).await {
+    diagnostics.record_named(
+        "diagnostics.automatic_upload_started",
+        candidate.report.tunnel_session_id.as_deref(),
+        expected_report_id.as_deref(),
+        None,
+    );
+    let upload_started = std::time::Instant::now();
+    let upload_result = application.upload_diagnostics(&candidate.report).await;
+    let upload_duration = upload_started.elapsed();
+    match upload_result {
         Ok(response) if Some(response.report_id.as_str()) == expected_report_id.as_deref() => {
             match diagnostics.automatic_upload_succeeded(&candidate, current_unix_time()) {
-                Ok(()) => diagnostics.record_named(
+                Ok(()) => diagnostics.record_timed_named(
                     "diagnostics.automatic_report_uploaded",
                     candidate.report.tunnel_session_id.as_deref(),
                     Some(&response.request_id),
                     Some(candidate.report.trigger.as_str()),
+                    upload_duration,
                 ),
                 Err(error) => {
                     let _ = diagnostics.automatic_upload_failed(current_unix_time());
@@ -524,20 +534,22 @@ async fn upload_automatic_diagnostics(
         }
         Ok(_) => {
             let _ = diagnostics.automatic_upload_failed(current_unix_time());
-            diagnostics.record_named(
+            diagnostics.record_timed_named(
                 "diagnostics.automatic_upload_failed",
                 candidate.report.tunnel_session_id.as_deref(),
-                None,
+                expected_report_id.as_deref(),
                 Some("invalid_diagnostics_response"),
+                upload_duration,
             );
         }
         Err(error) => {
             let _ = diagnostics.automatic_upload_failed(current_unix_time());
-            diagnostics.record_named(
+            diagnostics.record_timed_named(
                 "diagnostics.automatic_upload_failed",
                 candidate.report.tunnel_session_id.as_deref(),
-                None,
+                expected_report_id.as_deref(),
                 Some(&automatic_upload_error_code(&error)),
+                upload_duration,
             );
         }
     }
