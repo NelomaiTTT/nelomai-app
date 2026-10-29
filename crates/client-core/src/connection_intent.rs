@@ -139,9 +139,9 @@ pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> Recovery
         | "physical_egress_unavailable"
         | "local_networks_unavailable"
         | "installed_applications_unavailable" => RecoveryDecision::RetrySameOperation,
-        "connection_no_longer_active" | "tunnel_handshake_timeout" => {
-            RecoveryDecision::RetryNewOperation
-        }
+        "connection_no_longer_active"
+        | "tunnel_handshake_timeout"
+        | "probe_targets_unreachable" => RecoveryDecision::RetryNewOperation,
         "connection_stall_recycle_rate_limited"
         | "operation_in_progress"
         | "device_operation_busy" => {

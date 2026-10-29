@@ -721,6 +721,7 @@ fn preserves_structured_recovery_error(code: &str) -> bool {
     matches!(
         code,
         "configuration_fetch_failed"
+            | "probe_targets_unreachable"
             | "connection_stall_verification_unavailable"
             | "operation_in_progress"
             | "device_operation_busy"
@@ -5989,7 +5990,10 @@ fn structured_retry_delay_millis(error: &CoreApiError) -> Option<u64> {
 }
 
 fn transient_start_rejection(code: &str) -> bool {
-    code == "configuration_fetch_failed"
+    matches!(
+        code,
+        "configuration_fetch_failed" | "probe_targets_unreachable"
+    )
 }
 
 fn redundant_tunnel_start(

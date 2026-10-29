@@ -73,6 +73,7 @@ internal class ConnectionIntentErrorPolicy {
             ).forEach { put(it, ConnectionIntentDecision.RETRY_SAME_OPERATION) }
             listOf(
                 "connection_no_longer_active",
+                "probe_targets_unreachable",
                 "tunnel_handshake_timeout",
             ).forEach { put(it, ConnectionIntentDecision.RETRY_NEW_OPERATION) }
             listOf(

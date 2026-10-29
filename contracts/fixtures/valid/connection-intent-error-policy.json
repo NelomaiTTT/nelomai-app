@@ -7,6 +7,7 @@
     { "code": "candidate_unavailable", "decision": "retry_same_operation" },
     { "code": "configuration_fetch_failed", "decision": "retry_same_operation" },
     { "code": "binding_sync_failed", "decision": "retry_same_operation" },
+    { "code": "probe_targets_unreachable", "decision": "retry_new_operation" },
     { "code": "connection_no_longer_active", "decision": "retry_new_operation" },
     { "code": "connection_already_active", "decision": "reconcile_then_retry" },
     { "code": "connection_release_pending", "decision": "retry_same_operation" },

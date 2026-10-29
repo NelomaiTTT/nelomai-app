@@ -12086,3 +12086,58 @@ async fn desktop_async_stop_clears_only_saved_members_of_the_retired_pair() {
         assert_eq!(journal.pinned_connection, (!same_pair).then_some(saved));
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn unreachable_probes_retry_with_fresh_operation_and_keep_validation_terminal() {
+    assert_eq!(
+        classify_recovery(
+            "probe_targets_unreachable",
+            RecoveryPolicyContext::default()
+        ),
+        RecoveryDecision::RetryNewOperation,
+    );
+    for code in [
+        "invalid_probe_results",
+        "invalid_probe_result",
+        "invalid_candidate",
+    ] {
+        assert_eq!(
+            classify_recovery(code, RecoveryPolicyContext::default()),
+            RecoveryDecision::Terminal
+        );
+    }
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::from(
+            nelomai_client_api::ClientApiError::Api {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                request_id: "unreachable-probes".to_string(),
+                code: "probe_targets_unreachable".to_string(),
+                message: "No server answered the probes".to_string(),
+                retry_after_seconds: None,
+            },
+        ));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(core
+        .connection_intent_attempt(options(), 1_700_000_000)
+        .await
+        .is_err());
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::ServerUnavailable);
+    core.connection_intent_attempt(options(), 1_700_000_005)
+        .await
+        .unwrap();
+    let ids = api.operation_ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}

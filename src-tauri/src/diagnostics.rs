@@ -107,6 +107,7 @@ impl ConnectionIntentReasonClass {
     pub(crate) fn from_code(code: &str) -> Self {
         match code {
             "transport_error"
+            | "probe_targets_unreachable"
             | "android_service_dispatch_unavailable"
             | "endpoint_route_lost"
             | "endpoint_route_unavailable"
@@ -1584,6 +1585,10 @@ mod tests {
 
     #[test]
     fn connection_intent_reason_classes_do_not_echo_unknown_codes() {
+        assert_eq!(
+            ConnectionIntentReasonClass::from_code("probe_targets_unreachable"),
+            ConnectionIntentReasonClass::Network,
+        );
         assert_eq!(
             ConnectionIntentReasonClass::from_code("transport_error"),
             ConnectionIntentReasonClass::Network,
