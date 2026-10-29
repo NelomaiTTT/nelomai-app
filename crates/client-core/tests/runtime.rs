@@ -12135,9 +12135,11 @@ async fn unreachable_probes_retry_with_fresh_operation_and_keep_validation_termi
     core.connection_intent_attempt(options(), 1_700_000_005)
         .await
         .unwrap();
-    let ids = api.operation_ids.lock().unwrap();
-    assert_eq!(ids.len(), 2);
-    assert_ne!(ids[0], ids[1]);
+    {
+        let ids = api.operation_ids.lock().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
     assert!(store.load().unwrap().unwrap().pending_start.is_none());
     assert_eq!(core.state().await.phase, Phase::Connected);
 }
