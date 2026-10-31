@@ -2276,7 +2276,20 @@ where
                     });
                     return Ok(ConnectedPolicyApplyOutcome::ApplyBusy);
                 }
-                Err(_) => {
+                Err(error) => {
+                    let reason = match &error {
+                        nelomai_client_tunnel::TunnelError::Backend(code) => {
+                            nelomai_client_tunnel::owned_policy_rejection_code(code)
+                                .unwrap_or("tunnel_backend_error")
+                        }
+                        nelomai_client_tunnel::TunnelError::InvalidOptions { code } => code,
+                    };
+                    self.logger.record(crate::CoreLogEvent {
+                        kind: "split_tunnel.native_apply_failed",
+                        operation_id: None,
+                        request_id: None,
+                        code: Some(reason.into()),
+                    });
                     // Admission/preparation can fail before any native replacement.
                     // Inspect the real transport instead of treating an intact pair
                     // as a failed rollback or issuing an ordinary Stop/Start.

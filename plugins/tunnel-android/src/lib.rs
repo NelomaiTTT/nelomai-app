@@ -231,12 +231,10 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
             .await
             .map_err(|error| {
                 #[cfg(mobile)]
-                if let Some(code) = error.rejection_code().filter(|code| {
-                    matches!(
-                        *code,
-                        "redundant_policy_busy" | "tunnel_operation_in_progress"
-                    )
-                }) {
+                if let Some(code) = error
+                    .rejection_code()
+                    .and_then(nelomai_client_tunnel::owned_policy_rejection_code)
+                {
                     return TunnelError::Backend(code.into());
                 }
                 to_tunnel_error(error)
