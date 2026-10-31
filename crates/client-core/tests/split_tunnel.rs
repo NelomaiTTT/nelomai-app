@@ -1000,21 +1000,50 @@ async fn native_owned_pair_admission_error_preserves_live_transport() {
 #[tokio::test]
 async fn native_owned_policy_failure_records_safe_original_reason() {
     for (code, expected) in [
-        ("redundant_policy_preflight_rejected", "redundant_policy_preflight_rejected"),
+        (
+            "redundant_policy_preflight_rejected",
+            "redundant_policy_preflight_rejected",
+        ),
         ("tunnel_service_timeout", "tunnel_service_timeout"),
-        ("private_key=secret endpoint=192.0.2.1", "tunnel_backend_error"),
+        (
+            "private_key=secret endpoint=192.0.2.1",
+            "tunnel_backend_error",
+        ),
     ] {
         let (fixture, running) = native_owned_policy_fixture(Layer::Tic).await;
-        fixture.tunnel.owned_policy_outcomes.lock().unwrap().push_back(Err(code));
-        fixture.core.synchronize_split_tunnel(1_100, true).await.unwrap();
-        let events = fixture.logger.events.lock().unwrap();
-        assert!(events.iter().any(|event| event.kind == "split_tunnel.native_apply_failed"
-            && event.code.as_deref() == Some(expected)));
-        assert!(!format!("{events:?}").contains("private_key"));
+        fixture
+            .tunnel
+            .owned_policy_outcomes
+            .lock()
+            .unwrap()
+            .push_back(Err(code));
+        fixture
+            .core
+            .synchronize_split_tunnel(1_100, true)
+            .await
+            .unwrap();
+        {
+            let events = fixture.logger.events.lock().unwrap();
+            assert!(events
+                .iter()
+                .any(|event| event.kind == "split_tunnel.native_apply_failed"
+                    && event.code.as_deref() == Some(expected)));
+            assert!(!format!("{events:?}").contains("private_key"));
+        }
         assert_eq!(fixture.core.state().await.connection, Some(running));
         assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
-        assert_eq!(fixture.api.apply_results.lock().unwrap().last().unwrap().error_code.as_deref(),
-            Some("split_tunnel_apply_failed"));
+        assert_eq!(
+            fixture
+                .api
+                .apply_results
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .error_code
+                .as_deref(),
+            Some("split_tunnel_apply_failed")
+        );
     }
 }
 
