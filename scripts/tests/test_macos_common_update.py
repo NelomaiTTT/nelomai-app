@@ -5,10 +5,12 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -98,6 +100,10 @@ test "$1" = --verify && test "$2" = --strict || exit 96
 test "${REJECT_SIGNATURE:-0}" = 0 || exit 97
 printf 'signature\\n' >> "$EVENTS"
 ''')
+        self.executable(self.bin / "xattr", '''#!/bin/sh
+test "$1" = -dr && test "$2" = com.apple.quarantine || exit 96
+test "${REJECT_QUARANTINE_NORMALIZATION:-0}" = 0 || exit 97
+''' + ('exec /usr/bin/xattr "$@"\n' if sys.platform == "darwin" else 'exit 0\n'))
         self.executable(self.bin / "mv", '''#!/bin/sh
 if [ "${FAIL_ACTIVATION:-0}" = 1 ] && [ -f "$1/new-marker" ]; then exit 98; fi
 case "$1" in
@@ -120,6 +126,7 @@ esac
         script = script.replace("/Library/Application Support/Nelomai", str(self.root / "protected"))
         script = script.replace("/usr/bin/ditto", str(self.bin / "ditto"))
         script = script.replace("/usr/bin/codesign", str(self.bin / "codesign"))
+        script = script.replace("/usr/bin/xattr", str(self.bin / "xattr"))
         self.script = self.root / "installer.sh"
         self.script.write_text(script)
         self.events = self.root / "events"
@@ -167,6 +174,134 @@ esac
         result = self.run_installer([self.source])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.destination / "new-marker").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS quarantine metadata")
+    def test_downloaded_bundle_keeps_source_quarantine_out_of_protected_install(self):
+        # Removing the protected-copy policy must reproduce the remote startup
+        # failure's prerequisite. Exercise real ditto and xattrs, not a copy mock.
+        self.executable(self.bin / "ditto", '#!/bin/sh\nexec /usr/bin/ditto "$@"\n')
+        quarantine = "00c1;6ae7b1f3;Telegram;"
+        for attribute, value in [("com.apple.quarantine", quarantine),
+                                 ("com.nelomai.test-metadata", "keep")]:
+            subprocess.run(["/usr/bin/xattr", "-w", attribute, value, str(self.source)], check=True)
+        source_executable = self.source / "Contents/MacOS/nelomai-app"
+        subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", quarantine,
+                        str(source_executable)], check=True)
+        result = self.run_installer([self.source])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        source_marker = subprocess.check_output(
+            ["/usr/bin/xattr", "-p", "com.apple.quarantine", str(self.source)], text=True)
+        self.assertEqual(source_marker.strip(), quarantine)
+        destination_attributes = subprocess.check_output(
+            ["/usr/bin/xattr", str(self.destination)], text=True).splitlines()
+        self.assertNotIn("com.apple.quarantine", destination_attributes)
+        installed_executable = self.destination / "Contents/MacOS/nelomai-app"
+        self.assertNotIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(installed_executable)], text=True).splitlines())
+        self.assertEqual(subprocess.check_output(
+            ["/usr/bin/xattr", "-p", "com.apple.quarantine", str(source_executable)],
+            text=True).strip(), quarantine)
+        metadata = subprocess.check_output(
+            ["/usr/bin/xattr", "-p", "com.nelomai.test-metadata", str(self.destination)], text=True)
+        self.assertEqual(metadata.strip(), "keep")
+        self.assertEqual((self.destination / "new-marker").read_bytes(), b"new")
+
+    def test_failed_quarantine_normalization_never_replaces_previous_bundle(self):
+        self.assert_previous_preserved(self.run_installer(
+            [self.source], REJECT_QUARANTINE_NORMALIZATION="1"))
+        self.assertEqual((self.service_root / "container-manifest.json").read_text(), "previous-pointer")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS quarantine metadata")
+    def test_rejected_signature_keeps_quarantine_in_retained_staging(self):
+        self.executable(self.bin / "ditto", '#!/bin/sh\nexec /usr/bin/ditto "$@"\n')
+        quarantine = "00c1;6ae7b1f3;Telegram;"
+        subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", quarantine,
+                        str(self.source)], check=True)
+        self.assert_previous_preserved(self.run_installer([self.source], REJECT_SIGNATURE="1"))
+        staged, = self.install_root.glob(".install.*/Nelomai.app")
+        # macOS may update the quarantine flags when the layout verifier runs;
+        # failed validation must not remove the marker from retained staging.
+        self.assertIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(staged)], text=True).splitlines())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS quarantine metadata")
+    def test_metadata_repair_preserves_installed_version_inode_and_service(self):
+        (self.source / "installed-version").write_text("0.4.1")
+        result = self.run_installer([self.source])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inode = self.destination.stat().st_ino
+        backups = list(self.install_root.glob(".install.*"))
+        events = self.events.read_text()
+        subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", "00c1;6ae7b1f3;Telegram;",
+                        str(self.destination)], check=True)
+        result = self.run_installer([self.source, "--repair-download-metadata"])
+        self.assertNotEqual(result.returncode, 0)
+        for flag in ("REJECT_LAYOUT", "REJECT_SIGNATURE", "REJECT_QUARANTINE_NORMALIZATION"):
+            with self.subTest(rejection=flag):
+                result = self.run_installer([self.destination, "--repair-download-metadata"], **{flag: "1"})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.destination.stat().st_ino, inode)
+                self.assertIn("com.apple.quarantine", subprocess.check_output(
+                    ["/usr/bin/xattr", str(self.destination)], text=True).splitlines())
+        events = self.events.read_text()
+        result = self.run_installer([self.destination, "--repair-download-metadata"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.destination.stat().st_ino, inode)
+        self.assertEqual((self.destination / "installed-version").read_text(), "0.4.1")
+        self.assertEqual(list(self.install_root.glob(".install.*")), backups)
+        self.assertEqual(self.events.read_text(), events + "layout\nsignature\n")
+        self.assertNotIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(self.destination)], text=True).splitlines())
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS quarantine metadata and SIGKILL")
+    def test_interrupted_metadata_repair_retains_newer_bundle_and_retries(self):
+        (self.source / "installed-version").write_text("0.4.1")
+        result = self.run_installer([self.source])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        inode = self.destination.stat().st_ino
+        late = self.destination / "zzz-late-resource"
+        late.write_bytes(b"resource after the interrupt boundary")
+        for path in (self.destination, self.destination / "Contents", late):
+            subprocess.run(["/usr/bin/xattr", "-w", "com.apple.quarantine", "00c1;6ae7b1f3;Telegram;", str(path)], check=True)
+        barrier = self.root / "metadata-child-cleaned"
+        self.executable(self.bin / "xattr", '''#!/bin/sh
+set -eu
+/usr/bin/xattr "$@"
+if [ "$3" = "$DESTINATION/Contents" ]; then
+  : > "$METADATA_BARRIER"
+  /bin/sleep 0.5
+fi
+''')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", EVENTS=str(self.events),
+                   DESTINATION=str(self.destination), SERVICE_ROOT=str(self.service_root),
+                   SERVICE_PLIST=str(self.plist), METADATA_BARRIER=str(barrier))
+        process = subprocess.Popen(["/bin/sh", str(self.script), "501", str(self.destination), "--repair-download-metadata"],
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not barrier.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(barrier.exists(), "metadata repair did not reach the interrupt boundary")
+            process.kill()
+            process.communicate(timeout=3)
+            self.assertEqual(process.returncode, -signal.SIGKILL)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+        self.assertEqual(self.destination.stat().st_ino, inode)
+        self.assertEqual((self.destination / "installed-version").read_text(), "0.4.1")
+        self.assertIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(self.destination)], text=True).splitlines())
+        self.assertIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(late)], text=True).splitlines())
+        self.executable(self.bin / "xattr", '#!/bin/sh\nexec /usr/bin/xattr "$@"\n')
+        result = self.run_installer([self.destination, "--repair-download-metadata"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.destination.stat().st_ino, inode)
+        self.assertEqual((self.destination / "installed-version").read_text(), "0.4.1")
+        self.assertNotIn("com.apple.quarantine", subprocess.check_output(
+            ["/usr/bin/xattr", str(late)], text=True).splitlines())
 
     def test_first_install_activates_helper_before_success(self):
         shutil.rmtree(self.destination)
@@ -275,6 +410,7 @@ esac
         for args in [
             ["/protected/install.sh", "501", "/tmp/app's bundle.app"],
             ["/protected/install.sh", "501", "/tmp/archive' ; touch nope.tar.gz", "a" * 64],
+            ["/protected/install.sh", "501", "/protected/Nelomai.app", "--repair-download-metadata"],
         ]:
             with self.subTest(args=args):
                 result = subprocess.run(["/usr/bin/osascript", str(apple_script), *args],

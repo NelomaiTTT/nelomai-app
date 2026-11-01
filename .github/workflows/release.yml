@@ -657,5 +657,5 @@ jobs:
             --run-id "$CANDIDATE_RUN" --inventory-sha256 "$INVENTORY_SHA256"
           python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.4.0 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
-          test "${#assets[@]}" -eq 16
+          test "${#assets[@]}" -eq 18
           gh release create v0.4.0 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.4.0" --notes "$RELEASE_NOTES"

@@ -26,10 +26,12 @@ class DesktopReleaseTest(ArtifactFixture):
         module("release-candidate-gates").verify_runtime_release(folder, "0.4.0", SOURCE, digest, self.public)
         self.assertEqual(len(json.loads(next(folder.glob("*release-set.manifest.json")).read_bytes())["artifacts"]), 3)
 
-    def test_publish_inventory_is_exactly_sixteen_desktop_assets(self):
+    def test_publish_inventory_includes_manual_dmg_and_detached_signature(self):
         gates = module("release-candidate-gates")
         self.assertEqual(set(gates.PACKAGE_NAMES), {"linux", "windows", "macos"})
-        self.assertEqual(len(gates.PUBLISH_ASSETS), 16)
+        self.assertEqual(len(gates.PUBLISH_ASSETS), 18)
+        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg", gates.PUBLISH_ASSETS)
+        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg.sig", gates.PUBLISH_ASSETS)
         self.assertFalse(any("android" in name for name in gates.PUBLISH_ASSETS))
 
     def test_required_bullet_changelog_rejects_empty_prose_and_preserves_shell_text(self):

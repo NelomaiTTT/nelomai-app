@@ -35,7 +35,9 @@ ENVIRONMENTS = (*CANDIDATE_ENVIRONMENTS, PUBLICATION_ENVIRONMENT)
 PACKAGE_NAMES = {
     "linux": f"nelomai-{VERSION}-linux-x86_64.AppImage", "windows": f"nelomai-{VERSION}-windows-x86_64.exe",
     "macos": f"nelomai-{VERSION}-macos-aarch64.app.tar.gz"}
+MACOS_DMG_NAME = f"nelomai-{VERSION}-macos-aarch64.dmg"
 PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
+    MACOS_DMG_NAME, MACOS_DMG_NAME + ".sig",
     "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
     f"nelomai-runtime-{VERSION}-release-set.manifest.json", f"nelomai-runtime-{VERSION}-release-set.manifest.sig",
     *(f"nelomai-runtime-{VERSION}-{platform}-{architecture}{suffix}"
@@ -135,12 +137,12 @@ def require_publishable_inventory(inventory, run_id, source, environment_ids, ru
             or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)
             or not environment_ids or inventory.get("environment_ids") != environment_ids):
         raise ValueError("test-key, build-only or foreign candidate is permanently nonpublishable")
-    packages = set(PACKAGE_NAMES.values())
+    packages = set(PACKAGE_NAMES.values()) | {MACOS_DMG_NAME, MACOS_DMG_NAME + ".sig"}
     assets = inventory.get("assets", {})
     if isinstance(assets, dict) and not set(assets) <= PUBLISH_ASSETS:
         raise ValueError("nonpublishable or acceptance-only asset in candidate inventory")
     if not isinstance(assets, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(assets.get(name, ""))) for name in packages):
-        raise ValueError("approved digests for all three exact installer/package names required")
+        raise ValueError("approved digests for every exact installer/package and DMG signature required")
 
 
 def github_get(endpoint):
@@ -330,6 +332,15 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
                 signature_file.write_text(artifact["signature"])
                 subprocess.run([executable, str(package), str(signature_file), str(updater_public_key)],
                                check=True, capture_output=True)
+    # Manual-install images have their own detached signature and never become
+    # update-selection targets in the existing three-package release manifest.
+    image, image_signature = directory / MACOS_DMG_NAME, directory / (MACOS_DMG_NAME + ".sig")
+    file_hash(image)
+    file_hash(image_signature)
+    if not 0 < image_signature.stat().st_size <= 4096:
+        raise ValueError("DMG signature size limit")
+    subprocess.run([executable, str(image), str(image_signature), str(updater_public_key)],
+                   check=True, capture_output=True)
 
 
 def main():

@@ -36,10 +36,15 @@ class ReleaseSimplificationTest(ArtifactFixture):
                     archive.writestr("classes.dex", b"fixture" * 300000)
             else:
                 package.write_bytes(b"fixture" * 300000)
+            entries = {"shipping": dict(name=package.name,
+                sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)}
+            if platform == "macos":
+                image = package.with_name("nelomai-0.4.0-macos-aarch64.dmg")
+                image.write_bytes(b"verified manual-install image fixture")
+                entries["dmg"] = dict(name=image.name, sha256=consumer.verifier.digest(image), size_bytes=image.stat().st_size)
             (folder / "package-digests.json").write_text(json.dumps(dict(
                 source_sha=SOURCE, release_set_sha256=digest, mode="build_only", platform=platform,
-                architecture=architecture, packages={"shipping": dict(name=package.name,
-                    sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)})))
+                architecture=architecture, packages=entries)))
         output, work = self.root / "finalized", self.root / "finalization"
         arguments = ["finalize-release-candidate", "--packages", str(packages), "--signed", str(signed),
                      "--output", str(output), "--private-key", str(self.keyfile), "--public-key", str(self.public),
@@ -59,6 +64,9 @@ class ReleaseSimplificationTest(ArtifactFixture):
             consumer.main()
         inventory = json.loads((output / "candidate/candidate-inventory.json").read_bytes())
         self.assertEqual(set(inventory["assets"]), consumer.gates.PUBLISH_ASSETS)
+        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg", inventory["assets"])
+        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg.sig", inventory["assets"])
+        self.assertEqual(len(json.loads((output / "candidate/nelomai-release-manifest.json").read_bytes())["artifacts"]), 3)
         self.assertEqual(inventory["purpose"], "shipping")
         self.assertEqual(inventory["run_attempt"], 3)
         self.assertEqual(set(json.loads(result.getvalue())), {"inventory_sha256"})

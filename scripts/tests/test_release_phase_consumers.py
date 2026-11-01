@@ -34,11 +34,25 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
                 signature = path.with_name(name + ".sig").read_text().strip()
             artifacts.append(dict(platform=platform, asset_name=name, size_bytes=path.stat().st_size,
                 sha256=module("verify-runtime-artifact").digest(path), signature=signature))
+        image = candidate / "nelomai-0.4.0-macos-aarch64.dmg"
+        image.write_bytes(b"final manual image bytes")
+        subprocess.run([str(ROOT / "node_modules/.bin/tauri"), "signer", "sign", str(image)],
+                       env=environment, check=True, capture_output=True)
         raw = json.dumps(dict(schema_version=1, version=gates.VERSION, artifacts=artifacts)).encode()
         manifest = candidate / "nelomai-release-manifest.json"
         manifest.write_bytes(raw)
         (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))
         gates.verify_updater_release(candidate, self.public, public, "d" * 64)
+        image.write_bytes(b"changed manual image bytes")
+        with self.assertRaises(subprocess.CalledProcessError):
+            gates.verify_updater_release(candidate, self.public, public, "d" * 64)
+        image.write_bytes(b"final manual image bytes")
+        image_signature = image.with_suffix(".dmg.sig")
+        valid_image_signature = image_signature.read_bytes()
+        image_signature.write_bytes(b"wrong manual image signature")
+        with self.assertRaises(subprocess.CalledProcessError):
+            gates.verify_updater_release(candidate, self.public, public, "d" * 64)
+        image_signature.write_bytes(valid_image_signature)
         manifest.write_bytes(raw + b" ")
         with self.assertRaises(Exception):
             gates.verify_updater_release(candidate, self.public, public, "d" * 64)

@@ -14,6 +14,8 @@ mod diagnostics;
 #[cfg(target_os = "macos")]
 mod macos_identity;
 #[cfg(target_os = "macos")]
+mod macos_installation;
+#[cfg(target_os = "macos")]
 mod macos_launch;
 #[cfg(any(target_os = "macos", test))]
 mod macos_power;

@@ -18,6 +18,7 @@ spec = importlib.util.spec_from_file_location("builder", Path(__file__).with_nam
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 gates, verifier = builder.gates, builder.verifier
+common = verifier.load_script("sign-macos-common-package.py")
 
 
 def verify_macos_common_signature(index, mode, pin):
@@ -59,6 +60,7 @@ def main():
     final_inputs = args.work / "collector"
     final_inputs.mkdir()
     macos_common_signature = None
+    manual_image = None
     for platform, architecture in verifier.release_targets(gates.VERSION):
         folder = args.packages / platform
         index = json.loads((folder / "package-digests.json").read_bytes())
@@ -73,6 +75,15 @@ def main():
         if platform == "macos":
             macos_common_signature = verify_macos_common_signature(
                 index, args.mode, os.environ.get("NELOMAI_MACOS_SIGNER_SHA1", ""))
+            image = common.require_dmg(index, folder, gates.MACOS_DMG_NAME)
+            manual_image = args.work / gates.MACOS_DMG_NAME
+            shutil.copyfile(image, manual_image)
+            before = verifier.digest(manual_image)
+            if before != index["packages"]["dmg"]["sha256"]:
+                raise ValueError("DMG changed while copying verified input")
+            builder.run(cli, "signer", "sign", manual_image, env=environment, capture=True)
+            if verifier.digest(manual_image) != before:
+                raise ValueError("DMG signing changed final image bytes")
         destination = args.work / ("shipping-" + name)
         shutil.copyfile(path, destination)
         if platform == "android":
@@ -103,6 +114,8 @@ def main():
     candidate = args.output / "candidate"
     builder.script("build-release-manifest.py", "--input-dir", final_inputs, "--output-dir", candidate,
                    "--version", gates.VERSION, env=environment)
+    for path in (manual_image, manual_image.with_suffix(".dmg.sig")):
+        shutil.copyfile(path, candidate / path.name)
     for path in (args.signed / "release").iterdir():
         shutil.copyfile(path, candidate / path.name)
     if {path.name for path in candidate.iterdir()} != gates.PUBLISH_ASSETS:

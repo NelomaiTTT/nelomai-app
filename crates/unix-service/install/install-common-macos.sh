@@ -10,6 +10,25 @@ case "$OWNER_UID" in *[!0123456789]*|'') exit 1 ;; esac
 SOURCE=$2
 INSTALL_ROOT='/Library/Application Support/Nelomai/common'
 DESTINATION="$INSTALL_ROOT/Nelomai.app"
+if [ "${3:-}" = --repair-download-metadata ]; then
+  # This mode is selected only for an already protected, verified installation.
+  # Never move its bundle: an interrupted repair must retain the installed
+  # version so a subsequently launched older shortcut cannot roll it back.
+  [ "$SOURCE" = "$DESTINATION" ] || exit 1
+  [ -d "$DESTINATION/Contents/Resources/runtime" ] || exit 1
+  [ -x "$DESTINATION/Contents/MacOS/nelomai-app" ] || exit 1
+  [ -z "$(find "$DESTINATION" -type l -print -quit)" ] || exit 1
+  "$DESTINATION/Contents/MacOS/nelomai-app" --verify-runtime-layout "$DESTINATION/Contents/Resources/runtime"
+  /usr/bin/codesign --verify --strict "$DESTINATION"
+  # Children first, root marker last: a partial operation remains detectable and
+  # retryable. No dispatcher replacement or restart is needed for metadata.
+  for metadata_child in "$DESTINATION"/* "$DESTINATION"/.[!.]* "$DESTINATION"/..?*; do
+    [ -e "$metadata_child" ] || continue
+    /usr/bin/xattr -dr com.apple.quarantine "$metadata_child"
+  done
+  /usr/bin/xattr -dr com.apple.quarantine "$DESTINATION"
+  exit 0
+fi
 if [ "$#" -eq 3 ]; then
   # Updater already verified the signature; pin the exact bytes across elevation.
   EXPECTED_SHA256=$3
@@ -58,6 +77,12 @@ fi
 /usr/bin/codesign --verify --strict "$STAGING/Nelomai.app"
 [ -f "$STAGING/Nelomai.app/Contents/Resources/install-macos.sh" ] || exit 1
 [ -x "$STAGING/Nelomai.app/Contents/Resources/dispatcher/1/nelomai-unix-service" ] || exit 1
+# Normalize only this verified, administrator-authorized system installation.
+# Retaining the source download's quarantine can make LaunchServices translocate
+# the protected common broker, breaking its exact executable-path admission.
+# The original downloaded app and unrelated metadata remain untouched. Failure
+# leaves the previous installation active and staging available for recovery.
+/usr/bin/xattr -dr com.apple.quarantine "$STAGING/Nelomai.app"
 if [ -e "$DESTINATION" ]; then mv "$DESTINATION" "$STAGING/previous.app"; fi
 if ! mv "$STAGING/Nelomai.app" "$DESTINATION"; then
   if [ -e "$STAGING/previous.app" ]; then mv "$STAGING/previous.app" "$DESTINATION"; fi

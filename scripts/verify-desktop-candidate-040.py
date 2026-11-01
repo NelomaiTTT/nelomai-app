@@ -66,26 +66,25 @@ assert publication.select_candidate(REPO, RUN, SOURCE, VERSION) == args.artifact
 candidate = ROOT / 'candidate'
 publication.check(candidate, SOURCE, RUN, args.inventory_sha256)
 inventory = json.loads((candidate / 'candidate-inventory.json').read_bytes())
-assert len(inventory['assets']) == 22
+assert set(inventory['assets']) == gates.PUBLISH_ASSETS
 runtime_key = gh(f'repos/{REPO}/actions/variables/NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64')['value']
 assert runtime_key == RUNTIME_PUBLIC_KEY_B64
 public = ROOT / 'runtime-public.raw'
 public.write_bytes(base64.b64decode(runtime_key, validate=True))
 updater = ROOT / 'updater-public.txt'
 updater.write_text(json.loads((APP / 'src-tauri/tauri.conf.json').read_text())['plugins']['updater']['pubkey'])
-android_pin = gh(f'repos/{REPO}/actions/variables/ANDROID_SIGNER_SHA256')['value']
 os.environ['TMPDIR'] = str(ROOT)
 os.environ['NELOMAI_RUNTIME_CONTRACT_VERIFIER'] = str(args.runtime_verifier.resolve(strict=True))
 os.environ['NELOMAI_UPDATER_SIGNATURE_VERIFIER'] = str(args.updater_verifier.resolve(strict=True))
 root_name = f'nelomai-runtime-{VERSION}-release-set.manifest.json'
 gates.verify_runtime_release(candidate, VERSION, SOURCE, inventory['assets'][root_name], public)
-gates.verify_updater_release(candidate, public, updater, android_pin)
+gates.verify_updater_release(candidate, public, updater, '')
 signer = load('sign-macos-common-package')
 assert inventory['macos_common_signature'] == signer.signature_metadata(MACOS_PIN)
 app, _ = signer.extract(candidate / gates.PACKAGE_NAMES['macos'], ROOT / 'verified-macos')
 signer.verify_signature(app, MACOS_PIN)
 result = {'source': SOURCE, 'run_id': RUN, 'ci_run_id': args.ci, 'artifact_id': args.artifact,
-          'inventory_sha256': args.inventory_sha256, 'assets_sha256_verified': 22,
+          'inventory_sha256': args.inventory_sha256, 'assets_sha256_verified': len(inventory['assets']),
           'runtime_and_updater_signatures': 'verified', 'macos_strict_signature': 'verified',
           'publish': 'skipped', 'tag_and_release': 'absent', 'installed': False,
           'windows_installer_sha256': inventory['assets'][gates.PACKAGE_NAMES['windows']]}

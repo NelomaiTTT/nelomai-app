@@ -43,6 +43,8 @@ pub enum InstallationAction {
     Continue,
     LaunchInstalled,
     RepairInstalled,
+    #[cfg(target_os = "macos")]
+    RepairDownloadMetadata,
     InstallCandidate,
 }
 /// Version ordering is evaluated only after both candidate manifests verify.
@@ -67,6 +69,61 @@ pub fn installation_action(
         Some(_) => InstallationAction::LaunchInstalled,
     })
 }
+
+#[cfg(target_os = "macos")]
+fn macos_installation_action(
+    candidate: &str,
+    installed: Option<&str>,
+    protected: bool,
+    executable: &Path,
+    installed_bundle: &Path,
+) -> io::Result<InstallationAction> {
+    let running_installed = executable == installed_bundle.join("Contents/MacOS/nelomai-app");
+    let action = installation_action(candidate, installed, protected, running_installed)?;
+    // Repair a quarantined handoff target, never an already admitted owner:
+    // reopening that same live process before returning would lose the launch.
+    if action == InstallationAction::LaunchInstalled
+        && crate::macos_installation::requires_installation_repair(installed_bundle)?
+    {
+        Ok(InstallationAction::RepairDownloadMetadata)
+    } else {
+        Ok(action)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_installer_command(
+    action: InstallationAction,
+    source: &Path,
+    installed: &Path,
+    uid: u32,
+) -> std::process::Command {
+    let selected = if matches!(
+        action,
+        InstallationAction::RepairInstalled | InstallationAction::RepairDownloadMetadata
+    ) {
+        installed
+    } else {
+        source
+    };
+    // The executing candidate defines the protocol, even when repairing a newer
+    // protected version. Metadata repair never replaces that version's bytes.
+    let resources = source.join("Contents/Resources");
+    let mut command = std::process::Command::new("/usr/bin/osascript");
+    command
+        .arg(resources.join("install-common-macos.applescript"))
+        .arg(resources.join("install-common-macos.sh"))
+        .arg(uid.to_string())
+        .arg(selected);
+    if action == InstallationAction::RepairDownloadMetadata {
+        command.arg("--repair-download-metadata");
+    }
+    command
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "macos_installation_tests.rs"]
+mod macos_installation_tests;
 
 struct NativeStop {
     child: Mutex<Option<Child>>,
@@ -885,31 +942,23 @@ fn pre_auth_handoff() -> io::Result<bool> {
             && existing
                 .as_ref()
                 .is_some_and(|runtime| protected_executable(runtime.executable()));
-        let action = installation_action(
+        let action = macos_installation_action(
             candidate.container_version(),
             existing.as_ref().map(|runtime| runtime.container_version()),
             protected,
-            executable == installed_exe,
+            &executable,
+            installed,
         )?;
         if action == InstallationAction::Continue {
             return Ok(false);
         }
         if action != InstallationAction::LaunchInstalled {
-            let selected = if action == InstallationAction::RepairInstalled {
-                installed
-            } else {
-                source
-            };
-            // The executing bundle defines the installer argument protocol;
-            // installed data may still contain the previous installer version.
-            let resources = source.join("Contents/Resources");
-            let status = platform::unix::installer_status(
-                std::process::Command::new("/usr/bin/osascript")
-                    .arg(resources.join("install-common-macos.applescript"))
-                    .arg(resources.join("install-common-macos.sh"))
-                    .arg(unsafe { libc::getuid() }.to_string())
-                    .arg(selected),
-            )
+            let status = platform::unix::installer_status(&mut macos_installer_command(
+                action,
+                source,
+                installed,
+                unsafe { libc::getuid() },
+            ))
             .map_err(|_| io::Error::other("common installation failed"))?;
             if !status.success() {
                 return Err(io::Error::other("common installation cancelled"));

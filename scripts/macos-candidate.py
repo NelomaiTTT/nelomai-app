@@ -23,6 +23,7 @@ canonical = container.release_set.canonical
 VERSION = '0.4.0'
 LATEST = 'nelomai-runtime-0.4.0-macos-aarch64'
 PACKAGE = 'nelomai-0.4.0-macos-aarch64.app.tar.gz'
+DMG = 'nelomai-0.4.0-macos-aarch64.dmg'
 SUFFIXES = ('.zip', '.manifest.json', '.manifest.sig')
 UPDATER_PUBLIC = json.loads((builder.ROOT / 'src-tauri/tauri.conf.json').read_bytes())['plugins']['updater']['pubkey']
 PRIVATE_ENV = ('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64', 'TAURI_SIGNING_PRIVATE_KEY',
@@ -221,7 +222,7 @@ def package(signed, output, sha, public, stable_public):
 def finalize(packages, signed, output, sha, public, stable_public):
     gates.require_operation('sign_candidate', 'release_sign')
     _, before = verified(signed, sha, public, stable_public)
-    expected_files = {'shipping/' + PACKAGE, 'package-digests.json'}
+    expected_files = {'shipping/' + PACKAGE, 'shipping/' + DMG, 'package-digests.json'}
     package_before = snapshot(packages)
     if set(package_before) != expected_files or os.environ.get('NELOMAI_UPDATER_PUBLIC_KEY') != UPDATER_PUBLIC:
         raise ValueError('macOS package inventory or updater public pin mismatch')
@@ -230,7 +231,10 @@ def finalize(packages, signed, output, sha, public, stable_public):
     metadata = common.signature_metadata(os.environ.get('NELOMAI_MACOS_SIGNER_SHA1', ''))
     if index.get('macos_common_signature') != metadata:
         raise ValueError('macOS candidate lacks pinned common signature verification')
-    if index != {**package_index(archive, signed, sha), 'macos_common_signature': metadata}:
+    image = common.require_dmg(index, packages, DMG)
+    expected = package_index(archive, signed, sha)
+    expected['packages']['dmg'] = index['packages']['dmg']
+    if index != {**expected, 'macos_common_signature': metadata}:
         raise ValueError('macOS package changed before finalization')
     if output.exists() or output.is_symlink():
         raise ValueError('immutable finalized macOS candidate exists')
@@ -239,16 +243,20 @@ def finalize(packages, signed, output, sha, public, stable_public):
         work = Path(temporary)
         candidate = work / 'candidate'
         candidate.mkdir()
-        destination = candidate / PACKAGE
-        shutil.copyfile(archive, destination)
         env = builder.updater_environment('sign_candidate', work, os.environ)
-        builder.run(builder.ROOT / 'node_modules/.bin/tauri', 'signer', 'sign', destination, env=env, capture=True)
         updater = work / 'updater-public.b64'
         updater.write_text(UPDATER_PUBLIC)
         executable = os.environ.get('NELOMAI_UPDATER_SIGNATURE_VERIFIER', str(builder.ROOT / 'target/debug/examples/verify-updater-signature'))
-        builder.run(executable, destination, candidate / (PACKAGE + '.sig'), updater, capture=True)
-        if (verifier.digest(destination) != index['packages']['shipping']['sha256'] or package_before != snapshot(packages)
-                or before != snapshot(signed)):
+        for source, kind in ((archive, 'shipping'), (image, 'dmg')):
+            destination = candidate / source.name
+            shutil.copyfile(source, destination)
+            if verifier.digest(destination) != index['packages'][kind]['sha256']:
+                raise ValueError('macOS package changed while copying verified input')
+            builder.run(builder.ROOT / 'node_modules/.bin/tauri', 'signer', 'sign', destination, env=env, capture=True)
+            builder.run(executable, destination, candidate / (source.name + '.sig'), updater, capture=True)
+            if verifier.digest(destination) != index['packages'][kind]['sha256']:
+                raise ValueError('macOS updater signing changed package bytes')
+        if package_before != snapshot(packages) or before != snapshot(signed):
             raise ValueError('macOS candidate inputs changed during finalization')
         shutil.copytree(signed, candidate / 'runtime')
         inventory = dict(purpose='macos-candidate', publishable=False, platform='macos', architecture='aarch64',

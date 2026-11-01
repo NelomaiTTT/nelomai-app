@@ -54,6 +54,10 @@ class CommonSigningTest(unittest.TestCase):
             source_sha="a" * 40, release_set_sha256="b" * 64, mode="sign_candidate", certificate_sha1=PIN)
         self.env = {"NELOMAI_MACOS_SIGNING_P12_BASE64": base64.b64encode(b"test-p12").decode(),
                     "NELOMAI_MACOS_SIGNING_P12_PASSWORD": "test-password"}
+        # Image creation is a native boundary; separate native tests mount a real
+        # image. Here preserve the input bytes so producer ordering is observable.
+        self.addCleanup(patch.stopall)
+        patch.object(self.signer, "build_dmg", side_effect=self.fake_dmg, create=True).start()
         self.pack()
 
     def pack(self):
@@ -72,6 +76,10 @@ class CommonSigningTest(unittest.TestCase):
         self.assertEqual(pin, PIN)
         (app / "Contents/MacOS/nelomai").write_bytes(b"signed-common")
         (app / "Contents/_CodeSignature/CodeResources").write_bytes(b"new-seal")
+
+    def fake_dmg(self, app, destination, work, version):
+        destination.write_text(json.dumps({
+            "common": (app / "Contents/MacOS/nelomai").read_text(), "version": version}))
 
     def process(self, sign=None):
         with patch.object(self.signer, "sign_bundle", side_effect=sign or self.fake_sign), \
@@ -92,6 +100,38 @@ class CommonSigningTest(unittest.TestCase):
             self.assertEqual(tar.extractfile("Nelomai.app/Contents/Resources/runtime/stable").read(), b"immutable-stable")
             self.assertEqual(tar.extractfile("Nelomai.app/Contents/MacOS/nelomai").read(), b"signed-common")
         self.assertEqual(sorted(p.name for p in self.args.output.iterdir()), ["package-digests.json", "shipping"])
+
+    def test_manual_dmg_contains_the_final_signed_common_and_is_indexed(self):
+        self.process()
+        name = "nelomai-0.3.2-macos-aarch64.dmg"
+        image = self.args.output / "shipping" / name
+        self.assertTrue(image.is_file(), "manual-install DMG is missing")
+        self.assertEqual(json.loads(image.read_text()), {"common": "signed-common", "version": "0.3.2"})
+        index = json.loads((self.args.output / "package-digests.json").read_text())
+        self.assertEqual(index["packages"]["dmg"], dict(
+            name=name, sha256=hashlib.sha256(image.read_bytes()).hexdigest(), size_bytes=image.stat().st_size))
+
+    def test_dmg_failure_never_publishes_partial_signed_package(self):
+        with patch.object(self.signer, "build_dmg", side_effect=RuntimeError("image failed")):
+            with self.assertRaises(RuntimeError):
+                self.process()
+        self.assertFalse(self.args.output.exists())
+
+    def test_manual_image_must_match_exact_indexed_name_and_bytes(self):
+        self.process()
+        name = "nelomai-0.3.2-macos-aarch64.dmg"
+        index = json.loads((self.args.output / "package-digests.json").read_text())
+        image = self.signer.require_dmg(index, self.args.output, name)
+        for field in ("name", "sha256", "size_bytes"):
+            record = index["packages"]["dmg"]
+            original = record[field]
+            record[field] = "wrong"
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.signer.require_dmg(index, self.args.output, name)
+            record[field] = original
+        image.write_bytes(b"tampered image")
+        with self.assertRaises(ValueError):
+            self.signer.require_dmg(index, self.args.output, name)
 
     def test_missing_credentials_and_pin_never_fall_back(self):
         for env, pin in (({}, PIN), (self.env, ""), (self.env, "NotAFingerprint")):

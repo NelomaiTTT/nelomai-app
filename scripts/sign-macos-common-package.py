@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign only the common host of an already verified macOS shipping package.
+"""Sign the common host and wrap its verified bytes in a manual-install DMG.
 
 No compilation, embedded-runtime signing, installation or Keychain item migration.
 Production credentials are scoped to this phase, never to native packaging.
@@ -39,12 +39,12 @@ def signature_metadata(pin):
     return dict(identifier=IDENTIFIER, certificate_sha1=pin.lower(), designated_requirement=requirement(pin))
 
 
-def run(*command):
+def run(*command, timeout=60):
     # Never expose argv or native stderr: security arguments include passwords.
     environment = {k: v for k, v in os.environ.items() if k not in SECRET_NAMES}
     try:
         result = subprocess.run([str(c) for c in command], capture_output=True, text=True,
-                                timeout=60, env=environment)
+                                timeout=timeout, env=environment)
     except (OSError, subprocess.TimeoutExpired):
         raise RuntimeError("macOS signing command could not complete") from None
     if result.returncode:
@@ -146,6 +146,71 @@ def check_unchanged(before, after, executable):
             raise ValueError("common signing changed protected bundle content: " + name)
 
 
+def require_dmg(index, folder, name):
+    image = folder / "shipping" / name
+    if image.is_symlink() or not image.is_file() or index.get("packages", {}).get("dmg") != dict(
+            name=name, sha256=digest(image), size_bytes=image.stat().st_size):
+        raise ValueError("macOS DMG package identity or digest differs")
+    return image
+
+
+def image_attachments(image):
+    info = plistlib.loads(run("/usr/bin/hdiutil", "info", "-plist").encode())
+    return [item for item in info["images"] if item.get("image-path") == str(image.resolve())]
+
+
+def verify_dmg(image, expected_app):
+    if image_attachments(image):
+        raise ValueError("DMG was already attached before verification")
+    try:
+        # Let Disk Arbitration choose the normal /Volumes mount. Some macOS
+        # configurations reject custom mountpoints inside removable volumes.
+        # All payload bytes still live in the image file in the supplied work.
+        run("/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", image, timeout=180)
+        mounts = [Path(entry["mount-point"]) for item in image_attachments(image)
+                  for entry in item["system-entities"] if "mount-point" in entry]
+        if len(mounts) != 1 or not mounts[0].is_mount():
+            raise ValueError("DMG verification requires exactly one mounted volume")
+        mounted, = mounts
+        entries = {path.name for path in mounted.iterdir()}
+        if entries - {"Nelomai.app", "Applications", ".fseventsd", ".metadata_never_index"}:
+            raise ValueError("unexpected DMG content")
+        link = mounted / "Applications"
+        if not link.is_symlink() or os.readlink(link) != "/Applications":
+            raise ValueError("DMG Applications link differs")
+        app = mounted / "Nelomai.app"
+        if snapshot(app) != expected_app:
+            raise ValueError("DMG app content differs from signed updater app")
+        run("/usr/bin/codesign", "--verify", "--strict", app)
+    finally:
+        # Query this exact newly created image, including partially failed
+        # attach. Detach only its virtual disk; never force or take a device
+        # name from a caller (notably the physical disk holding the image).
+        for item in image_attachments(image):
+            devices = [entry["dev-entry"] for entry in item["system-entities"]
+                       if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))]
+            if len(devices) != 1:
+                raise ValueError("ambiguous owned DMG device; no detach attempted")
+            run("/usr/bin/hdiutil", "detach", devices[0], timeout=180)
+
+
+def build_dmg(app, destination, work, version):
+    if destination.exists() or destination.is_symlink() or app.name != "Nelomai.app":
+        raise ValueError("immutable DMG output or invalid app name")
+    before = snapshot(app)
+    with tempfile.TemporaryDirectory(prefix="dmg-build-", dir=work) as temporary:
+        layout = Path(temporary) / "layout"
+        layout.mkdir()
+        shutil.copytree(app, layout / "Nelomai.app")
+        (layout / "Applications").symlink_to("/Applications", target_is_directory=True)
+        run("/usr/bin/hdiutil", "create", "-fs", "HFS+", "-format", "UDZO", "-nospotlight",
+            "-volname", "Nelomai " + version, "-srcfolder", layout, destination, timeout=180)
+        run("/usr/bin/hdiutil", "verify", destination, timeout=180)
+        verify_dmg(destination, before)
+        if snapshot(app) != before:
+            raise ValueError("DMG creation changed the signed source app")
+
+
 def process(args, environment):
     if args.mode not in ("build_only", "sign_candidate"):
         raise ValueError("unsupported signing mode")
@@ -194,6 +259,11 @@ def process(args, environment):
         else:
             shutil.copyfile(archive, destination)
         index["packages"]["shipping"] = dict(name=name, sha256=digest(destination), size_bytes=destination.stat().st_size)
+        dmg_name = name.removesuffix(".app.tar.gz") + ".dmg"
+        dmg = result / "shipping" / dmg_name
+        version = re.fullmatch(r"nelomai-(\d+\.\d+\.\d+)-macos-aarch64\.app\.tar\.gz", name)[1]
+        build_dmg(app, dmg, work, version)
+        index["packages"]["dmg"] = dict(name=dmg_name, sha256=digest(dmg), size_bytes=dmg.stat().st_size)
         (result / "package-digests.json").write_text(json.dumps(index, sort_keys=True) + "\n")
         result.rename(args.output)
 

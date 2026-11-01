@@ -145,6 +145,9 @@ class MacosCandidateTest(unittest.TestCase):
         archive = packages / 'shipping' / self.c.PACKAGE
         archive.write_bytes(b'synthetic archive never installed')
         index = self.c.package_index(archive, self.signed, self.sha)
+        image = packages / 'shipping' / self.c.DMG
+        image.write_bytes(b'manual image fixture')
+        index['packages']['dmg'] = dict(name=image.name, sha256=self.digest(image), size_bytes=image.stat().st_size)
         target = packages / 'package-digests.json'
         target.write_bytes(self.c.canonical(index))
         env = {'NELOMAI_UPDATER_PUBLIC_KEY': self.c.UPDATER_PUBLIC, 'NELOMAI_MACOS_SIGNER_SHA1': '12' * 20}
@@ -165,6 +168,9 @@ class MacosCandidateTest(unittest.TestCase):
         archive.write_bytes(b'outer common already signed by native protected phase')
         index = {**self.c.package_index(archive, self.signed, self.sha),
                  'macos_common_signature': self.c.common.signature_metadata('12' * 20)}
+        image = packages / 'shipping' / self.c.DMG
+        image.write_bytes(b'manual image fixture')
+        index['packages']['dmg'] = dict(name=image.name, sha256=self.digest(image), size_bytes=image.stat().st_size)
         (packages / 'package-digests.json').write_bytes(self.c.canonical(index))
         before = self.c.snapshot(packages)
         output = self.root / 'final'
@@ -187,9 +193,11 @@ class MacosCandidateTest(unittest.TestCase):
         self.assertEqual(inventory['macos_common_signature']['certificate_sha1'], '12' * 20)
         self.assertEqual(inventory['assets'][self.c.PACKAGE], self.digest(archive))
         self.assertIn(self.c.PACKAGE + '.sig', inventory['assets'])
+        self.assertEqual(inventory['assets'][self.c.DMG], self.digest(image))
+        self.assertIn(self.c.DMG + '.sig', inventory['assets'])
         self.assertFalse(any('0.4.0-release-set' in n or 'release-manifest' in n for n in inventory['assets']))
         self.assertEqual(before, self.c.snapshot(packages))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 4)
 
     def test_source_rejects_foreign_event_branch_sha_and_private_credentials_before_git(self):
         env = dict(GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REPOSITORY='NelomaiTTT/nelomai-app',

@@ -38,9 +38,14 @@ or generating a production key is **not** part of the local code change.
 3. Strict signature/requirement checks and comparisons before/after signing and
    re-extraction enforce unchanged nested payloads. The final package/index is
    uploaded as `signed-common-macos`; the original artifact is not overwritten.
+   This phase also creates a compressed DMG from that final app, with an
+   `Applications` link. A read-only mounted roundtrip checks the app's bytes,
+   permissions, signature and the link before the DMG digest enters the index.
 4. Linux finalization consumes this artifact, checks its pinned signing metadata
    and archive digest, then generates the existing updater signature and shipping
-   inventory. There are still 22 shipping assets. Metadata records the native
+   inventory. The DMG receives a separate Tauri signature and is included with
+   its `.sig` in the strict shipping allowlist. The updater manifest retains its
+   three ordinary targets and macOS `.app.tar.gz` package. Metadata records the native
    phase's verification; it is not a substitute for native codesign validation.
 
 The P12 is imported into a private temporary keychain, with codesign access only
@@ -64,3 +69,20 @@ disposable certificate and checks cleanup; it does not install Nelomai.
 Stable identity can avoid repeated Keychain prompts for newly created records
 while the keychain is unlocked. Migrating old ad-hoc item permissions remains
 separate. No full-install dialog count or silent first-upgrade migration is claimed.
+
+## Manual installation
+
+Use `nelomai-0.4.0-macos-aarch64.dmg` on Apple Silicon. Open the image in Finder,
+drag `Nelomai.app` to `Applications`, then launch the copy from Applications.
+The first launch performs the existing administrator-authorized helper setup.
+The `.app.tar.gz` package remains the input for automatic updates.
+
+Previously installed protected apps that retained download quarantine use a
+metadata-only authorized repair. It keeps the installed version and directory
+in place, clears child metadata before the root marker and can safely retry
+after interruption. An older launcher therefore retains a newer installed
+version throughout this repair; the helper is not replaced or restarted.
+
+The detached DMG signature authenticates its bytes with the existing updater
+authority. Apple Developer ID and notarization are separate from this signing
+scheme; changing the distribution container does not add them.
