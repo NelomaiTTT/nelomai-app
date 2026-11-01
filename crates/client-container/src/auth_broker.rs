@@ -3283,12 +3283,15 @@ impl AuthBroker {
                 }; // Drop the obsolete HTTP future before resetting transport.
                 match first {
                     Some(Ok(response)) => return Ok(response),
-                    Some(Err(ClientApiError::Transport(error))) => {
+                    Some(Err(
+                        error @ (ClientApiError::Transport(_)
+                        | ClientApiError::ControlTransportUnavailable),
+                    )) => {
                         if stopped_rx.borrow().is_none() {
                             let _ = stopped_rx.changed().await;
                         }
                         if *stopped_rx.borrow() != Some(true) {
-                            return Err(BrokerError::Api(ClientApiError::Transport(error)));
+                            return Err(BrokerError::Api(error));
                         }
                     }
                     Some(Err(error)) => return Err(error.into()),

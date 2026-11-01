@@ -52,6 +52,7 @@ fn diagnostic_upload_error(error: ClientApiError) -> CoreApiError {
         }
         ClientApiError::Transport(error) if error.is_body() => "diagnostics_body_failed".into(),
         ClientApiError::Transport(_) => "diagnostics_transport_failed".into(),
+        ClientApiError::ControlTransportUnavailable => "diagnostics_connect_failed".into(),
         ClientApiError::Api { status, .. } | ClientApiError::InvalidErrorResponse { status } => {
             format!("diagnostics_http_{}", status.as_u16())
         }

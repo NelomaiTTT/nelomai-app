@@ -666,7 +666,9 @@ pub enum CoreApiError {
 impl From<ClientApiError> for CoreApiError {
     fn from(error: ClientApiError) -> Self {
         match error {
-            ClientApiError::Transport(_) => Self::Retryable,
+            ClientApiError::Transport(_) | ClientApiError::ControlTransportUnavailable => {
+                Self::Retryable
+            }
             ClientApiError::Api { code, message, .. } if code == "invalid_credentials" => {
                 Self::Rejected {
                     code,

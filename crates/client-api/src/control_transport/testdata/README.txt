@@ -1,0 +1,1 @@
+Public test-only certificates and key from tokio-rustls0.26.4 tests/certs, licensed MIT OR Apache-2.0. The key is deliberately public and is never used by production code. Certificate DNS name foobar.com; tests override all dialing to loopback and perform no external lookup. Validity1975–4096. These fixtures verify that TLS/SNI/certificate checks survive the private byte relay.

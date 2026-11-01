@@ -1099,7 +1099,10 @@ impl SwitchCoordinator {
                     let receipt = match broker.reconcile_transition(frozen.clone()).await {
                         Ok(receipt) => receipt,
                         Err(BrokerError::Timeout)
-                        | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                        | Err(BrokerError::Api(
+                            ClientApiError::Transport(_)
+                            | ClientApiError::ControlTransportUnavailable,
+                        )) => {
                             return Ok(SwitchProgress::Pending {
                                 retry_after_seconds: delay,
                             });
@@ -1166,7 +1169,10 @@ impl SwitchCoordinator {
                             {
                                 Ok(response) => response,
                                 Err(BrokerError::Timeout)
-                                | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                                | Err(BrokerError::Api(
+                                    ClientApiError::Transport(_)
+                                    | ClientApiError::ControlTransportUnavailable,
+                                )) => {
                                     return Ok(SwitchProgress::Pending {
                                         retry_after_seconds: delay,
                                     });

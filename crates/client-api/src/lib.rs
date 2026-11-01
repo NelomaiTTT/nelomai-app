@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+mod control_transport;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseHistoryEntry {
     pub version: String,
@@ -765,6 +768,8 @@ pub enum ClientApiError {
     InvalidBaseUrl(String),
     #[error("request failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("physical control transport unavailable")]
+    ControlTransportUnavailable,
     #[error("invalid application version header")]
     InvalidAppVersion(#[from] InvalidHeaderValue),
     #[error("{code}: {message}")]
@@ -867,13 +872,38 @@ pub struct ClientApi {
 #[derive(Clone)]
 struct ResettableHttpClient {
     current: Arc<RwLock<HttpClient>>,
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    control: Option<Arc<control_transport::Slot>>,
 }
 
 impl ResettableHttpClient {
     fn new() -> Result<Self, ClientApiError> {
         Ok(Self {
             current: Arc::new(RwLock::new(Self::build()?)),
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            control: None,
         })
+    }
+
+    fn for_panel(origin: &Url) -> Result<Self, ClientApiError> {
+        let client = Self::new()?;
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        let client = {
+            let mut client = client;
+            // Shipping API origins require HTTPS. Debug HTTP fixtures retain
+            // their local transport; Android keeps its existing VpnService
+            // package exclusion and never creates a desktop relay.
+            if origin.scheme() == "https" {
+                client.control = Some(Arc::new(control_transport::Slot::new(
+                    origin.clone(),
+                    Arc::new(control_transport::SystemDialer),
+                )));
+            }
+            client
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        let _ = origin;
+        Ok(client)
     }
 
     fn build() -> Result<HttpClient, ClientApiError> {
@@ -890,7 +920,20 @@ impl ResettableHttpClient {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *current = replacement;
+        drop(current);
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        if let Some(control) = &self.control {
+            control.reset();
+        }
         Ok(())
+    }
+
+    async fn execute(&self, request: reqwest::Request) -> Result<Response, ClientApiError> {
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+        if let Some(control) = &self.control {
+            return control.execute(request).await;
+        }
+        Ok(self.client().execute(request).await?)
     }
 
     fn client(&self) -> HttpClient {
@@ -935,7 +978,7 @@ impl ClientApi {
             .map_err(|error| ClientApiError::InvalidBaseUrl(error.to_string()))?;
         Ok(Self {
             // Reqwest has no cookie jar unless its optional `cookies` feature is enabled.
-            http: ResettableHttpClient::new()?,
+            http: ResettableHttpClient::for_panel(&base)?,
             api_base,
             app_version: None,
             runtime_identity: None,
@@ -2031,7 +2074,7 @@ impl ClientApi {
                 }
             }
         }
-        Ok(self.http.client().execute(request).await?)
+        self.http.execute(request).await
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(
