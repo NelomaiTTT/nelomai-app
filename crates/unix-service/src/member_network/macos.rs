@@ -192,7 +192,7 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
         &mut self,
         options: &nelomai_client_tunnel::DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<super::session::NetworkPolicy> {
         let plan =
             nelomai_client_tunnel::Ipv4RoutePlan::from_options(options).map_err(|_| invalid())?;
@@ -221,9 +221,6 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
         };
         for ipv4 in [true, false] {
             let needed = requested.iter().any(|n| n.addr().is_ipv4() == ipv4);
-            if !needed && !plan.exclude_local_networks {
-                continue;
-            }
             let table = self.commands.run(
                 "/usr/sbin/netstat",
                 &[
@@ -237,31 +234,6 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
                 .map(|line| line.split_whitespace().collect::<Vec<_>>())
                 .filter(|f| f.len() >= 4)
                 .collect::<Vec<_>>();
-            if !needed {
-                // No endpoint or policy bypass needs a gateway in this family.
-                // Existing connected LAN routes can still be retained verbatim
-                // on several physical adapters without selecting a default.
-                for fields in rows.iter().filter(|f| {
-                    physical_interface(f[3]) && f[1].starts_with("link#") && !f[2].contains('I')
-                }) {
-                    let Some(destination) = table_destination(fields[0], ipv4) else {
-                        continue;
-                    };
-                    if destination.prefix_len() == 0
-                        || destination.prefix_len() == if ipv4 { 32 } else { 128 }
-                    {
-                        continue;
-                    }
-                    policy.retained_routes.push(RouteValue {
-                        destination,
-                        scope: RouteScope::Global,
-                        interface: self.commands.interface_index(fields[3])?,
-                        gateway: None,
-                        metric: 0,
-                    });
-                }
-                continue;
-            }
             let mut defaults = Vec::new();
             for fields in rows
                 .iter()
@@ -281,11 +253,65 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
             }
             defaults.sort();
             defaults.dedup();
-            if defaults.len() != 1 {
+            if !needed {
+                // No endpoint or policy bypass needs a gateway in this family.
+                // Existing connected LAN routes can still be retained verbatim
+                // on several physical adapters without selecting a default.
+                for fields in rows.iter().filter(|f| {
+                    plan.exclude_local_networks
+                        && physical_interface(f[3])
+                        && f[1].starts_with("link#")
+                        && !f[2].contains('I')
+                }) {
+                    let Some(destination) = table_destination(fields[0], ipv4) else {
+                        continue;
+                    };
+                    if destination.prefix_len() == 0
+                        || destination.prefix_len() == if ipv4 { 32 } else { 128 }
+                    {
+                        continue;
+                    }
+                    policy.retained_routes.push(RouteValue {
+                        destination,
+                        scope: RouteScope::Global,
+                        interface: self.commands.interface_index(fields[3])?,
+                        gateway: None,
+                        metric: 0,
+                    });
+                }
+                if defaults.len() != 1 {
+                    continue;
+                }
+            } else if defaults.len() != 1 {
                 return Err(io::Error::other("physical_egress_ambiguous_or_unavailable"));
             }
             let (_, interface, gateway) = defaults[0];
             let name = self.commands.interface_name(interface)?;
+            // An interface-bound control socket needs a scoped physical default
+            // while the unscoped split defaults belong to the VPN. Journal it
+            // with this session; never globally bypass a panel/DNS address.
+            let control = RouteValue {
+                destination: if ipv4 { "0.0.0.0/0" } else { "::/0" }
+                    .parse()
+                    .map_err(|_| invalid())?,
+                scope: RouteScope::Member(interface),
+                interface,
+                gateway: Some(gateway),
+                metric: 0,
+            };
+            if owned
+                .iter()
+                .any(|r| r.destination == control.destination && r.scope == control.scope)
+            {
+                policy.bypasses.push(control);
+            } else {
+                let value = NetworkValue::Route(control.clone());
+                match self.read(&value.key())? {
+                    None => policy.bypasses.push(control),
+                    Some(actual) if actual == value => policy.retained_routes.push(control),
+                    _ => return Err(io::Error::other("physical_route_conflict")),
+                }
+            }
             for destination in requested
                 .iter()
                 .copied()
@@ -298,7 +324,10 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
                     gateway: Some(gateway),
                     metric: 0,
                 };
-                if owned.contains(&destination) {
+                if owned
+                    .iter()
+                    .any(|r| r.destination == destination && r.scope == RouteScope::Global)
+                {
                     policy.bypasses.push(route);
                     continue;
                 }
@@ -323,7 +352,7 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
                     _ => return Err(io::Error::other("physical_route_conflict")),
                 }
             }
-            if plan.exclude_local_networks {
+            if needed && plan.exclude_local_networks {
                 for fields in rows
                     .iter()
                     .filter(|f| f[3] == name && f[1].starts_with("link#") && !f[2].contains('I'))
@@ -765,7 +794,7 @@ mod tests {
             policy.retained_routes[0].destination,
             "192.168.1.0/24".parse().unwrap()
         );
-        assert_eq!(policy.bypasses.len(), 2);
+        assert_eq!(policy.bypasses.len(), 3);
         assert!(policy
             .bypasses
             .iter()
@@ -791,12 +820,22 @@ mod tests {
         let endpoint = "198.51.100.1".parse().unwrap();
         let options = nelomai_client_tunnel::DesktopTunnelOptions::default();
         let borrowed = native.resolve_policy(&options, &[endpoint], &[]).unwrap();
-        assert!(borrowed.bypasses.is_empty());
+        assert_eq!(borrowed.bypasses.len(), 1);
         assert_eq!(borrowed.retained_routes.len(), 1);
         let owned = native
-            .resolve_policy(&options, &[endpoint], &["198.51.100.1/32".parse().unwrap()])
+            .resolve_policy(
+                &options,
+                &[endpoint],
+                &[RouteValue {
+                    destination: "198.51.100.1/32".parse().unwrap(),
+                    scope: RouteScope::Global,
+                    interface: 5,
+                    gateway: Some("192.168.1.1".parse().unwrap()),
+                    metric: 0,
+                }],
+            )
             .unwrap();
-        assert_eq!(owned.bypasses.len(), 1);
+        assert_eq!(owned.bypasses.len(), 2);
         assert!(owned.retained_routes.is_empty());
     }
 
@@ -867,7 +906,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(policy.bypasses.len(), 1);
+        assert_eq!(policy.bypasses.len(), 2);
     }
 
     #[test]
@@ -883,8 +922,144 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(policy.bypasses.len(), 1);
+        assert_eq!(policy.bypasses.len(), 2);
         assert_eq!(policy.retained_routes.len(), 2);
         assert_eq!(policy.retained_routes[1].interface, 6);
+    }
+    #[test]
+    fn control_scoped_default_is_prepared_with_the_physical_endpoint() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\n",
+                v6: "",
+            },
+        };
+        let policy = native
+            .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .unwrap();
+        assert!(policy.bypasses.contains(&RouteValue {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            scope: RouteScope::Member(5),
+            interface: 5,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            metric: 0,
+        }));
+        assert!(policy
+            .bypasses
+            .iter()
+            .any(|r| r.destination == "198.51.100.1/32".parse().unwrap()
+                && r.scope == RouteScope::Global));
+        assert!(!policy
+            .bypasses
+            .iter()
+            .any(|r| r.destination.prefix_len() == 0 && r.scope == RouteScope::Global));
+    }
+    #[test]
+    fn control_scoped_default_borrows_preexisting_matching_route() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\ndefault 192.168.1.1 UGScI en0\n",
+                v6: "",
+            },
+        };
+        let policy = native
+            .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .unwrap();
+        assert!(policy
+            .retained_routes
+            .iter()
+            .any(|r| r.destination == "0.0.0.0/0".parse().unwrap()
+                && r.scope == RouteScope::Member(5)));
+        assert!(!policy
+            .bypasses
+            .iter()
+            .any(|r| r.scope == RouteScope::Member(5)));
+    }
+    #[test]
+    fn control_scoped_default_rejects_foreign_gateway() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\ndefault 192.168.1.2 UGScI en0\n",
+                v6: "",
+            },
+        };
+        assert!(native
+            .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .is_err());
+    }
+
+    #[test]
+    fn control_scoped_defaults_include_unambiguous_physical_ipv6_without_ipv6_endpoint() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\n",
+                v6: "default fe80::1%en0 UGcIg en0\n",
+            },
+        };
+        let p = native
+            .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .unwrap();
+        assert!(p.retained_routes.contains(&RouteValue {
+            destination: "::/0".parse().unwrap(),
+            scope: RouteScope::Member(5),
+            interface: 5,
+            gateway: Some("fe80::1".parse().unwrap()),
+            metric: 0
+        }));
+    }
+    #[test]
+    fn control_scoped_default_refresh_keeps_owned_route_instead_of_borrowing_it() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\ndefault 192.168.1.1 UGScI en0\n",
+                v6: "",
+            },
+        };
+        let own = RouteValue {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            scope: RouteScope::Member(5),
+            interface: 5,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            metric: 0,
+        };
+        let p = native
+            .resolve_policy(
+                &Default::default(),
+                &["198.51.100.1".parse().unwrap()],
+                std::slice::from_ref(&own),
+            )
+            .unwrap();
+        assert!(p.bypasses.contains(&own));
+        assert!(!p.retained_routes.contains(&own));
+    }
+    #[test]
+    fn control_scoped_default_never_claims_ownership_of_global_os_default() {
+        let mut native = MacNetwork {
+            commands: PhysicalCommands {
+                v4: "default 192.168.1.1 UGSc en0\ndefault 192.168.1.1 UGScI en0\n",
+                v6: "",
+            },
+        };
+        let own = RouteValue {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            scope: RouteScope::Member(5),
+            interface: 5,
+            gateway: Some("192.168.1.1".parse().unwrap()),
+            metric: 0,
+        };
+        let options = nelomai_client_tunnel::DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["0.0.0.0/0".into()],
+            policy_hash: Some("explicit-user-exclusion".into()),
+            ..Default::default()
+        };
+        let p = native
+            .resolve_policy(&options, &["198.51.100.1".parse().unwrap()], &[own])
+            .unwrap();
+        assert!(p.retained_routes.iter().any(
+            |r| r.destination == "0.0.0.0/0".parse().unwrap() && r.scope == RouteScope::Global
+        ));
+        assert!(!p.bypasses.iter().any(
+            |r| r.destination == "0.0.0.0/0".parse().unwrap() && r.scope == RouteScope::Global
+        ));
     }
 }

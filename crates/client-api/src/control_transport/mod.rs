@@ -29,6 +29,7 @@ pub(super) trait Dialer: Send + Sync {
 }
 
 pub(super) struct SystemDialer;
+use relay::Observer;
 
 async fn race_connections(attempts: Vec<DialFuture>) -> io::Result<TcpStream> {
     use futures_util::{stream::FuturesUnordered, StreamExt};
@@ -44,16 +45,20 @@ async fn race_connections(attempts: Vec<DialFuture>) -> io::Result<TcpStream> {
             attempt.await
         });
     }
+    let mut last_error = io::Error::other("physical_connect_failed");
     while let Some(result) = running.next().await {
-        if let Ok(stream) = result {
-            return Ok(stream);
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
         }
     }
-    Err(io::Error::other("physical_connect_failed"))
+    Err(last_error)
 }
 
 async fn snapshot() -> io::Result<physical::Snapshot> {
-    native_read(physical::snapshot).await
+    native_read(physical::snapshot)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), "physical_discovery_failed"))
 }
 
 async fn native_read<T: Send + 'static>(
@@ -116,7 +121,16 @@ async fn connect_family(
         family.interface(address)?;
         vec![address]
     } else {
-        resolve_host(host, family).await?
+        resolve_host(host, family).await.map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                if e.kind() == io::ErrorKind::TimedOut {
+                    "physical_dns_timeout"
+                } else {
+                    "physical_dns_failed"
+                },
+            )
+        })?
     };
     if snapshot().await? != before {
         return Err(io::Error::other("physical_network_changed"));
@@ -168,7 +182,8 @@ async fn connect_address(
         Some(socket2::Protocol::TCP),
     )?;
     socket.set_nonblocking(true)?;
-    physical::bind_socket(&socket, interface, remote)?;
+    physical::bind_socket(&socket, interface, remote)
+        .map_err(|e| io::Error::new(e.kind(), "physical_bind_failed"))?;
     let stream: std::net::TcpStream = socket.into();
     let stream = tokio::net::TcpSocket::from_std_stream(stream)
         .connect(remote)
@@ -263,14 +278,30 @@ pub(super) struct Slot {
     origin: Url,
     dialer: Arc<dyn Dialer>,
     current: RwLock<Option<Arc<ControlClient>>>,
+    observer: RwLock<Option<Observer>>,
 }
 
 impl Slot {
+    pub fn set_observer(&self, observe: Observer) {
+        *self
+            .observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observe.clone());
+        if let Some(current) = self
+            .current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            current._relay.set_observer(Some(observe));
+        }
+    }
     pub fn new(origin: Url, dialer: Arc<dyn Dialer>) -> Self {
         Self {
             origin,
             dialer,
             current: RwLock::new(None),
+            observer: RwLock::new(None),
         }
     }
 
@@ -301,7 +332,14 @@ impl Slot {
                         .map_err(|_| super::ClientApiError::ControlTransportUnavailable)?,
                 ));
             }
-            current.as_ref().unwrap().clone()
+            let client = current.as_ref().unwrap();
+            client._relay.set_observer(
+                self.observer
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            );
+            client.clone()
         };
         client.execute(request).await
     }

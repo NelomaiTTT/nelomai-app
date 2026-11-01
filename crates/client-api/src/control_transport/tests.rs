@@ -2,6 +2,7 @@ use super::*;
 use std::{
     net::SocketAddr,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -609,4 +610,95 @@ async fn stopped_relay_is_rebuilt_without_replaying_or_cutting_an_active_body() 
         1,
         "recovery replayed the POST"
     );
+}
+
+#[tokio::test]
+async fn control_failure_observer_records_dns_reason_without_secret_error_text_or_fallback() {
+    struct BrokenDns;
+    impl Dialer for BrokenDns {
+        fn connect(&self, _: Origin) -> DialFuture {
+            Box::pin(async {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "physical_dns_timeout",
+                ))
+            })
+        }
+    }
+    let (ordinary, hits, server) = server("must not reach VPN").await;
+    let origin = Url::parse(&format!("http://{ordinary}")).unwrap();
+    let slot = Slot::new(origin.clone(), Arc::new(BrokenDns));
+    let (seen, mut events) = tokio::sync::mpsc::channel(1);
+    slot.set_observer(Arc::new(move |code, ms| {
+        let _ = seen.try_send((code, ms));
+    }));
+    let request = Client::new().get(origin).build().unwrap();
+    assert!(slot.execute(request).await.is_err());
+    server.abort();
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .map(|(code, _)| code),
+        Some("physical_dns_timeout")
+    );
+}
+
+#[tokio::test]
+async fn last_native_dns_failure_survives_the_family_race_for_diagnostics() {
+    let result = race_connections(vec![Box::pin(async {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "physical_dns_timeout",
+        ))
+    })])
+    .await;
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert_eq!(error.to_string(), "physical_dns_timeout");
+}
+
+#[tokio::test]
+async fn control_failure_observer_never_discloses_private_native_error_strings() {
+    struct Broken {
+        kind: io::ErrorKind,
+    }
+    impl Dialer for Broken {
+        fn connect(&self, _: Origin) -> DialFuture {
+            let kind = self.kind;
+            Box::pin(async move {
+                Err(io::Error::new(
+                    kind,
+                    "https://user:secret@private bearer-token",
+                ))
+            })
+        }
+    }
+    for (kind, expected) in [
+        (
+            io::ErrorKind::NetworkUnreachable,
+            "physical_route_unavailable",
+        ),
+        (io::ErrorKind::Other, "physical_connect_failed"),
+    ] {
+        let slot = Slot::new(
+            Url::parse("http://127.0.0.1:9").unwrap(),
+            Arc::new(Broken { kind }),
+        );
+        let (seen, mut events) = tokio::sync::mpsc::channel(1);
+        slot.set_observer(Arc::new(move |code, _| {
+            let _ = seen.try_send(code);
+        }));
+        assert!(slot
+            .execute(Client::new().get("http://127.0.0.1:9").build().unwrap())
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+    }
 }

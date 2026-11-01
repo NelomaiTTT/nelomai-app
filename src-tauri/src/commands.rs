@@ -3919,6 +3919,7 @@ pub async fn app_send_diagnostics(
                 "Не удалось подготовить диагностический отчёт",
             )
         })?;
+    let upload_started = Instant::now();
     match application.upload_diagnostics(&report).await {
         Ok(response) => {
             diagnostics.record_named(
@@ -3930,15 +3931,85 @@ pub async fn app_send_diagnostics(
             Ok(response)
         }
         Err(error) => {
-            diagnostics.record_named(
-                "diagnostics.upload_failed",
-                None,
-                None,
-                Some("upload_failed"),
+            record_manual_diagnostics_failure(
+                &diagnostics,
+                &error,
+                upload_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             );
             Err(error.into())
         }
     }
+}
+
+fn record_manual_diagnostics_failure(
+    diagnostics: &AppDiagnostics,
+    error: &ApplicationError,
+    duration_ms: u64,
+) {
+    let candidate = match error {
+        ApplicationError::Api(CoreApiError::Rejected { code, .. })
+        | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected { code, .. })) => {
+            Some(code.as_str())
+        }
+        ApplicationError::Api(CoreApiError::Unauthorized)
+        | ApplicationError::Core(CoreError::SignedOut) => Some("signed_out"),
+        ApplicationError::Api(CoreApiError::AccessExpired)
+        | ApplicationError::Core(CoreError::AccessExpired) => Some("access_expired"),
+        _ => None,
+    };
+    // Application-level failures may carry server strings: admit exact local
+    // diagnostic codes and a bounded HTTP status, never arbitrary error text.
+    let code = candidate
+        .filter(|code| {
+            matches!(
+                *code,
+                "signed_out"
+                    | "access_expired"
+                    | "diagnostics_timeout"
+                    | "diagnostics_connect_failed"
+                    | "diagnostics_response_decode_failed"
+                    | "diagnostics_body_failed"
+                    | "diagnostics_transport_failed"
+                    | "diagnostics_invalid_request"
+            ) || code.strip_prefix("diagnostics_http_").is_some_and(|s| {
+                s.len() == 3
+                    && s.bytes().all(|c| c.is_ascii_digit())
+                    && s.parse::<u16>()
+                        .is_ok_and(|status| (100..=599).contains(&status))
+            })
+        })
+        .unwrap_or("diagnostics_upload_failed");
+    diagnostics.record_timed_named(
+        "diagnostics.upload_failed",
+        None,
+        None,
+        Some(code),
+        Duration::from_millis(duration_ms),
+    );
+}
+#[test]
+fn manual_diagnostics_failure_keeps_safe_reason_and_duration_without_private_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let diagnostics = AppDiagnostics::new(
+        dir.path().into(),
+        crate::resource_usage::ResourceSnapshot::capture_for_test(),
+    )
+    .unwrap();
+    let error = ApplicationError::Api(CoreApiError::Rejected {
+        code: "diagnostics_connect_failed".into(),
+        message: "https://user:secret@private/diagnostics bearer-private".into(),
+        retry_after_seconds: None,
+    });
+    record_manual_diagnostics_failure(&diagnostics, &error, 7004);
+    let text = std::fs::read_to_string(dir.path().join("application.jsonl")).unwrap();
+    let event = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|e| e["kind"] == "diagnostics.upload_failed")
+        .unwrap();
+    assert_eq!(event["code"], "diagnostics_connect_failed");
+    assert_eq!(event["duration_ms"], 7004);
+    assert!(!text.contains("secret") && !text.contains("bearer-private"));
 }
 
 fn stable_diagnostics_connection_lease(
@@ -7351,3 +7422,36 @@ mod tests {
 #[cfg(any(test, target_os = "android"))]
 #[path = "ipc_stack_budget.rs"]
 mod ipc_stack_budget;
+
+#[test]
+fn manual_diagnostics_failure_never_logs_unrecognised_server_codes() {
+    for code in [
+        "bearer-private",
+        "diagnostics_http_500\nsecret",
+        "diagnostics_http_999",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            dir.path().into(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        record_manual_diagnostics_failure(
+            &diagnostics,
+            &ApplicationError::Api(CoreApiError::Rejected {
+                code: code.into(),
+                message: "secret".into(),
+                retry_after_seconds: None,
+            }),
+            42,
+        );
+        let text = std::fs::read_to_string(dir.path().join("application.jsonl")).unwrap();
+        assert!(!text.contains("secret") && !text.contains("bearer-private"));
+        let event = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["kind"] == "diagnostics.upload_failed")
+            .unwrap();
+        assert_eq!(event["code"], "diagnostics_upload_failed");
+    }
+}

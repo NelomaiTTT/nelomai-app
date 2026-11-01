@@ -2192,12 +2192,13 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
             reject_next_save: AtomicBool::new(false),
             lose_next_save_ack: AtomicBool::new(false),
         });
+        let logger = Arc::new(MemoryLogger::default());
         let core = nelomai_client_core::ClientCore::new(
             api.clone(),
             store.clone(),
             owner,
             local,
-            Arc::new(MemoryLogger::default()),
+            logger.clone(),
         );
         let epoch = core.begin_start_attempt();
         core.desktop_connection_intent_attempt_with_cancellation_epoch(
@@ -2284,6 +2285,14 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
                 [true, false]
             );
             assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 1);
+            assert!(logger
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "desktop.redundancy.primary_report_failed"
+                    && e.operation_id.as_deref() == Some(pair.session.session_id.as_str())
+                    && e.code.as_deref() == Some("temporary_network_error")));
 
             // Readiness must be observed again before retrying the report.
             tunnel.pair.lock().unwrap().as_mut().unwrap().stalled = true;

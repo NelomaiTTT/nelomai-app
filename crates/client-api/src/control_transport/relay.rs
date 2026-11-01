@@ -5,6 +5,26 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 
+pub(super) type Observer = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
+
+// Emit only allowlisted stage codes, never arbitrary IO strings, URLs or addresses.
+pub(super) fn failure_code(error: &io::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "physical_dns_timeout" => "physical_dns_timeout",
+        "physical_dns_failed" => "physical_dns_failed",
+        "physical_network_changed" => "physical_network_changed",
+        "physical_discovery_failed" => "physical_discovery_failed",
+        "physical_bind_failed" => "physical_bind_failed",
+        _ => match error.kind() {
+            io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable => {
+                "physical_route_unavailable"
+            }
+            io::ErrorKind::TimedOut => "physical_connect_timeout",
+            _ => "physical_connect_failed",
+        },
+    }
+}
+
 pub(super) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(super) type BoxIo = Box<dyn Io>;
@@ -109,16 +129,28 @@ impl Drop for Listener {
 
 pub(super) struct Relay {
     stop: Option<oneshot::Sender<()>>,
+    observer: Arc<std::sync::RwLock<Option<Observer>>>,
 }
 impl Relay {
+    pub fn set_observer(&self, observer: Option<Observer>) {
+        *self
+            .observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+    }
     pub fn is_running(&self) -> bool {
         self.stop.as_ref().is_some_and(|stop| !stop.is_closed())
     }
 
     pub fn start(mut listener: Listener, dialer: Arc<dyn Dialer>, origin: Origin) -> Self {
         let (stop, mut cancelled) = oneshot::channel();
+        let observer = Arc::new(std::sync::RwLock::<Option<Observer>>::new(None));
+        let observe = observer.clone();
         tokio::spawn(async move {
             static CONNECTIONS: Semaphore = Semaphore::const_new(16);
+            // A slow journal must never occupy async workers or connection
+            // capacity, nor create an unbounded queue of blocking log jobs.
+            static DIAGNOSTICS: Semaphore = Semaphore::const_new(16);
             loop {
                 let mut accepted = tokio::select! {
                     biased;
@@ -131,8 +163,10 @@ impl Relay {
                 };
                 let dialer = dialer.clone();
                 let origin = origin.clone();
+                let observe = observe.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let started = std::time::Instant::now();
                     let connected = tokio::select! {
                         _ = &mut accepted.closed => return,
                         result = tokio::time::timeout(
@@ -140,13 +174,43 @@ impl Relay {
                             dialer.connect(origin),
                         ) => result,
                     };
-                    if let Ok(Ok(remote)) = connected {
-                        let _ = bridge(accepted, remote).await;
+                    match connected {
+                        Ok(Ok(remote)) => {
+                            let _ = bridge(accepted, remote).await;
+                        }
+                        failed => {
+                            // Release both resources before best-effort log IO.
+                            drop(accepted);
+                            drop(_permit);
+                            let code = match &failed {
+                                Ok(Err(error)) => failure_code(error),
+                                _ => "physical_connect_timeout",
+                            };
+                            let callback = observe
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone();
+                            if let Some(callback) = callback {
+                                let ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                                let Ok(log_permit) = DIAGNOSTICS.try_acquire() else {
+                                    return;
+                                };
+                                tokio::task::spawn_blocking(move || {
+                                    let _permit = log_permit;
+                                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                        || callback(code, ms),
+                                    ));
+                                });
+                            }
+                        }
                     }
                 });
             }
         });
-        Self { stop: Some(stop) }
+        Self {
+            stop: Some(stop),
+            observer,
+        }
     }
 }
 impl Drop for Relay {

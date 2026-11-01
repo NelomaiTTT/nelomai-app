@@ -256,7 +256,7 @@ impl<N: PhysicalPolicyProvider> PhysicalPolicyProvider for DiagnosticNetwork<N> 
         &mut self,
         options: &DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[ipnet::IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<NetworkPolicy> {
         self.0
             .resolve_policy(options, endpoints, owned)

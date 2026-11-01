@@ -337,6 +337,9 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             .bypasses
             .iter()
             .chain(&policy.retained_routes)
+            // Physical scoped defaults serve explicitly bound control sockets,
+            // not a global exclusion of all user traffic from the VPN.
+            .filter(|r| r.scope == RouteScope::Global)
             .map(|r| r.destination)
             .collect::<Vec<_>>();
         let routes = member_route_plan(active, &members, &exclusions, policy.metric)
@@ -447,7 +450,7 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         }
         // Only the durable owner may identify routes excluded from discovery.
         // User policy exclusions remain options, never ownership evidence.
-        let owned = self.network.owned_route_destinations();
+        let owned = self.network.excluded_routes();
         self.network
             .system_mut()
             .resolve_policy(options, endpoints, &owned)
@@ -506,11 +509,13 @@ fn validate_policy(policy: &NetworkPolicy) -> Result<(), ServiceError> {
             .chain(&policy.retained_routes)
             .any(|r| {
                 r.interface == 0
-                    || r.scope != RouteScope::Global
+                    || !(r.scope == RouteScope::Global
+                        || matches!(r.scope, RouteScope::Member(i)
+                            if i == r.interface && r.destination.prefix_len() == 0 && r.gateway.is_some() && r.metric == 0))
                     || r.destination != r.destination.trunc()
                     || r.gateway
                         .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())
-                    || !seen.insert(r.destination)
+                    || !seen.insert((r.destination, r.scope))
             })
     {
         return Err(ServiceError::InvalidRequest);

@@ -90,7 +90,103 @@ mod control_transport {
                 .build()
                 .unwrap();
             let relay = relay::Relay::start(listener, Arc::new(Route(address)), Origin);
+            relay.set_observer(None);
             (client, relay)
+        }
+
+        #[tokio::test]
+        async fn blocked_diagnostics_do_not_hold_runtime_or_connection_capacity() {
+            let _serial = CASES.lock().await;
+            struct Broken;
+            impl Dialer for Broken {
+                fn connect(&self, _: Origin) -> DialFuture {
+                    Box::pin(async {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "physical_dns_timeout",
+                        ))
+                    })
+                }
+            }
+            struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+            impl Drop for Release {
+                fn drop(&mut self) {
+                    let (done, wake) = &*self.0;
+                    *done.lock().unwrap() = true;
+                    wake.notify_all();
+                }
+            }
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let release = Release(gate.clone());
+            let (entered, mut started) = tokio::sync::mpsc::channel(16);
+            let endpoint = relay::Listener::bind().unwrap();
+            let broken = endpoint
+                .configure(reqwest::Client::builder().no_proxy())
+                .build()
+                .unwrap();
+            let relay = relay::Relay::start(endpoint, Arc::new(Broken), Origin);
+            relay.set_observer(Some(Arc::new(move |_, _| {
+                let _ = entered.try_send(());
+                // Bounded even if the test panics: a stuck disk must not occupy
+                // the sole async worker or any of the 16 connection slots.
+                let _ = gate.1.wait_timeout_while(
+                    gate.0.lock().unwrap(),
+                    Duration::from_secs(3),
+                    |done| !*done,
+                );
+            })));
+            for _ in 0..16 {
+                let before = std::time::Instant::now();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    broken.get("http://foobar.com/").send(),
+                )
+                .await;
+                assert!(
+                    matches!(result, Ok(Err(_))),
+                    "diagnostic callback delayed the transport error: {result:?}"
+                );
+                assert!(
+                    before.elapsed() < Duration::from_secs(1),
+                    "diagnostic callback blocked the async worker"
+                );
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), started.recv())
+                        .await
+                        .unwrap(),
+                    Some(())
+                );
+            }
+            // With all log jobs stuck, another failure still completes and a
+            // healthy request can use the entire connection budget.
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                broken.get("http://foobar.com/").send(),
+            )
+            .await
+            .unwrap()
+            .is_err());
+            let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (healthy, _relay) = client(server.local_addr().unwrap());
+            let serve = tokio::spawn(async move {
+                let (mut socket, _) = server.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            });
+            let response = tokio::time::timeout(
+                Duration::from_secs(1),
+                healthy.get("http://foobar.com/").send(),
+            )
+            .await
+            .unwrap()
+            .expect("diagnostic callbacks retained connection permits");
+            assert_eq!(response.text().await.unwrap(), "ok");
+            serve.await.unwrap();
+            drop(release);
         }
 
         #[tokio::test]

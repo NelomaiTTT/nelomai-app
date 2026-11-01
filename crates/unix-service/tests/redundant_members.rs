@@ -1096,3 +1096,142 @@ fn restart_cleanup_restores_network_and_stops_owned_pair_without_replaying_start
         ["start A", "start B", "stop A", "stop B"]
     );
 }
+
+fn control_default() -> RouteValue {
+    RouteValue {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        scope: RouteScope::Member(5),
+        interface: 5,
+        gateway: Some("192.0.2.254".parse().unwrap()),
+        metric: 0,
+    }
+}
+#[test]
+fn control_default_keeps_vpn_routes_through_refresh_and_retried_cleanup() {
+    let (mut session, events, network) = network_setup();
+    let mut p = policy();
+    p.bypasses.push(control_default());
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p.clone())
+        .unwrap();
+    let control = NetworkValue::Route(control_default());
+    assert_eq!(
+        network.lock().unwrap().values.get(&control.key()),
+        Some(&control)
+    );
+    for destination in ["0.0.0.0/1", "128.0.0.0/1"] {
+        assert!(network.lock().unwrap().values.values().any(|v|matches!(v,NetworkValue::Route(r) if r.destination==destination.parse().unwrap() && r.interface==10 && r.scope==RouteScope::Global)));
+    }
+    session.network_changed(&scope(), p.clone()).unwrap();
+    assert_eq!(
+        network.lock().unwrap().values.get(&control.key()),
+        Some(&control)
+    );
+    events.lock().unwrap().fail_a_stop = true;
+    assert!(session.close(&scope()).is_err());
+    assert!(session.cleanup_pending());
+    events.lock().unwrap().fail_a_stop = false;
+    session.close(&scope()).unwrap();
+    session.close(&scope()).unwrap();
+    assert!(!network.lock().unwrap().values.contains_key(&control.key()));
+    let backends = [
+        Backend {
+            label: "A",
+            index: 10,
+            events: events.clone(),
+        },
+        Backend {
+            label: "B",
+            index: 20,
+            events,
+        },
+    ];
+    let mut restarted =
+        SessionNetwork::new(scope(), backends, Network(network.clone()), Store).unwrap();
+    restarted
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    restarted.close(&scope()).unwrap();
+    assert!(!network.lock().unwrap().values.contains_key(&control.key()));
+}
+#[test]
+fn control_default_borrowed_from_os_is_never_removed_by_stop() {
+    let (mut session, _, network) = network_setup();
+    let control = NetworkValue::Route(control_default());
+    network
+        .lock()
+        .unwrap()
+        .values
+        .insert(control.key(), control.clone());
+    let mut p = policy();
+    p.retained_routes.push(control_default());
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    assert!(network.lock().unwrap().values.values().any(|v|matches!(v,NetworkValue::Route(r) if r.destination=="0.0.0.0/1".parse().unwrap() && r.interface==10)));
+    session.close(&scope()).unwrap();
+    assert_eq!(
+        network.lock().unwrap().values.get(&control.key()),
+        Some(&control)
+    );
+}
+
+#[test]
+fn control_default_journal_survives_interrupted_session_and_cleans_after_reconstruction() {
+    #[derive(Clone)]
+    struct Saved(Arc<Mutex<Option<NetworkJournal>>>);
+    impl NetworkJournalStore for Saved {
+        fn save(&mut self, journal: &NetworkJournal) -> io::Result<()> {
+            *self.0.lock().unwrap() = Some(journal.clone());
+            Ok(())
+        }
+    }
+    let (_, events, network) = network_setup();
+    let backends = || {
+        [
+            Backend {
+                label: "A",
+                index: 10,
+                events: events.clone(),
+            },
+            Backend {
+                label: "B",
+                index: 20,
+                events: events.clone(),
+            },
+        ]
+    };
+    let saved = Saved(Arc::new(Mutex::new(None)));
+    let mut session =
+        SessionNetwork::new(scope(), backends(), Network(network.clone()), saved.clone()).unwrap();
+    let mut p = policy();
+    p.bypasses.push(control_default());
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    drop(session); // Reconstruct the owner from the last durable journal, without graceful Stop.
+    events.lock().unwrap().recovered_scope = Some(scope());
+    events.lock().unwrap().recovered_pending = true;
+    let journal = saved.0.lock().unwrap().clone().unwrap();
+    let mut recovered = SessionNetwork::recover_for_cleanup(
+        scope(),
+        backends(),
+        Network(network.clone()),
+        saved,
+        journal,
+    )
+    .unwrap();
+    assert!(recovered.cleanup_pending());
+    recovered.close(&scope()).unwrap();
+    assert!(!network
+        .lock()
+        .unwrap()
+        .values
+        .contains_key(&NetworkValue::Route(control_default()).key()));
+    assert!(network
+        .lock()
+        .unwrap()
+        .values
+        .values()
+        .all(|v| matches!(v, NetworkValue::Dns(_))));
+}

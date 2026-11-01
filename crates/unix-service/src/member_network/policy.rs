@@ -1,16 +1,21 @@
 //! Read-only physical discovery behind the session's private ownership boundary.
 use super::session::NetworkPolicy;
+#[cfg(test)]
 use ipnet::IpNet;
-use nelomai_client_tunnel::{redundancy::network::NetworkSystem, DesktopTunnelOptions};
+use nelomai_client_tunnel::{
+    redundancy::network::{NetworkSystem, RouteValue},
+    DesktopTunnelOptions,
+};
 use std::{io, net::IpAddr};
 
 pub trait PhysicalPolicyProvider: NetworkSystem {
     /// `owned` is supplied by SessionNetwork from its journal, never by IPC.
+    /// Preserve scope: a scoped control default never owns the OS global default.
     fn resolve_policy(
         &mut self,
         options: &DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<NetworkPolicy>;
 }
 
@@ -20,7 +25,7 @@ impl<C: super::macos::MacNetworkCommands> PhysicalPolicyProvider for super::maco
         &mut self,
         options: &DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<NetworkPolicy> {
         super::macos::MacNetwork::resolve_policy(self, options, endpoints, owned)
     }
@@ -34,9 +39,12 @@ impl<C: super::linux::LinuxNetworkCommands> PhysicalPolicyProvider
         &mut self,
         options: &DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<NetworkPolicy> {
-        super::linux::LinuxNetwork::resolve_policy(self, options, endpoints, owned)
+        let mut destinations = owned.iter().map(|r| r.destination).collect::<Vec<_>>();
+        destinations.sort();
+        destinations.dedup();
+        super::linux::LinuxNetwork::resolve_policy(self, options, endpoints, &destinations)
     }
 }
 
@@ -127,13 +135,18 @@ mod tests {
             &mut self,
             options: &DesktopTunnelOptions,
             endpoints: &[IpAddr],
-            owned: &[IpNet],
+            owned: &[RouteValue],
         ) -> io::Result<NetworkPolicy> {
             let mut state = self.0.borrow_mut();
             state.queries.push(Query {
                 options: options.clone(),
                 endpoints: endpoints.to_vec(),
-                owned: owned.to_vec(),
+                owned: {
+                    let mut v = owned.iter().map(|r| r.destination).collect::<Vec<_>>();
+                    v.sort();
+                    v.dedup();
+                    v
+                },
             });
             if state.fail_resolve {
                 return Err(io::Error::other("private resolver path/details"));

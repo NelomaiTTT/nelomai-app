@@ -440,6 +440,16 @@ fn setup_desktop(
             .join("diagnostics"),
         resource_usage::ResourceSnapshot::capture(app.handle()),
     )?);
+    let transport_diagnostics = diagnostics.clone();
+    let api = api.with_control_diagnostics(move |code, ms| {
+        transport_diagnostics.record_timed_named(
+            "control.transport.failed",
+            None,
+            None,
+            Some(code),
+            std::time::Duration::from_millis(ms),
+        )
+    });
     let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(
         &selected.preferences,
         &bootstrap.data_root.join("preferences.json"),

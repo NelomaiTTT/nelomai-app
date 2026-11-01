@@ -542,7 +542,7 @@ mod tests {
             &mut self,
             _: &DesktopTunnelOptions,
             endpoints: &[std::net::IpAddr],
-            _: &[ipnet::IpNet],
+            _: &[nelomai_client_tunnel::redundancy::network::RouteValue],
         ) -> io::Result<NetworkPolicy> {
             self.0.borrow_mut().calls.push("resolve");
             if self.0.borrow().failure == Some("policy") {

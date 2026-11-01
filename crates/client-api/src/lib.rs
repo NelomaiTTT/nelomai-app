@@ -552,6 +552,19 @@ impl fmt::Debug for RecoverableRefreshRequest {
     }
 }
 impl ClientApi {
+    /// Best-effort desktop dial failure diagnostics: allowlisted codes and
+    /// elapsed time only, with no request data or authentication material.
+    /// Runs outside async workers; events may be dropped if log jobs saturate.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub fn with_control_diagnostics(
+        self,
+        observe: impl Fn(&'static str, u64) + Send + Sync + 'static,
+    ) -> Self {
+        if let Some(control) = &self.http.control {
+            control.set_observer(Arc::new(observe));
+        }
+        self
+    }
     pub async fn refresh_recoverable(
         &self,
         request: &RecoverableRefreshRequest,

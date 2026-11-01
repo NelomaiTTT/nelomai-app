@@ -324,12 +324,40 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 reason: Some("primary_ready".into()),
                 observed_at: None,
             };
+            let started = Instant::now();
+            self.logger.record(CoreLogEvent {
+                kind: "desktop.redundancy.primary_report_started",
+                operation_id: Some(pair.session.session_id.clone()),
+                request_id: None,
+                code: None,
+            });
             let response = match self.api.report_redundant_role(&access, &request).await {
                 Ok(response) => response,
-                // Retry on the next coordinator tick, revalidating its guards.
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                Err(CoreApiError::Retryable) => return Ok(None),
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.logger.record_timed(
+                        CoreLogEvent {
+                            kind: "desktop.redundancy.primary_report_failed",
+                            operation_id: Some(pair.session.session_id.clone()),
+                            request_id: None,
+                            code: Some(
+                                match &error {
+                                    CoreApiError::Unauthorized => "signed_out",
+                                    CoreApiError::AccessExpired => "access_expired",
+                                    CoreApiError::Retryable => "temporary_network_error",
+                                    CoreApiError::Rejected { .. } => "server_rejected",
+                                }
+                                .into(),
+                            ),
+                        },
+                        elapsed_millis(started),
+                    );
+                    // Retry on the next coordinator tick, revalidating its guards.
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    if error == CoreApiError::Retryable {
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
             };
             // Initial B can already be CURRENT in the panel without being
             // locally installed yet. Validate against protected issuance, not
@@ -371,6 +399,15 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 .ok_or(CoreError::Storage)?
                 .primary_reported = true;
             self.store.save(&current).map_err(|_| CoreError::Storage)?;
+            self.logger.record_timed(
+                CoreLogEvent {
+                    kind: "desktop.redundancy.primary_report_confirmed",
+                    operation_id: Some(pair.session.session_id.clone()),
+                    request_id: Some(response.request_id.clone()),
+                    code: None,
+                },
+                elapsed_millis(started),
+            );
         } else if !snapshot.session.role_confirmed {
             let request = desktop_redundancy::role_request(&snapshot)?;
             // Native promotion can change the external route while preserving
