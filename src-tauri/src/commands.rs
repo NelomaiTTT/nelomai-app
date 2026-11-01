@@ -2818,75 +2818,84 @@ pub async fn app_login(
     updater: State<'_, Arc<NativeUpdater>>,
     request: LoginCommandRequest,
 ) -> Result<Bootstrap, CommandError> {
-    let response = application
-        .login(
-            LoginParameters {
-                login: request.login,
-                password: request.password,
-                device_name: request.device_name,
-            },
-            now_unix(),
-        )
-        .await
-        .map_err(|error| diagnose_sign_in_failure(error, &diagnostics))?;
-    #[cfg(target_os = "android")]
-    {
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        observe_private_auth_result(
-            app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
-                .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
-                .await,
-            &diagnostics,
-            SupportAuthStage::SignInRuntimeReady,
-        )
-        .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
-    }
-    #[cfg(desktop)]
-    diagnostics.set_automatic_device(&response.device.id);
-    #[cfg(not(target_os = "android"))]
-    let _ = app.tunnel_android().clear_background();
-    #[cfg(target_os = "android")]
-    let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
-        .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
-    #[cfg(not(target_os = "android"))]
-    let quick_plan_result = app.tunnel_android().clear_quick_plan();
-    #[cfg(target_os = "android")]
-    if quick_plan_result.is_ok() {
-        ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
-            quick_clear_ticket,
-            &ANDROID_DESIRED_ACTIVE_PROJECTION,
-            false,
-        );
-    } else {
-        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
-    }
-    #[cfg(not(target_os = "android"))]
-    let _ = quick_plan_result;
-    Box::pin(provision_android_background_resilient(
-        app.clone(),
-        application.inner().clone(),
-        diagnostics.inner().clone(),
-        response.clone(),
-    ))
-    .await;
-    schedule_startup_split_tunnel_refresh(
-        app.clone(),
-        application.inner().clone(),
-        diagnostics.inner().clone(),
-        split_tunnel_scheduler.inner().clone(),
-        response.clone(),
-    );
-    observe_and_schedule_update(
-        application.inner().clone(),
-        updater.inner().clone(),
-        &response,
-    );
-    schedule_push_registration(
-        app,
-        application.inner().clone(),
-        push_registration_scheduler.inner().clone(),
-    );
-    Ok(response)
+    // First Login has no bootstrap binding for state polling to report EOF.
+    // Preserve auth fencing; only retire the result when the owner channel closes.
+    runtime_state_if_channel_open(
+        || application.runtime_channel_closed(),
+        Box::pin(async {
+            let response = application
+                .login(
+                    LoginParameters {
+                        login: request.login,
+                        password: request.password,
+                        device_name: request.device_name,
+                    },
+                    now_unix(),
+                )
+                .await
+                .map_err(|error| diagnose_sign_in_failure(error, &diagnostics))?;
+            #[cfg(target_os = "android")]
+            {
+                let owner =
+                    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+                observe_private_auth_result(
+                    app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+                        .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
+                        .await,
+                    &diagnostics,
+                    SupportAuthStage::SignInRuntimeReady,
+                )
+                .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
+            }
+            #[cfg(desktop)]
+            diagnostics.set_automatic_device(&response.device.id);
+            #[cfg(not(target_os = "android"))]
+            let _ = app.tunnel_android().clear_background();
+            #[cfg(target_os = "android")]
+            let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
+                .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
+            #[cfg(not(target_os = "android"))]
+            let quick_plan_result = app.tunnel_android().clear_quick_plan();
+            #[cfg(target_os = "android")]
+            if quick_plan_result.is_ok() {
+                ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+                    quick_clear_ticket,
+                    &ANDROID_DESIRED_ACTIVE_PROJECTION,
+                    false,
+                );
+            } else {
+                ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
+            }
+            #[cfg(not(target_os = "android"))]
+            let _ = quick_plan_result;
+            Box::pin(provision_android_background_resilient(
+                app.clone(),
+                application.inner().clone(),
+                diagnostics.inner().clone(),
+                response.clone(),
+            ))
+            .await;
+            schedule_startup_split_tunnel_refresh(
+                app.clone(),
+                application.inner().clone(),
+                diagnostics.inner().clone(),
+                split_tunnel_scheduler.inner().clone(),
+                response.clone(),
+            );
+            observe_and_schedule_update(
+                application.inner().clone(),
+                updater.inner().clone(),
+                &response,
+            );
+            schedule_push_registration(
+                app,
+                application.inner().clone(),
+                push_registration_scheduler.inner().clone(),
+            );
+            Ok(response)
+        }),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -5106,6 +5115,38 @@ mod tests {
             runtime_state_if_channel_open(|| false, async { Ok(42) }).await,
             Ok(42)
         ));
+    }
+
+    #[tokio::test]
+    async fn login_eof_overrides_cancel_and_auth_recovery_but_keeps_open_channel_errors() {
+        use std::cell::Cell;
+        for error in [
+            CommandError::from_core(CoreError::StartCancelled),
+            CommandError::from_core(CoreError::AuthRecoveryRequired),
+            CommandError::new("invalid_credentials", "Неверный логин или пароль"),
+            CommandError::new("temporarily_unavailable", "Не удалось связаться с панелью"),
+        ] {
+            let original_code = error.code.clone();
+            let original_message = error.message.clone();
+            let closed = Cell::new(false);
+            let result = runtime_state_if_channel_open(|| closed.get(), async {
+                closed.set(true);
+                Err::<(), _>(error)
+            })
+            .await;
+            assert_eq!(result.unwrap_err().code, "runtime_channel_closed");
+
+            let result = runtime_state_if_channel_open(|| false, async {
+                Err::<(), _>(CommandError::new(
+                    original_code.clone(),
+                    original_message.clone(),
+                ))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(result.code, original_code);
+            assert_eq!(result.message, original_message);
+        }
     }
 
     #[cfg(desktop)]

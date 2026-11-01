@@ -670,7 +670,11 @@ impl RemoteOwner {
                 };
                 AuthResponseV1::State { stamp, state }
             }
-            AuthRequestV1::Login { stamp, request } => {
+            AuthRequestV1::Login {
+                stamp,
+                request,
+                supports_login_rejection,
+            } => {
                 let stamp = stamp.ok_or(PrivateError::Cancelled)?;
                 let fence = broker
                     .capture_stamped_login_fence(Some(&stamp))
@@ -717,8 +721,31 @@ impl RemoteOwner {
                             }
                         },
                     )
-                    .await
-                    .map_err(broker_error)?;
+                    .await;
+                let access = match access {
+                    Ok(access) => access,
+                    Err(error) => {
+                        if supports_login_rejection {
+                            if let BrokerError::Api(api) = &error {
+                                if let Some(reason) =
+                                    nelomai_client_api::LoginRejection::from_error(api)
+                                {
+                                    self.outbox.enqueue(
+                                        FrameV1::new(
+                                            id,
+                                            MessageV1::Response(AuthResponseV1::LoginRejected {
+                                                reason,
+                                            }),
+                                        ),
+                                        deadline,
+                                    )?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        return Err(broker_error(error));
+                    }
+                };
                 self.commit_and_grant(broker, access, lease, Some(id), deadline)
                     .await?;
                 held.granted = true;
@@ -1368,6 +1395,12 @@ impl PrivateRuntimeAuthClient {
             AuthRequestV1::Logout { stamp, .. } => Some(stamp.clone()),
             _ => None,
         };
+        let mutation_stamp = match &request {
+            AuthRequestV1::Login { stamp, .. } | AuthRequestV1::Logout { stamp, .. } => {
+                Some(stamp.clone())
+            }
+            _ => None,
+        };
         let cache_generation = self
             .stamp
             .lock()
@@ -1413,6 +1446,26 @@ impl PrivateRuntimeAuthClient {
             })?.map_err(|_| PrivateError::Closed),
         }?;
         lifetime.complete = true;
+        // Login/logout may advance the broker epoch even when they fail.
+        // Re-observe before retry, and fence delayed pre-mutation State replies.
+        // Discarding cache authority never grants a new scope.
+        if let Some(mutation_stamp) = mutation_stamp.filter(|_| {
+            matches!(
+                &response,
+                AuthResponseV1::Error { .. } | AuthResponseV1::LoginRejected { .. }
+            )
+        }) {
+            let mut cache = self.stamp.lock().map_err(|_| PrivateError::Closed)?;
+            cache.logout_generation = cache
+                .logout_generation
+                .checked_add(1)
+                .ok_or(PrivateError::Protocol)?;
+            // A late failure may belong to an older request than an already
+            // observed/granted login. Invalidate only that failure's source.
+            if cache.value == mutation_stamp {
+                cache.value = None;
+            }
+        }
         match response {
             AuthResponseV1::Error { error } => Err(error),
             response => {
@@ -1521,7 +1574,14 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
             .await
             .map_err(|error| self.login_error(PrivateLoginStage::State, error))?;
         match self
-            .request(AuthRequestV1::Login { stamp, request }, deadline)
+            .request(
+                AuthRequestV1::Login {
+                    stamp,
+                    request,
+                    supports_login_rejection: true,
+                },
+                deadline,
+            )
             .await
             .map_err(|error| self.login_error(PrivateLoginStage::Request, error))?
         {
@@ -1531,6 +1591,13 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
                     .map_err(|error| self.login_error(PrivateLoginStage::Admission, error))?;
                 Ok(access)
             }
+            AuthResponseV1::LoginRejected { reason } => Err(CoreError::Api(
+                nelomai_client_core::CoreApiError::Rejected {
+                    code: reason.code().into(),
+                    message: "Панель отклонила вход".into(),
+                    retry_after_seconds: None,
+                },
+            )),
             _ => Err(self.login_error(PrivateLoginStage::Response, PrivateError::Protocol)),
         }
     }
