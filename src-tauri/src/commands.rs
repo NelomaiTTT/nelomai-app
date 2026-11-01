@@ -824,46 +824,60 @@ async fn bootstrap_application_for_startup(
     diagnostics: &AppDiagnostics,
     now_unix: i64,
 ) -> Result<Bootstrap, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
-            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
+    let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+    let startup = app.state::<Arc<crate::runtime_startup::RuntimeStartup>>();
+    route_runtime_bootstrap(&owner, &startup, diagnostics, async {
+        #[cfg(target_os = "android")]
+        {
+            let first_error = match application.bootstrap_without_refresh(now_unix).await {
+                Ok(response) => return Ok(response),
+                Err(error) => error,
+            };
+            diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
+            // Eligibility comes from the owner and exact runtime admission, not the
+            // presentation error. No error callback clears native protected state.
+            let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+            let recovery =
+                owner.background(nelomai_client_container::ipc::BackgroundAction::Recover);
+            // Only a known-not-issued recovery clears its own ticket. A genuinely
+            // lost refresh/recovery stays fenced, so this cannot retry its old proof.
+            route_android_startup_recovery(
+                first_error,
+                async {
+                    recovery
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
+                },
+                application.bootstrap(now_unix),
+            )
             .await
-            .map_err(runtime_readiness_error)?;
-        let first_error = match application.bootstrap_without_refresh(now_unix).await {
-            Ok(response) => return Ok(response),
-            Err(error) => error,
-        };
-        diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
-        // Eligibility comes from the owner and exact runtime admission, not the
-        // presentation error. No error callback clears native protected state.
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        let recovery = owner.background(nelomai_client_container::ipc::BackgroundAction::Recover);
-        // Only a known-not-issued recovery clears its own ticket. A genuinely
-        // lost refresh/recovery stays fenced, so this cannot retry its old proof.
-        route_android_startup_recovery(
-            first_error,
-            async {
-                recovery
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
-            },
-            application.bootstrap(now_unix),
-        )
-        .await
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let startup = app.state::<Arc<crate::runtime_startup::RuntimeStartup>>();
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        startup
-            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
-            .await
-            .map_err(runtime_readiness_error)?;
-        application.bootstrap(now_unix).await.map_err(Into::into)
-    }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            application.bootstrap(now_unix).await.map_err(Into::into)
+        }
+    })
+    .await
+}
+
+async fn route_runtime_bootstrap<T>(
+    owner: &nelomai_client_container::ipc::PrivateRuntimeAuthClient,
+    startup: &crate::runtime_startup::RuntimeStartup,
+    diagnostics: &AppDiagnostics,
+    bootstrap: impl std::future::Future<Output = Result<T, CommandError>>,
+) -> Result<T, CommandError> {
+    runtime_state_if_channel_open(
+        || nelomai_client_core::RuntimeAuthProvider::is_channel_closed(owner),
+        async {
+            startup
+                .ensure_ready(crate::runtime_startup::request_ready(owner, diagnostics))
+                .await
+                .map_err(runtime_readiness_error)?;
+            bootstrap.await
+        },
+    )
+    .await
 }
 
 fn runtime_readiness_error(error: nelomai_client_container::ipc::PrivateError) -> CommandError {
@@ -1461,9 +1475,20 @@ async fn queue_desktop_tunnel_stopped(app: &AppHandle) {
     let Ok(Some(seal)) = diagnostics.pending_automatic_seal() else {
         return;
     };
+    let identity_before = crate::diagnostics::diagnostic_runtime_snapshot(app);
     let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(app);
-    match diagnostics.materialize_automatic_report(&seal, resource_snapshot, helper_log) {
+    let identity_after = crate::diagnostics::diagnostic_runtime_snapshot(app);
+    let identity = crate::diagnostics::coherent_diagnostic_identity(
+        identity_before.as_ref(),
+        identity_after.as_ref(),
+    );
+    match diagnostics.materialize_automatic_report_with_identity(
+        &seal,
+        resource_snapshot,
+        helper_log,
+        identity,
+    ) {
         Ok(true) => diagnostics.record_named(
             "diagnostics.automatic_report_queued",
             Some(&seal.session_id),
@@ -2102,6 +2127,27 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
     }
 }
 
+async fn runtime_state_if_channel_open<T>(
+    is_closed: impl Fn() -> bool,
+    read: impl std::future::Future<Output = Result<T, CommandError>>,
+) -> Result<T, CommandError> {
+    let check = || {
+        if is_closed() {
+            Err(CommandError::new(
+                "runtime_channel_closed",
+                "Потеряна связь со службой подключения",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let result = read.await;
+    // Closure while an earlier poll was running also retires its green reply.
+    check()?;
+    result
+}
+
 #[tauri::command]
 pub async fn app_state(
     app: AppHandle,
@@ -2109,77 +2155,84 @@ pub async fn app_state(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        android_app_state(
-            app,
-            application.inner().clone(),
-            diagnostics.inner().clone(),
-            metrics.inner().clone(),
-        )
-        .await
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        if metrics_view_is_visible(&app) {
-            metrics.mark_observed().await;
-        }
-        let quick_state_change = app
-            .tunnel_android()
-            .take_quick_state_change()
-            .unwrap_or_default();
-        let quick_state_changed = quick_state_change.changed;
-        let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
-            match application.bootstrap(now_unix()).await {
-                Ok(response) => {
-                    #[cfg(desktop)]
-                    diagnostics.set_automatic_device(&response.device.id);
-                    provision_android_background_resilient(
-                        app.clone(),
-                        application.inner().clone(),
-                        diagnostics.inner().clone(),
-                        response,
-                    )
-                    .await;
-                    if app
-                        .tunnel_android()
-                        .acknowledge_quick_state_change(quick_state_change.revision)
-                        .is_ok()
-                    {
-                        clear_quick_reconcile_retry();
-                    } else {
-                        defer_quick_reconcile(now_unix());
-                    }
-                    application.state().await
-                }
-                Err(_) => {
-                    defer_quick_reconcile(now_unix());
-                    application.reconcile_external_tunnel_state().await
-                }
+    runtime_state_if_channel_open(
+        || application.runtime_channel_closed(),
+        Box::pin(async {
+            #[cfg(target_os = "android")]
+            {
+                android_app_state(
+                    app,
+                    application.inner().clone(),
+                    diagnostics.inner().clone(),
+                    metrics.inner().clone(),
+                )
+                .await
             }
-        } else if quick_state_changed {
-            application.reconcile_external_tunnel_state().await
-        } else {
-            application.state().await
-        };
-        let warning = application.split_tunnel_warning().await;
-        let metrics_context = application.connection_metrics_context().await;
-        let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-        let status_unavailable_fallback = android_status_unavailable_fallback();
-        let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
-            current_connection_projection(&app, status_unavailable_fallback).await;
-        let local_cleanup = application.local_stop_pending_cleanup().await;
-        Ok(AppStateResponse::new(
-            state,
-            warning,
-            current_metrics,
-            intent_status,
-            next_retry_at_unix,
-            reserve_state,
-        )
-        .with_desktop_active_slot(desktop_active_slot)
-        .with_local_stop_pending_cleanup(local_cleanup))
-    }
+            #[cfg(not(target_os = "android"))]
+            {
+                if metrics_view_is_visible(&app) {
+                    metrics.mark_observed().await;
+                }
+                let quick_state_change = app
+                    .tunnel_android()
+                    .take_quick_state_change()
+                    .unwrap_or_default();
+                let quick_state_changed = quick_state_change.changed;
+                let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
+                    match application.bootstrap(now_unix()).await {
+                        Ok(response) => {
+                            #[cfg(desktop)]
+                            diagnostics.set_automatic_device(&response.device.id);
+                            provision_android_background_resilient(
+                                app.clone(),
+                                application.inner().clone(),
+                                diagnostics.inner().clone(),
+                                response,
+                            )
+                            .await;
+                            if app
+                                .tunnel_android()
+                                .acknowledge_quick_state_change(quick_state_change.revision)
+                                .is_ok()
+                            {
+                                clear_quick_reconcile_retry();
+                            } else {
+                                defer_quick_reconcile(now_unix());
+                            }
+                            application.state().await
+                        }
+                        Err(_) => {
+                            defer_quick_reconcile(now_unix());
+                            application.reconcile_external_tunnel_state().await
+                        }
+                    }
+                } else if quick_state_changed {
+                    application.reconcile_external_tunnel_state().await
+                } else {
+                    application.state().await
+                };
+                let warning = application.split_tunnel_warning().await;
+                let metrics_context = application.connection_metrics_context().await;
+                let current_metrics =
+                    current_connection_metrics(&metrics, metrics_context.as_ref()).await;
+                let status_unavailable_fallback = android_status_unavailable_fallback();
+                let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
+                    current_connection_projection(&app, status_unavailable_fallback).await;
+                let local_cleanup = application.local_stop_pending_cleanup().await;
+                Ok(AppStateResponse::new(
+                    state,
+                    warning,
+                    current_metrics,
+                    intent_status,
+                    next_retry_at_unix,
+                    reserve_state,
+                )
+                .with_desktop_active_slot(desktop_active_slot)
+                .with_local_stop_pending_cleanup(local_cleanup))
+            }
+        }),
+    )
+    .await
 }
 
 #[cfg(target_os = "android")]
@@ -2389,6 +2442,8 @@ where
 {
     let snapshot = local.await;
     if let Ok(guard) = gate.try_lock_owned() {
+        // Box before the Tauri spawn wrappers copy the concrete future.
+        let enrichment = Box::pin(enrichment);
         tauri::async_runtime::spawn(async move {
             let _guard = guard;
             enrichment.await;
@@ -2788,25 +2843,29 @@ pub async fn app_login(
     updater: State<'_, Arc<NativeUpdater>>,
     request: LoginCommandRequest,
 ) -> Result<Bootstrap, CommandError> {
-    let response = application
-        .login(
+    let response = route_runtime_login(
+        || application.runtime_channel_closed(),
+        Box::pin(application.login(
             LoginParameters {
                 login: request.login,
                 password: request.password,
                 device_name: request.device_name,
             },
             now_unix(),
-        )
-        .await
-        .map_err(CommandError::from)?;
-    #[cfg(any(target_os = "android", windows))]
-    {
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
-            .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
-            .await
-            .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
-    }
+        )),
+        async {
+            #[cfg(any(target_os = "android", windows))]
+            {
+                let owner =
+                    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+                app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+                    .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
+                    .await?;
+            }
+            Ok(())
+        },
+    )
+    .await?;
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]
@@ -2828,12 +2887,12 @@ pub async fn app_login(
     }
     #[cfg(not(target_os = "android"))]
     let _ = quick_plan_result;
-    provision_android_background_resilient(
+    Box::pin(provision_android_background_resilient(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
         response.clone(),
-    )
+    ))
     .await;
     schedule_startup_split_tunnel_refresh(
         app.clone(),
@@ -2855,6 +2914,21 @@ pub async fn app_login(
     Ok(response)
 }
 
+async fn route_runtime_login<T>(
+    is_closed: impl Fn() -> bool,
+    login: impl std::future::Future<Output = Result<T, ApplicationError>>,
+    ready: impl std::future::Future<Output = Result<(), nelomai_client_container::ipc::PrivateError>>,
+) -> Result<T, CommandError> {
+    runtime_state_if_channel_open(is_closed, async {
+        let response = login.await.map_err(CommandError::from)?;
+        ready
+            .await
+            .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
+        Ok(response)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn app_bootstrap(
     app: AppHandle,
@@ -2868,12 +2942,12 @@ pub async fn app_bootstrap(
     let bootstrap_started = Instant::now();
     let response = match tokio::time::timeout(
         STARTUP_BOOTSTRAP_TIMEOUT,
-        bootstrap_application_for_startup(
+        Box::pin(bootstrap_application_for_startup(
             &app,
             application.inner(),
             diagnostics.inner(),
             now_unix(),
-        ),
+        )),
     )
     .await
     {
@@ -3165,8 +3239,7 @@ pub async fn app_bind_peer(
     application: State<'_, Arc<NativeApplication>>,
     request: BindPeerRequest,
 ) -> Result<SafePeerBindingResponse, CommandError> {
-    application
-        .bind_peer(request)
+    Box::pin(application.bind_peer(request))
         .await
         .map(Into::into)
         .map_err(Into::into)
@@ -3424,7 +3497,7 @@ pub async fn app_start(
     let android_start_ticket = ANDROID_UI_START_STOP_COORDINATOR.start_ticket();
     #[cfg(not(target_os = "android"))]
     let _ = &application;
-    let start_result: Result<StartCommandResponse, CommandError> = async {
+    let start_result: Result<StartCommandResponse, CommandError> = Box::pin(async {
         let options = ConnectOptions {
             layer: request.layer,
             tic_connection_mode: request.tic_connection_mode,
@@ -3654,7 +3727,7 @@ pub async fn app_start(
                 .await?;
             Ok(response)
         }
-    }
+    })
     .await;
     match start_result {
         Ok(response) => {
@@ -3755,8 +3828,7 @@ pub async fn app_start_saved_stray(
         RouteMode::Standalone,
     )
     .await?;
-    let session_id = application
-        .start_saved_stray_offline(now_unix())
+    let session_id = Box::pin(application.start_saved_stray_offline(now_unix()))
         .await
         .map_err(CommandError::from)?;
     #[cfg(desktop)]
@@ -3791,7 +3863,7 @@ pub async fn app_wake_connection_intent(app: AppHandle) -> Result<(), CommandErr
 pub async fn app_pin_stray(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<Connection, CommandError> {
-    application.pin_stray().await.map_err(Into::into)
+    Box::pin(application.pin_stray()).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -3799,8 +3871,7 @@ pub async fn app_unpin_stray(
     application: State<'_, Arc<NativeApplication>>,
     request: LeaseCommandRequest,
 ) -> Result<Connection, CommandError> {
-    application
-        .unpin_stray(&request.lease_id, now_unix())
+    Box::pin(application.unpin_stray(&request.lease_id, now_unix()))
         .await
         .map_err(Into::into)
 }
@@ -3812,6 +3883,7 @@ pub async fn app_send_diagnostics(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     tunnel: State<'_, Arc<crate::platform::PlatformTunnelController>>,
 ) -> Result<DiagnosticUploadResponse, CommandError> {
+    let identity_before = crate::diagnostics::diagnostic_runtime_snapshot(&app);
     let connection_before = application
         .connection_metrics_context()
         .await
@@ -3830,11 +3902,16 @@ pub async fn app_send_diagnostics(
         .map(|context| context.session_id);
     let connection_lease_id =
         stable_diagnostics_connection_lease(connection_before, connection_after);
+    let identity_after = crate::diagnostics::diagnostic_runtime_snapshot(&app);
     let report = diagnostics
-        .build_report_with_helper(
+        .build_report_with_identity(
             resource_snapshot,
             helper_log,
             connection_lease_id.as_deref(),
+            crate::diagnostics::coherent_diagnostic_identity(
+                identity_before.as_ref(),
+                identity_after.as_ref(),
+            ),
         )
         .map_err(|_| {
             CommandError::new(
@@ -3932,7 +4009,7 @@ pub async fn app_update_restart(
     }
     #[cfg(not(desktop))]
     {
-        stop_for_shutdown(&app, &application).await?;
+        Box::pin(stop_for_shutdown(&app, &application)).await?;
         let _ = app;
         Err(update_command_error("common restart unavailable".into()))
     }
@@ -4298,11 +4375,11 @@ pub async fn app_logout(
     let logout_result =
         route_android_logout(push_registration_scheduler.logout(application.logout())).await;
     #[cfg(desktop)]
-    let logout_result = route_desktop_logout(
+    let logout_result = Box::pin(route_desktop_logout(
         push_registration_scheduler.logout(application.logout()),
         cancel_desktop_connection_intent(&app),
         prepare_desktop_logout(&app, &application, &diagnostics),
-    )
+    ))
     .await;
     #[cfg(all(not(desktop), not(target_os = "android")))]
     let logout_result = push_registration_scheduler
@@ -4825,6 +4902,281 @@ mod tests {
     }
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
+
+    #[tokio::test]
+    async fn login_owner_eof_is_not_an_account_recovery_request() {
+        use nelomai_client_container::{host::HostRequestV1, ipc::PrivateError};
+        use nelomai_client_core::RuntimeAuthProvider;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncReadExt;
+        // Closed before dispatch, EOF during password Login, EOF at the
+        // subsequent ready admission. Both IPC waits use the real client.
+        for stage in 0..3 {
+            let (owner, mut peer) = crate::runtime_control::tests::private_peer();
+            let disconnect = tokio::spawn(async move {
+                if stage != 0 {
+                    peer.read_u8().await.unwrap();
+                }
+                drop(peer);
+            });
+            if stage == 0 {
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !owner.is_channel_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let logins = AtomicUsize::new(0);
+            let admissions = AtomicUsize::new(0);
+            let result = route_runtime_login(
+                || owner.is_channel_closed(),
+                async {
+                    logins.fetch_add(1, Ordering::SeqCst);
+                    if stage == 2 {
+                        return Ok(42);
+                    } // Isolate EOF in post-login admission.
+                    owner
+                        .login(nelomai_client_api::RuntimeLogin {
+                            login: "synthetic".into(),
+                            password: "synthetic".into(),
+                            device_name: "synthetic".into(),
+                        })
+                        .await
+                        .map(|_| 42)
+                        .map_err(ApplicationError::Core)
+                },
+                async {
+                    admissions.fetch_add(1, Ordering::SeqCst);
+                    match owner.owner_request(HostRequestV1::RuntimeReady).await? {
+                        nelomai_client_container::host::HostResponseV1::Done => Ok(()),
+                        _ => Err(PrivateError::Protocol),
+                    }
+                },
+            )
+            .await;
+            disconnect.await.unwrap();
+            assert_eq!(
+                result.unwrap_err().code(),
+                "runtime_channel_closed",
+                "stage {stage}"
+            );
+            assert_eq!(logins.load(Ordering::SeqCst), usize::from(stage != 0));
+            assert_eq!(admissions.load(Ordering::SeqCst), usize::from(stage == 2));
+        }
+    }
+
+    #[tokio::test]
+    async fn login_account_rejection_keeps_its_code_and_does_not_run_ready_admission() {
+        use nelomai_client_container::ipc::{
+            read_frame, write_frame, AuthRequestV1, AuthResponseV1, FrameV1, MessageV1,
+        };
+        use nelomai_client_core::RuntimeAuthProvider;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (owner, mut peer) = crate::runtime_control::tests::private_peer();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let shutdown = release.clone();
+        let server = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            let state = read_frame(&mut peer, deadline).await.unwrap();
+            assert!(matches!(
+                state.message,
+                MessageV1::Request(AuthRequestV1::State)
+            ));
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    state.id,
+                    MessageV1::Response(AuthResponseV1::State {
+                        stamp: serde_json::from_value(
+                            serde_json::json!({"epoch":1,"family":"synthetic","identity":null}),
+                        )
+                        .unwrap(),
+                        state: nelomai_client_api::RuntimeAuthState::LoggedOut,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            let login = read_frame(&mut peer, deadline).await.unwrap();
+            assert!(matches!(
+                login.message,
+                MessageV1::Request(AuthRequestV1::Login {
+                    supports_login_rejection: true,
+                    ..
+                })
+            ));
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    login.id,
+                    MessageV1::Response(AuthResponseV1::LoginRejected {
+                        reason: nelomai_client_api::LoginRejection::InvalidCredentials,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            shutdown.notified().await;
+        });
+        let admitted = AtomicBool::new(false);
+        let result = route_runtime_login(
+            || owner.is_channel_closed(),
+            async {
+                owner
+                    .login(nelomai_client_api::RuntimeLogin {
+                        login: "synthetic".into(),
+                        password: "synthetic".into(),
+                        device_name: "synthetic".into(),
+                    })
+                    .await
+                    .map_err(ApplicationError::Core)
+            },
+            async {
+                admitted.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), "invalid_credentials");
+        assert!(!owner.is_channel_closed());
+        assert!(!admitted.load(Ordering::SeqCst));
+        release.notify_one();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_owner_eof_is_not_an_account_recovery_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::AsyncReadExt;
+        let (owner, mut peer) = crate::runtime_control::tests::private_peer();
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().join("diagnostics"),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let launched = Arc::new(AtomicBool::new(false));
+        let count = launched.clone();
+        let startup = crate::runtime_startup::RuntimeStartup::new(move || {
+            count.store(true, Ordering::SeqCst);
+        });
+        let disconnect = tokio::spawn(async move {
+            peer.read_u8().await.unwrap();
+            drop(peer);
+        });
+        let polled = AtomicBool::new(false);
+        let result = route_runtime_bootstrap(&owner, &startup, &diagnostics, async {
+            polled.store(true, Ordering::SeqCst);
+            Ok::<_, CommandError>(42)
+        })
+        .await;
+        disconnect.await.unwrap();
+        assert_eq!(result.unwrap_err().code, "runtime_channel_closed");
+        assert!(!launched.load(Ordering::SeqCst));
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_preserves_account_errors_only_while_owner_channel_is_open() {
+        use nelomai_client_container::ipc::{
+            read_frame, write_frame, AuthResponseV1, FrameV1, MessageV1,
+        };
+        use nelomai_client_core::RuntimeAuthProvider;
+        for close_after_ready in [false, true] {
+            let (owner, mut peer) = crate::runtime_control::tests::private_peer();
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().join("diagnostics"),
+                crate::resource_usage::ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let shutdown = release.clone();
+            let server = tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+                let request = read_frame(&mut peer, deadline).await.unwrap();
+                write_frame(
+                    &mut peer,
+                    FrameV1::new(
+                        request.id,
+                        MessageV1::Response(AuthResponseV1::Owner {
+                            response: nelomai_client_container::host::HostResponseV1::Done,
+                        }),
+                    ),
+                    deadline,
+                )
+                .await
+                .unwrap();
+                shutdown.notified().await;
+            });
+            let startup = crate::runtime_startup::RuntimeStartup::new(|| {});
+            let result = route_runtime_bootstrap(&owner, &startup, &diagnostics, async {
+                if close_after_ready {
+                    release.notify_one();
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while !owner.is_channel_closed() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                Err::<(), _>(CommandError::from_core(CoreError::AuthRecoveryRequired))
+            })
+            .await;
+            assert_eq!(
+                result.unwrap_err().code,
+                if close_after_ready {
+                    "runtime_channel_closed"
+                } else {
+                    "auth_recovery_required"
+                }
+            );
+            release.notify_one();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn nlm071_state_command_rejects_closed_owner_before_and_after_polling() {
+        use std::cell::Cell;
+        let closed = Cell::new(true);
+        let polled = Cell::new(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            polled.set(true);
+            Ok(42)
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code, "runtime_channel_closed");
+        assert!(!polled.get(), "closed owner must not be polled again");
+
+        closed.set(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            closed.set(true);
+            Ok(42)
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "runtime_channel_closed",
+            "an in-flight green reply cannot survive owner closure"
+        );
+
+        closed.set(false);
+        let result = runtime_state_if_channel_open(|| closed.get(), async {
+            Err::<(), _>(CommandError::new("temporarily_unavailable", "network"))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().code, "temporarily_unavailable");
+        assert!(matches!(
+            runtime_state_if_channel_open(|| false, async { Ok(42) }).await,
+            Ok(42)
+        ));
+    }
 
     #[cfg(desktop)]
     #[tokio::test]
@@ -6995,3 +7347,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(any(test, target_os = "android"))]
+#[path = "ipc_stack_budget.rs"]
+mod ipc_stack_budget;

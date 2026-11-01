@@ -465,6 +465,7 @@ fn setup_desktop(
     app.manage(port.clone());
     app.manage(Arc::new(runtime_control::RuntimeControls::new(
         port.clone(),
+        &bootstrap.target,
     )));
     app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
     app.manage(application.clone());

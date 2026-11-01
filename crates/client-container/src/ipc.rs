@@ -20,6 +20,8 @@ pub mod windows;
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 pub const REQUEST_BUDGET: Duration = Duration::from_secs(10);
+// Reserve time from the same wire deadline for native control and the reply.
+pub(crate) const AUTH_REPLY_MARGIN: Duration = Duration::from_secs(2);
 pub const MAX_PENDING: usize = 8;
 pub const OUTBOX_CAPACITY: usize = 32;
 

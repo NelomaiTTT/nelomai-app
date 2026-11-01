@@ -306,6 +306,7 @@ pub struct UpdateCoordinator<B> {
     barrier: Arc<dyn UpdateInstallBarrier>,
     phase: Arc<Mutex<UpdatePhase>>,
     offer: Mutex<Option<UpdateOffer>>,
+    cancelled_version: Mutex<Option<String>>,
     install_gate: AsyncMutex<()>,
 }
 
@@ -316,6 +317,7 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
             barrier,
             phase: Arc::new(Mutex::new(UpdatePhase::Idle)),
             offer: Mutex::new(None),
+            cancelled_version: Mutex::new(None),
             install_gate: AsyncMutex::new(()),
         }
     }
@@ -323,12 +325,25 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
     pub fn observe(&self, offer: Option<UpdateOffer>) {
         let mut current_offer = self.offer.lock().expect("update offer lock poisoned");
         let mut phase = self.phase.lock().expect("update phase lock poisoned");
+        let mut cancelled = self
+            .cancelled_version
+            .lock()
+            .expect("update cancellation lock poisoned");
+        if offer.as_ref().is_some_and(|offer| {
+            cancelled
+                .as_ref()
+                .is_some_and(|version| version != &offer.version)
+        }) {
+            *cancelled = None;
+        }
         *current_offer = offer.clone();
         match (&*phase, offer) {
             (UpdatePhase::ReadyToRestart { version }, Some(offer)) if version == &offer.version => {
             }
             (UpdatePhase::AwaitingInstallation { version }, Some(offer))
                 if version == &offer.version => {}
+            (UpdatePhase::Failed { version, .. }, Some(offer))
+                if version == &offer.version && cancelled.as_ref() == Some(version) => {}
             (UpdatePhase::Downloading { .. }, _) => {}
             (_, Some(offer)) => *phase = UpdatePhase::Available(offer),
             (_, None) => *phase = UpdatePhase::Idle,
@@ -351,11 +366,25 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
             return Ok(self.phase());
         }
         let _guard = self.install_gate.lock().await;
+        let phase = self.phase();
         if matches!(
-            self.phase(),
+            phase,
             UpdatePhase::ReadyToRestart { .. } | UpdatePhase::AwaitingInstallation { .. }
         ) {
-            return Ok(self.phase());
+            return Ok(phase);
+        }
+        {
+            let offer = self.offer.lock().expect("update offer lock poisoned");
+            let cancelled = self
+                .cancelled_version
+                .lock()
+                .expect("update cancellation lock poisoned");
+            if offer
+                .as_ref()
+                .is_some_and(|offer| cancelled.as_ref() == Some(&offer.version))
+            {
+                return Ok(phase);
+            }
         }
         self.install_locked(access_token).await
     }
@@ -471,6 +500,13 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
                 Ok(phase)
             }
             Err(error) => {
+                if error.code() == "apk_install_cancelled" {
+                    // Keep the user's decision even if journal recovery fails.
+                    *self
+                        .cancelled_version
+                        .lock()
+                        .expect("update cancellation lock poisoned") = Some(offer.version.clone());
+                }
                 if let Err(barrier_error) = self.barrier.installer_failed().await {
                     self.set_barrier_failure(&offer.version, &barrier_error);
                     return Err(barrier_error.into());

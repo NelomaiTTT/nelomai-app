@@ -244,10 +244,13 @@ impl UpdateBarrier {
 
     pub async fn installer_failed(&self) -> Result<(), UpdateBarrierError> {
         let _operation = self.operation.lock().await;
-        self.installer_failed_locked().await
+        self.installer_failed_locked(None).await
     }
 
-    async fn installer_failed_locked(&self) -> Result<(), UpdateBarrierError> {
+    async fn installer_failed_locked(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), UpdateBarrierError> {
         let Some(mut journal) = self.snapshot()? else {
             return Ok(());
         };
@@ -260,7 +263,7 @@ impl UpdateBarrier {
         }
         let progress = self
             .coordinator
-            .cancel_update_stop(&journal.operation_id)
+            .cancel_update_stop(&journal.operation_id, deadline)
             .await?;
         if matches!(progress, crate::SwitchProgress::Pending { .. }) {
             return Err(UpdateBarrierError::Pending);
@@ -274,7 +277,20 @@ impl UpdateBarrier {
         &self,
         installed_container_version: &str,
     ) -> Result<(), UpdateBarrierError> {
-        let _operation = self.operation.lock().await;
+        self.recover_before(installed_container_version, None).await
+    }
+
+    pub(crate) async fn recover_before(
+        &self,
+        installed_container_version: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), UpdateBarrierError> {
+        let _operation = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.operation.lock())
+                .await
+                .map_err(|_| UpdateBarrierError::Pending)?,
+            None => self.operation.lock().await,
+        };
         let Some(journal) = self.snapshot()? else {
             return Ok(());
         };
@@ -282,9 +298,9 @@ impl UpdateBarrier {
             return Err(UpdateBarrierError::Invalid);
         }
         if installed_container_version == journal.source_container {
-            return self.installer_failed_locked().await;
+            return self.installer_failed_locked(deadline).await;
         }
-        self.coordinator.recover_installed_update().await?;
+        self.coordinator.recover_installed_update(deadline).await?;
         Ok(())
     }
 

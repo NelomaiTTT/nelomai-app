@@ -1,4 +1,4 @@
-use nelomai_client_api::DiagnosticUploadRequest;
+use nelomai_client_api::{DiagnosticRuntimeIdentity, DiagnosticUploadRequest};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -39,6 +39,11 @@ pub(crate) struct AutomaticObservation {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct PendingSeal {
+    #[serde(default)]
+    pub runtime_identity: DiagnosticRuntimeIdentity,
+    // Only the process that observed this interval may supply capture-time identity.
+    #[serde(skip)]
+    capture_runtime_identity: bool,
     pub report_id: String,
     pub trigger: String,
     pub session_id: String,
@@ -69,6 +74,8 @@ impl Drop for UploadLease {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct AutomaticSession {
+    #[serde(skip)]
+    current_process: bool,
     connection_id: String,
     session_id: String,
     device_id: String,
@@ -149,6 +156,7 @@ impl DesktopAutomaticDiagnostics {
                     return Ok(AutomaticObservation::default());
                 };
                 let session = AutomaticSession {
+                    current_process: true,
                     connection_id: session_id.to_string(),
                     session_id: Uuid::new_v4().to_string(),
                     device_id,
@@ -198,6 +206,28 @@ impl DesktopAutomaticDiagnostics {
 
     pub(crate) fn pending_seal(&self) -> io::Result<Option<PendingSeal>> {
         Ok(self.lock_state()?.pending_seal.clone())
+    }
+
+    pub(crate) fn freeze_identity(
+        &self,
+        seal: &PendingSeal,
+        identity: DiagnosticRuntimeIdentity,
+    ) -> io::Result<Option<PendingSeal>> {
+        let mut state = self.lock_state()?;
+        let Some(current) = state
+            .pending_seal
+            .as_mut()
+            .filter(|current| current.report_id == seal.report_id)
+        else {
+            return Ok(None);
+        };
+        if current.capture_runtime_identity {
+            current.runtime_identity = identity;
+            current.capture_runtime_identity = false;
+        }
+        let frozen = current.clone();
+        self.save_state(&state)?;
+        Ok(Some(frozen))
     }
 
     pub(crate) fn materialize(
@@ -429,6 +459,8 @@ impl DesktopAutomaticDiagnostics {
 
 fn seal(session: &AutomaticSession, trigger: &str, tunnel_running: bool, now: i64) -> PendingSeal {
     PendingSeal {
+        runtime_identity: DiagnosticRuntimeIdentity::default(),
+        capture_runtime_identity: session.current_process,
         report_id: Uuid::new_v4().to_string(),
         trigger: trigger.to_string(),
         session_id: session.session_id.clone(),
@@ -603,6 +635,7 @@ mod tests {
 
     fn report(seal: &PendingSeal) -> DiagnosticUploadRequest {
         DiagnosticUploadRequest {
+            runtime_identity: Default::default(),
             report_id: Some(seal.report_id.clone()),
             trigger: seal.trigger.clone(),
             tunnel_session_id: Some(seal.session_id.clone()),

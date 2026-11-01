@@ -799,12 +799,18 @@ mod live_split_refresh {
     #[derive(Default)]
     struct Api {
         policy: Mutex<Option<SplitTunnelPolicy>>,
+        bootstrap: Mutex<Option<Bootstrap>>,
         offline: std::sync::atomic::AtomicBool,
     }
     #[async_trait]
     impl CoreApi for Api {
         async fn bootstrap(&self, _: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
-            panic!("no panel fetch")
+            Ok(self
+                .bootstrap
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("unexpected bootstrap"))
         }
         async fn start_connection(
             &self,
@@ -905,9 +911,23 @@ mod live_split_refresh {
     impl CoreLogger for Log {
         fn record(&self, _: crate::CoreLogEvent) {}
     }
+    #[derive(Clone, Copy, Default)]
+    enum RefreshReply {
+        #[default]
+        Ack,
+        Lost,
+        Invalid,
+        Pending,
+    }
+    enum RefreshCase<'a> {
+        Live,
+        Restored(&'a str),
+        Ambiguous(RefreshReply),
+    }
     struct Tunnel {
         snapshot: Mutex<Snapshot>,
         applied: Mutex<Vec<DesktopTunnelOptions>>,
+        next_reply: Mutex<RefreshReply>,
     }
     #[async_trait]
     impl TunnelController for Tunnel {
@@ -932,37 +952,76 @@ mod live_split_refresh {
             command: Command,
         ) -> Result<Snapshot, TunnelError> {
             let wire = serde_json::to_value(command).unwrap();
-            let mut snapshot = self.snapshot.lock().unwrap();
-            match wire["action"].as_str().unwrap() {
-                "status" => (),
-                "refresh_split_tunnel" => {
-                    assert_eq!(wire["expected_revision"], snapshot.session.local_revision);
-                    assert_eq!(
-                        wire["expected_network_epoch"],
-                        snapshot.session.network_epoch
-                    );
-                    assert_eq!(
-                        wire["expected_role_generation"],
-                        snapshot.session.role_generation
-                    );
-                    assert_eq!(
-                        wire["expected_membership_generation"],
-                        snapshot.session.membership_generation
-                    );
-                    self.applied
-                        .lock()
-                        .unwrap()
-                        .push(serde_json::from_value(wire["options"].clone()).unwrap());
-                    snapshot.session.local_revision += 1;
+            let (mut response, reply) = {
+                let mut snapshot = self.snapshot.lock().unwrap();
+                let mut reply = RefreshReply::Ack;
+                match wire["action"].as_str().unwrap() {
+                    "status" => (),
+                    "refresh_split_tunnel" => {
+                        assert_eq!(wire["expected_revision"], snapshot.session.local_revision);
+                        assert_eq!(
+                            wire["expected_network_epoch"],
+                            snapshot.session.network_epoch
+                        );
+                        assert_eq!(
+                            wire["expected_role_generation"],
+                            snapshot.session.role_generation
+                        );
+                        assert_eq!(
+                            wire["expected_membership_generation"],
+                            snapshot.session.membership_generation
+                        );
+                        self.applied
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::from_value(wire["options"].clone()).unwrap());
+                        snapshot.session.local_revision += 1;
+                        reply = std::mem::take(&mut *self.next_reply.lock().unwrap());
+                    }
+                    other => panic!("unexpected pair command {other}"),
                 }
-                other => panic!("unexpected pair command {other}"),
+                (snapshot.clone(), reply)
+            };
+            match reply {
+                RefreshReply::Ack => Ok(response),
+                RefreshReply::Lost => Err(TunnelError::Backend("lost_refresh_ack".into())),
+                RefreshReply::Invalid => {
+                    response.session.local_revision += 1;
+                    Ok(response)
+                }
+                RefreshReply::Pending => std::future::pending().await,
             }
-            Ok(snapshot.clone())
         }
     }
     #[tokio::test]
     async fn expired_domain_refresh_updates_retained_pair_before_revision_gate_without_saved_config(
     ) {
+        retained_pair_refresh_case(RefreshCase::Live).await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retained_split_recipe_requires_native_ack_even_with_equal_routes() {
+        for resolution in ["198.51.100.10/32", "203.0.113.9/32"] {
+            retained_pair_refresh_case(RefreshCase::Restored(resolution)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_split_lost_ack_requires_reapply_when_exclusions_are_disabled() {
+        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Lost)).await;
+    }
+
+    #[tokio::test]
+    async fn retained_split_invalid_ack_requires_reapply_when_exclusions_are_disabled() {
+        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Invalid)).await;
+    }
+
+    #[tokio::test]
+    async fn retained_split_interrupted_apply_requires_reapply_when_exclusions_are_disabled() {
+        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Pending)).await;
+    }
+
+    async fn retained_pair_refresh_case(case: RefreshCase<'_>) {
         let pair = pair();
         let before = both(&pair);
         let identity = RuntimeIdentity {
@@ -985,7 +1044,7 @@ mod live_split_refresh {
         assert!(runtime.saved_connection.is_none() && runtime.pinned_connection.is_none());
         let policy = SplitTunnelPolicy {
             format_version: 2,
-            enabled: true,
+            enabled: !matches!(case, RefreshCase::Ambiguous(_)),
             revision: 1,
             force_revision: 0,
             address_revision: 1,
@@ -1021,6 +1080,7 @@ mod live_split_refresh {
         let tunnel = Arc::new(Tunnel {
             snapshot: Mutex::new(before.clone()),
             applied: Mutex::new(vec![]),
+            next_reply: Mutex::new(RefreshReply::Ack),
         });
         let api = Arc::new(Api::default());
         let core = Arc::new(crate::ClientCore::with_split_tunnel_store(
@@ -1034,16 +1094,116 @@ mod live_split_refresh {
             CoreLocalStop::new(tunnel.clone()),
             Arc::new(Log),
         ));
+        if let RefreshCase::Ambiguous(reply) = case {
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            *core.split_tunnel_options.lock().await =
+                crate::split_tunnel::RunningSplitTunnelOptions::confirmed(
+                    TunnelOptions::default(),
+                    &pair.connection.lease_id,
+                    core.start_cancellation_epoch(),
+                );
+            let mut changed = split.load().unwrap();
+            let next = changed.cached_policy.as_mut().unwrap();
+            next.enabled = true;
+            next.policy_hash = format!("sha256:{}", "b".repeat(64));
+            next.address_rules[0].value = "new.example".into();
+            split.save(&changed).unwrap();
+            *tunnel.next_reply.lock().unwrap() = reply;
+            let pending = tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                core.refresh_retained_split_tunnel(
+                    &mut changed,
+                    161,
+                    |_| async { Some(vec!["203.0.113.9/32".into()]) },
+                    None,
+                    true,
+                ),
+            )
+            .await;
+            match reply {
+                RefreshReply::Pending => assert!(pending.is_err()),
+                _ => assert!(pending.unwrap().is_err()),
+            }
+            // The native commit happened even though its exact proof was lost.
+            assert_eq!(
+                tunnel.applied.lock().unwrap()[0].excluded_ipv4_cidrs,
+                ["203.0.113.9/32"]
+            );
+            let mut original = split.load().unwrap();
+            original.cached_policy = Some(policy);
+            split.save(&original).unwrap();
+            core.refresh_retained_split_tunnel(
+                &mut original,
+                162,
+                |_| async { panic!("disabled policy must not resolve domains") },
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            {
+                let applied = tunnel.applied.lock().unwrap();
+                assert_eq!(
+                    applied.len(),
+                    2,
+                    "must reapply after an ambiguous native commit"
+                );
+                assert!(applied[1].excluded_ipv4_cidrs.is_empty());
+            }
+            // A positive retry ACK permits the next identical operation to skip apply.
+            core.refresh_retained_split_tunnel(
+                &mut original,
+                163,
+                |_| async { panic!("disabled policy must not resolve domains") },
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+            assert_eq!(tunnel.applied.lock().unwrap().len(), 2);
+            return;
+        }
+        if let RefreshCase::Restored(resolution) = case {
+            let mut bootstrap: Bootstrap = serde_json::from_str(include_str!(
+                "../../../contracts/fixtures/valid/bootstrap.json"
+            ))
+            .unwrap();
+            bootstrap.connection = Some(pair.connection.clone());
+            *api.bootstrap.lock().unwrap() = Some(bootstrap);
+            core.bootstrap(161).await.unwrap();
+            assert_eq!(core.state.lock().await.phase, crate::Phase::Connected);
+            core.synchronize_split_tunnel_with_resolver(161, false, |_| async {
+                Some(vec![resolution.into()])
+            })
+            .await
+            .unwrap();
+            let applied = tunnel.applied.lock().unwrap();
+            assert_eq!(
+                applied.len(),
+                1,
+                "disk recipe cannot prove the native applied plan"
+            );
+            assert_eq!(applied[0].excluded_ipv4_cidrs, [resolution]);
+            return;
+        }
         *core.state.lock().await = crate::CoreState {
             phase: crate::Phase::Connected,
             connection: Some(pair.connection.clone()),
         };
-        *core.split_tunnel_options.lock().await = TunnelOptions {
-            excluded_ipv4_cidrs: vec!["198.51.100.10/32".into()],
-            exclude_local_networks: true,
-            policy_hash: Some(policy.policy_hash.clone()),
-            ..Default::default()
-        };
+        *core.split_tunnel_options.lock().await =
+            crate::split_tunnel::RunningSplitTunnelOptions::confirmed(
+                TunnelOptions {
+                    excluded_ipv4_cidrs: vec!["198.51.100.10/32".into()],
+                    exclude_local_networks: true,
+                    policy_hash: Some(policy.policy_hash.clone()),
+                    ..Default::default()
+                },
+                &pair.connection.lease_id,
+                core.start_cancellation_epoch(),
+            );
         let outcome = core
             .synchronize_split_tunnel_with_resolver(161, false, |_| async {
                 Some(vec!["203.0.113.9/32".into()])
@@ -1115,6 +1275,7 @@ mod live_split_refresh {
             core.split_tunnel_options
                 .lock()
                 .await
+                .options
                 .policy_hash
                 .as_deref(),
             Some(next.policy_hash.as_str())

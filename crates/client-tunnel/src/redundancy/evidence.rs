@@ -15,6 +15,8 @@ pub struct NativeHealthSample {
     pub admitted: bool,
     pub closed: bool,
     pub handshake_fresh: bool,
+    /// Outbound IP submissions/attempts, not only successful encrypted UDP sends.
+    /// Platform adapters include their native dropped-send accounting here.
     pub tx_packets: u64,
     /// Successfully decrypted IP packets delivered by the tunnel. Encrypted UDP
     /// receives (including handshakes, keepalives and junk) are not progress.

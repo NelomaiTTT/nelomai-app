@@ -93,6 +93,9 @@
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
   let localStopPendingCleanup = $state(false);
+  // A private client cannot reopen a closed channel. Reset only on full launch,
+  // never through mutable split warnings or a delayed successful state reply.
+  let runtimeChannelClosed = $state(false);
   let bootstrap = $state<Bootstrap | null>(null);
   let peers = $state<PeerOption[]>([]);
   let selectedPeerId = $state("");
@@ -146,6 +149,7 @@
   let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
+  let bootstrapPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
   let runtimeStateSync = $state(initialRuntimeStateSync());
@@ -316,7 +320,7 @@
       const overlay = bootstrap
         ? overlayFromHistoryState(window.history.state)
         : null;
-      splitTunnelOpen = overlay === "split_tunnel" && splitTunnelState !== null;
+      splitTunnelOpen = !runtimeChannelClosed && overlay === "split_tunnel" && splitTunnelState !== null;
       notificationsOpen = overlay === "notifications";
       changelogOpen = overlay === "changelog";
     };
@@ -341,6 +345,7 @@
 
   function showOverlay(overlay: AppOverlay) {
     if (!bootstrap) return;
+    if (runtimeChannelClosed && overlay === "split_tunnel") return;
     if (overlayFromHistoryState(window.history.state) !== overlay) {
       window.history.pushState(
         historyStateForOverlay(window.history.state, overlay),
@@ -469,6 +474,7 @@
 
   async function selectRuntime(useStable: boolean) {
     if (runtimeSelectionBusy) return;
+    startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
     try {
@@ -487,6 +493,7 @@
 
   async function restartRuntime() {
     if (runtimeSelectionBusy) return;
+    startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
     try {
@@ -498,9 +505,39 @@
     }
   }
 
+  function applyRuntimeChannelClosure(reason: unknown): boolean {
+    if (commandCode(reason) !== "runtime_channel_closed") return false;
+    // Owner EOF is not logout, remote cleanup success, or a network timeout.
+    // Keep the account/cleanup barrier; only retire unverified presentation.
+    runtimeChannelClosed = true;
+    desktopActiveSlot = null;
+    startupRetry.cancel();
+    splitTunnelOpen = false;
+    phase = "error";
+    connection = null;
+    connectionMetrics = null;
+    reserveState = null;
+    runtimeWarning = "runtime_channel_closed";
+    connectionIntentStatus = "blocked_terminal";
+    nextRetryAtUnix = null;
+    ownedConnectionIntentNotice = null;
+    error = "Потеряна связь со службой подключения. Статус защиты неизвестен.";
+    view = "unavailable";
+    return true;
+  }
+
+  function requireRuntimeChannelOpen() {
+    if (runtimeChannelClosed) {
+      throw {
+        code: "runtime_channel_closed",
+        message: "Потеряна связь со службой подключения",
+      };
+    }
+  }
+
   async function synchronizeRuntimeState(foreground = true) {
     if (
-      busy ||
+      runtimeChannelClosed || (busy && !connectionActionState.cancelBusy) ||
       !bootstrap?.binding ||
       (!["ready", "connecting", "connected", "stopping"].includes(phase) &&
         !(phase === "error" && connectionIntentStatus === "recovering"))
@@ -512,11 +549,27 @@
     if (!sync.started) return;
     try {
       const previous = phase;
+      const observingStop = connectionActionState.cancelBusy;
       const observedBootstrap = bootstrap;
       const actionEpoch = connectionActionState.epoch;
-      const current = await nativeClient.state().catch(() => null);
-      if (!current || busy || bootstrap !== observedBootstrap ||
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      // A confirmed EOF outranks unrelated UI busy work, unlike a successful
+      // snapshot. Account/action retirement still protects newer user intent.
+      if (applyRuntimeChannelClosure(stateError)) return;
+      if (!current || (observingStop && !connectionActionState.cancelBusy)) return;
+      if (connectionActionState.cancelBusy) {
+        // Observe local closure while the same Stop still awaits server cleanup.
+        // Do not retire the action or enable Start from an intermediate snapshot.
+        localStopPendingCleanup = current.localStopPendingCleanup === true;
+        return;
+      }
+      if (busy) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
@@ -558,12 +611,15 @@
     }
   }
 
-  async function restore() {
+  async function restore(automaticRetry = false) {
+    if (runtimeChannelClosed || runtimeSelectionBusy) return;
     const actionEpoch = connectionActionState.epoch;
     let expectedBootstrap = bootstrap;
-    startupRetry.cancel();
+    startupRetry.cancel(!automaticRetry);
+    let isStartupCurrent = startupRetry.checkpoint();
     startupPending = false;
     refreshPending = false;
+    bootstrapPending = true;
     busy = true;
     localStopPendingCleanup = false;
     error = null;
@@ -577,19 +633,26 @@
     startupTimer = timer;
     try {
       const response = await nativeClient.bootstrap();
-      if (bootstrap !== expectedBootstrap ||
+      if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       const applying = applyBootstrap(response);
+      isStartupCurrent = startupRetry.checkpoint();
       // Svelte may wrap the response; retain the assigned state identity.
       expectedBootstrap = bootstrap;
       await applying;
+      if (isStartupCurrent()) startupRetry.cancel();
     } catch (reason) {
-      if (bootstrap !== expectedBootstrap ||
+      if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
-      startupRetry.schedule(code, retryPendingStartup);
+      startupRetry.schedule(code, () => {
+        if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
+          !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+        retryPendingStartup(code);
+      });
       if (code === "signed_out" || code === "authentication_outcome_unknown" || code === "auth_recovery_required") {
         reserveState = null;
         desktopActiveSlot = null;
@@ -610,15 +673,21 @@
         error = commandMessage(reason, "startup");
       }
     } finally {
+      const ownsStartup = startupTimer === timer;
       window.clearTimeout(timer);
-      if (startupTimer === timer) startupTimer = null;
-      if (isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
+      if (ownsStartup) {
+        startupTimer = null;
+        bootstrapPending = false;
+      }
+      if (ownsStartup && isCurrentConnectionAction(connectionActionState, actionEpoch)) busy = false;
     }
   }
 
   async function applyBootstrap(response: Bootstrap) {
+    if (runtimeChannelClosed) return;
     const actionEpoch = connectionActionState.epoch;
-    startupRetry.cancel();
+    startupRetry.cancel(false);
+    const isStartupCurrent = startupRetry.checkpoint();
     startupPending = false;
     localStopPendingCleanup = false;
     bootstrap = response;
@@ -631,16 +700,19 @@
     void refreshNotifications(false, true);
 
     if (response.update.required) {
+      bootstrapPending = false;
       phase = "update_required";
       view = "update_required";
       return;
     }
     if (!response.access.can_connect || response.access.state === "expired") {
+      bootstrapPending = false;
       phase = "access_expired";
       view = "access_expired";
       return;
     }
     if (!response.binding) {
+      bootstrapPending = false;
       phase = "needs_peer_binding";
       view = "peer_selection";
       await loadPeers();
@@ -648,8 +720,10 @@
     }
 
     const state = await nativeClient.state();
-    if (bootstrap !== observedBootstrap ||
+    if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== observedBootstrap ||
       !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+    if (runtimeChannelClosed) return;
+    bootstrapPending = false;
     phase = state.phase;
     localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
@@ -670,7 +744,8 @@
 
   async function submitLogin(event: SubmitEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (runtimeChannelClosed || busy) return;
+    startupRetry.cancel();
     busy = true;
     error = null;
     diagnosticsStatus = null;
@@ -687,6 +762,7 @@
       logoutRecoveryRequired = false;
       await applyBootstrap(response);
     } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       phase = "signed_out";
       view = "sign_in";
       if (commandCode(reason) === "auth_recovery_required") logoutRecoveryRequired = true;
@@ -734,6 +810,7 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (runtimeChannelClosed && !forceStop) return;
     if (localStopPendingCleanup && !forceStop) return;
     if (
       !forceStop &&
@@ -764,6 +841,7 @@
       if (stopping) {
         phase = "stopping";
         connection = await nativeClient.stop();
+        if (runtimeChannelClosed) return;
         connectionMetrics = null;
         reserveState = null;
         desktopActiveSlot = null;
@@ -790,7 +868,7 @@
           egressMode: selectedEgressMode,
           allowAlternate: true,
         });
-        if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+        if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
         connection = startResult.connection;
         connectionIntentStatus = startResult.status === "recovering" ? "recovering" : "none";
         nextRetryAtUnix = startResult.nextRetryAtUnix;
@@ -807,7 +885,7 @@
       }
       view = "connection";
       const current = await nativeClient.state();
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       phase = current.phase;
       runtimeWarning = current.warning;
@@ -815,7 +893,8 @@
       reserveState = current.reserveState;
       desktopActiveSlot = readDesktopActiveSlot(current);
     } catch (reason) {
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (applyRuntimeChannelClosure(reason)) return;
       const failureCode = commandCode(reason);
       if (!stopping && ["peer_binding_required", "binding_conflict"].includes(failureCode ?? "")) {
         await restore();
@@ -830,8 +909,13 @@
           START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS,
         );
       }
-      const current = await nativeClient.state().catch(() => null);
-      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
+      if (applyRuntimeChannelClosure(stateError)) return;
       localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
@@ -931,11 +1015,12 @@
   }
 
   async function unbindPeer() {
-    if (busy) return;
+    if (runtimeChannelClosed || busy) return;
     busy = true;
     error = null;
     try {
       await nativeClient.unbindPeer();
+      if (runtimeChannelClosed) return;
       connection = null;
       reserveState = null;
       desktopActiveSlot = null;
@@ -947,6 +1032,7 @@
       view = "peer_selection";
       await loadPeers();
     } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) return;
       error = commandMessage(reason, "unbind_peer");
     } finally {
       busy = false;
@@ -1027,8 +1113,14 @@
       notificationsOpen = false;
       changelogOpen = false;
       clearUpdateTimer();
-      phase = "signed_out";
-      view = "sign_in";
+      // The confirmed sign-out clears the account above, but cannot reopen a
+      // closed owner channel or replace its mandatory relaunch presentation.
+      if (runtimeChannelClosed) {
+        applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
+      } else {
+        phase = "signed_out";
+        view = "sign_in";
+      }
       void nativeClient.recordStartupStage("sign_in_logout_completed");
     } catch (reason) {
       logoutRecoveryRequired = true;
@@ -1039,12 +1131,16 @@
     }
   }
 
-  function retryPendingStartup() {
-    if (!startupPending || view !== "unavailable") return;
+  function retryPendingStartup(code: string | null = "runtime_startup_pending") {
+    if (runtimeChannelClosed || runtimeSelectionBusy || view !== "unavailable" ||
+      (!startupPending && code !== "temporarily_unavailable")) return;
     if (busy) {
-      startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+      // New foreground work takes priority over a temporary network retry.
+      if (code !== "temporarily_unavailable") {
+        startupRetry.schedule(code, () => retryPendingStartup(code));
+      }
     } else {
-      void restore();
+      void restore(true);
     }
   }
 
@@ -1229,16 +1325,28 @@
   }
 
   async function loadSplitTunnel(force: boolean) {
+    if (runtimeChannelClosed) {
+      if (force) requireRuntimeChannelOpen();
+      return;
+    }
     if (splitTunnelBusy) return;
     splitTunnelBusy = true;
     try {
-      splitTunnelApplications =
+      const applications =
         await nativeClient.splitTunnelInstalledApplications();
-      splitTunnelState = force
+      if (runtimeChannelClosed) return;
+      const state = force
         ? await nativeClient.refreshSplitTunnel()
         : await nativeClient.splitTunnelState();
-      runtimeWarning = splitTunnelState.warning;
-    } catch {
+      if (runtimeChannelClosed) return;
+      splitTunnelApplications = applications;
+      splitTunnelState = state;
+      runtimeWarning = state.warning;
+    } catch (reason) {
+      if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) {
+        if (force) throw reason;
+        return;
+      }
       if (force) throw new Error("split_tunnel_refresh_failed");
     } finally {
       splitTunnelLoaded = true;
@@ -1247,26 +1355,43 @@
   }
 
   async function openSplitTunnel() {
+    if (runtimeChannelClosed) return;
     await loadSplitTunnel(false);
+    if (runtimeChannelClosed) return;
     if (splitTunnelState) showOverlay("split_tunnel");
   }
 
   async function saveSplitTunnel(
     request: SplitTunnelSettingsUpdate,
   ): Promise<boolean> {
+    requireRuntimeChannelOpen();
+    const observedBootstrap = bootstrap;
+    const actionEpoch = connectionActionState.epoch;
     try {
       let response = await nativeClient.saveSplitTunnel(request, false);
+      requireRuntimeChannelOpen();
       if (response.requiresReconnectConfirmation) {
         const confirmed = window.confirm(
           "Чтобы применить настройки, текущее подключение будет кратковременно перезапущено. Продолжить?",
         );
         if (!confirmed) return false;
         response = await nativeClient.saveSplitTunnel(request, true);
+        requireRuntimeChannelOpen();
       }
       splitTunnelState = response.state;
       return response.saved;
     } catch (reason) {
-      const current = await nativeClient.state().catch(() => null);
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) throw reason;
+      if (applyRuntimeChannelClosure(reason)) throw reason;
+      let stateError: unknown;
+      const current = await nativeClient.state().catch((reason) => {
+        stateError = reason;
+        return null;
+      });
+      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) throw reason;
+      if (applyRuntimeChannelClosure(stateError)) throw reason;
       if (current) {
         phase = current.phase;
         localStopPendingCleanup = current.localStopPendingCleanup === true;
@@ -1285,16 +1410,22 @@
     value: string,
     scope: SplitTunnelAddressRule["scope"],
   ): Promise<void> {
-    splitTunnelState = await nativeClient.addSplitTunnelAddressRule(value, scope);
-    runtimeWarning = splitTunnelState.warning;
+    requireRuntimeChannelOpen();
+    const state = await nativeClient.addSplitTunnelAddressRule(value, scope);
+    requireRuntimeChannelOpen();
+    splitTunnelState = state;
+    runtimeWarning = state.warning;
   }
 
   async function removeSplitTunnelAddressRule(
     ruleId: number,
     scope: SplitTunnelAddressRule["scope"],
   ): Promise<void> {
-    splitTunnelState = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
-    runtimeWarning = splitTunnelState.warning;
+    requireRuntimeChannelOpen();
+    const state = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
+    requireRuntimeChannelOpen();
+    splitTunnelState = state;
+    runtimeWarning = state.warning;
   }
 
   function updateProgress(status: UpdateStatus): string {
@@ -1329,9 +1460,11 @@
       <span>Nelomai</span>
     </a>
     <div class="header-actions">
-      <span class="status" data-phase={phase}>
+      <span class="status" data-phase={!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable")) ? "preparing" : phase}>
         <span aria-hidden="true"></span>
-        {startupPending ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения") : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
+        {runtimeChannelClosed ? "Статус защиты неизвестен" : (startupPending || (bootstrapPending && view === "unavailable"))
+          ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения")
+          : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1920,7 +2053,7 @@
         <p class="eyebrow">Доступ</p>
         <h1>Подключение пока недоступно</h1>
         <p>Срок доступа истёк. Продлите его в панели, затем нажмите «Проверить снова».</p>
-        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+        <button class="secondary-button" type="button" onclick={() => restore()} disabled={busy}>
           Проверить снова
         </button>
       </div>
@@ -1967,18 +2100,28 @@
       </div>
     {:else}
       <div class="panel message-panel">
-        <p class="eyebrow">Подключение к панели</p>
-        <h1>{startupPending ? (refreshPending ? "Восстанавливаем соединение с аккаунтом" : "Завершаем подготовку приложения") : "Сейчас сервис недоступен"}</h1>
-        {#if error}<p class="error-message">{error}</p>{/if}
-        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
-          {busy ? "Проверяем…" : "Повторить"}
-        </button>
+        <p class="eyebrow">{runtimeChannelClosed ? "Служба подключения" : "Подключение к панели"}</p>
+        <h1>{!runtimeChannelClosed && (startupPending || bootstrapPending)
+          ? (refreshPending ? "Восстанавливаем соединение с аккаунтом"
+            : startupPending ? "Завершаем подготовку приложения" : "Подключаемся к панели")
+          : "Сейчас сервис недоступен"}</h1>
+        {#if runtimeChannelClosed}
+          <p class="error-message">Потеряна связь со службой подключения. Статус защиты неизвестен.</p>
+          <p>Полностью завершите Nelomai и заново откройте приложение. Данные очищать не нужно.</p>
+        {:else if error}
+          <p class="error-message">{error}</p>
+        {/if}
+        {#if !runtimeChannelClosed}
+          <button class="secondary-button" type="button" onclick={() => restore()} disabled={busy}>
+            {busy ? "Проверяем…" : "Повторить"}
+          </button>
+        {/if}
       </div>
     {/if}
   </section>
 </main>
 
-{#if splitTunnelOpen && splitTunnelState}
+{#if !runtimeChannelClosed && splitTunnelOpen && splitTunnelState}
   <SplitTunnelSettings
     state={splitTunnelState}
     applications={splitTunnelApplications}

@@ -430,6 +430,7 @@ struct Panel {
     bootstrap_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     reconcile_calls: AtomicUsize,
+    hold_reconcile: AtomicUsize,
     headers: Mutex<Vec<HeaderMap>>,
     reject_bootstrap_access: AtomicUsize,
     fail_bootstrap: AtomicUsize,
@@ -503,6 +504,9 @@ async fn reconcile(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+    if state.hold_reconcile.load(Ordering::SeqCst) == 1 {
+        std::future::pending::<()>().await;
+    }
     state.headers.lock().unwrap().push(headers);
     state.reconcile_bodies.lock().unwrap().push(body.clone());
     if state
@@ -2749,6 +2753,56 @@ async fn coordinator_persists_bounded_retry_before_an_offline_dispatch() {
 }
 
 #[tokio::test]
+async fn coordinator_honors_repeated_server_retry_hint_after_reconstruction() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, enrolled_store(), Arc::new(Stop)).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Pending {
+            retry_after_seconds: 1
+        }
+    );
+    drop(coordinator);
+    for _ in 0..4 {
+        let path = root.path().join("common/runtime-switch-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        journal["retry"]["retry_not_before_unix_ms"] = json!(1);
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        state.return_retry.store(1, Ordering::SeqCst);
+        let coordinator = SwitchCoordinator::open(owner.clone(), manifest())
+            .unwrap()
+            .attach(broker.clone(), control.clone());
+        assert_eq!(
+            coordinator.recover().await.unwrap(),
+            SwitchProgress::Pending {
+                retry_after_seconds: 1
+            }
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn updated_manifest_supersedes_only_the_clean_predecessor_and_resumes_successor() {
     let state = Arc::new(Panel::default());
     state.return_retry.store(1, Ordering::SeqCst);
@@ -2836,7 +2890,7 @@ async fn repeated_updates_recover_active_successor_source_after_committed_apply(
 }
 
 #[tokio::test]
-async fn logout_at_auth_resuming_retires_only_its_barrier_before_new_login_start() {
+async fn logout_at_auth_resuming_retires_initial_startup_barrier_before_new_login_start() {
     exercise_logout_switch_cleanup(false, false, false).await;
 }
 
@@ -2924,7 +2978,8 @@ async fn exercise_logout_switch_cleanup(
     let mut coordinator = Arc::new(
         SwitchCoordinator::open(owner.clone(), manifest())
             .unwrap()
-            .attach(broker.clone(), control.clone()),
+            .attach(broker.clone(), control.clone())
+            .require_initial_transition(RuntimeSlot::Latest),
     );
     let make_port = |coordinator: Arc<SwitchCoordinator>| {
         Arc::new(
@@ -3060,11 +3115,24 @@ async fn exercise_logout_switch_cleanup(
         coordinator = Arc::new(
             SwitchCoordinator::open(owner.clone(), manifest())
                 .unwrap()
-                .attach(broker.clone(), control),
+                .attach(broker.clone(), control)
+                .require_initial_transition(RuntimeSlot::Latest),
         );
         port = make_port(coordinator.clone());
     }
     port.recover_logout_cleanup().await.unwrap();
+    coordinator.before_tunnel_start().await.expect(
+        "completed logout must discharge the old initial transition without login or owner restart",
+    );
+    // The logout receipt does not authorize bypassing an independent update.
+    let update_path = root.path().join("common/update-journal-v1.json");
+    std::fs::write(&update_path, b"unreadable pending update").unwrap();
+    assert!(coordinator.before_tunnel_start().await.is_err());
+    assert_eq!(
+        std::fs::read(&update_path).unwrap(),
+        b"unreadable pending update"
+    );
+    std::fs::remove_file(update_path).unwrap();
     port.login(nelomai_client_api::RuntimeLogin {
         login: "b".into(),
         password: "synthetic-password".into(),
@@ -3294,5 +3362,65 @@ async fn unknown_legacy_refresh_is_durable_and_never_automatically_resent() {
         Err(BrokerError::RecoveryRequired)
     ));
     assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn restart_after_durable_local_stop_does_not_wait_for_server_cleanup() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest.clone())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    assert!(matches!(
+        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    let journal = coordinator.snapshot().unwrap().unwrap();
+    assert_eq!(journal.phase(), SwitchPhase::ServerReconciling);
+    assert!(coordinator
+        .status_for(&active)
+        .unwrap()
+        .local_stop_confirmed());
+
+    // Let retry backoff expire: a slow cleanup endpoint must not delay the
+    // local process handoff once its Stop receipt is already durable.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    state.hold_reconcile.store(1, Ordering::SeqCst);
+    let restart = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.prepare_runtime_restart(&active),
+    )
+    .await
+    .expect("durable local Stop must allow restart without another HTTP wait")
+    .unwrap();
+    assert_eq!(restart.active_slot, RuntimeSlot::Latest);
+    assert_eq!(restart.selected_slot, RuntimeSlot::Stable);
+    assert_eq!(restart.pending_slot, None);
+    assert_eq!(restart.phase, Some(SwitchPhase::ServerReconciling));
+    assert_eq!(coordinator.snapshot().unwrap().unwrap(), journal);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.stops.load(Ordering::SeqCst), 1);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&coordinator).is_err());
+
+    // The successor still has to obtain CLEAN and resume authorization;
+    // relaunch alone never grants permission to start a tunnel.
+    drop(coordinator);
+    let successor = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker, control);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_err());
+    state.hold_reconcile.store(0, Ordering::SeqCst);
+    assert_eq!(successor.recover().await.unwrap(), SwitchProgress::Ready);
+    assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_ok());
     server.abort();
 }

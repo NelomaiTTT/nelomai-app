@@ -553,6 +553,21 @@ async fn frame_read_and_incoming_queue_do_not_regenerate_request_budget() {
     outbox.close();
 }
 
+#[tokio::test(start_paused = true)]
+async fn nlm071_partial_frame_keeps_original_ten_second_fail_closed_bound() {
+    let (mut peer, stream) = tokio::io::duplex(4096);
+    let (outbox, _incoming) = transport::connect(stream);
+    let started = Instant::now();
+    peer.write_all(&[0]).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(!outbox.is_closed());
+    peer.write_all(&[0]).await.unwrap(); // More header bytes do not restart time.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    transport::closed(&mut outbox.cancellation()).await;
+    assert_eq!(started.elapsed(), Duration::from_secs(10));
+}
+
 #[tokio::test]
 async fn outbox_rejects_oversize_before_queueing_owned_credentials() {
     let (stream, _peer) = tokio::io::duplex(8);
@@ -638,6 +653,7 @@ impl crate::host::PrivateOwnerCommands for HeldRuntimeRestart {
         &self,
         _: &RuntimeTarget,
         request: crate::host::HostRequestV1,
+        _: Instant,
     ) -> Result<crate::host::HostResponseV1, PrivateError> {
         assert!(matches!(
             request,
@@ -934,10 +950,11 @@ impl ProtectedRecordStore for Record {
     }
 }
 #[derive(Default)]
-struct Tunnel(AtomicUsize);
+struct Tunnel(AtomicUsize, AtomicUsize);
 #[async_trait::async_trait]
 impl TunnelController for Tunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn stop(&self) -> Result<(), TunnelError> {
@@ -958,6 +975,7 @@ struct Fixture {
     child: Arc<ChildAdmission>,
     auth: Arc<ProtectedAuthStore<Record>>,
     tunnel: Arc<Tunnel>,
+    local: Arc<CoreLocalStop<Tunnel>>,
     record: Arc<RuntimeRecordOwner<ProtectedRuntimeStore<Record>>>,
     auth_backend: Record,
     runtime_backend: Record,
@@ -1055,7 +1073,7 @@ impl Fixture {
         let client = Arc::new(PrivateRuntimeAuthClient::new(
             child_socket,
             child.clone(),
-            stop,
+            stop.clone(),
         ));
         Self {
             _root: root,
@@ -1066,6 +1084,7 @@ impl Fixture {
             child,
             auth,
             tunnel,
+            local: stop,
             record,
             auth_backend,
             runtime_backend,
@@ -1081,6 +1100,783 @@ async fn fresh_install_reports_logged_out() {
         fixture.client.state().await.unwrap(),
         RuntimeAuthState::LoggedOut
     );
+}
+
+// This uses the same CoreLocalStop state/epoch as the private reader, rather
+// than inferring presentation from a stop counter or a standalone stop port.
+#[tokio::test]
+async fn nlm071_peer_eof_stops_real_core_without_claiming_logout_or_ready() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    fixture.client.access(None).await.unwrap();
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        fixture.client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    fixture.local.stop_local_for_transition().await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    let auth_before = fixture.auth.load().unwrap();
+    let runtime_before = fixture.record.operational().load().unwrap();
+    let stops_before = fixture.tunnel.0.load(Ordering::SeqCst);
+    fixture.parent.revoke_peer(); // Real socket shutdown/EOF, no Revoke or Stop control.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("EOF must physically stop independent of writer gates");
+    assert!(fixture.client.check_start_barrier().is_err());
+    assert!(core.access_snapshot().await.is_err());
+    assert_eq!(fixture.auth.load().unwrap(), auth_before);
+    assert_eq!(fixture.record.operational().load().unwrap(), runtime_before);
+    let state = core.state().await;
+    assert!(state.connection.is_none());
+    assert_eq!(
+        state.phase,
+        Phase::Error,
+        "transport loss does not confirm credential revocation"
+    );
+    assert!(core.start(nlm071_options(), 1_700_000_000).await.is_err());
+    assert_eq!(fixture.tunnel.1.load(Ordering::SeqCst), 0);
+    assert_eq!(core.state().await.phase, Phase::Error);
+    assert_eq!(fixture.auth.load().unwrap(), auth_before);
+    assert_eq!(fixture.record.operational().load().unwrap(), runtime_before);
+}
+
+#[tokio::test]
+async fn nlm071_delayed_logged_out_observation_cannot_turn_new_access_eof_into_logout() {
+    nlm071_delayed_logged_out(false, false).await;
+}
+
+#[derive(Clone, Copy)]
+enum Nlm071LogoutEvidenceStage {
+    Fresh,
+    Prepared,
+    Committed,
+    DelayedState,
+    Revoked,
+    Stopped,
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_initial_logged_out_prepare_eof_is_error() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::Prepared, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_initial_logged_out_commit_eof_is_error() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::Committed, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_delayed_state_after_prepare_eof_is_error() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::DelayedState, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_delayed_state_after_expired_prepare_eof_is_error() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::DelayedState, true).await;
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_revoke_cleanup_prepare_eof_remains_signed_out() {
+    for expire in [false, true] {
+        nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::Revoked, expire).await;
+    }
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_stop_cleanup_prepare_eof_remains_signed_out() {
+    for expire in [false, true] {
+        nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::Stopped, expire).await;
+    }
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_fresh_logged_out_eof_remains_signed_out() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::Fresh, false).await;
+}
+
+// Exercise the actual reader, admission record and shared CoreLocalStop. The
+// peer supplies ordered frames so EOF lands before any validated Access/Grant.
+async fn nlm071_logout_evidence_eof(stage: Nlm071LogoutEvidenceStage, expire: bool) {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    use Nlm071LogoutEvidenceStage::*;
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), false);
+    let (old_stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+    let writers = fixture.local.runtime_writer_gates();
+    let child = Arc::new(ChildAdmission::new(
+        "logout-evidence-child".into(),
+        writers.clone(),
+        Arc::new(RuntimeRecordInventory::new(fixture.record.clone(), vec![])),
+    ));
+    let (mut peer, socket) = private_socketpair().unwrap();
+    let client = Arc::new(PrivateRuntimeAuthClient::new(
+        socket,
+        child.clone(),
+        fixture.local.clone(),
+    ));
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    fixture.local.stop_local_for_transition().await.unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let initial = tokio::spawn({
+        let client = client.clone();
+        async move { client.state().await }
+    });
+    let initial_request = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(
+        initial_request.message,
+        MessageV1::Request(AuthRequestV1::State)
+    ));
+    write_frame(
+        &mut peer,
+        FrameV1::new(
+            initial_request.id,
+            MessageV1::Response(AuthResponseV1::State {
+                stamp: old_stamp.clone(),
+                state: RuntimeAuthState::LoggedOut,
+            }),
+        ),
+        deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(initial.await.unwrap().unwrap(), RuntimeAuthState::LoggedOut);
+
+    let delayed = if matches!(stage, DelayedState) {
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move { client.state().await }
+        });
+        let request = read_frame(&mut peer, deadline).await.unwrap();
+        assert!(matches!(
+            request.message,
+            MessageV1::Request(AuthRequestV1::State)
+        ));
+        Some((task, request.id))
+    } else {
+        None
+    };
+    let login = if matches!(stage, Prepared | Committed | DelayedState) {
+        let task = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .login(RuntimeLogin {
+                        login: "synthetic".into(),
+                        password: "synthetic".into(),
+                        device_name: "fixture".into(),
+                    })
+                    .await
+            }
+        });
+        let request = read_frame(&mut peer, deadline).await.unwrap();
+        assert!(matches!(
+            request.message,
+            MessageV1::Request(AuthRequestV1::Login { .. })
+        ));
+        Some(task)
+    } else {
+        None
+    };
+    if matches!(stage, Revoked | Stopped) {
+        let control = if matches!(stage, Revoked) {
+            ControlV1::Revoke
+        } else {
+            ControlV1::Stop
+        };
+        write_frame(
+            &mut peer,
+            FrameV1::new(900, MessageV1::Control(control)),
+            deadline,
+        )
+        .await
+        .unwrap();
+        if matches!(stage, Stopped) {
+            assert!(matches!(
+                read_frame(&mut peer, deadline).await.unwrap().message,
+                MessageV1::Ack(ControlAckV1::Done)
+            ));
+            assert_eq!(core.state().await.phase, Phase::SignedOut);
+        }
+    }
+    let scope = RuntimeAuthScope {
+        auth_epoch: 1,
+        family: "synthetic".into(),
+        identity: RuntimeTarget {
+            container_version: "0.2.16".into(),
+            runtime_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            runtime_slot: RuntimeSlot::Stable,
+        }
+        .identity(Some(1))
+        .unwrap(),
+    };
+    if !matches!(stage, Fresh) {
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                901,
+                MessageV1::Control(ControlV1::Prepare {
+                    incarnation: "logout-evidence-child".into(),
+                }),
+            ),
+            if expire {
+                Instant::now() + Duration::from_millis(50)
+            } else {
+                deadline
+            },
+        )
+        .await
+        .unwrap();
+        let MessageV1::Ack(ControlAckV1::Prepared { lease }) =
+            read_frame(&mut peer, deadline).await.unwrap().message
+        else {
+            panic!("actual child lease expected");
+        };
+        assert!(writers.lifecycle().try_lock().is_err());
+        if matches!(stage, Committed) {
+            // The owner persists authenticated credentials before Commit; EOF
+            // without Grant must preserve them and present a channel error.
+            let mut auth = fixture.auth.load().unwrap().unwrap();
+            auth.auth_epoch = scope.auth_epoch;
+            auth.access_token = Some("synthetic-access".into());
+            auth.refresh_token = Some("synthetic-refresh".into());
+            auth.confirmed_identity = Some(scope.identity.clone());
+            auth.session_generation = Some(1);
+            fixture.auth.save(&auth).unwrap();
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    902,
+                    MessageV1::Control(ControlV1::CommitAdmission {
+                        lease,
+                        scope: scope.clone(),
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_frame(&mut peer, deadline).await.unwrap().message,
+                MessageV1::Ack(ControlAckV1::Committed)
+            ));
+        }
+        if expire {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while writers.lifecycle().try_lock().is_err() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reader timer must expire the actual prepared lease");
+        }
+    }
+    if let Some((task, request_id)) = delayed {
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                request_id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: old_stamp,
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), RuntimeAuthState::LoggedOut);
+    }
+    assert!(child.check(&scope).is_err());
+    let auth_before = fixture.auth.load().unwrap();
+    let runtime_before = fixture.record.operational().load().unwrap();
+    let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    drop(peer);
+    if let Some(login) = login {
+        assert!(login.await.unwrap().is_err());
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(writers.lifecycle().try_lock().is_ok());
+    assert!(client.check_start_barrier().is_err());
+    assert!(core.state().await.connection.is_none());
+    assert_eq!(fixture.auth.load().unwrap(), auth_before);
+    assert_eq!(fixture.record.operational().load().unwrap(), runtime_before);
+    let expected = if matches!(stage, Fresh | Revoked | Stopped) {
+        Phase::SignedOut
+    } else {
+        Phase::Error
+    };
+    assert_eq!(
+        core.state().await.phase,
+        expected,
+        "only fresh LoggedOut or explicit Revoke/Stop confirms logout at EOF"
+    );
+}
+
+#[tokio::test]
+async fn nlm071_delayed_logged_out_after_grant_cannot_claim_logout() {
+    nlm071_delayed_logged_out(true, false).await;
+}
+
+#[tokio::test]
+async fn nlm071_delayed_logged_out_after_grant_and_expired_prepare_cannot_claim_logout() {
+    nlm071_delayed_logged_out(true, true).await;
+}
+
+async fn nlm071_delayed_logged_out(grant_control: bool, expired_prepare: bool) {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), true);
+    let old = Fixture::new(api.clone(), false);
+    let (old_stamp, _) = old.broker.observe_stamped().await.unwrap();
+    let (stamp, observation) = fixture.broker.observe_stamped().await.unwrap();
+    let access = observation.access.unwrap();
+    let child = Arc::new(ChildAdmission::new(
+        "delayed-state-child".into(),
+        fixture.local.runtime_writer_gates(),
+        Arc::new(RuntimeRecordInventory::new(fixture.record.clone(), vec![])),
+    ));
+    let (mut peer, socket) = private_socketpair().unwrap();
+    let client = Arc::new(PrivateRuntimeAuthClient::new(
+        socket,
+        child.clone(),
+        fixture.local.clone(),
+    ));
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    fixture.local.stop_local_for_transition().await.unwrap();
+    let before = fixture.auth.load().unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let delayed = tokio::spawn({
+        let client = client.clone();
+        async move { client.state().await }
+    });
+    let delayed_request = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(
+        delayed_request.message,
+        MessageV1::Request(AuthRequestV1::State)
+    ));
+    let newer = tokio::spawn({
+        let client = client.clone();
+        let stamp = stamp.clone();
+        async move {
+            client
+                .request(
+                    AuthRequestV1::AccessToken {
+                        stamp: Some(stamp),
+                        stale: None,
+                    },
+                    deadline,
+                )
+                .await
+        }
+    });
+    let newer_request = read_frame(&mut peer, deadline).await.unwrap();
+    let scope = transport::scope(&access);
+    let lease = child
+        .prepare(newer_request.id, "delayed-state-child", deadline)
+        .await
+        .unwrap();
+    child.commit(&lease, &scope).unwrap();
+    let response = AuthResponseV1::Access { stamp, access };
+    let frame = if grant_control {
+        FrameV1::new(
+            900,
+            MessageV1::Control(ControlV1::Grant {
+                lease,
+                scope: scope.clone(),
+                response: Box::new(Some((newer_request.id, response))),
+            }),
+        )
+    } else {
+        child.grant(&lease, &scope).unwrap();
+        FrameV1::new(newer_request.id, MessageV1::Response(response))
+    };
+    write_frame(&mut peer, frame, deadline).await.unwrap();
+    assert!(matches!(
+        newer.await.unwrap().unwrap(),
+        AuthResponseV1::Access { .. }
+    ));
+    if expired_prepare {
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                901,
+                MessageV1::Control(ControlV1::Prepare {
+                    incarnation: "delayed-state-child".into(),
+                }),
+            ),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        let ack = read_frame(&mut peer, deadline).await.unwrap();
+        assert!(matches!(
+            ack.message,
+            MessageV1::Ack(ControlAckV1::Prepared { .. })
+        ));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        child.expire();
+    }
+    // This old observation arrives after the new validated Access response.
+    // It is not a Revoke/Stop control and must not retire the newer scope.
+    write_frame(
+        &mut peer,
+        FrameV1::new(
+            delayed_request.id,
+            MessageV1::Response(AuthResponseV1::State {
+                stamp: old_stamp,
+                state: RuntimeAuthState::LoggedOut,
+            }),
+        ),
+        deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(delayed.await.unwrap().unwrap(), RuntimeAuthState::LoggedOut);
+    assert_eq!(child.check(&scope).is_ok(), !expired_prepare);
+    let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.state().await.phase, Phase::Error);
+    assert!(client.check_start_barrier().is_err());
+    assert_eq!(fixture.auth.load().unwrap(), before);
+}
+
+#[tokio::test]
+async fn nlm071_pending_refresh_preflight_wait_returns_pending_with_exact_ticket() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let access = fixture.client.access(None).await.unwrap();
+    assert!(fixture.broker.access_token(Some(&access)).await.is_err());
+    let before = fixture.auth.load().unwrap();
+    assert!(before
+        .as_ref()
+        .unwrap()
+        .broker
+        .as_ref()
+        .unwrap()
+        .pending_request
+        .is_some());
+    let held = crate::auth_broker::hold_test_issuance(&fixture.broker).await;
+    let started = Instant::now();
+    let result = fixture
+        .client
+        .request(
+            AuthRequestV1::AccessToken {
+                stamp: Some(crate::ScopeStamp::from_access(&access)),
+                stale: Some(access),
+            },
+            started + REQUEST_BUDGET,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(PrivateError::RefreshPending)),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < REQUEST_BUDGET);
+    assert_eq!(fixture.auth.load().unwrap(), before);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(fixture.parent.is_connected());
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::RecoveryRequired
+    );
+    drop(held);
+    server.abort();
+}
+
+#[tokio::test]
+async fn nlm071_fresh_logged_out_observation_then_eof_stays_signed_out() {
+    nlm071_logged_out_eof(false).await;
+}
+
+#[tokio::test]
+async fn nlm071_reopened_completed_logout_observation_then_eof_stays_signed_out() {
+    nlm071_logged_out_eof(true).await;
+}
+
+async fn nlm071_logged_out_eof(reopened: bool) {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let (api, _, server) = logout_panel().await;
+    let fixture = if reopened {
+        let previous = Fixture::new(api.clone(), true);
+        previous
+            .parent
+            .admit_empty_current(&previous.broker)
+            .await
+            .unwrap();
+        previous.client.access(None).await.unwrap();
+        previous.broker.logout().await.unwrap();
+        assert_eq!(
+            previous.auth.load().unwrap().unwrap().logout_state,
+            LogoutState::LoggedOut
+        );
+        Fixture::from_records(
+            previous._root,
+            api.clone(),
+            previous.auth_backend,
+            previous.runtime_backend,
+            None,
+            None,
+        )
+    } else {
+        Fixture::new(api.clone(), false)
+    };
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        fixture.client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+    let before = fixture.auth.load().unwrap();
+    let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    fixture.parent.revoke_peer(); // New channel has seen no Revoke/Stop control.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+    assert!(core.state().await.connection.is_none());
+    assert!(fixture.client.check_start_barrier().is_err());
+    assert_eq!(fixture.auth.load().unwrap(), before);
+    server.abort();
+}
+
+#[tokio::test]
+async fn nlm071_http_timeout_returns_pending_before_ipc_deadline_and_keeps_channel_usable() {
+    nlm071_bounded_refresh(false).await;
+}
+
+#[tokio::test]
+async fn nlm071_expired_replay_shares_http_deadline_and_keeps_successor_pending() {
+    nlm071_bounded_refresh(true).await;
+}
+
+#[tokio::test]
+async fn nlm071_short_remaining_budget_does_not_issue_http_or_close_usable_channel() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let access = fixture.client.access(None).await.unwrap();
+    let before = fixture.auth.load().unwrap();
+    // Exercise a genuinely shortened advertised remaining_ms, not a fresh
+    // 10s timeout at the owner. There is no room for issuance plus reply margin.
+    let result = fixture
+        .client
+        .request(
+            AuthRequestV1::AccessToken {
+                stamp: Some(crate::ScopeStamp::from_access(&access)),
+                stale: Some(access),
+            },
+            Instant::now() + Duration::from_millis(500),
+        )
+        .await;
+    assert!(matches!(result, Err(PrivateError::Cancelled)), "{result:?}");
+    assert_eq!(fixture.auth.load().unwrap(), before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.parent.is_connected());
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::Active
+    );
+    server.abort();
+}
+
+fn nlm071_options() -> nelomai_client_core::ConnectOptions {
+    use nelomai_contracts::{EgressMode, Layer, RouteMode, TicConnectionMode};
+    nelomai_client_core::ConnectOptions {
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probes: Vec::new(),
+        allow_alternate: false,
+    }
+}
+
+async fn nlm071_bounded_refresh(expired_replay: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let received = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let observed = observed.clone();
+            let received = received.clone();
+            async move {
+                received.lock().unwrap().push(body);
+                let call = observed.fetch_add(1, Ordering::SeqCst);
+                // Each HTTP operation fits 10s individually. Expired replay
+                // needs a second one under the SAME IPC operation deadline.
+                tokio::time::sleep(Duration::from_secs(if expired_replay { 5 } else { 9 })).await;
+                axum::Json(serde_json::json!({
+                    "api_version":"1", "request_id":"synthetic", "token_type":"Bearer",
+                    "access_token":"recovered-access", "access_expires_in":if expired_replay && call == 0 { 0 } else { 900 },
+                    "refresh_token":"recovered-refresh", "refresh_expires_in":3600,
+                    "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                    "device":{"id":"device","name":"synthetic","platform":"macos",
+                        "container_version":"0.2.16","runtime_version":"0.2.16",
+                        "runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}
+                }))
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let pause = Arc::new(AdmissionPause {
+        after_commit: false,
+        delay_access: false,
+        scope_delay: Duration::from_millis(600),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        grants: AtomicUsize::new(0),
+    });
+    let fixture = Fixture::with_pause(api, true, None, Some(pause));
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let old = fixture.client.access(None).await.unwrap();
+    let started = Instant::now();
+    let result = fixture
+        .client
+        .request(
+            AuthRequestV1::AccessToken {
+                stamp: Some(crate::ScopeStamp::from_access(&old)),
+                stale: Some(old.clone()),
+            },
+            started + REQUEST_BUDGET,
+        )
+        .await;
+    server.abort();
+    assert!(
+        matches!(result, Err(PrivateError::RefreshPending)),
+        "owner must deliver pending instead of closing the peer: {result:?}"
+    );
+    assert!(started.elapsed() < REQUEST_BUDGET);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        if expired_replay { 2 } else { 1 }
+    );
+    assert!(fixture.parent.is_connected());
+    assert!(fixture.client.check_start_barrier().is_ok());
+    // The transport can answer further requests, but pending auth is never a
+    // grant to Start or a reason to retry an ordinary old refresh token.
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::RecoveryRequired
+    );
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::RecoveryRequired
+    );
+    let auth = fixture.auth.load().unwrap().unwrap();
+    let pending = auth.broker.unwrap().pending_request.unwrap();
+    assert_eq!(pending.kind, BrokerRequestKind::Refresh);
+    let received = requests.lock().unwrap();
+    assert_eq!(
+        pending.operation_id,
+        received.last().unwrap()["operation_id"].as_str().unwrap()
+    );
+    assert_eq!(received[0]["refresh_token"], "synthetic-refresh");
+    assert_eq!(auth.logout_state, LogoutState::Active);
+    assert_eq!(
+        auth.access_token.as_deref(),
+        Some(if expired_replay {
+            "recovered-access"
+        } else {
+            "synthetic-access"
+        })
+    );
+    if expired_replay {
+        assert_eq!(received[1]["refresh_token"], "recovered-refresh");
+        assert_ne!(received[0]["operation_id"], received[1]["operation_id"]);
+    }
 }
 
 #[tokio::test]
@@ -1112,6 +1908,8 @@ async fn pending_auth_cleanup_is_not_mislabeled_as_pristine_logout() {
 
 struct AdmissionPause {
     after_commit: bool,
+    delay_access: bool,
+    scope_delay: Duration,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     grants: AtomicUsize,
@@ -1124,18 +1922,52 @@ impl AdmissionPause {
         let (mut from_child, mut to_child) = downstream.into_split();
         let observe = self.clone();
         tokio::spawn(async move {
+            let mut delayed_access = None;
+            let mut access_seen = false;
             loop {
                 let Ok(frame) = read_frame(&mut from_owner, Instant::now() + REQUEST_BUDGET).await
                 else {
                     break;
                 };
+                let deadline = Instant::now() + Duration::from_millis(frame.remaining_ms);
                 if matches!(frame.message, MessageV1::Control(ControlV1::Grant { .. })) {
                     observe.grants.fetch_add(1, Ordering::SeqCst);
                 }
-                if write_frame(&mut to_child, frame, Instant::now() + REQUEST_BUDGET)
-                    .await
-                    .is_err()
+                // Reproduce an Access response overtaken by recovery Prepare,
+                // after its owner's final CheckScope already succeeded. Both
+                // endpoints and every frame are real; only delivery is delayed.
+                if observe.delay_access
+                    && !access_seen
+                    && matches!(
+                        frame.message,
+                        MessageV1::Response(AuthResponseV1::Access { .. })
+                    )
                 {
+                    access_seen = true;
+                    delayed_access = Some((frame, deadline));
+                    observe.entered.notify_one();
+                    continue;
+                }
+                if matches!(
+                    frame.message,
+                    MessageV1::Control(ControlV1::ValidateScope { .. })
+                ) {
+                    if let Some((access, access_deadline)) = delayed_access.take() {
+                        if write_frame(&mut to_child, access, access_deadline)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                if matches!(
+                    frame.message,
+                    MessageV1::Control(ControlV1::CheckScope { .. })
+                ) {
+                    tokio::time::sleep(observe.scope_delay).await;
+                }
+                if write_frame(&mut to_child, frame, deadline).await.is_err() {
                     break;
                 }
             }
@@ -1148,19 +1980,17 @@ impl AdmissionPause {
                 else {
                     break;
                 };
+                let deadline = Instant::now() + Duration::from_millis(frame.remaining_ms);
                 let boundary = matches!(frame.message, MessageV1::Ack(ControlAckV1::Committed))
                     && pause.after_commit
                     || matches!(frame.message, MessageV1::Ack(ControlAckV1::Prepared { .. }))
                         && !pause.after_commit;
-                if boundary && !held {
+                if boundary && !held && !pause.delay_access && pause.scope_delay.is_zero() {
                     held = true;
                     pause.entered.notify_one();
                     pause.release.notified().await;
                 }
-                if write_frame(&mut to_owner, frame, Instant::now() + REQUEST_BUDGET)
-                    .await
-                    .is_err()
-                {
+                if write_frame(&mut to_owner, frame, deadline).await.is_err() {
                     break;
                 }
             }
@@ -1175,6 +2005,8 @@ async fn logout_at_prepared_or_committed_ack_prevents_final_grant() {
         let (api, _, server) = logout_panel().await;
         let pause = Arc::new(AdmissionPause {
             after_commit,
+            delay_access: false,
+            scope_delay: Duration::ZERO,
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
             grants: AtomicUsize::new(0),
@@ -1246,10 +2078,14 @@ async fn readmission_survives_same_scope_refresh_after_scope_check() {
         .unwrap();
     let old = fixture.client.access(None).await.unwrap();
     let finishes = AtomicUsize::new(0);
-    let ready = fixture.parent.admit_current_after(&fixture.broker, || {
-        finishes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    });
+    let ready = fixture.parent.admit_current_after(
+        &fixture.broker,
+        Instant::now() + REQUEST_BUDGET,
+        || {
+            finishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    );
     tokio::pin!(ready);
     // Capture token A and reach the real CheckScope wait. Do not poll Ready
     // again until a concurrent access request has completed its HTTP refresh.
@@ -1296,10 +2132,14 @@ async fn readmission_rejects_changed_authority_after_scope_check() {
             .await
             .unwrap();
         let finishes = AtomicUsize::new(0);
-        let ready = fixture.parent.admit_current_after(&fixture.broker, || {
-            finishes.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
+        let ready = fixture.parent.admit_current_after(
+            &fixture.broker,
+            Instant::now() + REQUEST_BUDGET,
+            || {
+                finishes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        );
         tokio::pin!(ready);
         poll_pending(ready.as_mut()).await;
         // Round trip ensures the child's prior scope ACK was emitted. Change
@@ -1895,8 +2735,16 @@ async fn logout_timeout_reply_fits_full_ipc_budget_and_allows_retry_then_login()
 
 #[tokio::test]
 async fn owner_originated_logout_revokes_real_child_latch() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
     let (api, calls, server) = logout_panel().await;
-    let fixture = Fixture::new(api, true);
+    let fixture = Fixture::new(api.clone(), true);
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        fixture.client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
     fixture
         .parent
         .admit_empty_current(&fixture.broker)
@@ -1910,7 +2758,89 @@ async fn owner_originated_logout_revokes_real_child_latch() {
         fixture.child.check(&transport::scope(&access)).is_err(),
         "owner logout must close remote admission"
     );
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+    let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    fixture.parent.revoke_peer();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        core.state().await.phase,
+        Phase::SignedOut,
+        "EOF after confirmed logout must not replace it with Error"
+    );
+    assert!(fixture
+        .auth
+        .load()
+        .unwrap()
+        .unwrap()
+        .refresh_token
+        .is_none());
     server.abort();
+}
+
+#[tokio::test]
+async fn nlm071_confirmed_revoke_then_eof_remains_signed_out() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let access = fixture.client.access(None).await.unwrap();
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        fixture.client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    fixture.local.stop_local_for_transition().await.unwrap();
+    let auth_before = fixture.auth.load().unwrap();
+    let runtime_before = fixture.record.operational().load().unwrap();
+    fixture
+        .parent
+        .outbox
+        .enqueue(
+            FrameV1::new(
+                fixture.parent.outbox.id().unwrap(),
+                MessageV1::Control(ControlV1::Revoke),
+            ),
+            Instant::now() + REQUEST_BUDGET,
+        )
+        .unwrap();
+    // Ordered scope rejection proves the actual child processed Revoke before EOF.
+    assert!(matches!(
+        fixture
+            .parent
+            .control(
+                ControlV1::CheckScope {
+                    scope: transport::scope(&access)
+                },
+                Instant::now() + REQUEST_BUDGET
+            )
+            .await,
+        Err(PrivateError::RecoveryRequired)
+    ));
+    let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    fixture.parent.revoke_peer();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+    assert!(fixture.client.check_start_barrier().is_err());
+    assert_eq!(fixture.auth.load().unwrap(), auth_before);
+    assert_eq!(fixture.record.operational().load().unwrap(), runtime_before);
 }
 
 #[tokio::test]
@@ -3083,4 +4013,242 @@ async fn inherited_socket_drives_auth_and_actual_record_in_separate_child_proces
         LogoutState::LoggedOut
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn nlm092_delayed_access_does_not_abort_background_recovery() {
+    // Success, known refusal (fallback permitted), and unknown issuance
+    // (must stay fenced) all survive rejection of the concurrent old reply.
+    for outcome in ["success", "refused", "unknown"] {
+        let native: Arc<dyn PrivateBackgroundDispatcher> = match outcome {
+            "success" => Arc::new(Recover(AtomicUsize::new(0))),
+            _ => Arc::new(RefuseRecovery(outcome == "unknown")),
+        };
+        let pause = Arc::new(AdmissionPause {
+            after_commit: false,
+            delay_access: true,
+            scope_delay: Duration::ZERO,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            grants: AtomicUsize::new(0),
+        });
+        let fixture = Fixture::with_pause(
+            ClientApi::new("http://127.0.0.1:9").unwrap(),
+            true,
+            Some(native),
+            Some(pause.clone()),
+        );
+        let mut original = fixture.auth.load().unwrap().unwrap();
+        original.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+        fixture.auth.save(&original).unwrap();
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        fixture.client.state().await.unwrap();
+        let client = fixture.client.clone();
+        let access = tokio::spawn(async move { client.access(None).await });
+        tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+            .await
+            .unwrap();
+        let recovery = fixture.client.background(BackgroundAction::Recover).await;
+        assert!(
+            matches!(
+                access.await.unwrap(),
+                Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            ),
+            "old access must be rejected without closing the channel: {outcome}"
+        );
+        assert!(!fixture.client.is_channel_closed(), "{outcome}");
+        assert!(fixture.parent.is_connected(), "{outcome}");
+        let current = fixture.client.access(None).await;
+        match outcome {
+            "success" => {
+                assert!(
+                    matches!(recovery, Ok(AuthResponseV1::Access { .. })),
+                    "{recovery:?}"
+                );
+                assert_eq!(current.unwrap().access_token(), "recovered-access");
+            }
+            "refused" => {
+                assert!(matches!(recovery, Err(PrivateError::RecoveryRequired)));
+                assert_eq!(current.unwrap().access_token(), "synthetic-access");
+            }
+            _ => {
+                assert!(matches!(recovery, Err(PrivateError::RecoveryRequired)));
+                assert!(current.is_err());
+                assert_eq!(
+                    fixture.client.state().await.unwrap(),
+                    RuntimeAuthState::RecoveryRequired
+                );
+                assert!(fixture
+                    .auth
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .broker
+                    .unwrap()
+                    .pending_recovery
+                    .is_some());
+                assert_eq!(
+                    fixture.auth.load().unwrap().unwrap().refresh_token,
+                    original.refresh_token
+                );
+                assert!(fixture.client.check_start_barrier().is_err());
+            }
+        }
+        assert!(
+            !fixture.client.is_channel_closed(),
+            "channel also survives subsequent requests"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nlm092_rejected_access_preserves_admission_and_protocol_fences() {
+    for case in [
+        "revoke",
+        "foreign_scope",
+        "stamp_mismatch",
+        "unknown_id",
+        "duplicate",
+    ] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+        let access = fixture.broker.access_token(None).await.unwrap();
+        let scope = transport::scope(&access);
+        let child = Arc::new(ChildAdmission::new(
+            "access-fences".into(),
+            fixture.local.runtime_writer_gates(),
+            fixture.record.clone(),
+        ));
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = child.prepare(1, "access-fences", deadline).await.unwrap();
+        child.commit(&lease, &scope).unwrap();
+        child.grant(&lease, &scope).unwrap();
+        let (mut peer, socket) = private_socketpair().unwrap();
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            socket,
+            child.clone(),
+            fixture.local.clone(),
+        ));
+        let old_stamp = ScopeStamp::from_access(&access);
+        let request_client = client.clone();
+        let stamp = old_stamp.clone();
+        let request = tokio::spawn(async move {
+            request_client
+                .request(
+                    AuthRequestV1::AccessToken {
+                        stamp: Some(stamp),
+                        stale: None,
+                    },
+                    deadline,
+                )
+                .await
+        });
+        let sent = read_frame(&mut peer, deadline).await.unwrap();
+        if case != "foreign_scope" {
+            // A rejected reply must not reopen admission or erase logout history.
+            write_frame(
+                &mut peer,
+                FrameV1::new(900, MessageV1::Control(ControlV1::Revoke)),
+                deadline,
+            )
+            .await
+            .unwrap();
+        }
+        let foreign = AccessSnapshot::new(
+            "synthetic-foreign".into(),
+            access.identity().clone(),
+            access.auth_epoch(),
+            "another-family".into(),
+        )
+        .unwrap();
+        let reply_access = if matches!(case, "foreign_scope" | "stamp_mismatch") {
+            foreign
+        } else {
+            access.clone()
+        };
+        let stamp = if case == "stamp_mismatch" {
+            old_stamp
+        } else {
+            ScopeStamp::from_access(&reply_access)
+        };
+        let id = if case == "unknown_id" {
+            sent.id + 1
+        } else {
+            sent.id
+        };
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                id,
+                MessageV1::Response(AuthResponseV1::Access {
+                    stamp,
+                    access: reply_access,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        let result = request.await.unwrap();
+        if matches!(case, "stamp_mismatch" | "unknown_id") {
+            assert!(result.is_err(), "{case}");
+            assert!(
+                client.is_channel_closed(),
+                "protocol error must still close channel: {case}"
+            );
+            continue;
+        }
+        assert!(
+            matches!(result, Err(PrivateError::RecoveryRequired)),
+            "{case}: {result:?}"
+        );
+        assert!(!client.is_channel_closed(), "{case}");
+        if case == "foreign_scope" {
+            child.check(&scope).unwrap(); // Failed foreign response cannot alter current admission.
+        } else {
+            assert!(child.check(&scope).is_err());
+        }
+        if case == "duplicate" {
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    sent.id,
+                    MessageV1::Response(AuthResponseV1::Access {
+                        stamp: ScopeStamp::from_access(&access),
+                        access,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), client.wait_for_channel_close())
+                .await
+                .unwrap();
+            assert!(client.is_channel_closed());
+        } else {
+            // Rejection completed just that request; another RPC remains usable.
+            let state_client = client.clone();
+            let state = tokio::spawn(async move { state_client.state().await });
+            let query = read_frame(&mut peer, deadline).await.unwrap();
+            write_frame(
+                &mut peer,
+                FrameV1::new(
+                    query.id,
+                    MessageV1::Response(AuthResponseV1::State {
+                        stamp: ScopeStamp::from_access(&access),
+                        state: RuntimeAuthState::LoggedOut,
+                    }),
+                ),
+                deadline,
+            )
+            .await
+            .unwrap();
+            assert_eq!(state.await.unwrap().unwrap(), RuntimeAuthState::LoggedOut);
+            assert!(!client.is_channel_closed());
+        }
+    }
 }

@@ -74,6 +74,7 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(port.clone());
     app.manage(Arc::new(runtime_control::RuntimeControls::new(
         port.clone(),
+        &bootstrap.target,
     )));
     app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
     app.manage(application.clone());

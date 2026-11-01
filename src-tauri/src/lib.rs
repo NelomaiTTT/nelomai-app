@@ -406,12 +406,18 @@ fn start_automatic_diagnostics_scheduler(
 
             match diagnostics.pending_automatic_seal() {
                 Ok(Some(seal)) => {
+                    let identity_before = diagnostics::diagnostic_runtime_snapshot(&app);
                     let helper_log = platform::diagnostic_helper_log(&tunnel).await;
                     let resource_snapshot = resource_usage::ResourceSnapshot::capture(&app);
-                    match diagnostics.materialize_automatic_report(
+                    let identity_after = diagnostics::diagnostic_runtime_snapshot(&app);
+                    match diagnostics.materialize_automatic_report_with_identity(
                         &seal,
                         resource_snapshot,
                         helper_log,
+                        diagnostics::coherent_diagnostic_identity(
+                            identity_before.as_ref(),
+                            identity_after.as_ref(),
+                        ),
                     ) {
                         Ok(true) => diagnostics.record_named(
                             "diagnostics.automatic_report_queued",
@@ -2842,6 +2848,7 @@ mod tests {
         ));
     }
 
+    #[cfg(desktop)]
     #[test]
     fn automatic_upload_diagnostics_preserves_the_stable_failure_reason() {
         assert_eq!(
@@ -2996,6 +3003,7 @@ mod tests {
 
     #[test]
     fn windows_service_recovery_waits_for_a_terminal_tunnel_state() {
+        use nelomai_client_tunnel::TunnelStatus;
         assert_eq!(
             classify_windows_service_recovery(None),
             WindowsServiceRecoveryDecision::Wait,

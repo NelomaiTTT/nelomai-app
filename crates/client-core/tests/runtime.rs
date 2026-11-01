@@ -33,6 +33,41 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::Notify;
 
+// Hold a real owner response, not its storage/auth work, to exercise the
+// foreground/native race at the asynchronous IPC boundary.
+struct HeldCleanupAuth {
+    inner: Arc<dyn nelomai_client_core::RuntimeAuthProvider>,
+    hold_refresh: bool,
+    entered: Notify,
+    release: Notify,
+    completed: AtomicUsize,
+}
+
+#[async_trait]
+impl nelomai_client_core::RuntimeAuthProvider for HeldCleanupAuth {
+    async fn state(&self) -> Result<nelomai_client_api::RuntimeAuthState, CoreError> {
+        self.inner.state().await
+    }
+    async fn login(
+        &self,
+        request: nelomai_client_api::RuntimeLogin,
+    ) -> Result<AccessSnapshot, CoreError> {
+        self.inner.login(request).await
+    }
+    async fn logout(&self) -> Result<(), CoreError> {
+        self.inner.logout().await
+    }
+    async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+        let snapshot = self.inner.access(stale).await?;
+        if stale.is_some() == self.hold_refresh {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(snapshot)
+    }
+}
+
 struct MemoryStore(Mutex<Option<StoredAuth>>);
 
 impl MemoryStore {
@@ -549,7 +584,11 @@ struct MockApi {
     async_stop_responses: Mutex<VecDeque<serde_json::Value>>,
     transport_resets: AtomicUsize,
     refresh_calls: AtomicUsize,
+    refresh_completions: AtomicUsize,
     start_calls: AtomicUsize,
+    hold_start: AtomicBool,
+    start_seen: Notify,
+    release_start: Notify,
     hold_restore: AtomicBool,
     restore_entered: Notify,
     restore_release: Notify,
@@ -559,6 +598,9 @@ struct MockApi {
     operation_ids: Mutex<Vec<String>>,
     stop_calls: AtomicUsize,
     hold_stop: AtomicBool,
+    stop_seen: Notify,
+    release_stop: Notify,
+    stop_errors: Mutex<VecDeque<CoreApiError>>,
     redundant_stop_calls: AtomicUsize,
     redundant_stop_requests: Mutex<Vec<RedundantStopRequest>>,
     desktop_role_responses: Mutex<VecDeque<nelomai_contracts::RedundantRoleResponse>>,
@@ -592,6 +634,7 @@ struct MockApi {
     awg3_start: AtomicBool,
     warm_start: AtomicBool,
     redundant_start: AtomicBool,
+    async_stop_start: AtomicBool,
     desktop_endpoint_override: Mutex<Option<String>>,
     mismatched_egress: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
@@ -606,6 +649,13 @@ struct MockApi {
     pin_fails: AtomicBool,
     reconcile_requests: Mutex<Vec<OperationReconcileRequest>>,
     reconcile_responses: Mutex<VecDeque<OperationReconcileResponse>>,
+    reconcile_outcomes: Mutex<VecDeque<Result<OperationReconcileResponse, CoreApiError>>>,
+    background_token_calls: AtomicUsize,
+    reconcile_access_tokens: Mutex<Vec<String>>,
+    reconcile_errors: Mutex<VecDeque<CoreApiError>>,
+    reconcile_seen: Notify,
+    hold_reconcile: AtomicBool,
+    release_reconcile: Notify,
     operation_events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
 }
 
@@ -617,7 +667,11 @@ impl MockApi {
             async_stop_responses: Mutex::new(VecDeque::new()),
             transport_resets: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
+            refresh_completions: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
+            hold_start: AtomicBool::new(false),
+            start_seen: Notify::new(),
+            release_start: Notify::new(),
             hold_restore: AtomicBool::new(false),
             restore_entered: Notify::new(),
             restore_release: Notify::new(),
@@ -627,6 +681,9 @@ impl MockApi {
             operation_ids: Mutex::new(Vec::new()),
             stop_calls: AtomicUsize::new(0),
             hold_stop: AtomicBool::new(false),
+            stop_seen: Notify::new(),
+            release_stop: Notify::new(),
+            stop_errors: Mutex::new(VecDeque::new()),
             redundant_stop_calls: AtomicUsize::new(0),
             redundant_stop_requests: Mutex::new(Vec::new()),
             desktop_role_responses: Mutex::new(VecDeque::new()),
@@ -660,6 +717,7 @@ impl MockApi {
             awg3_start: AtomicBool::new(false),
             warm_start: AtomicBool::new(false),
             redundant_start: AtomicBool::new(false),
+            async_stop_start: AtomicBool::new(false),
             desktop_endpoint_override: Mutex::new(None),
             mismatched_egress: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
@@ -674,6 +732,13 @@ impl MockApi {
             pin_fails: AtomicBool::new(false),
             reconcile_requests: Mutex::new(Vec::new()),
             reconcile_responses: Mutex::new(VecDeque::new()),
+            reconcile_outcomes: Mutex::new(VecDeque::new()),
+            background_token_calls: AtomicUsize::new(0),
+            reconcile_access_tokens: Mutex::new(Vec::new()),
+            reconcile_errors: Mutex::new(VecDeque::new()),
+            reconcile_seen: Notify::new(),
+            hold_reconcile: AtomicBool::new(false),
+            release_reconcile: Notify::new(),
             operation_events: Mutex::new(None),
         }
     }
@@ -730,12 +795,44 @@ impl CoreApi for MockApi {
         &self,
         _access_token: &AccessSnapshot,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        self.background_token_calls.fetch_add(1, Ordering::SeqCst);
         Ok(BackgroundTokenResponse {
             api_version: ApiVersion::V1,
             request_id: "background-token-request".to_string(),
             token: "background-token".to_string(),
             expires_in: 3_600,
         })
+    }
+
+    async fn reconcile_operation(
+        &self,
+        access_token: &AccessSnapshot,
+        request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, CoreApiError> {
+        self.reconcile_access_tokens
+            .lock()
+            .unwrap()
+            .push(access_token.access_token().into());
+        self.reconcile_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        self.reconcile_seen.notify_one();
+        if self.hold_reconcile.load(Ordering::SeqCst) {
+            self.release_reconcile.notified().await;
+        }
+        if let Some(outcome) = self.reconcile_outcomes.lock().unwrap().pop_front() {
+            return outcome;
+        }
+        if let Some(error) = self.reconcile_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        Ok(self
+            .reconcile_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| cleanup_reconciliation(OperationState::Cancelled)))
     }
 
     async fn reconcile_background_operation(
@@ -779,6 +876,10 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.operation_id.clone());
+        self.start_seen.notify_one();
+        if self.hold_start.load(Ordering::SeqCst) {
+            self.release_start.notified().await;
+        }
         if self.reject_stale_start.load(Ordering::SeqCst)
             && access_token.access_token() == "stale-access"
         {
@@ -824,6 +925,8 @@ impl CoreApi for MockApi {
                 "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
             ))
             .unwrap();
+            response.redundancy.as_mut().unwrap().async_stop_v1 =
+                self.async_stop_start.load(Ordering::SeqCst);
             // The shared wire fixture omits native AWG markers. Desktop also
             // validates that the advertised transport matches the configuration.
             let endpoint = self
@@ -862,8 +965,12 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.failure_code.clone());
+        self.stop_seen.notify_one();
         if self.hold_stop.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
+            self.release_stop.notified().await;
+        }
+        if let Some(error) = self.stop_errors.lock().unwrap().pop_front() {
+            return Err(error);
         }
         if self.reject_stale_stop.load(Ordering::SeqCst)
             && access_token.access_token() == "stale-access"
@@ -6428,6 +6535,7 @@ async fn redundant_pending_start_reconciles_its_original_kind_for_retry_and_canc
             Arc::new(MemoryTunnel::default()),
             Arc::new(MemoryLogger::default()),
         );
+        let core = core.with_retry_policy(RetryPolicy::new(Vec::new()));
         if cancel {
             let epoch = core.begin_start_attempt();
             assert!(core
@@ -11833,6 +11941,7 @@ impl support::TestAuthApi for MockApi {
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
         self.refresh_calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(20)).await;
+        self.refresh_completions.fetch_add(1, Ordering::SeqCst);
         Ok(token_response("fresh-access", "fresh-refresh"))
     }
 }
@@ -12142,4 +12251,1696 @@ async fn unreachable_probes_retry_with_fresh_operation_and_keep_validation_termi
     }
     assert!(store.load().unwrap().unwrap().pending_start.is_none());
     assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+fn pending_redundant_cleanup() -> StoredPendingStart {
+    StoredPendingStart {
+        recovery_contract_version: Some(2),
+        redundancy_contract_version: Some(1),
+        reserve_enabled: Some(true),
+        request_fingerprint: Some("a".repeat(64)),
+        cancel_operation_id: Some("pending-cancel".into()),
+        ..pending_explicit_start()
+    }
+}
+
+fn cleanup_reconciliation(state: OperationState) -> OperationReconcileResponse {
+    OperationReconcileResponse {
+        api_version: ApiVersion::V1,
+        request_id: "cleanup-reconcile".into(),
+        state,
+        cancel_requested: true,
+        lease_id: None,
+        lease_status: None,
+        retry_count: 1,
+        next_attempt_at: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_start_waits_for_exact_old_cleanup_without_issuing_background_tokens() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_responses.lock().unwrap().extend([
+        cleanup_reconciliation(OperationState::Compensating),
+        cleanup_reconciliation(OperationState::Applying),
+        cleanup_reconciliation(OperationState::Cancelled),
+    ]);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    let requests = api.reconcile_requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in requests.iter() {
+        assert_eq!(request.operation_id, pending.operation_id);
+        assert_eq!(
+            request.kind,
+            nelomai_contracts::OperationKind::RedundantStart
+        );
+        assert_eq!(request.contract_version, 2);
+        assert_eq!(
+            request.request_fingerprint,
+            pending.request_fingerprint.clone().unwrap()
+        );
+        assert!(request.cancel_if_absent);
+    }
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn completed_explicit_cleanup_does_not_rotate_native_background_credential() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_retry_budget_preserves_unresolved_operation() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_responses
+        .lock()
+        .unwrap()
+        .extend((0..4).map(|_| {
+            let mut response = cleanup_reconciliation(OperationState::Compensating);
+            response.retry_count = 99; // Server worker backoff can be 300s.
+            response
+        }));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    let started_at = tokio::time::Instant::now();
+    let result = core.prepare_explicit_start(&options(), epoch).await;
+    assert_eq!(started_at.elapsed(), Duration::from_secs(15));
+    assert!(
+        matches!(result, Err(CoreError::Api(CoreApiError::Rejected { code, .. }))
+        if code == "operation_in_progress")
+    );
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 4);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_wait_is_cancelled_immediately_by_user_stop() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_responses
+        .lock()
+        .unwrap()
+        .push_back(cleanup_reconciliation(OperationState::Compensating));
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task_core = core.clone();
+    let task =
+        tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+    api.reconcile_seen.notified().await;
+    let cancelled_at = tokio::time::Instant::now();
+    assert!(core.signal_start_cancellation());
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(tokio::time::Instant::now(), cancelled_at);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_rechecks_native_tunnel_and_exact_journal_before_retry() {
+    for native_started in [false, true] {
+        let mut stored = auth();
+        stored.pending_start = Some(pending_redundant_cleanup());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .push_back(cleanup_reconciliation(OperationState::Compensating));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = Arc::new(support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let epoch = core.begin_start_attempt();
+        let task_core = core.clone();
+        let task =
+            tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+        api.reconcile_seen.notified().await;
+        if native_started {
+            *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        } else {
+            let mut changed = store.load().unwrap().unwrap();
+            changed.pending_start.as_mut().unwrap().operation_id = "native-successor".into();
+            store.save(&changed).unwrap();
+        }
+        assert!(task.await.unwrap().is_err());
+        assert!(store.load().unwrap().unwrap().pending_start.is_some());
+        assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_rejects_unconfirmed_response_without_retry_or_forgetting() {
+    for mut response in [
+        cleanup_reconciliation(OperationState::Compensating),
+        cleanup_reconciliation(OperationState::Cancelled),
+    ] {
+        if response.state == OperationState::Compensating {
+            response.cancel_requested = false;
+        } else {
+            response.lease_id = Some("live-lease".into());
+            response.lease_status = Some(LeaseStatus::Connected);
+        }
+        let pending = pending_redundant_cleanup();
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.reconcile_responses.lock().unwrap().push_back(response);
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        assert!(
+            matches!(core.prepare_explicit_start(&options(), epoch).await,
+            Err(CoreError::Api(CoreApiError::Rejected { code, .. })) if code == "invalid_client_api_response")
+        );
+        assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_refreshes_foreground_authority_once_without_rotating_background() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Unauthorized);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.reconcile_access_tokens.lock().unwrap().as_slice(),
+        ["stale-access", "fresh-access"]
+    );
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_refresh_budget_survives_compensating_poll() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_outcomes.lock().unwrap().extend([
+        Err(CoreApiError::Unauthorized),
+        Ok(cleanup_reconciliation(OperationState::Compensating)),
+        Err(CoreApiError::Unauthorized),
+        Ok(cleanup_reconciliation(OperationState::Cancelled)),
+    ]);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.prepare_explicit_start(&options(), epoch).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 3);
+    assert_eq!(
+        api.reconcile_access_tokens.lock().unwrap().as_slice(),
+        ["stale-access", "fresh-access", "fresh-access"]
+    );
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_refresh_budget_rejects_consecutive_unauthorized() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_outcomes.lock().unwrap().extend([
+        Err(CoreApiError::Unauthorized),
+        Err(CoreApiError::Unauthorized),
+    ]);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.prepare_explicit_start(&options(), epoch).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 2);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_refresh_budget_allows_first_refresh_on_later_poll() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_outcomes.lock().unwrap().extend([
+        Ok(cleanup_reconciliation(OperationState::Compensating)),
+        Err(CoreApiError::Unauthorized),
+        Ok(cleanup_reconciliation(OperationState::Applying)),
+        Ok(cleanup_reconciliation(OperationState::Cancelled)),
+    ]);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 4);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_refresh_budget_resets_for_new_explicit_attempt() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_outcomes.lock().unwrap().extend([
+        Err(CoreApiError::Unauthorized),
+        Ok(cleanup_reconciliation(OperationState::Compensating)),
+        Err(CoreApiError::Unauthorized),
+        Err(CoreApiError::Unauthorized),
+        Ok(cleanup_reconciliation(OperationState::Cancelled)),
+    ]);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.prepare_explicit_start(&options(), epoch).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    core.finish_start_attempt();
+    let epoch = core.begin_start_attempt();
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 5);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[cfg(not(target_os = "android"))]
+async fn explicit_cleanup_fences_successor_replaced_during_awaited_status() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_responses
+        .lock()
+        .unwrap()
+        .push_back(cleanup_reconciliation(OperationState::Compensating));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task = tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+    api.reconcile_seen.notified().await;
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    tunnel.status_entered.notified().await;
+    let mut successor = store.load().unwrap().unwrap();
+    successor.pending_start.as_mut().unwrap().operation_id = "native-successor".into();
+    store.save(&successor).unwrap();
+    tunnel.status_release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(
+        store.load().unwrap().unwrap().pending_start,
+        successor.pending_start
+    );
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_fences_successor_replaced_during_http_response() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.hold_reconcile.store(true, Ordering::SeqCst);
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task = tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+    api.reconcile_seen.notified().await;
+    let mut successor = store.load().unwrap().unwrap();
+    successor.pending_start.as_mut().unwrap().operation_id = "native-successor".into();
+    store.save(&successor).unwrap();
+    api.release_reconcile.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(
+        store.load().unwrap().unwrap().pending_start,
+        successor.pending_start
+    );
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_stop_cancels_held_http_without_refresh_or_forgetting() {
+    for late_unauthorized in [true, false] {
+        let pending = pending_redundant_cleanup();
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.hold_reconcile.store(true, Ordering::SeqCst);
+        if late_unauthorized {
+            api.reconcile_errors
+                .lock()
+                .unwrap()
+                .push_back(CoreApiError::Unauthorized);
+        }
+        let core = Arc::new(support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let epoch = core.begin_start_attempt();
+        let task_core = core.clone();
+        let mut task =
+            tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+        api.reconcile_seen.notified().await;
+        assert!(core.signal_start_cancellation());
+        let cancelled = tokio::time::timeout(Duration::from_millis(1), &mut task).await;
+        api.hold_reconcile.store(false, Ordering::SeqCst);
+        api.release_reconcile.notify_one();
+        if cancelled.is_err() {
+            let _ = task.await;
+        }
+        assert!(matches!(cancelled, Ok(Ok(Err(CoreError::StartCancelled)))));
+        assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_stop_during_owner_refresh_does_not_drop_ipc_or_redispatch_http() {
+    let pending = pending_redundant_cleanup();
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Unauthorized);
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task_core = core.clone();
+    let task =
+        tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+    api.reconcile_seen.notified().await;
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    core.signal_start_cancellation();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(api.refresh_completions.load(Ordering::SeqCst), 1);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+}
+
+fn pending_cleanup_live_lease() -> StoredPendingStart {
+    StoredPendingStart {
+        recovery_contract_version: Some(1),
+        request_fingerprint: Some("a".repeat(64)),
+        ..pending_explicit_start()
+    }
+}
+
+fn live_cleanup_reconciliation() -> OperationReconcileResponse {
+    OperationReconcileResponse {
+        lease_id: Some("old-stray-start".into()),
+        lease_status: Some(LeaseStatus::Connected),
+        ..cleanup_reconciliation(OperationState::Applied)
+    }
+}
+
+fn cleanup_busy() -> CoreApiError {
+    CoreApiError::Rejected {
+        code: "operation_in_progress".into(),
+        message: "Cleanup is still in progress".into(),
+        retry_after_seconds: Some(1),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_legacy_shares_refresh_budget_across_polls() {
+    let mut pending = pending_explicit_start();
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors.lock().unwrap().extend([
+        CoreApiError::Unauthorized,
+        cleanup_busy(),
+        CoreApiError::Unauthorized,
+    ]);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.prepare_explicit_start(&options(), epoch).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_live_stop_shares_reconcile_refresh_budget() {
+    let mut pending = pending_cleanup_live_lease();
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_outcomes.lock().unwrap().extend([
+        Err(CoreApiError::Unauthorized),
+        Ok(live_cleanup_reconciliation()),
+    ]);
+    api.stop_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Unauthorized);
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.prepare_explicit_start(&options(), epoch).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.reconcile_requests.lock().unwrap().len(), 2);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+}
+
+async fn assert_cleanup_helper_tracks_own_stop_id(legacy: bool) {
+    let pending = if legacy {
+        pending_explicit_start()
+    } else {
+        pending_cleanup_live_lease()
+    };
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    if !legacy {
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .extend([live_cleanup_reconciliation(), live_cleanup_reconciliation()]);
+    }
+    api.stop_errors.lock().unwrap().push_back(cleanup_busy());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    let new_options = ConnectOptions {
+        allow_alternate: true,
+        ..options()
+    };
+    core.prepare_explicit_start(&new_options, epoch)
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 2);
+    let stop_ids = api.stop_operation_ids.lock().unwrap();
+    assert_eq!(stop_ids.len(), 2);
+    assert!(!stop_ids[0].is_empty());
+    assert_eq!(stop_ids[0], stop_ids[1]);
+    assert_eq!(
+        api.start_calls.load(Ordering::SeqCst),
+        if legacy { 2 } else { 0 }
+    );
+    assert!(api
+        .operation_ids
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|id| id == "old-stray-start"));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.background_token_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_legacy_tracks_own_durable_stop_id() {
+    assert_cleanup_helper_tracks_own_stop_id(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_live_stop_tracks_own_durable_stop_id() {
+    assert_cleanup_helper_tracks_own_stop_id(false).await;
+}
+
+async fn assert_cleanup_helper_cancels_http(legacy: bool) {
+    for late_unauthorized in [true, false] {
+        let mut pending = if legacy {
+            pending_explicit_start()
+        } else {
+            pending_cleanup_live_lease()
+        };
+        pending.cancel_operation_id = Some("original-stop".into());
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        if legacy {
+            api.hold_start.store(true, Ordering::SeqCst);
+            if late_unauthorized {
+                api.start_errors
+                    .lock()
+                    .unwrap()
+                    .push_back(CoreApiError::Unauthorized);
+            }
+        } else {
+            api.reconcile_responses
+                .lock()
+                .unwrap()
+                .push_back(live_cleanup_reconciliation());
+            api.hold_stop.store(true, Ordering::SeqCst);
+            if late_unauthorized {
+                api.stop_errors
+                    .lock()
+                    .unwrap()
+                    .push_back(CoreApiError::Unauthorized);
+            }
+        }
+        let core = Arc::new(support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let epoch = core.begin_start_attempt();
+        let task_core = core.clone();
+        let mut task =
+            tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+        if legacy {
+            api.start_seen.notified().await;
+        } else {
+            api.stop_seen.notified().await;
+        }
+        assert!(core.signal_start_cancellation());
+        let cancelled = tokio::time::timeout(Duration::from_millis(1), &mut task).await;
+        api.hold_start.store(false, Ordering::SeqCst);
+        api.hold_stop.store(false, Ordering::SeqCst);
+        api.release_start.notify_one();
+        api.release_stop.notify_one();
+        if cancelled.is_err() {
+            let _ = task.await;
+        }
+        assert!(matches!(cancelled, Ok(Ok(Err(CoreError::StartCancelled)))));
+        assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), usize::from(legacy));
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), usize::from(!legacy));
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_legacy_cancels_held_http_and_late_401() {
+    assert_cleanup_helper_cancels_http(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_live_stop_cancels_held_http_and_late_401() {
+    assert_cleanup_helper_cancels_http(false).await;
+}
+
+async fn assert_cleanup_helper_finishes_owner_refresh_before_cancel(legacy: bool) {
+    let mut pending = if legacy {
+        pending_explicit_start()
+    } else {
+        pending_cleanup_live_lease()
+    };
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    if legacy {
+        api.start_errors
+            .lock()
+            .unwrap()
+            .push_back(CoreApiError::Unauthorized);
+    } else {
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .push_back(live_cleanup_reconciliation());
+        api.stop_errors
+            .lock()
+            .unwrap()
+            .push_back(CoreApiError::Unauthorized);
+    }
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task_core = core.clone();
+    let task =
+        tokio::spawn(async move { task_core.prepare_explicit_start(&options(), epoch).await });
+    if legacy {
+        api.start_seen.notified().await;
+    } else {
+        api.stop_seen.notified().await;
+    }
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert!(core.signal_start_cancellation());
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(api.refresh_completions.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), usize::from(legacy));
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), usize::from(!legacy));
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_legacy_finishes_owner_refresh_before_cancel() {
+    assert_cleanup_helper_finishes_owner_refresh_before_cancel(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_live_stop_finishes_owner_refresh_before_cancel() {
+    assert_cleanup_helper_finishes_owner_refresh_before_cancel(false).await;
+}
+
+async fn assert_cleanup_helper_fences_successor(legacy: bool) {
+    let mut pending = if legacy {
+        pending_explicit_start()
+    } else {
+        pending_cleanup_live_lease()
+    };
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending);
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    if legacy {
+        api.hold_start.store(true, Ordering::SeqCst);
+    } else {
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .push_back(live_cleanup_reconciliation());
+        api.hold_stop.store(true, Ordering::SeqCst);
+    }
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task = tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+    if legacy {
+        api.start_seen.notified().await;
+    } else {
+        api.stop_seen.notified().await;
+    }
+    // Same UUID, different intent: checking only operation_id is insufficient.
+    let mut successor = store.load().unwrap().unwrap();
+    successor.pending_start.as_mut().unwrap().allow_alternate = true;
+    store.save(&successor).unwrap();
+    api.hold_start.store(false, Ordering::SeqCst);
+    api.hold_stop.store(false, Ordering::SeqCst);
+    api.release_start.notify_one();
+    api.release_stop.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(
+        store.load().unwrap().unwrap().pending_start,
+        successor.pending_start
+    );
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), usize::from(!legacy));
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), usize::from(legacy));
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_legacy_fences_same_uuid_successor() {
+    assert_cleanup_helper_fences_successor(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_helper_live_stop_fences_same_uuid_successor() {
+    assert_cleanup_helper_fences_successor(false).await;
+}
+
+async fn assert_cleanup_native_after_owner_wait(hold_refresh: bool) {
+    for legacy in [false, true] {
+        for native_status in [TunnelStatus::Starting, TunnelStatus::Running] {
+            let mut pending = if legacy {
+                pending_explicit_start()
+            } else {
+                pending_cleanup_live_lease()
+            };
+            pending.cancel_operation_id = Some("original-stop".into());
+            let mut stored = auth();
+            stored.pending_start = Some(pending.clone());
+            let store = Arc::new(MemoryStore::new(stored));
+            let api = Arc::new(MockApi::new(0));
+            if hold_refresh {
+                if legacy {
+                    api.start_errors
+                        .lock()
+                        .unwrap()
+                        .push_back(CoreApiError::Unauthorized);
+                } else {
+                    api.reconcile_errors
+                        .lock()
+                        .unwrap()
+                        .push_back(CoreApiError::Unauthorized);
+                }
+            }
+            let tunnel = Arc::new(MemoryTunnel::default());
+            let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+            let owner = Arc::new(HeldCleanupAuth {
+                inner: Arc::new(support::TestOwner::new(
+                    api.clone(),
+                    store.clone(),
+                    local.clone(),
+                )),
+                hold_refresh,
+                entered: Notify::new(),
+                release: Notify::new(),
+                completed: AtomicUsize::new(0),
+            });
+            let core = Arc::new(nelomai_client_core::ClientCore::new(
+                api.clone(),
+                Arc::new(support::LegacyRuntime::new(store.clone())),
+                owner.clone(),
+                local,
+                Arc::new(MemoryLogger::default()),
+            ));
+            let epoch = core.begin_start_attempt();
+            let task =
+                tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+            owner.entered.notified().await;
+            *tunnel.status.lock().unwrap() = native_status;
+            owner.release.notify_one();
+            assert!(
+                task.await.unwrap().is_err(),
+                "legacy={legacy}, refresh={hold_refresh}"
+            );
+            assert_eq!(owner.completed.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                api.refresh_calls.load(Ordering::SeqCst),
+                usize::from(hold_refresh)
+            );
+            assert_eq!(
+                api.reconcile_requests.lock().unwrap().len(),
+                usize::from(hold_refresh && !legacy)
+            );
+            assert_eq!(
+                api.start_calls.load(Ordering::SeqCst),
+                usize::from(hold_refresh && legacy)
+            );
+            assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+            assert_eq!(*tunnel.status.lock().unwrap(), native_status);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_owner_access_prevents_mutation() {
+    assert_cleanup_native_after_owner_wait(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_owner_refresh_prevents_redispatch() {
+    assert_cleanup_native_after_owner_wait(true).await;
+}
+
+async fn assert_cleanup_native_after_reconcile(state: OperationState) {
+    for native_status in [TunnelStatus::Starting, TunnelStatus::Running] {
+        let mut pending = pending_cleanup_live_lease();
+        pending.cancel_operation_id = Some("original-stop".into());
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.hold_reconcile.store(true, Ordering::SeqCst);
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .push_back(if state == OperationState::Applied {
+                live_cleanup_reconciliation()
+            } else {
+                cleanup_reconciliation(state)
+            });
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = Arc::new(support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let epoch = core.begin_start_attempt();
+        let task =
+            tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+        api.reconcile_seen.notified().await;
+        *tunnel.status.lock().unwrap() = native_status;
+        api.release_reconcile.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+        assert_eq!(*tunnel.status.lock().unwrap(), native_status);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_applied_response_prevents_stop() {
+    assert_cleanup_native_after_reconcile(OperationState::Applied).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_terminal_response_preserves_pending() {
+    assert_cleanup_native_after_reconcile(OperationState::Cancelled).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_legacy_replay_prevents_stop() {
+    let mut pending = pending_explicit_start();
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.hold_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task = tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+    api.start_seen.notified().await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    api.release_start.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Running);
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_cleanup_native_activation_during_stop_response_preserves_pending() {
+    let mut pending = pending_cleanup_live_lease();
+    pending.cancel_operation_id = Some("original-stop".into());
+    let mut stored = auth();
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    api.reconcile_responses
+        .lock()
+        .unwrap()
+        .push_back(live_cleanup_reconciliation());
+    api.hold_stop.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let task = tokio::spawn(async move { core.prepare_explicit_start(&options(), epoch).await });
+    api.stop_seen.notified().await;
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    api.release_stop.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Running);
+}
+
+fn cached_stray_connection(lease_id: &str, kind: StoredConnectionKind) -> StoredConnection {
+    StoredConnection {
+        lease_id: lease_id.into(),
+        pool_id: None,
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probe_url: None,
+        kind,
+        configuration: "[Interface]\nPrivateKey = offline-secret\n".into(),
+        valid_until_unix: Some(1_700_000_100),
+    }
+}
+
+#[tokio::test]
+async fn cancelled_async_start_reconciles_original_operation_before_native_ownership() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    api.async_stop_start.store(true, Ordering::SeqCst);
+    api.hold_start.store(true, Ordering::SeqCst);
+    let mut stored = auth();
+    let unrelated_cache =
+        cached_stray_connection("unrelated-lease", StoredConnectionKind::DynamicWarm);
+    stored.saved_connection = Some(unrelated_cache.clone());
+    stored.pinned_connection = Some(StoredConnection {
+        lease_id: "20000000-0000-4000-8000-000000000002".into(),
+        pool_id: Some("pool-test".into()),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::Pinned,
+        configuration: "old-pinned-configuration".into(),
+        valid_until_unix: None,
+    });
+    let store = Arc::new(MemoryStore::new(stored));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let attempt = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.start_recovery_v2_with_cancellation_epoch(options(), 1_700_000_000, true, epoch)
+                .await
+        })
+    };
+    api.start_seen.notified().await;
+    assert!(core.signal_start_cancellation());
+    api.release_start.notify_one();
+    assert!(matches!(
+        attempt.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    core.finish_start_attempt();
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    {
+        let requests = api.reconcile_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].operation_id,
+            api.operation_ids.lock().unwrap()[0]
+        );
+        assert!(requests[0].cancel_if_absent);
+        assert_eq!(requests[0].contract_version, 2);
+    }
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert!(store.load().unwrap().unwrap().pinned_connection.is_none());
+    assert_eq!(
+        store.load().unwrap().unwrap().saved_connection,
+        Some(unrelated_cache)
+    );
+    api.hold_start.store(false, Ordering::SeqCst);
+    core.start_recovery_v2(options(), 1_700_000_001, true)
+        .await
+        .unwrap();
+    let ids = api.operation_ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[tokio::test]
+async fn cancelled_async_start_persists_cache_removal_and_marker_atomically() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    api.async_stop_start.store(true, Ordering::SeqCst);
+    api.hold_start.store(true, Ordering::SeqCst);
+    let mut stored = auth();
+    let lease_id = "20000000-0000-4000-8000-000000000002";
+    stored.saved_connection = Some(cached_stray_connection(
+        lease_id,
+        StoredConnectionKind::DynamicWarm,
+    ));
+    stored.pinned_connection = Some(cached_stray_connection(
+        lease_id,
+        StoredConnectionKind::Pinned,
+    ));
+    let store = Arc::new(RejectDynamicCacheRemovalStore::new(stored));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let attempt = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.start_recovery_v2_with_cancellation_epoch(options(), 1_700_000_000, true, epoch)
+                .await
+        })
+    };
+    api.start_seen.notified().await;
+    core.signal_start_cancellation();
+    api.release_start.notify_one();
+    assert!(matches!(attempt.await.unwrap(), Err(CoreError::Storage)));
+    core.finish_start_attempt();
+    let retained = store.load().unwrap().unwrap();
+    assert!(retained
+        .pending_start
+        .as_ref()
+        .unwrap()
+        .cancel_operation_id
+        .is_none());
+    assert!(retained.saved_connection.is_some());
+    assert!(retained.pinned_connection.is_some());
+    assert!(api.reconcile_requests.lock().unwrap().is_empty());
+    assert!(matches!(
+        core.start_saved_stray_offline(1_700_000_001).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    let reconstructed = support::core(
+        api,
+        store,
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(matches!(
+        reconstructed.start_saved_stray_offline(1_700_000_001).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unresolved_v2_start_blocks_offline_cache_with_or_without_cancel_marker() {
+    for marked in [false, true] {
+        for kind in [
+            StoredConnectionKind::DynamicWarm,
+            StoredConnectionKind::Pinned,
+        ] {
+            let mut stored = auth();
+            let mut pending = pending_redundant_cleanup();
+            if !marked {
+                pending.cancel_operation_id = None;
+            }
+            stored.pending_start = Some(pending);
+            let cache = cached_stray_connection("cached-lease", kind);
+            match kind {
+                StoredConnectionKind::Pinned => stored.pinned_connection = Some(cache),
+                _ => stored.saved_connection = Some(cache),
+            }
+            let tunnel = Arc::new(MemoryTunnel::default());
+            let core = support::core(
+                Arc::new(MockApi::new(0)),
+                Arc::new(MemoryStore::new(stored)),
+                tunnel.clone(),
+                Arc::new(MemoryLogger::default()),
+            );
+            assert!(
+                matches!(
+                    core.start_saved_stray_offline(1_700_000_001).await,
+                    Err(CoreError::SavedConnectionUnavailable)
+                ),
+                "marked={marked}, kind={kind:?}"
+            );
+            assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_repairs_old_cache_before_clearing_its_barrier() {
+    let mut stored = auth();
+    let pending = pending_redundant_cleanup();
+    stored.pending_start = Some(pending.clone());
+    stored.saved_connection = Some(cached_stray_connection(
+        "unknown-old-lease",
+        StoredConnectionKind::DynamicWarm,
+    ));
+    stored.pinned_connection = Some(cached_stray_connection(
+        "other-old-lease",
+        StoredConnectionKind::Pinned,
+    ));
+    let store = Arc::new(RejectDynamicCacheRemovalStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(matches!(core.stop().await, Err(CoreError::Storage)));
+    let retained = store.load().unwrap().unwrap();
+    assert_eq!(retained.pending_start.as_ref(), Some(&pending));
+    assert!(retained.saved_connection.is_some());
+    assert!(retained.pinned_connection.is_some());
+    assert!(api.reconcile_requests.lock().unwrap().is_empty());
+    assert!(matches!(
+        core.start_saved_stray_offline(1_700_000_001).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+
+    let repaired_store = Arc::new(MemoryStore::new(retained));
+    let reconstructed = support::core(
+        api.clone(),
+        repaired_store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(matches!(
+        reconstructed.stop().await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    let repaired = repaired_store.load().unwrap().unwrap();
+    assert!(repaired.pending_start.is_none());
+    assert!(repaired.saved_connection.is_none());
+    assert!(repaired.pinned_connection.is_none());
+    assert!(matches!(
+        reconstructed.start_saved_stray_offline(1_700_000_001).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    let requests = api.reconcile_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].operation_id, pending.operation_id);
+    assert!(requests[0].cancel_if_absent);
+}
+
+#[tokio::test]
+async fn cancelled_start_retry_reconciliation_keeps_barrier_when_cache_removal_fails() {
+    for final_state in [
+        OperationState::Cancelled,
+        OperationState::Terminal,
+        OperationState::Applied,
+    ] {
+        for marked in [false, true] {
+            let mut stored = auth();
+            let mut pending = pending_redundant_cleanup();
+            if !marked {
+                pending.cancel_operation_id = None;
+            }
+            stored.pending_start = Some(pending.clone());
+            stored.saved_connection = Some(cached_stray_connection(
+                "old-lease",
+                StoredConnectionKind::DynamicWarm,
+            ));
+            let store = Arc::new(RejectDynamicCacheRemovalStore::new(stored));
+            let api = Arc::new(MockApi::new(0));
+            let mut reply = cleanup_reconciliation(final_state);
+            if final_state == OperationState::Applied {
+                reply.lease_id = Some("old-lease".into());
+                reply.lease_status = Some(LeaseStatus::Released);
+            }
+            api.reconcile_responses
+                .lock()
+                .unwrap()
+                .extend([reply.clone(), reply]);
+            let core = support::core(
+                api.clone(),
+                store.clone(),
+                Arc::new(MemoryTunnel::default()),
+                Arc::new(MemoryLogger::default()),
+            );
+            assert!(matches!(
+                core.reconcile_pending_operation_for_retry().await,
+                Err(CoreError::Storage)
+            ));
+            let retained = store.load().unwrap().unwrap();
+            assert_eq!(retained.pending_start.as_ref(), Some(&pending));
+            assert!(retained.saved_connection.is_some());
+            assert_eq!(
+                api.reconcile_requests.lock().unwrap().len(),
+                usize::from(!marked)
+            );
+
+            let working_store = Arc::new(MemoryStore::new(retained));
+            let reconstructed = support::core(
+                api.clone(),
+                working_store.clone(),
+                Arc::new(MemoryTunnel::default()),
+                Arc::new(MemoryLogger::default()),
+            );
+            reconstructed
+                .reconcile_pending_operation_for_retry()
+                .await
+                .unwrap();
+            let repaired = working_store.load().unwrap().unwrap();
+            assert!(repaired.pending_start.is_none());
+            assert!(repaired.saved_connection.is_none());
+            let requests = api.reconcile_requests.lock().unwrap();
+            assert_eq!(requests.len(), if marked { 1 } else { 2 });
+            assert!(requests
+                .iter()
+                .all(|request| request.operation_id == pending.operation_id
+                    && request.cancel_if_absent == marked));
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_preserves_cache_from_an_unrelated_layer() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let mut unrelated_cache = cached_stray_connection("tic-lease", StoredConnectionKind::Fixed);
+    unrelated_cache.layer = Layer::Tic;
+    stored.saved_connection = Some(unrelated_cache.clone());
+    stored.pinned_connection = Some(cached_stray_connection(
+        "stray-lease",
+        StoredConnectionKind::Pinned,
+    ));
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = support::core(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(matches!(
+        core.stop().await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    let repaired = store.load().unwrap().unwrap();
+    assert!(repaired.pending_start.is_none());
+    assert!(repaired.pinned_connection.is_none());
+    assert_eq!(repaired.saved_connection, Some(unrelated_cache));
+}
+
+#[tokio::test]
+async fn cancelled_async_start_replays_lost_cancellation_after_reconstruction() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    api.async_stop_start.store(true, Ordering::SeqCst);
+    api.hold_start.store(true, Ordering::SeqCst);
+    api.reconcile_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err(CoreApiError::Retryable));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let attempt = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.start_recovery_v2_with_cancellation_epoch(options(), 1_700_000_000, true, epoch)
+                .await
+        })
+    };
+    api.start_seen.notified().await;
+    core.signal_start_cancellation();
+    api.release_start.notify_one();
+    let _ = attempt.await.unwrap();
+    core.finish_start_attempt();
+    let pending = store.load().unwrap().unwrap().pending_start.unwrap();
+    assert!(pending.cancel_operation_id.is_some());
+    assert!(core.has_pending_stop_cleanup().unwrap());
+    let reconstructed = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let _ = reconstructed.stop().await;
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert!(!reconstructed.has_pending_stop_cleanup().unwrap());
+    let requests = api.reconcile_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|r| r.operation_id == pending.operation_id && r.cancel_if_absent));
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_async_start_does_not_cancel_a_live_native_owner() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    api.async_stop_start.store(true, Ordering::SeqCst);
+    api.hold_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let epoch = core.begin_start_attempt();
+    let attempt = {
+        let core = core.clone();
+        tokio::spawn(async move {
+            core.start_recovery_v2_with_cancellation_epoch(options(), 1_700_000_000, true, epoch)
+                .await
+        })
+    };
+    api.start_seen.notified().await;
+    core.signal_start_cancellation();
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    api.release_start.notify_one();
+    assert!(attempt.await.unwrap().is_err());
+    core.finish_start_attempt();
+    assert!(api.reconcile_requests.lock().unwrap().is_empty());
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Running);
+    assert!(core.has_pending_stop_cleanup().unwrap());
+}
+
+#[tokio::test]
+async fn cancelled_start_keeps_journal_when_reply_does_not_confirm_cancellation() {
+    let mut stored = auth();
+    stored.pending_start = Some(pending_redundant_cleanup());
+    let store = Arc::new(MemoryStore::new(stored));
+    let api = Arc::new(MockApi::new(0));
+    let mut reply = cleanup_reconciliation(OperationState::Cancelled);
+    reply.cancel_requested = false;
+    api.reconcile_responses.lock().unwrap().push_back(reply);
+    let core = support::core(
+        api,
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    assert!(core.stop().await.is_err());
+    assert!(core.has_pending_stop_cleanup().unwrap());
+    assert!(store.load().unwrap().unwrap().pending_start.is_some());
+}
+
+async fn assert_cancel_replay_is_fenced_during_owner_wait(
+    hold_refresh: bool,
+    activate_native: bool,
+) {
+    let statuses = if activate_native {
+        vec![
+            TunnelStatus::Stopped,
+            TunnelStatus::Starting,
+            TunnelStatus::Running,
+        ]
+    } else {
+        vec![TunnelStatus::Stopped]
+    };
+    for native_status in statuses {
+        let pending = pending_redundant_cleanup();
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        if hold_refresh {
+            api.reconcile_errors
+                .lock()
+                .unwrap()
+                .push_back(CoreApiError::Unauthorized);
+        }
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(HeldCleanupAuth {
+            inner: Arc::new(support::TestOwner::new(
+                api.clone(),
+                store.clone(),
+                local.clone(),
+            )),
+            hold_refresh,
+            entered: Notify::new(),
+            release: Notify::new(),
+            completed: AtomicUsize::new(0),
+        });
+        let core = Arc::new(nelomai_client_core::ClientCore::new(
+            api.clone(),
+            Arc::new(support::LegacyRuntime::new(store.clone())),
+            owner.clone(),
+            local,
+            Arc::new(MemoryLogger::default()),
+        ));
+        let task = {
+            let core = core.clone();
+            tokio::spawn(async move { core.stop().await })
+        };
+        owner.entered.notified().await;
+        if activate_native {
+            tunnel.native_session_owned.store(true, Ordering::SeqCst);
+            *tunnel.status.lock().unwrap() = native_status;
+        } else {
+            core.signal_start_cancellation();
+        }
+        owner.release.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(owner.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            api.reconcile_requests.lock().unwrap().len(),
+            usize::from(hold_refresh)
+        );
+        assert_eq!(
+            api.refresh_calls.load(Ordering::SeqCst),
+            usize::from(hold_refresh)
+        );
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+        assert!(core.has_pending_stop_cleanup().unwrap());
+        tunnel.native_session_owned.store(false, Ordering::SeqCst);
+        *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+        owner.release.notify_one();
+        let _ = core.stop().await;
+        assert!(!core.has_pending_stop_cleanup().unwrap());
+        assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_native_activation_during_access_preserves_journal() {
+    assert_cancel_replay_is_fenced_during_owner_wait(false, true).await;
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_native_activation_during_refresh_prevents_redispatch() {
+    assert_cancel_replay_is_fenced_during_owner_wait(true, true).await;
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_generation_change_during_access_preserves_journal() {
+    assert_cancel_replay_is_fenced_during_owner_wait(false, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_generation_change_during_refresh_prevents_redispatch() {
+    assert_cancel_replay_is_fenced_during_owner_wait(true, false).await;
+}
+
+async fn assert_cancel_replay_is_fenced_during_reconcile(activate_native: bool) {
+    let statuses = if activate_native {
+        vec![
+            TunnelStatus::Stopped,
+            TunnelStatus::Starting,
+            TunnelStatus::Running,
+        ]
+    } else {
+        vec![TunnelStatus::Stopped]
+    };
+    for native_status in statuses {
+        let pending = pending_redundant_cleanup();
+        let mut stored = auth();
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.hold_reconcile.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = Arc::new(support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let task = {
+            let core = core.clone();
+            tokio::spawn(async move { core.stop().await })
+        };
+        api.reconcile_seen.notified().await;
+        if activate_native {
+            tunnel.native_session_owned.store(true, Ordering::SeqCst);
+            *tunnel.status.lock().unwrap() = native_status;
+        } else {
+            core.signal_start_cancellation();
+        }
+        api.release_reconcile.notify_one();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(api.reconcile_requests.lock().unwrap().len(), 1);
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+        assert!(core.has_pending_stop_cleanup().unwrap());
+        assert_eq!(core.state().await.phase, Phase::Stopping);
+        tunnel.native_session_owned.store(false, Ordering::SeqCst);
+        *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+        api.hold_reconcile.store(false, Ordering::SeqCst);
+        let _ = core.stop().await;
+        assert!(!core.has_pending_stop_cleanup().unwrap());
+        assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_native_activation_during_reconcile_preserves_journal() {
+    assert_cancel_replay_is_fenced_during_reconcile(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_start_replay_generation_change_during_reconcile_preserves_journal() {
+    assert_cancel_replay_is_fenced_during_reconcile(false).await;
 }

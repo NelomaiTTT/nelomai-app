@@ -242,7 +242,10 @@ impl RemoteOwner {
         let mut cancel = self.outbox.cancellation();
         let result = tokio::select! { biased;
             _ = closed(&mut cancel) => Err(PrivateError::Closed),
-            result = timeout_at(deadline, receiver) => result.map_err(|_| PrivateError::Timeout)?.map_err(|_| PrivateError::Closed),
+            result = timeout_at(deadline, receiver) => result.map_err(|_| {
+                self.outbox.close_with_reason("request_timeout");
+                PrivateError::Timeout
+            })?.map_err(|_| PrivateError::Closed),
         }?;
         if matches!(&result, ControlAckV1::Prepared { lease } if lease.request != id || lease.incarnation != self.binding.incarnation)
         {
@@ -516,14 +519,15 @@ impl RemoteOwner {
     /// Explicit startup/control admission. Read-only state/access never binds a
     /// missing runtime scope. The actual child record is the only full writer.
     pub async fn admit_empty_current(&self, broker: &AuthBroker) -> Result<(), PrivateError> {
-        self.admit_current_after(broker, || Ok(())).await
+        self.admit_current_after(broker, Instant::now() + REQUEST_BUDGET, || Ok(()))
+            .await
     }
     pub(crate) async fn admit_current_after(
         &self,
         broker: &AuthBroker,
+        deadline: Instant,
         finish: impl FnOnce() -> Result<(), PrivateError> + Send,
     ) -> Result<(), PrivateError> {
-        let deadline = Instant::now() + REQUEST_BUDGET;
         timeout_at(deadline, async {
             // RuntimeReady is also used by UI retries. Keep an already admitted
             // exact scope live while schedulers have access requests in flight.
@@ -585,16 +589,21 @@ impl RemoteOwner {
         &self,
         broker: &AuthBroker,
         coordinator: &crate::SwitchCoordinator,
+        deadline: Instant,
     ) -> Result<(), PrivateError> {
-        let _execution = coordinator.lock_logout_cleanup().await;
-        let Some(receipt) = broker
-            .completed_runtime_logout()
+        // Only observation/lock acquisition is cancellable here. Once native
+        // cleanup is dispatched, retain the original deadline for its proof.
+        let recovery_deadline = deadline - AUTH_REPLY_MARGIN;
+        let _execution = timeout_at(recovery_deadline, coordinator.lock_logout_cleanup())
             .await
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        let Some(receipt) = timeout_at(recovery_deadline, broker.completed_runtime_logout())
+            .await
+            .map_err(|_| PrivateError::RecoveryRequired)?
             .map_err(broker_error)?
         else {
             return Ok(());
         };
-        let deadline = Instant::now() + REQUEST_BUDGET;
         let lease = self.prepare(deadline).await?;
         let _held = AdmissionLease {
             owner: self,
@@ -645,7 +654,9 @@ impl RemoteOwner {
                     .commands
                     .as_ref()
                     .ok_or(PrivateError::RecoveryRequired)?;
-                let response = commands.dispatch(&self.binding.target, request).await?;
+                let response = commands
+                    .dispatch(&self.binding.target, request, deadline)
+                    .await?;
                 self.live(deadline)?;
                 AuthResponseV1::Owner { response }
             }
@@ -762,10 +773,12 @@ impl RemoteOwner {
             }
             AuthRequestV1::AccessToken { stamp, stale } => {
                 let stamp = stamp.ok_or(PrivateError::Cancelled)?;
-                let (observed_stamp, observation) = broker
-                    .observe_access_stamped()
-                    .await
-                    .map_err(broker_error)?;
+                let auth_deadline = deadline - AUTH_REPLY_MARGIN;
+                let (observed_stamp, observation) =
+                    timeout_at(auth_deadline, broker.observe_access_stamped())
+                        .await
+                        .map_err(|_| PrivateError::RefreshPending)?
+                        .map_err(broker_error)?;
                 if observation.state == BrokerAuthState::LoggedOut {
                     // A completed logout has no token by design, not because
                     // protected storage needs recovery. Preserve that state so
@@ -783,9 +796,9 @@ impl RemoteOwner {
                 }
                 let current = match observation.access {
                     Some(access) => access,
-                    None => broker
-                        .pending_refresh_access()
+                    None => timeout_at(auth_deadline, broker.pending_refresh_access())
                         .await
+                        .map_err(|_| PrivateError::RefreshPending)?
                         .map_err(broker_error)?,
                 };
                 self.check_target(&current)?;
@@ -805,12 +818,19 @@ impl RemoteOwner {
                     return Err(PrivateError::Protocol);
                 }
                 self.live(deadline)?;
-                let access = broker
-                    .access_token_fenced_checked(&stamp, stale.as_ref(), || {
-                        self.live(deadline).map_err(|_| BrokerError::Cancelled)
-                    })
-                    .await
-                    .map_err(broker_error)?;
+                // This bounds issuance waits and BOTH possible recoverable
+                // refresh HTTP calls together. A dropped HTTP outcome retains
+                // its durable pending ticket; it never retries an ordinary old
+                // refresh proof or grants access after the request's deadline.
+                let access = timeout_at(
+                    auth_deadline,
+                    broker.access_token_fenced_checked(&stamp, stale.as_ref(), || {
+                        self.live(auth_deadline).map_err(|_| BrokerError::Cancelled)
+                    }),
+                )
+                .await
+                .map_err(|_| PrivateError::RefreshPending)?
+                .map_err(broker_error)?;
                 self.check_target(&access)?;
                 if !matches!(
                     self.control(
@@ -864,6 +884,7 @@ impl RemoteOwner {
                         .dispatch(
                             &self.binding.target,
                             crate::host::HostRequestV1::RuntimeReady,
+                            deadline,
                         )
                         .await?;
                 }
@@ -1085,6 +1106,14 @@ impl Drop for PrivateRuntimeAuthClient {
     }
 }
 impl PrivateRuntimeAuthClient {
+    /// The first fixed local cause, without private frames or server text.
+    pub async fn wait_for_channel_close(&self) -> &'static str {
+        let mut receiver = self.outbox.cancellation();
+        closed(&mut receiver).await;
+        let reason = (*receiver.borrow()).unwrap_or("local_close");
+        reason
+    }
+
     pub async fn owner_request(
         &self,
         request: crate::host::HostRequestV1,
@@ -1124,6 +1153,12 @@ impl PrivateRuntimeAuthClient {
         let mut cancel = outbox.cancellation();
         tokio::spawn(async move {
             let mut controls = tokio::task::JoinSet::new();
+            let mut confirmed_logout = false;
+            let mut observed_logout = false;
+            // Causal history, not the current admission latch: an attempted
+            // Prepare retires State evidence even before Access/Grant, and
+            // expiry cannot make a delayed State authoritative again.
+            let mut admission_seen = false;
             let mut expiry = tokio::time::interval(Duration::from_millis(10));
             loop {
                 let (frame, deadline) = tokio::select! { biased;
@@ -1138,12 +1173,41 @@ impl PrivateRuntimeAuthClient {
                 match frame.message {
                     MessageV1::Response(response) => {
                         if let AuthResponseV1::Access { stamp, access } = &response {
-                            if *stamp != ScopeStamp::from_access(access)
-                                || client_child.check(&scope(access)).is_err()
-                            {
+                            if *stamp != ScopeStamp::from_access(access) {
                                 break;
                             }
+                            if let Err(error) = client_child.check(&scope(access)) {
+                                if error != PrivateError::RecoveryRequired {
+                                    break;
+                                }
+                                // Prepare/Revoke can overtake the owner's checked
+                                // reply. Never deliver access without admission,
+                                // but let recovery finish on this same channel.
+                                // Unknown/duplicate replies still close the peer.
+                                if client_pending
+                                    .finish(frame.id, AuthResponseV1::Error { error })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                            confirmed_logout = false;
+                            observed_logout = false;
+                            admission_seen = true;
+                        } else if !admission_seen
+                            && matches!(
+                                &response,
+                                AuthResponseV1::State {
+                                    state: RuntimeAuthState::LoggedOut,
+                                    ..
+                                }
+                            )
+                        {
+                            observed_logout = true;
                         }
+                        // After admission begins, ordered Revoke/Stop controls,
+                        // not delayed State, establish logout.
                         if client_pending.finish(frame.id, response).is_err() {
                             break;
                         }
@@ -1154,6 +1218,10 @@ impl PrivateRuntimeAuthClient {
                                 if controls.len() >= MAX_PENDING {
                                     break;
                                 }
+                                // Cleanup Prepare must retain explicit logout;
+                                // a new admission must retire mere observation.
+                                observed_logout = false;
+                                admission_seen = true;
                                 let child = client_child.clone();
                                 let outbox = client_box.clone();
                                 controls.spawn(async move {
@@ -1195,6 +1263,9 @@ impl PrivateRuntimeAuthClient {
                                 if client_child.grant(&lease, &granted).is_err() {
                                     break;
                                 }
+                                confirmed_logout = false;
+                                observed_logout = false;
+                                admission_seen = true;
                                 if let Some((reply_to, response)) = *response {
                                     if client_pending.finish(reply_to, response).is_err() {
                                         break;
@@ -1207,6 +1278,7 @@ impl PrivateRuntimeAuthClient {
                                 continue;
                             }
                             ControlV1::Revoke => {
+                                confirmed_logout = true;
                                 client_child.revoke();
                                 continue;
                             }
@@ -1227,6 +1299,7 @@ impl PrivateRuntimeAuthClient {
                                 .complete_logout(&lease, &receipt)
                                 .map(|()| ControlAckV1::Done),
                             ControlV1::Stop => {
+                                confirmed_logout = true;
                                 if controls.len() >= MAX_PENDING {
                                     break;
                                 }
@@ -1284,12 +1357,19 @@ impl PrivateRuntimeAuthClient {
                 }
             }
             client_child.close();
-            client_box.close();
+            client_box.close_with_reason("response_or_control_rejected");
             client_pending.clear();
             controls.abort_all();
             // Physical stop is independent of held writer guards and is polled
             // even when the peer disappeared before an explicit Stop command.
-            let _ = timeout_at(Instant::now() + REQUEST_BUDGET, stop.stop_local()).await;
+            let _ = timeout_at(Instant::now() + REQUEST_BUDGET, async {
+                if confirmed_logout || observed_logout {
+                    stop.stop_local().await
+                } else {
+                    stop.stop_local_on_disconnect().await
+                }
+            })
+            .await;
             while controls.join_next().await.is_some() {}
         });
         Self {
@@ -1328,7 +1408,9 @@ impl PrivateRuntimeAuthClient {
         let (receiver, login_id) = {
             let _send = self.send_gate.lock().map_err(|_| PrivateError::Closed)?;
             let id = self.outbox.id()?;
-            let receiver = self.pending.insert(id)?;
+            let receiver = self.pending.insert(id).inspect_err(|_| {
+                self.outbox.close_with_reason("pending_limit_or_duplicate");
+            })?;
             let login_id = if matches!(request, AuthRequestV1::Login { .. }) {
                 let mut pending = self
                     .pending_login
@@ -1353,7 +1435,10 @@ impl PrivateRuntimeAuthClient {
         let mut cancel = self.outbox.cancellation();
         let response = tokio::select! { biased;
             _ = closed(&mut cancel) => Err(PrivateError::Closed),
-            result = timeout_at(deadline, receiver) => result.map_err(|_| PrivateError::Timeout)?.map_err(|_| PrivateError::Closed),
+            result = timeout_at(deadline, receiver) => result.map_err(|_| {
+                self.outbox.close_with_reason("request_timeout");
+                PrivateError::Timeout
+            })?.map_err(|_| PrivateError::Closed),
         }?;
         lifetime.complete = true;
         // Login/logout may advance the broker epoch even when they fail.
@@ -1463,6 +1548,10 @@ impl nelomai_client_core::RuntimeStartPreflight for PrivateRuntimeAuthClient {
 
 #[async_trait]
 impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
+    fn is_channel_closed(&self) -> bool {
+        self.outbox.is_closed()
+    }
+
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
         match self
             .request(AuthRequestV1::State, Instant::now() + REQUEST_BUDGET)
