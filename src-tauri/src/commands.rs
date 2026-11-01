@@ -855,7 +855,6 @@ async fn bootstrap_application_for_startup(
             async {
                 observe_private_auth_result(recovery.await, diagnostics, SupportAuthStage::Recover)
                     .map(|_| ())
-                    .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
             },
             application.bootstrap(now_unix),
         )
@@ -893,7 +892,7 @@ fn runtime_readiness_error(error: nelomai_client_container::ipc::PrivateError) -
 #[cfg(any(target_os = "android", test))]
 async fn route_android_startup_recovery<T>(
     first_error: ApplicationError,
-    recovery: impl std::future::Future<Output = Result<(), CoreError>>,
+    recovery: impl std::future::Future<Output = Result<(), nelomai_client_container::ipc::PrivateError>>,
     ordinary_bootstrap: impl std::future::Future<Output = Result<T, ApplicationError>>,
 ) -> Result<T, CommandError> {
     if !matches!(
@@ -902,11 +901,24 @@ async fn route_android_startup_recovery<T>(
     ) {
         return Err(first_error.into());
     }
+    use nelomai_client_container::ipc::PrivateError;
     match recovery.await {
-        Ok(()) | Err(CoreError::AuthRecoveryRequired) => {
+        Ok(()) | Err(PrivateError::RecoveryRequired) => {
             ordinary_bootstrap.await.map_err(Into::into)
         }
-        Err(error) => Err(CommandError::from_core(error)),
+        Err(PrivateError::Closed) => Err(CommandError::new(
+            "runtime_channel_closed",
+            "Потеряна связь со службой подключения",
+        )),
+        Err(error) => Err(CommandError::from_core(match error {
+            PrivateError::Timeout | PrivateError::Service | PrivateError::RefreshPending => {
+                CoreError::Api(nelomai_client_core::CoreApiError::Retryable)
+            }
+            PrivateError::Cancelled => CoreError::StartCancelled,
+            PrivateError::AccessUnavailable => CoreError::AccessExpired,
+            PrivateError::OutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
+            _ => CoreError::AuthRecoveryRequired,
+        })),
     }
 }
 
@@ -5047,7 +5059,10 @@ mod tests {
     #[tokio::test]
     async fn android_startup_owner_rejection_never_falls_through_after_logout_or_access_expiry() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for rejection in [CoreError::StartCancelled, CoreError::AccessExpired] {
+        for rejection in [
+            nelomai_client_container::ipc::PrivateError::Cancelled,
+            nelomai_client_container::ipc::PrivateError::AccessUnavailable,
+        ] {
             let fallbacks = AtomicUsize::new(0);
             let result = route_android_startup_recovery(
                 ApplicationError::Core(CoreError::AuthRecoveryRequired),
@@ -5076,6 +5091,50 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn android_startup_known_refusal_can_retry_ordinary_bootstrap() {
+        use nelomai_client_container::ipc::PrivateError;
+        for recovery in [Ok(()), Err(PrivateError::RecoveryRequired)] {
+            let result = route_android_startup_recovery(
+                ApplicationError::Core(CoreError::AuthRecoveryRequired),
+                async { recovery },
+                async { Ok::<_, ApplicationError>(42) },
+            )
+            .await;
+            assert_eq!(result.ok(), Some(42));
+        }
+    }
+
+    #[tokio::test]
+    async fn android_startup_owner_errors_keep_retryability_without_ordinary_auth_fallback() {
+        use nelomai_client_container::ipc::PrivateError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (failure, expected) in [
+            (PrivateError::Timeout, "temporarily_unavailable"),
+            (PrivateError::Service, "temporarily_unavailable"),
+            (PrivateError::RefreshPending, "temporarily_unavailable"),
+            (PrivateError::Closed, "runtime_channel_closed"),
+            (PrivateError::Protocol, "auth_recovery_required"),
+            (PrivateError::RefreshRejected, "auth_recovery_required"),
+            (
+                PrivateError::OutcomeUnknown,
+                "authentication_outcome_unknown",
+            ),
+        ] {
+            let fallbacks = AtomicUsize::new(0);
+            let result = route_android_startup_recovery(
+                ApplicationError::Core(CoreError::AuthRecoveryRequired),
+                async { Err(failure) },
+                async {
+                    fallbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ApplicationError>(42)
+                },
+            )
+            .await;
+            assert_eq!(result.err().map(|error| error.code), Some(expected.into()));
+            assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+        }
     }
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};

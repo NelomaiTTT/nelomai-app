@@ -925,6 +925,7 @@ internal class ServiceRedundantConnectionPanel(
         AndroidRedundantTransaction,
         String,
     ) -> org.json.JSONObject = BackgroundConnectionClient::stopRedundant,
+    private val cleanupCredential: (String) -> BackgroundCredential = credential,
 ) : RedundantConnectionPanel {
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
         val transport = recoverTransport(
@@ -984,7 +985,8 @@ internal class ServiceRedundantConnectionPanel(
         val leaseId = transaction.localActiveLeaseId ?: transaction.slotALeaseId ?: transaction.slotBLeaseId
             ?: return RedundantStopOutcome.Pending
         return runCatching {
-            val auth = credential(transaction.template.deviceId)
+            val auth = cleanupCredential(transaction.template.deviceId)
+            require(auth.deviceId == transaction.template.deviceId)
             val reply = stopTransport(auth, transaction, leaseId)
             val accepted = reply.optJSONObject("stop_acceptance")
             if (accepted != null) {

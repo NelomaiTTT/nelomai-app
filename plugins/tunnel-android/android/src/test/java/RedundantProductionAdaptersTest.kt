@@ -477,6 +477,83 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun redundantStopUsesRetainedCredentialAfterLogoutStarts() {
+        val device = "11111111-1111-4111-8111-111111111111"
+        var bytes: ByteArray? = null
+        val credentials = BackgroundCredentialStore(object : EncryptedRecordBackend {
+            override fun read() = bytes?.clone()
+            override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.clone(); return true }
+        })
+        assertTrue(credentials.configure(0, BackgroundCredentialProvision(device,
+            "https://nelomai.example", "original-token", 1_900_000_000,
+            "install-secret", 1, BackgroundCapabilitySnapshot(1, true, 1_900_000_000)))
+            is CredentialStoreResult.Success)
+        assertTrue(credentials.beginLogoutCurrent("33333333-3333-4333-8333-333333333333")
+            is CredentialStoreResult.Success)
+        val stopped = AndroidRedundantTransaction(false,
+            AndroidIntentTemplate(device, "account", "stray", "dynamic", "standalone", "ipv4", true),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "lease-a", slotBLeaseId = null, localActiveLeaseId = "lease-a", standbyDesired = false,
+            roleGeneration = 1, membershipGeneration = 1, startOperationId = "start",
+            startRequestFingerprint = "f".repeat(64))
+        var cleanupTransportCalls = 0
+        val panel = ServiceRedundantConnectionPanel(
+            credential = { error("active credential must not be requested during Logout cleanup") },
+            cleanupCredential = { _ ->
+                val envelope = (credentials.read() as CredentialStoreResult.Success).value
+                assertEquals(null, envelope.active)
+                requireNotNull(envelope.cleanupCredential).also { assertEquals(device, it.deviceId) }
+            },
+            stopTransport = { auth, tx, lease ->
+                cleanupTransportCalls++
+                assertEquals("original-token", auth.token)
+                assertEquals(stopped, tx)
+                org.json.JSONObject().put("connection", org.json.JSONObject()
+                    .put("lease_id", lease).put("status", "released").put("session_id", org.json.JSONObject.NULL))
+            })
+        repeat(2) { assertEquals(RedundantStopOutcome.Completed, panel.stopOutcome(stopped)) }
+        assertEquals(RedundantStopOutcome.Pending, panel.stopOutcome(stopped.copy(
+            template = stopped.template.copy(deviceId = "44444444-4444-4444-8444-444444444444"))))
+        assertEquals("Wrong-device Stop must not reach HTTP", 2, cleanupTransportCalls)
+        try {
+            panel.recover(stopped)
+            org.junit.Assert.fail("Cleanup credential must not authorize recovery")
+        } catch (_: IllegalStateException) { }
+    }
+
+    @Test
+    fun recoveredFormerActiveCanServeTheNextFailoverWithoutUserTraffic() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            var firstSwitch: Int? = null
+            for (now in 30_000L..45_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                assertFalse("first failure unexpectedly stalled", decision.sessionStalled)
+                if (decision.switchTo != null) {
+                    firstSwitch = decision.switchTo
+                    assertTrue(fixture.native.activate(if (firstSwitch == 0) "lease-a" else "lease-b"))
+                    break
+                }
+            }
+            assertEquals(1 - primary, firstSwitch)
+            // Native consumes DNS replies itself: a healthy standby need not
+            // produce any TUN writes while the other slot carries user traffic.
+            for (now in 46_000L..70_000L step 1_000L) {
+                val decision = fixture.tick(now) { _, _ -> true }
+                assertFalse(decision.sessionStalled)
+                assertEquals(null, decision.switchTo)
+            }
+            var secondSwitch: Int? = null
+            for (now in 71_000L..85_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot == primary }
+                assertFalse("recovered former active rejected at $now, primary=$primary", decision.sessionStalled)
+                if (decision.switchTo != null) { secondSwitch = decision.switchTo; break }
+            }
+            assertEquals("healthy former active must receive traffic again", primary, secondSwitch)
+        }
+    }
+
+    @Test
     fun dnsOnlyFailureDoesNotStopOrdinaryStandbyProbes() {
         for (primary in listOf(0, 1)) {
             val fixture = pairFixture(primary)

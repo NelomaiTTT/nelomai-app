@@ -99,6 +99,7 @@ async fn actual_reply_adapter_clears_only_known_refusal_ticket_and_permits_refre
         ("background_recovery_not_issued", false, false),
         ("app_access_unavailable", false, true),
         ("native_outcome_unknown", true, false),
+        ("background_transport_unavailable", true, false),
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
@@ -207,6 +208,14 @@ async fn actual_reply_adapter_clears_only_known_refusal_ticket_and_permits_refre
             .await;
         assert!(result.is_err());
         assert_eq!(
+            matches!(
+                &result,
+                Err(CoreError::Api(nelomai_client_core::CoreApiError::Retryable))
+            ),
+            code == "background_transport_unavailable",
+            "Only a typed transport failure may become retryable: {code}",
+        );
+        assert_eq!(
             matches!(result, Err(CoreError::AccessExpired)),
             access_expired,
             "{code}"
@@ -228,6 +237,28 @@ async fn actual_reply_adapter_clears_only_known_refusal_ticket_and_permits_refre
             assert!(matches!(fallback, Err(BrokerError::RecoveryRequired)));
         } else {
             assert_eq!(fallback.unwrap().access_token(), "successor-access");
+        }
+        if code == "background_transport_unavailable" {
+            let recovered = port.recover_background(|_| async {
+                Ok(serde_json::from_value(json!({
+                    "api_version":"1","request_id":"native-retry","token_type":"Bearer",
+                    "access_token":"native-recovered","access_expires_in":900,
+                    "refresh_token":"native-refresh","refresh_expires_in":3600,
+                    "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                    "device":{"id":"device","name":"test","platform":"android",
+                        "container_version":"0.2.16","runtime_version":"0.2.16",
+                        "runtime_contract_version":1,"runtime_slot":"latest","session_generation":7}
+                })).unwrap())
+            }).await.unwrap();
+            assert_eq!(recovered.access_token(), "native-recovered");
+            assert!(store
+                .load()
+                .unwrap()
+                .unwrap()
+                .broker
+                .unwrap()
+                .pending_recovery
+                .is_none());
         }
         assert_eq!(
             calls.load(Ordering::SeqCst),

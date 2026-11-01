@@ -45,7 +45,10 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
             handler.postDelayed(timeout, 10_000)
             return
         }
-        bound = context.bindService(Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService"), connection, Context.BIND_AUTO_CREATE)
+        // The owner has hosted launcher UI and can be cached before its runtime.
+        // Track Android's freezer dependency even while the owner is cached.
+        bound = context.bindService(Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService"), connection,
+            Context.BIND_AUTO_CREATE or Context.BIND_ALLOW_OOM_MANAGEMENT)
         if (!bound) complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         else handler.postDelayed(timeout, 10_000)
     }

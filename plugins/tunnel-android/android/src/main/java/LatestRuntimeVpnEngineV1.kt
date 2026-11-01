@@ -19,6 +19,10 @@ class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1 {
 
 internal fun requiresVpnStartAdmission(context: android.content.Context, intent: Intent?): Boolean =
     when (intent?.action) {
+        // A stopped durable intent may still own lease/logout cleanup. Such
+        // recovery must remain available before VPN permission is granted.
+        NelomaiVpnService.ACTION_ENSURE_RUNNING ->
+            QuickTunnelController.desiredActiveSnapshot(context) != false
         NelomaiVpnService.ACTION_QUICK_TOGGLE -> !QuickTunnelController.desiredActive(context)
         NelomaiVpnService.ACTION_CANCEL_CLIENT_START, NelomaiVpnService.ACTION_CLIENT_STOP,
         NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY,

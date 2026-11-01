@@ -2601,6 +2601,61 @@ async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refres
     }
 }
 
+struct TemporaryRecovery;
+#[async_trait::async_trait]
+impl PrivateBackgroundDispatcher for TemporaryRecovery {
+    async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: crate::NativeAuthRequest,
+        action: BackgroundAction,
+    ) -> Result<Option<nelomai_client_api::TokenResponse>, crate::NativeAuthFailure> {
+        assert!(matches!(action, BackgroundAction::Recover));
+        Err(crate::NativeAuthFailure::TemporarilyUnavailable)
+    }
+}
+
+#[tokio::test]
+async fn temporary_native_recovery_preserves_private_channel_and_uncertain_auth_fence() {
+    let fixture = Fixture::with_background(
+        ClientApi::new("http://127.0.0.1:9").unwrap(),
+        true,
+        Some(Arc::new(TemporaryRecovery)),
+    );
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("synthetic-device".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let original = fixture.client.access(None).await.unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            fixture.client.background(BackgroundAction::Recover).await,
+            Err(PrivateError::Timeout)
+        ));
+        assert!(!fixture.client.is_channel_closed());
+        assert!(fixture.child.check(&transport::scope(&original)).is_err());
+        assert!(fixture
+            .auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_recovery
+            .is_some());
+        assert_eq!(
+            fixture.auth.load().unwrap().unwrap().refresh_token,
+            auth.refresh_token
+        );
+    }
+}
+
 struct Provision(AtomicUsize, AtomicUsize);
 
 struct RefuseRecovery(bool);
@@ -4335,4 +4390,134 @@ async fn unknown_private_login_then_logout_can_reauthenticate_same_account() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     fixture.child.check(&transport::scope(&access)).unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn slow_login_returns_before_ipc_deadline_without_losing_uncertain_ticket() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/login",
+        axum::routing::post(move || {
+            let counted = counted.clone();
+            async move {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(REQUEST_BUDGET * 2).await;
+                }
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "request_id":"synthetic", "code":"invalid_credentials", "message":"rejected"
+                    })),
+                )
+            }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, false);
+    let started = Instant::now();
+    assert!(matches!(
+        fixture.client.login(password_login()).await,
+        Err(nelomai_client_core::CoreError::Api(
+            nelomai_client_core::CoreApiError::Retryable
+        ))
+    ));
+    assert!(
+        !fixture.client.is_channel_closed(),
+        "a slow HTTP Login must return an error before the IPC channel expires"
+    );
+    assert!(started.elapsed() < REQUEST_BUDGET - Duration::from_millis(500));
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::AuthenticationOutcomeUnknown
+    );
+    let uncertain = fixture.auth.load().unwrap().unwrap();
+    assert!(uncertain.broker.as_ref().unwrap().pending_request.is_some());
+    assert!(fixture.client.check_start_barrier().is_err());
+    let mut foreign = password_login();
+    foreign.login = "different-account".into();
+    assert!(fixture.client.login(foreign).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "unknown Login fences other accounts"
+    );
+    assert!(fixture.client.login(password_login()).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "explicit same-account retry reaches HTTP"
+    );
+    assert!(!fixture.client.is_channel_closed());
+    assert!(fixture.client.check_start_barrier().is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn durable_logout_cancels_old_native_wait_before_runtime_cleanup() {
+    for recover in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let router = axum::Router::new().route("/api/client/v1/auth/logout-runtime", axum::routing::post(|| async {
+            axum::Json(serde_json::json!({"code":"session_revoked_cleanup_accepted","cleanup_reconcile_operation_id":"11111111-1111-4111-8111-111111111111"}))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let fixture = Fixture::new(api, true);
+        let mut auth = fixture.auth.load().unwrap().unwrap();
+        auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+        fixture.auth.save(&auth).unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let incoming = entered.clone();
+        let broker = fixture.broker.clone();
+        let pending = tokio::spawn(async move {
+            broker
+                .native_auth(
+                    |_| Ok(()),
+                    move |_| async move {
+                        incoming.notify_one();
+                        std::future::pending().await
+                    },
+                    recover,
+                )
+                .await
+        });
+        entered.notified().await;
+        fixture.client.logout().await.unwrap();
+        let receipt = fixture
+            .broker
+            .completed_runtime_logout()
+            .await
+            .unwrap()
+            .unwrap();
+        let cleanup = tokio::time::timeout(
+            Duration::from_millis(200),
+            fixture.broker.stop_runtime_logout_cleanup(&receipt),
+        )
+        .await;
+        assert!(
+            matches!(cleanup, Ok(Ok(()))),
+            "revoked native wait held issuance through post-Logout cleanup: recover={recover}"
+        );
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::BrokerError::Cancelled)
+        ));
+        assert_eq!(
+            fixture.broker.auth_state().await.unwrap(),
+            crate::BrokerAuthState::LoggedOut
+        );
+        assert!(fixture
+            .auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_recovery
+            .is_none());
+        assert!(fixture.client.check_start_barrier().is_err());
+        server.abort();
+    }
 }

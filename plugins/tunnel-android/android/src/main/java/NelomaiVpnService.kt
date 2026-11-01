@@ -1577,7 +1577,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         val ownerServiceGeneration = serviceGeneration
         val coordinator = RedundantConnectionCoordinator(
             recoveryStore,
-            ServiceRedundantConnectionPanel(::serviceActiveCredential),
+            ServiceRedundantConnectionPanel(
+                ::serviceActiveCredential,
+                cleanupCredential = { serviceCredential() },
+            ),
             native,
             healthMonitor = redundantHealthMonitorForNetwork(physicalState),
             onAllSlotsStalled = {
@@ -4834,12 +4837,16 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         ) return
         TunnelLog.info("service.recovery_owner_requested", mapOf("reason" to reason))
         runCatching {
-            ContextCompat.startForegroundService(
-                applicationContext,
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
-                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
-                        .setAction(ACTION_ENSURE_RUNNING)),
-            )
+            val intent = ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
+                .setAction(ACTION_ENSURE_RUNNING)
+            if (requiresVpnStartAdmission(applicationContext, intent)) {
+                ContextCompat.startForegroundService(
+                    applicationContext,
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(intent),
+                )
+            } else {
+                applicationContext.startService(intent)
+            }
         }.onFailure { error ->
             TunnelLog.warning("service.recovery_owner_request_failed", error = error)
         }

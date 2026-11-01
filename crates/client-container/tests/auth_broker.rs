@@ -1020,13 +1020,24 @@ async fn owner_native_recovery_checks_real_runtime_admission_and_ignores_stale_e
             .await,
         Err(nelomai_client_core::CoreError::AccessExpired)
     ));
+    // Logout owns its completion independently of the native callback being
+    // cancelled. Nesting logout inside that cancellable future would drop the
+    // test's revocation itself at the durable cancellation notification.
+    let native_entered = Arc::new(Notify::new());
+    let entered = native_entered.clone();
+    let logout_broker = broker.clone();
+    let logout = tokio::spawn(async move {
+        entered.notified().await;
+        logout_broker.logout().await.unwrap();
+    });
     assert!(port
         .recover_background(|_| async {
-            broker.logout().await.unwrap();
-            Err(NativeAuthFailure::NotIssued)
+            native_entered.notify_one();
+            std::future::pending().await
         })
         .await
         .is_err());
+    logout.await.unwrap();
     assert_eq!(
         store.load().unwrap().unwrap().logout_state,
         LogoutState::LoggedOut

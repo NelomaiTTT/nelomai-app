@@ -705,8 +705,12 @@ impl RemoteOwner {
                     architecture: self.profile.architecture.clone(),
                     app_version: self.binding.target.container_version.clone(),
                 };
-                let access = broker
-                    .login_fenced_with_ticket(
+                // Return a slow Login before the channel's own deadline. A
+                // cancelled password request retains its durable unknown-outcome
+                // ticket; it must not also retire the usable owner channel.
+                let access = timeout_at(
+                    deadline - AUTH_REPLY_MARGIN,
+                    broker.login_fenced_with_ticket(
                         &request,
                         &self.binding.target,
                         &fence,
@@ -720,8 +724,10 @@ impl RemoteOwner {
                                 }
                             }
                         },
-                    )
-                    .await;
+                    ),
+                )
+                .await
+                .unwrap_or(Err(BrokerError::Timeout));
                 let access = match access {
                     Ok(access) => access,
                     Err(error) => {

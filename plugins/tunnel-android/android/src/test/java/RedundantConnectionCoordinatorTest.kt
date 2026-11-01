@@ -2597,6 +2597,58 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun recoveredFormerPrimarySwitchesInTheSameSnapshotThatCancelsReplacement() {
+        var nowMs = 2_500_000L
+        var stalled = 0
+        val native = FakeNative()
+        val coordinator = testRedundantCoordinator(store(transaction()), FakePanel(), native,
+            epochNowMs = { nowMs }, monotonicMs = { nowMs }, onAllSlotsStalled = { stalled++ })
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY))))
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertTrue(requireNotNull(coordinator.status()).retry.acquirePending)
+        nowMs += 30_000L
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = nowMs - 30_000)
+                .copy(standbyProbeState = StandbyProbeState.SUCCEEDED),
+            healthSlot(index = 1, active = true, hardFailure = true))))
+        assertEquals("Fresh readiness must be used before the standby check expires",
+            "lease-a", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-b", "lease-a"), native.activated)
+        assertEquals(0, native.stopCalls)
+        assertEquals(0, stalled)
+    }
+
+    @Test
+    fun recoveredFormerPrimaryCannotSwitchUntilReplacementCancellationIsDurable() {
+        for (activeFailed in listOf(false, true)) {
+            val nowMs = 2_500_000L
+            val backend = CoordinatorRecordBackend()
+            val native = FakeNative()
+            val coordinator = testRedundantCoordinator(store(transaction(), backend), FakePanel(), native,
+                epochNowMs = { nowMs }, monotonicMs = { nowMs })
+            assertTrue(coordinator.onHealthObservations(listOf(
+                healthSlot(index = 0, active = true, hardFailure = true),
+                healthSlot(index = 1, health = BackendHealth.READY))))
+            val recovered = listOf(healthSlot(index = 0, health = BackendHealth.READY),
+                healthSlot(index = 1, active = true, health = BackendHealth.READY, hardFailure = activeFailed))
+            backend.failOnWriteNumber = backend.writeCount + 1
+            assertFalse(coordinator.onHealthObservations(recovered))
+            assertEquals(listOf("lease-b"), native.activated)
+            assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+            assertTrue(requireNotNull(coordinator.status()).retry.acquirePending)
+            backend.failOnWriteNumber = null
+            assertTrue(coordinator.onHealthObservations(recovered))
+            assertTrue(coordinator.onHealthObservations(recovered))
+            assertEquals(if (activeFailed) listOf("lease-b", "lease-a") else listOf("lease-b"), native.activated)
+            assertEquals(if (activeFailed) "lease-a" else "lease-b", coordinator.status()?.localActiveLeaseId)
+            assertEquals(0, native.stopCalls)
+        }
+    }
+
+    @Test
     fun recoveredFormerPrimaryCancelsReplacementBeforeDeadline() {
         var nowMs = 2_500_000L
         val panel = FakePanel()
