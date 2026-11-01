@@ -676,6 +676,68 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun repeatedSendErrorsRequireFreshUsableReserveBeforeFailover() {
+        for (primary in listOf(0, 1)) {
+            for (reserveHealthy in listOf(false, true)) {
+                val fixture = pairFixture(primary)
+                fixture.backend.failedProbeSendSlots += primary
+                var decision = FailoverDecision(null, false)
+                for (now in 30_000L..38_000L step 1_000L) {
+                    decision = fixture.tick(now) { slot, _ -> slot != primary && reserveHealthy }
+                    if (decision.switchTo != null || decision.sessionStalled) break
+                }
+                assertEquals("primary=$primary, reserve=$reserveHealthy",
+                    if (reserveHealthy) 1 - primary else null, decision.switchTo)
+                assertEquals(!reserveHealthy, decision.sessionStalled)
+            }
+        }
+    }
+
+    @Test
+    fun oldOrSingleSendErrorCannotConfirmAnOngoingFailure() {
+        for (oneNewError in listOf(false, true)) {
+            val fixture = timingFixture(active = true)
+            fixture.backend.sendErrorsBySlot[0] = 7L
+            fixture.backend.countProbeSend = false
+            if (oneNewError) fixture.backend.failedProbeSendSlots += 0
+            fixture.observe(0, healthy = false)
+            fixture.backend.failedProbeSendSlots.clear()
+            for (now in 1_000L..12_000L step 1_000L) {
+                val observation = fixture.observe(now, healthy = false)
+                assertFalse("old error reused at $now, oneNew=$oneNewError",
+                    RedundantHealthMonitor().failed(now, observation))
+            }
+        }
+    }
+
+    @Test
+    fun decryptedTrafficCancelsRepeatedSendErrorSuspicion() {
+        for (receiveFrom in listOf(1_000L, 5_000L)) {
+            val fixture = timingFixture(active = true)
+            fixture.backend.failedProbeSendSlots += 0
+            for (now in 0L..10_000L step 1_000L) {
+                if (now >= receiveFrom) fixture.backend.decryptedReceivePackets += 1L
+                val observation = fixture.observe(now, healthy = false)
+                if (now >= receiveFrom) assertFalse(observation.independentFailureSignal)
+                assertFalse(RedundantHealthMonitor().failed(now, observation))
+            }
+        }
+    }
+
+    @Test
+    fun successfulProbeCancelsRepeatedSendErrorSuspicion() {
+        val fixture = timingFixture(active = true)
+        fixture.backend.failedProbeSendSlots += 0
+        for (now in 0L..4_000L step 1_000L) fixture.observe(now, healthy = false)
+        fixture.backend.failedProbeSendSlots.clear()
+        for (now in 5_000L..10_000L step 1_000L) {
+            val observation = fixture.observe(now, healthy = true)
+            assertFalse(observation.independentFailureSignal)
+            assertFalse(RedundantHealthMonitor().failed(now, observation))
+        }
+    }
+
+    @Test
     fun silentActiveLossReachesFailoverWithinEightSecondsAcrossProbePhases() {
         for (failureAt in listOf(30_000L, 31_000L, 32_000L)) {
             val fixture = timingFixture(active = true)
@@ -1144,7 +1206,7 @@ class RedundantProductionAdaptersTest {
         assertTrue(native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
         assertTrue(native.activate("lease-b"))
         backend.metricsOverride = {
-            """{"dispatcher":{"OutboundBytes":14,"InboundBytes":22,"ProbePacketsInjected":9000},"slots":[{"slot":0,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":500,"udp_receive_packets":400}},{"slot":1,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":700,"udp_receive_packets":600}}]}"""
+            """{"dispatcher":{"OutboundBytes":14,"InboundBytes":22,"ProbePacketsInjected":9000},"slots":[{"slot":0,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_errors":0,"udp_send_packets":500,"udp_receive_packets":400}},{"slot":1,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_errors":0,"udp_send_packets":700,"udp_receive_packets":600}}]}"""
         }
 
         val metrics = requireNotNull(native.metrics(includeProbeTarget = true))
@@ -1251,7 +1313,7 @@ class RedundantProductionAdaptersTest {
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         backend.metricsOverride = {
-            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":0,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
+            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":0,"udp_send_errors":0,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
         }
 
         val observation = native.healthObservations().single()
@@ -1425,7 +1487,7 @@ class RedundantProductionAdaptersTest {
                     val tx = if (healthy) 1 + now / 1000 else 3 * (1 + now / 5000)
                     val rx = if (healthy) minOf(now, receiveFrozenAtMs ?: now) / 1000 else 0
                     val handshake = if (healthy) 1_800_000_000_000L else 0L
-                    """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
+                    """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_errors":0,"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
                 }
             }
             val probe = BackgroundRedundantHealthProbe("dns_a", "77.88.8.8", "nelomai.ru", 4000)
@@ -1608,6 +1670,8 @@ internal class RecordingSessionBackend(
     var probeClock: () -> Long = { 0L }
     var useSlotCounters = false
     private val slotSendPackets = mutableMapOf<Int, Long>()
+    val sendErrorsBySlot = mutableMapOf<Int, Long>()
+    val failedProbeSendSlots = mutableSetOf<Int>()
     val rebindFailures = mutableSetOf<Int>()
     val reboundSlots = mutableListOf<Int>()
     var latestProbeToken: Long? = null
@@ -1658,7 +1722,9 @@ internal class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
-        if (countProbeSend) {
+        if (slot in failedProbeSendSlots) {
+            sendErrorsBySlot[slot] = (sendErrorsBySlot[slot] ?: 0L) + 1L
+        } else if (countProbeSend) {
             udpSendPackets += 1
             slotSendPackets[slot] = (slotSendPackets[slot] ?: 0L) + 1L
         }
@@ -1683,7 +1749,7 @@ internal class RecordingSessionBackend(
             postfix = "]}",
         ) { slot ->
             val sent = if (useSlotCounters) slotSendPackets[slot] ?: 0L else udpSendPackets
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_receive_packets":$udpReceivePackets}}"""
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_send_errors":${sendErrorsBySlot[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 
