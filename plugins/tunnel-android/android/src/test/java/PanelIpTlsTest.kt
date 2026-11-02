@@ -11,12 +11,15 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.ConscryptMode
 import ru.nelomai.runtime.v1.PanelDns
 import ru.nelomai.runtime.v1.PanelDirectIpRoute
 import ru.nelomai.testing.PanelTlsFixture
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
+// The JVM fixture observes real SNI through JSSE; Robolectric's provider default differs by host architecture.
+@ConscryptMode(ConscryptMode.Mode.OFF)
 class PanelIpTlsTest {
     private val credential = BackgroundCredential("11111111-1111-4111-8111-111111111111", "https://nelomai.ru", "synthetic", 1_900_000_000)
 

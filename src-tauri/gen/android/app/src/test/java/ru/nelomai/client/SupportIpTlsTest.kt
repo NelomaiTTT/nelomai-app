@@ -10,12 +10,15 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.ConscryptMode
 import ru.nelomai.runtime.v1.PanelDns
 import ru.nelomai.runtime.v1.PanelDirectIpRoute
 import ru.nelomai.testing.PanelTlsFixture
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
+// The JVM fixture observes real SNI through JSSE; Robolectric's provider default differs by host architecture.
+@ConscryptMode(ConscryptMode.Mode.OFF)
 class SupportIpTlsTest {
     private val code = "nld_" + "A".repeat(43)
     private fun report(test: (SupportDiagnosticReport) -> Unit) {
