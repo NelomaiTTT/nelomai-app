@@ -2879,6 +2879,7 @@ dependencies = [
  "futures-util",
  "nelomai-contracts",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

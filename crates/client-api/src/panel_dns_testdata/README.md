@@ -1,0 +1,1 @@
+Public loopback HTTPS test fixtures only. The committed server key is deliberately public and must never be used outside tests. The leaf certificate covers nelomai.ru and is signed by this test CA; production clients never load this CA. Generated with OpenSSL on 2026-11-02, valid for ten years. The CA private key is not part of the repository.

@@ -3,7 +3,7 @@ use crate::{
     UpdateBackend, UpdateBackendError, UpdateBarrierPhase, UpdateEndpointPolicy,
 };
 use async_trait::async_trait;
-use nelomai_client_api::AccessSnapshot;
+use nelomai_client_api::{panel_http_client_builder, AccessSnapshot};
 use reqwest::{Client, StatusCode};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ impl AndroidUpdateBackend {
     ) -> Result<Self, UpdateBackendError> {
         let endpoint_policy = UpdateEndpointPolicy::new(PANEL_BASE)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
-        let http = Client::builder()
+        let http = panel_http_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(15 * 60))
             .build()

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nelomai_client_api::AccessSnapshot;
+use nelomai_client_api::{resolve_panel_addresses, AccessSnapshot};
 #[cfg(not(windows))]
 use nelomai_client_updater::InstalledUpdate;
 use nelomai_client_updater::{
@@ -62,12 +62,24 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .endpoint_policy
             .manifest_url(&target, &current_version)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
+        // The plugin uses reqwest 0.13. Pass the shared resolver's address
+        // snapshot through its supported hook, for both check and download.
+        let panel_host = endpoint
+            .host_str()
+            .ok_or_else(|| UpdateBackendError::new("invalid_update_endpoint"))?
+            .to_owned();
+        let panel_addresses = resolve_panel_addresses(&panel_host)
+            .await
+            .map_err(|_| UpdateBackendError::new("update_check_failed"))?;
         let mut builder = self
             .app
             .updater_builder()
             .pubkey(self.public_key.clone())
             .endpoints(vec![endpoint])
-            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
+            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?
+            .configure_client(move |builder| {
+                builder.resolve_to_addrs(&panel_host, &panel_addresses)
+            });
         // The updater carries these same headers into Update.download().
         for (name, value) in access_token.bearer_headers() {
             builder = builder
