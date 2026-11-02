@@ -23,6 +23,37 @@ fn validates_private_android_artifact_metadata() {
 }
 
 #[test]
+fn backup_manifest_retains_version_hash_and_signer_checks() {
+    let policy = UpdateEndpointPolicy::new("https://nelomai.ru").unwrap();
+    let mut backup = manifest();
+    backup.url = "https://nelomai.top/api/client/v1/updates/artifacts/update.apk".into();
+    assert_eq!(
+        backup
+            .clone()
+            .validate("0.2.0", &policy)
+            .unwrap()
+            .artifact_url
+            .host_str(),
+        Some("nelomai.top")
+    );
+    assert_eq!(
+        backup.clone().validate("0.2.1", &policy).unwrap_err(),
+        AndroidManifestError::VersionChanged
+    );
+    let mut bad_hash = backup.clone();
+    bad_hash.sha256 = "invalid".into();
+    assert_eq!(
+        bad_hash.validate("0.2.0", &policy).unwrap_err(),
+        AndroidManifestError::InvalidHash
+    );
+    backup.signature = "invalid".into();
+    assert_eq!(
+        backup.validate("0.2.0", &policy).unwrap_err(),
+        AndroidManifestError::InvalidSigner
+    );
+}
+
+#[test]
 fn rejects_untrusted_or_inconsistent_android_artifacts() {
     let policy = UpdateEndpointPolicy::new("https://nelomai.ru").unwrap();
     let mut external = manifest();

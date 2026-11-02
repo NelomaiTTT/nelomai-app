@@ -1,5 +1,7 @@
 mod panel_dns;
-pub use panel_dns::{panel_http_client_builder, resolve_panel_addresses};
+pub use panel_dns::{
+    execute_panel_request, panel_backup_url, panel_http_client_builder, resolve_panel_addresses,
+};
 
 use futures_util::StreamExt;
 use nelomai_contracts::{
@@ -2088,7 +2090,7 @@ impl ClientApi {
                 }
             }
         }
-        Ok(self.http.client().execute(request).await?)
+        Ok(execute_panel_request(&self.http.client(), request, HTTP_REQUEST_TIMEOUT).await?)
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(

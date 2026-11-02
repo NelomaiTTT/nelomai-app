@@ -2993,6 +2993,7 @@ dependencies = [
  "nelomai-client-api",
  "nelomai-contracts",
  "reqwest 0.12.28",
+ "rustls",
  "semver",
  "serde",
  "serde_json",

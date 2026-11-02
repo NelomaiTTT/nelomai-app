@@ -3,7 +3,7 @@ use crate::{
     UpdateBackend, UpdateBackendError, UpdateBarrierPhase, UpdateEndpointPolicy,
 };
 use async_trait::async_trait;
-use nelomai_client_api::{panel_http_client_builder, AccessSnapshot};
+use nelomai_client_api::{execute_panel_request, panel_http_client_builder, AccessSnapshot};
 use reqwest::{Client, StatusCode};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -76,10 +76,15 @@ impl AndroidUpdateBackend {
         for (name, value) in access_token.bearer_headers() {
             request = request.header(name, value);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| UpdateBackendError::new("update_download_failed"))?;
+        let mut response = execute_panel_request(
+            &self.http,
+            request
+                .build()
+                .map_err(|_| UpdateBackendError::new("update_download_failed"))?,
+            Duration::from_secs(15 * 60),
+        )
+        .await
+        .map_err(|_| UpdateBackendError::new("update_download_failed"))?;
         if !response.status().is_success() {
             return Err(UpdateBackendError::new("update_download_failed"));
         }
@@ -203,10 +208,15 @@ impl UpdateBackend for AndroidUpdateBackend {
         for (name, value) in access_token.bearer_headers() {
             request = request.header(name, value);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| UpdateBackendError::new("update_check_failed"))?;
+        let response = execute_panel_request(
+            &self.http,
+            request
+                .build()
+                .map_err(|_| UpdateBackendError::new("update_check_failed"))?,
+            Duration::from_secs(15 * 60),
+        )
+        .await
+        .map_err(|_| UpdateBackendError::new("update_check_failed"))?;
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(InstallResult::NoUpdate);
         }
@@ -284,6 +294,192 @@ async fn cleanup_stale_updates(directory: &Path, current: &Path) -> Result<(), U
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn https_backup_fetches_manifest_and_apk_and_rejects_tampering() {
+        use rustls::{
+            pki_types::{CertificateDer, PrivatePkcs8KeyDer},
+            ServerConfig, ServerConnection, StreamOwned,
+        };
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::atomic::{AtomicUsize, Ordering},
+            thread,
+        };
+        fn server(
+            apk: &'static [u8],
+        ) -> (
+            std::net::SocketAddr,
+            thread::JoinHandle<(usize, Vec<String>)>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    include_bytes!("../../client-api/src/panel_dns_testdata/backup-server.der")
+                        .to_vec(),
+                )],
+                PrivatePkcs8KeyDer::from(
+                    include_bytes!("../../client-api/src/panel_dns_testdata/backup-server-key.der")
+                        .to_vec(),
+                )
+                .into(),
+            )
+            .unwrap();
+            let thread = thread::spawn(move || {
+                let mut connections = 0;
+                let mut requests = Vec::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while connections < 2 && std::time::Instant::now() < deadline {
+                    let socket = match listener.accept() {
+                        Ok((socket, _)) => socket,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(3));
+                            continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    connections += 1;
+                    socket.set_nonblocking(false).unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut stream = StreamOwned::new(
+                        ServerConnection::new(Arc::new(config.clone())).unwrap(),
+                        socket,
+                    );
+                    let mut data = Vec::new();
+                    loop {
+                        let mut buffer = [0; 2048];
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => data.extend_from_slice(&buffer[..n]),
+                        }
+                        assert!(data.len() < 16384);
+                        if data.windows(4).any(|v| v == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
+                    assert_eq!(stream.conn.server_name(), Some("nelomai.top"));
+                    let request = String::from_utf8(data).unwrap();
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("host: nelomai.top\r\n"));
+                    assert!(request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer synthetic\r\n"));
+                    let body = if request.starts_with("GET /api/client/v1/updates/manifest/") {
+                        serde_json::json!({"version":"0.3.10","url":"https://nelomai.ru/api/client/v1/updates/artifacts/update.apk","signature":"a".repeat(64),"sha256":format!("{:x}",Sha256::digest(b"abc")),"size_bytes":3}).to_string().into_bytes()
+                    } else {
+                        assert!(
+                            request.starts_with("GET /api/client/v1/updates/artifacts/update.apk ")
+                        );
+                        apk.to_vec()
+                    };
+                    requests.push(request);
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                    stream.flush().unwrap();
+                }
+                (connections, requests)
+            });
+            (address, thread)
+        }
+        struct Installer(Arc<AtomicUsize>);
+        #[async_trait]
+        impl AndroidApkInstaller for Installer {
+            async fn install_apk(
+                &self,
+                path: &Path,
+                _: &str,
+                signer: &str,
+            ) -> Result<bool, UpdateBackendError> {
+                assert_eq!(std::fs::read(path).unwrap(), b"abc");
+                assert_eq!(signer, "a".repeat(64));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            }
+        }
+        for apk in [b"abc".as_slice(), b"abd".as_slice()] {
+            let (primary, primary_thread) = server(apk);
+            let (backup, backup_thread) = server(apk);
+            let dir = tempfile::tempdir().unwrap();
+            let installed = Arc::new(AtomicUsize::new(0));
+            let mut backend = AndroidUpdateBackend::new(
+                dir.path().into(),
+                "0.3.9".into(),
+                Arc::new(Installer(installed.clone())),
+            )
+            .unwrap();
+            backend.http = panel_http_client_builder()
+                .no_proxy()
+                .add_root_certificate(
+                    reqwest::Certificate::from_der(include_bytes!(
+                        "../../client-api/src/panel_dns_testdata/backup-ca.der"
+                    ))
+                    .unwrap(),
+                )
+                .resolve("nelomai.ru", primary)
+                .resolve("nelomai.top", backup)
+                .build()
+                .unwrap();
+            let access = AccessSnapshot::new(
+                "synthetic".into(),
+                nelomai_contracts::RuntimeIdentity {
+                    container_version: "0.3.9".into(),
+                    runtime_version: "0.3.9".into(),
+                    runtime_contract_version: 1,
+                    slot: nelomai_contracts::RuntimeSlot::Latest,
+                    session_generation: Some(1),
+                },
+                1,
+                "test-family".into(),
+            )
+            .unwrap();
+            let result = backend
+                .install(
+                    &access,
+                    "0.3.10",
+                    UpdateBarrierPhase::LocalStopped,
+                    Arc::new(|_| {}),
+                )
+                .await;
+            let (count, requests) = primary_thread.join().unwrap();
+            assert_eq!(count, 2);
+            assert!(
+                requests.is_empty(),
+                "credentials reached primary despite its wrong certificate"
+            );
+            assert_eq!(backup_thread.join().unwrap().1.len(), 2);
+            if apk == b"abc" {
+                assert!(matches!(result.unwrap(), InstallResult::InstallerOpened(_)));
+                assert_eq!(installed.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(result.unwrap_err().code(), "update_hash_mismatch");
+                assert_eq!(installed.load(Ordering::SeqCst), 0);
+                assert!(!dir.path().join(".nelomai-update.part").exists());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn installer_cancellation_is_distinct_from_open_failure() {
         use std::io::{Read, Write};

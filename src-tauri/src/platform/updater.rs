@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nelomai_client_api::{resolve_panel_addresses, AccessSnapshot};
+use nelomai_client_api::{panel_backup_url, resolve_panel_addresses, AccessSnapshot};
 #[cfg(not(windows))]
 use nelomai_client_updater::InstalledUpdate;
 use nelomai_client_updater::{
@@ -7,6 +7,7 @@ use nelomai_client_updater::{
     UpdateEndpointPolicy,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -64,21 +65,51 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
         // The plugin uses reqwest 0.13. Pass the shared resolver's address
         // snapshot through its supported hook, for both check and download.
+        let check_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let backup_endpoint = panel_backup_url(&endpoint);
+        let backup_host = backup_endpoint
+            .as_ref()
+            .and_then(|url| url.host_str())
+            .map(str::to_owned);
         let panel_host = endpoint
             .host_str()
             .ok_or_else(|| UpdateBackendError::new("invalid_update_endpoint"))?
             .to_owned();
-        let panel_addresses = resolve_panel_addresses(&panel_host)
-            .await
-            .map_err(|_| UpdateBackendError::new("update_check_failed"))?;
+        let (panel_addresses, backup_addresses) = if let Some(host) = &backup_host {
+            let (primary, backup) = tokio::join!(
+                resolve_panel_addresses(&panel_host),
+                resolve_panel_addresses(host)
+            );
+            (
+                primary.map_err(|_| UpdateBackendError::new("update_check_failed"))?,
+                Some(backup.map_err(|_| UpdateBackendError::new("update_check_failed"))?),
+            )
+        } else {
+            (
+                resolve_panel_addresses(&panel_host)
+                    .await
+                    .map_err(|_| UpdateBackendError::new("update_check_failed"))?,
+                None,
+            )
+        };
+        let mut endpoints = vec![endpoint];
+        endpoints.extend(backup_endpoint);
         let mut builder = self
             .app
             .updater_builder()
             .pubkey(self.public_key.clone())
-            .endpoints(vec![endpoint])
+            .endpoints(endpoints)
             .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?
+            .timeout(Duration::from_secs(20))
             .configure_client(move |builder| {
-                builder.resolve_to_addrs(&panel_host, &panel_addresses)
+                let builder = builder
+                    .connect_timeout(Duration::from_secs(8))
+                    .resolve_to_addrs(&panel_host, &panel_addresses);
+                if let (Some(host), Some(addresses)) = (&backup_host, &backup_addresses) {
+                    builder.resolve_to_addrs(host, addresses)
+                } else {
+                    builder
+                }
             });
         // The updater carries these same headers into Update.download().
         for (name, value) in access_token.bearer_headers() {
@@ -89,9 +120,9 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         let updater = builder
             .build()
             .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
-        let Some(update) = updater
-            .check()
+        let Some(mut update) = tokio::time::timeout_at(check_deadline, updater.check())
             .await
+            .map_err(|_| UpdateBackendError::new("update_check_failed"))?
             .map_err(|_| UpdateBackendError::new("update_check_failed"))?
         else {
             return Ok(InstallResult::NoUpdate);
@@ -107,16 +138,36 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         }
 
         let mut downloaded = 0_u64;
-        let bytes = update
-            .download(
-                |chunk, total| {
-                    downloaded = downloaded.saturating_add(chunk as u64);
-                    progress(DownloadProgress { downloaded, total });
-                },
-                || {},
-            )
-            .await
-            .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        let download_deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        let mut backup_download = panel_backup_url(&update.download_url);
+        let bytes = loop {
+            let remaining =
+                download_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(UpdateBackendError::new("update_install_failed"));
+            }
+            update.timeout = Some(remaining);
+            match update
+                .download(
+                    |chunk, total| {
+                        downloaded = downloaded.saturating_add(chunk as u64);
+                        progress(DownloadProgress { downloaded, total });
+                    },
+                    || {},
+                )
+                .await
+            {
+                Ok(bytes) => break bytes,
+                Err(tauri_plugin_updater::Error::Reqwest(error)) if error.is_connect() => {
+                    let Some(url) = backup_download.take() else {
+                        return Err(UpdateBackendError::new("update_install_failed"));
+                    };
+                    update.download_url = url;
+                    downloaded = 0;
+                }
+                Err(_) => return Err(UpdateBackendError::new("update_install_failed")),
+            }
+        };
 
         let stop_proof = crate::container::begin_installation(&self.app, expected_version)
             .await

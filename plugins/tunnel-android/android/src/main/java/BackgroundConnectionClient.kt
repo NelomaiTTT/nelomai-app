@@ -5,6 +5,7 @@ import android.content.Context
 import java.net.URI
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.Proxy
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.concurrent.Callable
@@ -15,11 +16,14 @@ import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
 import okhttp3.Call
 import okhttp3.ConnectionPool
+import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody
+import ru.nelomai.runtime.v1.PanelDns
+import ru.nelomai.runtime.v1.PanelDirectIpRoute
 import okio.BufferedSink
 import org.json.JSONArray
 import org.json.JSONObject
@@ -936,7 +940,13 @@ internal class BackgroundOperationClient(
 
 // One client, synchronous calls on the existing credential worker. Do not retain
 // idle sockets across VPN/network changes. Keep standard alternate-address fallback.
+private class BackgroundRequestState {
+    @Volatile var tracked = false
+    @Volatile var httpStarted = false
+}
+
 internal val backgroundHttpClient = OkHttpClient.Builder()
+    .dns(object : okhttp3.Dns { override fun lookup(hostname: String) = PanelDns.Default.lookup(hostname) })
     .connectTimeout(BACKGROUND_CONNECT_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
     .readTimeout(BACKGROUND_READ_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
     .writeTimeout(BACKGROUND_READ_TIMEOUT_MILLIS.toLong(), TimeUnit.MILLISECONDS)
@@ -944,11 +954,31 @@ internal val backgroundHttpClient = OkHttpClient.Builder()
     .followSslRedirects(false)
     .protocols(listOf(Protocol.HTTP_1_1))
     .connectionPool(ConnectionPool(0, 1, TimeUnit.MINUTES))
+    .eventListenerFactory {
+        object : EventListener() {
+            override fun callStart(call: Call) {
+                call.request().tag(BackgroundRequestState::class.java)?.tracked = true
+            }
+            override fun requestHeadersStart(call: Call) {
+                call.request().tag(BackgroundRequestState::class.java)?.httpStarted = true
+            }
+        }
+    }
     .build()
+
+internal fun newBackgroundPanelCall(request: Request, client: OkHttpClient = backgroundHttpClient): Call {
+    val selected = if (request.tag(PanelDirectIpRoute::class.java) == null) client else {
+        require(request.url.isHttps && request.url.port == 443 && request.url.username.isEmpty() && request.url.password.isEmpty())
+        client.newBuilder().proxy(Proxy.NO_PROXY).dns(object : okhttp3.Dns {
+            override fun lookup(hostname: String) = PanelDns.Default.directAddresses(hostname)
+        }).build()
+    }
+    return selected.newCall(request)
+}
 
 internal class BackgroundHttpApiTransport(
     private val cancellation: CompletableFuture<Unit>? = null,
-    private val newCall: (Request) -> Call = backgroundHttpClient::newCall,
+    private val newCall: (Request) -> Call = { newBackgroundPanelCall(it) },
 ) : BackgroundApiTransport {
     override fun execute(
         credential: BackgroundCredential,
@@ -987,11 +1017,17 @@ internal class BackgroundHttpApiTransport(
         val encoded = payload?.toString()?.toByteArray(StandardCharsets.UTF_8)
         var cancelCall: CompletableFuture<Void>? = null
         return try {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
+                (BACKGROUND_CONNECT_TIMEOUT_MILLIS + BACKGROUND_READ_TIMEOUT_MILLIS).toLong())
+            val attempt = BackgroundRequestState()
             val requestBody = if (encoded != null || method in setOf("POST", "PUT", "PATCH")) {
                 object : RequestBody() {
                     override fun contentType() = if (encoded != null) "application/json".toMediaType() else null
                     override fun contentLength() = encoded?.size?.toLong() ?: 0L
+                    // Allow connection fallback, but never let OkHttp replay a sent operation.
+                    override fun isOneShot() = true
                     override fun writeTo(sink: BufferedSink) {
+                        attempt.httpStarted = true
                         if (encoded != null) {
                             sink.write(encoded)
                             sink.flush()
@@ -1006,12 +1042,44 @@ internal class BackgroundHttpApiTransport(
             backgroundAuthorizationHeaders(credential, authorization).forEach { (name, value) ->
                 request.header(name, value)
             }
-            val call = newCall(request.build())
-            // Call.cancel is sticky even before execute/connect; disconnect on an
-            // unopened HttpURLConnection is not. No extra worker or polling timer.
-            cancelCall = cancellation?.thenRun { call.cancel() }
             if (encoded != null) recordPhase("request_body") else phase = "response_headers"
-            call.execute().use { response ->
+            fun executePrepared(): okhttp3.Response {
+                var prepared = request.tag(BackgroundRequestState::class.java, attempt).build()
+                var backupStage = 0
+                while (true) {
+                    if (cancellation?.isDone == true || Thread.currentThread().isInterrupted) throw BackgroundConnectionException("tunnel_start_cancelled")
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0) throw java.net.SocketTimeoutException("panel request deadline")
+                    val call = newCall(prepared)
+                    call.timeout().timeout(remaining, TimeUnit.NANOSECONDS)
+                    cancelCall?.cancel(false)
+                    // Cancellation remains sticky for either connection attempt.
+                    cancelCall = cancellation?.thenRun { call.cancel() }
+                    try { return call.execute() }
+                    catch (error: java.io.IOException) {
+                        val tlsFailure = error is javax.net.ssl.SSLHandshakeException || error is javax.net.ssl.SSLPeerUnverifiedException
+                        val knownConnectFailure = error is java.net.UnknownHostException ||
+                            error is java.net.ConnectException || error is java.net.NoRouteToHostException ||
+                            tlsFailure
+                        val origin = prepared.url
+                        val alternate = when (origin.host) { "nelomai.ru" -> "nelomai.top"; "nelomai.top" -> "nelomai.ru"; else -> null }
+                        if (backupStage >= 3 || (backupStage == 2 && !tlsFailure) || attempt.httpStarted || (!attempt.tracked && !knownConnectFailure) ||
+                            alternate == null || origin.scheme != "https" || origin.port != 443 ||
+                            origin.username.isNotEmpty() || origin.password.isNotEmpty() || cancellation?.isDone == true ||
+                            Thread.currentThread().isInterrupted) throw error
+                        prepared = prepared.newBuilder().apply {
+                            when (backupStage) {
+                                0 -> url(origin.newBuilder().host(alternate).build()).removeHeader("Host")
+                                1 -> tag(PanelDirectIpRoute::class.java, PanelDirectIpRoute)
+                                // Same IP, other approved TLS identity; no retry after HTTP starts.
+                                else -> url(origin.newBuilder().host(alternate).build()).removeHeader("Host")
+                            }
+                        }.build()
+                        backupStage++
+                    }
+                }
+            }
+            executePrepared().use { response ->
                 val status = response.code
                 responseStatus = status
                 recordPhase("response_headers")
