@@ -125,6 +125,10 @@ fn macos_installer_command(
 #[path = "macos_installation_tests.rs"]
 mod macos_installation_tests;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[path = "linux_installation.rs"]
+mod linux_installation;
+
 struct NativeStop {
     child: Mutex<Option<Child>>,
     exit_owner: nelomai_client_container::desktop::RuntimeExitOwner,
@@ -1011,20 +1015,15 @@ fn pre_auth_handoff() -> io::Result<bool> {
                         .ok_or_else(|| io::Error::other("whole AppImage required"))?,
                 )
             };
-            let installer = if installed.join("install-common-linux.sh").exists() {
-                installed.join("install-common-linux.sh")
-            } else {
-                source_resources.join("install-common-linux.sh")
-            };
+            let installed_script = installed.join("install-common-linux.sh");
+            let candidate_script = source_resources.join("install-common-linux.sh");
+            let installer = linux_installation::script(&installed_script, &candidate_script);
             let sha = nelomai_contracts::dispatcher::file_digest(&archive)?;
-            let status = platform::unix::installer_status(
-                std::process::Command::new("/usr/bin/pkexec")
-                    .arg("/bin/sh")
-                    .arg(installer)
-                    .arg(archive)
-                    .arg(sha),
-            )
-            .map_err(|_| io::Error::other("common installation failed"))?;
+            let status =
+                linux_installation::run(installer, &archive, &sha, Path::new("/tmp"), |command| {
+                    platform::unix::installer_status(command)
+                        .map_err(|_| io::Error::other("common installation failed"))
+                })?;
             if !status.success() {
                 return Err(io::Error::other("common installation cancelled"));
             }

@@ -420,9 +420,19 @@ fn text<'a>(v: &'a Map<String, Value>, key: &str) -> io::Result<&'a str> {
     v.get(key).and_then(Value::as_str).ok_or_else(invalid)
 }
 fn number(v: &Map<String, Value>, key: &str) -> io::Result<u32> {
-    v.get(key)
-        .and_then(Value::as_u64)
+    let value = v.get(key).ok_or_else(invalid)?;
+    value
+        .as_u64()
         .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| {
+            // ip -j -N emits table IDs as decimal strings on stock iproute2.
+            // Accept only the same unsigned u32 domain as JSON integers.
+            let text = value.as_str()?;
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u32>().ok()
+        })
         .ok_or_else(invalid)
 }
 fn only(v: &Map<String, Value>, keys: &[&str]) -> io::Result<()> {
@@ -572,6 +582,74 @@ mod tests {
             links().get("eth0").unwrap()
         )
         .is_err());
+    }
+
+    #[test]
+    fn iproute2_decimal_table_strings_match_numeric_rules() {
+        let numeric = r#"[{"priority":0,"src":"all","table":255},{"priority":32766,"src":"all","table":254},{"priority":32767,"src":"all","table":253}]"#;
+        let native = r#"[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"},{"priority":32767,"src":"all","table":"253"}]"#;
+        let interface = links().remove("eth0").unwrap();
+        verify_rules(numeric, &interface).unwrap();
+        verify_rules(native, &interface).unwrap();
+        let warm = r#"[{"priority":"0","src":"all","table":"255"},{"priority":"31120","src":"all","table":"254","suppress_prefixlength":"0"},{"priority":"31121","src":"all","table":"42761","not":true,"fwmark":"0xa709","fwmask":"0xffffffff"},{"priority":"32766","src":"all","table":"254"}]"#;
+        verify_rules(warm, &interface).unwrap();
+    }
+
+    #[test]
+    fn decimal_numbers_are_bounded_ascii_unsigned_integers() {
+        for (raw, expected) in [
+            ("0", 0),
+            ("4294967295", u32::MAX),
+            (r#""0""#, 0),
+            (r#""4294967295""#, u32::MAX),
+            (r#""00254""#, 254),
+        ] {
+            let v: Value = serde_json::from_str(&format!("{{\"value\":{raw}}}")).unwrap();
+            assert_eq!(number(object(&v).unwrap(), "value").unwrap(), expected);
+        }
+        for raw in [
+            "-1",
+            "1.0",
+            "1e2",
+            "4294967296",
+            "null",
+            "true",
+            r#""""#,
+            r#""-1""#,
+            r#""+1""#,
+            r#"" 254""#,
+            r#""254 ""#,
+            r#""1.0""#,
+            r#""1e2""#,
+            r#""２５４""#,
+            r#""0xff""#,
+            r#""4294967296""#,
+            r#""18446744073709551616""#,
+        ] {
+            let v: Value = serde_json::from_str(&format!("{{\"value\":{raw}}}")).unwrap();
+            assert!(
+                number(object(&v).unwrap(), "value").is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_strings_preserve_policy_whitelist() {
+        let valid = r#"[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"}]"#;
+        let interface = links().remove("eth0").unwrap();
+        verify_rules(valid, &interface).unwrap();
+        for bad in [
+            valid.replace("255", "256"),
+            valid.replace("32766", "12345"),
+            valid.replace("\"table\":\"255\"", "\"table\":\"255\",\"goto\":100"),
+            valid.replace("all", "192.0.2.4"),
+            valid.replace("32766", "0"),
+            valid.replace("255", "+255"),
+            valid.replace("254", "main"),
+        ] {
+            assert!(verify_rules(&bad, &interface).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]
