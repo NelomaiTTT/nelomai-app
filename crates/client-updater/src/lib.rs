@@ -67,8 +67,12 @@ impl UpdateEndpointPolicy {
     }
 
     pub fn is_trusted_artifact(&self, artifact: &Url) -> bool {
+        let approved_backup = nelomai_client_api::panel_backup_url(&self.panel_origin);
         artifact.scheme() == self.panel_origin.scheme()
-            && artifact.host_str() == self.panel_origin.host_str()
+            && (artifact.host_str() == self.panel_origin.host_str()
+                || approved_backup
+                    .as_ref()
+                    .is_some_and(|backup| artifact.host_str() == backup.host_str()))
             && artifact.port_or_known_default() == self.panel_origin.port_or_known_default()
             && artifact.username().is_empty()
             && artifact.password().is_none()

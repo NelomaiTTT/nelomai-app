@@ -415,6 +415,7 @@ async fn stalled_physical_dial_uses_the_connect_budget_without_fallback() {
 
 #[tokio::test]
 async fn cancelled_native_reads_retain_capacity_until_os_work_finishes() {
+    let _serial = NATIVE_READER_CASES.lock().await;
     type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
     struct Release(Gate);
     impl Drop for Release {
@@ -474,6 +475,11 @@ async fn cancelled_native_reads_retain_capacity_until_os_work_finishes() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        4,
+        "cancelled queued read started after capacity returned"
+    );
 }
 
 // Descriptor exhaustion is process-wide: run this case alone in a child test
@@ -701,4 +707,533 @@ async fn control_failure_observer_never_discloses_private_native_error_strings()
             Some(expected)
         );
     }
+}
+
+// Native transport uses the same real TLS fixtures as the ordinary client;
+// only OS discovery/NIC dialing is replaced with a loopback route.
+struct PanelRoute {
+    primary: SocketAddr,
+    backup: SocketAddr,
+    calls: Arc<AtomicUsize>,
+}
+impl Dialer for PanelRoute {
+    fn connect(&self, origin: Origin) -> DialFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let target = match origin.host.as_str() {
+            "nelomai.ru" => self.primary,
+            "nelomai.top" => self.backup,
+            _ => panic!("unexpected native panel origin"),
+        };
+        Box::pin(async move { TcpStream::connect(target).await })
+    }
+}
+
+#[tokio::test]
+async fn native_panel_uses_independent_backup_tls_identity_after_pre_http_failure() {
+    use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
+    let primary = HttpsFixture::start_with(true, Reply::Status(200));
+    let backup = HttpsFixture::start_with(true, Reply::Status(200));
+    let _roots = DnsScope::new(DnsAnswer::Success, primary.address).with_roots(true);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let origin = Url::parse("https://nelomai.ru/api/client/v1/auth/login").unwrap();
+    let slot = Slot::new(
+        origin.clone(),
+        Arc::new(PanelRoute {
+            primary: primary.address,
+            backup: backup.address,
+            calls: calls.clone(),
+        }),
+    );
+    let request = Client::new()
+        .post(origin)
+        .header(reqwest::header::HOST, "nelomai.ru")
+        .bearer_auth("native-synthetic")
+        .body("one-native-post")
+        .build()
+        .unwrap();
+    let result = slot.execute(request).await;
+    assert!(result.is_ok(), "native fallback failed: {result:?}");
+    assert_eq!(result.unwrap().url().host_str(), Some("nelomai.top"));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let (request, sni) = primary.server.join().unwrap();
+    assert!(request.is_none());
+    assert_eq!(sni.as_deref(), Some("nelomai.ru"));
+    let (request, sni) = backup.server.join().unwrap();
+    assert_eq!(sni.as_deref(), Some("nelomai.top"));
+    let request = request.unwrap().to_ascii_lowercase();
+    assert!(request.contains("host: nelomai.top\r\n"));
+    assert!(request.contains("authorization: bearer native-synthetic\r\n"));
+    assert!(request.ends_with("\r\n\r\none-native-post"));
+}
+
+#[tokio::test]
+async fn native_panel_never_replays_after_eof_http_error_or_same_origin_redirect() {
+    use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
+    for mode in 0..3 {
+        let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reply = match mode {
+            0 => Reply::Eof,
+            1 => Reply::Status(503),
+            _ => Reply::Redirect("https://nelomai.ru/later-connect-failure".into()),
+        };
+        let primary = HttpsFixture::start_with(false, reply);
+        let _roots = DnsScope::new(DnsAnswer::Success, primary.address).with_roots(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let origin = Url::parse("https://nelomai.ru/api/client/v1/auth/login").unwrap();
+        let slot = Slot::new(
+            origin.clone(),
+            Arc::new(PanelRoute {
+                primary: primary.address,
+                backup: trap.local_addr().unwrap(),
+                calls: calls.clone(),
+            }),
+        );
+        let result = slot
+            .execute(
+                Client::new()
+                    .post(origin)
+                    .body("once")
+                    .timeout(Duration::from_millis(300))
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        match mode {
+            0 => assert!(result.is_err()),
+            1 => assert_eq!(result.unwrap().status(), 503),
+            _ => assert_eq!(result.unwrap().status(), 307),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "HTTP outcome triggered another native dial"
+        );
+        assert!(primary
+            .server
+            .join()
+            .unwrap()
+            .0
+            .unwrap()
+            .ends_with("\r\n\r\nonce"));
+    }
+}
+
+struct TimedPanelRoute {
+    calls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+    primary: Duration,
+    backup: Duration,
+}
+impl Dialer for TimedPanelRoute {
+    fn connect(&self, origin: Origin) -> DialFuture {
+        let delay = if origin.host == "nelomai.ru" {
+            self.primary
+        } else {
+            self.backup
+        };
+        let calls = self.calls.clone();
+        let drops = self.drops.clone();
+        Box::pin(async move {
+            struct Dropped(Arc<AtomicUsize>);
+            impl Drop for Dropped {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let _drop = Dropped(drops);
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "controlled pre-send failure",
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn native_backup_shares_total_deadline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let slot = Slot::new(
+        Url::parse("https://nelomai.ru").unwrap(),
+        Arc::new(TimedPanelRoute {
+            calls: calls.clone(),
+            drops: Arc::default(),
+            primary: Duration::from_millis(150),
+            backup: Duration::from_millis(300),
+        }),
+    );
+    let start = std::time::Instant::now();
+    let result = slot
+        .execute(
+            Client::new()
+                .post("https://nelomai.ru/x")
+                .body("once")
+                .timeout(Duration::from_millis(250))
+                .build()
+                .unwrap(),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "safe pre-send failure did not reach backup"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(380),
+        "backup restarted operation budget"
+    );
+}
+
+#[tokio::test]
+async fn native_cancellation_drops_dial_and_never_starts_backup() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let slot = Slot::new(
+        Url::parse("https://nelomai.ru").unwrap(),
+        Arc::new(TimedPanelRoute {
+            calls: calls.clone(),
+            drops: drops.clone(),
+            primary: Duration::from_secs(60),
+            backup: Duration::from_secs(60),
+        }),
+    );
+    let request = Client::new()
+        .post("https://nelomai.ru/x")
+        .body("once")
+        .build()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), slot.execute(request))
+            .await
+            .is_err()
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "cancelled native dial survived its operation"
+    );
+}
+
+#[tokio::test]
+async fn native_backup_rejects_wrong_or_untrusted_certificate_without_credentials() {
+    use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
+    for trust_backup in [true, false] {
+        let primary = HttpsFixture::start_with(true, Reply::Status(200));
+        let backup = HttpsFixture::start_with(!trust_backup, Reply::Status(200));
+        let _roots = DnsScope::new(DnsAnswer::Success, primary.address).with_roots(trust_backup);
+        let origin = Url::parse("https://nelomai.ru/x").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let slot = Slot::new(
+            origin.clone(),
+            Arc::new(PanelRoute {
+                primary: primary.address,
+                backup: backup.address,
+                calls: calls.clone(),
+            }),
+        );
+        let result = slot
+            .execute(
+                Client::new()
+                    .post(origin)
+                    .bearer_auth("must-not-send")
+                    .build()
+                    .unwrap(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(primary.server.join().unwrap().0.is_none());
+        let (request, sni) = backup.server.join().unwrap();
+        assert!(request.is_none());
+        assert_eq!(sni.as_deref(), Some("nelomai.top"));
+    }
+}
+
+static NATIVE_READER_CASES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn blocked_dns_workers_do_not_starve_fallback_metadata_and_cancelled_dns_queue() {
+    let _serial = NATIVE_READER_CASES.lock().await;
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    struct Release(Gate);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let gate: Gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let gate = gate.clone();
+        let started = started.clone();
+        readers.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                native_dns_read(move || {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let mut open = gate.0.lock().unwrap();
+                    while !*open {
+                        open = gate.1.wait(open).unwrap();
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for reader in readers {
+        assert!(reader.await.unwrap().is_err());
+    }
+    // This is the same admission path used by snapshot() and post-DNS NIC
+    // revalidation. It must finish while every uncancellable DNS slot is busy.
+    let metadata = tokio::time::timeout(Duration::from_millis(150), native_read(|| Ok(()))).await;
+    assert!(
+        metadata.is_ok(),
+        "static-IP fallback metadata waited behind stalled native DNS"
+    );
+    metadata.unwrap().unwrap();
+    let observed = started.clone();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(40),
+        native_dns_read(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        4,
+        "DNS admission grew beyond its bounded workers"
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), native_dns_read(|| Ok(())))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        4,
+        "cancelled queued DNS read started after capacity returned"
+    );
+}
+
+type ResolverLookup = Arc<dyn Fn(String, physical::Snapshot) -> ResolveFuture + Send + Sync>;
+thread_local! {
+    static RESOLVER: std::cell::RefCell<Option<ResolverLookup>> = const { std::cell::RefCell::new(None) };
+}
+type ResolveFuture = Pin<Box<dyn Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>>;
+pub(super) fn fixture_resolve(host: String, family: physical::Snapshot) -> Option<ResolveFuture> {
+    RESOLVER.with(|slot| slot.borrow().as_ref().map(|lookup| lookup(host, family)))
+}
+struct ResolverScope;
+impl Drop for ResolverScope {
+    fn drop(&mut self) {
+        RESOLVER.with(|slot| slot.replace(None));
+    }
+}
+fn dual_stack() -> physical::Snapshot {
+    let interface = physical::Interface {
+        index: 1,
+        name: "fixture".into(),
+        identity: "fixture".into(),
+        addresses: vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()],
+        gateway: None,
+    };
+    physical::Snapshot {
+        ipv4: Some(interface.clone()),
+        ipv6: Some(interface),
+    }
+}
+#[tokio::test]
+async fn failed_aaaa_cannot_steal_healthy_a_and_static_ipv4_is_selected_once() {
+    let _scope = ResolverScope;
+    RESOLVER.with(|slot| {
+        slot.replace(Some(Arc::new(|_, family| {
+            Box::pin(async move {
+                if family.ipv4.is_none() {
+                    Err(io::ErrorKind::NotFound.into())
+                } else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(vec!["192.0.2.15".parse().unwrap()])
+                }
+            })
+        })))
+    });
+    let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut arms = Vec::<DialFuture>::new();
+    for ipv6 in [true, false] {
+        let mut family = dual_stack();
+        if ipv6 {
+            family.ipv4 = None;
+        } else {
+            family.ipv6 = None;
+        }
+        let healthy = healthy.local_addr().unwrap();
+        let trap = trap.local_addr().unwrap();
+        arms.push(Box::pin(async move {
+            let addresses = resolve_physical_panel_host("nelomai.ru", family).await?;
+            let attempts = addresses
+                .into_iter()
+                .map(|ip| {
+                    Box::pin(async move {
+                        TcpStream::connect(
+                            if ip == "192.0.2.15".parse::<std::net::IpAddr>().unwrap() {
+                                healthy
+                            } else {
+                                trap
+                            },
+                        )
+                        .await
+                    }) as DialFuture
+                })
+                .collect();
+            race_connections(attempts).await
+        }));
+    }
+    let stream = race_connections(arms).await.unwrap();
+    assert_eq!(
+        stream.peer_addr().unwrap(),
+        healthy.local_addr().unwrap(),
+        "failed AAAA scheduled a synthetic IPv4 before healthy A"
+    );
+    RESOLVER.with(|slot| {
+        slot.replace(Some(Arc::new(|_, _| {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        })))
+    });
+    let mut v4 = dual_stack();
+    v4.ipv6 = None;
+    let mut v6 = dual_stack();
+    v6.ipv4 = None;
+    let (v4, v6) = tokio::join!(
+        resolve_physical_panel_host("nelomai.ru", v4),
+        resolve_physical_panel_host("nelomai.ru", v6)
+    );
+    assert_eq!(
+        v4.unwrap(),
+        vec!["45.144.221.68".parse::<std::net::IpAddr>().unwrap()]
+    );
+    assert!(
+        v6.unwrap().is_empty(),
+        "static IPv4 scheduled by both family arms"
+    );
+}
+
+#[tokio::test]
+async fn linux_dns_discovery_cannot_occupy_fallback_metadata_admission() {
+    let _serial = NATIVE_READER_CASES.lock().await;
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let _release = Release(gate.clone());
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let gate = gate.clone();
+        let started = started.clone();
+        tasks.push(tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                resolve_linux_host(
+                    "nelomai.ru".into(),
+                    dual_stack(),
+                    move |_| {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let mut open = gate.0.lock().unwrap();
+                        while !*open {
+                            open = gate.1.wait(open).unwrap();
+                        }
+                        Ok(Vec::new())
+                    },
+                    physical::bind_socket,
+                ),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while started.load(Ordering::SeqCst) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for task in tasks {
+        assert!(task.await.unwrap().is_err());
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), native_read(|| Ok(())))
+            .await
+            .is_ok(),
+        "Linux discovery still occupied snapshot admission"
+    );
+}
+
+#[test]
+fn cancelled_native_job_waiting_for_a_blocking_thread_never_starts() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        static ADMISSION: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+        });
+        ready.await.unwrap();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let observed = ran.clone();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            native_read_in(&ADMISSION, move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        )
+        .await
+        .is_err());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "cancelled admitted job began after timeout"
+        );
+        assert_eq!(ADMISSION.available_permits(), 4);
+        let error = native_read_in(&ADMISSION, || Err::<(), _>(io::ErrorKind::TimedOut.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "blocking owner changed the native IO error contract"
+        );
+    });
 }

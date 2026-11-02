@@ -1,3 +1,9 @@
+mod blocking;
+mod panel_dns;
+pub use panel_dns::{
+    execute_panel_request, panel_backup_url, panel_http_client_builder, resolve_panel_addresses,
+};
+
 use futures_util::StreamExt;
 use nelomai_contracts::{
     Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
@@ -935,7 +941,7 @@ impl ResettableHttpClient {
     }
 
     fn build() -> Result<HttpClient, ClientApiError> {
-        Ok(HttpClient::builder()
+        Ok(panel_http_client_builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?)
@@ -961,7 +967,7 @@ impl ResettableHttpClient {
         if let Some(control) = &self.control {
             return control.execute(request).await;
         }
-        Ok(self.client().execute(request).await?)
+        Ok(execute_panel_request(&self.client(), request, HTTP_REQUEST_TIMEOUT).await?)
     }
 
     fn client(&self) -> HttpClient {
@@ -1712,7 +1718,7 @@ impl ClientApi {
         endpoint: Url,
         resolved_ip: Option<IpAddr>,
     ) -> Result<RequestBuilder, ProbeFailureCode> {
-        let mut client = HttpClient::builder()
+        let mut client = panel_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(3))
             .http1_only()

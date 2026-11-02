@@ -30,6 +30,7 @@ path = "src/bin/nelomai-runtime.rs"
 required-features = ["desktop-runtime"]
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 ed25519-dalek = "2.2"
 
 [dependencies]
@@ -82,3 +83,5 @@ libc = "0.2"
 notify-rust = "=4.11.7"
 tauri-plugin-notification = "2"
 tauri-plugin-updater = "=2.10.1"
+# Match the plugin HTTP types without changing the Android reqwest 0.12 client.
+reqwest-updater = { package = "reqwest", version = "0.13", default-features = false }

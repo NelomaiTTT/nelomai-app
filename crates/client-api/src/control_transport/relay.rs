@@ -152,7 +152,7 @@ impl Relay {
             // capacity, nor create an unbounded queue of blocking log jobs.
             static DIAGNOSTICS: Semaphore = Semaphore::const_new(16);
             loop {
-                let mut accepted = tokio::select! {
+                let accepted = tokio::select! {
                     biased;
                     _ = &mut cancelled => break,
                     result = listener.accept() => match result { Ok(socket) => socket, Err(_) => break },
@@ -166,21 +166,32 @@ impl Relay {
                 let observe = observe.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    #[cfg(unix)]
+                    let mut accepted = accepted;
                     let started = std::time::Instant::now();
-                    let connected = tokio::select! {
-                        _ = &mut accepted.closed => return,
-                        result = tokio::time::timeout(
-                            super::super::HTTP_CONNECT_TIMEOUT,
-                            dialer.connect(origin),
-                        ) => result,
+                    #[cfg(unix)]
+                    let connected = {
+                        let result = tokio::select! {
+                            _ = &mut accepted.closed => return,
+                            result = tokio::time::timeout(
+                                super::super::HTTP_CONNECT_TIMEOUT,
+                                dialer.connect(origin),
+                            ) => result,
+                        };
+                        result.map(|result| result.map(|remote| (accepted, remote)))
                     };
+                    #[cfg(windows)]
+                    let connected = tokio::time::timeout(
+                        super::super::HTTP_CONNECT_TIMEOUT,
+                        connect_with_preface(accepted, dialer.connect(origin)),
+                    )
+                    .await;
                     match connected {
-                        Ok(Ok(remote)) => {
+                        Ok(Ok((accepted, remote))) => {
                             let _ = bridge(accepted, remote).await;
                         }
                         failed => {
                             // Release both resources before best-effort log IO.
-                            drop(accepted);
                             drop(_permit);
                             let code = match &failed {
                                 Ok(Err(error)) => failure_code(error),
@@ -219,6 +230,43 @@ impl Drop for Relay {
         // including response bodies whose reqwest client was just reset.
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
+        }
+    }
+}
+
+// Named pipes have no separate peer-closure event like Unix HUP. While the
+// exact dial is pending, read the TLS preface so even closure behind buffered
+// bytes cancels it. No HTTP can precede the HTTPS handshake. Retain every byte
+// for bridge(), bound memory, and fail closed if the preface reaches the cap.
+#[cfg(any(windows, test))]
+async fn connect_with_preface(
+    mut local: Local,
+    dial: super::DialFuture,
+) -> io::Result<(Local, tokio::net::TcpStream)> {
+    const LIMIT: usize = 64 * 1024;
+    let mut prefix = Vec::new();
+    let mut buffer = [0; 8192];
+    tokio::pin!(dial);
+    loop {
+        let read_limit = buffer.len().min(LIMIT - prefix.len());
+        tokio::select! {
+            _ = &mut local.closed => return Err(io::ErrorKind::ConnectionAborted.into()),
+            result = &mut dial => {
+                let remote = result?;
+                let (read, write) = tokio::io::split(local.io);
+                local.io = Box::new(tokio::io::join(std::io::Cursor::new(prefix).chain(read), write));
+                return Ok((local, remote));
+            }
+            result = local.io.read(&mut buffer[..read_limit]) => {
+                let length = result?;
+                if length == 0 {
+                    return Err(io::ErrorKind::ConnectionAborted.into());
+                }
+                prefix.extend_from_slice(&buffer[..length]);
+                if prefix.len() >= LIMIT {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+            }
         }
     }
 }
@@ -283,6 +331,115 @@ async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn short_preface_reads_never_consume_more_than_the_exact_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl tokio::io::AsyncRead for Counted {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buffer: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                let length = if self.0.load(Ordering::SeqCst) == 0 {
+                    1
+                } else {
+                    buffer.remaining().min(8192)
+                };
+                buffer.put_slice(&[0; 8192][..length]);
+                self.0.fetch_add(length, Ordering::SeqCst);
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let local = Local {
+            io: Box::new(tokio::io::join(
+                Counted(consumed.clone()),
+                tokio::io::sink(),
+            )),
+            closed: Box::pin(std::future::pending()),
+        };
+        let result = connect_with_preface(local, Box::pin(std::future::pending())).await;
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            consumed.load(Ordering::SeqCst),
+            64 * 1024,
+            "preface reader consumed beyond its exact memory/input bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_local_disconnect_cancels_the_exact_pending_dial() {
+        let (mut client, socket) = tokio::io::duplex(4096);
+        client.write_all(b"buffered-client-hello").await.unwrap();
+        drop(client);
+        let local = Local {
+            io: Box::new(socket),
+            closed: Box::pin(std::future::pending()),
+        };
+        let dial: super::super::DialFuture = Box::pin(std::future::pending());
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_with_preface(local, dial),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "local disconnect left a physical dial alive"
+        );
+        assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn preconnect_buffer_preserves_tls_bytes_and_bidirectional_io() {
+        let (mut client, socket) = tokio::io::duplex(4096);
+        client.write_all(b"buffered-client-hello").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let local = Local {
+            io: Box::new(socket),
+            closed: Box::pin(std::future::pending()),
+        };
+        let dial = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::net::TcpStream::connect(address).await
+        });
+        let (mut local, _remote) = connect_with_preface(local, dial).await.unwrap();
+        let mut prefix = [0; 21];
+        tokio::time::timeout(Duration::from_millis(100), local.io.read_exact(&mut prefix))
+            .await
+            .expect("buffered preface was lost")
+            .unwrap();
+        assert_eq!(&prefix, b"buffered-client-hello");
+        client.write_all(b"later").await.unwrap();
+        let mut later = [0; 5];
+        local.io.read_exact(&mut later).await.unwrap();
+        assert_eq!(&later, b"later");
+        local.io.write_all(b"reply").await.unwrap();
+        client.read_exact(&mut later).await.unwrap();
+        assert_eq!(&later, b"reply");
+    }
+
+    #[tokio::test]
+    async fn oversized_preconnect_data_fails_closed_without_unbounded_buffering() {
+        let (mut client, socket) = tokio::io::duplex(128 * 1024);
+        client.write_all(&vec![0; 70 * 1024]).await.unwrap();
+        let local = Local {
+            io: Box::new(socket),
+            closed: Box::pin(std::future::pending()),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_with_preface(local, Box::pin(std::future::pending())),
+        )
+        .await;
+        assert!(result.is_ok(), "oversized preface retained pending work");
+        assert_eq!(
+            result.unwrap().err().unwrap().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     #[tokio::test]
     async fn local_disconnect_does_not_wait_for_a_silent_remote_half() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

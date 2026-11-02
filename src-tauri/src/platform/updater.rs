@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nelomai_client_api::AccessSnapshot;
+use nelomai_client_api::{panel_backup_url, resolve_panel_addresses, AccessSnapshot};
 #[cfg(not(windows))]
 use nelomai_client_updater::InstalledUpdate;
 use nelomai_client_updater::{
@@ -7,6 +7,7 @@ use nelomai_client_updater::{
     UpdateEndpointPolicy,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_updater::UpdaterExt;
 
@@ -62,25 +63,87 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .endpoint_policy
             .manifest_url(&target, &current_version)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
-        let mut builder = self
-            .app
-            .updater_builder()
-            .pubkey(self.public_key.clone())
-            .endpoints(vec![endpoint])
-            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
-        // The updater carries these same headers into Update.download().
-        for (name, value) in access_token.bearer_headers() {
-            builder = builder
-                .header(name, value)
-                .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?;
-        }
-        let updater = builder
-            .build()
-            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
-        let Some(update) = updater
-            .check()
-            .await
-            .map_err(|_| UpdateBackendError::new("update_check_failed"))?
+        // The durable LocalStopped barrier blocks native Start throughout this
+        // install. The plugin runs after our VPN is stopped, so it needs no
+        // second physical relay adapter across incompatible reqwest versions.
+        // The plugin uses reqwest 0.13. Pass the shared resolver's address
+        // snapshot through its supported hook, for both check and download.
+        let check_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let backup_endpoint = panel_backup_url(&endpoint);
+        let backup_host = backup_endpoint
+            .as_ref()
+            .and_then(|url| url.host_str())
+            .map(str::to_owned);
+        let panel_host = endpoint
+            .host_str()
+            .ok_or_else(|| UpdateBackendError::new("invalid_update_endpoint"))?
+            .to_owned();
+        let (panel_addresses, backup_addresses) = tokio::time::timeout_at(check_deadline, async {
+            Ok::<_, UpdateBackendError>(if let Some(host) = &backup_host {
+                let (primary, backup) = tokio::join!(
+                    resolve_panel_addresses(&panel_host),
+                    resolve_panel_addresses(host)
+                );
+                (
+                    primary.map_err(|_| UpdateBackendError::new("update_check_failed"))?,
+                    Some(backup.map_err(|_| UpdateBackendError::new("update_check_failed"))?),
+                )
+            } else {
+                (
+                    resolve_panel_addresses(&panel_host)
+                        .await
+                        .map_err(|_| UpdateBackendError::new("update_check_failed"))?,
+                    None,
+                )
+            })
+        })
+        .await
+        .map_err(|_| UpdateBackendError::new("update_check_failed"))??;
+        let Some(update) = updater_request(
+            endpoint,
+            check_deadline,
+            "update_check_failed",
+            |endpoint, remaining| {
+                let panel_host = panel_host.clone();
+                let panel_addresses = panel_addresses.clone();
+                let backup_host = backup_host.clone();
+                let backup_addresses = backup_addresses.clone();
+                async move {
+                    // One endpoint per plugin instance: its internal multi-endpoint
+                    // loop would otherwise retry HTTP and parse failures too.
+                    let mut builder = self
+                        .app
+                        .updater_builder()
+                        .pubkey(self.public_key.clone())
+                        .endpoints(vec![endpoint])
+                        .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?
+                        .timeout(remaining)
+                        .configure_client(move |builder| {
+                            let builder = configure_updater_client(builder)
+                                .resolve_to_addrs(&panel_host, &panel_addresses);
+                            if let (Some(host), Some(addresses)) = (&backup_host, &backup_addresses)
+                            {
+                                builder.resolve_to_addrs(host, addresses)
+                            } else {
+                                builder
+                            }
+                        });
+                    for (name, value) in access_token.bearer_headers() {
+                        builder = builder
+                            .header(name, value)
+                            .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?;
+                    }
+                    let updater = builder
+                        .build()
+                        .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
+                    updater
+                        .check()
+                        .await
+                        .map_err(UpdaterAttemptError::Transport)
+                }
+            },
+        )
+        .await?
         else {
             return Ok(InstallResult::NoUpdate);
         };
@@ -94,17 +157,32 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             return Err(UpdateBackendError::new("untrusted_update_artifact"));
         }
 
-        let mut downloaded = 0_u64;
-        let bytes = update
-            .download(
-                |chunk, total| {
-                    downloaded = downloaded.saturating_add(chunk as u64);
-                    progress(DownloadProgress { downloaded, total });
-                },
-                || {},
-            )
-            .await
-            .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        let download_deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
+        let bytes = updater_request(
+            update.download_url.clone(),
+            download_deadline,
+            "update_install_failed",
+            |url, remaining| {
+                let mut download = update.clone();
+                let progress = progress.clone();
+                async move {
+                    download.download_url = url;
+                    download.timeout = Some(remaining);
+                    let mut downloaded = 0_u64;
+                    download
+                        .download(
+                            |chunk, total| {
+                                downloaded = downloaded.saturating_add(chunk as u64);
+                                progress(DownloadProgress { downloaded, total });
+                            },
+                            || {},
+                        )
+                        .await
+                        .map_err(UpdaterAttemptError::Transport)
+                }
+            },
+        )
+        .await?;
 
         let stop_proof = crate::container::begin_installation(&self.app, expected_version)
             .await
@@ -310,5 +388,292 @@ mod macos_tests {
     #[test]
     fn macos_update_rejects_root_owner_before_authorization() {
         assert!(stage_macos_update(b"abc", Path::new("/unused"), 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    #[tokio::test]
+    async fn production_updater_loop_retries_manifest_and_download_once_and_keeps_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let client = configure_updater_client(reqwest_updater::Client::builder())
+            .resolve("nelomai.ru", address)
+            .resolve("nelomai.top", address)
+            .build()
+            .unwrap();
+        for operation in ["manifest", "download"] {
+            let url =
+                reqwest_updater::Url::parse(&format!("https://nelomai.ru/api/{operation}?x=a%2Fb"))
+                    .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let client = client.clone();
+            let result = updater_request(
+                url,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                "fixture_failure",
+                move |url, _| {
+                    let seen = seen.clone();
+                    let client = client.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        if url.host_str() == Some("nelomai.top") {
+                            return Ok(url.to_string());
+                        }
+                        let error = client.get(url).send().await.unwrap_err();
+                        Err(UpdaterAttemptError::Transport(error.into()))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "{operation} loop omitted its safe alternate"
+            );
+            assert_eq!(
+                result,
+                format!("https://nelomai.top/api/{operation}?x=a%2Fb")
+            );
+        }
+        // HTTP/parse failures represented by plugin ReleaseNotFound and
+        // configuration errors never select the second origin.
+        for backend in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let result: Result<(), _> = updater_request(
+                reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                "fixture_failure",
+                move |_, _| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if backend {
+                            Err(UpdaterAttemptError::Backend(UpdateBackendError::new(
+                                "configuration",
+                            )))
+                        } else {
+                            Err(UpdaterAttemptError::Transport(
+                                tauri_plugin_updater::Error::ReleaseNotFound,
+                            ))
+                        }
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let copy = client.clone();
+        let start = std::time::Instant::now();
+        let result = updater_request(
+            reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
+            tokio::time::Instant::now() + Duration::from_millis(120),
+            "fixture_timeout",
+            move |url, _| {
+                let seen = seen.clone();
+                let copy = copy.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    if url.host_str() == Some("nelomai.top") {
+                        Ok(())
+                    } else {
+                        Err(UpdaterAttemptError::Transport(
+                            copy.get(url).send().await.unwrap_err().into(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().code(), "fixture_timeout");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(start.elapsed() < Duration::from_millis(180));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let copy = client.clone();
+        let result: Result<(), _> = updater_request(
+            reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "fixture_failure",
+            move |url, _| {
+                let seen = seen.clone();
+                let copy = copy.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Err(UpdaterAttemptError::Transport(
+                        copy.get(url).send().await.unwrap_err().into(),
+                    ))
+                }
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "backup failure recursively retried"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let cancelled = updater_request(
+            reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "fixture_failure",
+            move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    Ok::<_, UpdaterAttemptError>(())
+                }
+            },
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), cancelled)
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Real reqwest 0.13 errors: textual error matching would not establish
+    // whether HTTP bytes had already reached the peer.
+    #[tokio::test]
+    async fn updater_classifier_accepts_only_initial_pre_http_connect_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest_updater::Url::parse(&format!(
+            "http://{}/initial",
+            closed.local_addr().unwrap()
+        ))
+        .unwrap();
+        drop(closed);
+        let client = configure_updater_client(reqwest_updater::Client::builder())
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let error = client
+            .post(url.clone())
+            .body("once")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(safe_updater_connect_failure(&error.into(), &url));
+        for mode in 0..3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = reqwest_updater::Url::parse(&format!(
+                "http://{}/initial",
+                listener.local_addr().unwrap()
+            ))
+            .unwrap();
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let later = format!("http://{}/later", closed.local_addr().unwrap());
+            drop(closed);
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                assert!(socket.read(&mut bytes).await.unwrap() > 0);
+                if mode == 1 {
+                    socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else if mode == 2 {
+                    socket.write_all(format!("HTTP/1.1 307 Redirect\r\nLocation: {later}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                }
+            });
+            // Exercise the production policy: even a same-operation later
+            // connect error cannot turn an accepted redirect into a replay.
+            let result = client
+                .post(url.clone())
+                .body("once")
+                .send()
+                .await
+                .and_then(|r| r.error_for_status());
+            if mode == 2 {
+                assert_eq!(
+                    result.unwrap().status(),
+                    307,
+                    "redirect was followed after HTTP was sent"
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    !safe_updater_connect_failure(&error.into(), &url),
+                    "ambiguous outcome mode {mode} qualified for fallback"
+                );
+            }
+            server.await.unwrap();
+        }
+        assert!(!safe_updater_connect_failure(
+            &tauri_plugin_updater::Error::ReleaseNotFound,
+            &url
+        ));
+    }
+}
+
+fn safe_updater_connect_failure(
+    error: &tauri_plugin_updater::Error,
+    url: &reqwest_updater::Url,
+) -> bool {
+    matches!(error, tauri_plugin_updater::Error::Reqwest(error)
+        if error.is_connect() && error.url() == Some(url))
+}
+
+// The connect classifier is safe only when no previous HTTP hop can have run.
+fn configure_updater_client(
+    builder: reqwest_updater::ClientBuilder,
+) -> reqwest_updater::ClientBuilder {
+    builder
+        .no_proxy()
+        .redirect(reqwest_updater::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+}
+
+#[derive(Debug)]
+enum UpdaterAttemptError {
+    Backend(UpdateBackendError),
+    Transport(tauri_plugin_updater::Error),
+}
+impl From<UpdateBackendError> for UpdaterAttemptError {
+    fn from(error: UpdateBackendError) -> Self {
+        Self::Backend(error)
+    }
+}
+
+// Both real plugin operations use this loop; the attempt seam leaves their
+// signature/version/artifact checks in place while making retries testable.
+async fn updater_request<T, F, Fut>(
+    mut url: reqwest_updater::Url,
+    deadline: tokio::time::Instant,
+    code: &'static str,
+    mut attempt: F,
+) -> Result<T, UpdateBackendError>
+where
+    F: FnMut(reqwest_updater::Url, Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<T, UpdaterAttemptError>>,
+{
+    let mut backup = panel_backup_url(&url);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(UpdateBackendError::new(code));
+        }
+        match tokio::time::timeout_at(deadline, attempt(url.clone(), remaining)).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(UpdaterAttemptError::Backend(error))) => return Err(error),
+            Ok(Err(UpdaterAttemptError::Transport(error)))
+                if safe_updater_connect_failure(&error, &url) =>
+            {
+                url = backup.take().ok_or_else(|| UpdateBackendError::new(code))?;
+            }
+            _ => return Err(UpdateBackendError::new(code)),
+        }
     }
 }

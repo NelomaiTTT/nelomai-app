@@ -64,19 +64,34 @@ async fn snapshot() -> io::Result<physical::Snapshot> {
 async fn native_read<T: Send + 'static>(
     read: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> io::Result<T> {
-    // Keep permits inside blocking work: cancelling an HTTP future cannot
-    // otherwise bound the number of still-running OS metadata subprocesses.
     static READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-    let permit = READERS
+    native_read_in(&READERS, read).await
+}
+
+// Uncancellable scoped DNS calls must not occupy snapshot/NIC revalidation
+// capacity after the async DNS budget expires and the static route is selected.
+async fn native_dns_read<T: Send + 'static>(
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    static READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    native_read_in(&READERS, read).await
+}
+
+async fn native_read_in<T: Send + 'static>(
+    readers: &'static tokio::sync::Semaphore,
+    read: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    // Keep permits inside blocking work. Cancelling a caller releases neither
+    // a live OS worker's admission nor a cancelled queued closure into it.
+    let permit = readers
         .acquire()
         .await
         .map_err(|_| io::Error::other("physical_discovery_failed"))?;
-    tokio::task::spawn_blocking(move || {
+    crate::blocking::read(move || {
         let _permit = permit;
         read()
     })
     .await
-    .map_err(|_| io::Error::other("physical_discovery_failed"))?
 }
 
 impl Dialer for SystemDialer {
@@ -121,16 +136,18 @@ async fn connect_family(
         family.interface(address)?;
         vec![address]
     } else {
-        resolve_host(host, family).await.map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                if e.kind() == io::ErrorKind::TimedOut {
-                    "physical_dns_timeout"
-                } else {
-                    "physical_dns_failed"
-                },
-            )
-        })?
+        resolve_physical_panel_host(&host, family)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        "physical_dns_timeout"
+                    } else {
+                        "physical_dns_failed"
+                    },
+                )
+            })?
     };
     if snapshot().await? != before {
         return Err(io::Error::other("physical_network_changed"));
@@ -146,12 +163,41 @@ async fn connect_family(
     race_connections(attempts).await
 }
 
+async fn resolve_physical_panel_host(
+    host: &str,
+    family: physical::Snapshot,
+) -> io::Result<Vec<std::net::IpAddr>> {
+    crate::panel_dns::resolve_panel_addresses_with(host, |name| {
+        let family = family.clone();
+        async move {
+            resolve_host(name, family).await.map(|addresses| {
+                addresses
+                    .into_iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, 0))
+                    .collect()
+            })
+        }
+    })
+    .await
+    .map(|addresses| {
+        addresses
+            .into_iter()
+            .map(|address| address.ip())
+            .filter(|address| family.interface(*address).is_ok())
+            .collect()
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
 async fn resolve_host(
     host: String,
     family: physical::Snapshot,
 ) -> io::Result<Vec<std::net::IpAddr>> {
-    native_read(move || physical::resolve(&host, &family)).await
+    #[cfg(test)]
+    if let Some(result) = tests::fixture_resolve(host.clone(), family.clone()) {
+        return result.await;
+    }
+    native_dns_read(move || physical::resolve(&host, &family)).await
 }
 
 #[cfg(target_os = "linux")]
@@ -159,9 +205,17 @@ async fn resolve_host(
     host: String,
     family: physical::Snapshot,
 ) -> io::Result<Vec<std::net::IpAddr>> {
-    let selected = family.clone();
-    let servers = native_read(move || physical::dns_servers(&selected)).await?;
-    linux_wire::resolve(&host, &family, &servers, physical::bind_socket).await
+    #[cfg(test)]
+    if let Some(result) = tests::fixture_resolve(host.clone(), family.clone()) {
+        return result.await;
+    }
+    resolve_linux_host(
+        host,
+        family,
+        |selected| physical::dns_servers(&selected),
+        physical::bind_socket,
+    )
+    .await
 }
 
 async fn connect_address(
@@ -205,7 +259,10 @@ pub(super) struct ControlClient {
 
 impl ControlClient {
     pub fn new(url: &Url, dialer: Arc<dyn Dialer>) -> io::Result<Self> {
-        Self::build(url, dialer, Client::builder())
+        let builder = Client::builder();
+        #[cfg(test)]
+        let builder = crate::panel_dns::https_tests::configure_client(builder);
+        Self::build(url, dialer, builder)
     }
 
     fn build(
@@ -225,26 +282,13 @@ impl ControlClient {
                 .ok_or_else(|| io::Error::other("control_origin_invalid"))?,
         };
         let listener = relay::Listener::bind()?;
-        let expected = origin.clone();
-        let scheme = url.scheme().to_owned();
         let builder = builder
             .no_proxy()
             .connect_timeout(super::HTTP_CONNECT_TIMEOUT)
             .timeout(super::HTTP_REQUEST_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                let url = attempt.url();
-                if url.scheme() != scheme
-                    || url.host_str().map(|s| s.trim_matches(['[', ']']))
-                        != Some(expected.host.as_str())
-                    || url.port_or_known_default() != Some(expected.port)
-                {
-                    attempt.stop()
-                } else if attempt.previous().len() >= 10 {
-                    attempt.error("control_redirect_limit")
-                } else {
-                    attempt.follow()
-                }
-            }));
+            // A later redirect connect error cannot prove the initial POST
+            // was unsent. Surface redirects without replaying any HTTP bytes.
+            .redirect(reqwest::redirect::Policy::none());
         let client = listener
             .configure(builder)
             .build()
@@ -278,6 +322,7 @@ pub(super) struct Slot {
     origin: Url,
     dialer: Arc<dyn Dialer>,
     current: RwLock<Option<Arc<ControlClient>>>,
+    backup: RwLock<Option<Arc<ControlClient>>>,
     observer: RwLock<Option<Observer>>,
 }
 
@@ -287,63 +332,119 @@ impl Slot {
             .observer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observe.clone());
-        if let Some(current) = self
-            .current
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            current._relay.set_observer(Some(observe));
+        for slot in [&self.current, &self.backup] {
+            if let Some(current) = slot
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                current._relay.set_observer(Some(observe.clone()));
+            }
         }
     }
+
     pub fn new(origin: Url, dialer: Arc<dyn Dialer>) -> Self {
         Self {
             origin,
             dialer,
             current: RwLock::new(None),
+            backup: RwLock::new(None),
             observer: RwLock::new(None),
         }
     }
 
     pub fn reset(&self) {
-        self.current
+        for slot in [&self.current, &self.backup] {
+            slot.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    fn client_for(
+        &self,
+        slot: &RwLock<Option<Arc<ControlClient>>>,
+        origin: &Url,
+    ) -> Result<Arc<ControlClient>, super::ClientApiError> {
+        let mut current = slot
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Retire stopped relays only before a new request.
+        if current
+            .as_ref()
+            .is_none_or(|client| !client._relay.is_running())
+        {
+            *current = Some(Arc::new(
+                ControlClient::new(origin, self.dialer.clone())
+                    .map_err(|_| super::ClientApiError::ControlTransportUnavailable)?,
+            ));
+        }
+        let client = current.as_ref().unwrap().clone();
+        client._relay.set_observer(
+            self.observer
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
+        Ok(client)
     }
 
     pub async fn execute(
         &self,
         request: reqwest::Request,
     ) -> Result<reqwest::Response, super::ClientApiError> {
-        let client = {
-            let mut current = self
-                .current
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // A stopped accept task drops its cancellation receiver. Retire
-            // that client before a NEW request; never replay one already sent.
-            if current
-                .as_ref()
-                .is_none_or(|client| !client._relay.is_running())
+        let mut request = request;
+        let budget = request
+            .timeout()
+            .copied()
+            .unwrap_or(super::HTTP_REQUEST_TIMEOUT);
+        *request.timeout_mut() = Some(budget);
+        let original = request.url().clone();
+        let backup = crate::panel_backup_url(&original).and_then(|url| {
+            let mut alternate = request.try_clone()?;
+            *alternate.url_mut() = url;
+            alternate.headers_mut().remove(reqwest::header::HOST);
+            Some(alternate)
+        });
+        let started = std::time::Instant::now();
+        let client = self.client_for(&self.current, &self.origin)?;
+        *request.timeout_mut() = Some(budget.saturating_sub(started.elapsed()));
+        match client.execute(request).await {
+            Err(super::ClientApiError::Transport(error))
+                if error.is_connect() && error.url() == Some(&original) =>
             {
-                *current = Some(Arc::new(
-                    ControlClient::new(&self.origin, self.dialer.clone())
-                        .map_err(|_| super::ClientApiError::ControlTransportUnavailable)?,
-                ));
+                let remaining = budget.saturating_sub(started.elapsed());
+                match backup {
+                    Some(mut alternate) if !remaining.is_zero() => {
+                        let client = self.client_for(&self.backup, alternate.url())?;
+                        let remaining = budget.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            return Err(super::ClientApiError::Transport(error));
+                        }
+                        *alternate.timeout_mut() = Some(remaining);
+                        client.execute(alternate).await
+                    }
+                    _ => Err(super::ClientApiError::Transport(error)),
+                }
             }
-            let client = current.as_ref().unwrap();
-            client._relay.set_observer(
-                self.observer
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            );
-            client.clone()
-        };
-        client.execute(request).await
+            result => result,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+// Keep actual Linux discovery on the DNS admission path. The injected OS
+// discovery/bind functions also permit host-independent tests of this adapter.
+#[cfg(any(target_os = "linux", test))]
+async fn resolve_linux_host(
+    host: String,
+    family: physical::Snapshot,
+    discover: impl FnOnce(physical::Snapshot) -> io::Result<Vec<physical::DnsServer>> + Send + 'static,
+    bind: linux_wire::BindSocket,
+) -> io::Result<Vec<std::net::IpAddr>> {
+    let selected = family.clone();
+    let servers = native_dns_read(move || discover(selected)).await?;
+    linux_wire::resolve(&host, &family, &servers, bind).await
+}
