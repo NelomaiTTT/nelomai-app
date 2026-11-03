@@ -398,34 +398,24 @@ mod transport_tests {
     async fn production_updater_loop_retries_manifest_and_download_once_and_keeps_budget() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = closed.local_addr().unwrap();
-        drop(closed);
-        let client = configure_updater_client(reqwest_updater::Client::builder())
-            .resolve("nelomai.ru", address)
-            .resolve("nelomai.top", address)
-            .build()
-            .unwrap();
         for operation in ["manifest", "download"] {
             let url =
                 reqwest_updater::Url::parse(&format!("https://nelomai.ru/api/{operation}?x=a%2Fb"))
                     .unwrap();
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = calls.clone();
-            let client = client.clone();
             let result = updater_request(
                 url,
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 "fixture_failure",
                 move |url, _| {
                     let seen = seen.clone();
-                    let client = client.clone();
                     async move {
                         seen.fetch_add(1, Ordering::SeqCst);
                         if url.host_str() == Some("nelomai.top") {
                             return Ok(url.to_string());
                         }
-                        let error = client.get(url).send().await.unwrap_err();
+                        let error = pre_http_tls_failure(url).await;
                         Err(UpdaterAttemptError::Transport(error.into()))
                     }
                 },
@@ -472,7 +462,12 @@ mod transport_tests {
         }
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        let copy = client.clone();
+        // Obtain the real connect error before timing the loop: neither the
+        // deadline test nor its second-attempt count depends on OS refusal latency.
+        let mut timeout_error = Some(
+            pre_http_tls_failure(reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap())
+                .await,
+        );
         let start = std::time::Instant::now();
         let result = updater_request(
             reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
@@ -480,16 +475,14 @@ mod transport_tests {
             "fixture_timeout",
             move |url, _| {
                 let seen = seen.clone();
-                let copy = copy.clone();
+                let error = timeout_error.take();
                 async move {
                     seen.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(80)).await;
                     if url.host_str() == Some("nelomai.top") {
                         Ok(())
                     } else {
-                        Err(UpdaterAttemptError::Transport(
-                            copy.get(url).send().await.unwrap_err().into(),
-                        ))
+                        Err(UpdaterAttemptError::Transport(error.unwrap().into()))
                     }
                 }
             },
@@ -500,18 +493,16 @@ mod transport_tests {
         assert!(start.elapsed() < Duration::from_millis(180));
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
-        let copy = client.clone();
         let result: Result<(), _> = updater_request(
             reqwest_updater::Url::parse("https://nelomai.ru/check").unwrap(),
             tokio::time::Instant::now() + Duration::from_secs(1),
             "fixture_failure",
             move |url, _| {
                 let seen = seen.clone();
-                let copy = copy.clone();
                 async move {
                     seen.fetch_add(1, Ordering::SeqCst);
                     Err(UpdaterAttemptError::Transport(
-                        copy.get(url).send().await.unwrap_err().into(),
+                        pre_http_tls_failure(url).await.into(),
                     ))
                 }
             },
@@ -545,29 +536,69 @@ mod transport_tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Avoid depending on OS closed-port refusal latency: observe a real
+    // TLS ClientHello and reject the handshake before
+    // HTTP. The DNS override keeps the production HTTPS/default-port URL intact.
+    // Both futures are owned here and dropped together on timeout/cancellation.
+    async fn pre_http_tls_failure(url: reqwest_updater::Url) -> reqwest_updater::Error {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = configure_updater_client(reqwest_updater::Client::builder())
+            .resolve_to_addrs(url.host_str().unwrap(), &[listener.local_addr().unwrap()])
+            .build()
+            .unwrap();
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(client.post(url.clone()).body("once").send(), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = [0; 5];
+                socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(
+                    header[0], 22,
+                    "expected TLS handshake, not HTTP: {header:?}"
+                );
+                assert_eq!(header[1], 3, "expected TLS record version: {header:?}");
+                let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+                assert!(
+                    (4..=16384).contains(&length),
+                    "invalid ClientHello record length"
+                );
+                let mut hello = vec![0; length];
+                socket.read_exact(&mut hello).await.unwrap();
+                assert_eq!(hello[0], 1, "expected TLS ClientHello");
+                // TLS fatal handshake_failure alert; no certificate or HTTP response.
+                socket.write_all(&[21, 3, 3, 0, 2, 2, 40]).await.unwrap();
+                socket.shutdown().await.unwrap();
+            })
+        })
+        .await
+        .expect("local TLS failure fixture exceeded its bound");
+        let error = response.unwrap_err();
+        assert!(
+            error.is_connect() && !error.is_timeout() && error.url() == Some(&url),
+            "TLS fixture: connect={} timeout={} url={:?} error={error:?}",
+            error.is_connect(),
+            error.is_timeout(),
+            error.url()
+        );
+        error
+    }
+
     // Real reqwest 0.13 errors: textual error matching would not establish
     // whether HTTP bytes had already reached the peer.
     #[tokio::test]
     async fn updater_classifier_accepts_only_initial_pre_http_connect_failure() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = reqwest_updater::Url::parse(&format!(
-            "http://{}/initial",
-            closed.local_addr().unwrap()
-        ))
-        .unwrap();
-        drop(closed);
+        let url = reqwest_updater::Url::parse("https://nelomai.ru/initial").unwrap();
+        let error = tauri_plugin_updater::Error::from(pre_http_tls_failure(url.clone()).await);
+        eprintln!("local pre-HTTP TLS fixture returned {error:?}");
+        assert!(safe_updater_connect_failure(&error, &url), "{error:?}");
+        assert!(
+            !safe_updater_connect_failure(&error, &url.join("/later").unwrap()),
+            "a connect error for a different URL qualified for fallback: {error:?}"
+        );
         let client = configure_updater_client(reqwest_updater::Client::builder())
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
-        let error = client
-            .post(url.clone())
-            .body("once")
-            .send()
-            .await
-            .unwrap_err();
-        assert!(safe_updater_connect_failure(&error.into(), &url));
         for mode in 0..3 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = reqwest_updater::Url::parse(&format!(
