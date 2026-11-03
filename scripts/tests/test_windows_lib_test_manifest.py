@@ -1,11 +1,13 @@
 """A library-test manifest is checked in PE resources, not by string presence."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -35,6 +37,21 @@ def image(manifest=MANIFEST, resource_id=1):
     return bytes(data)
 
 
+def configure_and_run(tool, root, record, sdk):
+    config = root / "runner with spaces.toml"
+    original_images = {path: path.read_bytes() for path in (root / "target").rglob("*.exe")}
+    record.write_text("stale preparation")
+    tool.configure(root, config, record, sdk)
+    assert all(path.read_bytes() == data for path, data in original_images.items()), "preflight must not embed before the final Cargo link"
+    assert not record.exists(), "preflight must not claim a prepared executable"
+    runner = tomllib.loads(config.read_text(encoding="utf-8"))["target"]["x86_64-pc-windows-msvc"]["runner"]
+    assert runner[:3] == [sys.executable, str(Path(tool.__file__).resolve()), "run"]
+    assert runner[-1] == "--"
+    options = dict(zip(runner[3:-1:2], runner[4:-1:2]))
+    exe = Path(options["--expected-executable"])
+    return tool.run_harness([str(exe)], exe, Path(options["--manifest"]), Path(options["--mt"]), Path(options["--record"]))
+
+
 class WindowsLibTestManifestTest(unittest.TestCase):
     def test_resource_one_requires_exact_v6_dependency_and_no_elevation(self):
         tool = module("windows/prepare-lib-test-manifest")
@@ -49,6 +66,78 @@ class WindowsLibTestManifestTest(unittest.TestCase):
                 with self.subTest(value=value[:20]), self.assertRaises(ValueError):
                     exe.write_bytes(value)
                     tool.verify_manifest(exe)
+
+    def test_runner_prepares_after_relink_and_preserves_failure_and_postguard(self):
+        tool = module("windows/prepare-lib-test-manifest")
+        self.assertTrue(callable(getattr(tool, "run_harness", None)),
+                        "manifest preparation must run inside Cargo runner after final link")
+        with tempfile.TemporaryDirectory(prefix="runner with spaces ") as temporary:
+            root = Path(temporary)
+            exe = root / "nelomai_app_lib-abcdef.exe"
+            source = root / "locked manifest.xml"
+            source.write_bytes(MANIFEST)
+            mt = root / "mt.exe"
+            record = root / "prepared.json"
+            command = [str(exe), "platform::updater::", "--nocapture", "argument with spaces"]
+            for test_exit, corrupt_after, embed in ((0, False, True), (17, False, True),
+                                                    (0, True, True), (17, True, True), (0, False, False)):
+                exe.write_bytes(b"final Cargo relink without resource")
+                calls = []
+                def run(argv, **kwargs):
+                    calls.append(argv)
+                    if argv[0] == str(mt):
+                        self.assertEqual(argv, [str(mt), "-nologo", "-manifest", str(source), f"-outputresource:{exe};#1"])
+                        if embed:
+                            exe.write_bytes(image())
+                        return subprocess.CompletedProcess(argv, 0)
+                    self.assertEqual(argv, command)
+                    self.assertNotIn("cwd", kwargs)
+                    self.assertNotIn("env", kwargs)
+                    tool.verify_manifest(exe)
+                    self.assertEqual(json.loads(record.read_text())["executable_sha256"], tool.digest(exe))
+                    if corrupt_after:
+                        exe.write_bytes(b"changed during test")
+                    return subprocess.CompletedProcess(argv, test_exit)
+                with patch.object(tool.subprocess, "run", side_effect=run):
+                    if not embed:
+                        with self.assertRaises(ValueError):
+                            tool.run_harness(command, exe, source, mt, record)
+                        self.assertEqual(len(calls), 1)
+                    else:
+                        result = tool.run_harness(command, exe, source, mt, record)
+                        self.assertEqual(result, test_exit or int(corrupt_after))
+                        self.assertEqual(len(calls), 2)
+            with patch.object(tool.subprocess, "run", side_effect=AssertionError("must not launch")):
+                with self.assertRaisesRegex(ValueError, "Cargo-selected"):
+                    tool.run_harness([str(root / "wrong.exe")], exe, source, mt, record)
+
+    def test_runner_real_spawn_inherits_argv_environment_and_cwd(self):
+        tool = module("windows/prepare-lib-test-manifest")
+        real_run = subprocess.run
+        with tempfile.TemporaryDirectory(prefix="spawn with spaces ") as temporary:
+            root = Path(temporary)
+            exe = Path(sys.executable)
+            observed = root / "observed.json"
+            child = ("import os,sys,json; from pathlib import Path; "
+                     "Path(os.environ['RUNNER_OBSERVED']).write_text(json.dumps(dict(argv=sys.argv[1:], cwd=os.getcwd(), sentinel=os.environ['RUNNER_SENTINEL']))); "
+                     "sys.exit(23)")
+            manifest = root / "manifest.xml"
+            manifest.write_bytes(MANIFEST)
+            mt = root / "mt.exe"
+            prepared = root / "sdk-prepared"
+            command = [str(exe), "-c", child, "platform::updater::", "--exact", "argument with spaces", "", 'quote"and\\slash']
+            def run(argv, **kwargs):
+                if argv[0] == str(mt):
+                    prepared.touch()
+                    return subprocess.CompletedProcess(argv, 0)
+                self.assertTrue(prepared.exists())
+                return real_run(argv, **kwargs)
+            # Only SDK/PE format are substituted. The runner's process spawn is real.
+            with patch.dict(os.environ, RUNNER_OBSERVED=str(observed), RUNNER_SENTINEL="inherited value"), \
+                 patch.object(tool.subprocess, "run", side_effect=run), \
+                 patch.object(tool, "verify_manifest"):
+                self.assertEqual(tool.run_harness(command, exe, manifest, mt, root / "record.json"), 23)
+            self.assertEqual(json.loads(observed.read_text()), dict(argv=command[3:], cwd=os.getcwd(), sentinel="inherited value"))
 
     def test_prepares_exact_compiler_artifact_and_verifies_embedded_bytes(self):
         tool = module("windows/prepare-lib-test-manifest")
@@ -78,13 +167,15 @@ class WindowsLibTestManifestTest(unittest.TestCase):
                 if command[:2] == ["cargo", "test"]:
                     self.assertEqual(command[2:], ["--locked", "-p", "nelomai-app", "--lib", "--no-run", "--message-format=json"])
                     return subprocess.CompletedProcess(command, 0, "\n".join(map(json.dumps, artifacts)) + "\n", "")
+                if command == [str(exe)]:
+                    return subprocess.CompletedProcess(command, 0)
                 self.assertEqual(command, [str(mt), "-nologo", "-manifest", str(source), f"-outputresource:{exe};#1"])
                 if embed:
                     exe.write_bytes(image())
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with patch.object(tool.subprocess, "run", side_effect=run):
-                tool.prepare(root, record, sdk)
+                configure_and_run(tool, root, record, sdk)
             saved = json.loads(record.read_text())
             self.assertEqual(saved["executable"], str(exe))
             self.assertEqual(saved["manifest_sha256"], hashlib.sha256(MANIFEST).hexdigest())
@@ -99,18 +190,18 @@ class WindowsLibTestManifestTest(unittest.TestCase):
             exe.write_bytes(original)
             record.unlink()
             with patch.object(tool.subprocess, "run", side_effect=run), self.assertRaisesRegex(ValueError, "resource directory"):
-                tool.prepare(root, record, sdk)
+                configure_and_run(tool, root, record, sdk)
             self.assertFalse(record.exists())
             artifacts = [artifact, dict(artifact, executable=str(exe.with_name("nelomai_app_lib-123456.exe")))]
             with patch.object(tool.subprocess, "run", side_effect=run), self.assertRaisesRegex(ValueError, "exactly one"):
-                tool.prepare(root, record, sdk)
+                configure_and_run(tool, root, record, sdk)
             artifacts = [dict(artifact, executable=str(root / "nelomai_app_lib-abcdef.exe"))]
             with patch.object(tool.subprocess, "run", side_effect=run), self.assertRaisesRegex(ValueError, "expected library-test image"):
-                tool.prepare(root, record, sdk)
+                configure_and_run(tool, root, record, sdk)
             # Compiler failure propagates before mt.exe can be invoked.
             with patch.object(tool.subprocess, "run", side_effect=subprocess.CalledProcessError(101, "cargo")):
                 with self.assertRaises(subprocess.CalledProcessError):
-                    tool.prepare(root, record, sdk)
+                    configure_and_run(tool, root, record, sdk)
 
     def test_cargo_json_utf8_bytes_are_independent_of_windows_cp1252_reader(self):
         tool = module("windows/prepare-lib-test-manifest")
@@ -143,13 +234,15 @@ class WindowsLibTestManifestTest(unittest.TestCase):
                         # A real child writes bytes; subprocess performs the actual pipe decoding.
                         child = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))", payload.hex()]
                         return real_run(child, **kwargs)
+                    if command == [str(exe)]:
+                        return subprocess.CompletedProcess(command, 0)
                     self.assertEqual(command, [str(mt), "-nologo", "-manifest", str(source), f"-outputresource:{exe};#1"])
                     exe.write_bytes(image())
                     return subprocess.CompletedProcess(command, 0)
 
                 with patch.object(tool.subprocess, "_text_encoding", return_value="cp1252"), \
                      patch.object(tool.subprocess, "run", side_effect=run):
-                    tool.prepare(root, record, sdk)
+                    configure_and_run(tool, root, record, sdk)
                 saved = json.loads(record.read_text())
                 self.assertEqual(saved["manifest_source"], str(source))
                 self.assertEqual(saved["executable"], str(exe))

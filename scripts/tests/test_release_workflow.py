@@ -140,15 +140,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
         steps = workflow["jobs"]["windows-build"]["steps"]
         self.assertEqual(steps[9].get("id"), "updater_tests")
         program = steps[9]["run"]
-        self.assertIn("cargo test --locked -p nelomai-app --lib platform::updater::", program.splitlines())
+        self.assertIn('cargo test --locked --config "$env:RUNNER_TEMP/updater-loader/runner.toml" -p nelomai-app --lib platform::updater::', program.splitlines())
         factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
         checker.assert_windows_factory_jobs(workflow, factory)
         for mutate in (
             lambda steps: steps[9].update(**{"continue-on-error": True}),
-            lambda steps: steps[9].update(run=steps[9]["run"].replace("prepare --record", "verify --record")),
+            lambda steps: steps[9].update(run=steps[9]["run"].replace('--config "$env:RUNNER_TEMP/updater-loader/runner.toml" -p', '-p')),
+            lambda steps: steps[9].update(run=steps[9]["run"].replace("platform::updater::", "missing_test_namespace::")),
+            lambda steps: steps[9].update(run=steps[9]["run"].replace("configure --record", "verify --record")),
             lambda steps: steps[9].update(run=steps[9]["run"].replace('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', 'echo ignored')),
             lambda steps: steps[9].update(run=steps[9]["run"].replace('if ($testExit -ne 0) { exit $testExit }', 'echo ignored')),
-            lambda steps: steps[9].update(run=steps[9]["run"].replace("verify --record", "prepare --record")),
+            lambda steps: steps[9].update(run=steps[9]["run"].replace("verify --record", "configure --record")),
 
             lambda steps: steps[10].update(**{"if": "always()"}),
             lambda steps: steps[10].update(**{"continue-on-error": True}),
@@ -487,7 +489,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         windows = [step.get("run", "") for step in workflow["jobs"]["windows-build"]["steps"]]
         self.assertIn("cargo test --locked -p nelomai-client-api", windows)
         self.assertIn("cargo test -p nelomai-client-updater", windows)
-        self.assertIn("cargo test --locked -p nelomai-app --lib platform::updater::",
+        self.assertIn('cargo test --locked --config "$env:RUNNER_TEMP/updater-loader/runner.toml" -p nelomai-app --lib platform::updater::',
                       [line for program in windows for line in program.splitlines()])
         macos = workflow["jobs"]["macos-development"]["steps"]
         shared = next(step for step in macos

@@ -95,7 +95,10 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def prepare(root, record, sdk=None):
+def configure(root, config, record, sdk=None):
+    # Resolve inputs before Cargo owns its build lock; never call Cargo from the runner.
+    record = record.resolve()
+    record.unlink(missing_ok=True)
     metadata = json.loads(subprocess.run(["cargo", "metadata", "--locked", "--format-version=1",
         "--filter-platform=x86_64-pc-windows-msvc"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout)
     packages = [item for item in metadata["packages"] if item["name"] == "tauri-build"]
@@ -123,17 +126,37 @@ def prepare(root, record, sdk=None):
     executable = executables[0]
     if not re.fullmatch(r"nelomai_app_lib-[a-f0-9]+\.exe", executable.name) or not executable.is_relative_to(Path(metadata["target_directory"]).resolve()):
         raise ValueError("compiler executable is not the expected library-test image")
-    subprocess.run([str(mt), "-nologo", "-manifest", str(manifest), f"-outputresource:{executable};#1"], cwd=root, check=True)
+    runner = [sys.executable, str(Path(__file__).resolve()), "run", "--record", str(record),
+              "--expected-executable", str(executable), "--manifest", str(manifest), "--mt", str(mt), "--"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    # JSON strings/arrays are also TOML; keep paths with spaces as individual argv entries.
+    config.write_text("target.x86_64-pc-windows-msvc.runner = " + json.dumps(runner, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def run_harness(command, expected_executable, manifest, mt, record):
+    if not command or Path(command[0]).resolve() != expected_executable.resolve():
+        raise ValueError("Cargo-selected executable differs from the app library-test compiler artifact")
+    executable = Path(command[0]).resolve()
+    check_xml(manifest.read_bytes())
+    subprocess.run([str(mt), "-nologo", "-manifest", str(manifest), f"-outputresource:{executable};#1"], check=True)
     verify_manifest(executable)
     saved = dict(executable=str(executable), executable_sha256=digest(executable), manifest_source=str(manifest),
                  manifest_sha256=digest(manifest), sdk_mt=str(mt))
     record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(json.dumps(saved, indent=2) + "\n")
-    print(json.dumps(saved))
+    record.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(saved), flush=True)
+    # Cargo supplies the exact argv, package CWD and dynamic-library environment.
+    result = subprocess.run(command)
+    try:
+        verify_record(record)
+    except (ValueError, OSError) as error:
+        print(f"post-test manifest verification failed: {error}", file=sys.stderr)
+        return result.returncode or 1
+    return result.returncode
 
 
 def verify_record(record):
-    saved = json.loads(record.read_text())
+    saved = json.loads(record.read_text(encoding="utf-8"))
     executable = Path(saved["executable"])
     if digest(executable) != saved["executable_sha256"]:
         raise ValueError("library-test executable changed after preparation; possible relink")
@@ -143,12 +166,26 @@ def verify_record(record):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "verify"))
+    parser.add_argument("mode", choices=("configure", "run", "verify"))
     parser.add_argument("--record", type=Path, required=True)
-    args = parser.parse_args()
-    if args.mode == "prepare":
-        if os.name != "nt":
-            parser.error("manifest preparation requires the native Windows SDK")
-        prepare(ROOT, args.record)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--expected-executable", type=Path)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--mt", type=Path)
+    # Everything following -- belongs to Cargo's executable, including its flags.
+    arguments = sys.argv[1:]
+    separator = arguments.index("--") if "--" in arguments else len(arguments)
+    args = parser.parse_args(arguments[:separator])
+    command = arguments[separator + 1:]
+    if args.mode in ("configure", "run") and os.name != "nt":
+        parser.error("manifest preparation requires the native Windows SDK")
+    if args.mode == "configure":
+        if args.config is None:
+            parser.error("configure requires --config")
+        configure(ROOT, args.config, args.record)
+    elif args.mode == "run":
+        if not command or any(value is None for value in (args.expected_executable, args.manifest, args.mt)):
+            parser.error("run requires --expected-executable, --manifest, --mt and -- executable [args]")
+        sys.exit(run_harness(command, args.expected_executable, args.manifest, args.mt, args.record))
     else:
         verify_record(args.record)
