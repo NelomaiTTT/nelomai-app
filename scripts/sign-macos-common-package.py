@@ -6,6 +6,7 @@ Production credentials are scoped to this phase, never to native packaging.
 """
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -17,11 +18,50 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 IDENTIFIER = "ru.nelomai.client"
 SECRET_NAMES = ("NELOMAI_MACOS_SIGNING_P12_BASE64", "NELOMAI_MACOS_SIGNING_P12_PASSWORD")
+DIAGNOSTIC_LABELS = {
+    "stage": frozenset(("main", "process", "input-validation", "prepare-output", "extract-bundle",
+                        "snapshot-bundle", "sign-bundle", "keychain-cleanup", "verify-signature",
+                        "bundle-content", "repack-bundle", "verify-repack", "copy-archive",
+                        "build-dmg", "dmg-attachments", "dmg-preflight", "dmg-validation",
+                        "dmg-cleanup", "publish-output")),
+    "operation": frozenset(("native", "security-read-search", "security-create-keychain",
+                            "security-unlock-keychain", "security-import", "security-partition-list",
+                            "security-set-search", "security-restore-search", "security-delete-keychain",
+                            "codesign-sign", "codesign-verify", "codesign-display", "codesign-verify-dmg",
+                            "hdiutil-info", "hdiutil-attach", "hdiutil-detach", "hdiutil-create", "hdiutil-verify")),
+}
+
+
+def diagnostic(kind, label, event, status=None):
+    # Only fixed vocabulary and bounded integers may reach the CI log. Logging
+    # must neither replace an operation's failure nor turn success into failure.
+    try:
+        if (any(type(value) is not str for value in (kind, label, event))
+                or kind not in DIAGNOSTIC_LABELS or label not in DIAGNOSTIC_LABELS[kind]
+                or event not in ("entered", "completed", "failed", "timeout", "oserror")):
+            return
+        suffix = f" status={status}" if type(status) is int and -(2 ** 31) <= status < 2 ** 31 else ""
+        print(f"macos-sign {kind}={label} event={event}{suffix}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+@contextmanager
+def stage(label):
+    diagnostic("stage", label, "entered")
+    try:
+        yield
+    except BaseException:
+        diagnostic("stage", label, "failed")
+        raise
+    else:
+        diagnostic("stage", label, "completed")
 
 
 def digest(path):
@@ -39,27 +79,36 @@ def signature_metadata(pin):
     return dict(identifier=IDENTIFIER, certificate_sha1=pin.lower(), designated_requirement=requirement(pin))
 
 
-def run(*command, timeout=60):
+def run(*command, timeout=60, operation="native"):
     # Never expose argv or native stderr: security arguments include passwords.
     environment = {k: v for k, v in os.environ.items() if k not in SECRET_NAMES}
+    diagnostic("operation", operation, "entered")
     try:
         result = subprocess.run([str(c) for c in command], capture_output=True, text=True,
                                 timeout=timeout, env=environment)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        diagnostic("operation", operation, "timeout")
+        raise RuntimeError("macOS signing command could not complete") from None
+    except OSError:
+        diagnostic("operation", operation, "oserror")
         raise RuntimeError("macOS signing command could not complete") from None
     if result.returncode:
-        raise RuntimeError(f"macOS signing command failed ({Path(command[0]).name}, exit {result.returncode})")
+        diagnostic("operation", operation, "failed", result.returncode)
+        raise RuntimeError(f"macOS signing command failed (exit {result.returncode})")
+    diagnostic("operation", operation, "completed", 0)
     return result.stdout + result.stderr
 
 
+@stage("verify-signature")
 def verify_signature(app, pin):
     expected = requirement(pin)
-    run("/usr/bin/codesign", "--verify", "--strict", "-R", "=" + expected, app)
-    details = run("/usr/bin/codesign", "--display", "-r-", app)
+    run("/usr/bin/codesign", "--verify", "--strict", "-R", "=" + expected, app, operation="codesign-verify")
+    details = run("/usr/bin/codesign", "--display", "-r-", app, operation="codesign-display")
     if re.findall(r"^designated => (.+)$", details, re.MULTILINE) != [expected]:
         raise ValueError("macOS common designated requirement is not the stable pinned identity")
 
 
+@stage("sign-bundle")
 def sign_bundle(app, pin, work, environment):
     expected = requirement(pin)
     with tempfile.TemporaryDirectory(prefix="signing-", dir=work) as temporary:
@@ -69,27 +118,31 @@ def sign_bundle(app, pin, work, environment):
         p12.write_bytes(base64.b64decode(environment[SECRET_NAMES[0]], validate=True))
         p12.chmod(0o600)
         password = secrets.token_urlsafe(32)
-        search = shlex.split(run("/usr/bin/security", "list-keychains", "-d", "user"))
+        search = shlex.split(run("/usr/bin/security", "list-keychains", "-d", "user", operation="security-read-search"))
         try:
-            run("/usr/bin/security", "create-keychain", "-p", password, keychain)
-            run("/usr/bin/security", "unlock-keychain", "-p", password, keychain)
+            run("/usr/bin/security", "create-keychain", "-p", password, keychain, operation="security-create-keychain")
+            run("/usr/bin/security", "unlock-keychain", "-p", password, keychain, operation="security-unlock-keychain")
             run("/usr/bin/security", "import", p12, "-k", keychain, "-P", environment[SECRET_NAMES[1]],
-                "-T", "/usr/bin/codesign")
+                "-T", "/usr/bin/codesign", operation="security-import")
             run("/usr/bin/security", "set-key-partition-list", "-S", "apple-tool:,apple:,codesign:",
-                "-s", "-k", password, keychain)
-            run("/usr/bin/security", "list-keychains", "-d", "user", "-s", *search, keychain)
+                "-s", "-k", password, keychain, operation="security-partition-list")
+            run("/usr/bin/security", "list-keychains", "-d", "user", "-s", *search, keychain,
+                operation="security-set-search")
             run("/usr/bin/codesign", "--force", "--sign", pin, "--keychain", keychain,
                 "--identifier", IDENTIFIER, "--requirements", "=designated => " + expected,
-                "--preserve-metadata=entitlements,flags", "--timestamp=none", app)
+                "--preserve-metadata=entitlements,flags", "--timestamp=none", app, operation="codesign-sign")
             verify_signature(app, pin)
         finally:
-            try:
-                run("/usr/bin/security", "list-keychains", "-d", "user", "-s", *search)
-            finally:
-                if keychain.exists():
-                    run("/usr/bin/security", "delete-keychain", keychain)
+            with stage("keychain-cleanup"):
+                try:
+                    run("/usr/bin/security", "list-keychains", "-d", "user", "-s", *search,
+                        operation="security-restore-search")
+                finally:
+                    if keychain.exists():
+                        run("/usr/bin/security", "delete-keychain", keychain, operation="security-delete-keychain")
 
 
+@stage("extract-bundle")
 def extract(archive, destination):
     def package_filter(member, target):
         filtered = tarfile.data_filter(member, target)
@@ -120,6 +173,7 @@ def extract(archive, destination):
     return app, "Contents/MacOS/" + executable
 
 
+@stage("snapshot-bundle")
 def snapshot(app):
     result = {}
     for path in (app, *app.rglob("*")):
@@ -130,6 +184,7 @@ def snapshot(app):
     return result
 
 
+@stage("bundle-content")
 def check_unchanged(before, after, executable):
     # Only common Mach-O signature bytes and the outer resource seal may change.
     # Native packaging has already ad-hoc signed the outer bundle, so its seal
@@ -154,46 +209,51 @@ def require_dmg(index, folder, name):
     return image
 
 
+@stage("dmg-attachments")
 def image_attachments(image):
-    info = plistlib.loads(run("/usr/bin/hdiutil", "info", "-plist").encode())
+    info = plistlib.loads(run("/usr/bin/hdiutil", "info", "-plist", operation="hdiutil-info").encode())
     return [item for item in info["images"] if item.get("image-path") == str(image.resolve())]
 
 
 def verify_dmg(image, expected_app):
-    if image_attachments(image):
-        raise ValueError("DMG was already attached before verification")
+    with stage("dmg-preflight"):
+        if image_attachments(image):
+            raise ValueError("DMG was already attached before verification")
     try:
-        # Let Disk Arbitration choose the normal /Volumes mount. Some macOS
-        # configurations reject custom mountpoints inside removable volumes.
-        # All payload bytes still live in the image file in the supplied work.
-        run("/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", image, timeout=180)
-        mounts = [Path(entry["mount-point"]) for item in image_attachments(image)
-                  for entry in item["system-entities"] if "mount-point" in entry]
-        if len(mounts) != 1 or not mounts[0].is_mount():
-            raise ValueError("DMG verification requires exactly one mounted volume")
-        mounted, = mounts
-        entries = {path.name for path in mounted.iterdir()}
-        if entries - {"Nelomai.app", "Applications", ".fseventsd", ".metadata_never_index"}:
-            raise ValueError("unexpected DMG content")
-        link = mounted / "Applications"
-        if not link.is_symlink() or os.readlink(link) != "/Applications":
-            raise ValueError("DMG Applications link differs")
-        app = mounted / "Nelomai.app"
-        if snapshot(app) != expected_app:
-            raise ValueError("DMG app content differs from signed updater app")
-        run("/usr/bin/codesign", "--verify", "--strict", app)
+        with stage("dmg-validation"):
+            # Let Disk Arbitration choose the normal /Volumes mount. Some macOS
+            # configurations reject custom mountpoints inside removable volumes.
+            # All payload bytes still live in the image file in the supplied work.
+            run("/usr/bin/hdiutil", "attach", "-readonly", "-nobrowse", image, timeout=180, operation="hdiutil-attach")
+            mounts = [Path(entry["mount-point"]) for item in image_attachments(image)
+                      for entry in item["system-entities"] if "mount-point" in entry]
+            if len(mounts) != 1 or not mounts[0].is_mount():
+                raise ValueError("DMG verification requires exactly one mounted volume")
+            mounted, = mounts
+            entries = {path.name for path in mounted.iterdir()}
+            if entries - {"Nelomai.app", "Applications", ".fseventsd", ".metadata_never_index"}:
+                raise ValueError("unexpected DMG content")
+            link = mounted / "Applications"
+            if not link.is_symlink() or os.readlink(link) != "/Applications":
+                raise ValueError("DMG Applications link differs")
+            app = mounted / "Nelomai.app"
+            if snapshot(app) != expected_app:
+                raise ValueError("DMG app content differs from signed updater app")
+            run("/usr/bin/codesign", "--verify", "--strict", app, operation="codesign-verify-dmg")
     finally:
-        # Query this exact newly created image, including partially failed
-        # attach. Detach only its virtual disk; never force or take a device
-        # name from a caller (notably the physical disk holding the image).
-        for item in image_attachments(image):
-            devices = [entry["dev-entry"] for entry in item["system-entities"]
-                       if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))]
-            if len(devices) != 1:
-                raise ValueError("ambiguous owned DMG device; no detach attempted")
-            run("/usr/bin/hdiutil", "detach", devices[0], timeout=180)
+        with stage("dmg-cleanup"):
+            # Query this exact newly created image, including partially failed
+            # attach. Detach only its virtual disk; never force or take a device
+            # name from a caller (notably the physical disk holding the image).
+            for item in image_attachments(image):
+                devices = [entry["dev-entry"] for entry in item["system-entities"]
+                           if re.fullmatch(r"/dev/disk[0-9]+", entry.get("dev-entry", ""))]
+                if len(devices) != 1:
+                    raise ValueError("ambiguous owned DMG device; no detach attempted")
+                run("/usr/bin/hdiutil", "detach", devices[0], timeout=180, operation="hdiutil-detach")
 
 
+@stage("build-dmg")
 def build_dmg(app, destination, work, version):
     if destination.exists() or destination.is_symlink() or app.name != "Nelomai.app":
         raise ValueError("immutable DMG output or invalid app name")
@@ -204,39 +264,42 @@ def build_dmg(app, destination, work, version):
         shutil.copytree(app, layout / "Nelomai.app")
         (layout / "Applications").symlink_to("/Applications", target_is_directory=True)
         run("/usr/bin/hdiutil", "create", "-fs", "HFS+", "-format", "UDZO", "-nospotlight",
-            "-volname", "Nelomai " + version, "-srcfolder", layout, destination, timeout=180)
-        run("/usr/bin/hdiutil", "verify", destination, timeout=180)
+            "-volname", "Nelomai " + version, "-srcfolder", layout, destination, timeout=180, operation="hdiutil-create")
+        run("/usr/bin/hdiutil", "verify", destination, timeout=180, operation="hdiutil-verify")
         verify_dmg(destination, before)
         if snapshot(app) != before:
             raise ValueError("DMG creation changed the signed source app")
 
 
+@stage("process")
 def process(args, environment):
-    if args.mode not in ("build_only", "sign_candidate"):
-        raise ValueError("unsupported signing mode")
-    if args.output.exists() or args.output.is_symlink():
-        raise ValueError("immutable signing output exists")
-    metadata = None
-    if args.mode == "sign_candidate":
-        metadata = signature_metadata(args.certificate_sha1)
-        if not all(environment.get(name) for name in SECRET_NAMES):
-            raise ValueError("macOS candidate requires permanent signing credentials")
-    elif any(environment.get(name) for name in SECRET_NAMES):
-        raise ValueError("build_only must not receive production signing credentials")
-    index = json.loads((args.input / "package-digests.json").read_bytes())
-    for key, value in dict(source_sha=args.source_sha, release_set_sha256=args.release_set_sha256,
-                           mode=args.mode, platform="macos", architecture="aarch64").items():
-        if index.get(key) != value:
-            raise ValueError("native package identity mismatch")
-    item = index["packages"]["shipping"]
-    name = item["name"]
-    if not re.fullmatch(r"nelomai-[0-9]+\.[0-9]+\.[0-9]+-macos-aarch64\.app\.tar\.gz", name):
-        raise ValueError("unexpected shipping archive name")
-    archive = args.input / "shipping" / name
-    if archive.is_symlink() or item != dict(name=name, sha256=digest(archive), size_bytes=archive.stat().st_size):
-        raise ValueError("native package changed before common signing")
-    args.work.mkdir(parents=True, exist_ok=True)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with stage("input-validation"):
+        if args.mode not in ("build_only", "sign_candidate"):
+            raise ValueError("unsupported signing mode")
+        if args.output.exists() or args.output.is_symlink():
+            raise ValueError("immutable signing output exists")
+        metadata = None
+        if args.mode == "sign_candidate":
+            metadata = signature_metadata(args.certificate_sha1)
+            if not all(environment.get(name) for name in SECRET_NAMES):
+                raise ValueError("macOS candidate requires permanent signing credentials")
+        elif any(environment.get(name) for name in SECRET_NAMES):
+            raise ValueError("build_only must not receive production signing credentials")
+        index = json.loads((args.input / "package-digests.json").read_bytes())
+        for key, value in dict(source_sha=args.source_sha, release_set_sha256=args.release_set_sha256,
+                               mode=args.mode, platform="macos", architecture="aarch64").items():
+            if index.get(key) != value:
+                raise ValueError("native package identity mismatch")
+        item = index["packages"]["shipping"]
+        name = item["name"]
+        if not re.fullmatch(r"nelomai-[0-9]+\.[0-9]+\.[0-9]+-macos-aarch64\.app\.tar\.gz", name):
+            raise ValueError("unexpected shipping archive name")
+        archive = args.input / "shipping" / name
+        if archive.is_symlink() or item != dict(name=name, sha256=digest(archive), size_bytes=archive.stat().st_size):
+            raise ValueError("native package changed before common signing")
+    with stage("prepare-output"):
+        args.work.mkdir(parents=True, exist_ok=True)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="common-", dir=args.work) as temporary, \
          tempfile.TemporaryDirectory(prefix=".common-output-", dir=args.output.parent) as output_tmp:
         work = Path(temporary)
@@ -249,23 +312,27 @@ def process(args, environment):
             sign_bundle(app, args.certificate_sha1, work, environment)
             after = snapshot(app)
             check_unchanged(before, after, executable)
-            with tarfile.open(destination, "w:gz") as tar:
-                tar.add(app, arcname=app.name)
-            unpacked, _ = extract(destination, work / "after")
-            if snapshot(unpacked) != after:
-                raise ValueError("repacking changed signed bundle")
-            verify_signature(unpacked, args.certificate_sha1)
+            with stage("repack-bundle"):
+                with tarfile.open(destination, "w:gz") as tar:
+                    tar.add(app, arcname=app.name)
+            with stage("verify-repack"):
+                unpacked, _ = extract(destination, work / "after")
+                if snapshot(unpacked) != after:
+                    raise ValueError("repacking changed signed bundle")
+                verify_signature(unpacked, args.certificate_sha1)
             index["macos_common_signature"] = metadata
         else:
-            shutil.copyfile(archive, destination)
+            with stage("copy-archive"):
+                shutil.copyfile(archive, destination)
         index["packages"]["shipping"] = dict(name=name, sha256=digest(destination), size_bytes=destination.stat().st_size)
         dmg_name = name.removesuffix(".app.tar.gz") + ".dmg"
         dmg = result / "shipping" / dmg_name
         version = re.fullmatch(r"nelomai-(\d+\.\d+\.\d+)-macos-aarch64\.app\.tar\.gz", name)[1]
         build_dmg(app, dmg, work, version)
-        index["packages"]["dmg"] = dict(name=dmg_name, sha256=digest(dmg), size_bytes=dmg.stat().st_size)
-        (result / "package-digests.json").write_text(json.dumps(index, sort_keys=True) + "\n")
-        result.rename(args.output)
+        with stage("publish-output"):
+            index["packages"]["dmg"] = dict(name=dmg_name, sha256=digest(dmg), size_bytes=dmg.stat().st_size)
+            (result / "package-digests.json").write_text(json.dumps(index, sort_keys=True) + "\n")
+            result.rename(args.output)
 
 
 def main():
@@ -278,7 +345,8 @@ def main():
     parser.add_argument("--certificate-sha1", default="")
     args = parser.parse_args()
     try:
-        process(args, os.environ)
+        with stage("main"):
+            process(args, os.environ)
     except Exception:
         # Do not let arbitrary native/library exception strings leak credentials.
         parser.exit(1, "macOS common signing failed; no package published\n")

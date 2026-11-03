@@ -1,7 +1,9 @@
 """Real archive/index handling; mock only native Security/codesign operations."""
 import base64
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import plistlib
@@ -9,6 +11,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import subprocess
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -255,7 +258,7 @@ class CommonSigningTest(unittest.TestCase):
     def test_signing_failure_restores_search_list_and_removes_secrets(self):
         search = ["/test/login.keychain-db"]
         deleted = []
-        def run(*cmd):
+        def run(*cmd, **kwargs):
             cmd = tuple(str(c) for c in cmd)
             if cmd[:2] == ("/usr/bin/security", "create-keychain"):
                 Path(cmd[-1]).touch()
@@ -281,6 +284,202 @@ class CommonSigningTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as error:
             self.signer.run("/usr/bin/false", "private-password")
         self.assertNotIn("private-password", str(error.exception))
+
+    def test_native_failure_and_cleanup_failures_are_attributed_in_order_without_secrets(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        self.env["NELOMAI_MACOS_SIGNING_P12_PASSWORD"] = marker
+        self.args.work.mkdir()
+        def native(command, **kwargs):
+            if command[1] == "create-keychain":
+                Path(command[-1]).touch()
+            code = 0
+            if command[1] == "import":
+                code = 42
+            elif command[1] == "list-keychains" and "-s" in command:
+                code = 19
+            elif command[1] == "delete-keychain":
+                code = 17
+            return subprocess.CompletedProcess(command, code, '"/' + marker + '"', marker)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), patch.object(self.signer.subprocess, "run", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "exit 17") as error:
+                self.signer.sign_bundle(self.app, PIN, self.args.work, self.env)
+        log = err.getvalue()
+        events = ["operation=security-import event=failed status=42",
+                  "stage=keychain-cleanup event=entered",
+                  "operation=security-restore-search event=failed status=19",
+                  "operation=security-delete-keychain event=failed status=17",
+                  "stage=keychain-cleanup event=failed", "stage=sign-bundle event=failed"]
+        for event in events:
+            self.assertIn(event, log)
+        positions = [log.index(event) for event in events]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn(marker, out.getvalue() + log + str(error.exception))
+        self.assertFalse(any(self.args.work.rglob("*.p12")))
+
+    def test_native_timeout_and_oserror_are_distinct_without_exception_or_output_leaks(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        self.args.work.mkdir()
+        for failure, event in ((subprocess.TimeoutExpired([marker], 60, output=marker, stderr=marker), "timeout"),
+                               (OSError(marker), "oserror")):
+            def native(command, **kwargs):
+                if command[1] == "import":
+                    raise failure
+                if command[1] == "create-keychain":
+                    Path(command[-1]).touch()
+                return subprocess.CompletedProcess(command, 0, '"/' + marker + '"', "")
+            out, err = io.StringIO(), io.StringIO()
+            with self.subTest(event=event), redirect_stdout(out), redirect_stderr(err), \
+                 patch.object(self.signer.subprocess, "run", side_effect=native):
+                with self.assertRaises(RuntimeError) as error:
+                    self.signer.sign_bundle(self.app, PIN, self.args.work, self.env)
+                self.assertIn("operation=security-import event=" + event, err.getvalue())
+                self.assertIn("stage=keychain-cleanup event=completed", err.getvalue())
+                self.assertNotIn(marker, out.getvalue() + err.getvalue() + str(error.exception))
+
+    def test_unknown_command_name_is_never_used_as_a_diagnostic_label(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), patch.object(self.signer.subprocess, "run",
+                return_value=subprocess.CompletedProcess([marker], 23, marker, marker)):
+            with self.assertRaises(RuntimeError) as error:
+                self.signer.run("/" + marker, marker)
+        self.assertIn("operation=native event=failed status=23", err.getvalue())
+        self.assertNotIn(marker, out.getvalue() + err.getvalue() + str(error.exception))
+
+    def test_diagnostics_reject_unknown_labels_and_non_numeric_status(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        class UntrustedLabel(str):
+            def __str__(self):
+                return marker
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.signer.diagnostic("operation", marker, "failed", 23)
+            self.signer.diagnostic(marker, "native", "failed", 23)
+            self.signer.diagnostic("operation", "native", marker, 23)
+            self.signer.diagnostic("operation", UntrustedLabel("native"), "failed", 23)
+            self.signer.diagnostic("operation", "native", "failed", marker)
+            self.signer.diagnostic("operation", "native", "failed", 2 ** 100)
+        self.assertNotIn(marker, err.getvalue())
+        self.assertEqual(err.getvalue().splitlines(), ["macos-sign operation=native event=failed"] * 2)
+
+    def test_real_subprocess_exit_and_timeout_are_attributed_without_captured_output(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        for program, timeout, event in (("import sys; print(sys.argv[1]); print(sys.argv[1], file=sys.stderr); sys.exit(23)",
+                                         10, "failed status=23"),
+                                        ("import sys, time; print(sys.argv[1], flush=True); time.sleep(10)",
+                                         0.1, "timeout")):
+            out, err = io.StringIO(), io.StringIO()
+            with self.subTest(event=event), redirect_stdout(out), redirect_stderr(err):
+                with self.assertRaises(RuntimeError) as error:
+                    self.signer.run(sys.executable, "-c", program, marker, timeout=timeout)
+                self.assertIn("operation=native event=" + event, err.getvalue())
+                self.assertNotIn(marker, out.getvalue() + err.getvalue() + str(error.exception))
+
+    def test_main_native_failure_keeps_output_unpublished_and_allows_clean_rerun(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        def native(command, **kwargs):
+            if command[1] == "create-keychain":
+                Path(command[-1]).touch()
+            code = 29 if command[1] == "import" else 0
+            return subprocess.CompletedProcess(command, code, '"/' + marker + '"', "")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), \
+             patch.object(self.signer.subprocess, "run", side_effect=native), \
+             patch.object(self.signer.argparse.ArgumentParser, "parse_args", return_value=self.args), \
+             patch.dict(os.environ, self.env):
+            with self.assertRaises(SystemExit) as error:
+                self.signer.main()
+        self.assertEqual(error.exception.code, 1)
+        self.assertIn("operation=security-import event=failed status=29", err.getvalue())
+        self.assertIn("stage=keychain-cleanup event=completed", err.getvalue())
+        self.assertIn("stage=process event=failed", err.getvalue())
+        self.assertNotIn(marker, out.getvalue() + err.getvalue())
+        self.assertFalse(self.args.output.exists())
+        self.assertEqual(list(self.args.work.iterdir()), [])
+        with redirect_stderr(io.StringIO()):
+            self.process()
+        self.assertTrue(self.args.output.is_dir())
+
+    def test_main_attributes_logical_validation_without_publishing_or_exception_text(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        self.index["packages"]["shipping"]["name"] = marker
+        self.save_index()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err), \
+             patch.object(self.signer.argparse.ArgumentParser, "parse_args", return_value=self.args), \
+             patch.dict(os.environ, self.env):
+            with self.assertRaises(SystemExit) as error:
+                self.signer.main()
+        self.assertEqual(error.exception.code, 1)
+        self.assertIn("stage=input-validation event=failed", err.getvalue())
+        self.assertIn("stage=main event=failed", err.getvalue())
+        self.assertIn("macOS common signing failed; no package published", err.getvalue())
+        self.assertNotIn(marker, out.getvalue() + err.getvalue())
+        self.assertFalse(self.args.output.exists())
+
+    def test_protected_content_failure_is_attributed_before_output_publication(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        protected = self.app / "Contents/Resources" / marker
+        protected.write_bytes(b"original")
+        self.pack()
+        def mutate(app, *args):
+            (app / "Contents/Resources" / marker).write_bytes(b"changed")
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(ValueError):
+            self.process(mutate)
+        self.assertIn("stage=bundle-content event=failed", err.getvalue())
+        self.assertNotIn(marker, err.getvalue())
+        self.assertFalse(self.args.output.exists())
+
+    def test_success_reports_completed_stages_and_stream_failure_does_not_change_result(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.process()
+        self.assertIn("stage=input-validation event=completed", err.getvalue())
+        self.assertIn("stage=publish-output event=completed", err.getvalue())
+        self.assertIn("stage=process event=completed", err.getvalue())
+        class BrokenStream:
+            def write(self, text):
+                raise OSError("diagnostic stream unavailable")
+        self.args.output = self.root / "second-output"
+        with redirect_stderr(BrokenStream()):
+            self.process()
+        self.assertTrue(self.args.output.is_dir())
+        primary = ValueError("primary failure")
+        self.args.output = self.root / "failed-output"
+        with redirect_stderr(BrokenStream()), self.assertRaises(ValueError) as error:
+            self.process(lambda *args: (_ for _ in ()).throw(primary))
+        self.assertIs(error.exception, primary)
+        self.assertFalse(self.args.output.exists())
+
+    def test_partial_dmg_attach_timeout_is_logged_before_authoritative_cleanup_failure(self):
+        marker = "INJECTED_SECRET_DO_NOT_LOG"
+        queries = 0
+        def native(command, **kwargs):
+            nonlocal queries
+            if command[1] == "info":
+                queries += 1
+                images = [] if queries == 1 else [{"image-path": str(self.archive.resolve()),
+                    "system-entities": [{"dev-entry": "/dev/disk99"}]}]
+                return subprocess.CompletedProcess(command, 0, plistlib.dumps({"images": images}).decode(), "")
+            if command[1] == "attach":
+                raise subprocess.TimeoutExpired([marker], 180, output=marker, stderr=marker)
+            if command[1] == "detach":
+                return subprocess.CompletedProcess(command, 24, marker, marker)
+            raise AssertionError("unexpected native operation")
+        err = io.StringIO()
+        with redirect_stderr(err), patch.object(self.signer.subprocess, "run", side_effect=native):
+            with self.assertRaisesRegex(RuntimeError, "exit 24") as error:
+                self.signer.verify_dmg(self.archive, {})
+        log = err.getvalue()
+        self.assertIn("operation=hdiutil-attach event=timeout", log)
+        self.assertIn("stage=dmg-cleanup event=entered", log)
+        self.assertLess(log.index("operation=hdiutil-attach event=timeout"),
+                        log.index("stage=dmg-cleanup event=entered"))
+        self.assertIn("operation=hdiutil-detach event=failed status=24", log)
+        self.assertIn("stage=dmg-cleanup event=failed", log)
+        self.assertNotIn(marker, log + str(error.exception))
 
     @unittest.skipUnless(os.environ.get("NELOMAI_TEST_NATIVE_SIGNING") == "1", "isolated native signing opt-in")
     def test_native_two_builds_keep_requirement_and_preserve_nested_payload(self):
