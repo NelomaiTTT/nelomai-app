@@ -662,7 +662,7 @@ fn start_physical_network_scheduler(
 
 fn start_pending_stop_scheduler(
     application: Arc<NativeApplication>,
-    #[cfg(target_os = "macos")] intent: Arc<connection_intent::DesktopConnectionIntent>,
+    #[cfg(not(target_os = "android"))] intent: Arc<connection_intent::DesktopConnectionIntent>,
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -670,15 +670,32 @@ fn start_pending_stop_scheduler(
                 _ = tokio::time::sleep(PENDING_STOP_RETRY_INTERVAL) => {},
                 _ = application.wait_for_pending_stop() => {},
             }
-            let completion = application.retry_pending_stop().await;
-            #[cfg(target_os = "macos")]
-            if let Ok(Some(completion)) = completion {
-                intent.pending_stop_completed(completion).await;
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = completion;
+            #[cfg(not(target_os = "android"))]
+            retry_pending_stop_once(application.retry_pending_stop(), |completion| {
+                intent.pending_stop_completed(completion)
+            })
+            .await;
+            #[cfg(target_os = "android")]
+            let _ = application.retry_pending_stop().await;
         }
     });
+}
+
+#[cfg(not(target_os = "android"))]
+async fn retry_pending_stop_once<R, C, F>(retry: R, completed: C)
+where
+    R: std::future::Future<
+        Output = Result<
+            Option<nelomai_client_application::PendingStopCompletion>,
+            ApplicationError,
+        >,
+    >,
+    C: FnOnce(nelomai_client_application::PendingStopCompletion) -> F,
+    F: std::future::Future<Output = ()>,
+{
+    if let Ok(Some(completion)) = retry.await {
+        completed(completion).await;
+    }
 }
 
 #[cfg(not(target_os = "android"))]

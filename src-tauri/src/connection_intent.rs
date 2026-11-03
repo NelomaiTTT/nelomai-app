@@ -390,7 +390,6 @@ impl DesktopConnectionIntent {
         cancelled
     }
 
-    #[cfg(target_os = "macos")]
     pub(crate) async fn pending_stop_completed(
         &self,
         completion: nelomai_client_application::PendingStopCompletion,
@@ -1481,7 +1480,6 @@ where
 
 /// Only a completed cleanup of the connected intent can arm a new Start.
 /// An explicit Stop/Logout invalidates its saved epoch before waiting on gates.
-#[cfg(any(target_os = "macos", test))]
 fn queue_engine_recovery(
     state: &mut RuntimeState,
     completion: &nelomai_client_application::PendingStopCompletion,

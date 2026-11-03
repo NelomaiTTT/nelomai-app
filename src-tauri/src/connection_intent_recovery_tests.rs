@@ -584,6 +584,113 @@ async fn redundant_stall_actual_lost_ack_receipt_does_not_override_user_stop() {
 }
 
 #[tokio::test]
+async fn pending_stop_scheduler_delivers_cleanup_receipt_after_retry_once() {
+    let f = fixture(false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    let epoch = f.app.start_cancellation_epoch();
+    {
+        let mut state = f.state.lock().await;
+        state.pending_redundant_recovery = None;
+        state.next_retry_at_unix = None;
+    }
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    f.panel.fail_stop.store(true, Ordering::SeqCst);
+    let observation = f.app.begin_foreground_observation().await;
+    assert_eq!(
+        f.app
+            .foreground_state_guarded(observation, None, || true)
+            .await
+            .phase,
+        Phase::Stopping
+    );
+    crate::retry_pending_stop_once(f.app.retry_pending_stop(), |_| async {
+        panic!("failed cleanup must not deliver a recovery receipt")
+    })
+    .await;
+    assert_eq!(f.state.lock().await.next_retry_at_unix, None);
+    assert!(f.journal.value.lock().unwrap().desktop_redundancy.is_some());
+
+    f.panel.fail_stop.store(false, Ordering::SeqCst);
+    let delivered = std::sync::atomic::AtomicUsize::new(0);
+    let receiver = &delivered;
+    let fixture = &f;
+    crate::retry_pending_stop_once(f.app.retry_pending_stop(), |completion| async move {
+        receiver.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(completion.cancel_epoch, epoch);
+        assert!(fixture
+            .app
+            .check_start_cancellation(completion.cancel_epoch)
+            .is_ok());
+        assert!(queue_engine_recovery(
+            &mut *fixture.state.lock().await,
+            &completion,
+            22
+        ));
+    })
+    .await;
+    assert_eq!(delivered.load(Ordering::SeqCst), 1);
+    let state = f.state.lock().await;
+    assert_eq!(
+        state.coordinator.status(),
+        ConnectionIntentStatus::Recovering
+    );
+    assert_eq!(state.next_retry_at_unix, Some(22));
+    assert_eq!(state.cancel_epoch, Some(epoch));
+    assert!(state.reserve_requested);
+    drop(state);
+    assert!(f.journal.value.lock().unwrap().desktop_redundancy.is_none());
+    crate::retry_pending_stop_once(f.app.retry_pending_stop(), |_| async {
+        panic!("completed cleanup must not deliver a second receipt")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pending_stop_scheduler_cancellation_while_cleanup_is_blocked_does_not_rearm() {
+    let f = fixture(false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    {
+        let mut state = f.state.lock().await;
+        state.pending_redundant_recovery = None;
+        state.next_retry_at_unix = None;
+    }
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    let observation = f.app.begin_foreground_observation().await;
+    f.app
+        .foreground_state_guarded(observation, None, || true)
+        .await;
+
+    let gate = f.writers.lifecycle();
+    let held = gate.lock().await;
+    let fixture = &f;
+    let retry =
+        crate::retry_pending_stop_once(f.app.retry_pending_stop(), |completion| async move {
+            assert!(!queue_engine_recovery(
+                &mut *fixture.state.lock().await,
+                &completion,
+                22
+            ));
+        });
+    tokio::pin!(retry);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut retry)
+        .await
+        .is_err());
+    f.app.signal_start_cancellation();
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(1), retry)
+        .await
+        .unwrap();
+    assert_eq!(f.state.lock().await.next_retry_at_unix, None);
+    assert!(f.panel.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn engine_crash_cleanup_preserves_original_start_cancellation_epoch() {
     let f = fixture(false);
     f.app

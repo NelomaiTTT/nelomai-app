@@ -492,11 +492,7 @@ fn setup_desktop(
         diagnostics.record_named("startup.runtime_ready", None, None, None);
         start_split_tunnel_scheduler(application.clone(), split);
         start_physical_network_scheduler(application.clone(), intent.clone());
-        start_pending_stop_scheduler(
-            application.clone(),
-            #[cfg(target_os = "macos")]
-            intent.clone(),
-        );
+        start_pending_stop_scheduler(application.clone(), intent.clone());
         intent.spawn();
         start_connection_metrics_scheduler(
             handle.clone(),
