@@ -894,9 +894,23 @@ async fn engine_cleanup_acceptance_and_changed_member_preserve_recovery() {
                 pair.connection.lease_id = "50000000-0000-4000-8000-000000000002".into();
             }
         }
-        f.panel.async_stop.store(!changed_member, Ordering::SeqCst);
+        // A dead engine has no frozen last-active proof. Its cold cleanup
+        // negotiates background acceptance on Linux/macOS; Windows waits for
+        // a terminal Stop response, even when the session advertises async Stop.
+        let background_cleanup =
+            cfg!(any(target_os = "linux", target_os = "macos")) && !changed_member;
+        f.panel
+            .async_stop
+            .store(background_cleanup, Ordering::SeqCst);
         f.helper.crashed.store(true, Ordering::SeqCst);
         let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+        {
+            let requests = f.panel.requests.lock().unwrap();
+            assert!(!requests.is_empty());
+            assert!(requests
+                .iter()
+                .all(|request| request.background_cleanup == background_cleanup));
+        }
         assert!(f.journal.value.lock().unwrap().desktop_redundancy.is_none());
         let mut state = f.state.lock().await;
         assert!(
