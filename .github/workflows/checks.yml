@@ -231,8 +231,15 @@ jobs:
       - run: cargo test -p nelomai-client-updater
       - run: cargo test --locked -p nelomai-client-api
       - id: updater_tests
-        run: >-
+        run: |
+          $record = "$env:RUNNER_TEMP/updater-loader/prepared-manifest.json"
+          python scripts/windows/prepare-lib-test-manifest.py prepare --record $record
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p nelomai-app --lib platform::updater::
+          $testExit = $LASTEXITCODE
+          python scripts/windows/prepare-lib-test-manifest.py verify --record $record
+          if ($testExit -ne 0) { exit $testExit }
+          exit $LASTEXITCODE
       # Static evidence only. The original test failure remains the job result.
       - name: Collect updater loader diagnostics
         if: ${{ failure() && steps.updater_tests.outcome == 'failure' }}

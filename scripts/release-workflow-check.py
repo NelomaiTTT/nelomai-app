@@ -166,7 +166,14 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
         'cargo check -p nelomai-app',
         'cargo test -p nelomai-client-updater',
         'cargo test --locked -p nelomai-client-api',
-        'cargo test --locked -p nelomai-app --lib platform::updater::',
+        """$record = "$env:RUNNER_TEMP/updater-loader/prepared-manifest.json"
+python scripts/windows/prepare-lib-test-manifest.py prepare --record $record
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+cargo test --locked -p nelomai-app --lib platform::updater::
+$testExit = $LASTEXITCODE
+python scripts/windows/prepare-lib-test-manifest.py verify --record $record
+if ($testExit -ne 0) { exit $testExit }
+exit $LASTEXITCODE""",
         'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
         """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
