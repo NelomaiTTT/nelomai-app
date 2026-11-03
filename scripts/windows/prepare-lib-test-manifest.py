@@ -97,7 +97,7 @@ def digest(path):
 
 def prepare(root, record, sdk=None):
     metadata = json.loads(subprocess.run(["cargo", "metadata", "--locked", "--format-version=1",
-        "--filter-platform=x86_64-pc-windows-msvc"], cwd=root, check=True, capture_output=True, text=True).stdout)
+        "--filter-platform=x86_64-pc-windows-msvc"], cwd=root, check=True, capture_output=True, text=True, encoding="utf-8").stdout)
     packages = [item for item in metadata["packages"] if item["name"] == "tauri-build"]
     if len(packages) != 1:
         raise ValueError("expected exactly one locked tauri-build package")
@@ -109,7 +109,7 @@ def prepare(root, record, sdk=None):
         raise ValueError("Windows SDK x64 mt.exe is unavailable")
     mt = max(tools, key=lambda path: tuple(map(int, path.parents[1].name.split("."))))
     result = subprocess.run(["cargo", "test", "--locked", "-p", "nelomai-app", "--lib", "--no-run",
-                             "--message-format=json"], cwd=root, stdout=subprocess.PIPE, text=True)
+                             "--message-format=json"], cwd=root, stdout=subprocess.PIPE, text=True, encoding="utf-8")
     artifacts = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     for item in artifacts:
         if item.get("reason") == "compiler-message" and item.get("message", {}).get("rendered"):

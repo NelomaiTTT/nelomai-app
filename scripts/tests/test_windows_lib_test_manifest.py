@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -110,6 +111,48 @@ class WindowsLibTestManifestTest(unittest.TestCase):
             with patch.object(tool.subprocess, "run", side_effect=subprocess.CalledProcessError(101, "cargo")):
                 with self.assertRaises(subprocess.CalledProcessError):
                     tool.prepare(root, record, sdk)
+
+    def test_cargo_json_utf8_bytes_are_independent_of_windows_cp1252_reader(self):
+        tool = module("windows/prepare-lib-test-manifest")
+        real_run = subprocess.run
+        for stage in ("metadata", "test"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / ("registry-ā" if stage == "metadata" else "registry") / "tauri-build/src/windows-app-manifest.xml"
+                source.parent.mkdir(parents=True)
+                source.write_bytes(MANIFEST)
+                exe = root / "target/debug" / ("deps-ā" if stage == "test" else "deps") / "nelomai_app_lib-abcdef.exe"
+                exe.parent.mkdir(parents=True)
+                exe.write_bytes(b"unmanifested original")
+                sdk = root / "sdk"
+                mt = sdk / "10.0.26100.0/x64/mt.exe"
+                mt.parent.mkdir(parents=True)
+                mt.touch()
+                record = root / "record.json"
+                metadata = dict(target_directory=str(root / "target"), packages=[dict(
+                    name="tauri-build", manifest_path=str(source.parents[1] / "Cargo.toml"))])
+                artifact = dict(reason="compiler-artifact", target=dict(name="nelomai_app_lib"),
+                                profile=dict(test=True), executable=str(exe))
+
+                def run(command, **kwargs):
+                    if command[:1] == ["cargo"]:
+                        value = metadata if command[1] == "metadata" else artifact
+                        payload = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+                        if command[1] == stage:
+                            self.assertIn(b"\x81", payload)  # UTF-8 ā contains a byte undefined in cp1252.
+                        # A real child writes bytes; subprocess performs the actual pipe decoding.
+                        child = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))", payload.hex()]
+                        return real_run(child, **kwargs)
+                    self.assertEqual(command, [str(mt), "-nologo", "-manifest", str(source), f"-outputresource:{exe};#1"])
+                    exe.write_bytes(image())
+                    return subprocess.CompletedProcess(command, 0)
+
+                with patch.object(tool.subprocess, "_text_encoding", return_value="cp1252"), \
+                     patch.object(tool.subprocess, "run", side_effect=run):
+                    tool.prepare(root, record, sdk)
+                saved = json.loads(record.read_text())
+                self.assertEqual(saved["manifest_source"], str(source))
+                self.assertEqual(saved["executable"], str(exe))
 
     def test_mt_success_without_manifest_cannot_make_preparation_pass(self):
         # Validate the postcondition itself: an exit-0 mt double is insufficient.
