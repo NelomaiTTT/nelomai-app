@@ -32,6 +32,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Network
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", features = ["macros", "rt", "test-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Pipes"] }
+
 [target.'cfg(any(target_os = "macos", target_os = "linux", windows))'.dev-dependencies]
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 hickory-proto = { version = "0.24", default-features = false }

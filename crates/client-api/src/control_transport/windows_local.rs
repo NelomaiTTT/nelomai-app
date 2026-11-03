@@ -172,10 +172,10 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::io::AsRawHandle;
+    use std::{os::windows::io::AsRawHandle, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        net::windows::named_pipe::ClientOptions,
+        net::windows::named_pipe::{ClientOptions, NamedPipeClient},
     };
     use windows_sys::Win32::Security::{
         AclSizeInformation,
@@ -183,6 +183,32 @@ mod tests {
         GetAce, GetAclInformation, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACE_HEADER,
         ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeHandleStateW;
+
+    fn pipe_instances(client: &NamedPipeClient) -> u32 {
+        let mut instances = 0;
+        // The connected client has GENERIC_READ access. Querying the current
+        // instance count neither opens nor consumes any pending server slot.
+        let result = unsafe {
+            GetNamedPipeHandleStateW(
+                client.as_raw_handle(),
+                ptr::null_mut(),
+                &mut instances,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        assert_ne!(result, 0, "{}", io::Error::last_os_error());
+        instances
+    }
+
+    async fn wait_for_pipe_instances(client: &NamedPipeClient, expected: u32) {
+        while pipe_instances(client) != expected {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
 
     #[tokio::test]
     async fn native_pipe_accepts_a_full_request_burst_before_listener_is_polled() {
@@ -213,7 +239,26 @@ mod tests {
         // Opening immediately proves the next instance precedes accept's return.
         let mut second_client = ClientOptions::new().open(&name).unwrap();
         let mut second = listener.accept().await.unwrap();
+        // 16 pending + 2 accepted instances.
+        assert_eq!(pipe_instances(&first_client), 18);
+        // Negative control: observing a live listener must not exhaust its
+        // pending instances and falsely report retirement (as repeated opens can).
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            wait_for_pipe_instances(&first_client, 2),
+        )
+        .await
+        .is_err());
+        assert_eq!(pipe_instances(&first_client), 18);
         drop(listener);
+        // Mio retains handles until canceled overlapped I/O completes on IOCP;
+        // Drop requests cancellation, but does not synchronously close them.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_pipe_instances(&first_client, 2),
+        )
+        .await
+        .expect("retired listener must release every pending pipe instance");
         assert!(ClientOptions::new().open(&name).is_err());
         first_client.write_all(b"one").await.unwrap();
         second_client.write_all(b"two").await.unwrap();

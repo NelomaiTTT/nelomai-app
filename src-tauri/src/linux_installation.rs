@@ -34,7 +34,7 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::symlink};
+    use std::{ffi::OsStr, fs, os::unix::fs::symlink};
 
     // Only elevation/FUSE access is simulated. Command argument construction,
     // candidate reads and the child /bin/sh are real.
@@ -165,18 +165,24 @@ mod tests {
 
     #[test]
     fn protected_installed_helper_keeps_precedence() {
-        let protected = Path::new("/usr/bin/true");
+        // Some distributions expose true as a symlink; the fixture must be trusted.
+        let protected = fs::canonicalize("/usr/bin/true").unwrap();
         run(
-            protected,
+            &protected,
             Path::new("/missing/candidate"),
             Path::new("archive"),
             "digest",
             |command| {
                 assert_eq!(
                     command.get_args().collect::<Vec<_>>(),
-                    ["/bin/sh", "/usr/bin/true", "archive", "digest"]
+                    [
+                        OsStr::new("/bin/sh"),
+                        protected.as_os_str(),
+                        OsStr::new("archive"),
+                        OsStr::new("digest"),
+                    ]
                 );
-                Command::new("/usr/bin/true").status()
+                Command::new(&protected).status()
             },
         )
         .unwrap();
