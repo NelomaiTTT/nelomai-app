@@ -34,7 +34,7 @@ class PublicationInputsTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     publication.select_candidate("owner/repo", "42", source, "0.4.0", fetch)
         for version in ("", "0.3.0", "0.3.1", "0.3.3", "0.4.0a"):
-            with self.subTest(version=version), self.assertRaises(ValueError):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, "invalid candidate run or version"):
                 publication.select_candidate("owner/repo", "42", source, version, fetch)
 
     def test_selected_release_needs_no_approval_but_rejects_wrong_build_or_bytes(self):

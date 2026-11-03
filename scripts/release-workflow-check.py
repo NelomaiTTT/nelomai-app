@@ -65,6 +65,22 @@ def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
             "Checks must retain all six required checks and the isolated Windows graph")
     require("defaults" not in workflow, "Checks cannot override critical command shells")
     build, native, aggregate = (jobs[name] for name in ("windows-build", "windows-native", "windows"))
+    # Validate the failure-only evidence aperture exactly, then apply every
+    # existing strict producer guard to the unchanged sequence of build gates.
+    require(len(build["steps"]) == 18 and build["steps"][9].get("id") == "updater_tests",
+            "Windows updater gate must retain its identity and failure diagnostics")
+    require(build["steps"][10:12] == [
+        {"name": "Collect updater loader diagnostics",
+         "if": "${{ failure() && steps.updater_tests.outcome == 'failure' }}",
+         "timeout-minutes": 2,
+         "run": 'python scripts/windows/collect-loader-diagnostics.py --output "$env:RUNNER_TEMP/updater-loader"'},
+        {"name": "Retain updater loader diagnostics",
+         "if": "${{ always() && steps.updater_tests.outcome == 'failure' }}",
+         "uses": "actions/upload-artifact@v4",
+         "with": {"name": "windows-updater-loader-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}",
+                  "path": "${{ runner.temp }}/updater-loader/", "if-no-files-found": "warn", "retention-days": 1}},
+    ], "Loader evidence must be failure-only, bounded and separate from successful factory/shipping artifacts")
+    build = {**build, "steps": build["steps"][:10] + build["steps"][12:]}
     for name, job in (("windows-build", build), ("windows-native", native), ("windows", aggregate)):
         require(set(job) <= {"if", "name", "runs-on", "env", "steps", "outputs", "needs", "strategy"},
                 f"{name} cannot mask or replace its execution/status gates")

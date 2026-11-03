@@ -133,6 +133,30 @@ class ReleaseWorkflowTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 artifact.verify(output, source, digest)
 
+    def test_loader_diagnostics_cannot_mask_updater_gate_or_supply_factory_artifact(self):
+        import copy
+        checker = module("release-workflow-check")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        steps = workflow["jobs"]["windows-build"]["steps"]
+        self.assertEqual(steps[9].get("id"), "updater_tests")
+        self.assertEqual(steps[9]["run"], "cargo test --locked -p nelomai-app --lib platform::updater::")
+        factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+        checker.assert_windows_factory_jobs(workflow, factory)
+        for mutate in (
+            lambda steps: steps[9].update(**{"continue-on-error": True}),
+            lambda steps: steps[10].update(**{"if": "always()"}),
+            lambda steps: steps[10].update(**{"continue-on-error": True}),
+            lambda steps: steps[10].update(run="echo diagnostics skipped"),
+            lambda steps: steps[11].update(**{"if": "success()"}),
+            lambda steps: steps[11]["with"].update(path="${{ runner.temp }}/factory-artifact/"),
+            lambda steps: steps[11]["with"].update(name="candidate-0.4.0"),
+            lambda steps: steps.pop(10),
+        ):
+            changed = copy.deepcopy(workflow)
+            mutate(changed["jobs"]["windows-build"]["steps"])
+            with self.assertRaises(RuntimeError):
+                checker.assert_windows_factory_jobs(changed, factory)
+
     def test_windows_factory_build_and_native_graph_rejects_guard_bypasses(self):
         import copy
         checker = module("release-workflow-check")

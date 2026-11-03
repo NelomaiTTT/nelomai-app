@@ -143,7 +143,8 @@ class ReleaseSimplificationTest(ArtifactFixture):
         run = dict(id=42, head_sha=SOURCE, path=".github/workflows/release.yml", event="workflow_dispatch",
                    status="completed", conclusion="success", run_attempt=3,
                    repository={"full_name": "owner/repo"}, head_repository={"full_name": "owner/repo"})
-        artifact = dict(id=123, name="candidate-0.3.8", expired=False,
+        version = consumer.gates.STABLE_VERSION
+        artifact = dict(id=123, name=f"candidate-{version}", expired=False,
                         workflow_run={"id": 42, "head_sha": SOURCE})
 
         def fetch(endpoint):
@@ -151,13 +152,13 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 return {"total_count": 1, "artifacts": [artifact]}
             return run
 
-        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch), 123)
+        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, version, fetch), 123)
         for changes in ({"head_sha": "b" * 40}, {"conclusion": "failure"}, {"status": "in_progress"},
                         {"path": ".github/workflows/windows-build.yml"}):
-            with patch.dict(run, changes), self.assertRaises(ValueError):
-                consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch)
-        with patch.dict(artifact, {"expired": True}), self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", fetch)
-        with self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.3.8", lambda endpoint:
+            with patch.dict(run, changes), self.assertRaisesRegex(ValueError, "selected run"):
+                consumer.select_candidate("owner/repo", "42", SOURCE, version, fetch)
+        with patch.dict(artifact, {"expired": True}), self.assertRaisesRegex(ValueError, "shipping artifact"):
+            consumer.select_candidate("owner/repo", "42", SOURCE, version, fetch)
+        with self.assertRaisesRegex(ValueError, "shipping artifact"):
+            consumer.select_candidate("owner/repo", "42", SOURCE, version, lambda endpoint:
                 {"total_count": 2, "artifacts": [artifact, {**artifact, "id": 124}]} if "/artifacts?" in endpoint else run)

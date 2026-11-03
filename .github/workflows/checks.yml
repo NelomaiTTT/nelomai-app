@@ -230,8 +230,22 @@ jobs:
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
       - run: cargo test --locked -p nelomai-client-api
-      - run: >-
+      - id: updater_tests
+        run: >-
           cargo test --locked -p nelomai-app --lib platform::updater::
+      # Static evidence only. The original test failure remains the job result.
+      - name: Collect updater loader diagnostics
+        if: ${{ failure() && steps.updater_tests.outcome == 'failure' }}
+        timeout-minutes: 2
+        run: python scripts/windows/collect-loader-diagnostics.py --output "$env:RUNNER_TEMP/updater-loader"
+      - name: Retain updater loader diagnostics
+        if: ${{ always() && steps.updater_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-updater-loader-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ runner.temp }}/updater-loader/
+          if-no-files-found: warn
+          retention-days: 1
       # The actual factory invokes the audited unimpersonated SYSTEM cooperative
       # lease. Run this one test separately under its real production principal;
       # its selector/coordinator/ownership/native gates are not replaced.
