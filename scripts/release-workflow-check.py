@@ -149,6 +149,8 @@ throw 'Missing exact selected factory case completion; no partial-matrix PASS'
         'cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings',
         'cargo check -p nelomai-app',
         'cargo test -p nelomai-client-updater',
+        'cargo test --locked -p nelomai-client-api',
+        'cargo test --locked -p nelomai-app --lib platform::updater::',
         'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
         """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -187,10 +189,10 @@ python scripts/windows/carrier-factory-artifact.py create `
 --output "$env:RUNNER_TEMP/factory-artifact" --source-sha $env:SOURCE_SHA --artifact-name $env:ARTIFACT_NAME
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }""",
     ]
-    require(len(build["steps"]) == 14 and [program(step) for step in build["steps"][4:-1]] == build_programs,
+    require(len(build["steps"]) == 16 and [program(step) for step in build["steps"][4:-1]] == build_programs,
             "Common build must run ordinary/security/TxR gates before factory runtime preparation and retain all strict gates before artifact assembly")
-    require(all("env" not in step for step in build["steps"][:12]), "Common gates cannot override their source/runtime environment")
-    require(build["steps"][9].get("timeout-minutes") == build["steps"][10].get("timeout-minutes") == 2,
+    require(all("env" not in step for step in build["steps"][:14]), "Common gates cannot override their source/runtime environment")
+    require(build["steps"][11].get("timeout-minutes") == build["steps"][12].get("timeout-minutes") == 2,
             "Native readonly and isolated TxR gate budgets must remain unchanged")
     artifact = build["steps"][-2]
     require(artifact.get("id") == "artifact" and artifact.get("env") == {

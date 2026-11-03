@@ -1017,13 +1017,17 @@ fn pre_auth_handoff() -> io::Result<bool> {
             };
             let installed_script = installed.join("install-common-linux.sh");
             let candidate_script = source_resources.join("install-common-linux.sh");
-            let installer = linux_installation::script(&installed_script, &candidate_script);
             let sha = nelomai_contracts::dispatcher::file_digest(&archive)?;
-            let status =
-                linux_installation::run(installer, &archive, &sha, Path::new("/tmp"), |command| {
+            let status = linux_installation::run(
+                &installed_script,
+                &candidate_script,
+                &archive,
+                &sha,
+                |command| {
                     platform::unix::installer_status(command)
                         .map_err(|_| io::Error::other("common installation failed"))
-                })?;
+                },
+            )?;
             if !status.success() {
                 return Err(io::Error::other("common installation cancelled"));
             }

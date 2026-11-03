@@ -1045,6 +1045,7 @@ struct ResolverScope;
 impl Drop for ResolverScope {
     fn drop(&mut self) {
         RESOLVER.with(|slot| slot.replace(None));
+        FIXTURE_NETWORK.with(|slot| slot.replace(None));
     }
 }
 fn dual_stack() -> physical::Snapshot {
@@ -1060,80 +1061,291 @@ fn dual_stack() -> physical::Snapshot {
         ipv6: Some(interface),
     }
 }
-#[tokio::test]
-async fn failed_aaaa_cannot_steal_healthy_a_and_static_ipv4_is_selected_once() {
+// Scoped OS DNS and physical interfaces/bind are fixture boundaries. The
+// SystemDialer selects candidates and opens real TCP sockets to two local peers.
+type TestDial = Arc<dyn Fn(std::net::IpAddr) -> DialFuture + Send + Sync>;
+thread_local! {
+    static FIXTURE_NETWORK: std::cell::RefCell<Option<(physical::Snapshot, TestDial)>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) fn fixture_snapshot() -> Option<physical::Snapshot> {
+    FIXTURE_NETWORK.with(|slot| slot.borrow().as_ref().map(|(before, _)| before.clone()))
+}
+pub(super) fn fixture_dial(ip: std::net::IpAddr) -> Option<DialFuture> {
+    FIXTURE_NETWORK.with(|slot| slot.borrow().as_ref().map(|(_, dial)| dial(ip)))
+}
+
+const HEALTHY_A: &str = "192.0.2.15";
+const HEALTHY_AAAA: &str = "2001:db8::15";
+const REFUSED_AAAA: &str = "2001:db8::dead";
+const STATIC_IP: &str = "45.144.221.68";
+
+type Answer = Option<(u64, &'static str)>;
+async fn dns_race(
+    host: &str,
+    before: physical::Snapshot,
+    // primary AAAA, primary A, secondary AAAA, secondary A; empty = negative.
+    answers: [Answer; 4],
+    wanted: Option<&str>,
+    budget_ms: u64,
+) {
     let _scope = ResolverScope;
-    RESOLVER.with(|slot| {
-        slot.replace(Some(Arc::new(|_, family| {
-            Box::pin(async move {
-                if family.ipv4.is_none() {
-                    Err(io::ErrorKind::NotFound.into())
-                } else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    Ok(vec!["192.0.2.15".parse().unwrap()])
+    let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let good = healthy.local_addr().unwrap();
+    let bad = trap.local_addr().unwrap();
+    let wanted = wanted.map(|ip| ip.parse::<std::net::IpAddr>().unwrap());
+    let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = attempts.clone();
+    FIXTURE_NETWORK.with(|slot| {
+        slot.replace(Some((
+            before,
+            Arc::new(move |ip| {
+                seen.lock().unwrap().push(ip);
+                if ip == REFUSED_AAAA.parse::<std::net::IpAddr>().unwrap() {
+                    return Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) })
+                        as DialFuture;
                 }
+                Box::pin(TcpStream::connect(if Some(ip) == wanted {
+                    good
+                } else {
+                    bad
+                }))
+            }),
+        )))
+    });
+    let primary = host.to_owned();
+    RESOLVER.with(|slot| {
+        slot.replace(Some(Arc::new(move |name, family| {
+            let index = usize::from(name != primary) * 2 + usize::from(family.ipv4.is_some());
+            let answer = answers[index];
+            Box::pin(async move {
+                let Some((ms, addr)) = answer else {
+                    return std::future::pending().await;
+                };
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(addr.parse().ok().into_iter().collect())
             })
         })))
     });
-    let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut arms = Vec::<DialFuture>::new();
-    for ipv6 in [true, false] {
-        let mut family = dual_stack();
-        if ipv6 {
-            family.ipv4 = None;
-        } else {
-            family.ipv6 = None;
-        }
-        let healthy = healthy.local_addr().unwrap();
-        let trap = trap.local_addr().unwrap();
-        arms.push(Box::pin(async move {
-            let addresses = resolve_physical_panel_host("nelomai.ru", family).await?;
-            let attempts = addresses
-                .into_iter()
-                .map(|ip| {
-                    Box::pin(async move {
-                        TcpStream::connect(
-                            if ip == "192.0.2.15".parse::<std::net::IpAddr>().unwrap() {
-                                healthy
-                            } else {
-                                trap
-                            },
-                        )
-                        .await
-                    }) as DialFuture
-                })
-                .collect();
-            race_connections(attempts).await
-        }));
+    let stream = tokio::time::timeout(
+        Duration::from_millis(budget_ms),
+        SystemDialer.connect(Origin {
+            scheme: "https".into(),
+            host: host.into(),
+            port: 443,
+        }),
+    )
+    .await
+    .expect("family DNS starved a usable answer or restarted its budget");
+    if let Some(wanted) = wanted {
+        assert_eq!(
+            stream.unwrap().peer_addr().unwrap(),
+            good,
+            "a lower-priority TCP peer stole the dial"
+        );
+        let dialed: Vec<_> = attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|ip| *ip != REFUSED_AAAA.parse::<std::net::IpAddr>().unwrap())
+            .collect();
+        assert_eq!(dialed, vec![wanted]);
+    } else {
+        assert!(stream.is_err());
+        assert!(attempts.lock().unwrap().is_empty());
     }
-    let stream = race_connections(arms).await.unwrap();
-    assert_eq!(
-        stream.peer_addr().unwrap(),
-        healthy.local_addr().unwrap(),
-        "failed AAAA scheduled a synthetic IPv4 before healthy A"
-    );
-    RESOLVER.with(|slot| {
-        slot.replace(Some(Arc::new(|_, _| {
-            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
-        })))
-    });
-    let mut v4 = dual_stack();
-    v4.ipv6 = None;
+}
+
+#[tokio::test]
+async fn dns_race_primary_aaaa_beats_static_and_secondary_a() {
+    for secondary in ["", "192.0.2.99"] {
+        dns_race(
+            "nelomai.ru",
+            dual_stack(),
+            [
+                Some((650, HEALTHY_AAAA)),
+                Some((0, "")),
+                Some((0, "")),
+                Some((0, secondary)),
+            ],
+            Some(HEALTHY_AAAA),
+            1800,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn dns_race_primary_a_beats_failed_aaaa() {
+    dns_race(
+        "nelomai.ru",
+        dual_stack(),
+        [
+            Some((0, "")),
+            Some((400, HEALTHY_A)),
+            Some((0, "")),
+            Some((0, "")),
+        ],
+        Some(HEALTHY_A),
+        1500,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dns_race_each_usable_family_starts_before_silent_sibling_times_out() {
+    for (a6, a4, want) in [
+        (Some((0, HEALTHY_AAAA)), None, HEALTHY_AAAA),
+        (None, Some((0, HEALTHY_A)), HEALTHY_A),
+    ] {
+        dns_race(
+            "nelomai.ru",
+            dual_stack(),
+            [a6, a4, None, None],
+            Some(want),
+            800,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn dns_race_secondary_aaaa_beats_static_after_primary_dns_fails() {
+    dns_race(
+        "nelomai.ru",
+        dual_stack(),
+        [
+            Some((0, "")),
+            Some((0, "")),
+            Some((650, HEALTHY_AAAA)),
+            Some((0, "")),
+        ],
+        Some(HEALTHY_AAAA),
+        1800,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dns_race_both_secondary_answers_survive_silent_primary() {
+    dns_race(
+        "nelomai.ru",
+        dual_stack(),
+        [None, None, Some((5, REFUSED_AAAA)), Some((50, HEALTHY_A))],
+        Some(HEALTHY_A),
+        1600,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dns_race_static_once_only_with_ipv4_and_only_for_panel_hosts() {
+    let empty = [Some((0, "")); 4];
+    dns_race("nelomai.ru", dual_stack(), empty, Some(STATIC_IP), 1500).await;
     let mut v6 = dual_stack();
     v6.ipv4 = None;
-    let (v4, v6) = tokio::join!(
-        resolve_physical_panel_host("nelomai.ru", v4),
-        resolve_physical_panel_host("nelomai.ru", v6)
-    );
+    dns_race("nelomai.top", v6, empty, None, 1500).await;
+    dns_race(
+        "foreign.example",
+        dual_stack(),
+        [
+            Some((0, "")),
+            Some((0, "")),
+            Some((0, HEALTHY_AAAA)),
+            Some((0, HEALTHY_A)),
+        ],
+        None,
+        1500,
+    )
+    .await;
+}
+
+// Drive the real dialer's DNS ownership/deadline using virtual time; for
+// these timing tests every physical TCP attempt is recorded and refused.
+fn pending_dns() -> (
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<Vec<std::net::IpAddr>>>,
+) {
+    let started = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = attempts.clone();
+    FIXTURE_NETWORK.with(|slot| {
+        slot.replace(Some((
+            dual_stack(),
+            Arc::new(move |ip| {
+                seen.lock().unwrap().push(ip);
+                Box::pin(async { Err(io::ErrorKind::ConnectionRefused.into()) })
+            }),
+        )))
+    });
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let starts = started.clone();
+    let drops = dropped.clone();
+    RESOLVER.with(|slot| {
+        slot.replace(Some(Arc::new(move |_, _| {
+            let guard = CountDrop(drops.clone());
+            starts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let _guard = guard;
+                std::future::pending().await
+            })
+        })))
+    });
+    (started, dropped, attempts)
+}
+
+#[tokio::test(start_paused = true)]
+async fn dns_race_all_four_queries_share_one_deadline_and_static_is_attempted_once() {
+    let _scope = ResolverScope;
+    let (started, dropped, attempts) = pending_dns();
+    let start = tokio::time::Instant::now();
+    assert!(SystemDialer
+        .connect(Origin {
+            scheme: "https".into(),
+            host: "nelomai.ru".into(),
+            port: 443
+        })
+        .await
+        .is_err());
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+    assert_eq!(dropped.load(Ordering::SeqCst), 4);
     assert_eq!(
-        v4.unwrap(),
-        vec!["45.144.221.68".parse::<std::net::IpAddr>().unwrap()]
+        *attempts.lock().unwrap(),
+        vec![STATIC_IP.parse::<std::net::IpAddr>().unwrap()]
     );
     assert!(
-        v6.unwrap().is_empty(),
-        "static IPv4 scheduled by both family arms"
+        (Duration::from_millis(1000)..Duration::from_millis(1010)).contains(&start.elapsed()),
+        "{:?}",
+        start.elapsed()
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dns_race_cancelling_dial_drops_all_live_queries_before_static() {
+    let _scope = ResolverScope;
+    let (started, dropped, attempts) = pending_dns();
+    assert!(tokio::time::timeout(
+        Duration::from_millis(400),
+        SystemDialer.connect(Origin {
+            scheme: "https".into(),
+            host: "nelomai.ru".into(),
+            port: 443,
+        })
+    )
+    .await
+    .is_err());
+    assert_eq!(started.load(Ordering::SeqCst), 4);
+    assert_eq!(dropped.load(Ordering::SeqCst), 4);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(attempts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

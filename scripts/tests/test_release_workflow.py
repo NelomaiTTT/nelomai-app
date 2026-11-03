@@ -207,8 +207,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
             lambda jobs: jobs["windows-build"]["steps"][5].update(run="cargo check -p nelomai-windows-service"),
             lambda jobs: jobs["windows-build"]["steps"][-1].update(**{"if": "always()"}),
             lambda jobs: jobs["windows-build"]["steps"][-1]["with"].update(**{"retention-days": 14}),
-            lambda jobs: jobs["windows-build"]["steps"][8].update(run="cargo build -p nelomai-windows-service"),
-            lambda jobs: jobs["windows-build"]["steps"].insert(8, jobs["windows-build"]["steps"].pop(
+            lambda jobs: jobs["windows-build"]["steps"][10].update(run="cargo build -p nelomai-windows-service"),
+            lambda jobs: jobs["windows-build"]["steps"].insert(10, jobs["windows-build"]["steps"].pop(
                 next(index for index, step in enumerate(jobs["windows-build"]["steps"])
                      if step.get("name") == "Actual factory runtime input"))),
             lambda jobs: jobs["contracts-python"].update(steps=[
@@ -450,6 +450,25 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                         env={**os.environ, "FINALIZED_ARTIFACT_ID": artifact,
                                              "INVENTORY_SHA256": digest}, capture_output=True)
                 self.assertEqual(result.returncode, expected)
+
+    def test_native_panel_recovery_tests_cover_windows_and_macos(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        windows = [step.get("run", "") for step in workflow["jobs"]["windows-build"]["steps"]]
+        self.assertIn("cargo test --locked -p nelomai-client-api", windows)
+        self.assertIn("cargo test -p nelomai-client-updater", windows)
+        self.assertIn("cargo test --locked -p nelomai-app --lib platform::updater::", windows)
+        macos = workflow["jobs"]["macos-development"]["steps"]
+        shared = next(step for step in macos
+                      if step.get("name") == "Shared contract, tunnel, coordinator and application regressions")
+        for package in ("nelomai-client-api", "nelomai-client-updater"):
+            self.assertIn("-p " + package, shared["run"])
+        updater = next(step for step in macos if step.get("name") == "macOS updater authorization and recovery tests")
+        self.assertEqual(updater["run"],
+            'cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib platform::updater::')
+        for step in (shared, updater):
+            self.assertIn("steps.guard.outcome == 'success'", step["if"])
+            self.assertIn("steps.rust.outcome == 'success'", step["if"])
+        self.assertIn("steps.frontend.outcome == 'success'", updater["if"])
 
     def test_linux_diagnostic_source_gate_tracks_current_version(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())

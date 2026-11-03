@@ -229,6 +229,9 @@ jobs:
       - run: cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
+      - run: cargo test --locked -p nelomai-client-api
+      - run: >-
+          cargo test --locked -p nelomai-app --lib platform::updater::
       # The actual factory invokes the audited unimpersonated SYSTEM cooperative
       # lease. Run this one test separately under its real production principal;
       # its selector/coordinator/ownership/native gates are not replaced.
@@ -561,9 +564,11 @@ jobs:
           cargo test --locked --target "$CARGO_BUILD_TARGET"
           -p nelomai-contracts -p nelomai-client-tunnel
           -p nelomai-client-core -p nelomai-client-application
-      - name: macOS updater authorization argument tests
+          -p nelomai-client-api -p nelomai-client-updater
+      - name: macOS updater authorization and recovery tests
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
-        run: cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib platform::updater::macos_tests
+        run: >-
+          cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib platform::updater::
       - name: Clippy desktop application and runtime targets
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: cargo clippy --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --features desktop-runtime --all-targets -- -D warnings

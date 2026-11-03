@@ -2,6 +2,7 @@ use reqwest::{Client, Url};
 use std::{
     future::Future,
     io,
+    net::IpAddr,
     pin::Pin,
     sync::{Arc, RwLock},
 };
@@ -56,6 +57,10 @@ async fn race_connections(attempts: Vec<DialFuture>) -> io::Result<TcpStream> {
 }
 
 async fn snapshot() -> io::Result<physical::Snapshot> {
+    #[cfg(test)]
+    if let Some(before) = tests::fixture_snapshot() {
+        return Ok(before);
+    }
     native_read(physical::snapshot)
         .await
         .map_err(|e| io::Error::new(e.kind(), "physical_discovery_failed"))
@@ -98,47 +103,115 @@ impl Dialer for SystemDialer {
     fn connect(&self, origin: Origin) -> DialFuture {
         Box::pin(async move {
             let before = snapshot().await?;
-            let mut families: Vec<DialFuture> = Vec::new();
-            for ipv6 in [true, false] {
-                if if ipv6 {
-                    before.ipv6.is_none()
-                } else {
-                    before.ipv4.is_none()
-                } {
-                    continue;
-                }
-                let network = before.clone();
-                let target = origin.clone();
-                families.push(Box::pin(async move {
-                    connect_family(network, target, ipv6).await
-                }));
+            let port = origin.port;
+            if let Ok(ip) = origin.host.parse::<IpAddr>() {
+                before.interface(ip)?;
+                return connect_batch(before, port, vec![ip]).await;
             }
-            // DNS and TCP for both families share the caller's original dial
-            // deadline. A silent DNS family/address cannot starve the other.
-            race_connections(families).await
+            let attempts = physical_dials(before, port, &origin.host).await?;
+            futures_util::future::select_ok(attempts)
+                .await
+                .map(|(stream, _)| stream)
         })
     }
 }
 
-async fn connect_family(
+type FamilyQuery = futures_util::future::BoxFuture<'static, io::Result<DialFuture>>;
+type Queries = futures_util::stream::FuturesUnordered<FamilyQuery>;
+
+// Poll every available family of both names under one DNS deadline. Hold
+// secondary answers without opening sockets until all primary DNS has failed.
+async fn physical_dials(
     before: physical::Snapshot,
-    origin: Origin,
-    ipv6: bool,
-) -> io::Result<TcpStream> {
-    let mut family = before.clone();
-    if ipv6 {
-        family.ipv4 = None;
-    } else {
-        family.ipv6 = None;
+    port: u16,
+    host: &str,
+) -> io::Result<Vec<DialFuture>> {
+    use futures_util::StreamExt;
+    let policy = crate::panel_dns::PanelDnsFallback::for_host(host);
+    let deadline = policy.as_ref().map(|p| p.deadline);
+    let mut primary = family_queries(&before, port, host, deadline);
+    let mut secondary = policy
+        .as_ref()
+        .and_then(|p| p.secondary)
+        .map(|name| family_queries(&before, port, name, deadline))
+        .unwrap_or_default();
+    let mut held = Vec::new();
+    let mut last_error = io::Error::other("physical_egress_unavailable");
+    while !primary.is_empty() {
+        tokio::select! {
+            biased;
+            Some(answer) = primary.next() => match answer {
+                Ok(dial) => return Ok(selected_dials(vec![dial], primary)),
+                Err(error) => last_error = error,
+            },
+            Some(answer) = secondary.next(), if !secondary.is_empty() => {
+                if let Ok(dial) = answer { held.push(dial); }
+            }
+        }
     }
-    let host = origin.host.clone();
-    let addresses = if let Ok(address) = host.parse::<std::net::IpAddr>() {
-        family.interface(address)?;
-        vec![address]
-    } else {
-        resolve_physical_panel_host(&host, family)
-            .await
-            .map_err(|e| {
+    while held.is_empty() {
+        match secondary.next().await {
+            Some(Ok(dial)) => held.push(dial),
+            Some(Err(_)) => continue,
+            None => break,
+        }
+    }
+    if !held.is_empty() {
+        return Ok(selected_dials(held, secondary));
+    }
+    let policy = policy.ok_or(last_error)?;
+    before.interface(policy.address.ip())?;
+    Ok(vec![connect_batch(before, port, vec![policy.address.ip()])])
+}
+
+// The caller can dial the first usable answer immediately. A later answer
+// from this same name still races its TCP sibling, subject to the DNS deadline.
+fn selected_dials(mut ready: Vec<DialFuture>, remaining: Queries) -> Vec<DialFuture> {
+    for query in remaining {
+        ready.push(Box::pin(async move { query.await?.await }));
+    }
+    ready
+}
+
+fn family_queries(
+    before: &physical::Snapshot,
+    port: u16,
+    name: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> Queries {
+    let queries = Queries::new();
+    for ipv6 in [true, false] {
+        let mut family = before.clone();
+        if ipv6 {
+            family.ipv4 = None;
+        } else {
+            family.ipv6 = None;
+        }
+        if family.ipv4.is_none() && family.ipv6.is_none() {
+            continue;
+        }
+        let delay_v4 = !ipv6 && before.ipv6.is_some();
+        let network = before.clone();
+        let name = name.to_owned();
+        queries.push(Box::pin(async move {
+            let query = async {
+                if delay_v4 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                let mut ips = resolve_host(name, family.clone()).await?;
+                ips.retain(|ip| family.interface(*ip).is_ok());
+                if ips.is_empty() {
+                    return Err(io::Error::from(io::ErrorKind::NotFound));
+                }
+                Ok(connect_batch(network, port, ips))
+            };
+            let result = match deadline {
+                Some(end) => tokio::time::timeout_at(end, query)
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "physical_dns_timeout"))?,
+                None => query.await,
+            };
+            result.map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     if e.kind() == io::ErrorKind::TimedOut {
@@ -147,44 +220,22 @@ async fn connect_family(
                         "physical_dns_failed"
                     },
                 )
-            })?
-    };
-    if snapshot().await? != before {
-        return Err(io::Error::other("physical_network_changed"));
+            })
+        }));
     }
-    let attempts = addresses
-        .into_iter()
-        .map(|address| {
-            let network = before.clone();
-            Box::pin(async move { connect_address(network, address, origin.port).await })
-                as DialFuture
-        })
-        .collect();
-    race_connections(attempts).await
+    queries
 }
 
-async fn resolve_physical_panel_host(
-    host: &str,
-    family: physical::Snapshot,
-) -> io::Result<Vec<std::net::IpAddr>> {
-    crate::panel_dns::resolve_panel_addresses_with(host, |name| {
-        let family = family.clone();
-        async move {
-            resolve_host(name, family).await.map(|addresses| {
-                addresses
-                    .into_iter()
-                    .map(|ip| std::net::SocketAddr::new(ip, 0))
-                    .collect()
-            })
+fn connect_batch(before: physical::Snapshot, port: u16, addresses: Vec<IpAddr>) -> DialFuture {
+    Box::pin(async move {
+        if snapshot().await? != before {
+            return Err(io::Error::other("physical_network_changed"));
         }
-    })
-    .await
-    .map(|addresses| {
-        addresses
+        let attempts = addresses
             .into_iter()
-            .map(|address| address.ip())
-            .filter(|address| family.interface(*address).is_ok())
-            .collect()
+            .map(|address| Box::pin(connect_address(before.clone(), address, port)) as DialFuture)
+            .collect();
+        race_connections(attempts).await
     })
 }
 
@@ -223,6 +274,10 @@ async fn connect_address(
     address: std::net::IpAddr,
     port: u16,
 ) -> io::Result<TcpStream> {
+    #[cfg(test)]
+    if let Some(dial) = tests::fixture_dial(address) {
+        return dial.await;
+    }
     static CONNECTING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
     let _permit = CONNECTING
         .acquire()

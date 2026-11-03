@@ -39,30 +39,35 @@ pub fn panel_http_client_builder() -> ClientBuilder {
 /// Also used by the desktop updater, whose HTTP client is a different reqwest
 /// version. Zero ports let each HTTP client preserve the port in its URL.
 pub async fn resolve_panel_addresses(host: &str) -> io::Result<Vec<SocketAddr>> {
-    resolve_panel_addresses_with(host, |name| async move { os_lookup(&name).await }).await
+    with_panel_fallback(host, os_lookup(host), os_lookup).await
 }
 
-// Native desktop callers supply only their scoped physical resolver. This
-// shares the exact allowlist/deadline without ever invoking OS-default DNS.
-pub(crate) async fn resolve_panel_addresses_with<F, Fut>(
-    host: &str,
-    lookup: F,
-) -> io::Result<Vec<SocketAddr>>
-where
-    F: Fn(String) -> Fut,
-    Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
-{
-    with_panel_fallback(host, lookup(host.to_owned()), async {
-        if host.eq_ignore_ascii_case(PANEL_HOST) {
-            lookup(PANEL_BACKUP_HOST.to_owned()).await
+// Both ordinary and scoped resolvers use exactly this allowlist, secondary
+// name and absolute DNS budget. The numeric address never changes URL identity.
+pub(crate) struct PanelDnsFallback {
+    pub secondary: Option<&'static str>,
+    pub deadline: tokio::time::Instant,
+    pub address: SocketAddr,
+}
+
+impl PanelDnsFallback {
+    pub fn for_host(host: &str) -> Option<Self> {
+        let secondary = if host.eq_ignore_ascii_case(PANEL_HOST) {
+            Some(PANEL_BACKUP_HOST)
+        } else if host.eq_ignore_ascii_case(PANEL_BACKUP_HOST) {
+            None
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no secondary DNS name",
-            ))
-        }
-    })
-    .await
+            return None;
+        };
+        let address = SocketAddr::from((PANEL_BACKUP, 0));
+        #[cfg(test)]
+        let address = https_tests::backup_address().unwrap_or(address);
+        Some(Self {
+            secondary,
+            deadline: tokio::time::Instant::now() + PANEL_DNS_TIMEOUT,
+            address,
+        })
+    }
 }
 
 /// The only approved alternate HTTPS origin. Paths and query strings stay intact.
@@ -152,17 +157,22 @@ impl Resolve for PanelDns {
     }
 }
 
-async fn with_panel_fallback(
+async fn with_panel_fallback<Fut>(
     host: &str,
     lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
-    secondary_lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
-) -> io::Result<Vec<SocketAddr>> {
-    if !host.eq_ignore_ascii_case(PANEL_HOST) && !host.eq_ignore_ascii_case(PANEL_BACKUP_HOST) {
+    secondary_lookup: impl FnOnce(&'static str) -> Fut,
+) -> io::Result<Vec<SocketAddr>>
+where
+    Fut: Future<Output = io::Result<Vec<SocketAddr>>>,
+{
+    let Some(policy) = PanelDnsFallback::for_host(host) else {
         return lookup.await;
-    }
-    let deadline = tokio::time::Instant::now() + PANEL_DNS_TIMEOUT;
-    let primary = tokio::time::timeout_at(deadline, lookup);
-    let secondary = tokio::time::timeout_at(deadline, secondary_lookup);
+    };
+    let primary = tokio::time::timeout_at(policy.deadline, lookup);
+    let secondary = tokio::time::timeout_at(policy.deadline, async {
+        let name = policy.secondary.ok_or(io::ErrorKind::NotFound)?;
+        secondary_lookup(name).await
+    });
     pin_mut!(primary, secondary);
     let secondary_result = match select(primary, secondary).await {
         Either::Left((result, secondary)) => match result {
@@ -179,10 +189,7 @@ async fn with_panel_fallback(
             return Ok(addresses);
         }
     }
-    let address = SocketAddr::from((PANEL_BACKUP, 0));
-    #[cfg(test)]
-    let address = https_tests::backup_address().unwrap_or(address);
-    Ok(vec![address])
+    Ok(vec![policy.address])
 }
 
 #[cfg(test)]
@@ -238,7 +245,7 @@ mod tests {
         host: &str,
         lookup: impl Future<Output = io::Result<Vec<SocketAddr>>>,
     ) -> io::Result<Vec<SocketAddr>> {
-        with_panel_fallback(host, lookup, ready(Err(dns_error()))).await
+        with_panel_fallback(host, lookup, |_| ready(Err(dns_error()))).await
     }
 
     #[tokio::test]
