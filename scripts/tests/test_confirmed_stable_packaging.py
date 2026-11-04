@@ -13,6 +13,21 @@ STABLE_VERSION = module("release-candidate-gates").STABLE_VERSION
 
 
 class ConfirmedStablePackagingTest(ArtifactFixture):
+    def test_prior_stable_cannot_masquerade_as_pinned_runtime(self):
+        gates = module("release-candidate-gates")
+        prior = RuntimeReleaseSetTest.four_candidates(self, version="0.3.10")
+        aggregate = module("build-runtime-release-set")
+        digest = aggregate.build(prior, self.root / "prior-root", "0.3.10", SOURCE,
+                                 self.keyfile, self.public)
+        for suffix in (".json", ".sig"):
+            shutil.copyfile(
+                self.root / "prior-root" / ("nelomai-runtime-0.3.10-release-set.manifest" + suffix),
+                prior / (f"nelomai-runtime-{gates.STABLE_VERSION}-release-set.manifest" + suffix))
+        # Valid signatures and the expected digest cannot substitute an older
+        # runtime for the approved stable, even under the expected filename.
+        with self.assertRaisesRegex(ValueError, "approved release-set identity mismatch"):
+            gates.verify_runtime_release(prior, gates.STABLE_VERSION, SOURCE, digest, self.public)
+
     def test_android_common_host_version_matches_container_and_latest(self):
         expected = json.loads((ROOT / "src-tauri/tauri.conf.json").read_bytes())["version"]
         for name in ("crates/android-container/Cargo.toml", "src-tauri/Cargo.toml"):
