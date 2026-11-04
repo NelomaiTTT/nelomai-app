@@ -2,12 +2,14 @@ import { CHANGELOG } from "./changelog";
 
 export interface ReleaseHistoryEntry { version: string; notes: string }
 interface CacheStorage { getItem(key: string): string | null; setItem(key: string, value: string): void }
-const CACHE_KEY = "nelomai.ru.release-history.v1";
+const CACHE_KEY = "nelomai.ru.release-history.v2";
 const FALLBACK = CHANGELOG.map(entry => ({ version: entry.version, notes: entry.items.map(item => `• ${item}`).join("\n") }));
 
 export function parseReleaseHistory(value: unknown): ReleaseHistoryEntry[] {
-  const data = value as { api_version?: unknown; entries?: unknown } | null;
-  if (!data || data.api_version !== "1" || !Array.isArray(data.entries) || data.entries.length > 50) throw Error("invalid_release_history");
+  const data = value as { api_version?: unknown; platform?: unknown; entries?: unknown } | null;
+  if (!data || data.api_version !== "1" ||
+    typeof data.platform !== "string" || !["android", "windows", "macos", "linux"].includes(data.platform) ||
+    !Array.isArray(data.entries) || data.entries.length > 50) throw Error("invalid_release_history");
   const versions = new Set<string>();
   return data.entries.map(entry => {
     if (!entry || typeof entry.version !== "string" || !entry.version.trim() || entry.version.length > 64 ||
@@ -33,7 +35,7 @@ export class ReleaseHistory {
     this.pending = this.load().then(value => {
       const entries = parseReleaseHistory(value);
       this.current = entries;
-      try { this.storage?.setItem(CACHE_KEY, JSON.stringify({ api_version: "1", entries })); } catch { /* Quota/private mode: retain in memory. */ }
+      try { this.storage?.setItem(CACHE_KEY, JSON.stringify({ api_version: "1", platform: (value as { platform: string }).platform, entries })); } catch { /* Quota/private mode: retain in memory. */ }
       return entries;
     }).finally(() => { this.pending = null; });
     return this.pending;

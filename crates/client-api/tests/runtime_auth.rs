@@ -176,38 +176,79 @@ async fn foreground_reconcile_uses_exact_operation_and_captured_runtime_authorit
 }
 
 #[tokio::test]
-async fn release_history_is_public_and_keeps_notes_without_authentication() {
-    let (url, requests, handle) = server(json!({"api_version":"1","entries":[
-        {"version":"0.2.18","notes":"Первая строка\n<script>literal</script>"}
-    ]}));
-    let result = ClientApi::new(&url)
-        .unwrap()
-        .release_history()
-        .await
-        .unwrap();
-    assert_eq!(
-        result.entries[0].notes,
-        "Первая строка\n<script>literal</script>"
-    );
-    let request = requests.recv().unwrap().to_lowercase();
-    assert!(request.starts_with("get /api/client/v1/releases/changelog "));
-    assert!(!request.contains("authorization:"));
-    handle.join().unwrap();
+async fn release_history_sends_platform_without_auth_and_keeps_literal_notes() {
+    for (platform, name, version) in [
+        (Platform::Android, "android", "0.3.11"),
+        (Platform::Windows, "windows", "0.4.0"),
+        (Platform::Macos, "macos", "0.4.0"),
+        (Platform::Linux, "linux", "0.4.0"),
+    ] {
+        let (url, requests, handle) = server(json!({"api_version":"1","platform":name,"entries":[
+            {"version":version,"notes":"Первая строка\n<script>literal</script>"}
+        ]}));
+        let result = ClientApi::new(&url)
+            .unwrap()
+            .release_history(platform)
+            .await
+            .unwrap();
+        assert_eq!(result.platform, platform);
+        assert_eq!(result.entries[0].version, version);
+        assert_eq!(
+            result.entries[0].notes,
+            "Первая строка\n<script>literal</script>"
+        );
+        let request = requests.recv().unwrap().to_lowercase();
+        assert!(
+            request.starts_with(&format!(
+                "get /api/client/v1/releases/changelog?platform={name} "
+            )),
+            "wrong platform query: {request}"
+        );
+        assert!(!request.contains("authorization:"));
+        assert!(!request.contains("cookie:"));
+        assert!(!request.contains("x-nelomai-runtime-"));
+        handle.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn release_history_rejects_missing_unknown_and_mismatched_platform() {
+    for response in [
+        json!({"api_version":"1","entries":[]}),
+        json!({"api_version":"1","platform":null,"entries":[]}),
+        json!({"api_version":"1","platform":"unknown","entries":[]}),
+        json!({"api_version":"1","platform":42,"entries":[]}),
+        json!({"api_version":"1","platform":"macos","entries":[]}),
+    ] {
+        let (url, _requests, handle) = server(response);
+        let error = ClientApi::new(&url)
+            .unwrap()
+            .release_history(Platform::Android)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            nelomai_client_api::ClientApiError::InvalidPayload {
+                code: "invalid_release_history"
+            }
+        ));
+        handle.join().unwrap();
+    }
 }
 
 #[tokio::test]
 async fn release_history_rejects_invalid_and_excessive_payloads() {
     for response in [
-        json!({"api_version":"2","entries":[]}),
-        json!({"api_version":"1","entries":[{"version":"", "notes":"text"}]}),
-        json!({"api_version":"1","entries":[{"version":"0.2.18", "notes":"x".repeat(20_001)}]}),
-        json!({"api_version":"1","entries":[{"version":"0.2.18", "notes":"a"},{"version":"0.2.18", "notes":"b"}]}),
-        json!({"api_version":"1","entries":(0..51).map(|i|json!({"version":format!("0.0.{i}"),"notes":"ok"})).collect::<Vec<_>>()}),
+        json!({"api_version":"2","platform":"android","entries":[]}),
+        json!({"api_version":"1","platform":"android","entries":[{"version":"", "notes":"text"}]}),
+        json!({"api_version":"1","platform":"android","entries":[{"version":"0.2.18", "notes":"x".repeat(20_001)}]}),
+        json!({"api_version":"1","platform":"android","entries":[{"version":"0.2.18", "notes":"a"},{"version":"0.2.18", "notes":"b"}]}),
+        json!({"api_version":"1","platform":"android","entries":(0..51).map(|i|json!({"version":format!("0.0.{i}"),"notes":"ok"})).collect::<Vec<_>>()}),
     ] {
         let (url, _requests, handle) = server(response);
         assert!(ClientApi::new(&url)
             .unwrap()
-            .release_history()
+            .release_history(Platform::Android)
             .await
             .is_err());
         handle.join().unwrap();
@@ -241,7 +282,7 @@ async fn release_history_rejects_http_errors_before_reading_their_body() {
     });
     let error = ClientApi::new(&url)
         .unwrap()
-        .release_history()
+        .release_history(Platform::Macos)
         .await
         .unwrap_err();
     assert!(
