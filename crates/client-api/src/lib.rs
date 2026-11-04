@@ -44,6 +44,7 @@ pub struct ReleaseHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseHistory {
     pub api_version: ApiVersion,
+    pub platform: Platform,
     pub entries: Vec<ReleaseHistoryEntry>,
 }
 
@@ -1025,13 +1026,17 @@ impl ClientApi {
     }
 
     /// Public release metadata is independent of login, refresh and runtime admission.
-    pub async fn release_history(&self) -> Result<ReleaseHistory, ClientApiError> {
+    pub async fn release_history(
+        &self,
+        platform: Platform,
+    ) -> Result<ReleaseHistory, ClientApiError> {
         // Error descriptions are not displayed here; discard non-success bodies
         // instead of passing potentially huge HTML/JSON errors to api_error.
         let response = self
             .send_request(
                 self.http
                     .get(self.endpoint("releases/changelog")?)
+                    .query(&[("platform", platform)])
                     .timeout(Duration::from_secs(8)),
             )
             .await?
@@ -1044,7 +1049,8 @@ impl ClientApi {
         )
         .await?;
         let mut versions = HashSet::new();
-        if history.entries.len() > 50
+        if history.platform != platform
+            || history.entries.len() > 50
             || history.entries.iter().any(|entry| {
                 entry.version.trim().is_empty()
                     || entry.version.chars().count() > 64

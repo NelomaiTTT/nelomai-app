@@ -89,9 +89,9 @@ async fn missing_physical_path_never_falls_back_to_the_ordinary_route() {
 #[tokio::test]
 async fn api_requests_use_control_transport_but_tunnel_probes_keep_the_ordinary_path() {
     let (ordinary, ordinary_hits, first) =
-        server(r#"{"api_version":"1","entries":[{"version":"vpn","notes":"ordinary"}]}"#).await;
+        server(r#"{"api_version":"1","platform":"macos","entries":[{"version":"vpn","notes":"ordinary"}]}"#).await;
     let (physical, physical_hits, second) =
-        server(r#"{"api_version":"1","entries":[{"version":"direct","notes":"physical"}]}"#).await;
+        server(r#"{"api_version":"1","platform":"macos","entries":[{"version":"direct","notes":"physical"}]}"#).await;
     let origin = Url::parse(&format!("http://{ordinary}")).unwrap();
     let mut api = crate::ClientApi::new(origin.as_str()).unwrap();
     api.http.control = Some(Arc::new(Slot::new(
@@ -100,7 +100,10 @@ async fn api_requests_use_control_transport_but_tunnel_probes_keep_the_ordinary_
             target: Some(physical),
         }),
     )));
-    let history = api.release_history().await.unwrap();
+    let history = api
+        .release_history(nelomai_contracts::Platform::Macos)
+        .await
+        .unwrap();
     assert_eq!(history.entries[0].version, "direct");
     assert_eq!(ordinary_hits.load(Ordering::SeqCst), 0);
     assert!(api

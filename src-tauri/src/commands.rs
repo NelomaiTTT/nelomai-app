@@ -3029,7 +3029,7 @@ pub async fn app_release_history() -> Result<nelomai_client_api::ReleaseHistory,
     };
     nelomai_client_api::ClientApi::new(crate::PANEL_BASE)
         .map_err(unavailable)?
-        .release_history()
+        .release_history(current_platform())
         .await
         .map_err(unavailable)
 }
