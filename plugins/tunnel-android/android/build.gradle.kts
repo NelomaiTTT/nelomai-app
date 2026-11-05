@@ -33,6 +33,10 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    sourceSets.getByName("test") {
+        java.srcDir("../../../scripts/android/test-fixtures")
+        resources.srcDir("../../../crates/client-api/src/panel_dns_testdata")
+    }
 }
 
 dependencies {

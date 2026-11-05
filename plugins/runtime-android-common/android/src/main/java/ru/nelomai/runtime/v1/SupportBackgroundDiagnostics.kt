@@ -14,7 +14,7 @@ object SupportBackgroundDiagnostics {
         "background_credential_generation_conflict", "background_credential_capability_unavailable",
         "background_credential_device_mismatch", "background_credential_activation_pending",
         "background_credential_pending_absent", "background_credential_logout_absent",
-        "app_access_unavailable", "native_outcome_unknown",
+        "app_access_unavailable", "native_outcome_unknown", "background_transport_unavailable",
     )
 
     fun recordFailure(action: String, code: String) {

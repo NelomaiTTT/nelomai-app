@@ -477,6 +477,83 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun redundantStopUsesRetainedCredentialAfterLogoutStarts() {
+        val device = "11111111-1111-4111-8111-111111111111"
+        var bytes: ByteArray? = null
+        val credentials = BackgroundCredentialStore(object : EncryptedRecordBackend {
+            override fun read() = bytes?.clone()
+            override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.clone(); return true }
+        })
+        assertTrue(credentials.configure(0, BackgroundCredentialProvision(device,
+            "https://nelomai.example", "original-token", 1_900_000_000,
+            "install-secret", 1, BackgroundCapabilitySnapshot(1, true, 1_900_000_000)))
+            is CredentialStoreResult.Success)
+        assertTrue(credentials.beginLogoutCurrent("33333333-3333-4333-8333-333333333333")
+            is CredentialStoreResult.Success)
+        val stopped = AndroidRedundantTransaction(false,
+            AndroidIntentTemplate(device, "account", "stray", "dynamic", "standalone", "ipv4", true),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "lease-a", slotBLeaseId = null, localActiveLeaseId = "lease-a", standbyDesired = false,
+            roleGeneration = 1, membershipGeneration = 1, startOperationId = "start",
+            startRequestFingerprint = "f".repeat(64))
+        var cleanupTransportCalls = 0
+        val panel = ServiceRedundantConnectionPanel(
+            credential = { error("active credential must not be requested during Logout cleanup") },
+            cleanupCredential = { _ ->
+                val envelope = (credentials.read() as CredentialStoreResult.Success).value
+                assertEquals(null, envelope.active)
+                requireNotNull(envelope.cleanupCredential).also { assertEquals(device, it.deviceId) }
+            },
+            stopTransport = { auth, tx, lease ->
+                cleanupTransportCalls++
+                assertEquals("original-token", auth.token)
+                assertEquals(stopped, tx)
+                org.json.JSONObject().put("connection", org.json.JSONObject()
+                    .put("lease_id", lease).put("status", "released").put("session_id", org.json.JSONObject.NULL))
+            })
+        repeat(2) { assertEquals(RedundantStopOutcome.Completed, panel.stopOutcome(stopped)) }
+        assertEquals(RedundantStopOutcome.Pending, panel.stopOutcome(stopped.copy(
+            template = stopped.template.copy(deviceId = "44444444-4444-4444-8444-444444444444"))))
+        assertEquals("Wrong-device Stop must not reach HTTP", 2, cleanupTransportCalls)
+        try {
+            panel.recover(stopped)
+            org.junit.Assert.fail("Cleanup credential must not authorize recovery")
+        } catch (_: IllegalStateException) { }
+    }
+
+    @Test
+    fun recoveredFormerActiveCanServeTheNextFailoverWithoutUserTraffic() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            var firstSwitch: Int? = null
+            for (now in 30_000L..45_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                assertFalse("first failure unexpectedly stalled", decision.sessionStalled)
+                if (decision.switchTo != null) {
+                    firstSwitch = decision.switchTo
+                    assertTrue(fixture.native.activate(if (firstSwitch == 0) "lease-a" else "lease-b"))
+                    break
+                }
+            }
+            assertEquals(1 - primary, firstSwitch)
+            // Native consumes DNS replies itself: a healthy standby need not
+            // produce any TUN writes while the other slot carries user traffic.
+            for (now in 46_000L..70_000L step 1_000L) {
+                val decision = fixture.tick(now) { _, _ -> true }
+                assertFalse(decision.sessionStalled)
+                assertEquals(null, decision.switchTo)
+            }
+            var secondSwitch: Int? = null
+            for (now in 71_000L..85_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot == primary }
+                assertFalse("recovered former active rejected at $now, primary=$primary", decision.sessionStalled)
+                if (decision.switchTo != null) { secondSwitch = decision.switchTo; break }
+            }
+            assertEquals("healthy former active must receive traffic again", primary, secondSwitch)
+        }
+    }
+
+    @Test
     fun dnsOnlyFailureDoesNotStopOrdinaryStandbyProbes() {
         for (primary in listOf(0, 1)) {
             val fixture = pairFixture(primary)
@@ -676,6 +753,68 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun repeatedSendErrorsRequireFreshUsableReserveBeforeFailover() {
+        for (primary in listOf(0, 1)) {
+            for (reserveHealthy in listOf(false, true)) {
+                val fixture = pairFixture(primary)
+                fixture.backend.failedProbeSendSlots += primary
+                var decision = FailoverDecision(null, false)
+                for (now in 30_000L..38_000L step 1_000L) {
+                    decision = fixture.tick(now) { slot, _ -> slot != primary && reserveHealthy }
+                    if (decision.switchTo != null || decision.sessionStalled) break
+                }
+                assertEquals("primary=$primary, reserve=$reserveHealthy",
+                    if (reserveHealthy) 1 - primary else null, decision.switchTo)
+                assertEquals(!reserveHealthy, decision.sessionStalled)
+            }
+        }
+    }
+
+    @Test
+    fun oldOrSingleSendErrorCannotConfirmAnOngoingFailure() {
+        for (oneNewError in listOf(false, true)) {
+            val fixture = timingFixture(active = true)
+            fixture.backend.sendErrorsBySlot[0] = 7L
+            fixture.backend.countProbeSend = false
+            if (oneNewError) fixture.backend.failedProbeSendSlots += 0
+            fixture.observe(0, healthy = false)
+            fixture.backend.failedProbeSendSlots.clear()
+            for (now in 1_000L..12_000L step 1_000L) {
+                val observation = fixture.observe(now, healthy = false)
+                assertFalse("old error reused at $now, oneNew=$oneNewError",
+                    RedundantHealthMonitor().failed(now, observation))
+            }
+        }
+    }
+
+    @Test
+    fun decryptedTrafficCancelsRepeatedSendErrorSuspicion() {
+        for (receiveFrom in listOf(1_000L, 5_000L)) {
+            val fixture = timingFixture(active = true)
+            fixture.backend.failedProbeSendSlots += 0
+            for (now in 0L..10_000L step 1_000L) {
+                if (now >= receiveFrom) fixture.backend.decryptedReceivePackets += 1L
+                val observation = fixture.observe(now, healthy = false)
+                if (now >= receiveFrom) assertFalse(observation.independentFailureSignal)
+                assertFalse(RedundantHealthMonitor().failed(now, observation))
+            }
+        }
+    }
+
+    @Test
+    fun successfulProbeCancelsRepeatedSendErrorSuspicion() {
+        val fixture = timingFixture(active = true)
+        fixture.backend.failedProbeSendSlots += 0
+        for (now in 0L..4_000L step 1_000L) fixture.observe(now, healthy = false)
+        fixture.backend.failedProbeSendSlots.clear()
+        for (now in 5_000L..10_000L step 1_000L) {
+            val observation = fixture.observe(now, healthy = true)
+            assertFalse(observation.independentFailureSignal)
+            assertFalse(RedundantHealthMonitor().failed(now, observation))
+        }
+    }
+
+    @Test
     fun silentActiveLossReachesFailoverWithinEightSecondsAcrossProbePhases() {
         for (failureAt in listOf(30_000L, 31_000L, 32_000L)) {
             val fixture = timingFixture(active = true)
@@ -717,7 +856,7 @@ class RedundantProductionAdaptersTest {
     fun persistentLocalSendErrorsFailOverAfterFreshReserveProofForEitherActiveSlot() {
         for (primary in 0..1) {
             val fixture = pairFixture(primary)
-            fixture.backend.sendErrorSlots += primary
+            fixture.backend.failedProbeSendSlots += primary
             var switchedAt: Long? = null
             for (now in 30_000L..38_000L step 1_000L) {
                 val decision = fixture.tick(now) { slot, _ -> slot != primary }
@@ -736,9 +875,9 @@ class RedundantProductionAdaptersTest {
     fun oneOldSendErrorDoesNotConfirmContinuingDnsFailure() {
         val fixture = timingFixture(active = true)
         fixture.backend.countProbeSend = false
-        fixture.backend.sendErrorSlots += 0
+        fixture.backend.failedProbeSendSlots += 0
         fixture.observe(0, healthy = false)
-        fixture.backend.sendErrorSlots.clear()
+        fixture.backend.failedProbeSendSlots.clear()
         fixture.observe(2_000, healthy = false)
         for (now in 4_000L..12_000L step 2_000L) {
             val observation = fixture.observe(now, healthy = false)
@@ -750,7 +889,7 @@ class RedundantProductionAdaptersTest {
     @Test
     fun decryptedProgressClearsSendErrorSuspicion() {
         val fixture = timingFixture(active = true)
-        fixture.backend.sendErrorSlots += 0
+        fixture.backend.failedProbeSendSlots += 0
         fixture.observe(0, healthy = false)
         assertTrue(fixture.observe(2_000, healthy = false).independentFailureSignal)
         fixture.backend.decryptedReceivePackets = 1
@@ -1190,7 +1329,7 @@ class RedundantProductionAdaptersTest {
         assertTrue(native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
         assertTrue(native.activate("lease-b"))
         backend.metricsOverride = {
-            """{"dispatcher":{"OutboundBytes":14,"InboundBytes":22,"ProbePacketsInjected":9000},"slots":[{"slot":0,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":500,"udp_receive_packets":400}},{"slot":1,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":700,"udp_receive_packets":600}}]}"""
+            """{"dispatcher":{"OutboundBytes":14,"InboundBytes":22,"ProbePacketsInjected":9000},"slots":[{"slot":0,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_errors":0,"udp_send_packets":500,"udp_receive_packets":400}},{"slot":1,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_errors":0,"udp_send_packets":700,"udp_receive_packets":600}}]}"""
         }
 
         val metrics = requireNotNull(native.metrics(includeProbeTarget = true))
@@ -1297,7 +1436,7 @@ class RedundantProductionAdaptersTest {
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         backend.metricsOverride = {
-            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":0,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
+            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":0,"udp_send_errors":0,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
         }
 
         val observation = native.healthObservations().single()
@@ -1471,7 +1610,7 @@ class RedundantProductionAdaptersTest {
                     val tx = if (healthy) 1 + now / 1000 else 3 * (1 + now / 5000)
                     val rx = if (healthy) minOf(now, receiveFrozenAtMs ?: now) / 1000 else 0
                     val handshake = if (healthy) 1_800_000_000_000L else 0L
-                    """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
+                    """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_errors":0,"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
                 }
             }
             val probe = BackgroundRedundantHealthProbe("dns_a", "77.88.8.8", "nelomai.ru", 4000)
@@ -1654,8 +1793,8 @@ internal class RecordingSessionBackend(
     var probeClock: () -> Long = { 0L }
     var useSlotCounters = false
     private val slotSendPackets = mutableMapOf<Int, Long>()
-    val sendErrorSlots = mutableSetOf<Int>()
-    private val slotSendErrors = mutableMapOf<Int, Long>()
+    val sendErrorsBySlot = mutableMapOf<Int, Long>()
+    val failedProbeSendSlots = mutableSetOf<Int>()
     val rebindFailures = mutableSetOf<Int>()
     val reboundSlots = mutableListOf<Int>()
     var latestProbeToken: Long? = null
@@ -1706,8 +1845,8 @@ internal class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
-        if (slot in sendErrorSlots) {
-            slotSendErrors[slot] = (slotSendErrors[slot] ?: 0L) + 1L
+        if (slot in failedProbeSendSlots) {
+            sendErrorsBySlot[slot] = (sendErrorsBySlot[slot] ?: 0L) + 1L
         } else if (countProbeSend) {
             udpSendPackets += 1
             slotSendPackets[slot] = (slotSendPackets[slot] ?: 0L) + 1L
@@ -1733,7 +1872,7 @@ internal class RecordingSessionBackend(
             postfix = "]}",
         ) { slot ->
             val sent = if (useSlotCounters) slotSendPackets[slot] ?: 0L else udpSendPackets
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_send_errors":${slotSendErrors[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_send_errors":${sendErrorsBySlot[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 

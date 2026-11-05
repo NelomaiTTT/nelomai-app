@@ -326,6 +326,7 @@
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
         void protection.refresh();
+        wakeStartup();
         void nativeClient.wakeConnectionIntent();
         void synchronizeRuntimeState();
         void refreshProbes();
@@ -338,9 +339,11 @@
     };
     document.addEventListener("visibilitychange", handleVisibility);
     const handleOnline = () => {
+      wakeStartup();
       void nativeClient.wakeConnectionIntent();
     };
     window.addEventListener("online", handleOnline);
+    window.addEventListener("nelomai-network-restored", wakeStartup);
     const handleHistoryChange = () => {
       const overlay = bootstrap
         ? overlayFromHistoryState(window.history.state)
@@ -361,6 +364,7 @@
       if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("online", handleOnline);
+      window.removeEventListener("nelomai-network-restored", wakeStartup);
       window.removeEventListener("popstate", handleHistoryChange);
       clearUpdateTimer();
       nativeStateUnlisten?.();
@@ -636,8 +640,20 @@
     }
   }
 
+  function isAndroidRuntime() {
+    return bootstrap?.device.platform === "android" ||
+      (!bootstrap && typeof navigator !== "undefined" && /Android/i.test(navigator.userAgent));
+  }
+
+  function wakeStartup() {
+    if (runtimeChannelClosed || !isAndroidRuntime() || document.visibilityState !== "visible" ||
+      runtimeSelectionBusy || localStopPendingCleanup || connectionActionState.cancelBusy ||
+      view !== "unavailable" || phase !== "server_unavailable") return;
+    if (startupRetry.wake() && !busy) retryPendingStartup("temporarily_unavailable");
+  }
+
   async function restore(automaticRetry = false) {
-    if (runtimeChannelClosed || runtimeSelectionBusy) return;
+    if (runtimeChannelClosed || runtimeSelectionBusy || (automaticRetry && busy)) return;
     const actionEpoch = connectionActionState.epoch;
     let expectedBootstrap = bootstrap;
     startupRetry.cancel(!automaticRetry);
@@ -1146,6 +1162,7 @@
   function retryPendingStartup(code: string | null = "runtime_startup_pending") {
     if (runtimeChannelClosed || runtimeSelectionBusy || view !== "unavailable" ||
       (!startupPending && code !== "temporarily_unavailable")) return;
+    if (isAndroidRuntime() && (localStopPendingCleanup || connectionActionState.cancelBusy)) return;
     if (busy) {
       // New foreground work takes priority over a temporary network retry.
       if (code !== "temporarily_unavailable") {

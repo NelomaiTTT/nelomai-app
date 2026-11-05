@@ -11,9 +11,16 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 import java.net.URL
-import java.security.Principal
-import java.security.cert.Certificate
-import javax.net.ssl.HttpsURLConnection
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody
+import okhttp3.Protocol
+import okio.Timeout
+import okio.sink
+import okio.source
+import okio.buffer
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
@@ -170,7 +177,7 @@ class SupportDiagnosticsTest {
     @Test fun uploadUsesFixedHttpsHeaderOnlyAndRetriesExactFrozenPayload() = roots { files, backup ->
         val report = SupportDiagnosticCollector(files, backup, null).collect(uploadCode)
         val requests = mutableListOf<Connection>()
-        val uploader = SupportDiagnosticUploader { url -> Connection(url, 200,
+        val uploader = SupportDiagnosticUploader { outgoing -> Connection(outgoing, 200,
             """{"report_id":"${report.reportId}","request_id":"request-1","received_bytes":123}""").also { requests += it } }
         repeat(2) { assertTrue(uploader.upload(report, uploadCode) is SupportUploadResult.Success) }
         assertEquals(2, requests.size)
@@ -180,9 +187,7 @@ class SupportDiagnosticsTest {
             assertEquals("application/json", request.getRequestProperty("Content-Type"))
             assertEquals(uploadCode, request.getRequestProperty("X-Nelomai-Diagnostics-Code"))
             assertNull(request.getRequestProperty("Authorization"))
-            assertFalse(request.instanceFollowRedirects)
-            assertTrue(request.connectTimeout in 1..10_000)
-            assertTrue(request.readTimeout in 1..15_000)
+            assertTrue(request.timeout().timeoutNanos() in 1..java.util.concurrent.TimeUnit.SECONDS.toNanos(30))
             assertEquals(report.payload, request.sent.toString("UTF-8"))
             assertFalse(request.sent.toString("UTF-8").contains(uploadCode))
             assertTrue(request.closed)
@@ -193,7 +198,7 @@ class SupportDiagnosticsTest {
         log(files, "diagnostics/application.jsonl", "password=never-upload\nlogin_failed\n")
         val report = SupportDiagnosticCollector(files, backup, null).collect("")
         val requests = mutableListOf<Connection>()
-        val uploader = SupportDiagnosticUploader { url -> Connection(url, 200,
+        val uploader = SupportDiagnosticUploader { outgoing -> Connection(outgoing, 200,
             """{"report_id":"${report.reportId}","request_id":"anonymous-request","received_bytes":123}""").also { requests += it } }
         repeat(2) { assertTrue(uploader.upload(report, "") is SupportUploadResult.Success) }
         assertEquals(2, requests.size)
@@ -202,7 +207,6 @@ class SupportDiagnosticsTest {
             assertNull(request.getRequestProperty("X-Nelomai-Diagnostics-Code"))
             assertNull(request.getRequestProperty("Authorization"))
             assertEquals("", request.getRequestProperty("Cookie"))
-            assertFalse(request.instanceFollowRedirects)
             assertEquals(report.payload, request.sent.toString("UTF-8"))
             assertFalse(request.sent.toString("UTF-8").contains("never-upload"))
         }
@@ -211,11 +215,11 @@ class SupportDiagnosticsTest {
     @Test fun redirectIsFailureAndApiErrorKeepsRetryAfterWithoutEchoingSecrets() = roots { files, backup ->
         val report = SupportDiagnosticCollector(files, backup, null).collect("")
         val redirect = Connection(URL("https://nelomai.ru"), 302, "")
-        assertTrue(SupportDiagnosticUploader { redirect }.upload(report, uploadCode) is SupportUploadResult.Failure)
+        assertTrue(SupportDiagnosticUploader { redirect.bind(it) }.upload(report, uploadCode) is SupportUploadResult.Failure)
         val limited = Connection(URL("https://nelomai.ru"), 429,
             """{"api_version":"1","request_id":"r","code":"diagnostics_code_exhausted","message":"$uploadCode"}""")
         limited.retryAfter = "120"
-        val result = SupportDiagnosticUploader { limited }.upload(report, uploadCode) as SupportUploadResult.Failure
+        val result = SupportDiagnosticUploader { limited.bind(it) }.upload(report, uploadCode) as SupportUploadResult.Failure
         assertEquals(429, result.status)
         assertEquals("diagnostics_code_exhausted", result.code)
         assertEquals(120L, result.retryAfterSeconds)
@@ -282,7 +286,7 @@ class SupportDiagnosticsTest {
                 }
             }
         }
-        val uploader = SupportDiagnosticUploader { request }
+        val uploader = SupportDiagnosticUploader { request.bind(it) }
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         try {
             val result = executor.submit<SupportUploadResult> { uploader.upload(SupportDiagnosticCollector(files, backup, null).collect(""), uploadCode) }
@@ -292,23 +296,171 @@ class SupportDiagnosticsTest {
         } finally { release.countDown(); executor.shutdownNow() }
     }
 
-    private open class Connection(url: URL, private val status: Int, body: String) : HttpsURLConnection(url) {
+    @Test fun tlsFailureUsesBackupUrlBeforeWritingTheReport() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect(uploadCode)
+        val requests = mutableListOf<Connection>()
+        val uploader = SupportDiagnosticUploader { outgoing ->
+            object : Connection(outgoing, 200, """{"report_id":"${report.reportId}","request_id":"r","received_bytes":123}""") {
+                override fun connect() { if (url.host == "nelomai.ru") throw javax.net.ssl.SSLHandshakeException("synthetic") }
+                override fun getOutputStream(): ByteArrayOutputStream {
+                    connect()
+                    return super.getOutputStream()
+                }
+            }.also { requests += it }
+        }
+        assertTrue(uploader.upload(report, uploadCode) is SupportUploadResult.Success)
+        assertEquals(listOf("nelomai.ru", "nelomai.top"), requests.map { it.url.host })
+        assertEquals(0, requests.first().sent.size())
+        assertTrue(requests.first().closed)
+        assertEquals(report.payload, requests.last().sent.toString("UTF-8"))
+        assertEquals(uploadCode, requests.last().getRequestProperty("X-Nelomai-Diagnostics-Code"))
+    }
+
+    @Test fun failureAfterSendingReportNeverRetriesOnBackup() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        for (error in listOf(java.io.EOFException("after body"), java.net.SocketTimeoutException("after body"))) {
+            val requests = mutableListOf<Connection>()
+            val uploader = SupportDiagnosticUploader { outgoing -> object : Connection(outgoing, 200, "") {
+                override fun getResponseCode(): Int = throw error
+            }.also { requests += it } }
+            assertTrue(uploader.upload(report, "") is SupportUploadResult.Failure)
+            assertEquals(1, requests.size)
+            assertEquals(report.payload, requests.single().sent.toString("UTF-8"))
+        }
+    }
+
+    @Test fun timeoutDuringReportWriteNeverRetriesOnBackup() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        val requests = mutableListOf<Connection>()
+        val uploader = SupportDiagnosticUploader { outgoing ->
+            object : Connection(outgoing, 200, "") {
+                override fun getOutputStream() = object : ByteArrayOutputStream() {
+                    override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                        sent.write(bytes, offset, minOf(1, length))
+                        throw java.net.SocketTimeoutException("partial body")
+                    }
+                }
+            }.also { requests += it }
+        }
+        assertTrue(uploader.upload(report, "") is SupportUploadResult.Failure)
+        assertEquals(1, requests.size)
+        assertEquals(1, requests.single().sent.size())
+    }
+
+    @Test fun cancellationDuringHandshakeNeverOpensBackup() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        var calls = 0
+        lateinit var uploader: SupportDiagnosticUploader
+        uploader = SupportDiagnosticUploader { outgoing ->
+            calls++
+            object : Connection(outgoing, 200, "") {
+                override fun connect() {
+                    uploader.cancel()
+                    throw javax.net.ssl.SSLHandshakeException("cancelled handshake")
+                }
+            }
+        }
+        val result = uploader.upload(report, "") as SupportUploadResult.Failure
+        assertEquals("upload_cancelled", result.code)
+        assertEquals(1, calls)
+    }
+
+    @Test fun connectTimeoutUsesBackupBeforeWritingTheReport() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect(uploadCode)
+        val requests = mutableListOf<Connection>()
+        val uploader = SupportDiagnosticUploader { outgoing ->
+            object : Connection(outgoing, 200, """{"report_id":"${report.reportId}","request_id":"r","received_bytes":123}""") {
+                override fun connect() {
+                    if (url.host == "nelomai.ru") throw java.net.SocketTimeoutException("connect timeout")
+                }
+            }.also { requests += it }
+        }
+        assertTrue(uploader.upload(report, uploadCode) is SupportUploadResult.Success)
+        assertEquals(listOf("nelomai.ru", "nelomai.top"), requests.map { it.url.host })
+        assertEquals(0, requests.first().sent.size())
+        assertTrue(requests.first().closed)
+        assertEquals(report.payload, requests.last().sent.toString("UTF-8"))
+        assertEquals(uploadCode, requests.last().getRequestProperty("X-Nelomai-Diagnostics-Code"))
+    }
+
+    @Test fun connectTimeoutOnAllRoutesStopsAfterDirectIpAttempt() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        val hosts = mutableListOf<String>()
+        val uploader = SupportDiagnosticUploader { outgoing ->
+            hosts += outgoing.url.host
+            object : Connection(outgoing, 200, "") {
+                override fun connect(): Unit = throw java.net.SocketTimeoutException("connect timeout")
+            }
+        }
+        assertTrue(uploader.upload(report, "") is SupportUploadResult.Failure)
+        assertEquals(listOf("nelomai.ru", "nelomai.top", "nelomai.top"), hosts)
+    }
+
+    @Test fun lateTlsFailureOnIpNeverReplaysTheReportWithAnotherIdentity() = roots { files, backup ->
+        val report = SupportDiagnosticCollector(files, backup, null).collect("")
+        val requests = mutableListOf<Connection>()
+        val uploader = SupportDiagnosticUploader { outgoing ->
+            val number = requests.size + 1
+            object : Connection(outgoing, 200, "") {
+                override fun connect() { if (number < 3) throw java.net.UnknownHostException("outage") }
+                override fun getOutputStream() = object : ByteArrayOutputStream() {
+                    override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                        sent.write(bytes, offset, minOf(1, length))
+                        throw javax.net.ssl.SSLHandshakeException("late failure after partial write")
+                    }
+                }
+            }.also { requests += it }
+        }
+        assertTrue(uploader.upload(report, "") is SupportUploadResult.Failure)
+        assertEquals(listOf("nelomai.ru", "nelomai.top", "nelomai.top"), requests.map { it.url.host })
+        assertEquals(1, requests.sumOf { it.sent.size() })
+    }
+
+    private open class Connection(private var outgoing: Request, private val status: Int, body: String) : Call {
+        constructor(url: URL, status: Int, body: String) : this(Request.Builder().url(url).build(), status, body)
+        val url: URL get() = outgoing.url.toUrl()
+        val requestMethod: String get() = outgoing.method
         val sent = ByteArrayOutputStream()
         var closed = false
         var retryAfter: String? = null
         private val response = body.toByteArray()
-        override fun getOutputStream() = sent
-        override fun getInputStream(): java.io.InputStream = ByteArrayInputStream(response)
-        override fun getErrorStream() = ByteArrayInputStream(response)
-        override fun getResponseCode() = status
-        override fun getHeaderField(name: String?) = if (name == "Retry-After") retryAfter else null
-        override fun disconnect() { closed = true }
-        override fun usingProxy() = false
-        override fun connect() {}
-        override fun getCipherSuite() = "TLS_TEST"
-        override fun getLocalCertificates(): Array<Certificate>? = null
-        override fun getServerCertificates(): Array<Certificate> = emptyArray()
-        override fun getPeerPrincipal(): Principal? = null
-        override fun getLocalPrincipal(): Principal? = null
+        private val limit = Timeout()
+        private var executed = false
+        @Volatile private var cancelled = false
+        fun bind(request: Request): Connection { outgoing = request; return this }
+        fun getRequestProperty(name: String): String? = outgoing.header(name)
+        open fun getOutputStream() = sent
+        open fun getInputStream(): java.io.InputStream = ByteArrayInputStream(response)
+        open fun getErrorStream(): java.io.InputStream = ByteArrayInputStream(response)
+        open fun getResponseCode() = status
+        open fun connect() {}
+        override fun request() = outgoing
+        override fun timeout() = limit
+        override fun isExecuted() = executed
+        override fun isCanceled() = cancelled
+        override fun cancel() { cancelled = true; closed = true }
+        override fun clone(): Call = error("unused async/clone call")
+        override fun enqueue(responseCallback: Callback): Unit = error("unused async/clone call")
+        override fun execute(): Response {
+            executed = true
+            try {
+                if (cancelled) throw java.io.IOException("cancelled")
+                connect()
+                val sink = getOutputStream().sink().buffer()
+                outgoing.body?.writeTo(sink)
+                sink.flush()
+                val code = getResponseCode()
+                val input = if (code == 200) getInputStream() else getErrorStream()
+                val responseBody = object : ResponseBody() {
+                    private val source = input.source().buffer()
+                    override fun contentType(): okhttp3.MediaType? = null
+                    override fun contentLength() = -1L
+                    override fun source() = source
+                    override fun close() { closed = true; super.close() }
+                }
+                return Response.Builder().request(outgoing).protocol(Protocol.HTTP_1_1).code(code).message("test")
+                    .apply { retryAfter?.let { header("Retry-After", it) } }.body(responseBody).build()
+            } catch (error: Exception) { closed = true; throw error }
+        }
     }
 }

@@ -97,7 +97,8 @@ class RuntimeLifecycleGeneratorTest(unittest.TestCase):
         self.app = self.root / "src-tauri/gen/android/app"
         self.app.mkdir(parents=True)
         self.generated = self.app / "src/main/java/ru/nelomai/client/generated"
-        for name in ("LatestRuntimeActivity", "RuntimeEntrypoint", "StartupDiagnostics"):
+        for name in ("LatestRuntimeActivity", "BootstrapNetworkMonitor",
+                     "RuntimeEntrypoint", "StartupDiagnostics"):
             self.write(f"src-tauri/gen/android/app/src/main/java/ru/nelomai/client/{name}.kt", "package ru.nelomai.client\n")
         self.write("src-tauri/gen/android/app/src/main/java/io/crates/keyring/Keyring.kt", "package io.crates.keyring\n")
         self.write("plugins/amneziawg-android-tunnel/build/generated/runtimeHostJava/org/amnezia/awg/GoBackend.java",

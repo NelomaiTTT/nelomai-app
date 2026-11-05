@@ -1047,7 +1047,7 @@ internal class RedundantConnectionCoordinator(
     /** Applies one bounded native health snapshot without exposing a member failure to legacy recovery. */
     fun onHealthObservations(observations: List<SlotObservation>): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
-        val transaction = status() ?: return@synchronized false
+        var transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
         }
@@ -1072,13 +1072,14 @@ internal class RedundantConnectionCoordinator(
             } == true
         ) {
             val recovered = transaction.copy(retry = transaction.retry.cancelAcquire())
-            val persisted = persist(recovered)
-            if (persisted) {
-                failoverActive = false
-                onDiagnosticEvent(RedundantDiagnosticEvent.RECOVERY)
-                publishReserveStateLocked(recovered, bounded)
-            }
-            return@synchronized persisted
+            if (!persist(recovered)) return@synchronized false
+            transaction = recovered
+            failoverActive = false
+            onDiagnosticEvent(RedundantDiagnosticEvent.RECOVERY)
+            publishReserveStateLocked(recovered, bounded)
+            // Use this same fresh snapshot for failover. A later tick may be
+            // beyond the bounded standby-check window. The replacement fence
+            // has now been durably removed, so activation is admitted below.
         }
         val decision = healthMonitor.evaluateHealth(elapsedNow(), bounded)
         val switchIndex = decision.switchTo

@@ -1020,13 +1020,24 @@ async fn owner_native_recovery_checks_real_runtime_admission_and_ignores_stale_e
             .await,
         Err(nelomai_client_core::CoreError::AccessExpired)
     ));
+    // Logout owns its completion independently of the native callback being
+    // cancelled. Nesting logout inside that cancellable future would drop the
+    // test's revocation itself at the durable cancellation notification.
+    let native_entered = Arc::new(Notify::new());
+    let entered = native_entered.clone();
+    let logout_broker = broker.clone();
+    let logout = tokio::spawn(async move {
+        entered.notified().await;
+        logout_broker.logout().await.unwrap();
+    });
     assert!(port
         .recover_background(|_| async {
-            broker.logout().await.unwrap();
-            Err(NativeAuthFailure::NotIssued)
+            native_entered.notify_one();
+            std::future::pending().await
         })
         .await
         .is_err());
+    logout.await.unwrap();
     assert_eq!(
         store.load().unwrap().unwrap().logout_state,
         LogoutState::LoggedOut
@@ -1801,40 +1812,50 @@ async fn same_server_device_not_login_spelling_controls_generation_monotonicity(
 
 #[tokio::test]
 async fn definitive_rejection_does_not_erase_earlier_unknown_login_outcome() {
-    for (status, code) in [(401, "invalid_credentials"), (409, "device_limit_reached")] {
-        let state = Arc::new(Panel::default());
-        state.fail_login.store(true, Ordering::SeqCst);
-        let (api, server) = panel(state.clone()).await;
-        let broker = AuthBroker::new(api, auth_store(), Arc::new(Stop::default())).unwrap();
-        broker.logout().await.unwrap();
-        assert!(broker
-            .login(
-                &login_request(),
-                &RuntimeTarget::from_identity(&identity(8))
-            )
-            .await
-            .is_err());
-        *state.login_rejection.lock().unwrap() = Some((status, code.into()));
-        assert!(broker
-            .login(
-                &login_request(),
-                &RuntimeTarget::from_identity(&identity(8))
-            )
-            .await
-            .is_err());
-        assert_eq!(
-            broker.auth_state().await.unwrap(),
-            BrokerAuthState::AuthenticationOutcomeUnknown
-        );
-        let mut other = login_request();
-        other.login = "other-account".into();
-        assert!(broker
-            .login(&other, &RuntimeTarget::from_identity(&identity(8)))
-            .await
-            .is_err());
-        assert_eq!(state.login_requests.lock().unwrap().len(), 2);
-        server.abort();
-    }
+    let state = Arc::new(Panel::default());
+    state.fail_login.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = AuthBroker::new(api, auth_store(), Arc::new(Stop::default())).unwrap();
+    broker.logout().await.unwrap();
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    *state.login_rejection.lock().unwrap() = Some((401, "invalid_credentials".into()));
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        broker.auth_state().await.unwrap(),
+        BrokerAuthState::AuthenticationOutcomeUnknown
+    );
+    *state.login_rejection.lock().unwrap() = Some((409, "device_limit_reached".into()));
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        broker.auth_state().await.unwrap(),
+        BrokerAuthState::AuthenticationOutcomeUnknown
+    );
+    let mut other = login_request();
+    other.login = "other-account".into();
+    assert!(broker
+        .login(&other, &RuntimeTarget::from_identity(&identity(8)))
+        .await
+        .is_err());
+    assert_eq!(state.login_requests.lock().unwrap().len(), 3);
+    server.abort();
 }
 
 #[tokio::test]

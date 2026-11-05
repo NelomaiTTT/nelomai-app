@@ -22,7 +22,7 @@ class StableSourceGenerationTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.output = self.root / "output"
         app_java = self.root / "src-tauri/gen/android/app/src/main/java"
-        for name in ("LatestRuntimeActivity.kt", "StartupDiagnostics.kt", "RuntimeEntrypoint.kt"):
+        for name in ("LatestRuntimeActivity.kt", "BootstrapNetworkMonitor.kt", "StartupDiagnostics.kt", "RuntimeEntrypoint.kt"):
             path = app_java / "ru/nelomai/client" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("package ru.nelomai.client\n")
@@ -81,6 +81,10 @@ class StableSourceGenerationTest(unittest.TestCase):
         self.assertIn("import ru.nelomai.client.RuntimeProcessSelection\n", self.generated)
         self.assertIn("!ru.nelomai.client.RuntimeProcessSelection.needsExit(selected)", self.generated)
         self.assertNotIn("ru.nelomai.runtime.stable.RuntimeProcessSelection", self.generated)
+
+    def test_bootstrap_network_observer_is_included_in_the_runtime_namespace(self):
+        observer = self.output / "java/ru/nelomai/runtime/stable/BootstrapNetworkMonitor.kt"
+        self.assertIn("package ru.nelomai.runtime.stable", observer.read_text())
 
 
 if __name__ == "__main__":

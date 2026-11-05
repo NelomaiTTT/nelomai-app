@@ -12,7 +12,7 @@ import { KillSwitchControls, confirmAndroidTransition } from "./kill-switch";
 // native boundary replaced by controlled responses.
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
-const names = ["restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "confirmProtectionTransition", "installUpdate"];
+const names = ["isAndroidRuntime", "restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "confirmProtectionTransition", "installUpdate"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
@@ -51,7 +51,7 @@ const response = { defaults: { layer: "tic", tic_connection_mode: "personal", ro
 
 function fixture(bootstrap: () => Promise<unknown>) {
   const context: Record<string, any> = {
-    protectionBusy: false, transitionConfirming: false, confirmAndroidTransition,
+    navigator: {userAgent: "Android"}, protectionBusy: false, transitionConfirming: false, confirmAndroidTransition,
     protection: new KillSwitchControls({
       killSwitchStatus: async () => null,
       setKillSwitchPreference: async () => { throw new Error("not used by this fixture"); },

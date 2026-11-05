@@ -122,7 +122,7 @@ jobs:
           -
             platform: "macos"
             architecture: "aarch64"
-            runner: "macos-14"
+            runner: "macos-15"
             rust_target: "aarch64-apple-darwin"
           -
             platform: "android"
@@ -251,7 +251,7 @@ jobs:
           -
             platform: "macos"
             architecture: "aarch64"
-            runner: "macos-14"
+            runner: "macos-15"
             rust_target: "aarch64-apple-darwin"
           -
             platform: "android"

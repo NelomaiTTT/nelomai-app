@@ -108,6 +108,8 @@ pub enum NativeAuthFailure {
     /// Exact native/server rejection before auth issuance; no native state is erased.
     NotIssued,
     AccessUnavailable,
+    /// Transport failure is retryable, without proving the auth outcome absent.
+    TemporarilyUnavailable,
     OutcomeUnknown,
 }
 
@@ -429,6 +431,7 @@ pub struct AuthBroker {
     stop: Arc<dyn LocalAuthStop>,
     state: Mutex<()>,
     issuance: Mutex<()>,
+    logout_started: tokio::sync::Notify,
     refresh_retry: std::sync::Mutex<Option<RefreshRetry>>,
     refresh_events: std::sync::Mutex<std::collections::VecDeque<RefreshDiagnosticV1>>,
     refresh_diagnostics_directory: Option<std::path::PathBuf>,
@@ -498,6 +501,7 @@ impl AuthBroker {
             stop,
             state: Mutex::new(()),
             issuance: Mutex::new(()),
+            logout_started: tokio::sync::Notify::new(),
             refresh_retry: std::sync::Mutex::new(None),
             refresh_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             refresh_diagnostics_directory: None,
@@ -2195,12 +2199,8 @@ impl AuthBroker {
                 let mut auth = self.load()?;
                 if Self::owns_ticket(&auth, &ticket) {
                     let known_not_issued = local_not_issued
-                        || matches!(&error,
-                        BrokerError::Api(ClientApiError::Api { status, code, .. })
-                            if matches!((status.as_u16(), code.as_str()),
-                                (401, "invalid_credentials") | (403, "app_access_unavailable")
-                                | (409, "device_limit_reached")
-                                | (429, "login_rate_limited") | (422, "invalid_request")));
+                        || matches!(&error, BrokerError::Api(error)
+                            if nelomai_client_api::LoginRejection::from_error(error).is_some());
                     let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
                     if known_not_issued && !ticket.prior_login_outcome_unknown {
                         meta.pending_request = None;
@@ -3083,6 +3083,7 @@ impl AuthBroker {
                     pending_push.pending_push_cleanup_epoch = Some(epoch);
                 }
                 self.store.save(&auth)?;
+                self.logout_started.notify_waiters();
                 self.stop.revoke_runtime();
                 revoke();
                 drop(_state);
@@ -3124,6 +3125,7 @@ impl AuthBroker {
                 if never_authenticated {
                     auth.logout_state = LogoutState::LoggedOut;
                     self.store.save(&auth)?;
+                    self.logout_started.notify_waiters();
                     self.stop.revoke_runtime();
                     revoke();
                     drop(_state);
@@ -3180,6 +3182,9 @@ impl AuthBroker {
                         });
                 self.store.save(&auth)?;
             }
+            // The protected epoch is already cancelled. Release native waiters
+            // from issuance too; late platform callbacks remain epoch-fenced.
+            self.logout_started.notify_waiters();
             self.stop.revoke_runtime();
             revoke();
             (
@@ -3433,6 +3438,8 @@ impl AuthBroker {
         tokio::time::timeout_at(deadline, async {
             let fence = self.capture_login_fence().await?;
             let _issuance = self.issuance.lock().await;
+            let cancelled = self.logout_started.notified();
+            tokio::pin!(cancelled);
             let request = {
                 let _state = self.state.lock().await;
                 Self::check_deadline(Some(deadline))?;
@@ -3448,6 +3455,9 @@ impl AuthBroker {
                 if !recover && Self::observed_state(&auth)? != BrokerAuthState::Active {
                     return Err(BrokerError::RecoveryRequired);
                 }
+                // Register under the same state lock as the durable logout
+                // fence, so cancellation cannot be lost before dispatch waits.
+                cancelled.as_mut().enable();
                 let ticket = self.begin_native_locked(&mut auth)?;
                 let provision_predecessor = if recover {
                     None
@@ -3464,7 +3474,11 @@ impl AuthBroker {
                 }
             };
             let ticket = request.ticket.clone();
-            let response = dispatch(request).await;
+            let response = tokio::select! {
+                biased;
+                _ = &mut cancelled => return Err(BrokerError::Cancelled),
+                response = dispatch(request) => response,
+            };
             Self::check_deadline(Some(deadline))?;
             match response {
                 Ok(Some(response)) if recover => {
@@ -3495,6 +3509,8 @@ impl AuthBroker {
                     }
                     if matches!(other, Err(NativeAuthFailure::AccessUnavailable)) {
                         Err(BrokerError::AccessUnavailable)
+                    } else if matches!(other, Err(NativeAuthFailure::TemporarilyUnavailable)) {
+                        Err(BrokerError::Timeout)
                     } else if !recover && matches!(other, Ok(None)) {
                         Self::snapshot(&auth)
                     } else {

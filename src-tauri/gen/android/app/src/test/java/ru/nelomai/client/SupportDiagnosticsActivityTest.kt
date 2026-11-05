@@ -12,6 +12,10 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
+import org.robolectric.annotation.RealObject
+import okhttp3.ResponseBody.Companion.toResponseBody
 import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
@@ -93,9 +97,10 @@ class SupportDiagnosticsActivityTest {
         assertNull(shadowOf(activity.application).nextStartedService)
     }
 
+    @Config(shadows = [ScreenHttpClientShadow::class], instrumentedPackages = ["okhttp3."])
     @Test fun emptyCodeUploadsOnlyOnClickAndManualRetryUsesTheFrozenSanitizedReport() {
-        val requests = java.util.concurrent.CopyOnWriteArrayList<ScreenConnection>()
-        ScreenHttps.response = { url -> ScreenConnection(url).also { requests += it } }
+        val requests = java.util.concurrent.CopyOnWriteArrayList<ScreenCall>()
+        ScreenHttpClientShadow.response = { request -> ScreenCall(request).also { requests += it } }
         val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
         val activity = controller.get()
         try {
@@ -118,7 +123,7 @@ class SupportDiagnosticsActivityTest {
             }
             assertNull(shadowOf(activity.application).nextStartedService)
             assertNull(shadowOf(activity).nextStartedActivity)
-        } finally { controller.pause().stop().destroy(); ScreenHttps.response = null }
+        } finally { controller.pause().stop().destroy(); ScreenHttpClientShadow.response = null }
     }
 
     @Test fun malformedSuppliedCodeDoesNotUploadOrStartAnAccountService() {
@@ -248,40 +253,50 @@ class SupportDiagnosticsActivityTest {
     }
 }
 
-/** Network boundary only: the real activity, collector and uploader execute.
- * This test worker cannot contact the public diagnostics endpoint. */
-private object ScreenHttps {
-    @Volatile var response: ((java.net.URL) -> javax.net.ssl.HttpsURLConnection)? = null
-    init {
-        java.net.URL.setURLStreamHandlerFactory { protocol ->
-            if (protocol != "https") null else object : java.net.URLStreamHandler() {
-                override fun openConnection(url: java.net.URL): java.net.URLConnection =
-                    error("test HTTPS requires an explicit fixture")
-                override fun openConnection(url: java.net.URL, proxy: java.net.Proxy): java.net.URLConnection {
-                    check(url.toString() == "https://nelomai.ru/api/client/v1/diagnostics/support")
-                    check(proxy == java.net.Proxy.NO_PROXY)
-                    return requireNotNull(response) { "test HTTPS fixture is inactive" }(url)
-                }
-            }
-        }
+/** Network boundary only: the real activity, collector, request body and uploader execute.
+ * Inactive fixtures reject every call before any public network access. */
+@Implements(value = okhttp3.OkHttpClient::class, isInAndroidSdk = false)
+class ScreenHttpClientShadow {
+    @RealObject private lateinit var client: okhttp3.OkHttpClient
+
+    @Implementation
+    fun newCall(request: okhttp3.Request): okhttp3.Call {
+        check(request.url.toString() == "https://nelomai.ru/api/client/v1/diagnostics/support")
+        check(request.method == "POST")
+        check(client.proxy == java.net.Proxy.NO_PROXY)
+        return requireNotNull(response) { "Activity test HTTP fixture is inactive" }(request)
+    }
+
+    companion object {
+        @Volatile var response: ((okhttp3.Request) -> okhttp3.Call)? = null
     }
 }
 
-private class ScreenConnection(url: java.net.URL) : javax.net.ssl.HttpsURLConnection(url) {
+private class ScreenCall(private val outgoing: okhttp3.Request) : okhttp3.Call {
     val sent = java.io.ByteArrayOutputStream()
-    override fun getOutputStream() = sent
-    override fun getResponseCode() = 200
-    override fun getInputStream(): java.io.InputStream {
+    private val limit = okio.Timeout()
+    private var executed = false
+    @Volatile private var cancelled = false
+    fun getRequestProperty(name: String): String? = outgoing.header(name)
+    override fun request() = outgoing
+    override fun timeout() = limit
+    override fun isExecuted() = executed
+    override fun isCanceled() = cancelled
+    override fun cancel() { cancelled = true }
+    override fun clone(): okhttp3.Call = error("unused clone")
+    override fun enqueue(responseCallback: okhttp3.Callback): Unit = error("unused async call")
+    override fun execute(): okhttp3.Response {
+        executed = true
+        check(!cancelled)
+        val buffer = okio.Buffer()
+        requireNotNull(outgoing.body).writeTo(buffer)
+        sent.write(buffer.readByteArray())
         val report = org.json.JSONObject(sent.toString("UTF-8"))
-        return java.io.ByteArrayInputStream(org.json.JSONObject()
+        val response = org.json.JSONObject()
             .put("report_id", report.getString("report_id"))
             .put("request_id", "screen-request")
-            .put("received_bytes", sent.size()).toString().toByteArray())
+            .put("received_bytes", sent.size())
+        return okhttp3.Response.Builder().request(outgoing).protocol(okhttp3.Protocol.HTTP_1_1)
+            .code(200).message("OK").body(response.toString().toResponseBody()).build()
     }
-    override fun connect() {}
-    override fun disconnect() {}
-    override fun usingProxy() = false
-    override fun getCipherSuite() = "test"
-    override fun getLocalCertificates(): Array<java.security.cert.Certificate>? = null
-    override fun getServerCertificates(): Array<java.security.cert.Certificate> = emptyArray()
 }

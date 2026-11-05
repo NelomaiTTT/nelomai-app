@@ -467,6 +467,21 @@ pub enum TunnelError {
     InvalidOptions { code: &'static str },
 }
 
+/// Stable native admission/IPC reasons only. Never log a free-form backend
+/// message: it may contain configuration, keys or endpoints.
+pub fn owned_policy_rejection_code(code: &str) -> Option<&str> {
+    match code {
+        "redundant_policy_busy"
+        | "tunnel_operation_in_progress"
+        | "redundant_policy_preflight_rejected"
+        | "invalid_tunnel_request"
+        | "tunnel_service_timeout"
+        | "android_service_dispatch_unavailable"
+        | "tunnel_backend_error" => Some(code),
+        _ => None,
+    }
+}
+
 #[async_trait]
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;

@@ -1,3 +1,8 @@
+mod panel_dns;
+pub use panel_dns::{
+    execute_panel_request, panel_backup_url, panel_http_client_builder, resolve_panel_addresses,
+};
+
 use futures_util::StreamExt;
 use nelomai_contracts::{
     Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
@@ -35,6 +40,7 @@ pub struct ReleaseHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseHistory {
     pub api_version: ApiVersion,
+    pub platform: Platform,
     pub entries: Vec<ReleaseHistoryEntry>,
 }
 
@@ -801,6 +807,44 @@ pub enum ClientApiError {
     },
 }
 
+/// Definitive password-login refusals: the panel issued no session for this
+/// attempt. Only these fixed codes may cross private auth IPC, never panel text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginRejection {
+    InvalidCredentials,
+    AppAccessUnavailable,
+    DeviceLimitReached,
+    LoginRateLimited,
+    InvalidRequest,
+}
+
+impl LoginRejection {
+    pub fn from_error(error: &ClientApiError) -> Option<Self> {
+        let ClientApiError::Api { status, code, .. } = error else {
+            return None;
+        };
+        match (status.as_u16(), code.as_str()) {
+            (401, "invalid_credentials") => Some(Self::InvalidCredentials),
+            (403, "app_access_unavailable") => Some(Self::AppAccessUnavailable),
+            (409, "device_limit_reached") => Some(Self::DeviceLimitReached),
+            (429, "login_rate_limited") => Some(Self::LoginRateLimited),
+            (422, "invalid_request") => Some(Self::InvalidRequest),
+            _ => None,
+        }
+    }
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::InvalidCredentials => "invalid_credentials",
+            Self::AppAccessUnavailable => "app_access_unavailable",
+            Self::DeviceLimitReached => "device_limit_reached",
+            Self::LoginRateLimited => "login_rate_limited",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
 impl ClientApiError {
     pub fn stable_code(&self) -> Option<&str> {
         match self {
@@ -854,7 +898,7 @@ impl ResettableHttpClient {
     }
 
     fn build() -> Result<HttpClient, ClientApiError> {
-        Ok(HttpClient::builder()
+        Ok(panel_http_client_builder()
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build()?)
@@ -925,13 +969,17 @@ impl ClientApi {
     }
 
     /// Public release metadata is independent of login, refresh and runtime admission.
-    pub async fn release_history(&self) -> Result<ReleaseHistory, ClientApiError> {
+    pub async fn release_history(
+        &self,
+        platform: Platform,
+    ) -> Result<ReleaseHistory, ClientApiError> {
         // Error descriptions are not displayed here; discard non-success bodies
         // instead of passing potentially huge HTML/JSON errors to api_error.
         let response = self
             .send_request(
                 self.http
                     .get(self.endpoint("releases/changelog")?)
+                    .query(&[("platform", platform)])
                     .timeout(Duration::from_secs(8)),
             )
             .await?
@@ -944,7 +992,8 @@ impl ClientApi {
         )
         .await?;
         let mut versions = HashSet::new();
-        if history.entries.len() > 50
+        if history.platform != platform
+            || history.entries.len() > 50
             || history.entries.iter().any(|entry| {
                 entry.version.trim().is_empty()
                     || entry.version.chars().count() > 64
@@ -1618,7 +1667,7 @@ impl ClientApi {
         endpoint: Url,
         resolved_ip: Option<IpAddr>,
     ) -> Result<RequestBuilder, ProbeFailureCode> {
-        let mut client = HttpClient::builder()
+        let mut client = panel_http_client_builder()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(3))
             .http1_only()
@@ -2047,7 +2096,7 @@ impl ClientApi {
                 }
             }
         }
-        Ok(self.http.client().execute(request).await?)
+        Ok(execute_panel_request(&self.http.client(), request, HTTP_REQUEST_TIMEOUT).await?)
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(

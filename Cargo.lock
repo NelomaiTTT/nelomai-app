@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-android-container"
-version = "0.3.8"
+version = "0.3.11"
 dependencies = [
  "async-trait",
  "axum",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-app"
-version = "0.3.8"
+version = "0.3.11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2879,6 +2879,7 @@ dependencies = [
  "futures-util",
  "nelomai-contracts",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -2993,6 +2994,7 @@ dependencies = [
  "nelomai-client-api",
  "nelomai-contracts",
  "reqwest 0.12.28",
+ "rustls",
  "semver",
  "serde",
  "serde_json",
@@ -3034,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-unix-service"
-version = "0.3.8"
+version = "0.3.11"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3056,7 +3058,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-windows-service"
-version = "0.3.8"
+version = "0.3.11"
 dependencies = [
  "async-trait",
  "ipnet",

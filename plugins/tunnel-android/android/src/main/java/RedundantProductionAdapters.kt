@@ -177,9 +177,10 @@ internal class ServiceRedundantConnectionNative(
         var consecutiveProbeSuccesses: Int = 0,
         var probeFailed: Boolean = false,
         var hardFailure: Boolean = false,
-        var previousTxAttempts: Long = 0,
+        var previousTxPackets: Long = 0,
         var previousRxPackets: Long = 0,
-        var probeBaselineTxAttempts: Long? = null,
+        var probeBaselineTxPackets: Long? = null,
+        var probeBaselineSendErrors: Long? = null,
         var probeBaselineRxPackets: Long? = null,
         var urgentStartedAtElapsedMs: Long? = null,
         var urgentDeadlineElapsedMs: Long? = null,
@@ -193,7 +194,8 @@ internal class ServiceRedundantConnectionNative(
         val admitted: Boolean,
         val closed: Boolean,
         val latestHandshakeUnixMs: Long,
-        val txAttempts: Long,
+        val txPackets: Long,
+        val sendErrors: Long,
         val rxPackets: Long,
     )
 
@@ -477,7 +479,8 @@ internal class ServiceRedundantConnectionNative(
                 runtime.lastProbeFinishedAtElapsedMs = Long.MIN_VALUE
                 runtime.lastCompletedProbeStartedAtMs = Long.MIN_VALUE
                 if (runtime.slot == activeSlot) clearStandbyCheckLocked()
-                runtime.probeBaselineTxAttempts = null
+                runtime.probeBaselineTxPackets = null
+                runtime.probeBaselineSendErrors = null
                 runtime.probeBaselineRxPackets = null
                 clearUrgentFailureLocked(runtime)
             }
@@ -533,7 +536,7 @@ internal class ServiceRedundantConnectionNative(
         val activeMetrics = active?.let { metricsBySlot.getValue(it.slot.index) }
         if (active != null && activeMetrics != null) {
             advanceProbeLocked(nativeSession, active, elapsedNow,
-                activeMetrics.txAttempts, activeMetrics.rxPackets)
+                activeMetrics.txPackets, activeMetrics.rxPackets, activeMetrics.sendErrors)
         }
         val activeHardFailure = active != null && activeMetrics != null &&
             (active.hardFailure || activeMetrics.closed || !activeMetrics.admitted)
@@ -571,15 +574,15 @@ internal class ServiceRedundantConnectionNative(
         slots.values.filter { it.slot != activeSlot }.forEach { runtime ->
             val metrics = metricsBySlot.getValue(runtime.slot.index)
             advanceProbeLocked(nativeSession, runtime, elapsedNow,
-                metrics.txAttempts, metrics.rxPackets,
+                metrics.txPackets, metrics.rxPackets, metrics.sendErrors,
                 holdCompletedStandby = activeConfirmed || initialColdFallback,
                 initialWarmup = initialWarmup)
         }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
             val nativeMetrics = requireNotNull(metricsBySlot[runtime.slot.index])
-            val txAttempts = nativeMetrics.txAttempts
+            val txPackets = nativeMetrics.txPackets
             val rxPackets = nativeMetrics.rxPackets
-            runtime.previousTxAttempts = txAttempts
+            runtime.previousTxPackets = txPackets
             runtime.previousRxPackets = rxPackets
             val handshakeFresh = handshakeFresh(nativeMetrics, epochNow)
             val admitted = nativeMetrics.admitted
@@ -645,13 +648,8 @@ internal class ServiceRedundantConnectionNative(
             val latestHandshake = value.exactNonNegativeLong("latest_handshake_at_unix_ms")
                 ?: return null
             val telemetry = value.optJSONObject("telemetry") ?: return null
-            val sentPackets = telemetry.exactNonNegativeLong("udp_send_packets") ?: return null
-            val sendErrors = if (telemetry.has("udp_send_errors")) {
-                telemetry.exactNonNegativeLong("udp_send_errors") ?: return null
-            } else 0L
-            // Failed socket writes are outbound attempts too. Use only growth
-            // within each probe window; historical errors cannot confirm a loss.
-            val txAttempts = saturatingAdd(sentPackets, sendErrors)
+            val txPackets = telemetry.exactNonNegativeLong("udp_send_packets") ?: return null
+            val sendErrors = telemetry.exactNonNegativeLong("udp_send_errors") ?: return null
             // Handshakes, keepalives and junk can arrive on a broken return path.
             // Only decrypted IP packets prove inbound data-plane progress.
             val rxPackets = telemetry.exactNonNegativeLong("tun_write_packets") ?: return null
@@ -659,7 +657,8 @@ internal class ServiceRedundantConnectionNative(
                 admitted = admitted,
                 closed = closed,
                 latestHandshakeUnixMs = latestHandshake,
-                txAttempts = txAttempts,
+                txPackets = txPackets,
+                sendErrors = sendErrors,
                 rxPackets = rxPackets,
             )
         }
@@ -704,8 +703,9 @@ internal class ServiceRedundantConnectionNative(
         nativeSession: NativeSession,
         runtime: SlotRuntime,
         elapsedNow: Long,
-        currentTxAttempts: Long,
+        currentTxPackets: Long,
         currentRxPackets: Long,
+        currentSendErrors: Long,
         holdCompletedStandby: Boolean = false,
         initialWarmup: Boolean = false,
     ) {
@@ -750,24 +750,27 @@ internal class ServiceRedundantConnectionNative(
                         runtime,
                         elapsedNow,
                         succeeded = false,
-                        currentTxAttempts = currentTxAttempts,
+                        currentTxPackets = currentTxPackets,
                         currentRxPackets = currentRxPackets,
+                        currentSendErrors = currentSendErrors,
                     )
                 }
                 NativeProbeStatus.SUCCEEDED -> finishProbe(
                     runtime,
                     elapsedNow,
                     succeeded = true,
-                    currentTxAttempts = currentTxAttempts,
+                    currentTxPackets = currentTxPackets,
                     currentRxPackets = currentRxPackets,
+                    currentSendErrors = currentSendErrors,
                 )
                 NativeProbeStatus.FAILED, NativeProbeStatus.UNKNOWN ->
                     finishProbe(
                         runtime,
                         elapsedNow,
                         succeeded = false,
-                        currentTxAttempts = currentTxAttempts,
+                        currentTxPackets = currentTxPackets,
                         currentRxPackets = currentRxPackets,
+                        currentSendErrors = currentSendErrors,
                     )
             }
             if (runtime.probeToken != null) return
@@ -794,7 +797,8 @@ internal class ServiceRedundantConnectionNative(
         } else if (intervalBase != Long.MIN_VALUE && elapsedNow >= intervalBase &&
             elapsedNow - intervalBase < interval) return
         val probe = runtime.probe ?: return
-        runtime.probeBaselineTxAttempts = currentTxAttempts
+        runtime.probeBaselineTxPackets = currentTxPackets
+        runtime.probeBaselineSendErrors = currentSendErrors
         runtime.probeBaselineRxPackets = currentRxPackets
         runtime.urgentProbe = urgent
         runtime.lastProbeAtElapsedMs = elapsedNow
@@ -811,8 +815,9 @@ internal class ServiceRedundantConnectionNative(
                 runtime,
                 elapsedNow,
                 succeeded = false,
-                currentTxAttempts = currentTxAttempts,
+                currentTxPackets = currentTxPackets,
                 currentRxPackets = currentRxPackets,
+                currentSendErrors = currentSendErrors,
             )
             return
         }
@@ -831,14 +836,19 @@ internal class ServiceRedundantConnectionNative(
         runtime: SlotRuntime,
         elapsedNow: Long,
         succeeded: Boolean,
-        currentTxAttempts: Long,
+        currentTxPackets: Long,
         currentRxPackets: Long,
+        currentSendErrors: Long,
     ) {
         val wasUrgent = runtime.urgentProbe
-        val baselineTx = runtime.probeBaselineTxAttempts
+        val baselineTx = runtime.probeBaselineTxPackets
+        val baselineErrors = runtime.probeBaselineSendErrors
         val baselineRx = runtime.probeBaselineRxPackets
-        val attemptedWithoutReceive = baselineTx != null && baselineRx != null &&
-            currentTxAttempts > baselineTx && currentRxPackets <= baselineRx
+        // Local send failures cannot advance the successful-packet counter.
+        // They corroborate this probe only when new and without inbound progress.
+        val sendAttemptWithoutReceive = baselineTx != null && baselineErrors != null &&
+            baselineRx != null && currentRxPackets <= baselineRx &&
+            (currentTxPackets > baselineTx || currentSendErrors > baselineErrors)
         runtime.probeToken = null
         runtime.probeDeadlineElapsedMs = null
         runtime.lastProbeFinishedAtElapsedMs = elapsedNow
@@ -853,13 +863,13 @@ internal class ServiceRedundantConnectionNative(
         if (succeeded) {
             clearUrgentFailureLocked(runtime)
         } else if (wasUrgent) {
-            if (attemptedWithoutReceive) {
+            if (sendAttemptWithoutReceive) {
                 runtime.urgentCorroboratedFailures =
                     (runtime.urgentCorroboratedFailures + 1).coerceAtMost(REQUIRED_URGENT_FAILURES)
             } else {
                 clearUrgentFailureLocked(runtime)
             }
-        } else if (attemptedWithoutReceive) {
+        } else if (sendAttemptWithoutReceive) {
             runtime.urgentStartedAtElapsedMs = elapsedNow
             runtime.urgentDeadlineElapsedMs = saturatingAdd(
                 elapsedNow,
@@ -879,7 +889,8 @@ internal class ServiceRedundantConnectionNative(
         runtime.probeToken = null
         runtime.probeDeadlineElapsedMs = null
         runtime.urgentProbe = false
-        runtime.probeBaselineTxAttempts = null
+        runtime.probeBaselineTxPackets = null
+        runtime.probeBaselineSendErrors = null
         runtime.probeBaselineRxPackets = null
     }
 
@@ -962,6 +973,7 @@ internal class ServiceRedundantConnectionPanel(
         AndroidRedundantTransaction,
         String,
     ) -> org.json.JSONObject = BackgroundConnectionClient::stopRedundant,
+    private val cleanupCredential: (String) -> BackgroundCredential = credential,
 ) : RedundantConnectionPanel {
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
         val transport = recoverTransport(
@@ -1021,7 +1033,8 @@ internal class ServiceRedundantConnectionPanel(
         val leaseId = transaction.localActiveLeaseId ?: transaction.slotALeaseId ?: transaction.slotBLeaseId
             ?: return RedundantStopOutcome.Pending
         return runCatching {
-            val auth = credential(transaction.template.deviceId)
+            val auth = cleanupCredential(transaction.template.deviceId)
+            require(auth.deviceId == transaction.template.deviceId)
             val reply = stopTransport(auth, transaction, leaseId)
             val accepted = reply.optJSONObject("stop_acceptance")
             if (accepted != null) {

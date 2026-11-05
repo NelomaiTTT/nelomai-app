@@ -64,6 +64,7 @@ async fn private_frame_roundtrip_and_debug_never_print_password() {
                 password: "private-password".into(),
                 device_name: "fixture".into(),
             },
+            supports_login_rejection: false,
         }),
     );
     assert!(!format!("{frame:?}").contains("private-password"));

@@ -36,6 +36,7 @@ pub fn decode_background_reply(
             | "background_owner_scope_mismatch"
             | "background_credential_unavailable" => NativeAuthFailure::NotIssued,
             "app_access_unavailable" => NativeAuthFailure::AccessUnavailable,
+            "background_transport_unavailable" => NativeAuthFailure::TemporarilyUnavailable,
             _ => NativeAuthFailure::OutcomeUnknown,
         }),
         _ => Err(NativeAuthFailure::OutcomeUnknown),
