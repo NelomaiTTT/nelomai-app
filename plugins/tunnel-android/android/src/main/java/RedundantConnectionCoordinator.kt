@@ -130,6 +130,7 @@ private data class PendingPrimaryReadiness(
     val freshStart: Boolean,
     val onReady: () -> Unit,
     val onFailed: () -> Unit,
+    val onUnavailable: () -> Unit,
     val onCancelled: () -> Unit,
 )
 
@@ -238,6 +239,8 @@ internal class RedundantConnectionCoordinator(
     private val mutationFence: RedundantOperationMutationFence = RedundantOperationMutationFence(),
     private val onAllSlotsStalled: () -> Unit = {},
     private val onRecoveryReadiness: (Boolean) -> Unit = {},
+    private val onPrimaryReady: () -> Boolean = { true },
+    private val onPathUsable: (Boolean) -> Unit = {},
     private val standbyExecutor: Executor = Executor { task ->
         Thread(task, "nelomai-standby-request").apply { isDaemon = true }.start()
     },
@@ -523,8 +526,8 @@ internal class RedundantConnectionCoordinator(
         if (recoveryStarted || pendingPrimaryReadiness != null) return@synchronized true
         if (primaryReadinessFailed) return@synchronized false
         if (recoveryRetryAtUnix?.let { currentUnixSeconds() < it } == true) return@synchronized false
-        // Retryable control-plane errors retain the exact session. Native readiness
-        // failure remains terminal; a durable switch has its own bounded retries.
+        // Retryable control-plane errors retain the exact session. Native setup
+        // failures remain terminal; unavailable paths use total-loss restart.
         val response = try {
             fetch(transaction)
         } catch (error: Throwable) {
@@ -655,6 +658,7 @@ internal class RedundantConnectionCoordinator(
                     drainPendingWork = true,
                     onReady = { onRecoveryReadiness(true) },
                     onFailed = { onRecoveryReadiness(false) },
+                    onUnavailable = { status()?.let(::emitTotalLossCommandLocked) },
                     onCancelled = {},
                 )
             } finally {
@@ -712,12 +716,14 @@ internal class RedundantConnectionCoordinator(
         onReady: () -> Unit,
         onFailed: () -> Unit,
         onCancelled: () -> Unit,
+        onUnavailable: () -> Unit = onFailed,
     ): Boolean {
         if (healthProbe == null) {
             return completePrimaryReadinessLocked(
                 transaction,
                 drainPendingWork,
                 onReady,
+                onFailed,
             )
         }
         // With live probes, publish readiness and release the owner gate first.
@@ -735,6 +741,7 @@ internal class RedundantConnectionCoordinator(
             freshStart = freshStart,
             onReady = onReady,
             onFailed = onFailed,
+            onUnavailable = onUnavailable,
             onCancelled = onCancelled,
         )
         publishReserveStateLocked(transaction, emptyList())
@@ -767,6 +774,7 @@ internal class RedundantConnectionCoordinator(
                 switched,
                 drainPendingWork = false,
                 pending.onReady,
+                pending.onFailed,
             )
         }
         if (transaction.localActiveLeaseId != pending.activeLeaseId) {
@@ -785,6 +793,7 @@ internal class RedundantConnectionCoordinator(
                 ready,
                 drainPendingWork = false,
                 pending.onReady,
+                pending.onFailed,
             )
         }
         // The primary must not depend on reserve HTTP work. Reuse the existing
@@ -895,13 +904,13 @@ internal class RedundantConnectionCoordinator(
         transaction: AndroidRedundantTransaction,
         observations: List<SlotObservation>,
     ): Boolean {
-        if (!transaction.standbyDesired) return failPrimaryReadinessLocked(pending)
+        if (!transaction.standbyDesired) return failPrimaryReadinessLocked(pending, unavailable = true)
         val standbyLeaseId = listOfNotNull(
             transaction.slotALeaseId,
             transaction.slotBLeaseId,
         ).firstOrNull { it != pending.activeLeaseId } ?: return if (
             transaction.retry.acquirePending && elapsedNow() < pending.deadlineElapsedMs
-        ) true else failPrimaryReadinessLocked(pending)
+        ) true else failPrimaryReadinessLocked(pending, unavailable = true)
         val standbyIndex = transaction.slotIndex(standbyLeaseId)
             ?: return failPrimaryReadinessLocked(pending)
         val standby = observations.singleOrNull { it.index == standbyIndex }
@@ -916,7 +925,7 @@ internal class RedundantConnectionCoordinator(
             ) {
                 return true
             }
-            return failPrimaryReadinessLocked(pending)
+            return failPrimaryReadinessLocked(pending, unavailable = true)
         }
         // Recovery may retain a scheduled repair even though the restarted
         // CURRENT standby has recovered. Do not cancel a staged candidate.
@@ -948,6 +957,7 @@ internal class RedundantConnectionCoordinator(
             switched,
             drainPendingWork = false,
             pending.onReady,
+            pending.onFailed,
         )
     }
 
@@ -961,7 +971,15 @@ internal class RedundantConnectionCoordinator(
         transaction: AndroidRedundantTransaction,
         drainPendingWork: Boolean,
         onReady: () -> Unit,
+        onFailed: () -> Unit,
     ): Boolean {
+        if (!mutationFence.runIfActive(transaction.startOperationId) { onPrimaryReady() }) {
+            recoveryStarted = false
+            primaryReadinessFailed = true
+            runCatching(native::stop)
+            onFailed()
+            return false
+        }
         recoveryStarted = true
         primaryReadinessFailed = false
         failoverActive = transaction.retry.acquirePending &&
@@ -971,7 +989,10 @@ internal class RedundantConnectionCoordinator(
         return !drainPendingWork || drainPendingWorkLocked()
     }
 
-    private fun failPrimaryReadinessLocked(pending: PendingPrimaryReadiness): Boolean {
+    private fun failPrimaryReadinessLocked(
+        pending: PendingPrimaryReadiness,
+        unavailable: Boolean = false,
+    ): Boolean {
         if (pendingPrimaryReadiness !== pending) return false
         pendingPrimaryReadiness = null
         recoveryStarted = false
@@ -979,7 +1000,10 @@ internal class RedundantConnectionCoordinator(
         standbyWorkEpoch++
         runCatching(native::stop)
         publishReserveStateLocked(null, emptyList())
-        pending.onFailed()
+        // A recovered session whose paths are still unavailable must keep the
+        // durable intent. Reuse total-loss cleanup/replay; terminal validation,
+        // persistence and explicit cancellation retain their existing paths.
+        if (unavailable) pending.onUnavailable() else pending.onFailed()
         return false
     }
 
@@ -1040,6 +1064,7 @@ internal class RedundantConnectionCoordinator(
         val bounded = observations
             .filter { transaction.standbyDesired || it.index == activeIndex }
             .map { it.copy(active = it.index == activeIndex) }
+        onPathUsable(bounded.any { it.active && healthMonitor.primaryReady(elapsedNow(), it) })
         val replacingIndex = transaction.slotIndex(transaction.retry.acquireReplaceLeaseId)
         if (transaction.retry.acquirePending && transaction.candidateLeaseId == null &&
             replacingIndex != null && bounded.firstOrNull { it.index == replacingIndex }?.let {
@@ -1152,6 +1177,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun onUnderlyingNetworkChanged(available: Boolean): Boolean = synchronized(gate) {
+        onPathUsable(false)
         if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
@@ -1163,6 +1189,11 @@ internal class RedundantConnectionCoordinator(
                 true
             }
         ) return@synchronized false
+        // Recovery must see the returned network before starting probes/readiness.
+        if (available && recoveryRetryAtUnix != null && !primaryReadinessFailed) {
+            recoveryRetryAtUnix = currentUnixSeconds()
+            return@synchronized recover()
+        }
         val results = mutableListOf<Boolean>()
         val runningCandidate = transaction.candidateLeaseId?.takeIf { it == candidateWarmupLeaseId }
         val members = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)

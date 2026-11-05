@@ -4151,11 +4151,12 @@ async fn unchanged_settings_save_defers_pending_domain_without_cached_addresses(
         .await
         .unwrap());
     let reports = fixture.api.apply_results.lock().unwrap().len();
-    fixture
+    let error = fixture
         .core
         .save_split_tunnel_settings(&request, 1_100)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(error, CoreError::SplitTunnel(code) if code == "split_tunnel_apply_failed"));
     assert_eq!(
         fixture.tunnel.starts.load(Ordering::SeqCst),
         1,
@@ -4275,7 +4276,7 @@ async fn settings_save_defers_when_previous_domain_plan_cannot_be_reconstructed(
             "missing rollback routes must defer replacement, not use default options"
         );
         assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
-        assert_eq!(result.unwrap(), proposed);
+        assert!(matches!(result, Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_apply_failed"));
         assert_eq!(
             fixture.tunnel.options.lock().unwrap().last(),
             Some(&native_previous)
@@ -4931,7 +4932,7 @@ async fn failed_restoration_cannot_reuse_a_retired_owners_rollback_options() {
         fixture.api.set_policy(proposed.clone());
         fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
         let reports = fixture.api.apply_results.lock().unwrap().len();
-        fixture
+        let error = fixture
             .core
             .save_split_tunnel_settings(
                 &SplitTunnelSettingsUpdate {
@@ -4942,7 +4943,8 @@ async fn failed_restoration_cannot_reuse_a_retired_owners_rollback_options() {
                 1_100,
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(matches!(error, CoreError::SplitTunnel(code) if code == "split_tunnel_apply_failed"));
         assert_eq!(
             fixture.tunnel.starts.load(Ordering::SeqCst),
             1,
@@ -5293,7 +5295,7 @@ async fn settings_save_missing_new_domain_keeps_existing_rollback_cache() {
     proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
     proposed.address_rules[0].value = "new-domain-without-cache.invalid".into();
     fixture.api.set_policy(proposed.clone());
-    fixture
+    let error = fixture
         .core
         .save_split_tunnel_settings(
             &SplitTunnelSettingsUpdate {
@@ -5304,7 +5306,8 @@ async fn settings_save_missing_new_domain_keeps_existing_rollback_cache() {
             1_150,
         )
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(matches!(error, CoreError::SplitTunnel(code) if code == "split_tunnel_apply_failed"));
 
     assert_eq!(
         fixture.split_store.load().unwrap().domain_resolutions,
@@ -5326,6 +5329,58 @@ async fn settings_save_missing_new_domain_keeps_existing_rollback_cache() {
         fixture.split_store.load().unwrap().failed_policy_hash,
         Some(proposed.policy_hash)
     );
+}
+
+#[tokio::test]
+async fn settings_save_missing_rollback_plan_reports_failure_without_replacing_tun() {
+    let (fixture, running, previous) = unavailable_domain_recipe_with_repaired_cache().await;
+    let mut state = fixture.split_store.load().unwrap();
+    state.domain_resolutions.clear();
+    fixture.split_store.save(&state).unwrap();
+    let mut proposed = previous.clone();
+    proposed.policy_hash = format!("sha256:{}", "c".repeat(64));
+    proposed.address_rules.clear();
+    proposed.exclude_local_networks = false;
+    fixture.api.set_policy(proposed);
+
+    let error = fixture.core.save_split_tunnel_settings(&same_split_settings(), 1_150)
+        .await.unwrap_err();
+    assert!(matches!(error, CoreError::SplitTunnel(code) if code == "split_tunnel_apply_failed"));
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(fixture.split_store.load().unwrap().working_policy_hash, Some(previous.policy_hash));
+}
+
+#[tokio::test]
+async fn settings_save_empty_include_reports_failure_and_preserves_live_scope() {
+    for retained in [false, true] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture.core.synchronize_split_tunnel(900, false).await.unwrap();
+        let running = fixture.core.start(ConnectOptions::android_default(), 1_000).await.unwrap();
+        fixture.tunnel.retained_protection.store(retained, Ordering::SeqCst);
+        let previous = fixture.split_store.load().unwrap().working_policy_hash;
+        let old_options = fixture.tunnel.options.lock().unwrap().last().unwrap().clone();
+        let mut invalid = policy(SplitTunnelMode::IncludeSelected);
+        invalid.policy_hash = format!("sha256:{}", "e".repeat(64));
+        fixture.api.set_policy(invalid);
+        for now in [1_100, 1_101] {
+            let error = fixture.core.save_split_tunnel_settings(&SplitTunnelSettingsUpdate {
+                mode: SplitTunnelMode::IncludeSelected,
+                exclude_local_networks: true,
+                selected_packages: Vec::new(),
+            }, now).await.unwrap_err();
+            assert!(matches!(error, CoreError::SplitTunnel(code) if code == "split_tunnel_apply_failed"));
+            assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.tunnel.options.lock().unwrap().last(), Some(&old_options));
+            assert_eq!(fixture.core.state().await.connection.as_ref(), Some(&running));
+            assert_eq!(fixture.split_store.load().unwrap().working_policy_hash, previous);
+        }
+        fixture.api.set_policy(policy(SplitTunnelMode::ExcludeSelected));
+        fixture.core.save_split_tunnel_settings(&same_split_settings(), 1_200).await.unwrap();
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -6023,6 +6078,7 @@ struct CoordinatorTunnel {
     keep_running_on_stop_failure: AtomicBool,
     preserve_restart_intent: AtomicBool,
     independent_native_owner: AtomicBool,
+    retained_protection: AtomicBool,
     owned_session_scope: Mutex<Option<String>>,
     owned_policy_requests: Mutex<Vec<OwnedRedundantPolicyRequest>>,
     owned_policy_outcomes: Mutex<VecDeque<Result<OwnedRedundantPolicyOutcome, &'static str>>>,
@@ -6060,6 +6116,10 @@ impl CoordinatorTunnel {
 
 #[async_trait]
 impl TunnelController for CoordinatorTunnel {
+    async fn retains_protection(&self) -> Result<bool, TunnelError> {
+        Ok(self.retained_protection.load(Ordering::SeqCst))
+    }
+
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         if self.independent_native_owner.load(Ordering::SeqCst) {
             return Err(TunnelError::Backend("runtime_v2_owned".into()));
@@ -6457,4 +6517,160 @@ impl support::TestAuthApi for CoordinatorApi {
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
+}
+
+#[tokio::test]
+async fn retained_protection_policy_save_requires_a_real_apply() {
+    for has_connection in [false, true] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .set_split_tunnel_installed_packages(installed());
+        fixture
+            .core
+            .synchronize_split_tunnel(1_000, false)
+            .await
+            .unwrap();
+        if has_connection {
+            fixture
+                .core
+                .start(ConnectOptions::android_default(), 1_010)
+                .await
+                .unwrap();
+            *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+            let observation = fixture.core.begin_foreground_observation().await;
+            fixture
+                .core
+                .foreground_state(
+                    observation,
+                    Some(nelomai_client_core::NativeConnectionIntent {
+                        generation: 1,
+                        desired_active: true,
+                    }),
+                )
+                .await;
+            assert_ne!(fixture.core.state().await.phase, Phase::Connected);
+            assert!(fixture.core.state().await.connection.is_some());
+        }
+        fixture
+            .tunnel
+            .retained_protection
+            .store(true, Ordering::SeqCst);
+        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+        changed.revision = 8;
+        changed.policy_hash = format!("sha256:{}", "f".repeat(64));
+        changed.selected_packages = vec!["com.example.chat".into()];
+        fixture.api.set_policy(changed);
+        let result = fixture
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: SplitTunnelMode::ExcludeSelected,
+                    exclude_local_networks: true,
+                    selected_packages: vec![SplitTunnelSelectedPackage {
+                        package_id: "com.example.chat".into(),
+                        display_name: "Chat".into(),
+                    }],
+                },
+                1_100,
+            )
+            .await;
+        if has_connection {
+            result.unwrap();
+            assert_eq!(
+                fixture.tunnel.starts.load(Ordering::SeqCst),
+                2,
+                "retained TUN must actually receive the new policy"
+            );
+            assert!(fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .package_ids
+                .contains(&"com.example.chat".into()));
+        } else {
+            assert!(
+                matches!(result, Err(CoreError::SplitTunnel(ref code)) if code == "split_tunnel_apply_busy")
+            );
+            assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 0);
+            let mut cached = fixture.split_store.load().unwrap();
+            cached.working_policy_hash = cached
+                .cached_policy
+                .as_ref()
+                .map(|policy| policy.policy_hash.clone());
+            fixture.split_store.save(&cached).unwrap();
+            let repeated = fixture
+                .core
+                .save_split_tunnel_settings(
+                    &SplitTunnelSettingsUpdate {
+                        mode: SplitTunnelMode::ExcludeSelected,
+                        exclude_local_networks: true,
+                        selected_packages: Vec::new(),
+                    },
+                    1_101,
+                )
+                .await;
+            assert!(
+                matches!(repeated, Err(CoreError::SplitTunnel(ref code)) if code == "split_tunnel_apply_busy")
+            );
+        }
+        assert!(fixture.tunnel.retained_protection.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn local_user_stop_keeps_legacy_cleanup_identity_through_foreground_poll() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    let connection = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    fixture.local.stop_local_for_user().await.unwrap();
+    assert_eq!(
+        fixture.api.stop_calls.load(Ordering::SeqCst),
+        0,
+        "local Stop cannot wait for panel cleanup"
+    );
+    assert_eq!(
+        fixture.core.state().await.connection,
+        Some(connection.clone())
+    );
+    let observation = fixture.core.begin_foreground_observation().await;
+    fixture
+        .core
+        .foreground_state(
+            observation,
+            Some(nelomai_client_core::NativeConnectionIntent {
+                generation: 1,
+                desired_active: false,
+            }),
+        )
+        .await;
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    assert!(fixture.core.stop().await.is_err());
+    assert!(fixture.api.stop_calls.load(Ordering::SeqCst) > 0);
+    let observation = fixture.core.begin_foreground_observation().await;
+    fixture
+        .core
+        .foreground_state(
+            observation,
+            Some(nelomai_client_core::NativeConnectionIntent {
+                generation: 1,
+                desired_active: false,
+            }),
+        )
+        .await;
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    fixture.core.stop().await.unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Ready);
 }

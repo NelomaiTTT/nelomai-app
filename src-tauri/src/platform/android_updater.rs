@@ -52,6 +52,10 @@ impl<R: Runtime> AndroidUpdateBackend<R> {
 }
 #[async_trait]
 impl<R: Runtime> UpdateBackend for AndroidUpdateBackend<R> {
+    fn requires_install_confirmation(&self) -> bool {
+        self.backend.requires_install_confirmation()
+    }
+
     async fn install(
         &self,
         access: &AccessSnapshot,

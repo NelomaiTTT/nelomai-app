@@ -29,6 +29,7 @@ internal data class PhysicalNetworkSnapshot(
     val vpn: Boolean,
     val addresses: List<PhysicalLinkAddress>,
     val linkFingerprint: String = "",
+    val captivePortal: Boolean = false,
 )
 
 internal data class PhysicalNetworkState(
@@ -36,6 +37,7 @@ internal data class PhysicalNetworkState(
     val networks: List<Network>,
     val validated: Boolean,
     val fingerprint: String,
+    val captivePortal: Boolean = false,
 ) {
     val available: Boolean get() = networks.isNotEmpty()
 }
@@ -109,7 +111,9 @@ internal class PhysicalNetworks(context: Context) {
             localRoutes = routes,
             networks = eligible.map { it.first },
             validated = validated,
-            fingerprint = stateFingerprint(networkIds, routes, validated),
+            fingerprint = stateFingerprint(networkIds, routes, validated) + ":portal=" +
+                eligible.any { it.second.captivePortal },
+            captivePortal = eligible.any { it.second.wifi && it.second.captivePortal },
         )
     }
 
@@ -226,6 +230,7 @@ internal class PhysicalNetworks(context: Context) {
             PhysicalNetworkSnapshot(
                 active = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
                 validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+                captivePortal = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL),
                 wifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
                 cellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
                 ethernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),

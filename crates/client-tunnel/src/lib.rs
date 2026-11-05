@@ -470,6 +470,14 @@ pub enum TunnelError {
 #[async_trait]
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
+    /// Associate a foreground Start with Core's existing unique operation ID.
+    async fn start_for_attempt(
+        &self,
+        request: TunnelStartRequest,
+        _operation_id: &str,
+    ) -> Result<(), TunnelError> {
+        self.start(request).await
+    }
     async fn stop(&self) -> Result<(), TunnelError>;
     /// Prepare a same-lease local restart, not a user cancellation. Android
     /// replaces the transport at Start so its durable intent stays armed.
@@ -484,6 +492,14 @@ pub trait TunnelController: Send + Sync {
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         self.stop().await
     }
+    /// Compensate a rejected Start without disarming protection that predates it.
+    /// Platforms without retained enforcement keep the existing scoped cleanup.
+    async fn stop_failed_start(&self, _operation_id: &str) -> Result<(), TunnelError> {
+        if !matches!(self.status().await, Ok(TunnelStatus::Stopped)) {
+            self.stop_if_unowned().await?;
+        }
+        Ok(())
+    }
     /// Rebind the client UDP socket without replacing the panel lease.
     ///
     /// Returns `true` when the active backend performed a rebind and `false`
@@ -492,6 +508,11 @@ pub trait TunnelController: Send + Sync {
         Ok(false)
     }
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
+    /// A retained interface still has an effective policy even after transport
+    /// loss. Saved preferences alone must never count as its successful apply.
+    async fn retains_protection(&self) -> Result<bool, TunnelError> {
+        Ok(false)
+    }
     /// A native owner manages the whole v2 session, including its configurations.
     /// UI bootstrap must not recover it through the legacy single-lease API.
     async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {

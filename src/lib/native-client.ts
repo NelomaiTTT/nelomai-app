@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import type { KillSwitchStatus } from "./kill-switch";
 import { splitTunnelWarningMessage } from "./split-tunnel";
 
 import type {
@@ -180,6 +181,10 @@ export function createNativeClient(
     startSavedStray: () =>
       invoke("app_start_saved_stray") as Promise<string>,
     stop: () => invoke("app_stop") as Promise<Connection | null>,
+    killSwitchStatus: () => invoke("app_kill_switch_status") as Promise<KillSwitchStatus | null>,
+    setKillSwitchPreference: (enabled: boolean, confirmed: boolean) => invoke("app_set_kill_switch_preference", { enabled, confirmed }) as Promise<KillSwitchStatus>,
+    stopProtection: () => invoke("app_stop_protection") as Promise<void>,
+    retryProtectedConnection: () => invoke("app_retry_protected_connection") as Promise<void>,
     wakeConnectionIntent: () => invoke("app_wake_connection_intent") as Promise<void>,
     pinStray: () => invoke("app_pin_stray") as Promise<Connection>,
     unpinStray: (leaseId: string) =>
@@ -366,7 +371,7 @@ export function commandMessage(
     case "update_required":
       return "Эта версия больше не может подключаться. Установите обновление, чтобы продолжить.";
     case "device_limit_reached":
-      return "Все пиры уже заняты другими устройствами. Освободите один из них в панели или используйте существующее устройство.";
+      return "Для нового устройства нет свободного пира. Создайте или освободите пир в панели.";
     case "connection_unavailable":
       return "Не удалось подобрать рабочий сервер. Подождите несколько секунд и нажмите «Старт» ещё раз — приложение попробует другой сервер.";
     case "ipv6_pool_unavailable":

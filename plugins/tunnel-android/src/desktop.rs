@@ -168,6 +168,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         self.stop_tunnel()
     }
 
+    pub async fn stop_failed_start_tunnel_async(
+        &self,
+        _operation_id: &str,
+    ) -> crate::Result<TunnelOperationResponse> {
+        self.stop_tunnel_async().await
+    }
+
     pub async fn stop_unowned_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
         self.stop_tunnel_async().await
     }

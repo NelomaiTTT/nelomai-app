@@ -217,6 +217,10 @@ pub(crate) fn run_product(
         .invoke_handler(tauri::generate_handler![
             commands::app_state,
             commands::app_preferences,
+            commands::app_kill_switch_status,
+            commands::app_set_kill_switch_preference,
+            commands::app_stop_protection,
+            commands::app_retry_protected_connection,
             commands::app_set_close_to_tray,
             commands::app_set_dns_provider,
             commands::app_set_tic_egress_mode,

@@ -2920,6 +2920,7 @@ dependencies = [
  "nelomai-client-updater",
  "nelomai-contracts",
  "nelomai-unix-service",
+ "semver",
  "serde",
  "serde_json",
  "sha2",

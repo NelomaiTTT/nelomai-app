@@ -216,6 +216,26 @@ impl RemoteOwner {
     pub fn revoke_peer(&self) {
         self.outbox.close();
     }
+    fn login_error(&self, error: BrokerError) -> PrivateError {
+        // Older V1 runtimes reject unknown enum discriminators. Only the
+        // verified Android 0.5+ target understands this fixed, non-secret code.
+        if self.profile.platform == nelomai_contracts::Platform::Android
+            && semver::Version::parse(&self.binding.target.runtime_version)
+                .is_ok_and(|version| version >= semver::Version::new(0, 5, 0))
+        {
+            if let BrokerError::Api(nelomai_client_api::ClientApiError::Api { status, code, .. }) = &error {
+                match (status.as_u16(), code.as_str()) {
+                    (409, "device_limit_reached") => return PrivateError::DeviceLimitReached,
+                    (401, "invalid_credentials") => return PrivateError::InvalidCredentials,
+                    (403, "app_access_unavailable") => return PrivateError::AppAccessUnavailable,
+                    (429, "login_rate_limited") => return PrivateError::LoginRateLimited,
+                    (422, "invalid_request") => return PrivateError::InvalidLoginRequest,
+                    _ => {},
+                }
+            }
+        }
+        broker_error(error)
+    }
     fn live(&self, deadline: Instant) -> Result<(), PrivateError> {
         if self.outbox.is_closed() {
             return Err(PrivateError::Closed);
@@ -718,7 +738,7 @@ impl RemoteOwner {
                         },
                     )
                     .await
-                    .map_err(broker_error)?;
+                    .map_err(|error| self.login_error(error))?;
                 self.commit_and_grant(broker, access, lease, Some(id), deadline)
                     .await?;
                 held.granted = true;
@@ -1041,7 +1061,7 @@ impl RemoteOwner {
 #[derive(Default)]
 struct CachedScopeStamp {
     value: Option<ScopeStamp>,
-    logout_generation: u64,
+    invalidation_generation: u64,
 }
 
 /// Local diagnostic stages, never added to the private wire protocol.
@@ -1372,7 +1392,7 @@ impl PrivateRuntimeAuthClient {
             .stamp
             .lock()
             .map_err(|_| PrivateError::Closed)?
-            .logout_generation;
+            .invalidation_generation;
         let mut lifetime = RequestLifetime {
             outbox: self.outbox.clone(),
             complete: false,
@@ -1429,7 +1449,7 @@ impl PrivateRuntimeAuthClient {
                         }
                         _ => false,
                     };
-                    if cache.logout_generation == cache_generation || live_access {
+                    if cache.invalidation_generation == cache_generation || live_access {
                         cache.value = Some(stamp.clone());
                     }
                 }
@@ -1438,8 +1458,8 @@ impl PrivateRuntimeAuthClient {
                         let mut cache = self.stamp.lock().map_err(|_| PrivateError::Closed)?;
                         // Fence replies already in flight, but preserve a newer
                         // login which completed before this logout response.
-                        cache.logout_generation = cache
-                            .logout_generation
+                        cache.invalidation_generation = cache
+                            .invalidation_generation
                             .checked_add(1)
                             .ok_or(PrivateError::Protocol)?;
                         if cache.value == logout_stamp {
@@ -1521,9 +1541,29 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
             .await
             .map_err(|error| self.login_error(PrivateLoginStage::State, error))?;
         match self
-            .request(AuthRequestV1::Login { stamp, request }, deadline)
+            .request(AuthRequestV1::Login { stamp: stamp.clone(), request }, deadline)
             .await
-            .map_err(|error| self.login_error(PrivateLoginStage::Request, error))?
+            .map_err(|error| {
+                // Even a definitive rejection advances the broker's auth epoch.
+                // Re-read its stamp on retry without discarding a newer scope.
+                if matches!(error, PrivateError::Service | PrivateError::DeviceLimitReached
+                    | PrivateError::InvalidCredentials | PrivateError::AppAccessUnavailable
+                    | PrivateError::LoginRateLimited | PrivateError::InvalidLoginRequest) {
+                    if let Ok(mut cache) = self.stamp.lock() {
+                        if cache.value == stamp {
+                            cache.value = None;
+                        }
+                        // A fresh State may already have replaced the attempted stamp.
+                        // Preserve it, but still fence older replies already in flight.
+                        if let Some(generation) = cache.invalidation_generation.checked_add(1) {
+                            cache.invalidation_generation = generation;
+                        } else {
+                            self.outbox.close_with_reason("scope_generation_exhausted");
+                        }
+                    }
+                }
+                self.login_error(PrivateLoginStage::Request, error)
+            })?
         {
             AuthResponseV1::Access { access, .. } => {
                 self.child

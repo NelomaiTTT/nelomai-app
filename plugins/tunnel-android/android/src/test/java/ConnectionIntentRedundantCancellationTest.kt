@@ -22,9 +22,75 @@ import ru.nelomai.runtime.v1.RuntimeVpnHostV1
 import java.util.concurrent.Executor
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34], manifest = Config.NONE)
+@Config(sdk = [34], manifest = Config.NONE, shadows = [RetentionDescriptor::class])
 @LooperMode(LooperMode.Mode.PAUSED)
 class ConnectionIntentRedundantCancellationTest {
+    @Test fun explicitCurrentStopReleasesArmedServiceTun() = withProtection { fixture, retention ->
+        fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT), 0, 1)
+        assertFalse(retention.hasTun())
+    }
+
+    @Test fun staleGenerationCannotReleaseArmedServiceTun() = withProtection { fixture, retention ->
+        fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT)
+            .putExtra(EXTRA_GENERATION, 0L), 0, 1)
+        assertTrue(retention.hasTun())
+    }
+
+    @Test fun generationCleanupPreservesAlreadyArmedServiceTun() = withProtection { fixture, retention ->
+        val generation = fixture.store.read().successEnvelope().intent.generation
+        fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT)
+            .putExtra(EXTRA_GENERATION, generation), 0, 1)
+        assertFalse(fixture.store.read().successEnvelope().intent.desiredActive)
+        assertTrue(retention.hasTun())
+    }
+
+    @Test fun scopedLegacyCleanupPreservesProtectionButExplicitStopReleasesIt() {
+        for (scoped in listOf(true, false)) withProtection(withRedundant = false) { fixture, retention ->
+            val jobs = ArrayDeque<Runnable>()
+            ReflectionHelpers.setField(fixture.service, "redundantWork", RedundantVpnWorkDispatcher(Executor(jobs::addLast)))
+            val receiver = RecordingResultReceiver()
+            fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STOP)
+                .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+                .putExtra(EXTRA_LEGACY_STOP_ONLY, scoped)
+                .putExtra(EXTRA_RESULT_RECEIVER, receiver), 0, 1)
+            jobs.removeFirst().run()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(SERVICE_RESULT_OK, receiver.resultCode)
+            assertEquals(scoped, retention.hasTun())
+        }
+    }
+
+    @Test fun explicitStopReportsUnconfirmedCloseAndCanRetry() = withProtection { fixture, retention ->
+        RetentionDescriptor.failClose = RetentionDescriptor.files.keys.first { it.fileDescriptor.valid() }
+        val first = RecordingResultReceiver()
+        fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT)
+            .putExtra(EXTRA_RESULT_RECEIVER, first), 0, 1)
+        assertEquals(SERVICE_RESULT_ERROR, first.resultCode)
+        assertEquals("tunnel_cleanup_failed", first.resultData?.getString(EXTRA_ERROR_CODE))
+        assertTrue(retention.hasTun())
+        RetentionDescriptor.failClose = null
+        val retry = RecordingResultReceiver()
+        fixture.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT)
+            .putExtra(EXTRA_RESULT_RECEIVER, retry), 0, 2)
+        assertEquals(SERVICE_RESULT_OK, retry.resultCode)
+        assertFalse(retention.hasTun())
+    }
+
+    private fun withProtection(withRedundant: Boolean = true, test: (ServiceFixture, ServiceTunRetention) -> Unit) {
+        RetentionDescriptor.reset()
+        val f = serviceFixture(withRedundant, retainTunDescriptor = true)
+        ReflectionHelpers.setField(f.service, "redundantWork", RedundantVpnWorkDispatcher(Executor {}))
+        val retention = ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention")
+        val owner = Any()
+        retention.establish(owner, RetentionDescriptor::create)!!.close()
+        assertTrue(retention.ready(owner))
+        try { test(f, retention) } finally {
+            RetentionDescriptor.failClose = null
+            retention.stop(permanent = true)
+            RetentionDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
     @Test
     fun scopedStopFromDestroyedServiceCannotDisarmRecovery() {
         assertLateScopedStopPreservesRecovery {
@@ -228,7 +294,7 @@ class ConnectionIntentRedundantCancellationTest {
         )
     }
 
-    private fun serviceFixture(withRedundant: Boolean = true): ServiceFixture {
+    private fun serviceFixture(withRedundant: Boolean = true, retainTunDescriptor: Boolean = false): ServiceFixture {
         val backend = CancellationRecoveryBackend()
         val store = AndroidRecoveryStore(backend, BootIdentityProvider { 7 })
         if (withRedundant) {
@@ -241,7 +307,7 @@ class ConnectionIntentRedundantCancellationTest {
         val service = NelomaiVpnService(object : RuntimeVpnHostV1 {
             override val service = host
             override fun builder(beforeEstablish: (VpnService.Builder) -> Unit) = host.Builder()
-        })
+        }, retainTunDescriptor)
         ReflectionHelpers.setField(service, "recoveryStore", store)
         ReflectionHelpers.setField(
             service,

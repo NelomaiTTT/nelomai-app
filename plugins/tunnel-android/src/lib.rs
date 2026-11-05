@@ -158,6 +158,7 @@ impl<R: Runtime> AndroidTunnelController<R> {
         &self,
         request: TunnelStartRequest,
         local_restart: bool,
+        operation_id: Option<&str>,
     ) -> std::result::Result<(), TunnelError> {
         request
             .options
@@ -166,6 +167,7 @@ impl<R: Runtime> AndroidTunnelController<R> {
                 code: error.stable_code(),
             })?;
         let mut plugin_request = StartTunnelRequest::new(request.configuration.as_bytes());
+        plugin_request.client_operation_id = operation_id.map(str::to_owned);
         if local_restart {
             plugin_request.start_source = "local_restart".into();
         }
@@ -245,7 +247,15 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
     }
 
     async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {
-        self.start_request(request, false)
+        self.start_request(request, false, None)
+    }
+
+    async fn start_for_attempt(
+        &self,
+        request: TunnelStartRequest,
+        operation_id: &str,
+    ) -> std::result::Result<(), TunnelError> {
+        self.start_request(request, false, Some(operation_id))
     }
 
     async fn stop_for_restart(&self) -> std::result::Result<(), TunnelError> {
@@ -258,7 +268,7 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         &self,
         request: TunnelStartRequest,
     ) -> std::result::Result<(), TunnelError> {
-        self.start_request(request, true)
+        self.start_request(request, true, None)
     }
 
     async fn stop(&self) -> std::result::Result<(), TunnelError> {
@@ -281,6 +291,16 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         require_state(response, "stopped")
     }
 
+    async fn stop_failed_start(&self, operation_id: &str) -> std::result::Result<(), TunnelError> {
+        let response = self
+            .app
+            .tunnel_android()
+            .stop_failed_start_tunnel_async(operation_id)
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, "stopped")
+    }
+
     async fn status(&self) -> std::result::Result<TunnelStatus, TunnelError> {
         let response = self
             .app
@@ -298,6 +318,20 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 "unknown Android tunnel state: {state}"
             ))),
         }
+    }
+
+    async fn retains_protection(&self) -> std::result::Result<bool, TunnelError> {
+        #[cfg(target_os = "android")]
+        {
+            let status = self.app.tunnel_android().kill_switch_status().await.map_err(to_tunnel_error)?;
+            match status.state {
+                KillSwitchState::Armed | KillSwitchState::Blocked => Ok(true),
+                KillSwitchState::Off => Ok(false),
+                _ => Err(TunnelError::Backend("protection_status_unavailable".into())),
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        { Ok(false) }
     }
 
     async fn owns_redundant_session(&self) -> std::result::Result<bool, TunnelError> {

@@ -65,6 +65,33 @@ class RuntimeAdmittedLifecycleTest {
         assertTrue(controller.get().isFinishing)
         controller.pause().stop().destroy()
     }
+
+    @Test @Config(sdk = [34])
+    fun contentInsetsKeepSystemBarsCutoutsAndKeyboardOutsideWebView() {
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        val content = controller.get().findViewById<android.view.View>(android.R.id.content)
+        fun dispatch(left: Int, top: Int, right: Int, bottom: Int, keyboard: Int = 0) {
+            val insets = androidx.core.view.WindowInsetsCompat.Builder()
+                .setInsets(androidx.core.view.WindowInsetsCompat.Type.systemBars(),
+                    androidx.core.graphics.Insets.of(0, top, 0, bottom))
+                .setInsets(androidx.core.view.WindowInsetsCompat.Type.displayCutout(),
+                    androidx.core.graphics.Insets.of(left, 0, right, 0))
+                .setInsets(androidx.core.view.WindowInsetsCompat.Type.ime(),
+                    androidx.core.graphics.Insets.of(0, 0, 0, keyboard))
+                .build()
+            androidx.core.view.ViewCompat.dispatchApplyWindowInsets(content, insets)
+            assertEquals(left, content.paddingLeft)
+            assertEquals(top, content.paddingTop)
+            assertEquals(right, content.paddingRight)
+            assertEquals(maxOf(bottom, keyboard), content.paddingBottom)
+        }
+        dispatch(0, 24, 0, 32)
+        dispatch(0, 24, 0, 32) // Reapplication must not accumulate padding.
+        dispatch(28, 0, 0, 24) // Landscape cutout.
+        dispatch(0, 24, 0, 32, 300)
+        dispatch(0, 24, 0, 32) // Keyboard closed.
+        controller.pause().stop().destroy()
+    }
 }
 
 // Replace only unavailable JNI boundaries; the generated Wry/Tauri methods run.

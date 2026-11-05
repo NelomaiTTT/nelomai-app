@@ -301,6 +301,7 @@ impl From<RedundantTunnelStart> for RedundantStartRequest {
 pub struct StartTunnelRequest {
     pub api_version: u16,
     pub start_source: String,
+    pub client_operation_id: Option<String>,
     pub configuration: Zeroizing<Vec<u8>>,
     pub options: TunnelOptions,
     pub cache_quick_action: bool,
@@ -356,6 +357,7 @@ impl StartTunnelRequest {
         Self {
             api_version: TUNNEL_API_VERSION,
             start_source: "ui".to_string(),
+            client_operation_id: None,
             configuration: Zeroizing::new(configuration.to_vec()),
             options: TunnelOptions::default(),
             cache_quick_action: false,
@@ -394,6 +396,8 @@ impl Serialize for StartTunnelRequest {
         struct WireRequest<'a> {
             api_version: u16,
             start_source: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            client_operation_id: Option<&'a str>,
             configuration: &'a [u8],
             options: &'a TunnelOptions,
             cache_quick_action: bool,
@@ -406,6 +410,7 @@ impl Serialize for StartTunnelRequest {
         WireRequest {
             api_version: self.api_version,
             start_source: &self.start_source,
+            client_operation_id: self.client_operation_id.as_deref(),
             configuration: self.configuration.as_slice(),
             options: &self.options,
             cache_quick_action: self.cache_quick_action,
@@ -604,12 +609,57 @@ impl fmt::Debug for BackgroundUiProvisionRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KillSwitchState {
+    Off,
+    Armed,
+    Blocked,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillSwitchStatusResponse {
+    pub vpn_active: Option<bool>,
+    pub supported: bool,
+    pub enabled: Option<bool>,
+    pub disclosed: bool,
+    pub state: KillSwitchState,
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    pub external_lockdown: Option<bool>,
+}
+impl KillSwitchStatusResponse {
+    pub fn unavailable() -> Self {
+        Self {
+            vpn_active: None,
+            supported: true,
+            enabled: None,
+            disclosed: false,
+            state: KillSwitchState::Unknown,
+            error: Some("protection_status_unavailable".into()),
+            cause: None,
+            external_lockdown: None,
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillSwitchPreferenceRequest {
+    pub enabled: bool,
+    pub confirmed: bool,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopTunnelRequest {
     pub api_version: u16,
     #[serde(default)]
     pub legacy_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_start_operation_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -659,6 +709,19 @@ pub struct QuickStateChangeAcknowledgeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn protection_ipc_failure_does_not_claim_disabled_or_stopped() {
+        let value = serde_json::to_value(KillSwitchStatusResponse::unavailable()).unwrap();
+        assert_eq!(value["state"], "unknown");
+        assert!(value["enabled"].is_null());
+        assert!(value["vpnActive"].is_null());
+        assert!(value["externalLockdown"].is_null());
+        let unexpected: KillSwitchStatusResponse = serde_json::from_value(serde_json::json!({
+            "supported": true, "enabled": true, "disclosed": true, "state": "future_state",
+        })).unwrap();
+        assert_eq!(unexpected.state, KillSwitchState::Unknown);
+    }
+
 
     #[test]
     fn scoped_cleanup_and_explicit_stop_keep_distinct_wire_semantics() {
@@ -666,6 +729,7 @@ mod tests {
             let value = serde_json::to_value(StopTunnelRequest {
                 api_version: TUNNEL_API_VERSION,
                 legacy_only,
+                failed_start_operation_id: None,
             })
             .unwrap();
             assert_eq!(value["legacyOnly"], legacy_only);
@@ -782,6 +846,25 @@ mod tests {
 
         assert_eq!(value["cacheQuickAction"], true);
         assert_eq!(value["quickActionValidUntilUnix"], 1_785_700_000_i64);
+    }
+
+    #[test]
+    fn failed_start_cleanup_preserves_attempt_scope() {
+        let mut start = StartTunnelRequest::new(b"test");
+        start.client_operation_id = Some("failed-attempt".into());
+        assert_eq!(serde_json::to_value(start).unwrap()["clientOperationId"], "failed-attempt");
+        let request = StopTunnelRequest {
+            api_version: TUNNEL_API_VERSION,
+            legacy_only: true,
+            failed_start_operation_id: Some("failed-attempt".into()),
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["legacyOnly"], true);
+        assert_eq!(value["failedStartOperationId"], "failed-attempt");
+        let old: StopTunnelRequest = serde_json::from_value(serde_json::json!({
+            "apiVersion": TUNNEL_API_VERSION, "legacyOnly": true
+        })).unwrap();
+        assert!(old.failed_start_operation_id.is_none());
     }
 
     #[test]

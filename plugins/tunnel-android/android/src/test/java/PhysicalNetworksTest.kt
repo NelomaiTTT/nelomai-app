@@ -159,6 +159,14 @@ class PhysicalNetworksTest {
         )
     }
 
+    @Test
+    fun captivePortalOnlyAppliesToSelectedPhysicalNetworks() {
+        val portal = "wifi" to physicalNetwork("192.168.10.2/24", wifi = true, validated = false).copy(captivePortal = true)
+        val internet = "cell" to physicalNetwork("100.64.1.2/24", cellular = true)
+        assertEquals(false, PhysicalNetworks.preferValidatedNetworks(listOf(portal, internet)).any { it.second.captivePortal })
+        assertEquals(true, PhysicalNetworks.preferValidatedNetworks(listOf(portal)).any { it.second.captivePortal })
+    }
+
     private fun physicalNetwork(
         vararg addresses: String,
         active: Boolean = true,

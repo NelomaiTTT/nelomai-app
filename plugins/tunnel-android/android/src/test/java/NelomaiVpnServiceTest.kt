@@ -8337,6 +8337,12 @@ private fun serviceWithoutAndroidRuntime(): NelomaiVpnService {
         isAccessible = true
     }
     val unsafe = unsafeField.get(null)
-    return unsafeClass.getMethod("allocateInstance", Class::class.java)
+    val service = unsafeClass.getMethod("allocateInstance", Class::class.java)
         .invoke(unsafe, NelomaiVpnService::class.java) as NelomaiVpnService
+    // This boundary fixture deliberately skips Android construction. Initialize
+    // the real ownership gate, just as the service constructor now does.
+    NelomaiVpnService::class.java.getDeclaredField("tunRetention").apply {
+        isAccessible = true
+    }.set(service, ServiceTunRetention(false))
+    return service
 }

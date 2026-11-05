@@ -2087,6 +2087,248 @@ async fn login_diagnostics_preserve_private_failure_before_core_conversion() {
     }
 }
 
+async fn rejecting_login_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    rejecting_login_panel_with(409, "device_limit_reached").await
+}
+
+async fn rejecting_login_panel_with(status: u16, code: &'static str) -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().fallback(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async move {
+            (axum::http::StatusCode::from_u16(status).unwrap(), axum::Json(serde_json::json!({
+                "code": code, "message": "untrusted server prose",
+                "request_id": "synthetic"
+            })))
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (api, calls, server)
+}
+
+#[tokio::test]
+async fn rejected_login_can_retry_without_stale_stamp_or_local_data_reset() {
+    let (api, calls, server) = rejecting_login_panel().await;
+    let fixture = Fixture::new(api, false);
+    for username in ["first-account", "corrected-account"] {
+        let result = fixture.client.login(RuntimeLogin {
+            login: username.into(), password: "synthetic".into(), device_name: "fixture".into(),
+        }).await;
+        assert!(matches!(result, Err(nelomai_client_core::CoreError::Api(_))), "{result:?}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "both attempts must reach the server");
+    assert_eq!(fixture.client.state().await.unwrap(), RuntimeAuthState::LoggedOut);
+    assert!(fixture.client.check_start_barrier().is_err());
+    assert!(!fixture.client.is_channel_closed());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_login_preserves_safe_rejections_without_breaking_older_private_peers() {
+    for (platform, version, structured) in [
+        (Platform::Android, "0.5.0", true),
+        (Platform::Android, "0.3.8", false),
+        (Platform::Macos, "0.4.0", false),
+    ] {
+        for (status, expected_code) in [(409, "device_limit_reached"), (401, "invalid_credentials"), (403, "app_access_unavailable"), (429, "login_rate_limited"), (422, "invalid_request")] {
+        let (api, _, server) = rejecting_login_panel_with(status, expected_code).await;
+        let fixture = Fixture::new(api.clone(), false);
+        let (parent_socket, child_socket) = private_socketpair().unwrap();
+        let parent = RemoteOwner::new(parent_socket, LaunchBinding::fixture(RuntimeTarget {
+            container_version: "0.5.0".into(), runtime_version: version.into(),
+            runtime_contract_version: 1, runtime_slot: RuntimeSlot::Latest,
+        }, "fixture-child"), RuntimeClientProfile {
+            platform, platform_version: None, architecture: "aarch64".into(),
+        }).unwrap();
+        let broker = Arc::new(AuthBroker::new(api, fixture.auth.clone(), parent.clone()).unwrap());
+        let _service = parent.serve(broker).unwrap();
+        let client = PrivateRuntimeAuthClient::new(child_socket, fixture.child.clone(), fixture.local.clone());
+        let result = client.login(RuntimeLogin {
+            login: "synthetic".into(), password: "synthetic".into(), device_name: "fixture".into(),
+        }).await;
+        if structured {
+            assert!(matches!(result, Err(nelomai_client_core::CoreError::Api(
+                nelomai_client_core::CoreApiError::Rejected { ref code, ref message, .. }
+            )) if code == expected_code && !message.contains("untrusted")), "{result:?}");
+        } else {
+            assert!(matches!(result, Err(nelomai_client_core::CoreError::Api(
+                nelomai_client_core::CoreApiError::Retryable
+            ))), "legacy peer must keep its existing Service discriminator: {result:?}");
+        }
+        assert!(!client.is_channel_closed());
+        server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn pre_login_state_reply_cannot_restore_stamp_after_server_rejection() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+    let (mut peer, socket) = private_socketpair().unwrap();
+    let client = Arc::new(PrivateRuntimeAuthClient::new(socket, fixture.child.clone(), fixture.local.clone()));
+    let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let c = client.clone();
+    let initial = tokio::spawn(async move { c.state().await });
+    let request = read_frame(&mut peer, deadline).await.unwrap();
+    write_frame(&mut peer, FrameV1::new(request.id, MessageV1::Response(AuthResponseV1::State {
+        stamp: stamp.clone(), state: RuntimeAuthState::LoggedOut,
+    })), deadline).await.unwrap();
+    initial.await.unwrap().unwrap();
+    let c = client.clone();
+    let delayed = tokio::spawn(async move { c.state().await });
+    let old_request = read_frame(&mut peer, deadline).await.unwrap();
+    let c = client.clone();
+    let login = tokio::spawn(async move { c.login(RuntimeLogin {
+        login: "synthetic".into(), password: "synthetic".into(), device_name: "fixture".into(),
+    }).await });
+    let request = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(request.message, MessageV1::Request(AuthRequestV1::Login { .. })));
+    write_frame(&mut peer, FrameV1::new(request.id, MessageV1::Response(AuthResponseV1::Error {
+        error: PrivateError::Service,
+    })), deadline).await.unwrap();
+    assert!(login.await.unwrap().is_err());
+    write_frame(&mut peer, FrameV1::new(old_request.id, MessageV1::Response(AuthResponseV1::State {
+        stamp, state: RuntimeAuthState::LoggedOut,
+    })), deadline).await.unwrap();
+    delayed.await.unwrap().unwrap();
+    let c = client.clone();
+    let retry = tokio::spawn(async move { c.login(RuntimeLogin {
+        login: "corrected".into(), password: "synthetic".into(), device_name: "fixture".into(),
+    }).await });
+    let request = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(request.message, MessageV1::Request(AuthRequestV1::State)),
+        "late pre-login state must not restore an obsolete stamp");
+    drop(peer);
+    assert!(retry.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn fresh_state_before_login_rejection_still_fences_older_state() {
+    for rejection in [
+        PrivateError::Service,
+        PrivateError::DeviceLimitReached,
+        PrivateError::InvalidCredentials,
+        PrivateError::AppAccessUnavailable,
+        PrivateError::LoginRateLimited,
+        PrivateError::InvalidLoginRequest,
+    ] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+        let (mut peer, socket) = private_socketpair().unwrap();
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            socket,
+            fixture.child.clone(),
+            fixture.local.clone(),
+        ));
+        let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let c = client.clone();
+        let initial = tokio::spawn(async move { c.state().await });
+        let request = read_frame(&mut peer, deadline).await.unwrap();
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: stamp.clone(),
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        initial.await.unwrap().unwrap();
+        let c = client.clone();
+        let delayed = tokio::spawn(async move { c.state().await });
+        let old_request = read_frame(&mut peer, deadline).await.unwrap();
+        let c = client.clone();
+        let login = tokio::spawn(async move {
+            c.login(RuntimeLogin {
+                login: "synthetic".into(),
+                password: "synthetic".into(),
+                device_name: "fixture".into(),
+            })
+            .await
+        });
+        let request = read_frame(&mut peer, deadline).await.unwrap();
+        assert!(matches!(
+            request.message,
+            MessageV1::Request(AuthRequestV1::Login { .. })
+        ));
+        // Auth epoch already advanced while HTTP was in flight. A concurrent
+        // observation can cache it before the login error continuation runs.
+        let mut fresh_json = serde_json::to_value(&stamp).unwrap();
+        fresh_json["epoch"] = serde_json::json!(fresh_json["epoch"].as_u64().unwrap() + 1);
+        let fresh_stamp: ScopeStamp = serde_json::from_value(fresh_json).unwrap();
+        let c = client.clone();
+        let fresh = tokio::spawn(async move { c.state().await });
+        let fresh_request = read_frame(&mut peer, deadline).await.unwrap();
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                fresh_request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: fresh_stamp.clone(),
+                    state: RuntimeAuthState::AuthenticationOutcomeUnknown,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        fresh.await.unwrap().unwrap();
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                request.id,
+                MessageV1::Response(AuthResponseV1::Error { error: rejection }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert!(login.await.unwrap().is_err());
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                old_request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp,
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+        delayed.await.unwrap().unwrap();
+        let c = client.clone();
+        let retry = tokio::spawn(async move {
+            c.login(RuntimeLogin {
+                login: "corrected".into(),
+                password: "synthetic".into(),
+                device_name: "fixture".into(),
+            })
+            .await
+        });
+        let request = read_frame(&mut peer, deadline).await.unwrap();
+        match request.message {
+            MessageV1::Request(AuthRequestV1::Login { stamp, .. }) => assert_eq!(
+                stamp,
+                Some(fresh_stamp),
+                "late State must not replace the newer stamp"
+            ),
+            other => panic!("retry must preserve the already observed fresh stamp: {other:?}"),
+        }
+        drop(peer);
+        assert!(retry.await.unwrap().is_err());
+    }
+}
+
 #[tokio::test]
 async fn migrated_credentials_without_confirmed_identity_still_require_recovery() {
     let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);

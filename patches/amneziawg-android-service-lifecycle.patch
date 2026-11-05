@@ -1,16 +1,178 @@
 diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 --- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-@@ -505,7 +505,7 @@ public final class GoBackend implements Backend {
+@@ -23,6 +23,7 @@
+ import org.amnezia.awg.crypto.KeyFormatException;
+ import org.amnezia.awg.util.NonNullForAll;
+ 
++import java.io.IOException;
+ import java.net.InetAddress;
+ import java.util.Collections;
+ import java.util.Set;
+@@ -51,17 +52,74 @@
+     @Nullable private Config currentConfig;
+     @Nullable private Tunnel currentTunnel;
+     private int currentTunnelHandle = -1;
++    // Retention is opt-in. The ordinary backend must not keep the TUN alive
++    // after native closes its descriptor (including an internal native failure).
++    private final boolean retainTunDescriptor;
++    private final Object tunDescriptorGate = new Object();
++    @Nullable private ParcelFileDescriptor currentTunDescriptor;
++    @Nullable private IOException tunCloseFailure;
++    private boolean tunReady;
+     @Nullable private Thread statusThread;
+     @Nullable private StatusCallback statusCallback;
+ 
++    /** Caller owns the copy. Null means retention was not requested or no TUN was admitted. */
++    @Nullable
++    public ParcelFileDescriptor duplicateTun() throws IOException {
++        synchronized (tunDescriptorGate) {
++            if (tunCloseFailure != null)
++                throw tunCloseFailure;
++            return tunReady && currentTunDescriptor != null ? currentTunDescriptor.dup() : null;
++        }
++    }
++
++    private void captureTun(final ParcelFileDescriptor tun) throws IOException {
++        if (!retainTunDescriptor)
++            return;
++        synchronized (tunDescriptorGate) {
++            if (tunCloseFailure != null)
++                throw tunCloseFailure;
++            if (currentTunDescriptor != null)
++                throw new IOException("TUN descriptor still owned");
++            currentTunDescriptor = tun.dup();
++            tunReady = false;
++        }
++    }
++
++    private void closeOwnedTun() throws IOException {
++        synchronized (tunDescriptorGate) {
++            tunReady = false;
++            if (currentTunDescriptor == null)
++                return;
++            try {
++                // Keep the owned wrapper on failure so Stop/destroy can retry.
++                // A no-op close alone is not confirmation that its fd was released.
++                final java.io.FileDescriptor descriptor = currentTunDescriptor.getFileDescriptor();
++                currentTunDescriptor.close();
++                if (descriptor.valid())
++                    throw new IOException("TUN descriptor release unconfirmed");
++                currentTunDescriptor = null;
++                tunCloseFailure = null;
++            } catch (final IOException failure) {
++                tunCloseFailure = failure;
++                throw failure;
++            }
++        }
++    }
++
+     /**
+      * Public constructor for GoBackend.
+      *
+      * @param context An Android {@link Context}
+      */
+     public GoBackend(final Context context) {
++        this(context, false);
++    }
++
++    /** Explicit owner request to prepare a retained TUN; does not itself arm protection. */
++    public GoBackend(final Context context, final boolean retainTunDescriptor) {
+         SharedLibraryLoader.loadSharedLibrary(context, "wg-go");
+         this.context = context;
++        this.retainTunDescriptor = retainTunDescriptor;
+     }
+ 
+     /**
+@@ -371,6 +429,14 @@
+ 
+         if (state == State.TOGGLE)
+             state = originalState == State.UP ? State.DOWN : State.UP;
++        synchronized (tunDescriptorGate) {
++            if (tunCloseFailure != null) {
++                if (state != State.DOWN)
++                    throw tunCloseFailure;
++                // DOWN must retry even when native is already closed and currentTunnel is null.
++                closeOwnedTun();
++            }
++        }
+         if (state == originalState && tunnel == currentTunnel && config == currentConfig)
+             return originalState;
+         if (state == State.UP) {
+@@ -486,25 +552,41 @@
+                 service.setUnderlyingNetworks(null);
+ 
+             builder.setBlocking(true);
+-            try (final ParcelFileDescriptor tun = builder.establish()) {
+-                if (tun == null)
+-                    throw new BackendException(Reason.TUN_CREATION_ERROR);
+-                Log.d(TAG, "Go backend " + awgVersion());
+-                currentTunnelHandle = awgTurnOn(tunnel.getName(), tun.detachFd(), goConfig);
+-            }
+-            if (currentTunnelHandle < 0)
+-                throw new BackendException(Reason.GO_ACTIVATION_ERROR_CODE, currentTunnelHandle);
+-
+             try {
++                try (final ParcelFileDescriptor tun = service.establishTun(builder, this)) {
++                    if (tun == null)
++                        throw new BackendException(Reason.TUN_CREATION_ERROR);
++                    // Capture before detachFd: a saved integer could already name
++                    // another descriptor when the VPN owner later enables retention.
++                    captureTun(tun);
++                    Log.d(TAG, "Go backend " + awgVersion());
++                    currentTunnelHandle = awgTurnOn(tunnel.getName(), tun.detachFd(), goConfig);
++                }
++                if (currentTunnelHandle < 0)
++                    throw new BackendException(Reason.GO_ACTIVATION_ERROR_CODE, currentTunnelHandle);
+                 protectAndAdmitSockets(service, currentTunnelHandle);
+-            } catch (final RuntimeException failure) {
++                currentTunnel = tunnel;
++                currentConfig = config;
++                synchronized (tunDescriptorGate) {
++                    tunReady = true;
++                }
++            } catch (final Exception | Error failure) {
+                 final int failedHandle = currentTunnelHandle;
+                 currentTunnelHandle = -1;
+-                awgTurnOff(failedHandle);
++                if (failedHandle >= 0) {
++                    try { awgTurnOff(failedHandle); }
++                    catch (final Throwable cleanupFailure) { failure.addSuppressed(cleanupFailure); }
++                }
++                try { closeOwnedTun(); }
++                catch (final IOException cleanupFailure) {
++                    if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
++                }
++                try { service.onTunnelStartFailed(this); }
++                catch (final Throwable cleanupFailure) {
++                    if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
++                }
+                 throw failure;
+             }
+-            currentTunnel = tunnel;
+-            currentConfig = config;
+ 
+             launchStatusJob();
+         } else {
+@@ -517,10 +599,14 @@
+             currentTunnel = null;
+             currentTunnelHandle = -1;
              currentConfig = null;
-             awgTurnOff(handleToClose);
+-            awgTurnOff(handleToClose);
++            synchronized (tunDescriptorGate) { tunReady = false; }
              try {
 -                vpnService.get(0, TimeUnit.NANOSECONDS).stopSelf();
-+                vpnService.get(0, TimeUnit.NANOSECONDS).onTunnelDown();
-             } catch (final TimeoutException ignored) { }
+-            } catch (final TimeoutException ignored) { }
++                try { awgTurnOff(handleToClose); }
++                finally { closeOwnedTun(); }
++            } finally {
++                try { vpnService.get(0, TimeUnit.NANOSECONDS).onTunnelDown(this); }
++                catch (final TimeoutException ignored) { }
++            }
          }
  
-@@ -554,6 +554,11 @@ public final class GoBackend implements Backend {
+         tunnel.onStateChange(state);
+@@ -569,6 +655,23 @@
      public static class VpnService extends android.net.VpnService {
          @Nullable private GoBackend owner;
  
@@ -19,6 +181,59 @@ diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunne
 +            stopSelf();
 +        }
 +
++        /** Establish through the embedded service so its descriptor outlives native close. */
++        @Nullable
++        public ParcelFileDescriptor establishTun(final android.net.VpnService.Builder builder, final GoBackend backend) throws IOException {
++            return builder.establish();
++        }
++
++        public void onTunnelDown(final GoBackend backend) throws IOException {
++            onTunnelDown();
++        }
++
++        public void onTunnelStartFailed(final GoBackend backend) throws IOException { }
++
          public Builder getBuilder() {
              return new Builder();
          }
+@@ -581,19 +684,27 @@
+ 
+         @Override
+         public void onDestroy() {
+-            if (owner != null) {
+-                final Tunnel tunnel = owner.currentTunnel;
+-                if (tunnel != null) {
+-                    if (owner.currentTunnelHandle != -1)
+-                        awgTurnOff(owner.currentTunnelHandle);
+-                    owner.currentTunnel = null;
+-                    owner.currentTunnelHandle = -1;
+-                    owner.currentConfig = null;
+-                    tunnel.onStateChange(State.DOWN);
+-                }
+-            }
+-            vpnService = vpnService.newIncompleteFuture();
+-            super.onDestroy();
++            try {
++                if (owner != null) {
++                    synchronized (owner.tunDescriptorGate) { owner.tunReady = false; }
++                    final Tunnel tunnel = owner.currentTunnel;
++                    if (tunnel != null) {
++                        if (owner.currentTunnelHandle != -1)
++                            awgTurnOff(owner.currentTunnelHandle);
++                        owner.currentTunnel = null;
++                        owner.currentTunnelHandle = -1;
++                        owner.currentConfig = null;
++                        tunnel.onStateChange(State.DOWN);
++                    }
++                }
++            } finally {
++                if (owner != null) {
++                    try { owner.closeOwnedTun(); }
++                    catch (final IOException failure) { Log.e(TAG, "TUN descriptor release unconfirmed", failure); }
++                }
++                vpnService = vpnService.newIncompleteFuture();
++                super.onDestroy();
++            }
+         }
+ 
+         @Override

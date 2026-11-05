@@ -116,6 +116,9 @@ class OwnedRedundantPolicyArgs {
 class CancelOwnedRedundantPolicyArgs { lateinit var operationId: String }
 
 @InvokeArg
+class KillSwitchPreferenceArgs { var enabled: Boolean? = null; var confirmed: Boolean = false }
+
+@InvokeArg
 class ReservePreferenceArgs { var enabled: Boolean? = null }
 
 @InvokeArg
@@ -277,6 +280,7 @@ class VersionedTunnelArgs {
 class StopTunnelArgs {
     var apiVersion: Int = 0
     var legacyOnly: Boolean = false
+    var failedStartOperationId: String? = null
 }
 
 @InvokeArg
@@ -845,6 +849,7 @@ internal object TunnelRuntime {
                 serviceReady.get(5, TimeUnit.SECONDS)
                 requireCurrentStart()
                 logStage("start.service_ready", serviceStartedAt)
+                NelomaiVpnService.legacyStartBeginning(args.clientOperationId)
                 if (replaceExisting) {
                     val replaceStartedAt = System.nanoTime()
                     activeSession?.let { logDataPlaneSnapshot(it, "tunnel_replaced") }
@@ -1169,7 +1174,9 @@ internal object TunnelRuntime {
             } catch (error: Throwable) {
                 args.clearSensitiveConfigurations()
                 quickPlan?.clearSensitiveConfigurations()
-                if (args.startSource == "local_restart") {
+                if (args.startSource == "local_restart" ||
+                    (error is TunnelOperationException && error.code == "tunnel_start_cancelled")
+                ) {
                     // A Stop may have invalidated the generation after native
                     // UP. Do not leave a rejected replacement physically open.
                     clearActiveSession()
@@ -1261,6 +1268,7 @@ internal object TunnelRuntime {
                     )
                     TunnelPlugin.refreshQuickTile(applicationContext)
                 },
+                failedStartOperationId = clientOperationId,
             )
         }
     }
@@ -1468,6 +1476,7 @@ internal object TunnelRuntime {
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
         keepForegroundService: Boolean = false,
+        failedStartOperationId: String? = null,
     ) {
         try {
             validateVersion(apiVersion)
@@ -1476,8 +1485,13 @@ internal object TunnelRuntime {
             return
         }
 
+        // Record the rejected attempt even if native Stop is busy. A later
+        // generic compensation retry must not keep its provisional protection.
+        failedStartOperationId?.let { NelomaiVpnService.legacyStartRejected(it) }
         when (stateGate.beginStop()) {
             TransitionDecision.ALREADY_COMPLETE -> {
+                try { NelomaiVpnService.legacyTransportStopped() }
+                catch (error: Throwable) { onError(errorCode(error)); return }
                 clearActiveSession()
                 applicationContext?.let { context ->
                     runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
@@ -1505,6 +1519,7 @@ internal object TunnelRuntime {
             val startedAt = System.nanoTime()
             TunnelLog.info("stop.begin")
             try {
+                failedStartOperationId?.let { NelomaiVpnService.legacyStartRejected(it) }
                 activeSession?.let { session ->
                     logDataPlaneSnapshot(session, "tunnel_stopping")
                     logNetworkTelemetrySnapshot(session, "tunnel_stopping")
@@ -1518,6 +1533,9 @@ internal object TunnelRuntime {
                 }
                 AndroidSplitTunnel.clear()
                 val resolved = if (state == Tunnel.State.DOWN) {
+                    // Native may already be DOWN after an earlier close failure.
+                    // Retry the service owner's cleanup before acknowledging Stop.
+                    NelomaiVpnService.legacyTransportStopped()
                     SessionState.STOPPED
                 } else {
                     SessionState.FAILED
@@ -1579,6 +1597,9 @@ internal object TunnelRuntime {
                     .mapNotNull { key -> statistics.peer(key)?.latestHandshakeEpochMillis() }
                     .filter { it > 0 }
                     .maxOrNull()
+                if (latestHandshakeEpochMillis != null) {
+                    NelomaiVpnService.legacyTransportReady(requireBackend(), latestHandshakeEpochMillis)
+                }
                 val target = if (probe) {
                     session.config.peers.firstOrNull()?.endpoint?.orElse(null)?.host
                 } else {
@@ -1742,7 +1763,7 @@ internal object TunnelRuntime {
         }.onFailure {
             TunnelLog.warning("backend.memory_limit_failed", error = it)
         }
-        return GoBackend(context.applicationContext)
+        return GoBackend(context.applicationContext, true)
     }
 
     private fun replaceBackend(context: Context): GoBackend = synchronized(this) {
@@ -1818,7 +1839,17 @@ internal object TunnelRuntime {
         return TunnelOperationWatchdog(token, future)
     }
 
+    fun scheduleLocalStopFallback(action: () -> Unit): ScheduledFuture<*> =
+        watchdogExecutor.schedule(Runnable(action), TUNNEL_OPERATION_WATCHDOG_MILLIS, TimeUnit.MILLISECONDS)
+
     private fun terminateHungTunnelProcess(context: Context, operation: String) {
+        // An automatic watchdog must not destroy an owner that is still blocking
+        // protected traffic. Explicit Stop has its own durable, owner-scoped expiry.
+        if (NelomaiVpnService.retainsProtection()) {
+            NelomaiVpnService.legacyTransportUnavailable()
+            TunnelLog.warning("tunnel.operation_watchdog_expired", "${operation}_timeout_retaining_tun")
+            return
+        }
         val processId = android.os.Process.myPid()
         Thread(
             {
@@ -2051,6 +2082,8 @@ internal object TunnelRuntime {
             session.udpStallStartedElapsedMillis = null
         }
         if (tunWriteDelta > 0) {
+            // The existing telemetry proves decrypted traffic, not merely native UP.
+            NelomaiVpnService.legacyTransportReady(requireBackend())
             session.openNetworkIncidentElapsedMillis?.let { detectedAt ->
                 TunnelLog.incident(
                     "tunnel.network_incident_recovered",
@@ -2168,6 +2201,7 @@ internal object TunnelRuntime {
                 "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
             ),
         )
+        NelomaiVpnService.legacyTransportUnavailable()
         if (session.openNetworkIncidentElapsedMillis == null) {
             session.networkIncidentCount += 1
             session.openNetworkIncidentElapsedMillis = now
@@ -2549,6 +2583,9 @@ internal object TunnelRuntime {
                 .mapNotNull { key -> statistics.peer(key)?.latestHandshakeEpochMillis() }
                 .filter { it > 0 }
                 .maxOrNull()
+            if (latestHandshakeEpochMillis != null) {
+                NelomaiVpnService.legacyTransportReady(requireBackend(), latestHandshakeEpochMillis)
+            }
             val uptimeSeconds = (
                 SystemClock.elapsedRealtime() - session.startedAtElapsedMillis
             ).coerceAtLeast(0) / 1_000L
@@ -3192,6 +3229,30 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun retryProtectedConnection(invoke: Invoke) {
+        TunnelServiceClient.retryProtectedConnection(activity.applicationContext,
+            { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } })
+    }
+
+    @Command
+    fun killSwitchStatus(invoke: Invoke) {
+        TunnelStatusTransport.request(activity.applicationContext, TUNNEL_API_VERSION,
+            { status -> activity.runOnUiThread { invoke.resolve(status.killSwitchStatus()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } })
+    }
+
+    @Command
+    fun setKillSwitchPreference(invoke: Invoke) {
+        val args = try { invoke.parseArgs(KillSwitchPreferenceArgs::class.java) }
+        catch (_: Throwable) { invoke.reject("invalid_kill_switch_preference"); return }
+        val enabled = args.enabled ?: run { invoke.reject("invalid_kill_switch_preference"); return }
+        TunnelServiceClient.setKillSwitchPreference(activity.applicationContext, enabled, args.confirmed,
+            { status -> activity.runOnUiThread { invoke.resolve(status.killSwitchStatus()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } })
+    }
+
+    @Command
     fun setReservePreference(invoke: Invoke) {
         val enabled = try { invoke.parseArgs(ReservePreferenceArgs::class.java).enabled } catch (_: Throwable) { null }
         if (enabled == null) { invoke.reject("invalid_reserve_preference"); return }
@@ -3338,6 +3399,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             { state, duration -> resolveOperation(invoke, state, duration) },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
             legacyOnly = args.legacyOnly,
+            failedStartOperationId = args.failedStartOperationId,
         )
     }
 

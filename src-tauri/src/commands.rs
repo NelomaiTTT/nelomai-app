@@ -995,6 +995,11 @@ fn private_error_code(error: nelomai_client_container::ipc::PrivateError) -> &'s
         PrivateError::OutcomeUnknown => "private_outcome_unknown",
         PrivateError::AccessUnavailable => "private_access_unavailable",
         PrivateError::Service => "private_service",
+        PrivateError::DeviceLimitReached => "private_device_limit_reached",
+        PrivateError::InvalidCredentials => "private_invalid_credentials",
+        PrivateError::AppAccessUnavailable => "private_app_access_unavailable",
+        PrivateError::LoginRateLimited => "private_login_rate_limited",
+        PrivateError::InvalidLoginRequest => "private_invalid_login_request",
     }
 }
 
@@ -3810,6 +3815,114 @@ pub async fn app_stop(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<Option<Connection>, CommandError> {
     stop_connection(&app, &application).await
+}
+
+// Local Android protection controls are independent of bootstrap/auth and panel ACKs.
+#[tauri::command]
+pub async fn app_kill_switch_status(
+    app: AppHandle,
+) -> Option<tauri_plugin_tunnel_android::KillSwitchStatusResponse> {
+    #[cfg(target_os = "android")]
+    {
+        Some(
+            app.tunnel_android()
+                .kill_switch_status()
+                .await
+                .unwrap_or_else(|_| {
+                    tauri_plugin_tunnel_android::KillSwitchStatusResponse::unavailable()
+                }),
+        )
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        None
+    }
+}
+#[tauri::command]
+pub async fn app_set_kill_switch_preference(
+    app: AppHandle,
+    enabled: bool,
+    confirmed: bool,
+) -> Result<tauri_plugin_tunnel_android::KillSwitchStatusResponse, CommandError> {
+    #[cfg(target_os = "android")]
+    {
+        app.tunnel_android()
+            .set_kill_switch_preference(tauri_plugin_tunnel_android::KillSwitchPreferenceRequest {
+                enabled,
+                confirmed,
+            })
+            .await
+            .map_err(|_| {
+                CommandError::new(
+                    "kill_switch_preference_failed",
+                    "Не удалось изменить защиту. Проверьте её текущий статус.",
+                )
+            })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, enabled, confirmed);
+        Err(CommandError::new(
+            "kill_switch_unsupported",
+            "Защита недоступна в этой версии",
+        ))
+    }
+}
+#[tauri::command]
+pub async fn app_stop_protection(app: AppHandle) -> Result<(), CommandError> {
+    #[cfg(target_os = "android")]
+    {
+        let local = app.state::<Arc<nelomai_client_core::CoreLocalStop<crate::platform::PlatformTunnelController>>>();
+        let (ticket, ()) = ANDROID_UI_START_STOP_COORDINATOR.dispatch_projected_stop(|| ());
+        let result = local.stop_local_for_user().await;
+        if result.is_ok() {
+            ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+                ticket,
+                &ANDROID_DESIRED_ACTIVE_PROJECTION,
+                false,
+            );
+        } else {
+            ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(ticket);
+        }
+        result.map_err(|_| {
+            CommandError::new(
+                "tunnel_stop_unconfirmed",
+                "Остановка VPN и блокировки не подтверждена. Повторите локальный Stop.",
+            )
+        })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err(CommandError::new(
+            "kill_switch_unsupported",
+            "Защита недоступна в этой версии",
+        ))
+    }
+}
+#[tauri::command]
+pub async fn app_retry_protected_connection(app: AppHandle) -> Result<(), CommandError> {
+    #[cfg(target_os = "android")]
+    {
+        app.tunnel_android()
+            .retry_protected_connection()
+            .await
+            .map_err(|_| {
+                CommandError::new(
+                    "kill_switch_retry_failed",
+                    "Не удалось повторить подключение. Проверьте вход и разрешение VPN.",
+                )
+            })
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        Err(CommandError::new(
+            "kill_switch_unsupported",
+            "Защита недоступна в этой версии",
+        ))
+    }
 }
 
 #[tauri::command]

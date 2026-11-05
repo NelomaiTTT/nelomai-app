@@ -17,13 +17,129 @@ Completed evidence: the real-AWG S23U experiment established retained TUN behavi
 across both-slot stop/native close, one split-excluded UID, and offline local
 release. It did not establish normal recovery, network change, live split changes,
 IPv6, process-death recovery, forced Stop fallback or desktop behavior.
-All implementation/acceptance tasks below remain open.
+Current Android implementation and first-build evidence are tracked in
+[the 29 October checkpoint](2026-10-29-android-prebuild-progress.md). Device and
+desktop acceptance gates below remain open until their own evidence exists.
+
+### Android implementation started, 28 October 2026
+
+The user authorized starting Android 0.5.0. The first local increment extends the
+existing GoBackend lifecycle patch with explicit, opt-in descriptor retention.
+The ordinary constructor does not duplicate the TUN: native close leaves no extra
+backend handle, and retention duplication cannot fail an unprotected Start.
+An owner can request capture before native fd transfer using the constructor's
+`retainTunDescriptor` argument, then acquire an independent duplicate after socket
+admission. Existing production callers still use the ordinary constructor.
+
+Review corrections: a failed close keeps the owned wrapper available for another
+Stop or destroy attempt. Returning from close is not sufficient: the captured
+FileDescriptor must also be invalid before clearing the handle and error. Pending
+cleanup rejects new Start/duplication; repeated Stop retries cleanup even after
+native has already stopped. Successful confirmed cleanup permits the next Start.
+
+Validation: 19 ownership tests plus 7 existing backend Stop/local restart tests
+pass. Four isolated mutations of the review fixes (unconditional capture, sticky
+close error, skipped Stop retry and blindly trusted close return) are detected.
+Tests run the generated GoBackend and existing runtime callbacks, substituting JNI,
+VPN establishment and Android descriptor duplication. Robolectric's ordinary dup
+shares a Java descriptor, so this fixture uses independent file handles; it does
+not validate dup(2), kernel TUN lifetime, routing or traffic blocking.
+
+This is a backend prerequisite, not enabled killswitch protection. The service has
+not yet acquired a protection handle; preference/UI, redundant native
+backend, recovery/Stop integration and hardware acceptance remain open. Socket
+admission alone is not connection readiness. Keep the task-3 acceptance unchecked.
+The constructor argument is selected before Start; it does not implement first
+enable on an already running ordinary backend. That approved no-reconnect behavior
+still requires integration and must not be replaced with a reconnect workaround.
+No version/capability advertisement, APK, commit, push or deployment accompanies
+this increment. Original sources remain internal; test copies/caches/results are
+on the external SSD under the project storage rule.
 
 Use system mechanisms and existing project ownership/cancellation/recovery first.
 Do not add mandatory controllers, parallel recovery schedulers, new IPC commands,
 common firewall traits or a panel-address cache just because an old plan named
 them. No seamless protected runtime handover: the approved flow is confirmation,
 local Stop, then switch. No server ACK barrier for local Stop.
+
+### Service integration review fixes, 29 October 2026
+
+Both review findings are fixed locally; no commit, push or candidate build.
+`confirmTunReady` uses a short readiness gate that is never held across JNI,
+DNS or configuration work. Native admission publishes eligibility; stop and
+policy replacement revoke it before closing the transport. The existing
+service Start completion/cancellation gate remains authoritative.
+
+Core now sends its existing unique Start operation ID through `start_for_attempt`
+and identifies rejected attempts through `stop_failed_start`. Default trait
+implementations preserve other platforms' previous start/cleanup behavior.
+Android extends the existing Start/Stop payloads, retaining the legacy-only
+ownership barrier; no new IPC command, dependency or operation registry.
+A lease ID is deliberately insufficient because the same lease may be reused.
+
+Retention snapshots whether protection existed before that attempt. Rejection
+rolls back only newly acquired protection and prevents late handshake telemetry
+from re-arming it. Replayed Start keeps the original snapshot; a rejected attempt
+cannot restart under the same ID. A new attempt can proceed. Existing protection
+survives failed recovery. A busy Stop records rejection before returning so a
+later generic cleanup retry still releases the provisional handle. Close failure
+remains retryable, including when the transport is already stopped.
+
+Validation on external SSD: 251 targeted JVM tests, 5 Core tests, 18 Rust model
+wire-format tests; Android `aarch64-linux-android` cargo check passed. Eight targeted
+mutations were caught, then affected tests passed with the intended code restored.
+Evidence: `/Volumes/Apple-VM/Nelomai/android-050/logs/tun-service-fixes-20261029/`.
+The service, factory, protocol and runtime code are real; JNI, Android TUN and
+network backends are substitutes with file-backed descriptors. No actual TUN,
+device routing, emulator/hardware acceptance or production change was performed.
+Preference/UI/capability remain disabled/unconnected as before.
+
+### Service and hot-standby integration, 29 October 2026
+
+The next authorized increment connects descriptor ownership to NelomaiVpnService.
+Its explicit constructor opt-in defaults to false; preference/UI/capability are
+still unconnected. It keeps the established descriptor and transfers an independent
+duplicate to native. Both GoBackend and the service's redundant factory use this
+same owner. No second VPN service, recovery scheduler, IPC command or dependency
+was added. The ordinary backend constructor still retains no extra descriptor.
+
+The initial handle is provisional. Legacy native RUNNING does not arm it: existing
+metrics/periodic statistics must observe a handshake (the current Core criterion),
+or existing telemetry must observe decrypted TUN traffic. Hot-standby uses its
+existing primary readiness gate, with client Start confirmation inside the existing
+operation gate. Initial native/admission failure or cancellation releases provisional
+ownership. Once armed, slot stop, promotion, full backend close, scoped Core cleanup,
+generation cleanup and failed recovery preserve ownership. A new establish may
+replace the old descriptor; a failed native duplicate during armed recovery keeps
+the new original. This does not prove route continuity during Android replacement.
+
+Explicit service Stop/tile Stop/logout release the descriptor; revoke/destroy also
+permanently fence this owner. Stop does not wait for an in-flight establish, rejects
+its late result and permits another explicitly admitted Start. Failed/no-op close
+remains retryable and is not acknowledged as successful release. Idle service/process
+cleanup cannot discard a retained handle. Existing durable cleanup/ACK remains intact.
+
+Integration boundary: `legacyOnly` Stop is ambiguous in the old Core (automatic
+compensation and user cleanup share it), so it cannot authorize protection removal.
+Before enabling the preference in the UI, explicit local disarm must go through the
+existing unscoped service Stop/current-intent Stop, including Core-owned single
+connections. This is part of task 2/4, not a new meaning assigned to compensation.
+
+Validation: 256 targeted JVM tests passed across descriptor ownership, real
+service/factory callbacks, legacy runtime, cancellation and redundant coordinators.
+The factory tests substitute its native backend; GoBackend tests substitute JNI.
+TUN establishment, Android package-manager verification and dup use file-backed
+fixtures. No actual kernel TUN, app routing, live split continuity/rollback, IPv6,
+device lifecycle or production traffic acceptance was performed. These exit gates
+remain unchecked. Healthy enable/disable without reconnect, preference/disclosure,
+authoritative protection status and bounded forced Stop fallback also remain open.
+Five isolated mutations were caught: automatic disarm on native close, missing
+establish epoch fence, omitted redundant close notification, arming legacy on
+RUNNING before handshake, and trusting a no-op descriptor close. Product sources
+were restored and the affected 43 tests passed again; the other 213 baseline
+tests ran on the same final product code. No full application/native build was run.
+All test copies/cache/results are on the SSD in `logs/tun-service-20261029`.
+No commit, push, candidate/APK, installation or production changes.
 
 ## 1. Map current ownership and contracts
 

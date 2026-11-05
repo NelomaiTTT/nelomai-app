@@ -6,12 +6,13 @@ import { StartupRetry } from "./startup-retry";
 import { beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction } from "./connection-action";
 import { commandCode, commandMessage } from "./native-client";
 import { viewForAppState } from "./app-model";
+import { KillSwitchControls, confirmAndroidTransition } from "./kill-switch";
 
 // Exercise the page's real restore/retry and lifecycle callbacks, with only the
 // native boundary replaced by controlled responses.
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
-const names = ["restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout"];
+const names = ["restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "confirmProtectionTransition", "installUpdate"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
@@ -50,6 +51,12 @@ const response = { defaults: { layer: "tic", tic_connection_mode: "personal", ro
 
 function fixture(bootstrap: () => Promise<unknown>) {
   const context: Record<string, any> = {
+    protectionBusy: false, transitionConfirming: false, confirmAndroidTransition,
+    protection: new KillSwitchControls({
+      killSwitchStatus: async () => null,
+      setKillSwitchPreference: async () => { throw new Error("not used by this fixture"); },
+      stopProtection: async () => {}, retryProtectedConnection: async () => {},
+    }, () => {}),
     busy: false, bootstrap: null, runtimeChannelClosed: false, runtimeSelectionBusy: false,
     connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(),
     startupPending: false, bootstrapPending: false, refreshPending: false, startupSlow: false, startupTimer: null,
@@ -59,7 +66,7 @@ function fixture(bootstrap: () => Promise<unknown>) {
     connectionMetrics: null, reserveState: null, runtimeWarning: null, splitTunnelOpen: false,
     ownedConnectionIntentNotice: null, runtimeStatus: null,
     phaseLabels: { server_unavailable: "Сервер недоступен", error: "Ошибка" },
-    window: { setTimeout, clearTimeout }, commandCode, commandMessage, isCurrentConnectionAction,
+    window: { setTimeout, clearTimeout, confirm: () => true }, commandCode, commandMessage, isCurrentConnectionAction,
     viewForAppState, loadSplitTunnel: async () => {}, refreshProbes: async () => {},
     refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
     scheduleRuntimeStatusRefresh: () => {}, runtimeStatusRefresher: { commit: () => {} },
@@ -79,6 +86,36 @@ function fixture(bootstrap: () => Promise<unknown>) {
 describe("bounded bootstrap recovery", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it.each(["selectRuntime", "restartRuntime", "installUpdate"])(
+    "requires actual protection confirmation before %s and reports native failure", async (action) => {
+      const f = fixture(async () => response);
+      const status = { vpnActive: true, supported: true, enabled: true, disclosed: true,
+        state: "armed" as const, error: null, cause: null, externalLockdown: false };
+      f.context.protection = new KillSwitchControls({
+        killSwitchStatus: async () => status,
+        setKillSwitchPreference: async () => status,
+        stopProtection: async () => {}, retryProtectedConnection: async () => {},
+      }, () => {});
+      const confirm = vi.fn(() => false);
+      f.context.window.confirm = confirm;
+      f.context.updateBusy = false;
+      f.context.updateTimer = null;
+      f.context.observeUpdateStatus = () => {};
+      const mutate = vi.fn(async () => { throw { code: "transition_failed", message: "Transition failed" }; });
+      Object.assign(f.context.nativeClient, { runtimeSelect: mutate, restartRuntime: mutate, installUpdate: mutate });
+      await f.page[action](true);
+      expect(confirm).toHaveBeenCalledOnce();
+      expect(mutate).not.toHaveBeenCalled();
+      expect(f.context.protection.status.state).toBe("armed");
+      confirm.mockReturnValue(true);
+      await f.page[action](true);
+      expect(mutate).toHaveBeenCalledOnce();
+      expect(f.context.error).not.toBeNull();
+      expect(f.context.runtimeSelectionBusy).toBe(false);
+      expect(f.context.updateBusy).toBe(false);
+    },
+  );
 
   it("shows preparation instead of an outage while bootstrap is in flight", async () => {
     let finish!: (value: unknown) => void;

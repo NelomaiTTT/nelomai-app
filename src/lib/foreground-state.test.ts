@@ -6,6 +6,7 @@ import { beginConnectionStart, beginConnectionStop, initialConnectionActionState
   beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction, finishConnectionStart,
   finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
+import { KillSwitchControls } from "./kill-switch";
 import { commandCode, commandMessage, waitForSettlement,
   START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS } from "./native-client";
 import { bindingPreferenceUpdateRequest, connectionEgressMode, primaryAction,
@@ -70,6 +71,12 @@ function fixture() {
   let reject!: (reason: unknown) => void;
   const response = new Promise((resolve, fail) => { reply = resolve; reject = fail; });
   const context = {
+    protectionBusy: false,
+    protection: new KillSwitchControls({
+      killSwitchStatus: async () => null,
+      setKillSwitchPreference: async () => { throw new Error("not used by this fixture"); },
+      stopProtection: async () => {}, retryProtectedConnection: async () => {},
+    }, () => {}),
     busy: false, bootstrapPending: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
     runtimeChannelClosed: false, runtimeSelectionBusy: false,

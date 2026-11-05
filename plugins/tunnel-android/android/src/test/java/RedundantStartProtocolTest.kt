@@ -111,6 +111,28 @@ class RedundantStartProtocolTest {
             cancel.getStringExtra(EXTRA_CLIENT_OPERATION_ID))
     }
 
+    @Test fun legacyStartAndFailedCleanupCarryTheCoreOperationId() {
+        val context = RuntimeEnvironment.getApplication()
+        val operation = "40000000-0000-4000-8000-000000000001"
+        val args = StartTunnelArgs().apply {
+            configuration = byteArrayOf(1)
+            clientOperationId = operation
+        }
+        TunnelServiceClient.start(context, args, { _, _ -> }, { })
+        val start = shadowOf(context).nextStartedService
+        assertEquals(operation, start.getStringExtra(EXTRA_CLIENT_OPERATION_ID))
+        start.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER)!!.send(SERVICE_RESULT_OK,
+            Bundle().apply { putString(EXTRA_STATE, SessionState.RUNNING.wireName) })
+        shadowOf(Looper.getMainLooper()).idle()
+        TunnelServiceClient.stop(context, TUNNEL_API_VERSION, { _, _ -> }, {},
+            legacyOnly = true, failedStartOperationId = operation)
+        val stop = shadowOf(context).nextStartedService
+        assertEquals(operation, stop.getStringExtra(EXTRA_FAILED_START_OPERATION_ID))
+        stop.getParcelableExtra<ResultReceiver>(EXTRA_RESULT_RECEIVER)!!.send(SERVICE_RESULT_OK,
+            Bundle().apply { putString(EXTRA_STATE, SessionState.STOPPED.wireName) })
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
     @Test fun timeoutCancelsTheSameCanonicalOperationThatOwnsTheRedundantSession() {
         val context = RuntimeEnvironment.getApplication()
         val operation = "30000000-0000-4000-8000-000000000001"

@@ -30,6 +30,7 @@ internal class TunnelStatusEndpoint(
     private val isCurrent: () -> Boolean,
     private val verifyRuntime: ((Boolean) -> Unit) -> Unit,
     private val observe: (Intent) -> Unit,
+    private val decorate: (Bundle) -> Unit = {},
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private var closed = false
@@ -77,6 +78,7 @@ internal class TunnelStatusEndpoint(
         override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
             verified(receiver) {
                 receiver?.send(resultCode, Bundle(resultData ?: Bundle.EMPTY).apply {
+                    if (resultCode == SERVICE_RESULT_OK) decorate(this)
                     putBinder(EXTRA_STATUS_ENDPOINT, messenger.binder)
                     putLong(EXTRA_STATUS_GENERATION, generation)
                     putString(EXTRA_STATUS_RUNTIME, statusRuntimeIdentity)

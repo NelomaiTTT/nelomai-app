@@ -1572,7 +1572,7 @@ mod tests {
                 .unwrap(),
             )),
             Arc::new(ActiveAuth),
-            local,
+            local.clone(),
             Arc::new(nelomai_client_core::NoopLogger),
         );
         let _stalled_bootstrap = application.lifecycle_gate.lock().await;
@@ -1593,5 +1593,9 @@ mod tests {
         .expect("foreground must bypass stalled bootstrap");
         assert_eq!(state.phase, Phase::Connected);
         assert!(state.connection.is_none());
+        tokio::time::timeout(std::time::Duration::from_millis(100), local.stop_local_for_user())
+            .await.expect("local Stop must not wait for bootstrap or panel access").unwrap();
+        assert!(!tunnel.0.load(Ordering::SeqCst));
+        assert_eq!(application.state().await.phase, Phase::Ready);
     }
 }

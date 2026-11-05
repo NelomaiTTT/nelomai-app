@@ -20,6 +20,7 @@ class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1 {
 internal fun requiresVpnStartAdmission(context: android.content.Context, intent: Intent?): Boolean =
     when (intent?.action) {
         NelomaiVpnService.ACTION_QUICK_TOGGLE -> !QuickTunnelController.desiredActive(context)
+        NelomaiVpnService.ACTION_KILL_SWITCH_PREFERENCE,
         NelomaiVpnService.ACTION_CANCEL_CLIENT_START, NelomaiVpnService.ACTION_CLIENT_STOP,
         NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY,
         NelomaiVpnService.ACTION_CLIENT_STATUS, NelomaiVpnService.ACTION_CLIENT_METRICS,

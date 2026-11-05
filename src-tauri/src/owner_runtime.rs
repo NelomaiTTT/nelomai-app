@@ -71,7 +71,7 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         Arc::new(record.operational()),
         Arc::new(record.split()),
         port.clone(),
-        local,
+        local.clone(),
         diagnostics.clone(),
         port.clone(),
     ));
@@ -84,6 +84,7 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         port.clone(),
     )));
     app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
+    app.manage(local);
     app.manage(application.clone());
     app.manage(tunnel.clone());
     app.manage(diagnostics.clone());

@@ -143,6 +143,30 @@ class VpnPermissionCleanupDispatchTest {
     }
 
     @Test
+    fun killSwitchPreferenceRemainsAvailableWithoutStartAdmission() {
+        val selection = ru.nelomai.client.RuntimeSelectionV1("latest", "test", "test", null, null, "owner")
+        assertFalse(ru.nelomai.client.RuntimeDispatchPolicy.mayStart(selection))
+        withEngine { engine ->
+            for (enabled in listOf(true, false)) {
+                val reply = AwaitingReceiver()
+                TunnelServiceClient.setKillSwitchPreference(context, enabled, true,
+                    { reply.send(SERVICE_RESULT_OK, it) },
+                    { code -> reply.send(SERVICE_RESULT_ERROR, Bundle().apply { putString(EXTRA_ERROR_CODE, code) }) })
+                val request = shadowOf(context).nextStartedService
+                assertFalse(request.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
+                assertFalse(engine.requiresStartAdmission(request))
+                engine.start(request, 0, 1)
+                assertTrue(reply.await())
+                assertEquals(SERVICE_RESULT_OK, reply.resultCode)
+                assertEquals(enabled, KillSwitchPreference(context).enabled)
+                assertEquals("off", reply.resultData?.getString("kill_switch_state"))
+            }
+            assertTrue(engine.requiresStartAdmission(Intent(NelomaiVpnService.ACTION_CLIENT_START)))
+            assertTrue(engine.requiresStartAdmission(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING)))
+        }
+    }
+
+    @Test
     fun quickToggleStopRunsThroughEngineWithoutForegroundPermission() {
         val reply = AwaitingReceiver()
         withEngine { engine ->

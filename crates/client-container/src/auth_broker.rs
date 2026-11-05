@@ -2199,6 +2199,7 @@ impl AuthBroker {
                         BrokerError::Api(ClientApiError::Api { status, code, .. })
                             if matches!((status.as_u16(), code.as_str()),
                                 (401, "invalid_credentials") | (403, "app_access_unavailable")
+                                | (409, "device_limit_reached")
                                 | (429, "login_rate_limited") | (422, "invalid_request")));
                     let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
                     if known_not_issued && !ticket.prior_login_outcome_unknown {

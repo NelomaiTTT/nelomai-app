@@ -714,6 +714,52 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun persistentLocalSendErrorsFailOverAfterFreshReserveProofForEitherActiveSlot() {
+        for (primary in 0..1) {
+            val fixture = pairFixture(primary)
+            fixture.backend.sendErrorSlots += primary
+            var switchedAt: Long? = null
+            for (now in 30_000L..38_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                assertFalse(decision.sessionStalled)
+                if (decision.switchTo != null) {
+                    assertEquals(1 - primary, decision.switchTo)
+                    switchedAt = now
+                    break
+                }
+            }
+            assertTrue("Failed UDP writes must not strand healthy reserve $primary", switchedAt != null)
+        }
+    }
+
+    @Test
+    fun oneOldSendErrorDoesNotConfirmContinuingDnsFailure() {
+        val fixture = timingFixture(active = true)
+        fixture.backend.countProbeSend = false
+        fixture.backend.sendErrorSlots += 0
+        fixture.observe(0, healthy = false)
+        fixture.backend.sendErrorSlots.clear()
+        fixture.observe(2_000, healthy = false)
+        for (now in 4_000L..12_000L step 2_000L) {
+            val observation = fixture.observe(now, healthy = false)
+            assertFalse(observation.independentFailureSignal)
+            assertFalse(RedundantHealthMonitor().failed(now, observation))
+        }
+    }
+
+    @Test
+    fun decryptedProgressClearsSendErrorSuspicion() {
+        val fixture = timingFixture(active = true)
+        fixture.backend.sendErrorSlots += 0
+        fixture.observe(0, healthy = false)
+        assertTrue(fixture.observe(2_000, healthy = false).independentFailureSignal)
+        fixture.backend.decryptedReceivePackets = 1
+        val recovered = fixture.observe(3_000, healthy = false)
+        assertFalse(recovered.independentFailureSignal)
+        assertFalse(RedundantHealthMonitor().failed(3_000, recovered))
+    }
+
+    @Test
     fun readyStandbyKeepsSlowCadenceUntilPromotedToActive() {
         val fixture = timingFixture(active = false)
         for (now in 0L..13_000L step 1_000L) fixture.observe(now, healthy = true)
@@ -1608,6 +1654,8 @@ internal class RecordingSessionBackend(
     var probeClock: () -> Long = { 0L }
     var useSlotCounters = false
     private val slotSendPackets = mutableMapOf<Int, Long>()
+    val sendErrorSlots = mutableSetOf<Int>()
+    private val slotSendErrors = mutableMapOf<Int, Long>()
     val rebindFailures = mutableSetOf<Int>()
     val reboundSlots = mutableListOf<Int>()
     var latestProbeToken: Long? = null
@@ -1658,7 +1706,9 @@ internal class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
-        if (countProbeSend) {
+        if (slot in sendErrorSlots) {
+            slotSendErrors[slot] = (slotSendErrors[slot] ?: 0L) + 1L
+        } else if (countProbeSend) {
             udpSendPackets += 1
             slotSendPackets[slot] = (slotSendPackets[slot] ?: 0L) + 1L
         }
@@ -1683,7 +1733,7 @@ internal class RecordingSessionBackend(
             postfix = "]}",
         ) { slot ->
             val sent = if (useSlotCounters) slotSendPackets[slot] ?: 0L else udpSendPackets
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_receive_packets":$udpReceivePackets}}"""
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_send_errors":${slotSendErrors[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 

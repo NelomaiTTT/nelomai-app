@@ -4,6 +4,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.SystemBarStyle
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import io.crates.keyring.Keyring
 
 class LatestRuntimeActivity : TauriActivity() {
@@ -42,10 +45,21 @@ class LatestRuntimeActivity : TauriActivity() {
     }
     StartupDiagnostics.beginLaunch(applicationContext)
     startupHandler.postDelayed(frontendTimeout, 30_000L)
-    enableEdgeToEdge()
+    enableEdgeToEdge(
+      statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+      navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+    )
     Keyring.initializeNdkContext(applicationContext)
     StartupDiagnostics.record(applicationContext, "startup.android.keyring_ready")
     super.onCreate(savedInstanceState)
+    val content = findViewById<android.view.View>(android.R.id.content)
+    ViewCompat.setOnApplyWindowInsetsListener(content) { view, insets ->
+      val safe = insets.getInsets(WindowInsetsCompat.Type.systemBars() or
+        WindowInsetsCompat.Type.displayCutout() or WindowInsetsCompat.Type.ime())
+      view.setPadding(safe.left, safe.top, safe.right, safe.bottom)
+      WindowInsetsCompat.CONSUMED
+    }
+    ViewCompat.requestApplyInsets(content)
     StartupDiagnostics.record(applicationContext, "startup.android.activity_created")
   }
 

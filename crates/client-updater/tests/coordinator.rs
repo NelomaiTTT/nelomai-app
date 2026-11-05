@@ -695,3 +695,42 @@ async fn cancelled_offer_stays_cancelled_when_rollback_initially_fails() {
     assert_eq!(backend.0.load(Ordering::SeqCst), 1,
         "the same user-cancelled offer must not auto reopen just because journal recovery initially failed");
 }
+
+#[tokio::test]
+async fn android_background_offer_never_stops_vpn_or_opens_installer() {
+    struct Installer;
+    #[async_trait]
+    impl nelomai_client_updater::AndroidApkInstaller for Installer {
+        async fn install_apk(
+            &self,
+            _: &std::path::Path,
+            _: &str,
+            _: &str,
+        ) -> Result<bool, UpdateBackendError> {
+            panic!("automatic Android update must not open installer")
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let backend = nelomai_client_updater::AndroidUpdateBackend::new(
+        directory.path().into(),
+        "0.3.8".into(),
+        Arc::new(Installer),
+    )
+    .unwrap();
+    let barrier = Arc::new(RecordingBarrier::released());
+    barrier.reject_prepare.store(true, Ordering::SeqCst);
+    let coordinator = UpdateCoordinator::new(Arc::new(backend), barrier.clone());
+    coordinator.observe(Some(offer()));
+    let phase = coordinator
+        .install_automatically(&access(), UpdatePreferences::default())
+        .await
+        .unwrap();
+    assert_eq!(phase, UpdatePhase::Available(offer()));
+    assert!(barrier.prepares.lock().unwrap().is_empty());
+    assert!(coordinator.install_now(&access()).await.is_err());
+    assert_eq!(
+        barrier.prepares.lock().unwrap().len(),
+        1,
+        "manual install still uses verified local Stop barrier"
+    );
+}

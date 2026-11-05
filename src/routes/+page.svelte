@@ -3,6 +3,8 @@
   import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
+  import KillSwitchPanel from "$lib/KillSwitchPanel.svelte";
+  import { KillSwitchControls, confirmAndroidTransition, type KillSwitchStatus } from "$lib/kill-switch";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import RuntimeSelector from "$lib/RuntimeSelector.svelte";
@@ -91,6 +93,30 @@
     updateStatusNeedsPolling,
   } from "$lib/update-diagnostics";
 
+  let protectionStatus = $state<KillSwitchStatus | null>(null);
+  let protectionBusy = $state(false);
+  let protectionActionError = $state<string | null>(null);
+  let protectionActionEpoch = 0;
+  const protection = new KillSwitchControls(nativeClient, () => {
+    protectionStatus = protection.status;
+    protectionBusy = protection.busy;
+  });
+  async function protectionAction(action: () => Promise<void>) {
+    const epoch = ++protectionActionEpoch;
+    protectionActionError = null;
+    try { await action(); }
+    catch (reason) { if (epoch === protectionActionEpoch) protectionActionError = commandMessage(reason, "stop"); }
+  }
+  let transitionConfirming = false;
+  async function confirmProtectionTransition(kind: "update" | "runtime") {
+    if (transitionConfirming) return false;
+    transitionConfirming = true;
+    try {
+      await protection.refresh(true);
+      return confirmAndroidTransition(protection.status, kind,
+        ["connected", "connecting", "stopping"].includes(phase), (message) => window.confirm(message));
+    } finally { transitionConfirming = false; }
+  }
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
   let localStopPendingCleanup = $state(false);
@@ -229,6 +255,7 @@
 
   onMount(() => {
     let disposed = false;
+    void protection.refresh();
     void nativeClient.recordStartupStage("frontend_mounted");
     window.requestAnimationFrame(() => {
       startupKickoffTimer = window.setTimeout(() => {
@@ -283,7 +310,10 @@
       else connectionIntentNotificationUnlisten = unlisten;
     });
     stateTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void synchronizeRuntimeState(false);
+      if (document.visibilityState === "visible") {
+        void protection.refresh();
+        void synchronizeRuntimeState(false);
+      }
     }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
@@ -295,6 +325,7 @@
     }, 60_000);
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
+        void protection.refresh();
         void nativeClient.wakeConnectionIntent();
         void synchronizeRuntimeState();
         void refreshProbes();
@@ -468,6 +499,7 @@
 
   async function selectRuntime(useStable: boolean) {
     if (runtimeSelectionBusy) return;
+    if (!await confirmProtectionTransition("runtime")) return;
     startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
@@ -487,6 +519,7 @@
 
   async function restartRuntime() {
     if (runtimeSelectionBusy) return;
+    if (!await confirmProtectionTransition("runtime")) return;
     startupRetry.cancel();
     runtimeSelectionBusy = true;
     error = null;
@@ -503,6 +536,7 @@
     if (commandCode(reason) !== "runtime_channel_closed") return false;
     // Owner EOF is not logout, remote cleanup success, or a network timeout.
     // Keep the account/cleanup barrier; only retire unverified presentation.
+    void protection.refresh(true);
     runtimeChannelClosed = true;
     startupRetry.cancel();
     splitTunnelOpen = false;
@@ -794,6 +828,7 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (protectionBusy && !forceStop) return;
     if (runtimeChannelClosed && !forceStop) return;
     if (localStopPendingCleanup && !forceStop) return;
     if (
@@ -1256,6 +1291,7 @@
 
   async function installUpdate() {
     if (updateBusy) return;
+    if (!await confirmProtectionTransition("update")) return;
     updateBusy = true;
     error = null;
     void nativeClient.recordStartupStage("update_install_requested");
@@ -1285,6 +1321,7 @@
 
   async function restartForUpdate() {
     if (updateBusy) return;
+    if (!await confirmProtectionTransition("update")) return;
     updateBusy = true;
     try {
       await nativeClient.restartForUpdate();
@@ -1430,7 +1467,7 @@
   <title>Nelomai</title>
 </svelte:head>
 
-<main class="app-shell">
+<main class="app-shell" class:has-protection={!!protectionStatus}>
   <header>
     <a class="brand" href="/" aria-label="Nelomai">
       <span class="brand-mark" aria-hidden="true">✦</span>
@@ -1476,6 +1513,12 @@
       {/if}
     </div>
   </header>
+  {#if protectionStatus}
+    <KillSwitchPanel status={protectionStatus} busy={protectionBusy} actionError={protectionActionError}
+      onenabled={(enabled) => void protectionAction(() => protection.setEnabled(enabled, (message) => window.confirm(message)))}
+      onstop={() => void protectionAction(() => protection.stop())}
+      onretry={() => void protectionAction(() => protection.retry())} />
+  {/if}
   {#if diagnosticsStatus}
     <p class="diagnostics-status" aria-live="polite">{diagnosticsStatus}</p>
   {/if}
@@ -1704,7 +1747,7 @@
             class="connect-button"
             type="button"
             onclick={() => toggleConnection()}
-            disabled={localStopPendingCleanup || !canBeginConnectionAction(
+            disabled={protectionBusy || localStopPendingCleanup || !canBeginConnectionAction(
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
@@ -1963,6 +2006,9 @@
             </label>
           {/if}
           {#if updateStatus?.supported}
+            {#if protectionStatus}
+              <p class="hint">Приложение проверяет обновления в фоне. Установка начинается после вашего подтверждения.</p>
+            {:else}
             <label class="update-preference">
               <span>
                 <strong>Автоматические обновления</strong>
@@ -1974,6 +2020,7 @@
                 onchange={setAutomaticUpdates}
               />
             </label>
+            {/if}
           {/if}
           {#if runtimeStatus}
             <RuntimeSelector
@@ -2179,6 +2226,10 @@
       env(safe-area-inset-left, 0px);
     display: grid;
     grid-template-rows: auto 1fr;
+  }
+
+  .app-shell.has-protection {
+    grid-template-rows: auto auto 1fr;
   }
 
   header {

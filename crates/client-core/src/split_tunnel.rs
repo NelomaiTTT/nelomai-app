@@ -961,7 +961,7 @@ where
         if !allowed() {
             return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
         }
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+        self.retire_split_tunnel_confirmation(&connection, cancel_epoch, false)
             .await?;
         let stop_result = self.tunnel.stop_for_restart().await;
         self.ensure_offline_start_current(cancel_epoch).await?;
@@ -1153,7 +1153,7 @@ where
         .await;
         let transport =
             nelomai_client_tunnel::TunnelConfiguration::new(configuration.clone()).transport();
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+        self.retire_split_tunnel_confirmation(&connection, cancel_epoch, false)
             .await?;
         let stop_result = self.tunnel.stop_for_restart().await;
         self.ensure_offline_start_current(cancel_epoch).await?;
@@ -1254,11 +1254,13 @@ where
         &self,
         connection: &Connection,
         cancel_epoch: crate::StartCancellationEpoch,
+        retained_protection: bool,
     ) -> Result<(), CoreError> {
         let state = self.state.lock().await;
         let mut running = self.split_tunnel_options.lock().await;
         self.ensure_start_not_cancelled(cancel_epoch)?;
-        if state.phase != Phase::Connected
+        if !(state.phase == Phase::Connected || (retained_protection &&
+            matches!(state.phase, Phase::Stopping | Phase::Connecting)))
             || !state
                 .connection
                 .as_ref()
@@ -1632,7 +1634,8 @@ where
             || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
             // Explicit Save must check the live plan even when the cache and
             // working hash agree: both can predate a native background Start.
-            || self.state.lock().await.phase == Phase::Connected;
+            || self.state.lock().await.phase == Phase::Connected
+            || self.tunnel.retains_protection().await?;
         let outcome = if needs_apply {
             // Settings preflight compares cached domain addresses. Refreshing
             // them here could introduce an unconfirmed route replacement.
@@ -1986,13 +1989,20 @@ where
             self.start_cancel_epoch
                 .load(std::sync::atomic::Ordering::SeqCst),
         );
+        let retained_protection = self.tunnel.retains_protection().await?;
         let current = {
             let current_state = self.state.lock().await;
-            (current_state.phase == Phase::Connected)
+            (current_state.phase == Phase::Connected || (retained_protection &&
+                matches!(current_state.phase, Phase::Stopping | Phase::Connecting)))
                 .then(|| current_state.connection.clone())
                 .flatten()
         };
         let Some(connection) = current else {
+            // The retained interface still enforces its old scope. Saving desired
+            // settings is not proof that this scope changed without a live owner.
+            if retained_protection {
+                return Err(CoreError::SplitTunnel("split_tunnel_apply_busy".into()));
+            }
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         };
         let stored = self.load_runtime()?;
@@ -2024,7 +2034,7 @@ where
                 self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code)
                     .await;
                 mark_policy_failure(state, policy, now_unix);
-                return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+                return Ok(ConnectedPolicyApplyOutcome::ApplyFailed);
             }
             Err(error) => return Err(error),
         };
@@ -2063,7 +2073,7 @@ where
                         self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code)
                             .await;
                         mark_policy_failure(state, policy, now_unix);
-                        return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+                        return Ok(ConnectedPolicyApplyOutcome::ApplyFailed);
                     }
                     Err(error) => return Err(error),
                 };
@@ -2078,13 +2088,15 @@ where
         let connection_is_still_current = {
             let current_state = self.state.lock().await;
             self.ensure_start_not_cancelled(cancel_epoch)?;
-            current_state.phase == Phase::Connected
+            (current_state.phase == Phase::Connected || (retained_protection &&
+                matches!(current_state.phase, Phase::Stopping | Phase::Connecting)))
                 && current_state
                     .connection
                     .as_ref()
                     .is_some_and(|current| same_local_recovery_execution(current, &connection))
         };
         if !connection_is_still_current {
+            if retained_protection { return Err(CoreError::SplitTunnel("split_tunnel_apply_busy".into())); }
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         }
         if !native_owned
@@ -2162,7 +2174,7 @@ where
                 .await?;
                 return Ok(ConnectedPolicyApplyOutcome::ConfigurationUnavailable);
             };
-            self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+            self.retire_split_tunnel_confirmation(&connection, cancel_epoch, retained_protection)
                 .await?;
             let result = self
                 .tunnel
@@ -2348,7 +2360,7 @@ where
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::ConfigurationUnavailable);
         };
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+        self.retire_split_tunnel_confirmation(&connection, cancel_epoch, retained_protection)
             .await?;
         if self.tunnel.stop_for_restart().await.is_err() {
             mark_policy_failure(state, policy, now_unix);

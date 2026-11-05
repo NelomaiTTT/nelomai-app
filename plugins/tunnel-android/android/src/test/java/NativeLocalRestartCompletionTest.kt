@@ -35,6 +35,249 @@ import java.util.concurrent.TimeUnit
     CompletionFileDescriptor::class])
 @LooperMode(LooperMode.Mode.PAUSED)
 class NativeLocalRestartCompletionTest {
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun forcedStopRequiresDurableCancellationExactVpnProcessAndCurrentEpoch() {
+        for (scenario in listOf("force", "active_intent", "other_process", "new_start", "already_stopped")) {
+            OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+            org.robolectric.shadows.ShadowProcess.clearKilledProcesses()
+            try { withRuntime(retainTunDescriptor = true) { f ->
+                f.armCheckpoint()
+                TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                f.service.onLegacyTransportReady(f.backend)
+                val retention = ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention")
+                val pid = android.os.Process.myPid()
+                val manager = f.context.getSystemService(android.app.ActivityManager::class.java)
+                org.robolectric.Shadows.shadowOf(manager).setProcesses(listOf(
+                    android.app.ActivityManager.RunningAppProcessInfo().apply {
+                        this.pid = pid; uid = android.os.Process.myUid()
+                        processName = f.context.packageName + if (scenario == "other_process") ":runtime" else ":vpn"
+                    }))
+                if (scenario != "active_intent") assertTrue(f.coordinator.cancelCurrent() is AndroidCoordinatorResult.Accepted)
+                ReflectionHelpers.callInstanceMethod<Boolean>(f.service, "releaseProtection",
+                    ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType, false))
+                val expiry = f.timers.scheduled.last()
+                assertEquals(40_000L, expiry.second)
+                if (scenario == "new_start") retention.allowStart()
+                if (scenario == "already_stopped") {
+                    TunnelRuntime.stop(TUNNEL_API_VERSION, { _, _ -> }, { fail(it) })
+                    f.work.runNext()
+                }
+                expiry.first.run()
+                assertEquals(scenario, scenario == "force", org.robolectric.shadows.ShadowProcess.wasKilled(pid))
+                if (scenario == "force") assertFalse(f.envelope().intent.desiredActive)
+            } } finally {
+                OwnershipNative.reset()
+                OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+            }
+        }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun automaticWatchdogCannotDestroyRetainedProtection() {
+        OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+        org.robolectric.shadows.ShadowProcess.clearKilledProcesses()
+        try { withRuntime(retainTunDescriptor = true) { f ->
+            TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+            f.work.runNext(); f.service.onLegacyTransportReady(f.backend)
+            ReflectionHelpers.callInstanceMethod<Unit>(TunnelRuntime, "terminateHungTunnelProcess",
+                ReflectionHelpers.ClassParameter.from(Context::class.java, f.context),
+                ReflectionHelpers.ClassParameter.from(String::class.java, "metrics"))
+            assertFalse(org.robolectric.shadows.ShadowProcess.wasKilled(android.os.Process.myPid()))
+            assertEquals("blocked", ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention").state())
+        } } finally { OwnershipNative.reset(); OwnershipDescriptor.files.values.toSet().forEach { it.delete() } }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun nativeStartCancellationAfterHandshakeMustReleaseTun() {
+        OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+        try {
+            withRuntime(retainTunDescriptor = true) { f ->
+                OwnershipNative.statistics = "public_key=${"01".repeat(32)}\nlast_handshake_time_sec=1\n"
+                val start = args().apply { startSource = "connection_intent" }
+                val id = requireNotNull(start.clientOperationId)
+                TunnelRuntime.start(f.context, start, { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, _, _ -> }, { fail(it) })
+                f.work.runNext()
+                // The service-owned Start fence calls this cancellation directly;
+                // no Core failed-start compensation follows it.
+                TunnelRuntime.cancelClientStart(f.context, id)
+                f.work.runNext()
+                f.work.runNext()
+                assertEquals(SessionState.STOPPED, TunnelRuntime.state())
+                assertTrue(OwnershipNative.engineDescriptors.isEmpty())
+                assertFalse("Cancelled service-owned initial Start must not retain its TUN",
+                    ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention").hasTun())
+            }
+        } finally {
+            OwnershipNative.reset()
+            OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun rejectedInitialStartCloseFailureMustRetry() {
+        OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+        try {
+            withRuntime(retainTunDescriptor = true) { f ->
+                OwnershipNative.statistics = "public_key=${"01".repeat(32)}\nlast_handshake_time_sec=1\n"
+                TunnelRuntime.start(f.context, args().apply { startSource = "user" },
+                    { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, _, _ -> }, { fail(it) })
+                f.work.runNext()
+                val retention = ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention")
+                // Fail the service-owned original's close once, after native DOWN.
+                OwnershipDescriptor.controlCopy = OwnershipBuilder.established
+                OwnershipDescriptor.failControlClose = true
+                var errors = 0
+                TunnelRuntime.stop(TUNNEL_API_VERSION, { _, _ -> fail("unconfirmed close succeeded") },
+                    { errors++ }, failedStartOperationId = args().clientOperationId)
+                f.work.runNext()
+                assertEquals(1, errors)
+                assertEquals(Tunnel.State.DOWN, f.backend.getState(f.tunnel))
+                assertEquals(SessionState.FAILED, TunnelRuntime.state())
+                assertTrue(retention.hasTun())
+                // Core resumes durable compensation using ordinary legacy-only Stop.
+                var successes = 0
+                TunnelRuntime.stop(TUNNEL_API_VERSION, { _, _ -> successes++ }, { fail(it) })
+                f.work.runNext()
+                assertEquals(1, successes)
+                assertEquals(SessionState.STOPPED, TunnelRuntime.state())
+                assertFalse("Successful cleanup retry must release retained TUN", retention.hasTun())
+            }
+        } finally {
+            OwnershipNative.reset()
+            OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun initialStartCancelledAfterHandshakeMustReleaseTun() = verifyRejectedStart(false)
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun rejectedRecoveryPreservesPreviouslyArmedTun() = verifyRejectedStart(true)
+
+    private fun verifyRejectedStart(previouslyArmed: Boolean) {
+        OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+        try {
+            withRuntime(retainTunDescriptor = true) { f ->
+                OwnershipNative.statistics = "public_key=${"01".repeat(32)}\nlast_handshake_time_sec=1\n"
+                TunnelRuntime.start(f.context, args().apply { startSource = "user" },
+                    { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, observed, _ ->
+                    assertNotNull(observed)
+                }, { fail(it) })
+                f.work.runNext()
+                val rejectedOperationId = if (previouslyArmed) "40000000-0000-4000-8000-000000000002"
+                    else requireNotNull(args().clientOperationId)
+                if (previouslyArmed) {
+                    TunnelRuntime.start(f.context, args().apply { clientOperationId = rejectedOperationId }, { _, _ -> }, { fail(it) },
+                        keepForegroundServiceOnFailure = true)
+                    f.work.runNext()
+                    TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, _, _ -> }, { fail(it) })
+                    f.work.runNext()
+                }
+                // Core still checks cancellation after ensure_awg3_handshake and
+                // uses scoped compensation before publishing Phase::Connected.
+                var replies = 0
+                val receiver = Receiver { code, _ -> assertEquals(SERVICE_RESULT_OK, code); replies++ }
+                ReflectionHelpers.setField(f.service, "redundantWork",
+                    RedundantVpnWorkDispatcher(java.util.concurrent.Executor { it.run() }))
+                ReflectionHelpers.callInstanceMethod<Unit>(f.service, "handleClientStop",
+                    ReflectionHelpers.ClassParameter.from(Intent::class.java,
+                        Intent(NelomaiVpnService.ACTION_CLIENT_STOP)
+                            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+                            .putExtra(EXTRA_LEGACY_STOP_ONLY, true)
+                            .putExtra(EXTRA_FAILED_START_OPERATION_ID, rejectedOperationId)
+                            .putExtra(EXTRA_RESULT_RECEIVER, receiver)))
+                org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+                f.work.runNext()
+                assertEquals(1, replies)
+                assertEquals(SessionState.STOPPED, TunnelRuntime.state())
+                val retained = ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention")
+                assertEquals("Only protection predating the rejected Start may remain",
+                    previouslyArmed, retained.hasTun())
+            }
+        } finally {
+            OwnershipNative.reset()
+            OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun existingMetricsArmsServiceRetentionOnlyAfterHandshake() {
+        for (handshake in listOf(0L, 1L)) {
+            OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+            withRuntime(retainTunDescriptor = true) { f ->
+                OwnershipNative.statistics = "public_key=${"01".repeat(32)}\nlast_handshake_time_sec=$handshake\n"
+                TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                var replies = 0
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, observed, _ ->
+                    replies++
+                    assertEquals(handshake.takeIf { it > 0 }?.times(1000), observed)
+                }, { fail(it) })
+                f.work.runNext()
+                assertEquals(1, replies)
+                f.backend.setState(f.tunnel, Tunnel.State.DOWN, null)
+                val retained = ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention")
+                assertEquals(handshake > 0, retained.hasTun())
+            }
+            OwnershipNative.reset()
+            OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
+    @Test
+    @Config(shadows = [NoNativeLibrary::class, OwnershipNative::class, OwnershipVpn::class,
+        RetentionServiceBuilder::class, OwnershipDescriptor::class])
+    fun failedStartBusyStopIsStillReleasedByGenericCleanupRetry() {
+        OwnershipNative.reset(); OwnershipDescriptor.reset(); OwnershipVpn.protectSucceeds = true
+        try {
+            withRuntime(retainTunDescriptor = true) { f ->
+                OwnershipNative.statistics = "public_key=${"01".repeat(32)}\nlast_handshake_time_sec=1\n"
+                TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+                f.work.runNext()
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, _, _ -> }, { fail(it) })
+                f.work.runNext()
+                val gate = ReflectionHelpers.getField<TunnelStateGate>(TunnelRuntime, "stateGate")
+                assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+                var errors = 0
+                TunnelRuntime.stop(TUNNEL_API_VERSION, { _, _ -> fail("busy Stop succeeded") }, {
+                    assertEquals("tunnel_operation_in_progress", it); errors++
+                }, failedStartOperationId = args().clientOperationId!!)
+                assertEquals(1, errors)
+                gate.complete(SessionState.RUNNING)
+                // A queued observation must not re-arm the rejected Start.
+                TunnelRuntime.metrics(TUNNEL_API_VERSION, false, { _, _, _, _ -> }, { fail(it) })
+                f.work.runNext()
+                TunnelRuntime.stop(TUNNEL_API_VERSION, { _, _ -> }, { fail(it) })
+                f.work.runNext()
+                assertFalse(ReflectionHelpers.getField<ServiceTunRetention>(f.service, "tunRetention").hasTun())
+            }
+        } finally {
+            OwnershipNative.reset()
+            OwnershipDescriptor.files.values.toSet().forEach { it.delete() }
+        }
+    }
+
     // Returning normally cannot signal rejection to the runtime's native catch.
     // This characterizes the mechanism, not a historical RED against old production.
     @Test fun normalCallbackRejectionLeavesNativeUp() = withRuntime { f ->
@@ -48,9 +291,12 @@ class NativeLocalRestartCompletionTest {
         assertEquals(listOf("up"), CompletionNative.events)
     }
 
-    @Test fun thrownLateCallbackRejectionClosesNativeBeforeError() = withRuntime { f ->
+    @Test fun thrownLateCallbackRejectionClosesNativeBeforeError() = verifyLateRejection("local_restart")
+    @Test fun cancelledInitialCallbackClosesNativeBeforeError() = verifyLateRejection("user")
+
+    private fun verifyLateRejection(source: String) = withRuntime { f ->
         var callbacks = 0
-        TunnelRuntime.start(f.context, args(), { state, _ ->
+        TunnelRuntime.start(f.context, args().apply { startSource = source }, { state, _ ->
             callbacks++
             assertEquals(SessionState.RUNNING, state)
             assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
@@ -152,15 +398,16 @@ class NativeLocalRestartCompletionTest {
         f.coordinator.completeLocalRestart()
     }
 
-    private fun withRuntime(test: (Fixture) -> Unit) {
+    private fun withRuntime(retainTunDescriptor: Boolean = false, test: (Fixture) -> Unit) {
         val controller = Robolectric.buildService(VpnService::class.java).create()
         val host = controller.get()
+        if (retainTunDescriptor) OwnershipBuilder.directory = host.cacheDir
         val store = AndroidRecoveryStore(Record(), BootIdentityProvider { 1 })
         val coordinator = AndroidConnectionIntentCoordinator(store)
         val service = NelomaiVpnService(object : RuntimeVpnHostV1 {
             override val service = host
             override fun builder(beforeEstablish: (VpnService.Builder) -> Unit) = host.Builder().also(beforeEstablish)
-        })
+        }, retainTunDescriptor)
         val saved = mutableListOf<() -> Unit>()
         fun field(target: Any, name: String, value: Any?) {
             val old = ReflectionHelpers.getField<Any?>(target, name)
@@ -198,6 +445,14 @@ class NativeLocalRestartCompletionTest {
             field(service, "backgroundLogoutLifecycle", BackgroundLogoutServiceLifecycle(
                 logoutState = { BackgroundLogoutReadState.NONE }, recovery = store::read,
                 beginRedundantStop = { error("unexpected logout") }, runLogout = {}, scheduleRetry = {}, stopIfIdle = {}))
+            val serviceGeneration = ReflectionHelpers.getField<Long>(service, "serviceGeneration")
+            field(service, "redundantTotalLossLifecycle", RedundantTotalLossLifecycle(
+                currentServiceGeneration = { serviceGeneration }, serviceActive = { true },
+                barrierPending = { false }, logoutState = { BackgroundLogoutReadState.NONE },
+                recovery = store::read, post = { it() }, retryCleanup = {},
+                publishRestartStarting = {}, resume = {}, scheduleLogout = {},
+                scheduleStateReadRetry = {}, stopIfIdle = {},
+            ))
             field(service, "redundantWork", RedundantVpnWorkDispatcher(Work()))
             static(NelomaiVpnService::class.java, "activeService", service)
             static(NelomaiVpnService::class.java, "serviceReady", CompletableFuture.completedFuture(Unit))
@@ -213,10 +468,11 @@ class NativeLocalRestartCompletionTest {
             val backend = GoBackend(host.applicationContext)
             field(TunnelRuntime, "backend", backend)
             val tunnel = ReflectionHelpers.getField<Tunnel>(TunnelRuntime, "tunnel")
-            try { test(Fixture(host.applicationContext, service, store, coordinator, backend, tunnel, work)) }
+            try { test(Fixture(host.applicationContext, service, store, coordinator, backend, tunnel, work, timers)) }
             finally {
                 ReflectionHelpers.callInstanceMethod<Unit>(TunnelRuntime, "clearActiveSession")
                 backend.setState(tunnel, Tunnel.State.DOWN, null)
+                ReflectionHelpers.getField<ServiceTunRetention>(service, "tunRetention").stop(permanent = true)
             }
         } finally {
             saved.asReversed().forEach { it() }
@@ -228,7 +484,7 @@ class NativeLocalRestartCompletionTest {
 
     private class Fixture(val context: Context, val service: NelomaiVpnService,
         val store: AndroidRecoveryStore, val coordinator: AndroidConnectionIntentCoordinator,
-        val backend: GoBackend, val tunnel: Tunnel, val work: Work) {
+        val backend: GoBackend, val tunnel: Tunnel, val work: Work, val timers: DormantTimers) {
         fun envelope() = (store.read() as RecoveryStoreResult.Success).value
         fun armCheckpoint() {
             store.beginStart(0, AndroidIntentTemplate("11111111-1111-4111-8111-111111111111",
@@ -274,7 +530,11 @@ class NativeLocalRestartCompletionTest {
         override fun awaitTermination(timeout: Long, unit: TimeUnit) = false
     }
     private class DormantTimers : ScheduledThreadPoolExecutor(1) {
-        override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> = DormantFuture()
+        val scheduled = mutableListOf<Pair<Runnable, Long>>()
+        override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
+            scheduled += command to unit.toMillis(delay)
+            return DormantFuture()
+        }
         override fun scheduleAtFixedRate(command: Runnable, delay: Long, period: Long, unit: TimeUnit): ScheduledFuture<*> = DormantFuture()
     }
     private class DormantFuture : ScheduledFuture<Unit> {
@@ -288,6 +548,7 @@ class NativeLocalRestartCompletionTest {
     }
     companion object {
         private fun args() = StartTunnelArgs().apply {
+            clientOperationId = "40000000-0000-4000-8000-000000000001"
             apiVersion = TUNNEL_API_VERSION; startSource = "local_restart"
             configuration = ("[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" +
                 "Address = 10.241.0.3/32\n").toByteArray()

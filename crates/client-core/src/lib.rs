@@ -89,6 +89,7 @@ pub struct CoreLocalStop<T> {
     epoch: Arc<AtomicU64>,
     wake: Arc<Notify>,
     writers: Arc<RuntimeWriterGates>,
+    user_stop_pending: Arc<AtomicBool>,
 }
 impl<T: TunnelController> CoreLocalStop<T> {
     pub fn new(tunnel: Arc<T>) -> Arc<Self> {
@@ -98,41 +99,76 @@ impl<T: TunnelController> CoreLocalStop<T> {
             epoch: Arc::new(AtomicU64::new(0)),
             wake: Arc::new(Notify::new()),
             writers: Arc::new(RuntimeWriterGates::default()),
+            user_stop_pending: Arc::new(AtomicBool::new(false)),
         })
     }
     pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
         self.writers.clone()
     }
     pub async fn stop_local(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::SignedOut).await
+        self.stop_local_with_success_phase(Phase::SignedOut, false, false)
+            .await
     }
     pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Ready).await
+        self.stop_local_with_success_phase(Phase::Ready, false, false)
+            .await
+    }
+    /// Release locally without discarding the legacy connection identity needed
+    /// by the existing pending-Stop worker. No authentication or panel wait.
+    pub async fn stop_local_for_user(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Ready, false, true)
+            .await
     }
     /// A lost owner channel closes admission without revoking persisted auth.
     /// Error does not grant Start or assert that operational cleanup completed.
     pub async fn stop_local_on_disconnect(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Error).await
+        self.stop_local_with_success_phase(Phase::Error, true, false)
+            .await
     }
-    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
+    async fn stop_local_with_success_phase(
+        &self,
+        success_phase: Phase,
+        preserve_protection: bool,
+        preserve_connection: bool,
+    ) -> Result<(), CoreError> {
         {
             let mut state = self.state.lock().await;
             // Publish the owner stop with its cancellation epoch so a retired
             // Start cannot mistake it for a signal-only user cancellation.
             self.epoch.fetch_add(1, Ordering::SeqCst);
             self.wake.notify_waiters();
+            let connection = if preserve_connection {
+                state.connection.clone()
+            } else {
+                None
+            };
+            self.user_stop_pending.store(
+                connection.as_ref().is_some_and(|c| c.session_id.is_none()),
+                Ordering::SeqCst,
+            );
             *state = CoreState {
                 phase: Phase::Stopping,
-                connection: None,
+                connection,
             };
         }
-        let result = self.tunnel.stop().await;
+        // EOF is not consent to disarm. Native ownership/scoped Stop remains
+        // authoritative; uncertainty cannot authorize destroying retained TUN.
+        let result =
+            if preserve_protection && self.tunnel.retains_protection().await.unwrap_or(true) {
+                self.tunnel.stop_if_unowned().await
+            } else {
+                self.tunnel.stop().await
+            };
         let mut state = self.state.lock().await;
         if result.is_ok() {
-            *state = CoreState {
-                phase: success_phase,
-                connection: None,
-            };
+            if preserve_connection && state.connection.is_some() {
+                state.phase = Phase::Stopping;
+            } else {
+                *state = CoreState {
+                    phase: success_phase,
+                    connection: None,
+                };
+            }
         } else {
             state.phase = Phase::Error;
         }
@@ -1320,6 +1356,7 @@ pub struct ClientCore<A, S, T, L> {
     start_in_progress: AtomicBool,
     pending_start_active: AtomicBool,
     start_retry_wake: Arc<Notify>,
+    local_user_stop_pending: Arc<AtomicBool>,
     active_recovery_episode: Mutex<Option<ActiveRecoveryEpisode>>,
     connection_gate: Arc<Mutex<()>>,
     split_tunnel_store: Arc<dyn SplitTunnelStore>,
@@ -1387,6 +1424,7 @@ where
             start_in_progress: AtomicBool::new(false),
             pending_start_active: AtomicBool::new(pending_start_active),
             start_retry_wake: local.wake.clone(),
+            local_user_stop_pending: local.user_stop_pending.clone(),
             active_recovery_episode: Mutex::new(None),
             connection_gate: local.writers.connection.clone(),
             split_tunnel_store,
@@ -1782,7 +1820,13 @@ where
             }
             Ok(TunnelStatus::Stopping) => state.phase = Phase::Stopping,
             Ok(TunnelStatus::Stopped) if expected_stop => {
-                state.phase = Phase::Ready;
+                // A local user Stop may have finished before legacy panel cleanup.
+                // Keep its existing Stopping work visible until that worker ACKs;
+                // a native-owned pair retains its own durable cleanup instead.
+                let legacy_cleanup = self.local_user_stop_pending.load(Ordering::SeqCst) &&
+                    state.phase == Phase::Stopping && state.connection.as_ref()
+                    .is_some_and(|connection| connection.session_id.is_none());
+                if !legacy_cleanup { state.phase = Phase::Ready; }
                 if warnings.runtime.as_deref() == Some("tunnel_runtime_stopped") {
                     warnings.clear(SplitTunnelWarningKind::Runtime);
                 }
@@ -2790,26 +2834,29 @@ where
         let local_start_started = Instant::now();
         let local_start_result = self
             .tunnel
-            .start(TunnelStartRequest {
-                configuration,
-                options: tunnel_options.clone(),
-                quick_reconnect: match (is_redundant, valid_until_unix) {
-                    (true, _) => QuickReconnect::Disabled,
-                    (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
-                    (false, None) => QuickReconnect::Persistent,
+            .start_for_attempt(
+                TunnelStartRequest {
+                    configuration,
+                    options: tunnel_options.clone(),
+                    quick_reconnect: match (is_redundant, valid_until_unix) {
+                        (true, _) => QuickReconnect::Disabled,
+                        (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
+                        (false, None) => QuickReconnect::Persistent,
+                    },
+                    // Android also needs these metadata for its redundant transaction
+                    // and metadata-only tile template; offline reconnect stays disabled.
+                    quick_connection: Some(QuickConnection {
+                        lease_id: response.connection.lease_id.clone(),
+                        layer: response.connection.layer,
+                        tic_connection_mode: response.connection.tic_connection_mode,
+                        route_mode: response.connection.route_mode,
+                        egress_mode: response.connection.egress_mode,
+                        allow_alternate: options.allow_alternate,
+                    }),
+                    redundancy: redundant_start,
                 },
-                // Android also needs these metadata for its redundant transaction
-                // and metadata-only tile template; offline reconnect stays disabled.
-                quick_connection: Some(QuickConnection {
-                    lease_id: response.connection.lease_id.clone(),
-                    layer: response.connection.layer,
-                    tic_connection_mode: response.connection.tic_connection_mode,
-                    route_mode: response.connection.route_mode,
-                    egress_mode: response.connection.egress_mode,
-                    allow_alternate: options.allow_alternate,
-                }),
-                redundancy: redundant_start,
-            })
+                &operation_id,
+            )
             .await;
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
@@ -2976,6 +3023,7 @@ where
     }
 
     pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
+        self.local_user_stop_pending.store(false, Ordering::SeqCst);
         self.foreground_sequence.fetch_add(1, Ordering::SeqCst);
         self.start_in_progress.store(true, Ordering::SeqCst);
         StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst))
@@ -4387,9 +4435,10 @@ where
                 connection: Some(connection.clone()),
             };
         }
+        let operation_id = Uuid::new_v4().to_string();
         if let Err(error) = self
             .tunnel
-            .start(TunnelStartRequest {
+            .start_for_attempt(TunnelStartRequest {
                 configuration,
                 options: tunnel_options.clone(),
                 quick_reconnect: match (saved.kind, saved.valid_until_unix) {
@@ -4407,7 +4456,7 @@ where
                     allow_alternate: false,
                 }),
                 redundancy: None,
-            })
+            }, &operation_id)
             .await
         {
             // Even an error may follow a partially dispatched platform start.
@@ -4426,7 +4475,14 @@ where
                 .ensure_awg3_handshake(&saved.lease_id, None, Some(cancel_epoch))
                 .await
             {
-                if let Err(stop_error) = self.tunnel.stop().await {
+                // Cancellation is the explicit local logout/Stop boundary; an
+                // ordinary reconnect failure only compensates this attempt.
+                let cleanup = if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                    self.tunnel.stop().await
+                } else {
+                    self.tunnel.stop_failed_start(&operation_id).await
+                };
+                if let Err(stop_error) = cleanup {
                     let stop_error = CoreError::from(stop_error);
                     let mut state = self.state.lock().await;
                     if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
@@ -5441,12 +5497,14 @@ where
                 return Err(storage_error);
             }
         };
-        if stage.local_start_may_be_incomplete()
-            && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
-        {
+        if stage.local_start_may_be_incomplete() {
             // Ownership may change after the read above. Native backends fence
             // the legacy-only cleanup again when executing this command.
-            if let Err(cleanup_error) = self.tunnel.stop_if_unowned().await.map_err(CoreError::from)
+            if let Err(cleanup_error) = self
+                .tunnel
+                .stop_failed_start(operation_id)
+                .await
+                .map_err(CoreError::from)
             {
                 if self.tunnel.owns_redundant_session().await? {
                     // Confirmed native responsibility is a handoff, not a new

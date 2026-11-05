@@ -15,11 +15,14 @@ import org.json.JSONObject
 class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
     private val handler = Handler(Looper.getMainLooper())
     private var remote: IBinder? = null
-    private var bound = false
+    // Android requires unbind even when bindService returns false or throws.
+    private var bindingAttempted = false
+    private var unfrozenBindingAttempted = false
     private val pending = PendingSelectionReads<RuntimeSelectionV1>(8)
     private val timeout = Runnable { complete(Result.failure(IllegalStateException("runtime_owner_unavailable"))) }
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            if (!bindingAttempted || !unfrozenBindingAttempted) return
             remote = binder
             complete(runCatching { snapshot() })
         }
@@ -33,6 +36,14 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
             complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         }
     }
+    // Android can cache an owner that has displayed UI even while a noncached
+    // child is normally bound to it. WPRI separately keeps that owner unfrozen;
+    // retain the normal binding as well so foreground/VPN OOM priority is not lost.
+    // The normal connection owns Binder delivery, death handling and both releases.
+    private val unfrozenConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) = Unit
+        override fun onServiceDisconnected(name: ComponentName?) = Unit
+    }
 
     fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) {
         if (remote != null) { callback(runCatching { snapshot() }); return }
@@ -40,14 +51,24 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
             callback(Result.failure(IllegalStateException("runtime_owner_queue_full")))
             return
         }
-        if (bound) {
+        if (bindingAttempted) {
             handler.removeCallbacks(timeout)
             handler.postDelayed(timeout, 10_000)
             return
         }
-        bound = context.bindService(Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService"), connection, Context.BIND_AUTO_CREATE)
-        if (!bound) complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
-        else handler.postDelayed(timeout, 10_000)
+        val intent = Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService")
+        val ready = runCatching {
+            bindingAttempted = true
+            if (context.bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
+                unfrozenBindingAttempted = true
+                context.bindService(intent, unfrozenConnection,
+                    Context.BIND_AUTO_CREATE or Context.BIND_WAIVE_PRIORITY)
+            } else false
+        }.getOrDefault(false)
+        if (!ready) {
+            invalidateBinding()
+            complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
+        } else handler.postDelayed(timeout, 10_000)
     }
 
     fun snapshot(): RuntimeSelectionV1 = transact(RuntimeOwnerProtocol.SELECTION) { _, reply ->
@@ -94,8 +115,14 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
 
     private fun invalidateBinding() {
         remote = null
-        if (bound) runCatching { context.unbindService(connection) }
-        bound = false
+        if (bindingAttempted) {
+            bindingAttempted = false
+            runCatching { context.unbindService(connection) }
+        }
+        if (unfrozenBindingAttempted) {
+            unfrozenBindingAttempted = false
+            runCatching { context.unbindService(unfrozenConnection) }
+        }
     }
 
     override fun close() {

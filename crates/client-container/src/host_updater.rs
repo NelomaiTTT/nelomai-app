@@ -30,6 +30,10 @@ pub struct HostUpdateStatusV1 {
 struct Backend(Arc<dyn UpdateBackend>);
 #[async_trait::async_trait]
 impl UpdateBackend for Backend {
+    fn requires_install_confirmation(&self) -> bool {
+        self.0.requires_install_confirmation()
+    }
+
     async fn install(
         &self,
         access: &AccessSnapshot,
@@ -468,6 +472,11 @@ fn refresh_error_code(error: PrivateError) -> &'static str {
         PrivateError::RecoveryRequired => "update_refresh_recovery_required",
         PrivateError::OutcomeUnknown => "update_refresh_auth_unknown",
         PrivateError::AccessUnavailable => "update_refresh_access_unavailable",
+        PrivateError::DeviceLimitReached => "update_refresh_device_limit_reached",
+        PrivateError::InvalidCredentials => "update_refresh_invalid_credentials",
+        PrivateError::AppAccessUnavailable => "update_refresh_app_access_unavailable",
+        PrivateError::LoginRateLimited => "update_refresh_login_rate_limited",
+        PrivateError::InvalidLoginRequest => "update_refresh_invalid_login_request",
     }
 }
 
@@ -567,6 +576,21 @@ mod tests {
                 },
             ))
         }
+    }
+
+    #[test]
+    fn common_wrapper_preserves_android_confirmation_requirement() {
+        struct Installer;
+        #[async_trait]
+        impl nelomai_client_updater::AndroidApkInstaller for Installer {
+            async fn install_apk(&self, _: &std::path::Path, _: &str, _: &str) -> Result<bool, UpdateBackendError> {
+                panic!("not an installation test")
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let android = nelomai_client_updater::AndroidUpdateBackend::new(directory.path().into(), "0.3.8".into(), Arc::new(Installer)).unwrap();
+        assert!(Backend(Arc::new(android)).requires_install_confirmation());
+        assert!(!Backend(Arc::new(RecordingBackend::default())).requires_install_confirmation());
     }
 
     fn manifest() -> nelomai_contracts::VerifiedContainerManifest {

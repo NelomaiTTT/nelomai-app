@@ -255,6 +255,12 @@ impl UpdateBackendError {
 
 #[async_trait]
 pub trait UpdateBackend: Send + Sync {
+    /// Android's install pipeline begins with local Stop. A background offer
+    /// must not enter that pipeline before the user's disarm confirmation.
+    fn requires_install_confirmation(&self) -> bool {
+        false
+    }
+
     async fn install(
         &self,
         access_token: &AccessSnapshot,
@@ -362,7 +368,7 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         access_token: &AccessSnapshot,
         preferences: UpdatePreferences,
     ) -> Result<UpdatePhase, UpdateError> {
-        if !preferences.automatic {
+        if !preferences.automatic || self.backend.requires_install_confirmation() {
             return Ok(self.phase());
         }
         let _guard = self.install_gate.lock().await;

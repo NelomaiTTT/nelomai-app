@@ -218,6 +218,18 @@ pub(super) fn core_error(error: PrivateError) -> nelomai_client_core::CoreError 
         PrivateError::Cancelled | PrivateError::Closed => CoreError::StartCancelled,
         PrivateError::OutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
         PrivateError::AccessUnavailable => CoreError::AccessExpired,
+        PrivateError::DeviceLimitReached | PrivateError::InvalidCredentials
+        | PrivateError::AppAccessUnavailable | PrivateError::LoginRateLimited
+        | PrivateError::InvalidLoginRequest => {
+            let (code, message) = match error {
+                PrivateError::DeviceLimitReached => ("device_limit_reached", "Нет свободного пира для нового устройства."),
+                PrivateError::InvalidCredentials => ("invalid_credentials", "Неверный логин или пароль."),
+                PrivateError::AppAccessUnavailable => ("app_access_unavailable", "Приложение недоступно для этого аккаунта."),
+                PrivateError::LoginRateLimited => ("login_rate_limited", "Слишком много попыток входа. Подождите и попробуйте снова."),
+                _ => ("invalid_request", "Проверьте данные для входа."),
+            };
+            CoreError::Api(CoreApiError::Rejected { code: code.into(), message: message.into(), retry_after_seconds: None })
+        },
         PrivateError::Timeout | PrivateError::Service | PrivateError::RefreshPending => {
             CoreError::Api(CoreApiError::Retryable)
         }

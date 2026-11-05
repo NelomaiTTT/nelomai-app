@@ -19,6 +19,7 @@ internal fun androidServiceDispatchErrorCode(): String =
 
 internal const val EXTRA_RESULT_RECEIVER = "result_receiver"
 internal const val EXTRA_API_VERSION = "api_version"
+internal const val EXTRA_FAILED_START_OPERATION_ID = "failed_start_operation_id"
 internal const val EXTRA_LEGACY_STOP_ONLY = "legacy_stop_only"
 internal const val EXTRA_START_SOURCE = "start_source"
 internal const val EXTRA_CONFIGURATION = "configuration"
@@ -271,8 +272,8 @@ internal object TunnelServiceClient {
         val configuration = args.configuration.copyOf()
         val redundant = args.redundancy?.copyForServiceTransport()
         // Redundant ownership, cancellation and durable stop fences all use the
-        // server start operation. Legacy starts have no such identity.
-        val clientOperationId = redundant?.operationId ?: UUID.randomUUID().toString()
+        // server start operation. Core can supply the same identity for a legacy Start.
+        val clientOperationId = redundant?.operationId ?: args.clientOperationId ?: UUID.randomUUID().toString()
         try {
             requestBundle(
                 context,
@@ -308,25 +309,47 @@ internal object TunnelServiceClient {
         }
     }
 
+    fun retryProtectedConnection(context: Context, onSuccess: () -> Unit, onError: (String) -> Unit) =
+        requestBundle(context, ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_ENSURE_RUNNING).putExtra("manual_retry", true),
+            { onSuccess() }, onError)
+
+    fun setKillSwitchPreference(context: Context, enabled: Boolean, confirmed: Boolean,
+        onSuccess: (Bundle) -> Unit, onError: (String) -> Unit) = requestBundle(context,
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_KILL_SWITCH_PREFERENCE)
+            .putExtra("enabled", enabled).putExtra("confirmed", confirmed), onSuccess, onError)
+
     fun stop(
         context: Context,
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
         legacyOnly: Boolean = false,
+        failedStartOperationId: String? = null,
     ) = requestBundle(
         context,
         ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
             .putExtra(EXTRA_API_VERSION, apiVersion)
-            .putExtra(EXTRA_LEGACY_STOP_ONLY, legacyOnly),
+            .putExtra(EXTRA_LEGACY_STOP_ONLY, legacyOnly)
+            .putExtra(EXTRA_FAILED_START_OPERATION_ID, failedStartOperationId),
         { result ->
             val state = SessionState.values().firstOrNull {
                 it.wireName == result.getString(EXTRA_STATE)
             } ?: SessionState.FAILED
             onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
         },
-        onError,
+        { code ->
+            if (legacyOnly || code != SERVICE_REQUEST_TIMEOUT_ERROR) onError(code)
+            else TunnelStatusTransport.request(context, apiVersion, { status ->
+                // Re-observe after the owner's 40s fallback. IPC EOF is never proof.
+                if (status.getString(EXTRA_STATE) == SessionState.STOPPED.wireName &&
+                    status.getString("kill_switch_state") == "off") onSuccess(SessionState.STOPPED, 45_000)
+                else onError("tunnel_stop_unconfirmed")
+            }, { onError("tunnel_stop_unconfirmed") })
+        },
+        timeoutMillis = if (legacyOnly) SERVICE_REQUEST_TIMEOUT_MILLIS else 45_000L,
     )
 
     fun status(

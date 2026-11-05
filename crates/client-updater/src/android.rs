@@ -186,6 +186,10 @@ impl AndroidUpdateBackend {
 
 #[async_trait]
 impl UpdateBackend for AndroidUpdateBackend {
+    fn requires_install_confirmation(&self) -> bool {
+        true
+    }
+
     async fn install(
         &self,
         access_token: &AccessSnapshot,

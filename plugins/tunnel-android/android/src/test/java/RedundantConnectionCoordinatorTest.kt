@@ -13,6 +13,35 @@ import java.util.concurrent.atomic.AtomicReference
 
 class RedundantConnectionCoordinatorTest {
     @Test
+    fun protectionReadinessFailureCannotPublishRunning() {
+        val outcomes = mutableListOf<String>()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native,
+            onPrimaryReady = { outcomes += "protection"; false })
+        assertFalse(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            onPrimaryStarted = { outcomes += "ready" }, onPrimaryFailed = { outcomes += "failed" }))
+        assertEquals(listOf("protection", "failed"), outcomes)
+        assertFalse(coordinator.isRunning())
+    }
+
+    @Test
+    fun pendingOrCancelledReadinessDoesNotArmProtection() {
+        var cancelled = false
+        var confirmations = 0
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), FakeNative(),
+            onPrimaryReady = { confirmations++; true })
+        assertTrue(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()), shouldCancel = { cancelled }))
+        assertEquals(0, confirmations)
+        cancelled = true
+        assertFalse(coordinator.onHealthObservations(listOf(healthSlot(0, active = true,
+            handshakeFresh = true, consecutiveProbeSuccesses = 1))))
+        assertEquals(0, confirmations)
+    }
+
+    @Test
     fun primaryReadyRoleReconcilesRemoteCommitBeforeItsReplyArrives() {
         for (action in listOf("rebase", "acknowledged")) {
             var now = 0L
@@ -816,6 +845,44 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun networkWakeResumesProbesBeforeRecoveryAndWaitsForPathReadiness() {
+        var now = 0L
+        val monitor = RedundantHealthMonitor(initialNetworkAvailable = false)
+        val panel = FakePanel(
+            recoverErrors = ArrayDeque(listOf(BackgroundConnectionException("background_transport_unavailable"))),
+            recoveryHealthProbes = mapOf("lease-a" to probe()),
+        )
+        var nativeAvailable = false
+        val native = object : RedundantConnectionNative by FakeNative() {
+            override fun setNetworkAvailable(available: Boolean) { nativeAvailable = available }
+            override fun healthObservations(
+                initialReadiness: Boolean,
+                committedStandbyLeaseId: String?,
+                freshStart: Boolean,
+            ): List<SlotObservation> = if (nativeAvailable) listOf(
+                healthSlot(0, active = true, handshakeFresh = true, consecutiveProbeSuccesses = 1),
+            ) else emptyList()
+        }
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()), panel, native,
+            healthMonitor = monitor, monotonicMs = { now }, epochNowMs = { now },
+        )
+
+        assertFalse(coordinator.recover())
+        assertTrue(coordinator.onUnderlyingNetworkChanged(true))
+        assertEquals(2, panel.recoverCalls) // Network wake bypasses the pending backoff.
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        now = 3_999
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        now = 4_000
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
+        assertEquals(2, panel.recoverCalls)
+    }
+
+    @Test
     fun recoveryUsesBackoffAndProcessRecreationKeepsTheSameOperation() {
         val store = store(transaction())
         var now = 0L
@@ -860,6 +927,7 @@ class RedundantConnectionCoordinatorTest {
         val coordinator = testRedundantCoordinator(store, panel, native, epochNowMs = { now })
         assertFalse(coordinator.recover())
         store.cancelRedundantIntentAndDeferStop("stop-op", transaction().startOperationId)
+        assertFalse(coordinator.onUnderlyingNetworkChanged(available = true))
         now = 2_000
         assertFalse(coordinator.tick())
         assertEquals(1, panel.recoverCalls)
@@ -876,11 +944,12 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun recoveredBackgroundSessionPublishesReadinessOnlyAfterProbeAndPublishesFailure() {
+    fun recoveredBackgroundSessionPublishesReadinessOrRequestsNetworkRecovery() {
         for (healthy in listOf(true, false)) {
             val store = emptyStore()
             store.beginRedundant(transaction())
             val events = mutableListOf<Boolean>()
+            var restarts = 0
             val native = FakeNative().apply {
                 healthSnapshots += listOfNotNull(
                     healthSlot(0, active = true,
@@ -893,11 +962,12 @@ class RedundantConnectionCoordinatorTest {
             }
             val coordinator = testRedundantCoordinator(store,
                 FakePanel(recoveryHealthProbes = mapOf("lease-a" to probe())), native,
-                onRecoveryReadiness = { events += it })
+                onRecoveryReadiness = { events += it }, onAllSlotsStalled = { restarts++ })
             assertTrue(coordinator.recover())
             assertTrue(events.isEmpty())
             coordinator.tick()
-            assertEquals(listOf(healthy), events)
+            assertEquals(if (healthy) listOf(true) else emptyList<Boolean>(), events)
+            assertEquals(if (healthy) 0 else 1, restarts)
             assertEquals(healthy, coordinator.isRunning())
         }
     }
@@ -3360,6 +3430,54 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(0, native.stopCalls)
         assertTrue(coordinator.isRunning())
         assertFalse(panel.acquireReplaceLeaseIds.contains("lease-b"))
+    }
+
+    @Test
+    fun unavailableRecoveredReadinessPreparesAnotherDurableRestartOnlyOnce() {
+        for (prepared in listOf(false, true)) {
+            val store = emptyStore()
+            val original = transaction()
+            assertTrue(store.beginRedundant(original) is RecoveryStoreResult.Success)
+            val native = FakeNative()
+            val panel = FakePanel(recoveredSession = session("lease-a", 1, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            var now = 0L
+            var restarts = 0
+            val readiness = mutableListOf<Boolean>()
+            val coordinator = testRedundantCoordinator(store, panel, native,
+                epochNowMs = { now }, monotonicMs = { now },
+                onRecoveryReadiness = { readiness += it },
+                onAllSlotsStalled = {
+                    restarts++
+                    assertTrue(store.prepareRedundantTotalLoss(original.startOperationId,
+                        redundantTotalLossRestartReplay(original, "replacement")) is RecoveryStoreResult.Success)
+                })
+            if (prepared) assertTrue(coordinator.startPrepared(original, panel.recover(original)))
+            else assertTrue(coordinator.recover())
+            now = 30_000L
+            assertFalse(coordinator.onHealthObservations(listOf(
+                healthSlot(0, active = true, health = BackendHealth.WARMING, handshakeFresh = false),
+                healthSlot(1, health = BackendHealth.WARMING, handshakeFresh = false),
+            )))
+            assertEquals("Readiness loss must keep durable recovery ($prepared)", 1, restarts)
+            assertTrue(readiness.isEmpty())
+            assertFalse(coordinator.tick())
+            assertFalse(coordinator.resume())
+            assertEquals(1, restarts)
+            assertEquals(1, native.stopCalls)
+            val saved = (store.read() as RecoveryStoreResult.Success).value
+            assertTrue(saved.intent.desiredActive)
+            assertEquals("replacement", saved.redundantTransaction!!.retry.totalLossRestartReplay!!.startOperationId)
+            // Existing cleanup promotion retains the intent in the durable replay.
+            assertTrue(store.deferRedundantStop("stop", original.startOperationId) is RecoveryStoreResult.Success)
+            assertTrue(store.updateRedundant(original.startOperationId) {
+                it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+            } is RecoveryStoreResult.Success)
+            assertTrue(store.completeRedundantStop("stop", original.startOperationId) is RecoveryStoreResult.Success)
+            val replay = (store.read() as RecoveryStoreResult.Success).value
+            assertTrue(replay.intent.desiredActive)
+            assertEquals("replacement", replay.leaseTransaction!!.startOperationId)
+        }
     }
 
     @Test

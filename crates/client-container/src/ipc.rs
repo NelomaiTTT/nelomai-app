@@ -50,6 +50,16 @@ pub enum PrivateError {
     AccessUnavailable,
     #[error("authentication service failed")]
     Service,
+    #[error("no peer available for this device")]
+    DeviceLimitReached,
+    #[error("invalid login credentials")]
+    InvalidCredentials,
+    #[error("application access unavailable")]
+    AppAccessUnavailable,
+    #[error("login rate limited")]
+    LoginRateLimited,
+    #[error("invalid login request")]
+    InvalidLoginRequest,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

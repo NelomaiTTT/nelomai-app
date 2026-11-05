@@ -378,6 +378,8 @@ impl CoreLogger for MemoryLogger {
 
 #[derive(Default)]
 struct MemoryTunnel {
+    rejected_start_operations: Mutex<Vec<String>>,
+    start_operations: Mutex<Vec<String>>,
     starts: AtomicUsize,
     async_stop_supported: AtomicBool,
     stops: AtomicUsize,
@@ -432,6 +434,29 @@ struct MemoryTunnel {
 
 #[async_trait]
 impl TunnelController for MemoryTunnel {
+    async fn start_for_attempt(
+        &self,
+        request: TunnelStartRequest,
+        operation_id: &str,
+    ) -> Result<(), TunnelError> {
+        self.start_operations
+            .lock()
+            .unwrap()
+            .push(operation_id.into());
+        self.start(request).await
+    }
+
+    async fn stop_failed_start(&self, operation_id: &str) -> Result<(), TunnelError> {
+        self.rejected_start_operations
+            .lock()
+            .unwrap()
+            .push(operation_id.into());
+        if !matches!(self.status().await, Ok(TunnelStatus::Stopped)) {
+            self.stop_if_unowned().await?;
+        }
+        Ok(())
+    }
+
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         if self.owns_redundant_session().await? {
             return Err(TunnelError::Backend("native_owned".into()));
@@ -10586,6 +10611,10 @@ async fn cancellation_while_handshake_is_in_flight_stops_local_before_panel_comp
     core.finish_start_attempt();
 
     assert!(matches!(error, CoreError::StartCancelled));
+    assert_eq!(
+        tunnel.rejected_start_operations.lock().unwrap().as_slice(),
+        tunnel.start_operations.lock().unwrap().as_slice()
+    );
     assert_eq!(core.state().await.phase, Phase::Ready);
     assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Stopped);
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
@@ -11716,4 +11745,54 @@ async fn negotiated_async_stop_reaches_native_owner_and_core_does_not_take_its_s
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
     assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn offline_reconnect_failure_must_remain_scoped() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: awg3_configuration("offline-secret"),
+        valid_until_unix: Some(1_700_000_100),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = support::core(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+    core.start_saved_stray_offline(1_700_000_000).await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    tunnel.handshake_before_rebind.store(false, Ordering::SeqCst);
+    let error = core
+        .start_saved_stray_offline(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    let state = core.state().await;
+    assert_eq!(state.phase, Phase::Ready);
+    assert!(state.connection.is_none());
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+    let attempts = tunnel.start_operations.lock().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0], attempts[1]);
+    assert_eq!(*tunnel.rejected_start_operations.lock().unwrap(), vec![attempts[1].clone()]);
 }
