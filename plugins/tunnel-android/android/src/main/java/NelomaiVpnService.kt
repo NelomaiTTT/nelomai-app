@@ -2019,6 +2019,15 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             if (ready && owner.isRunning()) {
                 QuickTunnelController.updateState(applicationContext, SessionState.RUNNING,
                     desiredActive = null, changed = true)
+                runCatching {
+                    AutomaticDiagnostics.onTunnelStarted(
+                        applicationContext,
+                        transaction.localActiveLeaseId,
+                        "amneziawg_3",
+                        ownerSessionId = transaction.sessionId,
+                        deviceId = transaction.template.deviceId,
+                    )
+                }.onFailure { TunnelLog.warning("diagnostics.session_start_failed") }
             } else if (!ready && !owner.isRunning()) {
                 // A failed first handshake must not leave a tile stuck at STARTING.
                 beginFailClosedRedundantStop(operationId, owner)
@@ -5400,6 +5409,32 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
         fun stopForegroundService() {
             activeService?.finishService()
+        }
+
+        /** Null means the owner's identity is unreadable or changed during observation. */
+        internal fun redundantDiagnosticsSessionRunning(sessionId: String, deviceId: String?): Boolean? {
+            val service = activeService ?: return false
+            if (service.serviceDestroyed || !service.serviceCallbackGate.isOpen() ||
+                service.serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get()
+            ) return false
+            val installed = service.redundantVpnOwnerSlot.snapshot() ?: return false
+            if (!installed.owner.isRunning()) return false
+            val recovery = service.recoveryStore.read()
+            val current = service.redundantVpnOwnerSlot.snapshot()
+            // Route metadata replaces the record without replacing the VPN owner.
+            // An actual handoff invalidates this observation; it does not prove Stop.
+            if (activeService !== service ||
+                service.serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                current?.owner !== installed.owner ||
+                current.startOperationId != installed.startOperationId
+            ) return null
+            if (service.serviceDestroyed || !service.serviceCallbackGate.isOpen()) return false
+            if (recovery is RecoveryStoreResult.Failure) return null
+            val transaction = service.activeRedundantTransactionForCurrentWork(
+                recovery, installed.startOperationId,
+            ) ?: return false
+            return transaction.sessionId == sessionId && transaction.template.deviceId == deviceId &&
+                installed.owner.isRunning()
         }
 
         fun reportDataPlaneStall(leaseId: String): Boolean =

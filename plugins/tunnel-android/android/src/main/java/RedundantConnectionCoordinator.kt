@@ -653,7 +653,7 @@ internal class RedundantConnectionCoordinator(
                     shouldCancel = { false },
                     freshStart = freshStart,
                     drainPendingWork = true,
-                    onReady = { onRecoveryReadiness(true) },
+                    onReady = {},
                     onFailed = { onRecoveryReadiness(false) },
                     onCancelled = {},
                 )
@@ -968,6 +968,7 @@ internal class RedundantConnectionCoordinator(
             transaction.localActiveLeaseId == transaction.slotBLeaseId
         publishReserveStateLocked(transaction, emptyList())
         onReady()
+        onRecoveryReadiness(true)
         return !drainPendingWork || drainPendingWorkLocked()
     }
 
