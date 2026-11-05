@@ -36,6 +36,8 @@ pub(crate) enum StopFault {
     StopReply,
     GuardWithdrawal,
     DnsCommitAck,
+    RouteBudgetExhausted,
+    GuardWithdrawalBudgetExhausted,
 }
 thread_local! {
     pub(crate) static STOP_FAULT: std::cell::Cell<Option<StopFault>> = const { std::cell::Cell::new(None) };
@@ -526,7 +528,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
     let rounds = match role.as_deref() {
         Some("engine") => 1..2,
         Some("recover") => 2..4,
-        _ => 0..4,
+        _ => 0..6,
     };
     for round in rounds {
         let scope = SessionScope {
@@ -1045,6 +1047,8 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let fault = match round {
             0 => StopFault::RoutesCleanup,
             1 => StopFault::StopReply,
+            4 => StopFault::RouteBudgetExhausted,
+            5 => StopFault::GuardWithdrawalBudgetExhausted,
             _ => StopFault::GuardWithdrawal,
         };
         STOP_FAULT.with(|value| value.set(Some(fault)));
@@ -1057,10 +1061,17 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         let pending = actor.redundant(Command::Status {
             scope: scope.clone(),
         });
-        let first_wait = observed
-            .as_ref()
-            .ok()
-            .map(|(_, process)| unsafe { WaitForSingleObject(process.as_raw_handle(), 0) });
+        // TerminateProcess is asynchronous when the close deadline is exhausted.
+        // Observe its completion outside both measured Stop attempts; retain
+        // immediate liveness checks for the worker-preserving fault cases.
+        let observe_exit_ms = if fault == StopFault::GuardWithdrawalBudgetExhausted {
+            7_000
+        } else {
+            0
+        };
+        let first_wait = observed.as_ref().ok().map(|(_, process)| unsafe {
+            WaitForSingleObject(process.as_raw_handle(), observe_exit_ms)
+        });
         let repeat_at = Instant::now();
         let stopped = actor.redundant(Command::Stop {
             scope: scope.clone(),
@@ -1083,7 +1094,7 @@ fn worker_factory_start_stop_fresh_child_repeat() {
         assert!(pending.cleanup_pending);
         assert_eq!(
             first_wait,
-            Some(if round == 0 {
+            Some(if matches!(round, 0 | 4) {
                 WAIT_TIMEOUT
             } else {
                 WAIT_OBJECT_0

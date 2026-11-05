@@ -81,6 +81,26 @@ pub(crate) struct PhysicalRoute {
     /// Exact retained metadata, NOT a rewritten static/adoptable row.
     pub row: Row,
 }
+
+/// Route access policy; source/owner and exact row CAS remain the caller's
+/// responsibility. Only persisted network stopping selects cleanup semantics.
+pub(crate) fn verify_route_path(
+    expected: &PhysicalRoute,
+    stopping: bool,
+    read_identity: impl FnOnce(u32) -> std::io::Result<InterfaceIdentity>,
+    capture: impl FnOnce() -> std::io::Result<PhysicalSnapshot>,
+) -> std::io::Result<()> {
+    if stopping {
+        // DHCP/metric changes do not revoke authority over a journal-owned
+        // row. Reuse of the original NIC's index/LUID/GUID does revoke it.
+        return if read_identity(expected.proof.identity.index)? == expected.proof.identity {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(DiscoveryError::Stale))
+        };
+    }
+    capture()?.verify(expected).map_err(std::io::Error::other)
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedHost {
     pub destination: IpAddr,

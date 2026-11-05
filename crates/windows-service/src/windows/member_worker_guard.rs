@@ -63,13 +63,17 @@ impl Guard {
         #[cfg(test)]
         if kind == SessionKind::DynamicPermits
             && super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
-                if fault.get()
-                    == Some(super::member_worker_factory_native_tests::StopFault::GuardWithdrawal)
-                {
-                    fault.set(None);
-                    true
-                } else {
-                    false
+                use super::member_worker_factory_native_tests::StopFault;
+                match fault.get() {
+                    Some(StopFault::GuardWithdrawal) => {
+                        fault.set(None);
+                        true
+                    }
+                    Some(StopFault::GuardWithdrawalBudgetExhausted) => {
+                        fault.set(Some(StopFault::RouteBudgetExhausted));
+                        true
+                    }
+                    _ => false,
                 }
             })
         {

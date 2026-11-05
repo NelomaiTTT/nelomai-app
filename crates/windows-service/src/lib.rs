@@ -166,6 +166,7 @@ mod member_serialized_lease;
 mod member_source;
 #[cfg(any(windows, test))]
 mod member_worker_guard;
+mod member_worker_stop;
 pub mod redundancy;
 #[cfg(any(windows, test))]
 mod service_lifecycle;

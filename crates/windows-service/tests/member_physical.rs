@@ -48,6 +48,75 @@ fn ip(value: &str) -> IpAddr {
 }
 
 #[test]
+fn cleanup_checks_original_identity_without_rediscovering_forwarding_path() {
+    let original = capture(
+        vec![row("0.0.0.0/0", 7, Some("192.0.2.1"), 0)],
+        vec![interface(7, Family::V4, 25)],
+    );
+    let expected = original.resolve_host(ip("198.51.100.7")).unwrap().path;
+    let scans = std::cell::Cell::new(0);
+    let current_identity = expected.proof.identity;
+    verify_route_path(
+        &expected,
+        true,
+        |index| {
+            assert_eq!(index, 7);
+            Ok(current_identity)
+        },
+        || {
+            scans.set(scans.get() + 1);
+            // DHCP replaced the default gateway and metric. Authority to
+            // delete an exact journal-owned bypass row has not changed.
+            Ok(capture(
+                vec![row("0.0.0.0/0", 7, Some("192.0.2.2"), 1)],
+                vec![interface(7, Family::V4, 50)],
+            ))
+        },
+    )
+    .unwrap();
+    assert_eq!(scans.get(), 0);
+    assert!(verify_route_path(
+        &expected,
+        false,
+        |_| panic!("forwarding needs full proof"),
+        || {
+            Ok(capture(
+                vec![row("0.0.0.0/0", 7, Some("192.0.2.2"), 1)],
+                vec![interface(7, Family::V4, 50)],
+            ))
+        }
+    )
+    .is_err());
+}
+
+#[test]
+fn cleanup_rejects_recycled_interface_and_identity_query_failure() {
+    let original = capture(
+        vec![row("0.0.0.0/0", 7, Some("192.0.2.1"), 0)],
+        vec![interface(7, Family::V4, 25)],
+    );
+    let expected = original.resolve_host(ip("198.51.100.7")).unwrap().path;
+    for changed in 0..4 {
+        assert!(verify_route_path(
+            &expected,
+            true,
+            |_| {
+                let mut identity = expected.proof.identity;
+                match changed {
+                    0 => identity.index = 8,
+                    1 => identity.luid += 1,
+                    2 => identity.guid[0] ^= 1,
+                    _ => return Err(std::io::Error::other("query failed")),
+                }
+                Ok(identity)
+            },
+            || panic!("cleanup must not rediscover or adopt another path")
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn windows_lan_rows_are_retained_without_treating_them_as_remote_hosts() {
     // Observed physical Ethernet table on the Windows acceptance device.
     let prefixes = [

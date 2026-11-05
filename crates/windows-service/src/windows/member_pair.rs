@@ -112,6 +112,9 @@ impl CheckedRows {
         let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
             return Err(failed());
         };
+        self.absent_interface(*index)
+    }
+    fn absent_interface(&self, index: u32) -> io::Result<bool> {
         let member = self
             .proofs
             .0
@@ -123,7 +126,7 @@ impl CheckedRows {
                 m.owner
                     .proof
                     .or(m.owner.retired_proof)
-                    .is_some_and(|p| p.interface.index == *index)
+                    .is_some_and(|p| p.interface.index == index)
             })
             .cloned();
         match member {
@@ -144,14 +147,11 @@ impl NetworkSystem for CheckedRows {
         self.rows.read(key)
     }
     fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
-        crate::member_routes::read_many_routes(&mut NativeRowIo, keys, |key| {
-            if self.absent_member(key)? {
+        crate::member_routes::read_many_routes(&mut NativeRowIo, keys, |index| {
+            if self.absent_interface(index)? {
                 Ok(None)
             } else {
-                let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
-                    return Err(failed());
-                };
-                self.proofs.verify(*index).map(Some)
+                self.proofs.verify(index).map(Some)
             }
         })
     }

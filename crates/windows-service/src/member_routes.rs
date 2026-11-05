@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use nelomai_client_tunnel::redundancy::network::{
     NetworkSystem, NetworkValue, ResourceKey, RouteScope, RouteValue,
 };
-use std::io;
+use std::{collections::BTreeMap, io};
 
 pub const MAX_TABLE_ROWS: usize = 65_536;
 
@@ -90,26 +90,29 @@ pub(crate) fn read_absent_route(
     Ok(None)
 }
 
-/// A `None` proof attests exact interface absence, before and after the
-/// native enumeration. It authorizes only an empty result, never mutation.
+/// Attest each distinct interface around ONE native enumeration. A `None`
+/// proof attests exact absence and permits only empty rows, never mutation.
+/// Proofs are discarded at return; later CAS/readback revalidate independently.
 pub(crate) fn read_many_routes(
     rows: &mut impl RowIo,
     keys: &[ResourceKey],
-    mut check: impl FnMut(&ResourceKey) -> io::Result<Option<NativeProof>>,
+    mut check: impl FnMut(u32) -> io::Result<Option<NativeProof>>,
 ) -> io::Result<Vec<Option<NetworkValue>>> {
     let addressed = keys.iter().map(route_key).collect::<io::Result<Vec<_>>>()?;
-    let mut proofs = Vec::with_capacity(keys.len());
-    for (key, (_, index)) in keys.iter().zip(&addressed) {
-        let proof = check(key)?;
-        if proof.is_some_and(|p| p.index != *index || p.luid == 0) {
-            return Err(conflict());
+    let mut proofs = BTreeMap::new();
+    for (_, index) in &addressed {
+        if let std::collections::btree_map::Entry::Vacant(entry) = proofs.entry(*index) {
+            let proof = check(*index)?;
+            if proof.is_some_and(|p| p.index != *index || p.luid == 0) {
+                return Err(conflict());
+            }
+            entry.insert(proof);
         }
-        proofs.push(proof);
     }
     let current = rows.read_many(&addressed);
-    // Reattest every key even when enumeration failed, just like read_proven.
-    for (key, proof) in keys.iter().zip(&proofs) {
-        if check(key)? != *proof {
+    // Reattest even when enumeration failed, just like read_proven.
+    for (index, proof) in &proofs {
+        if check(*index)? != *proof {
             return Err(conflict());
         }
     }
@@ -120,8 +123,8 @@ pub(crate) fn read_many_routes(
     current
         .into_iter()
         .zip(addressed)
-        .zip(proofs)
-        .map(|((rows, (destination, index)), proof)| {
+        .map(|(rows, (destination, index))| {
+            let proof = proofs[&index];
             let Some(proof) = proof else {
                 return if rows.is_empty() {
                     Ok(None)
@@ -206,8 +209,8 @@ impl<R: RowIo, I: IdentityCheck> NetworkSystem for MemberRoutes<R, I> {
         Ok(row.map(|r| NetworkValue::Route(r.route)))
     }
     fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
-        read_many_routes(&mut self.rows, keys, |key| {
-            self.identity.verify(route_key(key)?.1).map(Some)
+        read_many_routes(&mut self.rows, keys, |index| {
+            self.identity.verify(index).map(Some)
         })
     }
     fn compare_exchange(
@@ -393,7 +396,68 @@ mod tests {
         )
     }
     #[test]
-    fn batch_uses_one_io_and_keeps_each_identity_check_and_fresh_cas() {
+    fn batch_cleanup_cost_scales_with_interfaces_and_cas_stays_fresh() {
+        let f = Fake::default();
+        let values: Vec<_> = (0..82)
+            .map(|n| {
+                let mut r = route(false);
+                r.destination = format!("172.16.{n}.0/24").parse().unwrap();
+                if n >= 80 {
+                    r.interface = 8;
+                    r.scope = RouteScope::WindowsInterface(8);
+                }
+                f.0.borrow_mut().rows.push(Row::static_route(
+                    r.clone(),
+                    NativeProof {
+                        index: r.interface,
+                        luid: u64::from(r.interface) * 100,
+                    },
+                ));
+                NetworkValue::Route(r)
+            })
+            .collect();
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let stale = Rc::new(std::cell::Cell::new(false));
+        let count = calls.clone();
+        let changed = stale.clone();
+        let mut m = MemberRoutes::new(f.clone(), move |index| {
+            count.set(count.get() + 1);
+            if count.get() > 4 && !changed.get() {
+                return Err(io::Error::other(
+                    "per-route discovery exhausted cleanup budget",
+                ));
+            }
+            if changed.get() {
+                return Err(conflict());
+            }
+            Ok(NativeProof {
+                index,
+                luid: u64::from(index) * 100,
+            })
+        });
+        let keys: Vec<_> = values.iter().map(NetworkValue::key).collect();
+        assert_eq!(
+            m.read_many(&keys).unwrap(),
+            values.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            calls.get(),
+            4,
+            "two interfaces, attested before and after the batch"
+        );
+        assert_eq!(f.0.borrow().events, ["batch"]);
+        stale.set(true);
+        assert!(m
+            .compare_exchange(&keys[0], Some(&values[0]), None)
+            .is_err());
+        assert!(
+            f.0.borrow().writes.is_empty(),
+            "batch evidence must not authorize later deletion"
+        );
+    }
+
+    #[test]
+    fn batch_uses_one_io_and_keeps_each_interface_check_and_fresh_cas() {
         let v4 = value(&route(false));
         let v6 = value(&route(true));
         let f = Fake::default();
@@ -410,10 +474,7 @@ mod tests {
             m.read_many(&[v6.key(), v4.key(), v4.key()]).unwrap(),
             vec![Some(v6), Some(v4.clone()), Some(v4.clone())]
         );
-        assert_eq!(
-            f.0.borrow().events,
-            ["verify", "verify", "verify", "batch", "verify", "verify", "verify"]
-        );
+        assert_eq!(f.0.borrow().events, ["verify", "batch", "verify"]);
         f.0.borrow_mut().rows.clear();
         assert!(m.compare_exchange(&v4.key(), Some(&v4), None).is_err());
         assert!(f.0.borrow().writes.is_empty());

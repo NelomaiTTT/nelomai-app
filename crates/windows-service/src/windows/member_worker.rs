@@ -1032,17 +1032,25 @@ impl crate::member_routes::IdentityCheck for WorkerIdentity {
                 return Err(failed());
             }
         } else {
-            let interface = self.journal.borrow().current.interface;
-            super::member_physical::verify(
+            let journal = self.journal.borrow();
+            let stopping = journal.current.network.read_view()?.stopping();
+            let interface = journal.current.interface;
+            crate::member_physical::verify_route_path(
                 &path,
-                &interface
-                    .map(|p| crate::member_physical::InterfaceIdentity {
-                        index: p.index,
-                        luid: p.luid,
-                        guid: p.guid,
-                    })
-                    .into_iter()
-                    .collect::<Vec<_>>(),
+                stopping,
+                super::member_physical::read_identity,
+                || {
+                    super::member_physical::capture(
+                        &interface
+                            .map(|p| crate::member_physical::InterfaceIdentity {
+                                index: p.index,
+                                luid: p.luid,
+                                guid: p.guid,
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>(),
+                    )
+                },
             )?;
         }
         Ok(crate::member_routes::NativeProof {
@@ -1054,7 +1062,7 @@ impl crate::member_routes::IdentityCheck for WorkerIdentity {
 impl WorkerIdentity {
     fn batch_read_identity(
         &mut self,
-        key: &ResourceKey,
+        index: u32,
     ) -> io::Result<Option<crate::member_routes::NativeProof>> {
         if self.original.is_none() {
             self.journal.borrow_mut().verify()?;
@@ -1065,16 +1073,11 @@ impl WorkerIdentity {
                 || journal.current.process.is_none()
                 || journal.current.boot != super::member_boot::boot_id()?
                 || journal.current.runtime != *journal.source.identity();
-            if absence_only
-                || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
-            {
+            if absence_only || interface.is_some_and(|p| p.index == index) {
                 return Ok(None);
             }
         }
-        let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
-            return Err(failed());
-        };
-        crate::member_routes::IdentityCheck::verify(self, *index).map(Some)
+        crate::member_routes::IdentityCheck::verify(self, index).map(Some)
     }
 }
 impl NetworkSystem for WorkerIdentity {
@@ -1115,7 +1118,7 @@ impl NetworkSystem for WorkerIdentity {
         crate::member_routes::read_many_routes(
             &mut super::member_routes::NativeRowIo,
             keys,
-            |key| self.batch_read_identity(key),
+            |index| self.batch_read_identity(index),
         )
     }
     fn compare_exchange(
@@ -1124,6 +1127,17 @@ impl NetworkSystem for WorkerIdentity {
         before: Option<&NetworkValue>,
         after: Option<&NetworkValue>,
     ) -> io::Result<()> {
+        if after.is_some()
+            && self
+                .journal
+                .borrow()
+                .current
+                .network
+                .read_view()?
+                .stopping()
+        {
+            return Err(failed()); // Stopping grants deletion, never new route authority.
+        }
         if self.original.is_none() {
             if after.is_some() {
                 return Err(failed());
@@ -2738,6 +2752,18 @@ impl NativePair for Control {
         if let Err(e) = self.delete_address() {
             error = Some(e);
         }
+        // Exercise the real preserve/retry path without sleeping in native tests.
+        #[cfg(test)]
+        let deadline = super::member_worker_factory_native_tests::STOP_FAULT.with(|fault| {
+            if fault.get()
+                == Some(super::member_worker_factory_native_tests::StopFault::RouteBudgetExhausted)
+            {
+                fault.set(None);
+                Instant::now()
+            } else {
+                deadline
+            }
+        });
         // Cleanup needs this original live worker/interface. After DATA
         // withdrawal, preserve that prerequisite for the same scoped retry.
         if withdrawn
@@ -2750,12 +2776,14 @@ impl NativePair for Control {
         }
         if self.original.child.borrow().is_some() && !self.original.exit_ack.get() {
             if self.rpc.borrow().is_some() {
-                match self.call(
-                    json!({"op":"stop","await_absence":false}),
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_secs(4)),
-                ) {
+                // Local cleanup may exhaust this attempt. Return BEFORE consuming
+                // the RPC or terminating: the same retained owner retries Stop.
+                let budget = crate::member_worker_stop::graceful_stop_timeout(
+                    deadline,
+                    Instant::now(),
+                    withdrawn,
+                )?;
+                match self.call(json!({"op":"stop","await_absence":false}), budget) {
                     Ok(reply)
                         if reply["closed"].as_bool() == Some(true)
                             && reply["absent"].as_bool() == Some(false) =>
