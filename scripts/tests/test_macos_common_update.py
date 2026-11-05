@@ -2,6 +2,7 @@
 import hashlib
 import io
 import os
+import plistlib
 from pathlib import Path
 import shlex
 import shutil
@@ -127,6 +128,7 @@ esac
         script = script.replace("/usr/bin/ditto", str(self.bin / "ditto"))
         script = script.replace("/usr/bin/codesign", str(self.bin / "codesign"))
         script = script.replace("/usr/bin/xattr", str(self.bin / "xattr"))
+        script = script.replace("/usr/bin/hdiutil", str(self.bin / "hdiutil"))
         self.script = self.root / "installer.sh"
         self.script.write_text(script)
         self.events = self.root / "events"
@@ -169,6 +171,141 @@ esac
         self.assertFalse(list(self.install_root.glob(".install.*/update.tar.gz")))
         for path in self.destination.rglob("*"):
             self.assertFalse(path.stat().st_mode & 0o022, str(path))
+
+    def dmg(self):
+        image = self.root / "verified update 'quoted'.dmg"
+        image.write_bytes(b"authenticated disk image fixture")
+        self.executable(self.bin / "hdiutil", """#!/bin/sh
+set -eu
+case "$1" in
+  verify)
+    test "${REJECT_IMAGE:-0}" = 0 || exit 77
+    printf 'image-verify\\n' >> "$EVENTS" ;;
+  attach)
+    test "$2" = -readonly && test "$3" = -nobrowse && test "$4" = -noautoopen && test "$5" = -mountpoint || exit 78
+    /bin/cp -R "$DMG_SOURCE" "$6/Nelomai.app"
+    /bin/ln -s /Applications "$6/Applications"
+    printf 'image-attach\\n' >> "$EVENTS"
+    test "${REJECT_ATTACH:-0}" = 0 || exit 79 ;;
+  detach)
+    printf 'image-detach\\n' >> "$EVENTS"
+    test "${REJECT_DETACH:-0}" = 0 || exit 80 ;;
+  *) exit 81 ;;
+esac
+""")
+        return image, hashlib.sha256(image.read_bytes()).hexdigest()
+
+    def test_dmg_is_hashed_before_mount_and_detached_before_activation(self):
+        args = self.dmg()
+        result = self.run_installer(args, DMG_SOURCE=str(self.source))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = self.events.read_text().splitlines()
+        self.assertEqual(events[:3], ["image-verify", "image-attach", "image-detach"])
+        self.assertLess(events.index("image-detach"), events.index("helper:501"))
+        self.assertTrue((self.destination / "new-marker").exists())
+        self.assertFalse(list(self.install_root.glob(".install.*/update.dmg")))
+
+    def test_dmg_hash_failure_never_calls_hdiutil(self):
+        image, _ = self.dmg()
+        self.assert_previous_preserved(self.run_installer([image, "0" * 64], DMG_SOURCE=str(self.source)))
+        self.assertFalse(self.events.exists())
+
+    def test_dmg_failure_preserves_previous_and_detach_is_required(self):
+        args = self.dmg()
+        for failure in ["REJECT_IMAGE", "REJECT_ATTACH", "REJECT_DETACH"]:
+            with self.subTest(failure=failure):
+                self.events.unlink(missing_ok=True)
+                self.assert_previous_preserved(self.run_installer(args, DMG_SOURCE=str(self.source), **{failure:"1"}))
+                events = self.events.read_text().splitlines() if self.events.exists() else []
+                self.assertNotIn("helper:501", events)
+                if failure != "REJECT_IMAGE":
+                    self.assertIn("image-detach", events)
+        # Same authenticated download can be retried after a failed mount/detach.
+        self.assertEqual(self.run_installer(args, DMG_SOURCE=str(self.source)).returncode, 0)
+
+    def test_dmg_rejects_links_inside_app_and_detaches_on_copy_failure(self):
+        args = self.dmg()
+        link = self.source / "Contents/escape"
+        link.symlink_to(self.root)
+        result = self.run_installer(args, DMG_SOURCE=str(self.source))
+        self.assert_previous_preserved(result)
+        self.assertIn("image-detach", self.events.read_text())
+        link.unlink()
+        self.events.unlink()
+        self.executable(self.bin / "ditto", "#!/bin/sh\nexit 79\n")
+        result = self.run_installer(args, DMG_SOURCE=str(self.source))
+        self.assert_previous_preserved(result)
+        self.assertIn("image-detach", self.events.read_text())
+        self.assertNotIn("helper:501", self.events.read_text())
+
+    def test_interrupted_dmg_copy_detaches_preserves_previous_and_can_retry(self):
+        args = self.dmg()
+        self.executable(self.bin / "ditto", '#!/bin/sh\nprintf "copy-ready\\n" >> "$EVENTS"\nsleep 10\n/bin/cp -R "$1" "$2"\n')
+        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", EVENTS=str(self.events),
+                   DESTINATION=str(self.destination), SERVICE_ROOT=str(self.service_root),
+                   SERVICE_PLIST=str(self.plist), DMG_SOURCE=str(self.source))
+        process = subprocess.Popen(["/bin/sh", str(self.script), "501", *map(str,args)], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.events.exists() and "copy-ready" in self.events.read_text():
+                    break
+                time.sleep(.02)
+            self.assertIn("copy-ready", self.events.read_text())
+            os.killpg(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+            result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+            self.assert_previous_preserved(result)
+            self.assertIn("image-detach", self.events.read_text())
+            self.assertNotIn("helper:501", self.events.read_text())
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.communicate(timeout=5)
+        self.executable(self.bin / "ditto", '#!/bin/sh\n/bin/cp -R "$1" "$2"\n')
+        self.assertEqual(self.run_installer(args, DMG_SOURCE=str(self.source)).returncode, 0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS disk image")
+    def test_native_dmg_mount_copy_detach_leaves_no_installer_image(self):
+        image = self.root / "native.dmg"
+        image_root = self.root / "dmg-root"
+        image_root.mkdir()
+        shutil.copytree(self.source, image_root / "Nelomai.app")
+        (image_root / "Applications").symlink_to("/Applications")
+        subprocess.run(["/usr/bin/hdiutil", "create", "-fs", "HFS+", "-format", "UDZO", "-nospotlight", "-srcfolder", str(image_root), str(image)], check=True, capture_output=True)
+        # Disk Arbitration on this host rejects custom mountpoints on removable
+        # volumes. Keep all bytes on SSD, let macOS choose its normal read-only
+        # mount, and map only this fixture's private mountpoint to it. The real
+        # production mount under /Library (and root elevation) is not simulated
+        # as verified by this test; copy, checksums and detach are native here.
+        self.executable(self.bin / "hdiutil", f"#!{sys.executable}\n" + """
+import os, pathlib, plistlib, subprocess, sys
+args=sys.argv[1:]
+if args[0]=='attach':
+    assert args[1:5]==['-readonly','-nobrowse','-noautoopen','-mountpoint']
+    point=pathlib.Path(args[5])
+    result=subprocess.run(['/usr/bin/hdiutil','attach','-readonly','-nobrowse','-noautoopen','-plist',args[6]],capture_output=True)
+    if result.returncode: sys.exit(result.returncode)
+    entries=plistlib.loads(result.stdout)['system-entities']
+    mounts=[entry['mount-point'] for entry in entries if 'mount-point' in entry]
+    assert len(mounts)==1
+    point.rmdir(); point.symlink_to(mounts[0])
+elif args[0]=='detach':
+    point=pathlib.Path(args[1])
+    result=subprocess.run(['/usr/bin/hdiutil','detach',str(point.resolve())])
+    if result.returncode: sys.exit(result.returncode)
+    point.unlink(); point.mkdir()
+else:
+    sys.exit(subprocess.run(['/usr/bin/hdiutil',*args]).returncode)
+""")
+        result = self.run_installer([image, hashlib.sha256(image.read_bytes()).hexdigest()])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.destination / "new-marker").exists())
+        self.assertFalse(list(self.install_root.glob(".install.*/update.dmg")))
+        for mount in self.install_root.glob(".install.*/mount"):
+            self.assertFalse(os.path.ismount(mount), "installer image still mounted")
 
     def test_existing_bundle_install_remains_supported(self):
         result = self.run_installer([self.source])

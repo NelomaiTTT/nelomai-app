@@ -157,6 +157,9 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             return Err(UpdateBackendError::new("untrusted_update_artifact"));
         }
 
+        #[cfg(target_os = "macos")]
+        let macos_package = MacosUpdatePackage::from_url(&update.download_url)?;
+
         let download_deadline = tokio::time::Instant::now() + Duration::from_secs(15 * 60);
         let bytes = updater_request(
             update.download_url.clone(),
@@ -210,7 +213,7 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             #[cfg(target_os = "linux")]
             let install = install_linux_common(bytes).await;
             #[cfg(target_os = "macos")]
-            let install = install_macos_common(bytes).await;
+            let install = install_macos_common(bytes, macos_package).await;
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let install = update
                 .install(bytes)
@@ -230,7 +233,36 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
 /// authorization. Stock Update::install leaves a user-owned extracted bundle,
 /// which otherwise forces another privileged repair during pre-auth startup.
 #[cfg(target_os = "macos")]
-async fn install_macos_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosUpdatePackage {
+    Archive,
+    Dmg,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosUpdatePackage {
+    fn from_url(url: &tauri::Url) -> Result<Self, UpdateBackendError> {
+        if url.path().ends_with(".app.tar.gz") {
+            Ok(Self::Archive)
+        } else if url.path().ends_with(".dmg") {
+            Ok(Self::Dmg)
+        } else {
+            Err(UpdateBackendError::new("unsupported_update_package"))
+        }
+    }
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Archive => "Nelomai.app.tar.gz",
+            Self::Dmg => "Nelomai.dmg",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn install_macos_common(
+    bytes: Vec<u8>,
+    package: MacosUpdatePackage,
+) -> Result<(), UpdateBackendError> {
     let resources = std::path::Path::new(
         "/Library/Application Support/Nelomai/common/Nelomai.app/Contents/Resources",
     );
@@ -243,7 +275,8 @@ async fn install_macos_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> 
                 .map_err(|_| UpdateBackendError::new("common_installer_untrusted"))?;
         }
     }
-    let (staging, mut command) = stage_macos_update(&bytes, resources, unsafe { libc::getuid() })?;
+    let (staging, mut command) =
+        stage_macos_update(&bytes, resources, unsafe { libc::getuid() }, package)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _staging = staging;
         let status = super::unix::installer_status(&mut command)
@@ -265,6 +298,7 @@ fn stage_macos_update(
     bytes: &[u8],
     resources: &std::path::Path,
     owner_uid: libc::uid_t,
+    package: MacosUpdatePackage,
 ) -> Result<(tempfile::TempDir, std::process::Command), UpdateBackendError> {
     use std::{
         io::Write,
@@ -278,7 +312,7 @@ fn stage_macos_update(
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
-    let archive = staging.path().join("Nelomai.app.tar.gz");
+    let archive = staging.path().join(package.filename());
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -353,7 +387,8 @@ mod macos_tests {
     fn macos_update_handoff_pins_private_bytes_and_installed_installer() {
         let resources =
             Path::new("/Library/Application Support/Nelomai/common/Nelomai.app/Contents/Resources");
-        let (staging, command) = stage_macos_update(b"abc", resources, 501).unwrap();
+        let (staging, command) =
+            stage_macos_update(b"abc", resources, 501, MacosUpdatePackage::Archive).unwrap();
         let archive = staging.path().join("Nelomai.app.tar.gz");
         assert_eq!(std::fs::read(&archive).unwrap(), b"abc");
         assert_eq!(
@@ -386,8 +421,52 @@ mod macos_tests {
     }
 
     #[test]
+    fn dmg_update_stages_verified_image_and_removes_it_on_drop() {
+        let package = MacosUpdatePackage::from_url(
+            &tauri::Url::parse("https://nelomai.ru/api/artifacts/verified.dmg?token=fixture")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package, MacosUpdatePackage::Dmg);
+        let (staging, command) =
+            stage_macos_update(b"signed-image", Path::new("/installed"), 501, package).unwrap();
+        let image = staging.path().join("Nelomai.dmg");
+        assert_eq!(std::fs::read(&image).unwrap(), b"signed-image");
+        assert_eq!(
+            std::fs::metadata(&image).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(command.get_args().any(|arg| arg == image.as_os_str()));
+        drop(staging);
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn macos_update_format_uses_only_supported_url_path_suffix() {
+        for path in [
+            "update.exe",
+            "update.zip",
+            "update.dmg/other",
+            "update.bin?name=update.dmg",
+        ] {
+            let url = tauri::Url::parse(&format!("https://nelomai.ru/{path}")).unwrap();
+            assert!(MacosUpdatePackage::from_url(&url).is_err());
+        }
+        assert_eq!(
+            MacosUpdatePackage::from_url(
+                &tauri::Url::parse("https://nelomai.ru/old.app.tar.gz").unwrap()
+            )
+            .unwrap(),
+            MacosUpdatePackage::Archive
+        );
+    }
+
+    #[test]
     fn macos_update_rejects_root_owner_before_authorization() {
-        assert!(stage_macos_update(b"abc", Path::new("/unused"), 0).is_err());
+        assert!(
+            stage_macos_update(b"abc", Path::new("/unused"), 0, MacosUpdatePackage::Archive)
+                .is_err()
+        );
     }
 }
 

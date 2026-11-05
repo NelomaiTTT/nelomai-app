@@ -5,6 +5,17 @@ mod macos_launch;
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("notice") {
+        macos_launch::show_replacement_notice().unwrap();
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("check-closed") {
+        let target = std::env::args().nth(2).unwrap();
+        if macos_launch::require_closed_before_replacement(std::path::Path::new(&target)).is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     let executable = std::env::current_exe().unwrap();
     let bundle = executable
         .parent()

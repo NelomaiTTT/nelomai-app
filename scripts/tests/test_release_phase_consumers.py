@@ -24,7 +24,7 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
         candidate = self.root / "updater-candidate"
         candidate.mkdir()
         artifacts = []
-        for platform, name in gates.PACKAGE_NAMES.items():
+        for (platform, architecture, kind), name in gates.updater_packages(gates.VERSION).items():
             path = candidate / name
             path.write_bytes((platform + " final bytes").encode())
             signature = "d" * 64
@@ -32,21 +32,19 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
                 subprocess.run([str(ROOT / "node_modules/.bin/tauri"), "signer", "sign", str(path)],
                                env=environment, check=True, capture_output=True)
                 signature = path.with_name(name + ".sig").read_text().strip()
-            artifacts.append(dict(platform=platform, asset_name=name, size_bytes=path.stat().st_size,
+            artifacts.append(dict(platform=platform, architecture=architecture, package_kind=kind, asset_name=name, size_bytes=path.stat().st_size,
                 sha256=module("verify-runtime-artifact").digest(path), signature=signature))
         image = candidate / "nelomai-0.4.0-macos-aarch64.dmg"
-        image.write_bytes(b"final manual image bytes")
-        subprocess.run([str(ROOT / "node_modules/.bin/tauri"), "signer", "sign", str(image)],
-                       env=environment, check=True, capture_output=True)
+        original_image = image.read_bytes()
         raw = json.dumps(dict(schema_version=1, version=gates.VERSION, artifacts=artifacts)).encode()
         manifest = candidate / "nelomai-release-manifest.json"
         manifest.write_bytes(raw)
         (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))
         gates.verify_updater_release(candidate, self.public, public, "d" * 64)
         image.write_bytes(b"changed manual image bytes")
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(ValueError, "digest"):
             gates.verify_updater_release(candidate, self.public, public, "d" * 64)
-        image.write_bytes(b"final manual image bytes")
+        image.write_bytes(original_image)
         image_signature = image.with_suffix(".dmg.sig")
         valid_image_signature = image_signature.read_bytes()
         image_signature.write_bytes(b"wrong manual image signature")
@@ -59,13 +57,23 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
         manifest.write_bytes(raw)
         # Desktop releases have no APK certificate authority. A signed index
         # cannot add Android or omit a required desktop target.
+        malformed = []
         bad = json.loads(raw)
         bad["artifacts"].append(dict(platform="android", asset_name="unexpected.apk"))
-        invalid = json.dumps(bad).encode()
-        manifest.write_bytes(invalid)
-        (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(invalid)))
-        with self.assertRaisesRegex(ValueError, "ordinary packages"):
-            gates.verify_updater_release(candidate, self.public, public, "")
+        malformed.append(bad)
+        bad = json.loads(raw)
+        bad["artifacts"] = [item for item in bad["artifacts"] if item["package_kind"] != "dmg"]
+        malformed.append(bad)
+        for field, value in (("package_kind", "app"), ("architecture", "x86_64"), ("asset_name", "unexpected.dmg")):
+            bad = json.loads(raw)
+            next(item for item in bad["artifacts"] if item["package_kind"] == "dmg")[field] = value
+            malformed.append(bad)
+        for bad in malformed:
+            invalid = json.dumps(bad).encode()
+            manifest.write_bytes(invalid)
+            (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(invalid)))
+            with self.subTest(artifacts=bad["artifacts"]), self.assertRaises(ValueError):
+                gates.verify_updater_release(candidate, self.public, public, "")
         manifest.write_bytes(raw)
         (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))
         (candidate / gates.PACKAGE_NAMES["macos"]).write_bytes(b"changed bytes")

@@ -9,6 +9,7 @@ import shutil
 
 SIGNATURE_SUFFIXES = {
     "app": ".app.tar.gz.sig",
+    "dmg": ".dmg.sig",
     "appimage": ".AppImage.sig",
     "nsis": ".exe.sig",
 }
@@ -23,6 +24,9 @@ def main() -> None:
     parser.add_argument("--architecture", choices=("x86_64", "aarch64"), required=True)
     parser.add_argument("--package-kind", choices=tuple(SIGNATURE_SUFFIXES), required=True)
     args = parser.parse_args()
+
+    if args.platform != {"app": "macos", "dmg": "macos", "appimage": "linux", "nsis": "windows"}[args.package_kind]:
+        raise SystemExit("package format does not match platform")
 
     suffix = SIGNATURE_SUFFIXES[args.package_kind]
     signatures = sorted(
@@ -43,6 +47,7 @@ def main() -> None:
         source_artifact.name.lower().find(
             {
                 "app": ".app.tar.gz",
+                "dmg": ".dmg",
                 "appimage": ".appimage",
                 "nsis": ".exe",
             }[args.package_kind]
@@ -67,7 +72,7 @@ def main() -> None:
         "asset_name": asset_name,
         "signature": signature,
     }
-    (args.output_dir / f"{args.platform}-{args.architecture}.artifact.json").write_text(
+    (args.output_dir / f"{args.platform}-{args.architecture}-{args.package_kind}.artifact.json").write_text(
         json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         encoding="utf-8",
     )

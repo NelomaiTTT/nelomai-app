@@ -42,8 +42,29 @@ else
 fi
 install -d -o root -g wheel -m 0755 '/Library/Application Support/Nelomai' "$INSTALL_ROOT"
 STAGING=$(mktemp -d "$INSTALL_ROOT/.install.XXXXXX")
-trap 'echo "Common installation staging retained for recovery: $STAGING" >&2' EXIT
+DMG_ATTACHED=0
+DMG_MOUNT="$STAGING/mount"
+trap 'if [ "$DMG_ATTACHED" -eq 1 ]; then /usr/bin/hdiutil detach "$DMG_MOUNT" || :; fi; echo "Common installation staging retained for recovery: $STAGING" >&2' EXIT
+trap 'exit 1' HUP INT TERM
 if [ "$#" -eq 3 ]; then
+  case "$SOURCE" in
+  *.dmg)
+    install -o root -g wheel -m 0600 "$SOURCE" "$STAGING/update.dmg"
+    [ "$(/usr/bin/shasum -a 256 "$STAGING/update.dmg" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256" ] || exit 1
+    /usr/bin/hdiutil verify "$STAGING/update.dmg"
+    mkdir "$DMG_MOUNT"
+    # This private mountpoint belongs only to this invocation. Even a partial
+    # attach must be detached on error; never detach another volume or force it.
+    DMG_ATTACHED=1
+    /usr/bin/hdiutil attach -readonly -nobrowse -noautoopen -mountpoint "$DMG_MOUNT" "$STAGING/update.dmg"
+    [ -d "$DMG_MOUNT/Nelomai.app" ] && [ ! -L "$DMG_MOUNT/Nelomai.app" ] || exit 1
+    [ -z "$(find "$DMG_MOUNT/Nelomai.app" -type l -print -quit)" ] || exit 1
+    /usr/bin/ditto "$DMG_MOUNT/Nelomai.app" "$STAGING/Nelomai.app"
+    /usr/bin/hdiutil detach "$DMG_MOUNT"
+    DMG_ATTACHED=0
+    /bin/rm "$STAGING/update.dmg"
+    ;;
+  *)
   install -o root -g wheel -m 0600 "$SOURCE" "$STAGING/update.tar.gz"
   [ "$(/usr/bin/shasum -a 256 "$STAGING/update.tar.gz" | cut -d ' ' -f 1)" = "$EXPECTED_SHA256" ] || exit 1
   /usr/bin/tar -tzf "$STAGING/update.tar.gz" > "$STAGING/members"
@@ -60,6 +81,8 @@ if [ "$#" -eq 3 ]; then
   # independent of the authorization environment. Keep staging itself private.
   (umask 022; /usr/bin/tar -xzf "$STAGING/update.tar.gz" --no-same-owner --no-same-permissions -C "$STAGING")
   /bin/rm "$STAGING/update.tar.gz" "$STAGING/members" "$STAGING/types"
+    ;;
+  esac
 else
   /usr/bin/ditto "$SOURCE" "$STAGING/Nelomai.app"
 fi

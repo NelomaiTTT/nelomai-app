@@ -72,14 +72,33 @@ pub fn installation_action(
 
 #[cfg(target_os = "macos")]
 fn macos_installation_action(
-    candidate: &str,
-    installed: Option<&str>,
+    candidate: &nelomai_contracts::VerifiedContainerManifest,
+    installed: Option<&nelomai_contracts::VerifiedContainerManifest>,
     protected: bool,
     executable: &Path,
     installed_bundle: &Path,
 ) -> io::Result<InstallationAction> {
     let running_installed = executable == installed_bundle.join("Contents/MacOS/nelomai-app");
-    let action = installation_action(candidate, installed, protected, running_installed)?;
+    let candidate = candidate.manifest();
+    let installed = installed.map(|manifest| manifest.manifest());
+    let action = installation_action(
+        &candidate.container_version,
+        installed.map(|manifest| manifest.container_version.as_str()),
+        protected,
+        running_installed,
+    )?;
+    // Different signed candidates can share a version during acceptance. Use
+    // their authenticated contents, including stable, to distinguish them.
+    // An identical copy remains an idempotent launch; lower versions still
+    // cannot replace a newer installation, and an admitted owner continues.
+    if matches!(
+        action,
+        InstallationAction::LaunchInstalled | InstallationAction::RepairInstalled
+    ) && installed.is_some_and(|installed| {
+        candidate.container_version == installed.container_version && candidate != installed
+    }) {
+        return Ok(InstallationAction::InstallCandidate);
+    }
     // Repair a quarantined handoff target, never an already admitted owner:
     // reopening that same live process before returning would lose the launch.
     if action == InstallationAction::LaunchInstalled
@@ -947,8 +966,8 @@ fn pre_auth_handoff() -> io::Result<bool> {
                 .as_ref()
                 .is_some_and(|runtime| protected_executable(runtime.executable()));
         let action = macos_installation_action(
-            candidate.container_version(),
-            existing.as_ref().map(|runtime| runtime.container_version()),
+            candidate.manifest(),
+            existing.as_ref().map(|runtime| runtime.manifest()),
             protected,
             &executable,
             installed,
@@ -957,6 +976,16 @@ fn pre_auth_handoff() -> io::Result<bool> {
             return Ok(false);
         }
         if action != InstallationAction::LaunchInstalled {
+            if action == InstallationAction::InstallCandidate && existing.is_some() {
+                if let Err(error) =
+                    crate::macos_launch::require_closed_before_replacement(installed)
+                {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        crate::macos_launch::show_replacement_notice()?;
+                    }
+                    return Err(error);
+                }
+            }
             let status = platform::unix::installer_status(&mut macos_installer_command(
                 action,
                 source,

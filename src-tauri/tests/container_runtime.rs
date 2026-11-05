@@ -77,6 +77,39 @@ impl Fixture {
 }
 
 #[test]
+fn retained_manifest_distinguishes_signed_same_version_builds_not_mutable_disk_contents() {
+    let fixture = Fixture::new();
+    let original = fixture.open(RuntimeSlot::Latest).unwrap();
+    let identical = fixture.open(RuntimeSlot::Latest).unwrap();
+    assert_eq!(
+        original.manifest().manifest(),
+        identical.manifest().manifest()
+    );
+
+    fixture.replace_executable(b"different authenticated runtime");
+    let replacement = fixture.open(RuntimeSlot::Latest).unwrap();
+    assert_eq!(
+        original.container_version(),
+        replacement.container_version()
+    );
+    assert_ne!(
+        original.manifest().manifest(),
+        replacement.manifest().manifest()
+    );
+    assert_eq!(
+        original.manifest().manifest(),
+        identical.manifest().manifest()
+    );
+
+    fs::write(fixture.executable(), b"untrusted replacement").unwrap();
+    assert!(fixture.open(RuntimeSlot::Latest).is_err());
+    assert_ne!(
+        original.manifest().manifest(),
+        replacement.manifest().manifest()
+    );
+}
+
+#[test]
 #[cfg(target_os = "macos")]
 fn macos_admits_product_named_runtime_and_rejects_modified_bytes() {
     for name in ["Nelomai", "Nelomai.app/Contents/MacOS/Nelomai"] {

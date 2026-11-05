@@ -16,8 +16,22 @@ import scripts.tests.test_runtime_release_set as release_fixtures
 
 class ReleaseSimplificationTest(ArtifactFixture):
     def test_shipping_only_finalizer_produces_complete_publishable_file_set(self):
+        self.check_finalizer("0.4.0")
+
+    def test_bridge_finalizer_preserves_archive_and_adds_dmg_to_signed_manifest(self):
+        self.check_finalizer("0.4.1")
+
+    def test_post_bridge_finalizer_ships_dmg_without_legacy_archive(self):
+        self.check_finalizer("0.4.2")
+
+    def check_finalizer(self, version):
         signed = self.root / "signed"
         consumer = module("finalize-release-candidate")
+        self.enterContext(patch.multiple(consumer.gates, VERSION=version,
+            PACKAGE_NAMES={platform: name.replace(consumer.gates.VERSION, version)
+                           for platform, name in consumer.gates.PACKAGE_NAMES.items()},
+            MACOS_DMG_NAME=f"nelomai-{version}-macos-aarch64.dmg",
+            PUBLISH_ASSETS=consumer.gates.publication_assets(version)))
         release = release_fixtures.RuntimeReleaseSetTest.four_candidates(self, version=consumer.gates.VERSION)
         for path in release.glob("*android*"):
             path.unlink()
@@ -39,7 +53,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
             entries = {"shipping": dict(name=package.name,
                 sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)}
             if platform == "macos":
-                image = package.with_name("nelomai-0.4.0-macos-aarch64.dmg")
+                image = package.with_name(f"nelomai-{version}-macos-aarch64.dmg")
                 image.write_bytes(b"verified manual-install image fixture")
                 entries["dmg"] = dict(name=image.name, sha256=consumer.verifier.digest(image), size_bytes=image.stat().st_size)
             (folder / "package-digests.json").write_text(json.dumps(dict(
@@ -64,9 +78,16 @@ class ReleaseSimplificationTest(ArtifactFixture):
             consumer.main()
         inventory = json.loads((output / "candidate/candidate-inventory.json").read_bytes())
         self.assertEqual(set(inventory["assets"]), consumer.gates.PUBLISH_ASSETS)
-        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg", inventory["assets"])
-        self.assertIn("nelomai-0.4.0-macos-aarch64.dmg.sig", inventory["assets"])
-        self.assertEqual(len(json.loads((output / "candidate/nelomai-release-manifest.json").read_bytes())["artifacts"]), 3)
+        self.assertIn(f"nelomai-{version}-macos-aarch64.dmg", inventory["assets"])
+        self.assertIn(f"nelomai-{version}-macos-aarch64.dmg.sig", inventory["assets"])
+        artifacts = json.loads((output / "candidate/nelomai-release-manifest.json").read_bytes())["artifacts"]
+        mac_formats = {"dmg"} if version == "0.4.2" else {"app", "dmg"}
+        self.assertEqual(len(artifacts), 2 + len(mac_formats))
+        self.assertEqual({item["package_kind"] for item in artifacts if item["platform"] == "macos"}, mac_formats)
+        self.assertEqual(len(inventory["assets"]), 17 if version == "0.4.2" else 18)
+        if version == "0.4.2":
+            self.assertFalse((output / "candidate" / consumer.gates.PACKAGE_NAMES["macos"]).exists())
+            self.assertFalse((work / ("shipping-" + consumer.gates.PACKAGE_NAMES["macos"])).exists())
         self.assertEqual(inventory["purpose"], "shipping")
         self.assertEqual(inventory["run_attempt"], 3)
         self.assertEqual(set(json.loads(result.getvalue())), {"inventory_sha256"})

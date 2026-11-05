@@ -66,7 +66,7 @@ tokio = { version = "1", features = ["fs", "io-util"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSRunningApplication", "NSWorkspace", "NSAlert"] }
 
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }

@@ -199,6 +199,11 @@ impl VerifiedRuntime {
     pub fn container_version(&self) -> &str {
         &self.manifest.manifest().container_version
     }
+    /// Authenticated packaging identity retained from admission, not reread
+    /// from a mutable candidate path during installation selection.
+    pub fn manifest(&self) -> &VerifiedContainerManifest {
+        &self.manifest
+    }
     pub fn resource_root(&self) -> &Path {
         &self.resource_root
     }

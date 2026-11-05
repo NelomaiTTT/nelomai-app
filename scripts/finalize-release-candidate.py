@@ -84,6 +84,13 @@ def main():
             builder.run(cli, "signer", "sign", manual_image, env=environment, capture=True)
             if verifier.digest(manual_image) != before:
                 raise ValueError("DMG signing changed final image bytes")
+            builder.script("collect-release-artifact.py", "--search-root", args.work, "--output-dir", final_inputs,
+                "--version", gates.VERSION, "--platform", platform, "--architecture", architecture,
+                "--package-kind", "dmg")
+            if (platform, architecture, "app") not in gates.updater_packages(gates.VERSION):
+                # The native archive was verified above as a signing input, but
+                # releases after the compatibility bridge ship only the DMG.
+                continue
         destination = args.work / ("shipping-" + name)
         shutil.copyfile(path, destination)
         if platform == "android":
@@ -114,8 +121,8 @@ def main():
     candidate = args.output / "candidate"
     builder.script("build-release-manifest.py", "--input-dir", final_inputs, "--output-dir", candidate,
                    "--version", gates.VERSION, env=environment)
-    for path in (manual_image, manual_image.with_suffix(".dmg.sig")):
-        shutil.copyfile(path, candidate / path.name)
+    signature = manual_image.with_suffix(".dmg.sig")
+    shutil.copyfile(signature, candidate / signature.name)
     for path in (args.signed / "release").iterdir():
         shutil.copyfile(path, candidate / path.name)
     if {path.name for path in candidate.iterdir()} != gates.PUBLISH_ASSETS:

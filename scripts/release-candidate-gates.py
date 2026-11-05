@@ -36,13 +36,35 @@ PACKAGE_NAMES = {
     "linux": f"nelomai-{VERSION}-linux-x86_64.AppImage", "windows": f"nelomai-{VERSION}-windows-x86_64.exe",
     "macos": f"nelomai-{VERSION}-macos-aarch64.app.tar.gz"}
 MACOS_DMG_NAME = f"nelomai-{VERSION}-macos-aarch64.dmg"
-PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
-    MACOS_DMG_NAME, MACOS_DMG_NAME + ".sig",
-    "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
-    f"nelomai-runtime-{VERSION}-release-set.manifest.json", f"nelomai-runtime-{VERSION}-release-set.manifest.sig",
-    *(f"nelomai-runtime-{VERSION}-{platform}-{architecture}{suffix}"
-      for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"))
-      for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
+
+
+def updater_packages(version):
+    """Exact shipping updater formats; 0.4.1 bridges archive-only old clients."""
+    if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version):
+        raise ValueError("unsupported shipping release version")
+    packages = {
+        ("linux", "x86_64", "appimage"): f"nelomai-{version}-linux-x86_64.AppImage",
+        ("windows", "x86_64", "nsis"): f"nelomai-{version}-windows-x86_64.exe",
+        ("macos", "aarch64", "dmg"): f"nelomai-{version}-macos-aarch64.dmg",
+    }
+    if tuple(map(int, version.split("."))) <= (0, 4, 1):
+        packages[("macos", "aarch64", "app")] = f"nelomai-{version}-macos-aarch64.app.tar.gz"
+    return packages
+
+
+def publication_assets(version):
+    # Native .app.tar.gz inputs remain private CI signing intermediates after
+    # the bridge. Runtime archives/signatures remain future stable inputs.
+    return frozenset(updater_packages(version).values()) | {
+        f"nelomai-{version}-macos-aarch64.dmg.sig",
+        "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
+        f"nelomai-runtime-{version}-release-set.manifest.json", f"nelomai-runtime-{version}-release-set.manifest.sig",
+        *(f"nelomai-runtime-{version}-{platform}-{architecture}{suffix}"
+          for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"))
+          for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
+
+
+PUBLISH_ASSETS = publication_assets(VERSION)
 
 
 def mode_policy(mode="build_only"):
@@ -137,7 +159,7 @@ def require_publishable_inventory(inventory, run_id, source, environment_ids, ru
             or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)
             or not environment_ids or inventory.get("environment_ids") != environment_ids):
         raise ValueError("test-key, build-only or foreign candidate is permanently nonpublishable")
-    packages = set(PACKAGE_NAMES.values()) | {MACOS_DMG_NAME, MACOS_DMG_NAME + ".sig"}
+    packages = set(updater_packages(VERSION).values()) | {MACOS_DMG_NAME + ".sig"}
     assets = inventory.get("assets", {})
     if isinstance(assets, dict) and not set(assets) <= PUBLISH_ASSETS:
         raise ValueError("nonpublishable or acceptance-only asset in candidate inventory")
@@ -311,15 +333,17 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
         base64.b64decode(signature.read_bytes().strip(), validate=True), body)
     document = json.loads(body)
     artifacts = document.get("artifacts", [])
-    if (document.get("schema_version") != 1 or document.get("version") != VERSION or len(artifacts) != len(PACKAGE_NAMES)
-            or {item.get("platform") for item in artifacts} != set(PACKAGE_NAMES)):
-        raise ValueError("signed release index must identify all three ordinary packages")
+    expected = updater_packages(VERSION)
+    identities = [(item.get("platform"), item.get("architecture"), item.get("package_kind")) for item in artifacts]
+    if (document.get("schema_version") != 1 or document.get("version") != VERSION
+            or len(identities) != len(expected) or set(identities) != set(expected)):
+        raise ValueError("signed release index must identify all exact ordinary packages")
     executable = os.environ.get("NELOMAI_UPDATER_SIGNATURE_VERIFIER", str(Path(__file__).resolve().parents[1]
         / "target/debug/examples" / ("verify-updater-signature.exe" if os.name == "nt" else "verify-updater-signature")))
     with tempfile.TemporaryDirectory(prefix="updater-final-verification-") as temporary:
         for artifact in artifacts:
             platform = artifact["platform"]
-            if artifact.get("asset_name") != PACKAGE_NAMES[platform]:
+            if artifact.get("asset_name") != expected[(platform, artifact["architecture"], artifact["package_kind"])]:
                 raise ValueError("signed release contains a nonpublishable package")
             package = directory / artifact["asset_name"]
             if file_hash(package) != artifact.get("sha256") or package.stat().st_size != artifact.get("size_bytes"):
@@ -328,12 +352,12 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
                 if not re.fullmatch(r"[0-9a-f]{64}", android_signer_sha256) or artifact.get("signature") != android_signer_sha256:
                     raise ValueError("signed APK certificate differs from explicit release certificate pin")
             else:
-                signature_file = Path(temporary) / (platform + ".sig")
+                signature_file = Path(temporary) / (artifact["asset_name"] + ".sig")
                 signature_file.write_text(artifact["signature"])
                 subprocess.run([executable, str(package), str(signature_file), str(updater_public_key)],
                                check=True, capture_output=True)
-    # Manual-install images have their own detached signature and never become
-    # update-selection targets in the existing three-package release manifest.
+    # Keep the separately distributed DMG signature verifiable for manual
+    # installation too; the signed manifest now authenticates DMG selection.
     image, image_signature = directory / MACOS_DMG_NAME, directory / (MACOS_DMG_NAME + ".sig")
     file_hash(image)
     file_hash(image_signature)
