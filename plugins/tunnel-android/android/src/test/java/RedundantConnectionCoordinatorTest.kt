@@ -101,6 +101,7 @@ class RedundantConnectionCoordinatorTest {
             }
             val native = FakeNative(usable = setOf("lease-a", "candidate"))
             val readiness = mutableListOf<Boolean>()
+            var primaryStarts = 0
             val coordinator = testRedundantCoordinator(
                 if (prepared) store(original) else emptyStore(), panel, native,
                 monotonicMs = { now }, onRecoveryReadiness = readiness::add)
@@ -111,7 +112,7 @@ class RedundantConnectionCoordinatorTest {
                 assertTrue(if (prepared) coordinator.startPrepared(original, RedundantRecoveryResponse(
                     session("lease-a", 1, 1, slotBLeaseId = null), configs, probes))
                 else coordinator.start(original, configs, probes,
-                    onPrimaryStarted = { readiness += true }))
+                    onPrimaryStarted = { primaryStarts += 1 }))
                 val waiting = healthSlot(0, active = true, probeFailed = true)
                 assertTrue(coordinator.onHealthObservations(listOf(waiting)))
                 now = 20_000
@@ -121,6 +122,7 @@ class RedundantConnectionCoordinatorTest {
                             consecutiveProbeSuccesses = 3, stableSinceMs = 0)))
                 }.get(1, TimeUnit.SECONDS))
                 assertEquals(listOf(true), readiness)
+                assertEquals(if (prepared) 0 else 1, primaryStarts)
                 assertTrue(coordinator.isRunning())
                 assertEquals(0, roleAttempts)
                 assertTrue(requireNotNull(coordinator.status()).retry.roleObservationPending)
@@ -3054,6 +3056,7 @@ class RedundantConnectionCoordinatorTest {
                 acquirePending = true, acquireOperationId = "repair", acquireReplaceLeaseId = "lease-b",
             )) }
             val readiness = mutableListOf<Boolean>()
+            var primaryStarts = 0
             val native = FakeNative()
             val panel = FakePanel(recoveredSession = session("lease-a", 1, 1),
                 recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()),
@@ -3064,7 +3067,7 @@ class RedundantConnectionCoordinatorTest {
             if (recovering) assertTrue(coordinator.recover()) else assertTrue(coordinator.start(original,
                 mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
                 mapOf("lease-a" to probe(), "lease-b" to probe()),
-                onPrimaryStarted = { readiness += true }, onPrimaryFailed = { readiness += false }))
+                onPrimaryStarted = { primaryStarts += 1 }, onPrimaryFailed = { readiness += false }))
             val primary = healthSlot(0, active = true, hardFailure = true)
             val standby = healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
                 consecutiveProbeSuccesses = 3, stableSinceMs = 0)
@@ -3082,6 +3085,7 @@ class RedundantConnectionCoordinatorTest {
                 standby.copy(standbyProbeState = StandbyProbeState.SUCCEEDED))))
             assertEquals(listOf("lease-a", "lease-b"), native.activated)
             assertEquals(listOf(true), readiness)
+                assertEquals(if (recovering) 0 else 1, primaryStarts)
             assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
             assertEquals(0, native.stopCalls)
         }

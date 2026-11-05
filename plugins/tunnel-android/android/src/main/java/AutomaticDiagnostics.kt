@@ -145,6 +145,8 @@ internal fun automaticDiagnosticsLatestLogTimestamp(
 }.maxOrNull()
 
 private const val KEY_SESSION_ID = "session_id"
+private const val KEY_SESSION_OWNER_ID = "session_owner_id"
+private const val KEY_SESSION_PROCESS_ID = "session_process_id"
 private const val KEY_SESSION_SEQUENCE = "session_sequence"
 private const val KEY_INTERVAL_STARTED_AT = "interval_started_at"
 private const val KEY_SESSION_RUNNING = "session_running"
@@ -700,10 +702,26 @@ internal object AutomaticDiagnostics {
         context: Context,
         connectionLeaseId: String?,
         transport: String,
+        ownerSessionId: String? = null,
+        deviceId: String? = BackgroundCredentialStore.load(context.applicationContext)?.deviceId,
     ) {
         val applicationContext = context.applicationContext
         synchronized(gate) {
             val preferences = preferences(applicationContext)
+            // Slot promotion and readiness retries belong to the same VPN session.
+            if (ownerSessionId != null && preferences.getBoolean(KEY_SESSION_RUNNING, false) &&
+                preferences.getString(KEY_SESSION_OWNER_ID, null) == ownerSessionId &&
+                preferences.getString(KEY_SESSION_DEVICE_ID, null) == deviceId &&
+                preferences.getInt(KEY_SESSION_PROCESS_ID, 0) == Process.myPid() &&
+                !preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)
+            ) {
+                if (checkpointFuture == null || checkpointFuture?.isDone == true) {
+                    val due = preferences.getLong(KEY_INTERVAL_STARTED_AT, nowUnix()) + CHECKPOINT_INTERVAL_SECONDS
+                    scheduleCheckpointLocked(applicationContext, (due - nowUnix()).coerceAtLeast(0))
+                }
+                scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
+                return
+            }
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
                 val stoppedSession = stoppedSessionSeal(preferences)
                 if (!preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
@@ -723,13 +741,14 @@ internal object AutomaticDiagnostics {
                 ) { "automatic_diagnostics_previous_session_not_saved" }
             }
             val now = nowUnix()
-            val deviceId = BackgroundCredentialStore.load(applicationContext)?.deviceId
             memoryGrowthTracker.reset()
             sessionMemoryDetailGate.reset(processRssBytes(Process.myPid()))
             sessionTransport = transport.take(32)
             check(
                 preferences.edit()
                     .putString(KEY_SESSION_ID, UUID.randomUUID().toString())
+                    .putString(KEY_SESSION_OWNER_ID, ownerSessionId)
+                    .putInt(KEY_SESSION_PROCESS_ID, Process.myPid())
                     .putInt(KEY_SESSION_SEQUENCE, 0)
                     .putLong(KEY_INTERVAL_STARTED_AT, now)
                     .putBoolean(KEY_SESSION_RUNNING, true)
@@ -1227,7 +1246,7 @@ internal object AutomaticDiagnostics {
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false) &&
                 !preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false) &&
-                TunnelRuntime.state() != SessionState.RUNNING
+                diagnosticSessionRunning(applicationContext) == false
             ) {
                 val stoppedSession = stoppedSessionSeal(preferences)
                 markStoppedSessionPending(
@@ -1260,6 +1279,15 @@ internal object AutomaticDiagnostics {
                 }
             }
         }
+    }
+
+    private fun diagnosticSessionRunning(context: Context): Boolean? {
+        val preferences = preferences(context)
+        val ownerSessionId = preferences.getString(KEY_SESSION_OWNER_ID, null)
+            ?: return TunnelRuntime.state() == SessionState.RUNNING
+        return NelomaiVpnService.redundantDiagnosticsSessionRunning(
+            ownerSessionId, preferences.getString(KEY_SESSION_DEVICE_ID, null),
+        )
     }
 
     private fun checkpoint(context: Context) {
@@ -1357,6 +1385,8 @@ internal object AutomaticDiagnostics {
                 editor.putLong(KEY_INTERVAL_STARTED_AT, seal.endedAt)
             } else {
                 editor.remove(KEY_SESSION_ID)
+                    .remove(KEY_SESSION_OWNER_ID)
+                    .remove(KEY_SESSION_PROCESS_ID)
                     .remove(KEY_SESSION_SEQUENCE)
                     .remove(KEY_INTERVAL_STARTED_AT)
                     .remove(KEY_SESSION_DEVICE_ID)
@@ -1792,6 +1822,13 @@ internal object AutomaticDiagnostics {
                     if (!preferences(context).getBoolean(KEY_SESSION_RUNNING, false)) {
                         return@synchronized
                     }
+                    // Reuse the existing 30-second watch: redundant traffic bypasses
+                    // TunnelRuntime's legacy data-plane sampler. Never advance a retired owner.
+                    runCatching {
+                        if (preferences(context).contains(KEY_SESSION_OWNER_ID) &&
+                            diagnosticSessionRunning(context) == true
+                        ) onDataPlaneObserved(context)
+                    }.onFailure { TunnelLog.warning("diagnostics.last_live_observation_failed") }
                     runCatching { androidProcessMemory(context) }
                         .onSuccess { processes ->
                             val residentBytes = automaticDiagnosticsTotalResidentBytes(processes)
