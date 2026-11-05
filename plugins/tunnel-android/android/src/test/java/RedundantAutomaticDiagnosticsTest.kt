@@ -44,6 +44,33 @@ class RedundantAutomaticDiagnosticsTest {
         assertEquals(1, reports.count { it.getString("trigger") == "tunnel_stopped" })
     }
 
+    @Test fun completedServiceStopSealsExactlyOnceBeforeServiceDestruction() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val id = f.session()
+        assertTrue(owner.revoke())
+        val complete = f.stopCompletion(f.tx.startOperationId, owner)
+        complete()
+        assertFalse("completed service Stop must end diagnostics", f.running())
+        val report = f.reports().single()
+        assertEquals("tunnel_stopped", report.getString("trigger"))
+        assertEquals(id, report.getString("tunnel_session_id"))
+        assertEquals(1, report.getInt("sequence"))
+        complete()
+        AutomaticDiagnostics.initialize(f.context)
+        assertEquals("neither duplicate completion nor next process initialization may reseal", 1, f.reports().size)
+    }
+
+    @Test fun staleStopCompletionCannotSealCurrentSession() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val id = f.session()
+        f.stopCompletion("old-start", null)()
+        assertTrue(f.running())
+        assertEquals(id, f.session())
+        assertTrue(f.reports().isEmpty())
+    }
+
     @Test fun recoveryOpensSessionAndRepeatedReadinessAndRoleSwitchDoNotDuplicateIt() = fixture { f ->
         assertTrue(f.store.beginRedundant(f.tx) is RecoveryStoreResult.Success)
         val owner = f.owner()
@@ -319,6 +346,39 @@ class RedundantAutomaticDiagnosticsTest {
             "22222222-2222-4222-8222-222222222222", "lease-a", "lease-b", "lease-a",
             true, 1, 1, "start", "fingerprint")
         val prefs = context.getSharedPreferences(AndroidRuntimeNamespace.record("nelomai-automatic-diagnostics"), 0)
+        fun stopCompletion(operation: String, owner: RedundantVpnProcessOwner?): () -> Unit {
+            val tombstones = RedundantCancelTombstoneStore(object : RedundantCancelTombstoneBackend {
+                var raw: String? = null
+                override fun read() = raw
+                override fun compareAndWrite(expected: String?, value: String): Boolean {
+                    if (raw != expected) return false
+                    raw = value; return true
+                }
+                override fun compareAndClear(expected: String): Boolean {
+                    if (raw != expected) return false
+                    raw = null; return true
+                }
+            }) { "test-stop" }
+            val tombstone = (tombstones.persist(operation) as RecoveryStoreResult.Success).value
+            ReflectionHelpers.setField(service, "redundantCancelTombstones", tombstones)
+            val generation = ReflectionHelpers.getField<Long>(service, "serviceGeneration")
+            ReflectionHelpers.setField(service, "redundantTotalLossLifecycle", RedundantTotalLossLifecycle(
+                currentServiceGeneration = { generation }, serviceActive = { true },
+                barrierPending = { false }, logoutState = { BackgroundLogoutReadState.NONE },
+                recovery = store::read, post = { it() }, retryCleanup = {},
+                publishRestartStarting = {}, resume = {}, scheduleLogout = {},
+                scheduleStateReadRetry = {}, stopIfIdle = {},
+            ))
+            // The real async cleanup result enters the service's completion callback.
+            val pendingType = Class.forName("ru.nelomai.tunnel.PendingRedundantStop")
+            val pending = pendingType.declaredConstructors.single().apply { isAccessible = true }
+                .newInstance(operation, tombstone, owner, generation, true, false)
+            ReflectionHelpers.setField(service, "pendingRedundantStop", pending)
+            val attempt = Class.forName("ru.nelomai.tunnel.PendingRedundantStopAttempt")
+                .declaredConstructors.single().apply { isAccessible = true }
+                .newInstance(pending, tombstone, RedundantRevokeResult(fenced = true, stopped = true))
+            return { call(service, "completePendingRedundantStopAttempt", attempt) }
+        }
         fun duringRecoveryRead(change: () -> Unit, test: () -> Unit) {
             val backend = ReflectionHelpers.getField<EncryptedRecordBackend>(store, "backend")
             val changed = java.util.concurrent.atomic.AtomicBoolean(false)

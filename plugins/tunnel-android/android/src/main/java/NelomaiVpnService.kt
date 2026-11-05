@@ -2415,6 +2415,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         pendingRedundantStop = null
         redundantStartOperation.finish(current.startOperationId)
         if (completionDisposition == RedundantStopCompletionDisposition.PUBLISH_STOPPED) {
+            runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
+                .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
             installRedundantVpnOwner(null)
             QuickTunnelController.updateState(
                 applicationContext,
