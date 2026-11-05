@@ -562,7 +562,7 @@ fn validate_release_set(
     validate_text(&manifest.release_set_id)?;
     validate_runtime_version(&manifest.runtime_version)?;
     validate_source_commit(&manifest.source_commit)?;
-    if manifest.artifacts.len() != 4 {
+    if manifest.artifacts.len() != 4 && manifest.artifacts.len() != 1 {
         return Err(RuntimeManifestError::InvalidReleaseSet);
     }
 
@@ -594,7 +594,8 @@ fn validate_release_set(
             }
         }
     }
-    if actual != expected {
+    let android_only = HashSet::from([("android", "aarch64")]);
+    if actual != expected && actual != android_only {
         return Err(RuntimeManifestError::InvalidReleaseSet);
     }
     Ok(())

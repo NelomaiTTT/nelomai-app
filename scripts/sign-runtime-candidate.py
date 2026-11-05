@@ -2,7 +2,7 @@
 """First signing phase: final runtime/root/container signatures, never native repacking.
 
 Native jobs authenticate and inspect draft archives under ephemeral TEST keys.
-This job repeats shared-contract and exact ZIP validation on all four targets,
+This job repeats shared-contract and exact ZIP validation on the explicitly selected targets,
 then signs the unchanged payload indexes with the explicit final trust key.
 Native outer packaging and installer/updater finalization happen afterward.
 """
@@ -24,7 +24,8 @@ gates = verifier.load_script("release-candidate-gates.py")
 
 
 def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
-         confirmed_stable=None, stable_public_key=None):
+         confirmed_stable=None, stable_public_key=None, scope="all"):
+    targets = gates.release_targets(scope)
     gates.full_source(source)
     if version not in ("0.2.20", gates.VERSION):
         raise ValueError("unsupported candidate version")
@@ -37,8 +38,8 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
     key = Ed25519PrivateKey.from_private_bytes(signing_key.read_bytes())
     if key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw) != public_key.read_bytes():
         raise ValueError("final signer differs from runtime trust pin")
-    if {path.name for path in drafts.iterdir()} != {platform for platform, _ in verifier.TARGETS}:
-        raise ValueError("exactly four native draft directories required")
+    if {path.name for path in drafts.iterdir()} != {platform for platform, _ in targets}:
+        raise ValueError("exact selected native draft directories required")
     # Complete read-only preflight before producing any final signatures.
     documents = {}
     snapshots = {}
@@ -47,13 +48,13 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
                                      gates.STABLE_ROOT_SHA256, stable_public_key)
         for path in confirmed_stable.iterdir():
             snapshots[path] = verifier.digest(path)
-        for platform, architecture in verifier.TARGETS:
+        for platform, architecture in targets:
             prefix = f"nelomai-runtime-{gates.STABLE_VERSION}-{platform}-{architecture}"
             documents[platform, "confirmed"] = verifier.verify(
                 *(confirmed_stable / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")),
                 stable_public_key, gates.STABLE_VERSION, gates.STABLE_SOURCE, platform, architecture,
                 inspect_native=False)
-    for platform, architecture in verifier.TARGETS:
+    for platform, architecture in targets:
         folder = drafts / platform
         if (folder / "runtime-public-key.raw").read_bytes() != public_key.read_bytes():
             raise ValueError("native compile-time runtime pin differs from final signer")
@@ -68,7 +69,7 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
         staged = Path(temporary) / "signed"
         release = staged / "release"
         release.mkdir(parents=True)
-        for platform, architecture in verifier.TARGETS:
+        for platform, architecture in targets:
             prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
             for slot in ("stable", "latest"):
                 destination = release if slot == "stable" else staged / "latest" / platform
@@ -77,7 +78,7 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
                     shutil.copyfile(drafts / platform / slot / (prefix + suffix), destination / (prefix + suffix))
                 body = (destination / (prefix + ".manifest.json")).read_bytes()
                 (destination / (prefix + ".manifest.sig")).write_bytes(key.sign(b"nelomai-runtime-manifest-v1\0" + body))
-        digest = aggregate.build(release, staged / "root", version, source, signing_key, public_key)
+        digest = aggregate.build(release, staged / "root", version, source, signing_key, public_key, scope=scope)
         for path in (staged / "root").iterdir():
             path.rename(release / path.name)
         (staged / "root").rmdir()
@@ -86,7 +87,7 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
             shutil.copyfile(stable_public_key, staged / "stable-public-key.raw")
             gates.verify_runtime_release(staged / "confirmed-stable", gates.STABLE_VERSION, gates.STABLE_SOURCE,
                                          gates.STABLE_ROOT_SHA256, staged / "stable-public-key.raw")
-        for platform, architecture in verifier.TARGETS:
+        for platform, architecture in targets:
             prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
             # Current shipping already exercises two slots; synthetic identities
             # remain only for the historical maintenance acceptance fixture.
@@ -130,10 +131,11 @@ def main():
     parser.add_argument("--confirmed-stable", type=Path)
     parser.add_argument("--stable-public-key", type=Path)
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
+    parser.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
     gates.require_operation(args.mode, "test_sign" if args.mode == "build_only" else "release_sign")
     print(sign(args.drafts, args.output, args.source_sha, args.signing_key, args.public_key,
-               version=args.version, confirmed_stable=args.confirmed_stable, stable_public_key=args.stable_public_key))
+               version=args.version, confirmed_stable=args.confirmed_stable, stable_public_key=args.stable_public_key, scope=args.scope))
 
 
 if __name__ == "__main__":

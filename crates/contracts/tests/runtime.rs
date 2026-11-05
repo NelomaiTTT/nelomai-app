@@ -536,6 +536,35 @@ fn release_set_requires_exact_unique_targets_and_verifies_root_digest_and_domain
 }
 
 #[test]
+fn release_set_accepts_android_only_but_rejects_other_partial_sets() {
+    for (platforms, accepted) in [
+        (vec!["android"], true),
+        (vec!["linux"], false),
+        (vec!["android", "linux"], false),
+        (vec![], false),
+    ] {
+        let mut root = release_set();
+        root.artifacts
+            .retain(|entry| platforms.contains(&entry.platform.as_str()));
+        let bytes = canonical(&root);
+        let signature = sign(RUNTIME_RELEASE_SET_SIGNATURE_DOMAIN, &bytes);
+        let result = verify_runtime_release_set_manifest(
+            &bytes,
+            &signature,
+            &public_key(),
+            &sha256_hex(&bytes),
+        );
+        assert_eq!(result.is_ok(), accepted, "platforms: {platforms:?}");
+        if let Ok(verified) = result {
+            assert!(verified.artifact("android", "aarch64").is_some());
+            assert!(verified.artifact("linux", "x86_64").is_none());
+            assert!(verified.artifact("macos", "aarch64").is_none());
+            assert!(verified.artifact("windows", "x86_64").is_none());
+        }
+    }
+}
+
+#[test]
 fn release_set_schema_cannot_embed_its_own_root_hash() {
     let root = release_set();
     let mut value = serde_json::to_value(root).unwrap();

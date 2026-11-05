@@ -28,8 +28,10 @@ gates = verifier.load_script("release-candidate-gates.py")
 SYNTHETIC_LATEST = "0.2.21"
 
 
-def stage_signed(signed, root_digest, output, public_key, platform, architecture, source, kind, readelf=None):
+def stage_signed(signed, root_digest, output, public_key, platform, architecture, source, kind, readelf=None, *, scope="all"):
     """Keyless native consumer of first-phase final signatures and unchanged ZIPs."""
+    if (platform, architecture) not in gates.release_targets(scope):
+        raise ValueError("container target outside release scope")
     if kind not in ("shipping", "acceptance"):
         raise ValueError("unknown container purpose")
     if output.exists() or output.is_symlink():
@@ -41,7 +43,7 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
     if version not in ("0.2.20", gates.VERSION) or (version == gates.VERSION and kind != "shipping"):
         raise ValueError("unsupported container version/purpose")
     confirmed = version == gates.VERSION
-    gates.verify_runtime_release(signed / "release", version, source, root_digest, public_key)
+    gates.verify_runtime_release(signed / "release", version, source, root_digest, public_key, scope=scope)
     if confirmed:
         gates.verify_runtime_release(signed / "confirmed-stable", gates.STABLE_VERSION, gates.STABLE_SOURCE,
                                      gates.STABLE_ROOT_SHA256, signed / "stable-public-key.raw")

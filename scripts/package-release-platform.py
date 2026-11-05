@@ -28,7 +28,10 @@ def main():
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
     parser.add_argument("--ndk", type=Path)
     parser.add_argument("--include-acceptance", action="store_true", help="Also build explicit diagnostic test inputs")
+    parser.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
+    if (args.platform, args.architecture) not in builder.gates.release_targets(args.scope):
+        raise ValueError("package target outside release scope")
     builder.gates.require_operation(args.mode, "build")
     if any(os.environ.get(name) for name in ("TAURI_SIGNING_PRIVATE_KEY", "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
             "ANDROID_KEYSTORE_PATH", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD")):
@@ -56,7 +59,7 @@ def main():
     for kind in (("shipping", "acceptance") if args.include_acceptance else ("shipping",)):
         staged = args.output / "staged" / kind
         container.stage_signed(args.signed, args.release_set_sha256, staged, args.public_key,
-            args.platform, args.architecture, args.source_sha, kind, readelf)
+            args.platform, args.architecture, args.source_sha, kind, readelf, scope=args.scope)
         work = args.output / "work" / kind
         if args.platform == "android":
             package = container.package_android(staged, work, args.public_key, readelf,
@@ -77,7 +80,7 @@ def main():
             shutil.copyfile(args.draft / name, args.output / "shipping" / name)
     (args.output / "package-digests.json").write_text(json.dumps(dict(source_sha=args.source_sha,
         release_set_sha256=args.release_set_sha256, platform=args.platform, architecture=args.architecture,
-        mode=args.mode, packages=packages, native_payloads="verified", full_acceptance="UNRUN"), sort_keys=True) + "\n")
+        mode=args.mode, release_scope=args.scope, packages=packages, native_payloads="verified", full_acceptance="UNRUN"), sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

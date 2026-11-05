@@ -36,13 +36,28 @@ ENVIRONMENTS = (*CANDIDATE_ENVIRONMENTS, PUBLICATION_ENVIRONMENT)
 PACKAGE_NAMES = {
     "linux": f"nelomai-{VERSION}-linux-x86_64.AppImage", "windows": f"nelomai-{VERSION}-windows-x86_64.exe",
     "macos": f"nelomai-{VERSION}-macos-aarch64.app.tar.gz", "android": f"nelomai-{VERSION}-android-aarch64.apk"}
-PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
-    "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
-    f"nelomai-{VERSION}-amneziawg-android-source.tar.gz", f"nelomai-{VERSION}-amneziawg-android-source.tar.gz.sha256",
-    f"nelomai-runtime-{VERSION}-release-set.manifest.json", f"nelomai-runtime-{VERSION}-release-set.manifest.sig",
-    *(f"nelomai-runtime-{VERSION}-{platform}-{architecture}{suffix}"
-      for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64"))
-      for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
+
+def release_targets(scope="all"):
+    targets = (("android", "aarch64"), ("linux", "x86_64"), ("macos", "aarch64"), ("windows", "x86_64"))
+    if scope == "all":
+        return targets
+    if scope == "android":
+        return targets[:1]
+    raise ValueError("unknown release scope")
+
+
+def publish_assets(scope="all"):
+    targets = release_targets(scope)
+    return frozenset(PACKAGE_NAMES[platform] for platform, _ in targets) | {
+        "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
+        f"nelomai-{VERSION}-amneziawg-android-source.tar.gz", f"nelomai-{VERSION}-amneziawg-android-source.tar.gz.sha256",
+        f"nelomai-runtime-{VERSION}-release-set.manifest.json", f"nelomai-runtime-{VERSION}-release-set.manifest.sig",
+        *(f"nelomai-runtime-{VERSION}-{platform}-{architecture}{suffix}"
+          for platform, architecture in targets
+          for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
+
+
+PUBLISH_ASSETS = publish_assets()
 
 
 def mode_policy(mode="build_only"):
@@ -131,18 +146,20 @@ def require_candidate_run(run, run_id, source, repository, run_attempt=1):
         raise ValueError("approved candidate run provenance mismatch")
 
 
-def require_publishable_inventory(inventory, run_id, source, environment_ids, run_attempt=1):
+def require_publishable_inventory(inventory, run_id, source, environment_ids, run_attempt=1, *, scope="all"):
     require_first_attempt({"id": inventory.get("run_id"), "run_attempt": inventory.get("run_attempt")}, run_id, run_attempt)
     if (inventory.get("trust") != "release" or inventory.get("mode") != "sign_candidate"
             or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)
             or not environment_ids or inventory.get("environment_ids") != environment_ids):
         raise ValueError("test-key, build-only or foreign candidate is permanently nonpublishable")
-    packages = set(PACKAGE_NAMES.values())
+    packages = {PACKAGE_NAMES[platform] for platform, _ in release_targets(scope)}
+    if inventory.get("release_scope", "all") != scope:
+        raise ValueError("candidate release scope mismatch")
     assets = inventory.get("assets", {})
-    if isinstance(assets, dict) and not set(assets) <= PUBLISH_ASSETS:
+    if isinstance(assets, dict) and not set(assets) <= publish_assets(scope):
         raise ValueError("nonpublishable or acceptance-only asset in candidate inventory")
     if not isinstance(assets, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(assets.get(name, ""))) for name in packages):
-        raise ValueError("approved digests for all four exact installer/package names required")
+        raise ValueError("approved digests for all selected exact installer/package names required")
 
 
 def github_get(endpoint):
@@ -279,7 +296,7 @@ def verify_retained_artifact(metadata, archive, directory, artifact_id, run_id, 
                 raise ValueError("local asset differs from retained ZIP")
 
 
-def verify_runtime_release(directory, version, source, root_sha256, public_key):
+def verify_runtime_release(directory, version, source, root_sha256, public_key, *, scope="all"):
     spec = importlib.util.spec_from_file_location("runtime_release_set", Path(__file__).with_name("build-runtime-release-set.py"))
     aggregate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(aggregate)
@@ -288,12 +305,12 @@ def verify_runtime_release(directory, version, source, root_sha256, public_key):
         directory / (name + ".sig"), public_key, root_sha256)
     if root["runtime_version"] != version or root["source_commit"] != source:
         raise ValueError("approved release-set identity mismatch")
-    actual = aggregate.collect(directory, version, source, public_key)
+    actual = aggregate.collect(directory, version, source, public_key, scope=scope)
     if sorted(root["artifacts"], key=lambda item: item["platform"]) != sorted(actual, key=lambda item: item["platform"]):
         raise ValueError("retained artifacts differ from approved release-set digests")
 
 
-def verify_updater_release(directory, runtime_public_key, updater_public_key, android_signer_sha256):
+def verify_updater_release(directory, runtime_public_key, updater_public_key, android_signer_sha256, *, scope="all"):
     """Existing release JSON/Ed25519 envelope plus Tauri's own minisign verifier.
 
     The two public keys are intentionally different formats and authorities.
@@ -311,9 +328,10 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
         base64.b64decode(signature.read_bytes().strip(), validate=True), body)
     document = json.loads(body)
     artifacts = document.get("artifacts", [])
-    if (document.get("schema_version") != 1 or document.get("version") != VERSION or len(artifacts) != 4
-            or {item.get("platform") for item in artifacts} != set(PACKAGE_NAMES)):
-        raise ValueError("signed release index must identify all four ordinary packages")
+    platforms = {platform for platform, _ in release_targets(scope)}
+    if (document.get("schema_version") != 1 or document.get("version") != VERSION or len(artifacts) != len(platforms)
+            or {item.get("platform") for item in artifacts} != platforms):
+        raise ValueError("signed release index must identify the exact selected packages")
     executable = os.environ.get("NELOMAI_UPDATER_SIGNATURE_VERIFIER", str(Path(__file__).resolve().parents[1]
         / "target/debug/examples" / ("verify-updater-signature.exe" if os.name == "nt" else "verify-updater-signature")))
     with tempfile.TemporaryDirectory(prefix="updater-final-verification-") as temporary:
@@ -367,6 +385,7 @@ def main():
     candidate.add_argument("--artifact-id", required=True)
     candidate.add_argument("--artifact-archive", type=Path, required=True)
     candidate.add_argument("--run-attempt", type=int, required=True)
+    candidate.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
     if args.command == "mode":
         require_operation(args.mode, args.operation)
@@ -393,9 +412,9 @@ def main():
                                  args.artifact_id, args.run_id, args.source_sha, run["repository"]["id"])
         environment_ids = check_approvals(args.repository, args.run_id, run_attempt=args.run_attempt)
         inventory = verify_inventory(args.directory, args.directory / "candidate-inventory.json", args.inventory_sha256)
-        require_publishable_inventory(inventory, args.run_id, args.source_sha, environment_ids, args.run_attempt)
-        verify_runtime_release(args.directory, VERSION, args.source_sha, args.release_set_sha256, args.public_key)
-        verify_updater_release(args.directory, args.public_key, args.updater_public_key, args.android_signer_sha256)
+        require_publishable_inventory(inventory, args.run_id, args.source_sha, environment_ids, args.run_attempt, scope=args.scope)
+        verify_runtime_release(args.directory, VERSION, args.source_sha, args.release_set_sha256, args.public_key, scope=args.scope)
+        verify_updater_release(args.directory, args.public_key, args.updater_public_key, args.android_signer_sha256, scope=args.scope)
         verify_retained_artifact(github_get(artifact_endpoint), args.artifact_archive, args.directory,
                                  args.artifact_id, args.run_id, args.source_sha, run["repository"]["id"])
         require_candidate_run(github_get(f"repos/{args.repository}/actions/runs/{args.run_id}"),

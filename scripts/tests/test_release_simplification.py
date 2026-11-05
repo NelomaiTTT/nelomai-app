@@ -16,16 +16,26 @@ import scripts.tests.test_runtime_release_set as release_fixtures
 
 class ReleaseSimplificationTest(ArtifactFixture):
     def test_shipping_only_finalizer_produces_complete_publishable_file_set(self):
+        self.check_finalizer("all")
+
+    def test_android_only_finalizer_preserves_exact_signatures_and_inventory(self):
+        self.check_finalizer("android")
+
+    def check_finalizer(self, scope):
         signed = self.root / "signed"
         consumer = module("finalize-release-candidate")
         release = release_fixtures.RuntimeReleaseSetTest.four_candidates(self, version=consumer.gates.VERSION)
+        if scope == "android":
+            for path in release.iterdir():
+                if "-android-aarch64." not in path.name:
+                    path.unlink()
         shutil.copytree(release, signed / "release")
         digest = module("build-runtime-release-set").build(signed / "release", self.root / "root-index",
-            consumer.gates.VERSION, SOURCE, self.keyfile, self.public)
+            consumer.gates.VERSION, SOURCE, self.keyfile, self.public, scope=scope)
         for path in (self.root / "root-index").iterdir():
             shutil.copyfile(path, signed / "release" / path.name)
         packages = self.root / "packages"
-        for platform, architecture in consumer.verifier.TARGETS:
+        for platform, architecture in consumer.gates.release_targets(scope):
             folder = packages / platform
             (folder / "shipping").mkdir(parents=True)
             package = folder / "shipping" / consumer.gates.PACKAGE_NAMES[platform]
@@ -35,7 +45,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
             else:
                 package.write_bytes(b"fixture" * 300000)
             (folder / "package-digests.json").write_text(json.dumps(dict(
-                source_sha=SOURCE, release_set_sha256=digest, mode="build_only", platform=platform,
+                source_sha=SOURCE, release_set_sha256=digest, mode="build_only", release_scope=scope, platform=platform,
                 architecture=architecture, packages={"shipping": dict(name=package.name,
                     sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)})))
         for suffix in (".tar.gz", ".tar.gz.sha256"):
@@ -44,7 +54,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
         arguments = ["finalize-release-candidate", "--packages", str(packages), "--signed", str(signed),
                      "--output", str(output), "--private-key", str(self.keyfile), "--public-key", str(self.public),
                      "--work", str(work), "--sdk", str(self.root / "sdk"), "--source-sha", SOURCE,
-                     "--release-set-sha256", digest]
+                     "--release-set-sha256", digest, "--scope", scope]
         run = consumer.builder.run
 
         def native_signer(*command, **kwargs):
@@ -58,7 +68,8 @@ class ReleaseSimplificationTest(ArtifactFixture):
              contextlib.redirect_stdout(io.StringIO()) as result:
             consumer.main()
         inventory = json.loads((output / "candidate/candidate-inventory.json").read_bytes())
-        self.assertEqual(set(inventory["assets"]), consumer.gates.PUBLISH_ASSETS)
+        self.assertEqual(set(inventory["assets"]), consumer.gates.publish_assets(scope))
+        self.assertEqual(inventory["release_scope"], scope)
         self.assertEqual(inventory["purpose"], "shipping")
         self.assertEqual(inventory["run_attempt"], 3)
         self.assertEqual(set(json.loads(result.getvalue())), {"inventory_sha256"})

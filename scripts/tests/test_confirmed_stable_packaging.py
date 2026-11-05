@@ -126,17 +126,27 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
             self.assertFalse((self.root / "rejected").exists())
 
     def test_shipping_binds_independent_stable_source_and_preserves_all_archived_bytes(self):
+        self.check_archived_stable("all")
+
+    def test_android_only_shipping_keeps_four_platform_stable_root_unchanged(self):
+        self.check_archived_stable("android")
+
+    def check_archived_stable(self, scope):
         drafts, stable, digest = self.inputs()
+        if scope == "android":
+            for path in drafts.iterdir():
+                if path.name != "android":
+                    shutil.rmtree(path)
         before = {p.name: p.read_bytes() for p in stable.iterdir()}
         signer = module("sign-runtime-candidate")
         with patch.object(signer.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(signer.gates, "STABLE_ROOT_SHA256", digest):
             signer.sign(drafts, self.root / "signed", "b" * 40, self.keyfile, self.public,
-                        version=VERSION, confirmed_stable=stable, stable_public_key=self.public)
+                        version=VERSION, confirmed_stable=stable, stable_public_key=self.public, scope=scope)
         archived = self.root / "signed/confirmed-stable"
         self.assertEqual(before, {p.name: p.read_bytes() for p in archived.iterdir()})
         verifier = module("verify-runtime-artifact")
-        for platform, arch in verifier.TARGETS:
+        for platform, arch in signer.gates.release_targets(scope):
             folder = self.root / "signed/containers" / platform / "shipping"
             container = verifier.authenticated("container", folder / "container-manifest-v1.json",
                 folder / "container-manifest-v1.sig", self.public, platform, arch)

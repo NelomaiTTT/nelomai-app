@@ -1,4 +1,5 @@
 """Required static authorization graph checks, complemented by executable gates."""
+import json
 import re
 import shlex
 import unittest
@@ -132,7 +133,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
                     self.assertEqual(step.get("with", {}).get("ref"), "${{ inputs.source_sha }}", name)
                     self.assertEqual(step["with"].get("fetch-depth"), 0, name)
         for name in ("native_drafts", "native_packages"):
-            targets = jobs[name]["strategy"]["matrix"]["include"]
+            expression = jobs[name]["strategy"]["matrix"]["include"]
+            self.assertTrue(expression.startswith("${{ fromJSON(inputs.release_scope == 'android' && '"))
+            android, full = re.findall(r"'(?P<json>\[.*?\])'", expression)
+            self.assertEqual([(row["platform"], row["architecture"]) for row in json.loads(android)],
+                             [("android", "aarch64")])
+            targets = json.loads(full)
             self.assertEqual({(row["platform"], row["architecture"]) for row in targets},
                 {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64")})
         self.assertEqual(jobs["sign"]["environment"], "release-candidate-signing")
@@ -150,6 +156,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         dispatch = workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]
         self.assertEqual(dispatch.get("mode", {}).get("default"), "build_only")
         self.assertTrue(dispatch["source_sha"]["required"])
+        self.assertEqual(dispatch["release_scope"]["options"], ["all", "android"])
+        self.assertEqual(dispatch["release_scope"]["default"], "all")
         build = yaml.safe_dump([workflow["jobs"][name] for name in ("native_drafts", "native_packages")])
         self.assertNotIn("secrets.", build)
         self.assertNotIn("contents: write", build)
