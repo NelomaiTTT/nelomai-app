@@ -1,3 +1,7 @@
+import {tmpdir} from "node:os";
+import {mkdir} from "node:fs/promises";
+const outputDir=process.env.VISUAL_OUTPUT ?? tmpdir();
+await mkdir(outputDir,{recursive:true});
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chromium } from "playwright-core";
@@ -111,6 +115,10 @@ try {
     executablePath,
     headless: true,
   });
+  if(process.env.UPDATE_SMOKE){
+    await capture("update-consent-desktop",{width:1280,height:800},"update-consent");
+    await capture("update-consent-mobile",{width:390,height:844},"update-consent");
+  } else {
   for (const scenario of ["runtime-pending-auto", "runtime-pending-manual", "runtime-pending-logout-failed", "runtime-pending-logout"]) {
     await capture(scenario, { width: 1280, height: 800 }, scenario);
   }
@@ -125,6 +133,7 @@ try {
   await capture("personal-tic-mobile", { width: 390, height: 844 }, "personal-tic");
   await capture("pinned-stray-mobile", { width: 390, height: 844 }, "pinned-stray");
   await capture("connection-desktop", { width: 1280, height: 800 }, "connection");
+  }
 } finally {
   try {
     await browser?.close();
@@ -144,11 +153,22 @@ async function capture(name, viewport, scenario) {
   page.setDefaultTimeout(30000);
   await page.addInitScript(
     ({ fixture, peerFixture, currentScenario, desktop }) => {
+      fixture.device.platform = desktop ? "macos" : "android";
       let connection = null;
+      let update={supported:true,automatic:true,protocol:2,phase:"downloading",version:"0.4.1",notes:null,required:false,downloaded:1024,total:2048,errorCode:null,offerId:"fixture-offer",promptPending:true,updateAvailable:true};
       window.__TAURI_CALLS__ = [];
+      window.__SET_UPDATE_PHASE__ = (phase) => { update = {...update, phase}; };
+      window.__UPDATE_CHECKING_READS__ = 0;
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
+          if(currentScenario==="update-consent"&&command.startsWith("app_update_")){
+            if(command==="app_update_status" && update.phase==="checking")window.__UPDATE_CHECKING_READS__++;
+            if(command==="app_update_presented"||command==="app_update_defer")update={...update,promptPending:false};
+            if(command==="app_update_confirm"){if(args.offerId!==update.offerId)throw Error("stale offer");update={...update,phase:"installing",promptPending:false};}
+            if(command==="app_update_check"&&args.reason==="manual")update={...update,promptPending:true};
+            return update;
+          }
           if (command === "app_bootstrap") {
             if (currentScenario.startsWith("runtime-pending") &&
                 window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === 1) {
@@ -296,7 +316,7 @@ async function capture(name, viewport, scenario) {
           }
           if (
             command === "app_update_status" ||
-            command === "app_update_refresh"
+            command === "app_update_check"
           ) {
             return {
               supported: true,
@@ -324,6 +344,34 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if(scenario==="update-consent"){
+    if (viewport.width < 600) {
+      await page.getByText("Проверять при открытии приложения. Установка — с вашего согласия.", {exact:true}).waitFor();
+      if (await page.getByText("Проверять каждые 30 минут. Установка — с вашего согласия.", {exact:true}).count()) throw Error("Android UI advertises a desktop timer");
+    }
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});await dialog.waitFor({state:"visible"});
+    await page.screenshot({path:`${outputDir}/nelomai-${name}.png`,fullPage:true});
+    await page.evaluate(()=>window.__SET_UPDATE_PHASE__("checking"));
+    await page.waitForFunction(()=>window.__UPDATE_CHECKING_READS__>0);
+    await page.waitForTimeout(50);
+    if(!await dialog.isVisible())throw Error("unanswered prompt disappeared during same-offer checking");
+    if(!await dialog.getByRole("button",{name:"Да",exact:true}).isDisabled())throw Error("confirmation allowed during checking");
+    if((await page.evaluate(()=>window.__TAURI_CALLS__)).some(c=>c.command==="app_update_confirm"))throw Error("checking submitted consent");
+    await page.evaluate(()=>window.__SET_UPDATE_PHASE__("ready_to_install"));
+    await page.waitForFunction(()=>{const d=document.querySelector('dialog[open]');return d&&Array.from(d.querySelectorAll('button')).some(b=>b.textContent==='Да'&&!b.disabled)});
+    await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();await dialog.waitFor({state:"hidden"});
+    await page.evaluate(()=>document.dispatchEvent(new Event("visibilitychange")));await page.waitForTimeout(1100);
+    if(await dialog.isVisible())throw Error("deferred offer repeated on visibility/status polling");
+    await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();await dialog.waitFor({state:"visible"});
+    await dialog.getByRole("button",{name:"Да",exact:true}).click();await dialog.waitFor({state:"hidden"});
+    await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).waitFor();
+    const calls=await page.evaluate(()=>window.__TAURI_CALLS__);
+    if(calls.filter(c=>c.command==="app_update_confirm").length!==1||calls.some(c=>c.command==="app_update_install"))throw Error("install path bypasses pinned confirmation");
+    if(!calls.some(c=>c.command==="app_update_check"&&c.args.reason==="startup"))throw Error("missing authenticated startup retry");
+    if(calls.filter(c=>c.command==="app_update_check"&&c.args.reason==="manual").length!==1)throw Error("visibility made a network check");
+    const size=await page.evaluate(()=>({scroll:document.documentElement.scrollWidth,width:innerWidth}));if(size.scroll>size.width)throw Error("update dialog overflow");
+    await context.close();return;
+  }
   if (scenario.startsWith("runtime-pending")) {
     await page.getByRole("heading", { name: "Завершаем подготовку приложения" }).waitFor();
     if (scenario.includes("logout")) {
@@ -345,7 +393,7 @@ async function capture(name, viewport, scenario) {
     if (calls !== (scenario === "runtime-pending-logout" ? 1 : 2)) {
       throw new Error(`${scenario} lost or duplicated bootstrap: ${calls}`);
     }
-    await page.screenshot({ path: `/tmp/nelomai-${name}.png`, fullPage: true });
+    await page.screenshot({ path: `${outputDir}/nelomai-${name}.png`, fullPage: true });
     await context.close();
     return;
   }
@@ -364,7 +412,7 @@ async function capture(name, viewport, scenario) {
     await page.waitForFunction(
       () =>
         (window.__TAURI_CALLS__ ?? []).some(
-          (call) => call.command === "app_update_refresh",
+          (call) => call.command === "app_update_check",
         ),
       undefined,
       { timeout: 5_000 },
@@ -441,7 +489,7 @@ async function capture(name, viewport, scenario) {
   }
 
   await page.screenshot({
-    path: `/tmp/nelomai-${name}.png`,
+    path: `${outputDir}/nelomai-${name}.png`,
     fullPage: true,
   });
   await context.close();

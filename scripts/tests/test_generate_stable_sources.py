@@ -26,6 +26,8 @@ class StableSourceGenerationTest(unittest.TestCase):
             path = app_java / "ru/nelomai/client" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("package ru.nelomai.client\n")
+        activity = app_java / "ru/nelomai/client/LatestRuntimeActivity.kt"
+        activity.write_text("package ru.nelomai.client\nimport ru.nelomai.client.RuntimeUpdateVisibility\n")
         keyring = app_java / "io/crates/keyring/Keyring.kt"
         keyring.parent.mkdir(parents=True, exist_ok=True)
         keyring.write_text("package io.crates.keyring\n")
@@ -81,6 +83,11 @@ class StableSourceGenerationTest(unittest.TestCase):
         self.assertIn("import ru.nelomai.client.RuntimeProcessSelection\n", self.generated)
         self.assertIn("!ru.nelomai.client.RuntimeProcessSelection.needsExit(selected)", self.generated)
         self.assertNotIn("ru.nelomai.runtime.stable.RuntimeProcessSelection", self.generated)
+
+    def test_update_visibility_stays_in_the_shared_container_process_contract(self):
+        activity = (self.output / "java/ru/nelomai/runtime/stable/LatestRuntimeActivity.kt").read_text()
+        self.assertIn("import ru.nelomai.client.RuntimeUpdateVisibility", activity)
+        self.assertNotIn("ru.nelomai.runtime.stable.RuntimeUpdateVisibility", activity)
 
     def test_bootstrap_network_observer_is_included_in_the_runtime_namespace(self):
         observer = self.output / "java/ru/nelomai/runtime/stable/BootstrapNetworkMonitor.kt"

@@ -1,7 +1,9 @@
 //! Common, UI-independent startup. Both native Android and desktop launchers
 //! enter here before loading a product runtime or opening protected records.
-pub use crate::host_updater::HostUpdateStatusV1;
 use crate::host_updater::HostUpdater;
+pub use crate::host_updater::{
+    HostUpdateStatusV1, UpdateCheckReason, UpdateRequestV2, UpdateStatusV2,
+};
 use crate::ipc::{
     LaunchBinding, OwnerService, PrivateBackgroundDispatcher, PrivateError, RemoteOwner,
     AUTH_REPLY_MARGIN,
@@ -212,6 +214,7 @@ pub enum HostRequestV1 {
     UpdateRefresh,
     UpdateSetAutomatic { enabled: bool },
     UpdateInstall,
+    UpdateV2 { request: UpdateRequestV2 },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
@@ -221,6 +224,9 @@ pub enum HostResponseV1 {
     },
     UpdateStatus {
         status: HostUpdateStatusV1,
+    },
+    UpdateV2 {
+        status: UpdateStatusV2,
     },
     RuntimeStatus {
         status: crate::RuntimeSwitchStatusV1,
@@ -244,6 +250,7 @@ struct HostCommands {
     ready_gate: Arc<tokio::sync::Mutex<()>>,
     migration: Option<Arc<dyn MigrationCompletion>>,
     runtime_pid: Option<u32>,
+    ui_generation: u64,
 }
 #[async_trait::async_trait]
 impl PrivateOwnerCommands for HostCommands {
@@ -333,7 +340,19 @@ impl PrivateOwnerCommands for HostCommands {
                     })
                     .await?;
                 }
+                #[cfg(not(target_os = "android"))]
+                if active {
+                    let _ = self.updater.check(UpdateCheckReason::Startup);
+                }
                 return Ok(HostResponseV1::Done);
+            }
+            HostRequestV1::UpdateV2 { request } => {
+                return Ok(HostResponseV1::UpdateV2 {
+                    status: self
+                        .updater
+                        .request_v2_for(Some(self.ui_generation), request)
+                        .await?,
+                });
             }
             HostRequestV1::UpdateStatus => {
                 return Ok(HostResponseV1::UpdateStatus {
@@ -347,9 +366,6 @@ impl PrivateOwnerCommands for HostCommands {
             }
             HostRequestV1::UpdateSetAutomatic { enabled } => {
                 let status = self.updater.set_automatic(enabled)?;
-                if enabled && status.supported {
-                    self.updater.install(true)?;
-                }
                 return Ok(HostResponseV1::UpdateStatus { status });
             }
             HostRequestV1::UpdateInstall => {
@@ -443,6 +459,7 @@ struct HostBridge {
     peer: Mutex<Option<HostPeer>>,
     native: HostNativePorts,
     broker: std::sync::OnceLock<std::sync::Weak<AuthBroker>>,
+    updater: std::sync::OnceLock<std::sync::Weak<HostUpdater>>,
     push_gate: Arc<tokio::sync::Mutex<()>>,
 }
 impl HostBridge {
@@ -480,6 +497,9 @@ impl HostBridge {
 #[async_trait::async_trait]
 impl LocalAuthStop for HostBridge {
     fn revoke_runtime(&self) {
+        if let Some(updater) = self.updater.get().and_then(std::sync::Weak::upgrade) {
+            updater.auth_revoked();
+        }
         if let Ok(peer) = self.peer() {
             peer.revoke_runtime();
         }
@@ -674,6 +694,7 @@ impl CommonHost {
             peer: Mutex::new(None),
             native,
             broker: std::sync::OnceLock::new(),
+            updater: std::sync::OnceLock::new(),
             push_gate: Arc::new(tokio::sync::Mutex::new(())),
         });
         let api = api
@@ -715,6 +736,14 @@ impl CommonHost {
             )
             .map_err(|_| HostError::RecoveryRequired)?,
         );
+        let _ = bridge.updater.set(Arc::downgrade(&updater));
+        let ui_bridge = Arc::downgrade(&bridge);
+        updater.set_ui_connection_probe(Arc::new(move || {
+            ui_bridge
+                .upgrade()
+                .and_then(|bridge| bridge.peer().ok())
+                .is_some_and(|peer| peer.is_connected())
+        }));
         Ok(Self {
             owner,
             installed: selection,
@@ -741,6 +770,26 @@ impl CommonHost {
     pub fn coordinator(&self) -> &Arc<SwitchCoordinator> {
         &self.coordinator
     }
+    #[cfg(not(target_os = "android"))]
+    pub fn start_update_scheduler(&self) {
+        self.updater.start_desktop_scheduler();
+    }
+    pub fn updater_status_v2(&self) -> Result<UpdateStatusV2, HostError> {
+        self.updater
+            .status_v2()
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+    #[cfg(not(target_os = "android"))]
+    pub fn take_update_notification(&self) -> Option<nelomai_client_updater::UpdateOffer> {
+        self.updater.take_notification()
+    }
+    pub fn update_ui_foreground(&self) -> bool {
+        self.updater.ui_foreground()
+    }
+    pub fn update_ui_disconnected(&self) {
+        self.updater.ui_disconnected();
+    }
+
     pub fn updater_status(&self) -> Result<HostUpdateStatusV1, HostError> {
         self.updater
             .status()
@@ -894,6 +943,7 @@ impl CommonHost {
                 ready_gate: self.ready_gate.clone(),
                 migration: self.migration.clone(),
                 runtime_pid: None,
+                ui_generation: self.updater.attach_ui(),
             })),
         )
         .map_err(|_| HostError::RecoveryRequired)?;
@@ -980,6 +1030,7 @@ impl CommonHost {
                 ready_gate: self.ready_gate.clone(),
                 migration: self.migration.clone(),
                 runtime_pid: Some(caller_pid),
+                ui_generation: self.updater.attach_ui(),
             })),
         )
         .map_err(|_| HostError::RecoveryRequired)?;

@@ -6,7 +6,7 @@ use nelomai_client_container::ipc::{
 use tauri::Manager;
 
 pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let (descriptor, bootstrap) = android_runtime::take_bootstrap()?;
+    let (descriptor, bootstrap, update_protocol) = android_runtime::take_bootstrap()?;
     let paths = bootstrap.runtime_paths()?;
     let selected = paths
         .iter()
@@ -83,7 +83,9 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(Arc::new(runtime_control::RuntimeControls::new(
         port.clone(),
     )));
-    app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
+    app.manage(Arc::new(
+        updates::NativeUpdater::new(port.clone()).with_update_protocol(update_protocol),
+    ));
     app.manage(application.clone());
     app.manage(tunnel.clone());
     app.manage(diagnostics.clone());
@@ -92,8 +94,10 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(push.clone());
     app.manage(metrics.clone());
     let handle = app.handle().clone();
+    let update_port = port.clone();
     let startup_diagnostics = diagnostics.clone();
     let startup = Arc::new(runtime_startup::RuntimeStartup::new(move || {
+        crate::android_update_ui::start(update_protocol, update_port);
         diagnostics.record_named("startup.runtime_ready", None, None, None);
         let dns = application_dns(&handle);
         let dns_handle = handle.clone();

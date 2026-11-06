@@ -51,3 +51,30 @@ fn child_bootstrap_only_derives_paths_for_admitted_selected_and_retained_state()
         "runtime/stable/state/0.2.15/state-v1.json"
     );
 }
+
+#[test]
+fn updater_v2_is_a_separate_strict_command_without_changing_legacy_wire() {
+    use nelomai_client_container::host::HostRequestV1;
+    let legacy: HostRequestV1 = serde_json::from_str(r#"{"command":"update_status"}"#).unwrap();
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        r#"{"command":"update_status"}"#
+    );
+    let v2 = serde_json::from_str::<HostRequestV1>(
+        r#"{"command":"update_v2","request":{"action":"check","reason":"manual"}}"#,
+    );
+    assert!(
+        v2.is_ok(),
+        "new updater contract needs its own explicit command"
+    );
+    for invalid in [
+        r#"{"command":"update_v2","request":{"action":"confirm"}}"#,
+        r#"{"command":"update_v2","request":{"action":"confirm","offerId":"offer","path":"/tmp/installer"}}"#,
+        r#"{"command":"update_v2","request":{"action":"status","offerId":"offer"}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<HostRequestV1>(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}

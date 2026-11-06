@@ -73,7 +73,7 @@ enum Call {
     ReleaseOwnerReload(u32, bool),
 }
 impl Callbacks {
-    fn install_apk(&self, path: &str, version: &str, signer: &str) -> Result<bool, ()> {
+    fn apk(&self, method: &str, path: &str, version: &str, signer: &str) -> Result<bool, ()> {
         let mut env = self.vm.attach_current_thread().map_err(|_| ())?;
         let path = env.new_string(path).map_err(|_| ())?;
         let version = env.new_string(version).map_err(|_| ())?;
@@ -81,7 +81,7 @@ impl Callbacks {
         let result = env
             .call_method(
                 self.object.as_obj(),
-                "installApk",
+                method,
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
                 &[
                     JValue::Object(&path),
@@ -216,6 +216,27 @@ impl nelomai_client_container::host::NativeRuntimeStorage for Native {
 }
 #[async_trait::async_trait]
 impl nelomai_client_updater::AndroidApkInstaller for Native {
+    async fn validate_apk(
+        &self,
+        path: &std::path::Path,
+        version: &str,
+        signer: &str,
+    ) -> Result<(), nelomai_client_updater::UpdateBackendError> {
+        let callback = self.0.clone();
+        let path = path.to_string_lossy().into_owned();
+        let version = version.to_owned();
+        let signer = signer.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            callback.apk("validateApk", &path, &version, &signer)
+        })
+        .await
+        {
+            Ok(Ok(true)) => Ok(()),
+            _ => Err(nelomai_client_updater::UpdateBackendError::new(
+                "apk_validation_failed",
+            )),
+        }
+    }
     async fn install_apk(
         &self,
         path: &std::path::Path,
@@ -227,7 +248,7 @@ impl nelomai_client_updater::AndroidApkInstaller for Native {
         let path = path.to_string_lossy().into_owned();
         let version = version.to_owned();
         let signer = signer.to_owned();
-        tokio::task::spawn_blocking(move || callback.install_apk(&path, &version, &signer))
+        tokio::task::spawn_blocking(move || callback.apk("installApk", &path, &version, &signer))
             .await
             .map_err(|_| {
                 nelomai_client_updater::UpdateBackendError::new("apk_installer_unavailable")
@@ -467,6 +488,17 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeSelection(
             std::ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeUpdateUiForeground(
+    _: JNIEnv,
+    _: JObject,
+    id: jlong,
+) -> jboolean {
+    host(id)
+        .is_ok_and(|host| host.owner.update_ui_foreground())
+        .into()
 }
 
 #[no_mangle]

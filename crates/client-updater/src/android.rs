@@ -1,6 +1,7 @@
 use crate::{
     AndroidManifestError, AndroidUpdateManifest, DownloadProgress, InstallResult, InstalledUpdate,
-    UpdateBackend, UpdateBackendError, UpdateBarrierPhase, UpdateEndpointPolicy,
+    PreparedUpdate, ResolvedUpdate, UpdateBackend, UpdateBackendError, UpdateBarrierPhase,
+    UpdateEndpointPolicy,
 };
 use async_trait::async_trait;
 use nelomai_client_api::{execute_panel_request, panel_http_client_builder, AccessSnapshot};
@@ -17,6 +18,14 @@ const ANDROID_TARGET: &str = "android-aarch64";
 
 #[async_trait]
 pub trait AndroidApkInstaller: Send + Sync {
+    async fn validate_apk(
+        &self,
+        _path: &Path,
+        _version: &str,
+        _signer: &str,
+    ) -> Result<(), UpdateBackendError> {
+        Err(UpdateBackendError::new("apk_validation_unavailable"))
+    }
     async fn install_apk(
         &self,
         path: &Path,
@@ -31,6 +40,7 @@ pub struct AndroidUpdateBackend {
     endpoint_policy: UpdateEndpointPolicy,
     http: Client,
     update_dir: PathBuf,
+    cache_use: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AndroidUpdateBackend {
@@ -52,7 +62,26 @@ impl AndroidUpdateBackend {
             endpoint_policy,
             http,
             update_dir,
+            cache_use: Arc::new(tokio::sync::Mutex::new(())),
         })
+    }
+
+    fn validated_resolved(
+        &self,
+        resolved: &ResolvedUpdate,
+    ) -> Result<crate::ValidatedAndroidUpdate, UpdateBackendError> {
+        if resolved.target != ANDROID_TARGET || resolved.key_identity != resolved.signature {
+            return Err(UpdateBackendError::new("invalid_update_manifest"));
+        }
+        AndroidUpdateManifest {
+            version: resolved.version.clone(),
+            url: resolved.artifact_url.clone(),
+            signature: resolved.signature.clone(),
+            sha256: resolved.sha256.clone().unwrap_or_default(),
+            size_bytes: resolved.size_bytes.unwrap_or_default(),
+        }
+        .validate(&resolved.version, &self.endpoint_policy)
+        .map_err(manifest_error)
     }
 
     async fn download(
@@ -68,9 +97,7 @@ impl AndroidUpdateBackend {
         let destination = self
             .update_dir
             .join(format!("nelomai-{}.apk", update.version));
-        cleanup_stale_updates(&self.update_dir, &destination).await?;
         remove_if_exists(&temporary).await?;
-        remove_if_exists(&destination).await?;
 
         let mut request = self.http.get(update.artifact_url.clone());
         for (name, value) in access_token.bearer_headers() {
@@ -157,7 +184,7 @@ impl AndroidUpdateBackend {
         let path = self
             .update_dir
             .join(format!("nelomai-{}.apk", update.version));
-        let metadata = match fs::metadata(&path).await {
+        let metadata = match fs::symlink_metadata(&path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(_) => return Err(UpdateBackendError::new("update_cache_unavailable")),
@@ -191,14 +218,11 @@ impl AndroidUpdateBackend {
 
 #[async_trait]
 impl UpdateBackend for AndroidUpdateBackend {
-    async fn install(
+    async fn resolve(
         &self,
         access_token: &AccessSnapshot,
         expected_version: &str,
-        barrier: UpdateBarrierPhase,
-        progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
-    ) -> Result<InstallResult, UpdateBackendError> {
-        debug_assert_eq!(barrier, UpdateBarrierPhase::LocalStopped);
+    ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
         let current_version = &self.current_container_version;
         let endpoint = self
             .endpoint_policy
@@ -218,7 +242,7 @@ impl UpdateBackend for AndroidUpdateBackend {
         .await
         .map_err(|_| UpdateBackendError::new("update_check_failed"))?;
         if response.status() == StatusCode::NO_CONTENT {
-            return Ok(InstallResult::NoUpdate);
+            return Ok(None);
         }
         if !response.status().is_success() {
             return Err(UpdateBackendError::new("update_check_failed"));
@@ -230,6 +254,28 @@ impl UpdateBackend for AndroidUpdateBackend {
         let update = manifest
             .validate(expected_version, &self.endpoint_policy)
             .map_err(manifest_error)?;
+        Ok(Some(ResolvedUpdate {
+            version: update.version,
+            target: ANDROID_TARGET.into(),
+            artifact_url: update.artifact_url.to_string(),
+            signature: update.signer_sha256.clone(),
+            key_identity: update.signer_sha256,
+            sha256: Some(update.sha256),
+            size_bytes: Some(update.size_bytes),
+        }))
+    }
+
+    async fn prepare(
+        &self,
+        access_token: &AccessSnapshot,
+        resolved: &ResolvedUpdate,
+        progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<PreparedUpdate, UpdateBackendError> {
+        let _cache = self
+            .cache_use
+            .try_lock()
+            .map_err(|_| UpdateBackendError::new("update_operation_busy"))?;
+        let update = self.validated_resolved(resolved)?;
         let apk = match self.cached_apk(&update).await? {
             Some(path) => {
                 progress(DownloadProgress {
@@ -240,16 +286,62 @@ impl UpdateBackend for AndroidUpdateBackend {
             }
             None => self.download(access_token, &update, progress).await?,
         };
-        let installer_opened = self
-            .installer
-            .install_apk(&apk, &update.version, &update.signer_sha256)
+        self.installer
+            .validate_apk(&apk, &update.version, &update.signer_sha256)
             .await?;
-        if !installer_opened {
-            return Err(UpdateBackendError::new("apk_install_cancelled"));
+        let resolved = resolved.clone();
+        let prepared =
+            tokio::task::spawn_blocking(move || PreparedUpdate::from_verified_file(resolved, apk))
+                .await
+                .map_err(|_| UpdateBackendError::new("update_cache_invalid"))??;
+        // Prune only after the replacement is fully verified. A failed download
+        // must not remove another ready package; a live installer owns this gate.
+        cleanup_stale_updates(&self.update_dir, prepared.path()).await?;
+        Ok(prepared)
+    }
+
+    async fn install_prepared(
+        &self,
+        prepared: &PreparedUpdate,
+        barrier: UpdateBarrierPhase,
+    ) -> Result<InstallResult, UpdateBackendError> {
+        debug_assert_eq!(barrier, UpdateBarrierPhase::LocalStopped);
+        let cache = self
+            .cache_use
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| UpdateBackendError::new("update_operation_busy"))?;
+        let update = self.validated_resolved(prepared.resolved())?;
+        let apk = self
+            .update_dir
+            .join(format!("nelomai-{}.apk", update.version));
+        if prepared.path() != apk {
+            return Err(UpdateBackendError::new("update_cache_invalid"));
         }
-        Ok(InstallResult::InstallerOpened(InstalledUpdate {
-            version: update.version,
-        }))
+        let prepared = prepared.clone();
+        let installer = self.installer.clone();
+        // Dropping the requesting future cannot cancel the JNI/system installer.
+        // Keep its file lease until the actual consumer completes, including cancel.
+        tokio::spawn(async move {
+            let _cache = cache;
+            prepared.revalidate_async().await?;
+            installer
+                .validate_apk(&apk, &update.version, &update.signer_sha256)
+                .await?;
+            if !installer
+                .install_apk(&apk, &update.version, &update.signer_sha256)
+                .await?
+            {
+                return Err(UpdateBackendError::new("apk_install_cancelled"));
+            }
+            // Cleanup is best effort after success; a disk error cannot undo installation.
+            let _ = remove_if_exists(&apk).await;
+            Ok(InstallResult::InstallerOpened(InstalledUpdate {
+                version: update.version,
+            }))
+        })
+        .await
+        .map_err(|_| UpdateBackendError::new("apk_installer_unavailable"))?
     }
 }
 
@@ -285,7 +377,11 @@ async fn cleanup_stale_updates(directory: &Path, current: &Path) -> Result<(), U
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".apk") || name.ends_with(".part") {
+        let owned_apk = name
+            .strip_prefix("nelomai-")
+            .and_then(|name| name.strip_suffix(".apk"))
+            .is_some_and(|version| semver::Version::parse(version).is_ok());
+        if owned_apk || name == ".nelomai-update.part" {
             remove_if_exists(&path).await?;
         }
     }
@@ -294,6 +390,318 @@ async fn cleanup_stale_updates(directory: &Path, current: &Path) -> Result<(), U
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn install_candidate(
+        backend: &AndroidUpdateBackend,
+        access: &AccessSnapshot,
+        version: &str,
+    ) -> Result<InstallResult, UpdateBackendError> {
+        let Some(resolved) = backend.resolve(access, version).await? else {
+            return Ok(InstallResult::NoUpdate);
+        };
+        let prepared = backend.prepare(access, &resolved, Arc::new(|_| {})).await?;
+        backend
+            .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+            .await
+    }
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+
+    struct ValidatingInstaller {
+        calls: Mutex<Vec<&'static str>>,
+        reject: AtomicBool,
+    }
+    #[async_trait]
+    impl AndroidApkInstaller for ValidatingInstaller {
+        async fn validate_apk(
+            &self,
+            path: &Path,
+            version: &str,
+            signer: &str,
+        ) -> Result<(), UpdateBackendError> {
+            self.calls.lock().unwrap().push("validate");
+            assert_eq!(std::fs::read(path).unwrap(), b"abc");
+            assert_eq!(version, "0.3.13");
+            assert_eq!(signer, "a".repeat(64));
+            if self.reject.load(Ordering::SeqCst) {
+                return Err(UpdateBackendError::new("apk_signer_mismatch"));
+            }
+            Ok(())
+        }
+        async fn install_apk(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Result<bool, UpdateBackendError> {
+            self.calls.lock().unwrap().push("install");
+            Ok(true)
+        }
+    }
+    fn split_fixture() -> (
+        tempfile::TempDir,
+        AndroidUpdateBackend,
+        Arc<ValidatingInstaller>,
+        ResolvedUpdate,
+        AccessSnapshot,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let installer = Arc::new(ValidatingInstaller {
+            calls: Mutex::new(Vec::new()),
+            reject: AtomicBool::new(false),
+        });
+        let backend =
+            AndroidUpdateBackend::new(dir.path().into(), "0.3.12".into(), installer.clone())
+                .unwrap();
+        let resolved = ResolvedUpdate {
+            version: "0.3.13".into(),
+            target: "android-aarch64".into(),
+            artifact_url: "https://nelomai.ru/api/client/v1/updates/artifacts/update.apk".into(),
+            signature: "a".repeat(64),
+            key_identity: "a".repeat(64),
+            sha256: Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into()),
+            size_bytes: Some(3),
+        };
+        std::fs::write(dir.path().join("nelomai-0.3.13.apk"), b"abc").unwrap();
+        let access = AccessSnapshot::new(
+            "synthetic".into(),
+            nelomai_contracts::RuntimeIdentity {
+                container_version: "0.3.12".into(),
+                runtime_version: "0.3.12".into(),
+                runtime_contract_version: 1,
+                slot: nelomai_contracts::RuntimeSlot::Latest,
+                session_generation: Some(1),
+            },
+            1,
+            "fixture-family".into(),
+        )
+        .unwrap();
+        (dir, backend, installer, resolved, access)
+    }
+    #[tokio::test]
+    async fn apk_prepare_validates_without_install_and_rechecks_bytes_before_handoff() {
+        let (_dir, backend, installer, resolved, access) = split_fixture();
+        let prepared = backend
+            .prepare(&access, &resolved, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(*installer.calls.lock().unwrap(), vec!["validate"]);
+        assert_eq!(prepared.resolved(), &resolved);
+        std::fs::write(prepared.path(), b"xyz").unwrap();
+        assert_eq!(
+            backend
+                .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+                .await
+                .unwrap_err()
+                .code(),
+            "update_hash_mismatch"
+        );
+        assert_eq!(*installer.calls.lock().unwrap(), vec!["validate"]);
+    }
+    #[tokio::test]
+    async fn apk_prepared_signature_is_rechecked_and_success_cleans_only_owned_file() {
+        let (dir, backend, installer, resolved, access) = split_fixture();
+        std::fs::write(dir.path().join("unrelated.apk"), b"keep").unwrap();
+        let prepared = backend
+            .prepare(&access, &resolved, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        installer.reject.store(true, Ordering::SeqCst);
+        assert_eq!(
+            backend
+                .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+                .await
+                .unwrap_err()
+                .code(),
+            "apk_signer_mismatch"
+        );
+        assert!(prepared.path().exists());
+        assert_eq!(
+            *installer.calls.lock().unwrap(),
+            vec!["validate", "validate"]
+        );
+        installer.reject.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            backend
+                .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+                .await
+                .unwrap(),
+            InstallResult::InstallerOpened(_)
+        ));
+        assert_eq!(
+            *installer.calls.lock().unwrap(),
+            vec!["validate", "validate", "validate", "install"]
+        );
+        assert!(!prepared.path().exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("unrelated.apk")).unwrap(),
+            b"keep"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apk_cache_rejects_symlink_without_following_or_removing_target() {
+        let (dir, backend, _, resolved, _) = split_fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("foreign.apk");
+        std::fs::write(&target, b"abc").unwrap();
+        let path = dir.path().join("nelomai-0.3.13.apk");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(backend
+            .cached_apk(&backend.validated_resolved(&resolved).unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(target).unwrap(), b"abc");
+    }
+    #[tokio::test]
+    async fn failed_apk_download_preserves_ready_file_and_retry_replaces_partial() {
+        use std::io::{Read, Write};
+        let (dir, mut backend, installer, mut resolved, access) = split_fixture();
+        std::fs::remove_file(dir.path().join("nelomai-0.3.13.apk")).unwrap();
+        let previous = dir.path().join("nelomai-0.3.12.apk");
+        std::fs::write(&previous, b"previous").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        backend.endpoint_policy = UpdateEndpointPolicy {
+            panel_origin: origin.parse().unwrap(),
+        };
+        resolved.artifact_url = format!("{origin}/api/client/v1/updates/artifacts/update.apk");
+        let server = std::thread::spawn(move || {
+            for body in [b"ab".as_slice(), b"abc".as_slice()] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).unwrap() > 0);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        assert!(backend
+            .prepare(&access, &resolved, Arc::new(|_| {}))
+            .await
+            .is_err());
+        assert!(installer.calls.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(&previous).unwrap(), b"previous");
+        assert!(!dir.path().join("nelomai-0.3.13.apk").exists());
+        let prepared = backend
+            .prepare(&access, &resolved, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), b"abc");
+        assert_eq!(*installer.calls.lock().unwrap(), vec!["validate"]);
+        assert!(!dir.path().join(".nelomai-update.part").exists());
+        assert!(!previous.exists());
+        server.join().unwrap();
+    }
+    #[tokio::test]
+    async fn active_installer_file_is_not_pruned_and_cancelled_package_is_reusable() {
+        struct BlockingInstaller {
+            validation: Arc<ValidatingInstaller>,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl AndroidApkInstaller for BlockingInstaller {
+            async fn validate_apk(
+                &self,
+                path: &Path,
+                version: &str,
+                signer: &str,
+            ) -> Result<(), UpdateBackendError> {
+                self.validation.validate_apk(path, version, signer).await
+            }
+            async fn install_apk(
+                &self,
+                _: &Path,
+                _: &str,
+                _: &str,
+            ) -> Result<bool, UpdateBackendError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(false)
+            }
+        }
+        let (_dir, mut backend, validation, resolved, access) = split_fixture();
+        let prepared = backend
+            .prepare(&access, &resolved, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let installer = Arc::new(BlockingInstaller {
+            validation,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        backend.installer = installer.clone();
+        let backend = Arc::new(backend);
+        let installing = {
+            let backend = backend.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                backend
+                    .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+                    .await
+            })
+        };
+        installer.entered.notified().await;
+        assert_eq!(
+            backend
+                .prepare(&access, &resolved, Arc::new(|_| {}))
+                .await
+                .unwrap_err()
+                .code(),
+            "update_operation_busy"
+        );
+        assert_eq!(std::fs::read(prepared.path()).unwrap(), b"abc");
+        installer.release.notify_one();
+        assert_eq!(
+            installing.await.unwrap().unwrap_err().code(),
+            "apk_install_cancelled"
+        );
+        assert!(prepared.path().exists());
+        assert_eq!(
+            backend
+                .prepare(&access, &resolved, Arc::new(|_| {}))
+                .await
+                .unwrap()
+                .sha256(),
+            prepared.sha256()
+        );
+        let abandoned = {
+            let backend = backend.clone();
+            let prepared = prepared.clone();
+            tokio::spawn(async move {
+                backend
+                    .install_prepared(&prepared, UpdateBarrierPhase::LocalStopped)
+                    .await
+            })
+        };
+        installer.entered.notified().await;
+        abandoned.abort();
+        assert!(abandoned.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            backend
+                .prepare(&access, &resolved, Arc::new(|_| {}))
+                .await
+                .unwrap_err()
+                .code(),
+            "update_operation_busy",
+            "cancelling the caller does not finish the native installer consumer"
+        );
+        installer.release.notify_one();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), backend.cache_use.lock())
+                .await
+                .unwrap(),
+        );
+        assert!(prepared.path().exists());
+    }
     #[tokio::test]
     async fn https_backup_fetches_manifest_and_apk_and_rejects_tampering() {
         use rustls::{
@@ -406,6 +814,16 @@ mod tests {
         struct Installer(Arc<AtomicUsize>);
         #[async_trait]
         impl AndroidApkInstaller for Installer {
+            async fn validate_apk(
+                &self,
+                path: &Path,
+                _: &str,
+                signer: &str,
+            ) -> Result<(), UpdateBackendError> {
+                assert_eq!(std::fs::read(path).unwrap(), b"abc");
+                assert_eq!(signer, "a".repeat(64));
+                Ok(())
+            }
             async fn install_apk(
                 &self,
                 path: &Path,
@@ -454,14 +872,7 @@ mod tests {
                 "test-family".into(),
             )
             .unwrap();
-            let result = backend
-                .install(
-                    &access,
-                    "0.3.10",
-                    UpdateBarrierPhase::LocalStopped,
-                    Arc::new(|_| {}),
-                )
-                .await;
+            let result = install_candidate(&backend, &access, "0.3.10").await;
             let (count, requests) = primary_thread.join().unwrap();
             assert_eq!(count, 2);
             assert!(
@@ -487,6 +898,16 @@ mod tests {
         struct Installer(u8);
         #[async_trait]
         impl AndroidApkInstaller for Installer {
+            async fn validate_apk(
+                &self,
+                path: &Path,
+                _: &str,
+                signer: &str,
+            ) -> Result<(), UpdateBackendError> {
+                assert_eq!(std::fs::read(path).unwrap(), b"abc");
+                assert_eq!(signer, "a".repeat(64));
+                Ok(())
+            }
             async fn install_apk(
                 &self,
                 path: &Path,
@@ -545,14 +966,7 @@ mod tests {
                 "synthetic-family".into(),
             )
             .unwrap();
-            let result = backend
-                .install(
-                    &access,
-                    "0.3.7",
-                    UpdateBarrierPhase::LocalStopped,
-                    Arc::new(|_| {}),
-                )
-                .await;
+            let result = install_candidate(&backend, &access, "0.3.7").await;
             server.join().unwrap();
             match mode {
                 0 => assert_eq!(result.unwrap_err().code(), "apk_install_cancelled"),

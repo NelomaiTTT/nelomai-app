@@ -9,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import java.io.File
@@ -21,6 +23,32 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 internal object RuntimeApkValidation {
+    fun validate(context: Context, path: String, version: String, signer: String): File {
+        require(version.isNotBlank() && version.length <= 64) { "invalid_version" }
+        val file = RuntimeApkValidation.path(File(context.cacheDir, "updates"), path)
+        val archive = requireNotNull(packageInfo(context, file.absolutePath, true)) { "archive_info_missing" }
+        require(archive.packageName == context.packageName && archive.versionName == version) { "package_mismatch" }
+        val installed = requireNotNull(packageInfo(context, context.packageName, false)) { "installed_info_missing" }
+        val archiveSigners = signers(archive)
+        require(archiveSigners.isNotEmpty()) { "archive_signers_missing" }
+        val installedSigners = signers(installed)
+        require(installedSigners.isNotEmpty()) { "installed_signers_missing" }
+        require(RuntimeApkValidation.signers(archiveSigners, installedSigners, signer.trim().lowercase())) { "signer_mismatch" }
+        return file
+    }
+    @Suppress("DEPRECATION")
+    fun packageInfo(context: Context, value: String, archive: Boolean): PackageInfo? {
+        var flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
+        // Android 9/10 only collect archive certificates when GET_SIGNATURES is set.
+        if (archive && Build.VERSION.SDK_INT in 28..29) flags = flags or PackageManager.GET_SIGNATURES
+        return if (archive) context.packageManager.getPackageArchiveInfo(value, flags) else context.packageManager.getPackageInfo(value, flags)
+    }
+    @Suppress("DEPRECATION")
+    private fun signers(info: PackageInfo): Set<String> {
+        val values = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners.orEmpty() else info.signatures.orEmpty()
+        return values.mapTo(mutableSetOf()) { signature -> MessageDigest.getInstance("SHA-256")
+            .digest(signature.toByteArray()).joinToString("") { "%02x".format(it) } }
+    }
     fun path(root: File, value: String): File = File(value).canonicalFile.also {
         require(it.isFile && it.extension.lowercase() == "apk" && it.parentFile == root.canonicalFile) { "invalid_apk_path" }
     }
@@ -56,14 +84,21 @@ internal object RuntimeApkInstaller {
     data class Request(val path: String, val version: String, val signer: String,
         val nonce: String = UUID.randomUUID().toString(), val result: CompletableFuture<Boolean> = CompletableFuture())
     private val pending = AtomicReference<Request?>(null)
-    fun install(context: Context, path: String, version: String, signer: String): Boolean {
+    fun install(context: Context, path: String, version: String, signer: String, foreground: () -> Boolean): Boolean {
         val request = Request(path, version, signer)
         check(pending.compareAndSet(null, request)) { "update_install_in_progress" }
         StartupDiagnostics.record(context, "update.android.install_requested")
         return try {
-            context.startActivity(Intent(context, RuntimeApkInstallerActivity::class.java)
-                .putExtra("request", request.nonce).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            StartupDiagnostics.record(context, "update.android.installer_activity_dispatched")
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    check(pending.get() === request && !request.result.isDone) { "request_expired" }
+                    // The worker's earlier proof can expire while queued on the UI thread.
+                    check(foreground()) { "update_ui_not_foreground" }
+                    context.startActivity(Intent(context, RuntimeApkInstallerActivity::class.java)
+                        .putExtra("request", request.nonce).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    StartupDiagnostics.record(context, "update.android.installer_activity_dispatched")
+                } catch (error: Throwable) { request.result.completeExceptionally(error) }
+            }
             request.result.get(15, TimeUnit.MINUTES).also { installed ->
                 StartupDiagnostics.record(
                     context,
@@ -114,7 +149,7 @@ class RuntimeApkInstallerActivity : Activity() {
             return
         }
         try {
-            validate(requireNotNull(request))
+            RuntimeApkValidation.validate(this, requireNotNull(request).path, request!!.version, request!!.signer)
             StartupDiagnostics.record(this, "update.android.package_validated")
             if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
                 StartupDiagnostics.record(this, "update.android.unknown_sources_requested")
@@ -138,8 +173,8 @@ class RuntimeApkInstallerActivity : Activity() {
             } else when (result) {
                 RESULT_CANCELED -> complete(false)
                 RESULT_OK -> {
-                    validate(value)
-                    check(packageInfo(packageName, false)?.versionName == value.version) { "installed_version_mismatch" }
+                    RuntimeApkValidation.validate(this, value.path, value.version, value.signer)
+                    check(RuntimeApkValidation.packageInfo(this, packageName, false)?.versionName == value.version) { "installed_version_mismatch" }
                     complete(true)
                 }
                 else -> error("installer_result_failed")
@@ -174,39 +209,14 @@ class RuntimeApkInstallerActivity : Activity() {
         }
         super.onDestroy()
     }
-    private fun validate(value: RuntimeApkInstaller.Request): File {
-        require(value.version.isNotBlank() && value.version.length <= 64) { "invalid_version" }
-        val file = RuntimeApkValidation.path(File(cacheDir, "updates"), value.path)
-        val archive = requireNotNull(packageInfo(file.absolutePath, true)) { "archive_info_missing" }
-        require(archive.packageName == packageName && archive.versionName == value.version) { "package_mismatch" }
-        val installed = requireNotNull(packageInfo(packageName, false)) { "installed_info_missing" }
-        val archiveSigners = signers(archive)
-        require(archiveSigners.isNotEmpty()) { "archive_signers_missing" }
-        val installedSigners = signers(installed)
-        require(installedSigners.isNotEmpty()) { "installed_signers_missing" }
-        require(RuntimeApkValidation.signers(archiveSigners, installedSigners, value.signer.trim().lowercase())) { "signer_mismatch" }
-        return file
-    }
-    @Suppress("DEPRECATION")
-    private fun packageInfo(value: String, archive: Boolean): PackageInfo? {
-        var flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
-        // Android 9/10 only collect archive certificates when GET_SIGNATURES is set.
-        if (archive && Build.VERSION.SDK_INT in 28..29) flags = flags or PackageManager.GET_SIGNATURES
-        return if (archive) packageManager.getPackageArchiveInfo(value, flags) else packageManager.getPackageInfo(value, flags)
-    }
-    @Suppress("DEPRECATION")
-    private fun signers(info: PackageInfo): Set<String> {
-        val values = if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners.orEmpty() else info.signatures.orEmpty()
-        return values.mapTo(mutableSetOf()) { signature -> MessageDigest.getInstance("SHA-256")
-            .digest(signature.toByteArray()).joinToString("") { "%02x".format(it) } }
-    }
     private fun activeRequest(): RuntimeApkInstaller.Request = requireNotNull(request).also {
         check(RuntimeApkInstaller.request(it.nonce) === it && !it.result.isDone) { "request_expired" }
     }
     @Suppress("DEPRECATION")
     private fun openInstaller() {
         // Revalidate after unknown-sources permission UI; no stale package proof.
-        val file = validate(activeRequest())
+        val value = activeRequest()
+        val file = RuntimeApkValidation.validate(this, value.path, value.version, value.signer)
         val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
         val intent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
             setDataAndType(uri, "application/vnd.android.package-archive")

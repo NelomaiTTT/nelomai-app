@@ -9,9 +9,13 @@ import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
 class MainActivity : Activity() {
     private var selection: RuntimeSelectionStore? = null
     private var launchStarted = false
+    private var updateLaunchSession: String? = null
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         if (routeDiagnostics(intent)) return
+        updateLaunchSession = if (state != null) state.getString("nelomai_update_launch_session")
+            else if (intent.action == Intent.ACTION_MAIN || intent.action == "android.service.quicksettings.action.QS_TILE_PREFERENCES")
+                java.util.UUID.randomUUID().toString() else null
         selection = RuntimeSelectionStore(this)
         setContentView(android.widget.TextView(this).apply {
             text = "Запуск Nelomai…"
@@ -29,7 +33,11 @@ class MainActivity : Activity() {
             stage = SupportStartupStage.LAUNCHER_OWNER_READ
             selection?.read { result ->
                 if (isFinishing || isDestroyed) return@read
-                result.onSuccess { startActivity(Intent(this, RuntimeBootstrapActivity::class.java)); finish() }
+                result.onSuccess {
+                    startActivity(Intent(this, RuntimeBootstrapActivity::class.java)
+                        .putExtra("nelomai_update_launch_session", updateLaunchSession))
+                    finish()
+                }
                     .onFailure { SupportDiagnosticsStartup.showFailure(this, SupportStartupStage.LAUNCHER_OWNER_READ, it) }
             }
         }.onFailure { SupportDiagnosticsStartup.showFailure(this, stage, it) }
@@ -47,6 +55,10 @@ class MainActivity : Activity() {
         return true
     }
     override fun onDestroy() { selection?.close(); super.onDestroy() }
+    override fun onSaveInstanceState(state: Bundle) {
+        state.putString("nelomai_update_launch_session", updateLaunchSession)
+        super.onSaveInstanceState(state)
+    }
 }
 
 /** Runs in :runtime so Binder records the actual admitted child PID. */
@@ -91,6 +103,8 @@ class RuntimeBootstrapActivity : Activity() {
                         val launch = Intent().setClassName(packageName, RuntimeAdapters.activity(selected))
                             .putExtra("runtime_endpoint_v1", fd).putExtra("runtime_bootstrap_v1", bootstrap)
                             .putExtra("runtime_selection_v1", RuntimeSelectionStore.encode(selected))
+                            .putExtra("nelomai_update_protocol", selection.updateProtocol)
+                            .putExtra("nelomai_update_launch_session", intent.getStringExtra("nelomai_update_launch_session"))
                         stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_PREPARE
                         RuntimeAdapters.prepareActivity(selected, launch)
                         stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_START

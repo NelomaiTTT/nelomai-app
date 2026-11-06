@@ -108,6 +108,145 @@ class RuntimeApkInstallerTest {
 
     @Test
     @Config(sdk = [24, 28, 29, 33], shadows = [ArchivePackageManager::class])
+    fun nativePrepareValidatesPackageWithoutOpeningActivityOrCreatingInstallRequest() {
+        val value = request(permission = false)
+        pending().set(null)
+        val service = Robolectric.buildService(RuntimeAuthBrokerService::class.java).get()
+        val callbacks = RuntimeNativeCallbacks(service)
+        val validate = callbacks.javaClass.methods.firstOrNull { it.name == "validateApk" }
+        assertNotNull("prepare needs a native validation callback independent of installation", validate)
+        assertEquals(true, validate!!.invoke(callbacks, value.path, value.version, value.signer))
+        assertNull(pending().get())
+        assertNull(shadowOf(RuntimeEnvironment.getApplication()).nextStartedActivity)
+
+        val failure = assertThrows(java.lang.reflect.InvocationTargetException::class.java) {
+            validate.invoke(callbacks, value.path, value.version, "0".repeat(64))
+        }
+        assertEquals("signer_mismatch", failure.cause?.message)
+        assertNull(pending().get())
+        assertNull(shadowOf(RuntimeEnvironment.getApplication()).nextStartedActivity)
+    }
+
+    @Test
+    @Config(shadows = [UpdateForegroundShadow::class])
+    fun visibilityRegistrationRejectsOldOwnerWrongPidAndReplacementProbe() {
+        val service = Robolectric.buildService(RuntimeAuthBrokerService::class.java).get()
+        RuntimeAuthBrokerService::class.java.getDeclaredField("host").apply { isAccessible = true; setLong(service, 1L) }
+        fun register(incarnation: String) {
+            val data = android.os.Parcel.obtain(); val reply = android.os.Parcel.obtain()
+            try {
+                data.writeInterfaceToken(RuntimeOwnerProtocol.DESCRIPTOR)
+                data.writeString(incarnation); data.writeStrongBinder(RuntimeUpdateVisibility.probe)
+                assertTrue(service.onBind(Intent(service, RuntimeAuthBrokerService::class.java))!!.transact(RuntimeOwnerProtocol.UPDATE_VISIBILITY, data, reply, 0))
+                reply.readException()
+            } finally { data.recycle(); reply.recycle() }
+        }
+        seedUpdateAdmission(service, android.os.Process.myPid() + 1)
+        assertThrows(IllegalArgumentException::class.java) { register("test-incarnation") }
+        seedUpdateAdmission(service, android.os.Process.myPid())
+        assertThrows(IllegalArgumentException::class.java) { register("old-incarnation") }
+        register("test-incarnation")
+        assertThrows(IllegalArgumentException::class.java) { register("test-incarnation") }
+    }
+
+    @Test
+    @Config(shadows = [UpdateForegroundShadow::class])
+    fun actualPauseRevokesInstallEvenBeforeOwnerReceivesLifecycleAndOldActivityCannotRestoreIt() {
+        val service = Robolectric.buildService(RuntimeAuthBrokerService::class.java).get()
+        RuntimeAuthBrokerService::class.java.getDeclaredField("host").apply { isAccessible = true; setLong(service, 1L) }
+        UpdateForegroundShadow.visible = true
+        assertFalse("service presence is not UI presence", service.updateUiForeground())
+        val first = attachVisibleUpdateRuntime(service)
+        try {
+            assertTrue(service.updateUiForeground())
+            RuntimeUpdateVisibility.paused(first)
+            assertFalse("owner still says visible, but the real UI already paused", service.updateUiForeground())
+            val replacement = Robolectric.buildActivity(Activity::class.java).get()
+            RuntimeUpdateVisibility.resumed(replacement)
+            RuntimeUpdateVisibility.paused(first)
+            assertTrue("late onDestroy of the old Activity cannot hide the replacement", service.updateUiForeground())
+            RuntimeUpdateVisibility.paused(replacement)
+            assertFalse(service.updateUiForeground())
+            assertFalse(RuntimeUpdateVisibility.isForeground(null))
+            assertFalse(RuntimeUpdateVisibility.isForeground(object : android.os.Binder() {
+                override fun onTransact(code: Int, data: android.os.Parcel, reply: android.os.Parcel?, flags: Int): Boolean {
+                    throw android.os.DeadObjectException()
+                }
+            }))
+        } finally { RuntimeUpdateVisibility.paused(first) }
+    }
+
+    @Test
+    @Config(shadows = [UpdateForegroundShadow::class])
+    fun nativeInstallRechecksForegroundOnMainThreadBeforeLaunchingActivity() {
+        val value = request()
+        pending().set(null)
+        val service = Robolectric.buildService(RuntimeAuthBrokerService::class.java).get()
+        RuntimeAuthBrokerService::class.java.getDeclaredField("host").apply { isAccessible = true; setLong(service, 1L) }
+        UpdateForegroundShadow.visible = true
+        val visibleActivity = attachVisibleUpdateRuntime(service)
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val result = worker.submit<Boolean> { RuntimeNativeCallbacks(service).installApk(value.path, value.version, value.signer) }
+        try {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (pending().get() == null && !result.isDone && System.nanoTime() < deadline) Thread.sleep(1)
+            assertNotNull("the native callback must own an install request", pending().get())
+            // UI disappeared after Stop/worker dispatch, before the UI-thread handoff.
+            UpdateForegroundShadow.visible = false
+            val dispatchDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (!result.isDone && System.nanoTime() < dispatchDeadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(1)
+            }
+            assertNull("a stale foreground proof must not open an Activity",
+                shadowOf(service).nextStartedActivity)
+            val failure = assertThrows(ExecutionException::class.java) { result.get(2, TimeUnit.SECONDS) }
+            assertEquals("update_ui_not_foreground", generateSequence<Throwable>(failure) { it.cause }.last().message)
+        } finally {
+            pending().get()?.result?.complete(false)
+            RuntimeUpdateVisibility.paused(visibleActivity)
+            worker.shutdownNow()
+            worker.awaitTermination(2, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    @Config(shadows = [UpdateForegroundShadow::class])
+    fun visibleNativeInstallWaitsForConsumerAndCancellationDoesNotReopenIt() {
+        val value = request()
+        pending().set(null)
+        val service = Robolectric.buildService(RuntimeAuthBrokerService::class.java).get()
+        RuntimeAuthBrokerService::class.java.getDeclaredField("host").apply { isAccessible = true; setLong(service, 1L) }
+        UpdateForegroundShadow.visible = true
+        val visibleActivity = attachVisibleUpdateRuntime(service)
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val result = worker.submit<Boolean> { RuntimeNativeCallbacks(service).installApk(value.path, value.version, value.signer) }
+        try {
+            var launched: Intent? = null
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            while (launched == null && !result.isDone && System.nanoTime() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                launched = shadowOf(service).nextStartedActivity
+                Thread.sleep(1)
+            }
+            assertEquals(RuntimeApkInstallerActivity::class.java.name, launched?.component?.className)
+            assertEquals(pending().get()?.nonce, launched?.getStringExtra("request"))
+            assertFalse("dispatch is not installer completion", result.isDone)
+            pending().get()!!.result.complete(false)
+            assertFalse(result.get(2, TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull(pending().get())
+            assertNull(shadowOf(service).nextStartedActivity)
+        } finally {
+            pending().get()?.result?.complete(false)
+            RuntimeUpdateVisibility.paused(visibleActivity)
+            worker.shutdownNow()
+            worker.awaitTermination(2, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test
+    @Config(sdk = [24, 28, 29, 33], shadows = [ArchivePackageManager::class])
     fun matchingArchiveOpensInstallerWhenCertificateCollectionRequiresLegacyFlag() {
         val request = request()
         val activity = launch(request).get()
@@ -249,4 +388,41 @@ class RuntimeApkInstallerTest {
         assertSame(current, pending().get())
         assertNull(shadowOf(activity).nextStartedActivityForResult)
     }
+}
+
+@Implements(RuntimeNativeHost::class)
+class UpdateForegroundShadow {
+    companion object {
+        var visible = false
+        @JvmStatic @Implementation fun __staticInitializer__() {
+            // Skip only System.loadLibrary; Kotlin's object instance still exists.
+            ReflectionHelpers.setStaticField(RuntimeNativeHost::class.java, "INSTANCE",
+                ReflectionHelpers.callConstructor(RuntimeNativeHost::class.java))
+        }
+    }
+    @Implementation fun nativeUpdateUiForeground(host: Long): Boolean = host != 0L && visible
+
+}
+
+private fun attachVisibleUpdateRuntime(service: RuntimeAuthBrokerService): Activity {
+    // JVM has no native owner/socket admission. Seed only its successful result;
+    // capability negotiation is exercised separately, registration/visibility are real Binder calls.
+    seedUpdateAdmission(service, android.os.Process.myPid())
+    val data = android.os.Parcel.obtain()
+    val reply = android.os.Parcel.obtain()
+    try {
+        data.writeInterfaceToken(RuntimeOwnerProtocol.DESCRIPTOR)
+        data.writeString("test-incarnation")
+        data.writeStrongBinder(RuntimeUpdateVisibility.probe)
+        assertTrue(service.onBind(Intent(service, RuntimeAuthBrokerService::class.java))!!.transact(RuntimeOwnerProtocol.UPDATE_VISIBILITY, data, reply, 0))
+        reply.readException()
+    } finally { data.recycle(); reply.recycle() }
+    return Robolectric.buildActivity(Activity::class.java).get().also(RuntimeUpdateVisibility::resumed)
+}
+
+private fun seedUpdateAdmission(service: RuntimeAuthBrokerService, pid: Int) {
+    val admissionClass = RuntimeAuthBrokerService::class.java.declaredClasses.single { it.simpleName == "UpdateUiAdmission" }
+    val admission = admissionClass.getDeclaredConstructor(Int::class.javaPrimitiveType, String::class.java, android.os.IBinder::class.java)
+        .apply { isAccessible = true }.newInstance(pid, "test-incarnation", null)
+    RuntimeAuthBrokerService::class.java.getDeclaredField("updateUiAdmission").apply { isAccessible = true; set(service, admission) }
 }

@@ -12,7 +12,16 @@ import android.util.Log
 
 class RuntimeAuthBrokerService : Service() {
     private var host: Long = 0
+    private data class UpdateUiAdmission(val pid: Int, val incarnation: String, val probe: IBinder? = null)
+    private val updateUiLock = Any()
+    private var updateUiAdmission: UpdateUiAdmission? = null
     fun currentSelection(): String = RuntimeNativeHost.nativeSelection(host)
+    fun updateUiForeground(): Boolean {
+        val admitted = synchronized(updateUiLock) { updateUiAdmission } ?: return false
+        return host != 0L && RuntimeNativeHost.nativeUpdateUiForeground(host) &&
+            RuntimeUpdateVisibility.isForeground(admitted.probe) &&
+            synchronized(updateUiLock) { updateUiAdmission === admitted }
+    }
     private val binder = object : Binder() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             if (code == INTERFACE_TRANSACTION) { reply?.writeString(DESCRIPTOR); return true }
@@ -28,7 +37,7 @@ class RuntimeAuthBrokerService : Service() {
                     reply.writeNoException(); reply.writeString(selection)
                     true
                 }
-                ATTACH -> {
+                ATTACH -> synchronized(updateUiLock) {
                     val request = requireNotNull(data.readString())
                     require(data.dataAvail() == 0)
                     val active = RuntimeSelectionStore.decode(RuntimeNativeHost.nativeSelection(host))
@@ -37,10 +46,22 @@ class RuntimeAuthBrokerService : Service() {
                     try {
                         val started = SystemClock.elapsedRealtime()
                         val bootstrap = RuntimeNativeHost.nativeAttach(host, pair[0].detachFd(), Binder.getCallingPid(), Binder.getCallingUid(), request)
+                        updateUiAdmission = UpdateUiAdmission(Binder.getCallingPid(), active.incarnation)
                         Log.i("NelomaiStartup", "owner.attach duration_ms=${SystemClock.elapsedRealtime() - started}")
                         reply.writeNoException(); reply.writeString(bootstrap)
                         reply.writeParcelable(pair[1], 0)
+                        reply.writeInt(2) // updater capability; legacy Binder readers ignore the tail
                     } finally { pair.forEach { it.close() } }
+                    true
+                }
+                RuntimeOwnerProtocol.UPDATE_VISIBILITY -> synchronized(updateUiLock) {
+                    val incarnation = data.readString()
+                    val probe = requireNotNull(data.readStrongBinder())
+                    require(data.dataAvail() == 0)
+                    val admitted = requireNotNull(updateUiAdmission)
+                    require(admitted.pid == Binder.getCallingPid() && admitted.incarnation == incarnation && admitted.probe == null)
+                    updateUiAdmission = admitted.copy(probe = probe)
+                    reply.writeNoException()
                     true
                 }
                 else -> super.onTransact(code, data, reply, flags)
@@ -68,6 +89,7 @@ class RuntimeAuthBrokerService : Service() {
         if (intent != null && intent.component?.packageName == packageName && intent.component?.className == javaClass.name && intent.action == null) binder else null
 
     override fun onDestroy() {
+        synchronized(updateUiLock) { updateUiAdmission = null }
         val ownerClosed = host != 0L && RuntimeNativeHost.nativeClose(host)
         host = 0
         RuntimeOwnerReloadGate.ownerStopped(ownerClosed)

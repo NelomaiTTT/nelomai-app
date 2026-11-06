@@ -13,6 +13,8 @@ import org.json.JSONObject
 
 /** Read-through Binder client. The Rust owner remains the only selection store. */
 class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
+    var updateProtocol: Int = 1
+        private set
     private val handler = Handler(Looper.getMainLooper())
     private var remote: IBinder? = null
     private var bound = false
@@ -75,7 +77,27 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
             reply.readException()
             val bootstrap = requireNotNull(reply.readString())
             val fd = requireNotNull(reply.readParcelable<ParcelFileDescriptor>(ParcelFileDescriptor::class.java.classLoader))
-            return fd to bootstrap
+            try {
+                // Optional owner-advertised sideband, never a new field in strict V1 JSON.
+                // Old owners have no tail; unknown versions stay on the legacy decoder.
+                val advertised = if (reply.dataAvail() == 0) 1 else {
+                    require(reply.dataAvail() == 4) { "runtime_capability_invalid" }
+                    reply.readInt()
+                }
+                updateProtocol = if (advertised == 2) 2 else 1
+                if (updateProtocol == 2) {
+                    val registration = Parcel.obtain()
+                    val acknowledgement = Parcel.obtain()
+                    try {
+                        registration.writeInterfaceToken(RuntimeOwnerProtocol.DESCRIPTOR)
+                        registration.writeString(selection.incarnation)
+                        registration.writeStrongBinder(RuntimeUpdateVisibility.probe)
+                        check(requireNotNull(remote).transact(RuntimeOwnerProtocol.UPDATE_VISIBILITY, registration, acknowledgement, 0))
+                        acknowledgement.readException()
+                    } finally { registration.recycle(); acknowledgement.recycle() }
+                }
+                return fd to bootstrap
+            } catch (error: Throwable) { fd.close(); throw error }
         } finally { data.recycle(); reply.recycle() }
     }
 
@@ -125,4 +147,5 @@ object RuntimeOwnerProtocol {
     const val DESCRIPTOR = "ru.nelomai.runtime.v1.AuthBroker"
     const val SELECTION = IBinder.FIRST_CALL_TRANSACTION
     const val ATTACH = IBinder.FIRST_CALL_TRANSACTION + 1
+    const val UPDATE_VISIBILITY = IBinder.FIRST_CALL_TRANSACTION + 2
 }

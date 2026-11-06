@@ -2,6 +2,8 @@
   import { onMount } from "svelte";
   import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import UpdatePrompt from "$lib/UpdatePrompt.svelte";
+  import {canConfirmUpdate,updatePrompt,updateMessage} from "$lib/update-presentation";
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
@@ -132,6 +134,10 @@
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
   const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
+  let updateDialogId = $state<string|null>(null);
+  let updateUiVisible = $state(true);
+  let manualUpdateResult = $state<string|null>(null);
+  let manualUpdatePending = false;
   let runtimeStatus = $state<RuntimeStatus | null>(null);
   let runtimeSelectionBusy = $state(false);
   let updateTimer: number | null = null;
@@ -228,6 +234,7 @@
   };
 
   onMount(() => {
+    updateUiVisible=document.visibilityState === "visible";
     let disposed = false;
     void nativeClient.recordStartupStage("frontend_mounted");
     window.requestAnimationFrame(() => {
@@ -283,7 +290,7 @@
       else connectionIntentNotificationUnlisten = unlisten;
     });
     stateTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void synchronizeRuntimeState(false);
+      if (document.visibilityState === "visible") {void synchronizeRuntimeState(false);if(bootstrap)void refreshUpdateStatus();}
     }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
@@ -294,6 +301,7 @@
       }
     }, 60_000);
     const handleVisibility = () => {
+      updateUiVisible = document.visibilityState === "visible";
       if (document.visibilityState === "visible") {
         wakeStartup();
         void nativeClient.wakeConnectionIntent();
@@ -302,7 +310,7 @@
         void refreshRuntimeStatus();
         if (bootstrap) {
           void refreshNotifications(false, true);
-          void refreshUpdateOffer();
+          void refreshUpdateStatus();
         }
       }
     };
@@ -701,6 +709,7 @@
     ticConnectionMode = response.defaults.tic_connection_mode;
     routeMode = response.defaults.route_mode;
     void refreshUpdateStatus();
+    void refreshUpdateOffer("startup");
     void refreshNotifications(false, true);
 
     if (response.update.required) {
@@ -1095,6 +1104,7 @@
       password = "";
       diagnosticsStatus = null;
       updateStatus = null;
+      updateDialogId = null;
       splitTunnelState = null;
       splitTunnelApplications = [];
       splitTunnelOpen = false;
@@ -1234,7 +1244,7 @@
     try {
       const status = await nativeClient.updateStatus();
       observeUpdateStatus(status);
-      if (updateStatusNeedsPolling(status)) {
+      if (updateUiVisible && updateStatusNeedsPolling(status)) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);
       }
     } catch {
@@ -1248,6 +1258,13 @@
       status,
     );
     updateStatus = status;
+    const checkingSameOffer = status.phase === "checking" && status.protocol === 2 && status.supported;
+    if(updateDialogId && (updateDialogId!==status.offerId || (!canConfirmUpdate(status) && !checkingSameOffer)))updateDialogId=null;
+    if(!updateDialogId)updateDialogId=updatePrompt(status,updateUiVisible && view!=="sign_in");
+    if(manualUpdatePending && status.phase!=="checking" && status.errorCode!=="update_refresh_pending") {
+      manualUpdatePending=false;
+      manualUpdateResult=status.errorCode ? "Не удалось проверить обновление. Повторите позже." : status.updateAvailable ? `Найдена версия ${status.version}` : "У вас актуальная версия.";
+    }
     if (refreshStage) void nativeClient.recordStartupStage(refreshStage);
     const stage = updateDiagnosticStage(status.phase);
     const key = stage ? `${stage}:${status.version ?? "none"}` : null;
@@ -1257,10 +1274,11 @@
     }
   }
 
-  async function refreshUpdateOffer() {
+  async function refreshUpdateOffer(reason:"startup"|"manual"="manual") {
     if (!bootstrap) return;
-    await updateOfferRefresher.run(
-      () => nativeClient.refreshUpdate(),
+    if(reason==="manual"){manualUpdatePending=true;manualUpdateResult="Проверяем…";}
+    const result=await updateOfferRefresher.run(
+      () => nativeClient.checkUpdate(reason),
       (status) => {
         observeUpdateStatus(status);
         if (updateStatusNeedsPolling(status)) {
@@ -1269,16 +1287,23 @@
         }
       },
     );
+    if(!result && reason==="manual"){manualUpdatePending=false;manualUpdateResult="Не удалось проверить обновление. Повторите позже.";}
   }
 
+  function showUpdatePrompt(){if(updateStatus && canConfirmUpdate(updateStatus))updateDialogId=updateStatus.offerId!;}
+  async function markUpdatePresented(){const id=updateDialogId;if(id)try{await nativeClient.presentedUpdate(id);}catch{await refreshUpdateStatus();}}
+  async function deferUpdate(){const id=updateDialogId;if(!id)return;try{observeUpdateStatus(await nativeClient.deferUpdate(id));updateDialogId=null;}catch(reason){error=commandMessage(reason,"update");await refreshUpdateStatus();}}
+
   async function installUpdate() {
-    if (updateBusy) return;
+    const id=updateDialogId;
+    if (updateBusy || !id) return;
     updateBusy = true;
     error = null;
     void nativeClient.recordStartupStage("update_install_requested");
     updateTimer = window.setTimeout(refreshUpdateStatus, 100);
     try {
-      observeUpdateStatus(await nativeClient.installUpdate());
+      observeUpdateStatus(await nativeClient.confirmUpdate(id));
+      updateDialogId=null;
     } catch (reason) {
       error = commandMessage(reason, "update");
       await refreshUpdateStatus();
@@ -1537,55 +1562,17 @@
       {/if}
     </section>
   {/if}
+  {#if updateDialogId && updateStatus && updateDialogId===updateStatus.offerId}
+    <UpdatePrompt status={updateStatus} visible={updateUiVisible} busy={updateBusy} onconfirm={installUpdate} onlater={deferUpdate} onpresented={markUpdatePresented}/>
+  {/if}
   {#if updateStatus && updateStatus.phase !== "idle" && view !== "sign_in"}
     <section class="update-banner" aria-live="polite">
-      <div>
-        <p class="eyebrow">Обновление</p>
-        {#if updateStatus.phase === "downloading"}
-          <strong>Загружаем Nelomai {updateStatus.version}</strong>
-          <span>{updateProgress(updateStatus)}</span>
-        {:else if updateStatus.phase === "ready_to_restart"}
-          <strong>Nelomai {updateStatus.version} готов к запуску</strong>
-          <span>Перезапустите приложение, чтобы завершить обновление.</span>
-        {:else if updateStatus.phase === "awaiting_installation"}
-          <strong>Подтвердите установку Nelomai {updateStatus.version}</strong>
-          <span>Завершите обновление в системном окне Android.</span>
-        {:else if updateStatus.phase === "failed"}
-          <strong>{updateStatus.errorCode === "apk_install_cancelled"
-            ? `Установка Nelomai ${updateStatus.version} отменена`
-            : `Не удалось установить Nelomai ${updateStatus.version}`}</strong>
-          <span>Можно повторить установку сейчас.</span>
-        {:else}
-          <strong>Доступна версия {updateStatus.version}</strong>
-          <span>
-            {updateStatus.supported
-              ? updateStatus.notes || "Обновление готово к загрузке."
-              : "Эту версию необходимо установить вручную."}
-          </span>
-        {/if}
-      </div>
-      {#if updateStatus.phase === "ready_to_restart"}
-        <button
-          class="primary-button update-action"
-          type="button"
-          onclick={restartForUpdate}
-          disabled={updateBusy}
-        >
-          Перезапустить
-        </button>
-      {:else if updateStatus.supported && updateStatus.phase !== "downloading"}
-        <button
-          class="secondary-button update-action"
-          type="button"
-          onclick={installUpdate}
-          disabled={updateBusy}
-        >
-          {updateBusy
-            ? "Начинаем…"
-            : updateStatus.phase === "awaiting_installation"
-              ? "Открыть снова"
-              : "Обновить"}
-        </button>
+      <div><p class="eyebrow">Обновление</p><strong>{updateStatus.version ? `Nelomai ${updateStatus.version}` : "Проверка версии"}</strong>
+      <span>{updateMessage(updateStatus)}</span>{#if updateStatus.phase==="downloading"}<span>{updateProgress(updateStatus)}</span>{/if}</div>
+      {#if updateStatus.phase==="ready_to_restart"}
+        <button class="primary-button update-action" type="button" onclick={restartForUpdate} disabled={updateBusy}>Перезапустить</button>
+      {:else if canConfirmUpdate(updateStatus)}
+        <button class="secondary-button update-action" type="button" onclick={showUpdatePrompt} disabled={updateBusy}>Обновить</button>
       {/if}
     </section>
   {/if}
@@ -1982,8 +1969,8 @@
           {#if updateStatus?.supported}
             <label class="update-preference">
               <span>
-                <strong>Автоматические обновления</strong>
-                <small>Загружать новые версии в фоне</small>
+                <strong>Проверять и скачивать обновления</strong>
+                <small>{bootstrap?.device.platform === "android" ? "Проверять при открытии приложения. Установка — с вашего согласия." : "Проверять каждые 30 минут. Установка — с вашего согласия."}</small>
               </span>
               <input
                 type="checkbox"
@@ -1991,6 +1978,8 @@
                 onchange={setAutomaticUpdates}
               />
             </label>
+            <button class="secondary-button" type="button" onclick={()=>refreshUpdateOffer("manual")} disabled={updateStatus.phase==="checking"}>Проверить обновления</button>
+            {#if manualUpdateResult}<p aria-live="polite">{manualUpdateResult}</p>{/if}
           {/if}
           {#if runtimeStatus}
             <RuntimeSelector

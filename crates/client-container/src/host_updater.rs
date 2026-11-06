@@ -1,12 +1,12 @@
-//! Common-owned updater. Runtime commands carry actions, never Bearer tokens,
-//! download URLs, installer paths or signing identities.
+//! Common-owned updater. UI commands carry actions and an opaque offer identity,
+//! never Bearer tokens, artifact URLs, installer paths or signing authority.
 use crate::ipc::PrivateError;
 use crate::{AuthBroker, SwitchCoordinator, UpdateBarrier, UpdatePrepare};
 use nelomai_client_api::{AccessSnapshot, ClientApi};
 use nelomai_client_updater::{
-    DownloadProgress, FileUpdatePreferenceStore, InstallResult, UpdateBackend, UpdateBackendError,
-    UpdateBarrierError, UpdateBarrierPhase, UpdateCoordinator, UpdateInstallBarrier, UpdateOffer,
-    UpdatePhase, UpdatePreferenceStore, UpdatePreferences,
+    DownloadProgress, FileUpdatePreferenceStore, InstallResult, PreparedUpdate, ResolvedUpdate,
+    UpdateBackend, UpdateBackendError, UpdateBarrierError, UpdateBarrierPhase, UpdateCoordinator,
+    UpdateInstallBarrier, UpdateOffer, UpdatePhase, UpdatePreferenceStore, UpdatePreferences,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,25 +27,94 @@ pub struct HostUpdateStatusV1 {
     pub total: Option<u64>,
     pub error_code: Option<String>,
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpdateRequestV2 {
+    Status {},
+    Check {
+        reason: UpdateCheckReason,
+    },
+    Confirm {
+        #[serde(rename = "offerId")]
+        offer_id: String,
+    },
+    Defer {
+        #[serde(rename = "offerId")]
+        offer_id: String,
+    },
+    Presented {
+        #[serde(rename = "offerId")]
+        offer_id: String,
+    },
+    SetAutomatic {
+        enabled: bool,
+    },
+    UiLifecycle {
+        foreground: bool,
+        #[serde(rename = "newUserLaunch")]
+        new_user_launch: bool,
+        #[serde(rename = "launchSessionId")]
+        launch_session_id: Option<String>,
+    },
+}
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCheckReason {
+    Startup,
+    Timer,
+    Foreground,
+    Manual,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateStatusV2 {
+    pub status: HostUpdateStatusV1,
+    pub phase: String,
+    pub offer_id: Option<String>,
+    pub prompt_pending: bool,
+    pub update_available: bool,
+}
 struct Backend(Arc<dyn UpdateBackend>);
 #[async_trait::async_trait]
 impl UpdateBackend for Backend {
-    async fn install(
+    async fn resolve(
         &self,
         access: &AccessSnapshot,
         version: &str,
-        barrier: UpdateBarrierPhase,
+    ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+        self.0.resolve(access, version).await
+    }
+    async fn prepare(
+        &self,
+        access: &AccessSnapshot,
+        resolved: &ResolvedUpdate,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<PreparedUpdate, UpdateBackendError> {
+        self.0.prepare(access, resolved, progress).await
+    }
+    async fn install_prepared(
+        &self,
+        prepared: &PreparedUpdate,
+        phase: UpdateBarrierPhase,
     ) -> Result<InstallResult, UpdateBackendError> {
-        self.0.install(access, version, barrier, progress).await
+        self.0.install_prepared(prepared, phase).await
     }
 }
-struct Barrier(Arc<UpdateBarrier>);
+struct Barrier {
+    barrier: Arc<UpdateBarrier>,
+    broker: Arc<AuthBroker>,
+}
 #[async_trait::async_trait]
 impl UpdateInstallBarrier for Barrier {
+    async fn validate_authority(&self, access: &AccessSnapshot) -> Result<(), UpdateBarrierError> {
+        self.broker
+            .with_current_access(access, || Ok(()))
+            .await
+            .map_err(|_| UpdateBarrierError::new("update_auth_changed"))
+    }
     async fn prepare(&self, target: &str) -> Result<UpdateBarrierPhase, UpdateBarrierError> {
         match self
-            .0
+            .barrier
             .prepare(target)
             .await
             .map_err(|_| UpdateBarrierError::new("update_shutdown_failed"))?
@@ -54,28 +123,33 @@ impl UpdateInstallBarrier for Barrier {
         }
     }
     async fn installer_opened(&self) -> Result<(), UpdateBarrierError> {
-        self.0
+        let result = self
+            .barrier
             .installer_opened()
             .await
-            .map_err(|_| UpdateBarrierError::new("update_journal_failed"))
+            .map_err(|_| UpdateBarrierError::new("update_journal_failed"));
+        result
     }
     async fn installer_failed(&self) -> Result<(), UpdateBarrierError> {
-        self.0
+        let result = self
+            .barrier
             .installer_failed()
             .await
-            .map_err(|_| UpdateBarrierError::new("update_recovery_failed"))
+            .map_err(|_| UpdateBarrierError::new("update_recovery_failed"));
+        result
     }
-}
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InstallKind {
-    Automatic,
-    Manual,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateOperation {
     Idle,
-    Refreshing { install_after: Option<InstallKind> },
-    Installing,
+    Refreshing,
+    Driving,
+}
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptSession {
+    launch_session_id: Option<String>,
+    deferred_version: Option<String>,
 }
 pub(crate) struct HostUpdater {
     api: ClientApi,
@@ -83,12 +157,23 @@ pub(crate) struct HostUpdater {
     preferences: FileUpdatePreferenceStore,
     current: Mutex<UpdatePreferences>,
     offer: Mutex<Option<UpdateOffer>>,
+    backend: Option<Arc<dyn UpdateBackend>>,
     coordinator: Option<UpdateCoordinator<Backend>>,
     barrier: Arc<UpdateBarrier>,
     version: String,
     operation: Mutex<UpdateOperation>,
-    install_recovery_gate: tokio::sync::Mutex<()>,
+    install_recovery_gate: Arc<tokio::sync::Mutex<()>>,
     refresh_error: Mutex<Option<String>>,
+    prompt_path: std::path::PathBuf,
+    prompt_session: Mutex<PromptSession>,
+    startup_checked: std::sync::atomic::AtomicBool,
+    ui_generation: Mutex<u64>,
+    android_policy: bool,
+    timer: Mutex<Option<tokio::task::AbortHandle>>,
+    timer_reset: Arc<tokio::sync::Notify>,
+    manual_pending: Mutex<bool>,
+    desktop_ui_visible: Mutex<Option<bool>>,
+    startup_pending: std::sync::atomic::AtomicBool,
 }
 impl HostUpdater {
     #[cfg(not(target_os = "android"))]
@@ -105,7 +190,7 @@ impl HostUpdater {
     pub fn native_start_blocked(&self) -> Result<bool, PrivateError> {
         self.barrier
             .snapshot()
-            .map(|journal| journal.is_some())
+            .map(|j| j.is_some())
             .map_err(|_| PrivateError::RecoveryRequired)
     }
     pub fn new(
@@ -116,38 +201,92 @@ impl HostUpdater {
         version: String,
         backend: Option<Arc<dyn UpdateBackend>>,
     ) -> Result<Self, PrivateError> {
+        let barrier =
+            Arc::new(UpdateBarrier::open(switch).map_err(|_| PrivateError::RecoveryRequired)?);
+        Self::new_with_policy(
+            root,
+            api,
+            broker,
+            barrier,
+            version,
+            backend,
+            cfg!(target_os = "android"),
+        )
+    }
+    fn new_with_policy(
+        root: &Path,
+        api: ClientApi,
+        broker: Arc<AuthBroker>,
+        barrier: Arc<UpdateBarrier>,
+        version: String,
+        backend: Option<Arc<dyn UpdateBackend>>,
+        android_policy: bool,
+    ) -> Result<Self, PrivateError> {
         let preferences = FileUpdatePreferenceStore::new(root.join("updates/preferences.json"));
         let current = preferences
             .load()
             .map_err(|_| PrivateError::RecoveryRequired)?;
-        let barrier =
-            Arc::new(UpdateBarrier::open(switch).map_err(|_| PrivateError::RecoveryRequired)?);
-        let coordinator = backend.map(|backend| {
-            UpdateCoordinator::new(
-                Arc::new(Backend(backend)),
-                Arc::new(Barrier(barrier.clone())),
+        let coordinator = backend.as_ref().map(|backend| {
+            UpdateCoordinator::with_foreground_guard(
+                Arc::new(Backend(backend.clone())),
+                Arc::new(Barrier {
+                    barrier: barrier.clone(),
+                    broker: broker.clone(),
+                }),
+                android_policy,
             )
         });
+        let gate = coordinator
+            .as_ref()
+            .map(|c| c.installation_gate())
+            .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+        let prompt_path = root.join("updates/prompt-session.json");
+        // This is UX state, never authorization. Corruption must not prevent
+        // owner/VPN startup or resurrect a prior installation decision.
+        let prompt_session = if android_policy {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&prompt_path)
+                .ok()
+                .and_then(|f| f.take(4097).read_to_end(&mut bytes).ok())
+                .filter(|_| bytes.len() <= 4096)
+                .and_then(|_| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default()
+        } else {
+            PromptSession::default()
+        };
+        if let Some(coordinator) = &coordinator {
+            coordinator.restore_deferred_version(prompt_session.deferred_version.clone());
+        }
         Ok(Self {
             api,
             broker,
             preferences,
             current: Mutex::new(current),
             offer: Mutex::new(None),
+            backend,
             coordinator,
             barrier,
             version,
             operation: Mutex::new(UpdateOperation::Idle),
-            install_recovery_gate: tokio::sync::Mutex::new(()),
+            install_recovery_gate: gate,
             refresh_error: Mutex::new(None),
+            prompt_path,
+            prompt_session: Mutex::new(prompt_session),
+            startup_checked: std::sync::atomic::AtomicBool::new(false),
+            ui_generation: Mutex::new(0),
+            android_policy,
+            timer: Mutex::new(None),
+            timer_reset: Arc::new(tokio::sync::Notify::new()),
+            manual_pending: Mutex::new(false),
+            desktop_ui_visible: Mutex::new(None),
+            startup_pending: std::sync::atomic::AtomicBool::new(false),
         })
     }
     pub async fn recover(
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(), PrivateError> {
-        // A live installer owns its Stop journal until Android returns a result.
-        // Never let startup/preflight recovery infer cancellation in that window.
         let _gate = self
             .install_recovery_gate
             .try_lock()
@@ -158,6 +297,13 @@ impl HostUpdater {
             .map_err(|_| PrivateError::RecoveryRequired)
     }
     pub fn status(&self) -> Result<HostUpdateStatusV1, PrivateError> {
+        let mut status = self.status_v2()?.status;
+        // Old runtime has no package-bound confirmation UI. Preserve its shape,
+        // report unsupported, and never let it infer silent installation.
+        status.supported = false;
+        Ok(status)
+    }
+    pub(crate) fn status_v2(&self) -> Result<UpdateStatusV2, PrivateError> {
         let automatic = self
             .current
             .lock()
@@ -167,70 +313,98 @@ impl HostUpdater {
         let phase = self
             .coordinator
             .as_ref()
-            .map(|coordinator| coordinator.phase())
-            .unwrap_or_else(|| {
-                offer
-                    .clone()
-                    .map(UpdatePhase::Available)
-                    .unwrap_or(UpdatePhase::Idle)
-            });
+            .map(|c| c.phase())
+            .unwrap_or(UpdatePhase::Idle);
         let operation = *self.operation.lock().map_err(|_| PrivateError::Closed)?;
-        let install_preparing = matches!(
-            operation,
-            UpdateOperation::Refreshing {
-                install_after: Some(_)
-            } | UpdateOperation::Installing
-        ) && !matches!(
-            phase,
-            UpdatePhase::Downloading { .. } | UpdatePhase::ReadyToRestart { .. }
-        );
-        let (phase, version, downloaded, total, phase_error_code) = match phase {
-            UpdatePhase::Idle => ("idle", None, 0, None, None),
-            UpdatePhase::Available(offer) => ("available", Some(offer.version), 0, None, None),
+        let (v2_phase, legacy_phase, version, downloaded, total, error) = match phase {
+            UpdatePhase::Idle => ("idle", "idle", None, 0, None, None),
+            UpdatePhase::Available(o) => ("available", "available", Some(o.version), 0, None, None),
             UpdatePhase::Downloading {
                 version,
                 downloaded,
                 total,
-            } => ("downloading", Some(version), downloaded, total, None),
-            UpdatePhase::ReadyToRestart { version } => {
-                ("ready_to_restart", Some(version), 0, None, None)
+            } => (
+                "downloading",
+                "downloading",
+                Some(version),
+                downloaded,
+                total,
+                None,
+            ),
+            UpdatePhase::ReadyToInstall { version } => (
+                "ready_to_install",
+                "available",
+                Some(version),
+                0,
+                None,
+                None,
+            ),
+            UpdatePhase::Installing { version } => (
+                "installing",
+                "downloading",
+                Some(version),
+                0,
+                None,
+                Some("update_install_preparing".into()),
+            ),
+            UpdatePhase::ReadyToRestart { version } => (
+                "ready_to_restart",
+                "ready_to_restart",
+                Some(version),
+                0,
+                None,
+                None,
+            ),
+            UpdatePhase::AwaitingInstallation { version } => (
+                "awaiting_installation",
+                "awaiting_installation",
+                Some(version),
+                0,
+                None,
+                None,
+            ),
+            UpdatePhase::Failed { version, code } => {
+                ("failed", "failed", Some(version), 0, None, Some(code))
             }
-            UpdatePhase::AwaitingInstallation { version } => {
-                ("awaiting_installation", Some(version), 0, None, None)
-            }
-            UpdatePhase::Failed { version, code } => ("failed", Some(version), 0, None, Some(code)),
         };
-        let refreshing = matches!(
-            operation,
-            UpdateOperation::Refreshing {
-                install_after: None
-            }
-        );
-        let error_code = if refreshing {
-            Some("update_refresh_pending".into())
-        } else if install_preparing {
-            Some("update_install_preparing".into())
-        } else {
-            phase_error_code.or_else(|| {
-                self.refresh_error
-                    .lock()
-                    .ok()
-                    .and_then(|error| error.clone())
-            })
-        };
-        Ok(HostUpdateStatusV1 {
+        let checking = operation == UpdateOperation::Refreshing
+            || *self
+                .manual_pending
+                .lock()
+                .map_err(|_| PrivateError::Closed)?;
+        let status = HostUpdateStatusV1 {
             supported: self.coordinator.is_some(),
             automatic,
-            phase: phase.into(),
+            phase: legacy_phase.into(),
             version,
-            notes: offer.as_ref().and_then(|offer| offer.notes.clone()),
-            required: offer.as_ref().is_some_and(|offer| offer.required),
+            notes: offer.as_ref().and_then(|o| o.notes.clone()),
+            required: offer.as_ref().is_some_and(|o| o.required),
             downloaded,
             total,
-            error_code,
+            error_code: if checking {
+                Some("update_refresh_pending".into())
+            } else {
+                error.or(self
+                    .refresh_error
+                    .lock()
+                    .map_err(|_| PrivateError::Closed)?
+                    .clone())
+            },
+        };
+        let coordinator = self.coordinator.as_ref();
+        Ok(UpdateStatusV2 {
+            status,
+            phase: if checking { "checking" } else { v2_phase }.into(),
+            offer_id: coordinator.and_then(|c| c.offer_id()),
+            prompt_pending: coordinator.is_some_and(|c| c.prompt_pending()),
+            update_available: coordinator.and_then(|c| c.offer_id()).is_some()
+                && !matches!(v2_phase, "ready_to_restart" | "awaiting_installation"),
         })
     }
-    pub fn set_automatic(&self, automatic: bool) -> Result<HostUpdateStatusV1, PrivateError> {
+    pub fn set_automatic(
+        self: &Arc<Self>,
+        automatic: bool,
+    ) -> Result<HostUpdateStatusV1, PrivateError> {
         let mut current = self.current.lock().map_err(|_| PrivateError::Closed)?;
         let next = UpdatePreferences { automatic };
         self.preferences
@@ -238,9 +412,13 @@ impl HostUpdater {
             .map_err(|_| PrivateError::RecoveryRequired)?;
         *current = next;
         drop(current);
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.set_automatic(automatic);
+        }
+        self.timer_reset.notify_one();
         self.status()
     }
-    async fn refresh(self: &Arc<Self>) -> Result<HostUpdateStatusV1, PrivateError> {
+    async fn refresh(&self) -> Result<(), PrivateError> {
         let access = self
             .broker
             .access_token(None)
@@ -254,8 +432,24 @@ impl HostUpdater {
             .bootstrap(access.access_token())
             .await
             .map_err(|_| PrivateError::Service)?;
-        let offer =
+        let mut offer =
             UpdateOffer::from_state(&response.update).map_err(|_| PrivateError::Protocol)?;
+        let resolved = if let (Some(offer), Some(backend)) = (&offer, &self.backend) {
+            backend
+                .resolve(&access, &offer.version)
+                .await
+                .map_err(|_| PrivateError::Service)?
+        } else {
+            None
+        };
+        if resolved.is_none() {
+            offer = None;
+        }
+        if let (Some(offer), Some(resolved)) = (&offer, &resolved) {
+            if offer.version != resolved.version {
+                return Err(PrivateError::Protocol);
+            }
+        }
         self.broker
             .with_current_access(&access, || {
                 *self
@@ -263,199 +457,435 @@ impl HostUpdater {
                     .lock()
                     .map_err(|_| crate::BrokerError::RecoveryRequired)? = offer.clone();
                 if let Some(coordinator) = &self.coordinator {
-                    coordinator.observe(offer);
+                    coordinator.observe_resolved(offer.zip(resolved), &access);
                 }
                 Ok(())
             })
             .await
-            .map_err(|_| PrivateError::Cancelled)?;
-        self.status()
+            .map_err(|_| PrivateError::Cancelled)
     }
-    /// Panel I/O may use the full HTTP request timeout, which is longer than
-    /// the runtime IPC budget. Keep that work in the common owner and let the
-    /// runtime poll status instead of holding its shared control channel.
     pub fn start_refresh(self: &Arc<Self>) -> Result<HostUpdateStatusV1, PrivateError> {
-        let should_start = {
-            let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
-            if *operation == UpdateOperation::Idle {
-                *operation = UpdateOperation::Refreshing {
-                    install_after: None,
-                };
-                true
-            } else {
-                false
-            }
-        };
-        if should_start {
-            let mut refresh_error = match self.refresh_error.lock() {
-                Ok(refresh_error) => refresh_error,
-                Err(_) => {
-                    self.reset_operation();
-                    return Err(PrivateError::Closed);
-                }
-            };
-            *refresh_error = None;
-            drop(refresh_error);
-
-            // Capture the pending state before spawning so even an immediate
-            // panel response cannot win the race with the IPC reply.
-            let pending = match self.status() {
-                Ok(status) => status,
-                Err(error) => {
-                    self.reset_operation();
-                    return Err(error);
-                }
-            };
-            let owner = self.clone();
-            tokio::spawn(async move {
-                owner.run_refresh().await;
-            });
-            return Ok(pending);
-        }
+        self.check(UpdateCheckReason::Manual)?;
         self.status()
     }
-    /// Download/installer work belongs to the common owner, not the 10s IPC
-    /// waiter. Status is polled; closing the product UI does not cancel updater.
-    pub fn install(self: &Arc<Self>, automatic: bool) -> Result<HostUpdateStatusV1, PrivateError> {
-        if self.coordinator.is_none() {
-            return Err(PrivateError::RecoveryRequired);
+    pub(crate) fn check(self: &Arc<Self>, reason: UpdateCheckReason) -> Result<(), PrivateError> {
+        if reason == UpdateCheckReason::Startup
+            && self
+                .startup_checked
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
         }
-        let kind = if automatic {
-            InstallKind::Automatic
-        } else {
-            InstallKind::Manual
-        };
-        let should_start = {
-            let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
-            match *operation {
-                UpdateOperation::Idle => {
-                    *operation = UpdateOperation::Installing;
-                    true
-                }
-                UpdateOperation::Refreshing { install_after } => {
-                    let install_after = match (install_after, kind) {
-                        (Some(InstallKind::Manual), _) | (_, InstallKind::Manual) => {
-                            InstallKind::Manual
-                        }
-                        _ => InstallKind::Automatic,
-                    };
-                    *operation = UpdateOperation::Refreshing {
-                        install_after: Some(install_after),
-                    };
-                    false
-                }
-                UpdateOperation::Installing => false,
-            }
-        };
-        if !automatic {
-            let mut refresh_error = match self.refresh_error.lock() {
-                Ok(refresh_error) => refresh_error,
-                Err(_) => {
-                    if should_start {
-                        self.reset_operation();
-                    }
-                    return Err(PrivateError::Closed);
-                }
-            };
-            *refresh_error = None;
+        if matches!(
+            reason,
+            UpdateCheckReason::Timer | UpdateCheckReason::Foreground
+        ) && !self
+            .current
+            .lock()
+            .map_err(|_| PrivateError::Closed)?
+            .automatic
+        {
+            return Ok(());
         }
-        let pending = match self.status() {
-            Ok(status) => status,
-            Err(error) => {
-                if should_start {
-                    self.reset_operation();
-                }
-                return Err(error);
-            }
-        };
-        if should_start {
-            let owner = self.clone();
-            tokio::spawn(async move {
-                if kind == InstallKind::Manual {
-                    if let Err(error) = owner.refresh().await {
-                        owner.record_refresh_error(error);
-                        owner.reset_operation();
-                        return;
-                    }
-                }
-                owner.run_install(kind).await;
-                owner.reset_operation();
-            });
+        if self.android_policy && reason == UpdateCheckReason::Timer {
+            return Err(PrivateError::Protocol);
         }
-        Ok(pending)
+        if reason == UpdateCheckReason::Manual {
+            *self
+                .manual_pending
+                .lock()
+                .map_err(|_| PrivateError::Closed)? = true;
+        }
+        self.start_check(reason == UpdateCheckReason::Startup)
     }
-
-    async fn run_refresh(self: &Arc<Self>) {
-        if let Err(error) = self.refresh().await {
-            self.record_refresh_error(error);
-            self.reset_operation();
-            return;
+    fn start_check(self: &Arc<Self>, queue_startup: bool) -> Result<(), PrivateError> {
+        let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
+        if *operation != UpdateOperation::Idle {
+            if queue_startup {
+                // Coalesce an authenticated startup arriving during a failed
+                // pre-login check. Only an explicit new request queues a retry.
+                self.startup_pending
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            return Ok(());
         }
+        self.startup_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        *operation = UpdateOperation::Refreshing;
+        drop(operation);
+        *self
+            .refresh_error
+            .lock()
+            .map_err(|_| PrivateError::Closed)? = None;
+        let owner = self.clone();
+        tokio::spawn(async move {
+            match owner.refresh().await {
+                Ok(()) => {
+                    owner
+                        .startup_checked
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    // Serialize completion with Later, which supersedes an
+                    // older manual presentation request even during download.
+                    let mut pending = owner
+                        .manual_pending
+                        .lock()
+                        .expect("update manual request poisoned");
+                    if std::mem::take(&mut *pending) {
+                        if let Some(coordinator) = &owner.coordinator {
+                            coordinator.request_manual_prompt();
+                            coordinator.suppress_notification();
+                        }
+                        if let Err(error) = owner.save_prompt() {
+                            owner.record_refresh_error(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    *owner
+                        .manual_pending
+                        .lock()
+                        .expect("update manual request poisoned") = false;
+                    owner.record_refresh_error(error);
+                    if let Some(c) = &owner.coordinator {
+                        c.invalidate();
+                    }
+                }
+            }
+            owner.reset_operation();
+            if !owner.resume_pending_check() {
+                let _ = owner.start_drive();
+            }
+        });
+        Ok(())
+    }
+    pub fn install(self: &Arc<Self>, _automatic: bool) -> Result<HostUpdateStatusV1, PrivateError> {
+        Err(PrivateError::Protocol)
+    }
+    fn start_drive(self: &Arc<Self>) -> Result<(), PrivateError> {
+        let Some(coordinator) = &self.coordinator else {
+            return Ok(());
+        };
         let automatic = self
             .current
             .lock()
+            .map_err(|_| PrivateError::Closed)?
+            .automatic;
+        if !automatic && !coordinator.has_consent() {
+            return Ok(());
+        }
+        if coordinator.offer_id().is_none() {
+            return Ok(());
+        }
+        let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
+        if *operation != UpdateOperation::Idle {
+            return Ok(());
+        }
+        *operation = UpdateOperation::Driving;
+        drop(operation);
+        let owner = self.clone();
+        tokio::spawn(async move {
+            if let (Some(coordinator), Ok(access)) =
+                (&owner.coordinator, owner.broker.access_token(None).await)
+            {
+                let automatic = owner.current.lock().map(|p| p.automatic).unwrap_or(false);
+                let _ = coordinator.drive(&access, automatic).await;
+            } else if let Some(coordinator) = &owner.coordinator {
+                coordinator.invalidate();
+            }
+            owner.reset_operation();
+            // A Yes racing with the final ready state must not be lost.
+            if !owner.resume_pending_check()
+                && owner.coordinator.as_ref().is_some_and(|c| c.has_consent())
+            {
+                let _ = owner.start_drive();
+            }
+        });
+        Ok(())
+    }
+    #[cfg(test)]
+    async fn request_v2(
+        self: &Arc<Self>,
+        request: UpdateRequestV2,
+    ) -> Result<UpdateStatusV2, PrivateError> {
+        self.request_v2_for(None, request).await
+    }
+    pub async fn request_v2_for(
+        self: &Arc<Self>,
+        generation: Option<u64>,
+        request: UpdateRequestV2,
+    ) -> Result<UpdateStatusV2, PrivateError> {
+        if let UpdateRequestV2::UiLifecycle {
+            foreground,
+            new_user_launch,
+            launch_session_id,
+        } = request
+        {
+            let active = self
+                .ui_generation
+                .lock()
+                .map_err(|_| PrivateError::Closed)?;
+            if generation.is_some_and(|generation| generation != *active) {
+                return Err(PrivateError::Cancelled);
+            }
+            self.ui_lifecycle(foreground, new_user_launch, launch_session_id)?;
+            return self.status_v2();
+        }
+        // Observation reads current protected state without issuing a refresh;
+        // a slow network operation must not block pause/disconnect on this IPC.
+        let access = self
+            .broker
+            .observe()
+            .await
             .ok()
-            .is_some_and(|current| current.automatic);
-        let install = {
-            let Ok(mut operation) = self.operation.lock() else {
-                return;
-            };
-            match *operation {
-                UpdateOperation::Refreshing { install_after } => {
-                    let install =
-                        install_after.or_else(|| automatic.then_some(InstallKind::Automatic));
-                    *operation = if install.is_some() {
-                        UpdateOperation::Installing
-                    } else {
-                        UpdateOperation::Idle
-                    };
-                    install
-                }
-                _ => None,
-            }
-        };
-        if let Some(kind) = install {
-            self.run_install(kind).await;
-            self.reset_operation();
-        }
-    }
-
-    async fn run_install(&self, kind: InstallKind) {
-        let _gate = self.install_recovery_gate.lock().await;
-        let Ok(access) = self.broker.access_token(None).await else {
-            return;
-        };
-        let Some(coordinator) = &self.coordinator else {
-            return;
-        };
-        match kind {
-            InstallKind::Automatic => {
-                let preferences = self.current.lock().ok().map(|current| *current);
-                if let Some(preferences) = preferences {
-                    let _ = coordinator
-                        .install_automatically(&access, preferences)
-                        .await;
-                }
-            }
-            InstallKind::Manual => {
-                let _ = coordinator.install_now(&access).await;
+            .and_then(|observation| observation.access);
+        if let Some(coordinator) = &self.coordinator {
+            if let Some(access) = &access {
+                coordinator.retain_scope(access);
+            } else {
+                coordinator.invalidate();
             }
         }
+        let active = self
+            .ui_generation
+            .lock()
+            .map_err(|_| PrivateError::Closed)?;
+        if generation.is_some_and(|generation| generation != *active) {
+            return Err(PrivateError::Cancelled);
+        }
+        match request {
+            UpdateRequestV2::Status {} => {}
+            UpdateRequestV2::Check { reason } => self.check(reason)?,
+            UpdateRequestV2::SetAutomatic { enabled } => {
+                self.set_automatic(enabled)?;
+                if enabled {
+                    self.check(UpdateCheckReason::Foreground)?;
+                }
+            }
+            UpdateRequestV2::Confirm { offer_id } => {
+                self.coordinator
+                    .as_ref()
+                    .ok_or(PrivateError::Protocol)?
+                    .confirm(&offer_id)
+                    .map_err(|_| PrivateError::Protocol)?;
+                self.save_prompt()?;
+                self.start_drive()?;
+            }
+            UpdateRequestV2::Defer { offer_id } => {
+                let mut pending = self
+                    .manual_pending
+                    .lock()
+                    .map_err(|_| PrivateError::Closed)?;
+                self.coordinator
+                    .as_ref()
+                    .ok_or(PrivateError::Protocol)?
+                    .defer(&offer_id)
+                    .map_err(|_| PrivateError::Protocol)?;
+                *pending = false;
+                drop(pending);
+                self.save_prompt()?;
+            }
+            UpdateRequestV2::Presented { offer_id } => self
+                .coordinator
+                .as_ref()
+                .ok_or(PrivateError::Protocol)?
+                .present(&offer_id)
+                .map_err(|_| PrivateError::Protocol)?,
+            UpdateRequestV2::UiLifecycle { .. } => unreachable!(),
+        }
+        self.status_v2()
     }
-
+    fn ui_lifecycle(
+        &self,
+        foreground: bool,
+        new_launch: bool,
+        session_id: Option<String>,
+    ) -> Result<(), PrivateError> {
+        if !self.android_policy {
+            if new_launch || session_id.is_some() {
+                return Err(PrivateError::Protocol);
+            }
+            *self
+                .desktop_ui_visible
+                .lock()
+                .map_err(|_| PrivateError::Closed)? = Some(foreground);
+            return Ok(());
+        }
+        let mut session = self
+            .prompt_session
+            .lock()
+            .map_err(|_| PrivateError::Closed)?;
+        let changed = if new_launch {
+            let id = session_id
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+                .ok_or(PrivateError::Protocol)?;
+            let changed = session.launch_session_id.as_ref() != Some(&id);
+            session.launch_session_id = Some(id);
+            changed
+        } else {
+            if session_id.is_some() {
+                return Err(PrivateError::Protocol);
+            }
+            false
+        };
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.set_ui_lifecycle(foreground, changed);
+        }
+        drop(session);
+        if changed {
+            self.startup_checked
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.save_prompt()
+        } else {
+            Ok(())
+        }
+    }
+    fn save_prompt(&self) -> Result<(), PrivateError> {
+        if !self.android_policy {
+            return Ok(());
+        }
+        use std::io::Write;
+        let mut session = self
+            .prompt_session
+            .lock()
+            .map_err(|_| PrivateError::Closed)?;
+        session.deferred_version = self.coordinator.as_ref().and_then(|c| c.deferred_version());
+        let parent = self
+            .prompt_path
+            .parent()
+            .ok_or(PrivateError::RecoveryRequired)?;
+        std::fs::create_dir_all(parent).map_err(|_| PrivateError::RecoveryRequired)?;
+        let mut file =
+            tempfile::NamedTempFile::new_in(parent).map_err(|_| PrivateError::RecoveryRequired)?;
+        serde_json::to_writer(&mut file, &*session).map_err(|_| PrivateError::RecoveryRequired)?;
+        file.flush().map_err(|_| PrivateError::RecoveryRequired)?;
+        file.as_file()
+            .sync_all()
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        file.persist(&self.prompt_path)
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        Ok(())
+    }
+    pub(crate) fn start_desktop_scheduler(self: &Arc<Self>) {
+        if self.android_policy {
+            return;
+        }
+        let mut timer = self.timer.lock().expect("update timer poisoned");
+        if timer.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let reset = self.timer_reset.clone();
+        let task = tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(30 * 60);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _=reset.notified()=>interval.reset(),
+                    _=interval.tick()=>{
+                        let Some(owner)=weak.upgrade() else{return;};let _=owner.check(UpdateCheckReason::Timer);
+                    }
+                }
+            }
+        });
+        *timer = Some(task.abort_handle());
+    }
+    pub(crate) fn take_notification(&self) -> Option<UpdateOffer> {
+        if self.android_policy
+            || !self.current.lock().ok()?.automatic
+            || *self.desktop_ui_visible.lock().ok()? != Some(false)
+            || *self.manual_pending.lock().ok()?
+        {
+            return None;
+        }
+        let coordinator = self.coordinator.as_ref()?;
+        if !coordinator.ui_connected() {
+            return None;
+        }
+        coordinator.take_notification()
+    }
+    pub fn set_ui_connection_probe(&self, probe: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Some(c) = &self.coordinator {
+            c.set_ui_connection_probe(probe);
+        }
+    }
+    pub fn attach_ui(&self) -> u64 {
+        let mut generation = self
+            .ui_generation
+            .lock()
+            .expect("update UI generation poisoned");
+        *generation = generation
+            .checked_add(1)
+            .expect("update UI generation exhausted");
+        self.ui_disconnected();
+        *generation
+    }
+    pub fn ui_foreground(&self) -> bool {
+        self.coordinator.as_ref().is_some_and(|c| {
+            c.has_consent()
+                && matches!(c.phase(), UpdatePhase::Installing { .. })
+                && c.ui_foreground()
+        })
+    }
+    pub(crate) fn auth_revoked(&self) {
+        self.startup_checked
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Some(c) = &self.coordinator {
+            c.invalidate();
+        }
+    }
+    pub fn ui_disconnected(&self) {
+        *self
+            .desktop_ui_visible
+            .lock()
+            .expect("update visibility poisoned") = None;
+        if let Some(c) = &self.coordinator {
+            c.set_ui_lifecycle(false, false);
+        }
+    }
     fn record_refresh_error(&self, error: PrivateError) {
-        if let Ok(mut refresh_error) = self.refresh_error.lock() {
-            *refresh_error = Some(refresh_error_code(error).into());
+        if let Ok(mut slot) = self.refresh_error.lock() {
+            *slot = Some(refresh_error_code(error).into());
         }
     }
-
+    fn resume_pending_check(self: &Arc<Self>) -> bool {
+        if self
+            .manual_pending
+            .lock()
+            .map(|pending| *pending)
+            .unwrap_or(false)
+        {
+            let _ = self.start_check(false);
+            return true;
+        }
+        if self
+            .startup_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            && !self
+                .startup_checked
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = self.check(UpdateCheckReason::Startup);
+            return true;
+        }
+        false
+    }
     fn reset_operation(&self) {
         if let Ok(mut operation) = self.operation.lock() {
             *operation = UpdateOperation::Idle;
         }
     }
 }
-
+impl Drop for HostUpdater {
+    fn drop(&mut self) {
+        if let Ok(timer) = self.timer.get_mut() {
+            if let Some(timer) = timer.take() {
+                timer.abort();
+            }
+        }
+    }
+}
 fn refresh_error_code(error: PrivateError) -> &'static str {
     match error {
         PrivateError::Timeout => "update_refresh_timeout",
@@ -470,7 +900,6 @@ fn refresh_error_code(error: PrivateError) -> &'static str {
         PrivateError::AccessUnavailable => "update_refresh_access_unavailable",
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,21 +978,70 @@ mod tests {
     #[derive(Default)]
     struct RecordingBackend {
         versions: Mutex<Vec<String>>,
+        files: Mutex<Vec<tempfile::NamedTempFile>>,
+        panel: Option<Arc<Panel>>,
+    }
+    fn test_descriptor(version: &str) -> ResolvedUpdate {
+        ResolvedUpdate {
+            version: version.into(),
+            target: "test".into(),
+            artifact_url: "https://nelomai.ru/api/client/v1/updates/artifacts/test".into(),
+            signature: "test".into(),
+            key_identity: "test".into(),
+            sha256: None,
+            size_bytes: None,
+        }
+    }
+    fn test_prepared(
+        resolved: &ResolvedUpdate,
+        files: &Mutex<Vec<tempfile::NamedTempFile>>,
+    ) -> PreparedUpdate {
+        use std::io::Write;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"verified synthetic package").unwrap();
+        let prepared =
+            PreparedUpdate::from_verified_file(resolved.clone(), file.path().to_owned()).unwrap();
+        files.lock().unwrap().push(file);
+        prepared
     }
 
     #[async_trait]
     impl UpdateBackend for RecordingBackend {
-        async fn install(
+        async fn resolve(
             &self,
             _: &AccessSnapshot,
             version: &str,
-            _: UpdateBarrierPhase,
+        ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+            if let Some(panel) = &self.panel {
+                if panel.fail.load(Ordering::SeqCst) {
+                    return Err(UpdateBackendError::new("manifest_unavailable"));
+                }
+                if panel.version.lock().unwrap().as_str() != version {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(test_descriptor(version)))
+        }
+        async fn prepare(
+            &self,
+            _: &AccessSnapshot,
+            resolved: &ResolvedUpdate,
             _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<PreparedUpdate, UpdateBackendError> {
+            Ok(test_prepared(resolved, &self.files))
+        }
+        async fn install_prepared(
+            &self,
+            prepared: &PreparedUpdate,
+            _: UpdateBarrierPhase,
         ) -> Result<InstallResult, UpdateBackendError> {
-            self.versions.lock().unwrap().push(version.to_owned());
+            self.versions
+                .lock()
+                .unwrap()
+                .push(prepared.resolved().version.clone());
             Ok(InstallResult::Installed(
                 nelomai_client_updater::InstalledUpdate {
-                    version: version.to_owned(),
+                    version: prepared.resolved().version.clone(),
                 },
             ))
         }
@@ -794,7 +1272,10 @@ mod tests {
                 .unwrap()
                 .attach(broker.clone(), control),
         );
-        let backend = Arc::new(RecordingBackend::default());
+        let backend = Arc::new(RecordingBackend {
+            panel: Some(panel.clone()),
+            ..Default::default()
+        });
         let updater = Arc::new(
             HostUpdater::new(
                 root.path(),
@@ -808,6 +1289,38 @@ mod tests {
         );
         updater.set_automatic(false).unwrap();
         (updater, panel, backend, tunnel, server, root)
+    }
+
+    #[tokio::test]
+    async fn automatic_refresh_never_stops_vpn_without_consent() {
+        let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
+        updater.set_automatic(true).unwrap();
+        updater.start_refresh().unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        assert_eq!(
+            tunnel.stops.load(Ordering::SeqCst),
+            0,
+            "discovery must not stop VPN"
+        );
+        assert!(backend.versions.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_install_cannot_bypass_consent() {
+        let (updater, _panel, backend, _tunnel, server, _root) = updater(false).await;
+        assert!(
+            updater.install(false).is_err(),
+            "legacy manual command carries no offer identity"
+        );
+        assert!(
+            updater.install(true).is_err(),
+            "legacy automatic command carries no consent"
+        );
+        assert!(backend.versions.lock().unwrap().is_empty());
+        server.abort();
     }
 
     #[tokio::test]
@@ -924,87 +1437,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_install_joins_in_flight_refresh_without_a_second_panel_request() {
-        let (updater, panel, _backend, _tunnel, server, _root) = updater(false).await;
-
+    async fn legacy_install_during_refresh_is_rejected_without_a_second_panel_request() {
+        let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
         updater.start_refresh().unwrap();
         wait_for_calls(&panel, 1).await;
-        assert_eq!(
-            updater.install(false).unwrap().error_code.as_deref(),
-            Some("update_install_preparing")
-        );
-
+        assert!(updater.install(false).is_err());
         panel.release.notify_one();
         wait_for_idle(&updater).await;
         assert_eq!(panel.calls.load(Ordering::SeqCst), 1);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn manual_install_refreshes_current_offer_before_attempting_install() {
-        let (updater, panel, backend, _tunnel, server, _root) = updater(false).await;
-
-        updater.start_refresh().unwrap();
-        wait_for_calls(&panel, 1).await;
-        panel.release.notify_one();
-        wait_for_refresh(&updater).await;
-        *panel.version.lock().unwrap() = "0.2.22".into();
-
-        assert_eq!(
-            updater.install(false).unwrap().error_code.as_deref(),
-            Some("update_install_preparing")
-        );
-        wait_for_calls(&panel, 2).await;
-        assert!(backend.versions.lock().unwrap().is_empty());
-        panel.release.notify_one();
-        wait_for_idle(&updater).await;
-        assert_eq!(updater.status().unwrap().version.as_deref(), Some("0.2.22"));
-        assert!(!backend
-            .versions
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|version| version == "0.2.21"));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn manual_install_does_not_stop_or_install_when_refresh_fails() {
-        let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
-
-        updater.start_refresh().unwrap();
-        wait_for_calls(&panel, 1).await;
-        panel.release.notify_one();
-        wait_for_refresh(&updater).await;
-        panel.fail.store(true, Ordering::SeqCst);
-
-        updater.install(false).unwrap();
-        wait_for_calls(&panel, 2).await;
-        panel.release.notify_one();
-        wait_for_idle(&updater).await;
         assert!(backend.versions.lock().unwrap().is_empty());
         assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
         server.abort();
     }
-
-    #[tokio::test]
-    async fn refresh_request_during_manual_install_joins_its_refresh() {
-        let (updater, panel, _backend, _tunnel, server, _root) = updater(false).await;
-
+    async fn discover(updater: &Arc<HostUpdater>, panel: &Panel) {
         updater.start_refresh().unwrap();
-        wait_for_calls(&panel, 1).await;
         panel.release.notify_one();
-        wait_for_refresh(&updater).await;
-
-        updater.install(false).unwrap();
-        wait_for_calls(&panel, 2).await;
-        assert_eq!(
-            updater.start_refresh().unwrap().error_code.as_deref(),
-            Some("update_install_preparing")
-        );
-        panel.release.notify_one();
+        wait_for_idle(updater).await;
+    }
+    async fn confirm(updater: &Arc<HostUpdater>) {
+        let offer_id = updater.status_v2().unwrap().offer_id.unwrap();
+        updater
+            .request_v2(UpdateRequestV2::Confirm { offer_id })
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn confirmation_rechecks_current_manifest_before_stop() {
+        let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
+        discover(&updater, &panel).await;
+        *panel.version.lock().unwrap() = "0.2.22".into();
+        confirm(&updater).await;
         wait_for_idle(&updater).await;
-        assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
+        assert!(backend.versions.lock().unwrap().is_empty());
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            updater.status().unwrap().error_code.as_deref(),
+            Some("update_offer_changed")
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn confirmation_does_not_stop_when_fresh_manifest_fails() {
+        let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
+        discover(&updater, &panel).await;
+        panel.fail.store(true, Ordering::SeqCst);
+        confirm(&updater).await;
+        wait_for_idle(&updater).await;
+        assert!(backend.versions.lock().unwrap().is_empty());
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn duplicate_confirmation_installs_once() {
+        let (updater, panel, backend, _tunnel, server, _root) = updater(false).await;
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
+        confirm(&updater).await;
+        wait_for_idle(&updater).await;
+        assert_eq!(backend.versions.lock().unwrap().as_slice(), ["0.2.21"]);
         server.abort();
     }
 
@@ -1013,6 +1504,7 @@ mod tests {
         entered: Notify,
         release: Notify,
         wait_for_result: bool,
+        files: Mutex<Vec<tempfile::NamedTempFile>>,
     }
     impl CancelledInstaller {
         fn new(wait_for_result: bool) -> Arc<Self> {
@@ -1021,17 +1513,31 @@ mod tests {
                 entered: Notify::new(),
                 release: Notify::new(),
                 wait_for_result,
+                files: Mutex::new(Vec::new()),
             })
         }
     }
     #[async_trait]
     impl UpdateBackend for CancelledInstaller {
-        async fn install(
+        async fn resolve(
             &self,
             _: &AccessSnapshot,
-            _: &str,
-            _: UpdateBarrierPhase,
+            version: &str,
+        ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+            Ok(Some(test_descriptor(version)))
+        }
+        async fn prepare(
+            &self,
+            _: &AccessSnapshot,
+            resolved: &ResolvedUpdate,
             _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<PreparedUpdate, UpdateBackendError> {
+            Ok(test_prepared(resolved, &self.files))
+        }
+        async fn install_prepared(
+            &self,
+            _: &PreparedUpdate,
+            _: UpdateBarrierPhase,
         ) -> Result<InstallResult, UpdateBackendError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
@@ -1047,8 +1553,8 @@ mod tests {
         let installer = CancelledInstaller::new(true);
         let (updater, panel, _, _, server, root) =
             updater_with_installer(false, Some(installer.clone())).await;
-        panel.release.notify_one();
-        updater.install(false).unwrap();
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
         tokio::time::timeout(Duration::from_secs(2), installer.entered.notified())
             .await
             .unwrap();
@@ -1096,8 +1602,9 @@ mod tests {
         let (updater, panel, _, _, server, root) =
             updater_with_installer(false, Some(installer.clone())).await;
         panel.fail_resume.store(true, Ordering::SeqCst);
-        panel.release.notify_one();
-        updater.install(false).unwrap();
+        discover(&updater, &panel).await;
+        let old_access = updater.broker.observe().await.unwrap().access.unwrap();
+        confirm(&updater).await;
         wait_for_idle(&updater).await;
         assert_eq!(
             updater.status().unwrap().error_code.as_deref(),
@@ -1109,7 +1616,13 @@ mod tests {
                 ["phase"],
             "cancel_requested"
         );
+        let old_offer = updater.status_v2().unwrap().offer_id;
         updater.recover(None).await.unwrap();
+        let new_access = updater.broker.observe().await.unwrap().access.unwrap();
+        assert_ne!(
+            old_access.identity().session_generation,
+            new_access.identity().session_generation
+        );
         assert!(!path.exists());
         updater.set_automatic(true).unwrap();
         updater.start_refresh().unwrap();
@@ -1121,13 +1634,14 @@ mod tests {
             1,
             "same cancelled offer must not reopen after recovery"
         );
-        assert_eq!(
-            updater.status().unwrap().error_code.as_deref(),
-            Some("update_recovery_failed"),
-            "automatic refresh must not hide the recovery error"
+        assert_ne!(
+            old_offer,
+            updater.status_v2().unwrap().offer_id,
+            "recovered auth generation needs a new offer identity"
         );
-        panel.release.notify_one();
-        updater.install(false).unwrap();
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
         wait_for_idle(&updater).await;
         assert_eq!(
             installer.calls.load(Ordering::SeqCst),
@@ -1138,7 +1652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_install_task_releases_recovery_without_losing_its_journal() {
+    async fn interrupted_caller_keeps_native_consumer_and_journal_until_result() {
         let installer = CancelledInstaller::new(true);
         let (updater, panel, _, _, server, root) =
             updater_with_installer(false, Some(installer.clone())).await;
@@ -1147,7 +1661,17 @@ mod tests {
         panel.release.notify_one();
         wait_for_refresh(&updater).await;
         let owner = updater.clone();
-        let install = tokio::spawn(async move { owner.run_install(InstallKind::Manual).await });
+        let id = owner.coordinator.as_ref().unwrap().offer_id().unwrap();
+        owner.coordinator.as_ref().unwrap().confirm(&id).unwrap();
+        let install = tokio::spawn(async move {
+            let access = owner.broker.access_token(None).await.unwrap();
+            owner
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .drive(&access, false)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(2), installer.entered.notified())
             .await
             .unwrap();
@@ -1155,16 +1679,181 @@ mod tests {
         assert!(path.exists());
         install.abort();
         assert!(install.await.unwrap_err().is_cancelled());
-
-        tokio::time::timeout(Duration::from_secs(2), updater.recover(None))
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(updater.recover(None).await.is_err());
+        assert!(path.exists());
+        assert!(updater.native_start_blocked().unwrap());
+        installer.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while updater.install_recovery_gate.try_lock().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        updater.recover(None).await.unwrap();
         assert!(!path.exists());
         assert!(!updater.native_start_blocked().unwrap());
         server.abort();
     }
 
+    #[tokio::test]
+    async fn replaced_runtime_cannot_reassert_consent_or_delay_current_status() {
+        let (updater, panel, backend, _, server, _root) = updater(false).await;
+        discover(&updater, &panel).await;
+        let old = updater.attach_ui();
+        let current = updater.attach_ui();
+        let id = updater.coordinator.as_ref().unwrap().offer_id().unwrap();
+        assert!(updater
+            .request_v2_for(Some(old), UpdateRequestV2::Confirm { offer_id: id })
+            .await
+            .is_err());
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        assert!(backend.versions.lock().unwrap().is_empty());
+        updater.check(UpdateCheckReason::Manual).unwrap();
+        wait_for_calls(&panel, 2).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            updater.request_v2_for(Some(current), UpdateRequestV2::Status {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        panel.release.notify_one();
+        wait_for_refresh(&updater).await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_timer_obeys_off_single_flight_and_skips_sleep_backlog() {
+        let (updater, panel, _, _, server, _root) = updater(false).await;
+        tokio::time::pause();
+        updater.start_desktop_scheduler();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1800)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 0);
+        updater.set_automatic(true).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        wait_for_calls(&panel, 1).await;
+        // The unresolved request coalesces ticks/manual checks; no catch-up burst.
+        updater.check(UpdateCheckReason::Manual).unwrap();
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 1);
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(7200)).await;
+        tokio::time::resume();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        tokio::task::yield_now().await;
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
+        let weak = Arc::downgrade(&updater);
+        drop(updater);
+        tokio::task::yield_now().await;
+        assert!(weak.upgrade().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn android_prompt_file_survives_owner_recreation_but_never_persists_consent() {
+        let (base, _panel, _, _, server, root) = updater(false).await;
+        let make = || {
+            Arc::new(
+                HostUpdater::new_with_policy(
+                    root.path(),
+                    base.api.clone(),
+                    base.broker.clone(),
+                    base.barrier.clone(),
+                    base.version.clone(),
+                    base.backend.clone(),
+                    true,
+                )
+                .unwrap(),
+            )
+        };
+        let access = base.broker.access_token(None).await.unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let first = make();
+        first.set_ui_connection_probe(Arc::new(|| true));
+        first
+            .ui_lifecycle(true, true, Some(session.clone()))
+            .unwrap();
+        let offer = UpdateOffer {
+            version: "0.2.21".into(),
+            notes: None,
+            required: false,
+        };
+        let observe = |owner: &HostUpdater| {
+            owner
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .observe_resolved(Some((offer.clone(), test_descriptor("0.2.21"))), &access)
+        };
+        observe(&first);
+        let id = first.coordinator.as_ref().unwrap().offer_id().unwrap();
+        first
+            .request_v2(UpdateRequestV2::Defer { offer_id: id })
+            .await
+            .unwrap();
+        drop(first);
+        let second = make();
+        second.set_ui_connection_probe(Arc::new(|| true));
+        observe(&second);
+        second.ui_lifecycle(true, false, None).unwrap();
+        assert!(!second.coordinator.as_ref().unwrap().prompt_pending());
+        second.ui_lifecycle(true, true, Some(session)).unwrap();
+        assert!(!second.coordinator.as_ref().unwrap().prompt_pending());
+        second
+            .ui_lifecycle(true, true, Some(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        assert!(second.coordinator.as_ref().unwrap().prompt_pending());
+        second
+            .coordinator
+            .as_ref()
+            .unwrap()
+            .confirm(&second.coordinator.as_ref().unwrap().offer_id().unwrap())
+            .unwrap();
+        second.save_prompt().unwrap();
+        drop(second);
+        let third = make();
+        observe(&third);
+        assert!(!third.coordinator.as_ref().unwrap().has_consent());
+        let text =
+            std::fs::read_to_string(root.path().join("updates/prompt-session.json")).unwrap();
+        assert!(!text.contains("consent") && !text.contains("offer_id"));
+        drop(third);
+        std::fs::write(
+            root.path().join("updates/prompt-session.json"),
+            vec![b'x'; 5000],
+        )
+        .unwrap();
+        let malformed = make();
+        observe(&malformed);
+        assert!(!malformed.coordinator.as_ref().unwrap().has_consent());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_retry_during_failed_check_is_not_lost_with_automatic_off() {
+        let (updater, panel, _, _, server, _root) = updater(true).await;
+        updater.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        updater.check(UpdateCheckReason::Startup).unwrap();
+        panel.release.notify_one();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        assert!(updater.coordinator.as_ref().unwrap().offer_id().is_some());
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
     async fn wait_for_calls(panel: &Panel, expected: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while panel.calls.load(Ordering::SeqCst) != expected {
@@ -1179,7 +1868,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             while matches!(
                 *updater.operation.lock().unwrap(),
-                UpdateOperation::Refreshing { .. }
+                UpdateOperation::Refreshing
             ) {
                 tokio::task::yield_now().await;
             }
@@ -1196,5 +1885,375 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[derive(Default)]
+    struct PausedDownload {
+        entered: Notify,
+        release: Notify,
+        files: Mutex<Vec<tempfile::NamedTempFile>>,
+    }
+    #[async_trait]
+    impl UpdateBackend for PausedDownload {
+        async fn resolve(
+            &self,
+            _: &AccessSnapshot,
+            version: &str,
+        ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+            Ok(Some(test_descriptor(version)))
+        }
+        async fn prepare(
+            &self,
+            _: &AccessSnapshot,
+            resolved: &ResolvedUpdate,
+            _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+        ) -> Result<PreparedUpdate, UpdateBackendError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(test_prepared(resolved, &self.files))
+        }
+    }
+    #[tokio::test]
+    async fn manual_during_download_preserves_later_on_next_foreground() {
+        let download = Arc::new(PausedDownload::default());
+        let (base, panel, _, _, server, root) =
+            updater_with_installer(false, Some(download.clone())).await;
+        let updater = Arc::new(
+            HostUpdater::new_with_policy(
+                root.path(),
+                base.api.clone(),
+                base.broker.clone(),
+                base.barrier.clone(),
+                base.version.clone(),
+                base.backend.clone(),
+                true,
+            )
+            .unwrap(),
+        );
+        updater.set_ui_connection_probe(Arc::new(|| true));
+        updater
+            .ui_lifecycle(true, true, Some(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        updater.set_automatic(true).unwrap();
+        updater.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), download.entered.notified())
+            .await
+            .unwrap();
+        updater
+            .request_v2(UpdateRequestV2::Check {
+                reason: UpdateCheckReason::Manual,
+            })
+            .await
+            .unwrap();
+        let id = updater.status_v2().unwrap().offer_id.unwrap();
+        updater
+            .request_v2(UpdateRequestV2::Defer { offer_id: id })
+            .await
+            .unwrap();
+        download.release.notify_one();
+        wait_for_idle(&updater).await;
+        assert!(!updater.status_v2().unwrap().prompt_pending);
+        updater.ui_lifecycle(false, false, None).unwrap();
+        updater.ui_lifecycle(true, false, None).unwrap();
+        updater.check(UpdateCheckReason::Foreground).unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&updater).await;
+        server.abort();
+        assert!(
+            !updater.status_v2().unwrap().prompt_pending,
+            "a completed old manual request must not erase newer Later on foreground"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_android_launch_checks_once_even_with_warm_owner_and_automatic_off() {
+        let (base, panel, _, _, server, root) = updater(false).await;
+        let owner = Arc::new(
+            HostUpdater::new_with_policy(
+                root.path(),
+                base.api.clone(),
+                base.broker.clone(),
+                base.barrier.clone(),
+                base.version.clone(),
+                base.backend.clone(),
+                true,
+            )
+            .unwrap(),
+        );
+        owner.set_automatic(false).unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        owner.ui_lifecycle(true, true, Some(first.clone())).unwrap();
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        let id = owner.status_v2().unwrap().offer_id.unwrap();
+        owner
+            .request_v2(UpdateRequestV2::Defer { offer_id: id })
+            .await
+            .unwrap();
+        owner.ui_lifecycle(false, false, None).unwrap();
+        owner.ui_lifecycle(true, true, Some(first)).unwrap();
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 1);
+        assert!(!owner.status_v2().unwrap().prompt_pending);
+        owner
+            .ui_lifecycle(true, true, Some(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert!(owner.status_v2().unwrap().prompt_pending);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_notification_requires_hidden_admitted_ui_and_automatic() {
+        let (owner, _, _, _, server, _root) = updater(false).await;
+        let connected = Arc::new(AtomicBool::new(true));
+        let probe = connected.clone();
+        owner.set_ui_connection_probe(Arc::new(move || probe.load(Ordering::SeqCst)));
+        let access = owner.broker.access_token(None).await.unwrap();
+        owner.coordinator.as_ref().unwrap().observe_resolved(
+            Some((
+                UpdateOffer {
+                    version: "0.2.21".into(),
+                    notes: None,
+                    required: false,
+                },
+                test_descriptor("0.2.21"),
+            )),
+            &access,
+        );
+        assert!(owner.take_notification().is_none(), "automatic off");
+        owner.set_automatic(true).unwrap();
+        assert!(
+            owner.take_notification().is_none(),
+            "unknown visibility must fail closed"
+        );
+        let generation = owner.attach_ui();
+        let visible = |foreground| UpdateRequestV2::UiLifecycle {
+            foreground,
+            new_user_launch: false,
+            launch_session_id: None,
+        };
+        owner
+            .request_v2_for(Some(generation), visible(true))
+            .await
+            .unwrap();
+        assert!(
+            owner.take_notification().is_none(),
+            "visible UI already presents the offer"
+        );
+        owner
+            .request_v2_for(Some(generation), visible(false))
+            .await
+            .unwrap();
+        connected.store(false, Ordering::SeqCst);
+        assert!(
+            owner.take_notification().is_none(),
+            "native disconnect before lifecycle delivery"
+        );
+        connected.store(true, Ordering::SeqCst);
+        owner.ui_disconnected();
+        assert!(
+            owner.take_notification().is_none(),
+            "disconnected peer cannot provide visibility"
+        );
+        let current = owner.attach_ui();
+        assert!(owner
+            .request_v2_for(Some(generation), visible(false))
+            .await
+            .is_err());
+        assert!(
+            owner.take_notification().is_none(),
+            "stale peer cannot restore visibility"
+        );
+        owner
+            .request_v2_for(Some(current), visible(false))
+            .await
+            .unwrap();
+        owner.set_automatic(false).unwrap();
+        assert!(owner.take_notification().is_none());
+        owner.set_automatic(true).unwrap();
+        assert!(owner.take_notification().is_some());
+        assert!(
+            owner.take_notification().is_none(),
+            "one banner per version"
+        );
+        assert!(
+            owner
+                .request_v2_for(
+                    Some(current),
+                    UpdateRequestV2::UiLifecycle {
+                        foreground: true,
+                        new_user_launch: true,
+                        launch_session_id: Some(uuid::Uuid::new_v4().to_string())
+                    }
+                )
+                .await
+                .is_err(),
+            "desktop must not acquire Android launch authority"
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn manual_during_download_checks_fresh_metadata_once_when_download_finishes() {
+        let download = Arc::new(PausedDownload::default());
+        let (owner, panel, _, _, server, _root) =
+            updater_with_installer(false, Some(download.clone())).await;
+        owner.set_automatic(true).unwrap();
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), download.entered.notified())
+            .await
+            .unwrap();
+        let id = owner.status_v2().unwrap().offer_id.unwrap();
+        owner
+            .request_v2(UpdateRequestV2::Defer { offer_id: id })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            owner.check(UpdateCheckReason::Manual).unwrap();
+        }
+        assert!(
+            !owner.status_v2().unwrap().prompt_pending,
+            "wait for fresh metadata before reopening"
+        );
+        download.release.notify_one();
+        wait_for_calls(&panel, 2).await;
+        assert_eq!(owner.status_v2().unwrap().phase, "checking");
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert!(owner.status_v2().unwrap().prompt_pending);
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn later_during_manual_refresh_wins_over_completion() {
+        let (owner, panel, _, _, server, _root) = updater(false).await;
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        let id = owner.status_v2().unwrap().offer_id.unwrap();
+        owner.check(UpdateCheckReason::Manual).unwrap();
+        wait_for_calls(&panel, 2).await;
+        owner
+            .request_v2(UpdateRequestV2::Defer { offer_id: id })
+            .await
+            .unwrap();
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert!(!owner.status_v2().unwrap().prompt_pending);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn failed_manual_does_not_turn_next_timer_into_manual() {
+        let (owner, panel, _, _, server, _root) = updater(true).await;
+        let access = owner.broker.access_token(None).await.unwrap();
+        let c = owner.coordinator.as_ref().unwrap();
+        c.observe_resolved(
+            Some((
+                UpdateOffer {
+                    version: "0.2.21".into(),
+                    notes: None,
+                    required: false,
+                },
+                test_descriptor("0.2.21"),
+            )),
+            &access,
+        );
+        owner
+            .request_v2(UpdateRequestV2::Defer {
+                offer_id: c.offer_id().unwrap(),
+            })
+            .await
+            .unwrap();
+        owner.check(UpdateCheckReason::Manual).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert_eq!(
+            owner.status_v2().unwrap().status.error_code.as_deref(),
+            Some("update_refresh_service")
+        );
+        owner.set_automatic(true).unwrap();
+        owner.check(UpdateCheckReason::Timer).unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert!(!owner.status_v2().unwrap().prompt_pending);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn yes_supersedes_persisted_later_without_persisting_consent() {
+        let download = Arc::new(PausedDownload::default());
+        let (base, panel, _, _, server, root) =
+            updater_with_installer(false, Some(download.clone())).await;
+        let owner = Arc::new(
+            HostUpdater::new_with_policy(
+                root.path(),
+                base.api.clone(),
+                base.broker.clone(),
+                base.barrier.clone(),
+                base.version.clone(),
+                base.backend.clone(),
+                true,
+            )
+            .unwrap(),
+        );
+        owner.set_ui_connection_probe(Arc::new(|| true));
+        owner
+            .ui_lifecycle(true, true, Some(uuid::Uuid::new_v4().to_string()))
+            .unwrap();
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        let id = owner.status_v2().unwrap().offer_id.unwrap();
+        owner
+            .request_v2(UpdateRequestV2::Defer {
+                offer_id: id.clone(),
+            })
+            .await
+            .unwrap();
+        owner
+            .request_v2(UpdateRequestV2::Confirm { offer_id: id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), download.entered.notified())
+            .await
+            .unwrap();
+        owner.ui_disconnected();
+        download.release.notify_one();
+        wait_for_idle(&owner).await;
+        let recreated = HostUpdater::new_with_policy(
+            root.path(),
+            base.api.clone(),
+            base.broker.clone(),
+            base.barrier.clone(),
+            base.version.clone(),
+            base.backend.clone(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            recreated
+                .coordinator
+                .as_ref()
+                .unwrap()
+                .deferred_version()
+                .is_none(),
+            "old Later must not return after common recreation"
+        );
+        assert!(!recreated.coordinator.as_ref().unwrap().has_consent());
+        server.abort();
     }
 }

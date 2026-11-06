@@ -34,7 +34,12 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         requireNotNull(migrationStorage).acknowledge(context)
         return true
     }
-    fun installApk(path: String, version: String, signer: String): Boolean = RuntimeApkInstaller.install(context, path, version, signer)
+    fun validateApk(path: String, version: String, signer: String): Boolean {
+        RuntimeApkValidation.validate(context, path, version, signer)
+        return true
+    }
+    fun installApk(path: String, version: String, signer: String): Boolean =
+        RuntimeApkInstaller.install(context, path, version, signer, context::updateUiForeground)
     private fun bridge(): RuntimeNativeBridgeV1 {
         val selected = RuntimeSelectionStore.decode(context.currentSelection())
         val namespace = when (selected.slot) {

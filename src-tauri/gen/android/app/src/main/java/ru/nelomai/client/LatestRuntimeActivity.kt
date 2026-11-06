@@ -1,5 +1,6 @@
 package ru.nelomai.client
 
+import ru.nelomai.client.RuntimeUpdateVisibility
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -52,6 +53,8 @@ class LatestRuntimeActivity : TauriActivity() {
         allowRetry = allowRetry)
       return
     }
+    if (RuntimeEntrypoint.supportsUpdates()) RuntimeEntrypoint.updateUiCreated(if (savedInstanceState == null) intent.getStringExtra("nelomai_update_launch_session") else null)
+    intent.removeExtra("nelomai_update_launch_session")
     ownerConnection.read { result ->
       if (result.isFailure) finish()
     }
@@ -74,12 +77,17 @@ class LatestRuntimeActivity : TauriActivity() {
     super.onResume()
     if (!runtimeLifecycleEnabled) return
     runtimeResumed = true
+    if (RuntimeEntrypoint.supportsUpdates()) {
+      RuntimeUpdateVisibility.resumed(this)
+      RuntimeEntrypoint.updateUiResumed()
+    }
     bootstrapNetworks.start()
     wakeStartup()
     StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("resumed"))
   }
 
   override fun onPause() {
+    if (RuntimeEntrypoint.supportsUpdates() && RuntimeUpdateVisibility.paused(this)) RuntimeEntrypoint.updateUiPaused()
     runtimeResumed = false
     bootstrapNetworks.stop()
     if (runtimeLifecycleEnabled) StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("paused"))
@@ -87,6 +95,7 @@ class LatestRuntimeActivity : TauriActivity() {
   }
 
   override fun onStop() {
+    if (RuntimeEntrypoint.supportsUpdates()) RuntimeEntrypoint.updateUiStopped(isChangingConfigurations)
     if (runtimeLifecycleEnabled) StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("stopped"))
     super.onStop()
   }
@@ -99,6 +108,7 @@ class LatestRuntimeActivity : TauriActivity() {
   }
 
   override fun onDestroy() {
+    if (RuntimeEntrypoint.supportsUpdates() && RuntimeUpdateVisibility.paused(this)) RuntimeEntrypoint.updateUiPaused()
     runtimeResumed = false
     bootstrapNetworks.stop()
     startupWebView = null

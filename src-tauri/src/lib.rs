@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android_runtime;
+#[cfg(target_os = "android")]
+mod android_update_ui;
 #[cfg(desktop)]
 mod automatic_diagnostics;
 mod commands;
@@ -244,6 +246,10 @@ pub(crate) fn run_product(
             commands::app_update_refresh,
             commands::app_update_set_automatic,
             commands::app_update_install,
+            commands::app_update_check,
+            commands::app_update_confirm,
+            commands::app_update_defer,
+            commands::app_update_presented,
             commands::app_update_restart,
             commands::app_runtime_switch_status,
             commands::app_runtime_switch_request,

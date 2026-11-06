@@ -64,6 +64,7 @@ def generate(root, output):
     def transform(value):
         for before, after in replacements.items():
             value = value.replace(before, after)
+        value = value.replace(NAMESPACE + '.RuntimeUpdateVisibility', 'ru.nelomai.client.RuntimeUpdateVisibility')
         value = value.replace(NAMESPACE + '.RuntimeSelectionStore', 'ru.nelomai.client.RuntimeSelectionStore')
         value = value.replace(NAMESPACE + '.RuntimeDispatchGuard', 'ru.nelomai.client.RuntimeDispatchGuard')
         value = value.replace(NAMESPACE + '.RuntimeProcessSelection', 'ru.nelomai.client.RuntimeProcessSelection')
