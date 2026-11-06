@@ -144,6 +144,7 @@ enum UpdateOperation {
     Idle,
     Refreshing,
     Driving,
+    Recovering,
 }
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -469,6 +470,25 @@ impl HostUpdater {
         self.status()
     }
     pub(crate) fn check(self: &Arc<Self>, reason: UpdateCheckReason) -> Result<(), PrivateError> {
+        if reason == UpdateCheckReason::Manual {
+            *self
+                .manual_pending
+                .lock()
+                .map_err(|_| PrivateError::Closed)? = true;
+        }
+        if reason == UpdateCheckReason::Startup
+            && !self
+                .startup_checked
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.startup_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Completing an already accepted cancellation is independent of the
+        // preference controlling discovery/download of another update.
+        if self.start_cancel_recovery()? {
+            return Ok(());
+        }
         if reason == UpdateCheckReason::Startup
             && self
                 .startup_checked
@@ -490,13 +510,63 @@ impl HostUpdater {
         if self.android_policy && reason == UpdateCheckReason::Timer {
             return Err(PrivateError::Protocol);
         }
-        if reason == UpdateCheckReason::Manual {
-            *self
-                .manual_pending
-                .lock()
-                .map_err(|_| PrivateError::Closed)? = true;
-        }
         self.start_check(reason == UpdateCheckReason::Startup)
+    }
+    fn start_cancel_recovery(self: &Arc<Self>) -> Result<bool, PrivateError> {
+        let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
+        if *operation == UpdateOperation::Recovering {
+            return Ok(true);
+        }
+        if *operation != UpdateOperation::Idle {
+            return Ok(false);
+        }
+        let Some(journal) = self
+            .barrier
+            .snapshot()
+            .map_err(|_| PrivateError::RecoveryRequired)?
+            .filter(|journal| journal.phase() == crate::UpdateJournalPhase::CancelRequested)
+        else {
+            return Ok(false);
+        };
+        let operation_id = journal.operation_id().to_owned();
+        *operation = UpdateOperation::Recovering;
+        drop(operation);
+        let owner = self.clone();
+        tokio::spawn(async move {
+            // This detached recovery includes server cleanup plus retry waits,
+            // unlike one IPC/network request's ten-second budget.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let result = tokio::time::timeout_at(deadline, async {
+                let _gate = owner.install_recovery_gate.lock().await;
+                owner
+                    .barrier
+                    .recover_cancel_before(&operation_id, deadline)
+                    .await
+            })
+            .await;
+            let completed = matches!(result, Ok(Ok(())));
+            if completed {
+                // Resume rotated auth. Never retain consent for its predecessor.
+                if let Some(coordinator) = &owner.coordinator {
+                    coordinator.invalidate();
+                }
+                *owner.refresh_error.lock().expect("update error poisoned") = None;
+            } else {
+                owner.record_refresh_error(PrivateError::RecoveryRequired);
+                *owner
+                    .manual_pending
+                    .lock()
+                    .expect("update manual request poisoned") = false;
+                owner
+                    .startup_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+            owner.reset_operation();
+            if completed {
+                owner.resume_pending_check();
+            }
+        });
+        Ok(true)
     }
     fn start_check(self: &Arc<Self>, queue_startup: bool) -> Result<(), PrivateError> {
         let mut operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
@@ -594,7 +664,8 @@ impl HostUpdater {
             }
             owner.reset_operation();
             // A Yes racing with the final ready state must not be lost.
-            if !owner.resume_pending_check()
+            if !owner.start_cancel_recovery().unwrap_or(false)
+                && !owner.resume_pending_check()
                 && owner.coordinator.as_ref().is_some_and(|c| c.has_consent())
             {
                 let _ = owner.start_drive();
@@ -628,6 +699,9 @@ impl HostUpdater {
                 return Err(PrivateError::Cancelled);
             }
             self.ui_lifecycle(foreground, new_user_launch, launch_session_id)?;
+            if foreground {
+                self.start_cancel_recovery()?;
+            }
             return self.status_v2();
         }
         // Observation reads current protected state without issuing a refresh;
@@ -1096,6 +1170,7 @@ mod tests {
         reconciles: AtomicUsize,
         resumes: AtomicUsize,
         fail_resume: AtomicBool,
+        retry_reconcile: AtomicUsize,
     }
 
     async fn reconcile(
@@ -1103,6 +1178,15 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         panel.reconciles.fetch_add(1, Ordering::SeqCst);
+        if panel
+            .retry_reconcile
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Json(json!({"state":"retry","operation_id":body["operation_id"],
+                "retired_lease_ids":[],"retired_session_ids":[],"retired_operation_ids":[],
+                "retry_after_seconds":1}));
+        }
         Json(json!({"state":"clean","operation_id":body["operation_id"],
             "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
             "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}))
@@ -1112,7 +1196,7 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
         panel.resumes.fetch_add(1, Ordering::SeqCst);
-        if panel.fail_resume.swap(false, Ordering::SeqCst) {
+        if panel.fail_resume.load(Ordering::SeqCst) {
             return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
         }
         assert_eq!(body["decision"], "cancel");
@@ -1190,6 +1274,7 @@ mod tests {
             reconciles: AtomicUsize::new(0),
             resumes: AtomicUsize::new(0),
             fail_resume: AtomicBool::new(false),
+            retry_reconcile: AtomicUsize::new(0),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap()))
@@ -1597,6 +1682,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_cancel_pending_recovers_without_restart_when_automatic_is_off() {
+        let installer = CancelledInstaller::new(false);
+        let (updater, panel, _, tunnel, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        panel.retry_reconcile.store(1, Ordering::SeqCst);
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while *updater.operation.lock().unwrap() != UpdateOperation::Idle {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !root.path().join("common/update-journal-v1.json").exists(),
+            "native Cancel left a durable barrier with no public recovery trigger"
+        );
+        assert!(!updater.native_start_blocked().unwrap());
+        assert_eq!(panel.reconciles.load(Ordering::SeqCst), 2);
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(installer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        assert!(!updater.status().unwrap().automatic);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_cancel_retries_are_bounded_and_foreground_can_continue() {
+        let installer = CancelledInstaller::new(false);
+        let (updater, panel, _, tunnel, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        panel.retry_reconcile.store(100, Ordering::SeqCst);
+        discover(&updater, &panel).await;
+        let started = tokio::time::Instant::now();
+        confirm(&updater).await;
+        tokio::time::timeout(Duration::from_secs(32), async {
+            while *updater.operation.lock().unwrap() != UpdateOperation::Idle {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(29));
+        assert!(
+            panel.reconciles.load(Ordering::SeqCst) <= 32,
+            "recovery must respect server retry delay, not spin"
+        );
+        let path = root.path().join("common/update-journal-v1.json");
+        assert!(path.exists());
+        assert!(updater.native_start_blocked().unwrap());
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), 0);
+        panel.retry_reconcile.store(0, Ordering::SeqCst);
+        updater
+            .request_v2(UpdateRequestV2::UiLifecycle {
+                foreground: true,
+                new_user_launch: false,
+                launch_session_id: None,
+            })
+            .await
+            .unwrap();
+        updater
+            .request_v2(UpdateRequestV2::UiLifecycle {
+                foreground: true,
+                new_user_launch: false,
+                launch_session_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while *updater.operation.lock().unwrap() != UpdateOperation::Idle {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!path.exists());
+        assert!(!updater.native_start_blocked().unwrap());
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), 1);
+        assert_eq!(installer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        assert!(!updater.status().unwrap().automatic);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_startup_during_cancel_is_checked_after_recovery() {
+        let installer = CancelledInstaller::new(false);
+        let (base, panel, _, _, server, root) =
+            updater_with_installer(false, Some(installer.clone())).await;
+        let updater = Arc::new(
+            HostUpdater::new_with_policy(
+                root.path(),
+                base.api.clone(),
+                base.broker.clone(),
+                base.barrier.clone(),
+                base.version.clone(),
+                base.backend.clone(),
+                true,
+            )
+            .unwrap(),
+        );
+        updater.set_ui_connection_probe(Arc::new(|| true));
+        updater.ui_lifecycle(true, false, None).unwrap();
+        panel.retry_reconcile.store(1, Ordering::SeqCst);
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *updater.operation.lock().unwrap() != UpdateOperation::Recovering {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        updater
+            .request_v2(UpdateRequestV2::UiLifecycle {
+                foreground: true,
+                new_user_launch: true,
+                launch_session_id: Some(uuid::Uuid::new_v4().to_string()),
+            })
+            .await
+            .unwrap();
+        updater.check(UpdateCheckReason::Startup).unwrap();
+        panel.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while *updater.operation.lock().unwrap() != UpdateOperation::Idle {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!root.path().join("common/update-journal-v1.json").exists());
+        assert_eq!(
+            panel.calls.load(Ordering::SeqCst),
+            2,
+            "a genuine launch check must survive cancellation recovery"
+        );
+        assert_eq!(installer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), 1);
+        assert!(!updater.coordinator.as_ref().unwrap().has_consent());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn cancelled_offer_survives_a_real_resume_failure_and_later_recovery() {
         let installer = CancelledInstaller::new(false);
         let (updater, panel, _, _, server, root) =
@@ -1617,7 +1848,9 @@ mod tests {
             "cancel_requested"
         );
         let old_offer = updater.status_v2().unwrap().offer_id;
-        updater.recover(None).await.unwrap();
+        panel.fail_resume.store(false, Ordering::SeqCst);
+        updater.check(UpdateCheckReason::Foreground).unwrap();
+        wait_for_idle(&updater).await;
         let new_access = updater.broker.observe().await.unwrap().access.unwrap();
         assert_ne!(
             old_access.identity().session_generation,

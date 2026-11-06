@@ -3551,6 +3551,29 @@ pub async fn app_start(
                         }
                         Some(bootstrap)
                     };
+                    if let Some(bootstrap) = &current_bootstrap {
+                        // Resume after a cancelled installer rotates the panel session.
+                        // Provision its background authority before either Start route can
+                        // allocate a lease; an existing durable operation keeps its scope.
+                        ANDROID_UI_START_STOP_COORDINATOR
+                            .run_start_side_effect(
+                                android_start_ticket,
+                                provision_android_background_serialized(
+                                    &service_app,
+                                    &rust_application,
+                                    bootstrap,
+                                ),
+                            )
+                            .await
+                            .map_err(|error| {
+                                record_start_preflight_failure(
+                                    &start_diagnostics,
+                                    "background_provision",
+                                    &error,
+                                );
+                                error
+                            })?;
+                    }
                     let recovery_capability = current_bootstrap
                         .as_ref()
                         .and_then(|bootstrap| bootstrap.capabilities.as_ref());
