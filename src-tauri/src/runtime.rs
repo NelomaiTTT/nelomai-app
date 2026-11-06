@@ -477,7 +477,15 @@ fn setup_desktop(
         port.clone(),
         &bootstrap.target,
     )));
-    app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
+    // Read only after the private native bootstrap has authenticated this owner.
+    let update_protocol = if std::env::var("NELOMAI_UPDATE_PROTOCOL").as_deref() == Ok("2") {
+        2
+    } else {
+        1
+    };
+    app.manage(Arc::new(
+        updates::NativeUpdater::new(port.clone()).with_update_protocol(update_protocol),
+    ));
     app.manage(application.clone());
     app.manage(tunnel.clone());
     app.manage(diagnostics.clone());

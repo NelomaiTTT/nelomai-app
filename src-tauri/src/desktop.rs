@@ -41,6 +41,9 @@ struct TrayMenuState {
     toggle: MenuItem<tauri::Wry>,
     traffic: MenuItem<tauri::Wry>,
     last_presentation: Mutex<Option<TrayPresentation>>,
+    last_icon: Mutex<Option<crate::tray_update::IconState>>,
+    #[cfg(windows)]
+    theme: Mutex<crate::tray_update::ThemeWatcher>,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,15 +69,12 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
         toggle: toggle.clone(),
         traffic: traffic.clone(),
         last_presentation: Mutex::new(None),
+        last_icon: Mutex::new(None),
+        #[cfg(windows)]
+        theme: Mutex::new(crate::tray_update::ThemeWatcher::new()),
     });
     app.manage(menu_state);
 
-    #[cfg(windows)]
-    let icon = app
-        .default_window_icon()
-        .map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()))
-        .unwrap_or_else(tray_icon);
-    #[cfg(not(windows))]
     let icon = tray_icon();
 
     TrayIconBuilder::with_id(TRAY_ID)
@@ -107,7 +107,11 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
 }
 
 fn tray_icon() -> Image<'static> {
-    Image::new(include_bytes!("../icons/tray-icon.rgba"), 64, 64)
+    crate::tray_update::IconState {
+        dark: false,
+        update: false,
+    }
+    .image()
 }
 
 fn start_tray_refresh(app: AppHandle) {
@@ -131,6 +135,23 @@ fn tray_disconnect_action(
 }
 
 pub(crate) async fn runtime_presentation(app: &AppHandle) -> crate::runtime::TraySnapshot {
+    // Report native visibility through the admitted V2 channel. An unavailable
+    // window query suppresses banners; it must not be interpreted as hidden.
+    let visible = app
+        .get_webview_window("main")
+        .and_then(|window| {
+            window
+                .is_visible()
+                .ok()
+                .zip(window.is_minimized().ok())
+                .map(|(visible, minimized)| visible && !minimized)
+        })
+        .unwrap_or(true);
+    let updater = app
+        .state::<Arc<crate::updates::NativeUpdater>>()
+        .inner()
+        .clone();
+    let _ = updater.report_desktop_visibility(visible).await;
     let application = app.state::<Arc<NativeApplication>>().inner().clone();
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>().inner().clone();
     let state = application.state().await;
@@ -189,6 +210,29 @@ async fn refresh_tray(app: &AppHandle) {
     };
 
     let tray = app.state::<Arc<TrayMenuState>>().inner().clone();
+    let update = crate::container::update_presentation(app);
+    #[cfg(windows)]
+    let dark = tray
+        .theme
+        .lock()
+        .map(|mut theme| theme.dark())
+        .unwrap_or(true);
+    #[cfg(not(windows))]
+    let dark = crate::tray_update::system_dark();
+    let icon_state = crate::tray_update::IconState { dark, update };
+    if let Ok(mut last) = tray.last_icon.lock() {
+        if *last != Some(icon_state) {
+            if let Some(icon) = app.tray_by_id(TRAY_ID) {
+                if icon
+                    .set_icon_with_as_template(Some(icon_state.image()), icon_state.template())
+                    .is_ok()
+                {
+                    *last = Some(icon_state);
+                }
+            }
+        }
+    }
+
     let changed = tray
         .last_presentation
         .lock()

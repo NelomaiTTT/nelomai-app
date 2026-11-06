@@ -310,6 +310,10 @@ pub(super) struct ControlClient {
     pub client: Client,
     origin: Origin,
     _relay: relay::Relay,
+    #[cfg(unix)]
+    local_name: std::path::PathBuf,
+    #[cfg(windows)]
+    local_name: String,
 }
 
 impl ControlClient {
@@ -348,11 +352,13 @@ impl ControlClient {
             .configure(builder)
             .build()
             .map_err(|_| io::Error::other("control_client_unavailable"))?;
+        let local_name = listener.local_name();
         let relay = relay::Relay::start(listener, dialer, origin.clone());
         Ok(Self {
             client,
             origin,
             _relay: relay,
+            local_name,
         })
     }
 
@@ -370,6 +376,22 @@ impl ControlClient {
             });
         }
         Ok(self.client.execute(request).await?)
+    }
+}
+
+/// Lifetime guard for the existing user-private physical transport. Allows the
+/// pinned updater HTTP library to use its native Unix/named-pipe connector;
+/// neither a new TCP proxy nor an ordinary-network fallback is introduced.
+#[derive(Clone)]
+pub struct UpdateTransport(Arc<ControlClient>);
+impl UpdateTransport {
+    #[cfg(unix)]
+    pub fn unix_socket(&self) -> std::path::PathBuf {
+        self.0.local_name.clone()
+    }
+    #[cfg(windows)]
+    pub fn windows_named_pipe(&self) -> String {
+        self.0.local_name.clone()
     }
 }
 
@@ -406,6 +428,22 @@ impl Slot {
             backup: RwLock::new(None),
             observer: RwLock::new(None),
         }
+    }
+
+    pub fn update_transport(&self, url: &Url) -> Result<UpdateTransport, super::ClientApiError> {
+        if url.origin() == self.origin.origin() {
+            return self
+                .client_for(&self.current, &self.origin)
+                .map(UpdateTransport);
+        }
+        if let Some(backup) = crate::panel_backup_url(&self.origin) {
+            if url.origin() == backup.origin() {
+                return self.client_for(&self.backup, &backup).map(UpdateTransport);
+            }
+        }
+        Err(super::ClientApiError::InvalidPayload {
+            code: "control_origin_mismatch",
+        })
     }
 
     pub fn reset(&self) {

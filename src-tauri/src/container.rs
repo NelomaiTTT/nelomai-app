@@ -370,6 +370,28 @@ pub(crate) fn tray_snapshot(app: &tauri::AppHandle) -> Option<TraySnapshot> {
     })
 }
 
+pub(crate) fn update_presentation(app: &tauri::AppHandle) -> bool {
+    let Some(state) = app.try_state::<Arc<CommonState>>() else {
+        return false;
+    };
+    if let Some(offer) = state.host.take_update_notification() {
+        use tauri_plugin_notification::NotificationExt;
+        let _ = app
+            .notification()
+            .builder()
+            .title("Доступно обновление Nelomai")
+            .body(format!(
+                "Найдена версия {}. Откройте приложение для установки.",
+                offer.version
+            ))
+            .show();
+    }
+    state
+        .host
+        .updater_status_v2()
+        .map(|s| s.update_available)
+        .unwrap_or(false)
+}
 pub fn run() {
     startup::stage("common.entry");
     if std::env::args().nth(1).as_deref() == Some("--verify-runtime-layout") {
@@ -414,6 +436,7 @@ pub fn run() {
     }));
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let result = startup::setup(|| {
                 use base64::Engine;
@@ -449,12 +472,13 @@ pub fn run() {
                 let fallback = Some(data.join("credentials"));
                 #[cfg(not(target_os = "linux"))]
                 let fallback = None;
-                let updater =
-                    platform::updater::DesktopUpdateBackend::from_build(app.handle().clone())
-                        .ok()
-                        .map(|backend| {
-                            Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>
-                        });
+                let api = nelomai_client_api::ClientApi::new(PANEL_BASE)?;
+                let updater = platform::updater::DesktopUpdateBackend::from_build(
+                    app.handle().clone(),
+                    api.clone(),
+                )
+                .ok()
+                .map(|backend| Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>);
                 startup::stage("common.open_host");
                 let host = Arc::new(CommonHost::open(
                     &data,
@@ -463,7 +487,7 @@ pub fn run() {
                     std::env::consts::OS,
                     std::env::consts::ARCH,
                     || nelomai_client_storage::SystemRecordFactory::new("primary", fallback),
-                    nelomai_client_api::ClientApi::new(PANEL_BASE)?,
+                    api,
                     RuntimeClientProfile {
                         platform: crate::commands::current_platform(),
                         platform_version: None,
@@ -508,6 +532,10 @@ pub fn run() {
                     finishing: AtomicBool::new(false),
                 });
                 app.manage(state.clone());
+                let scheduler = state.host.clone();
+                tauri::async_runtime::spawn(async move {
+                    scheduler.start_update_scheduler();
+                });
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
                 // A tray failure still needs the native pump to process Quit

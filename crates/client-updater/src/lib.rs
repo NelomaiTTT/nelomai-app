@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 mod android;
+mod prepared;
 pub use android::{AndroidApkInstaller, AndroidUpdateBackend};
 use nelomai_client_api::AccessSnapshot;
 use nelomai_contracts::UpdateState;
+pub use prepared::{PreparedCache, PreparedUpdate, ResolvedUpdate};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -211,6 +213,12 @@ pub enum UpdatePhase {
         downloaded: u64,
         total: Option<u64>,
     },
+    ReadyToInstall {
+        version: String,
+    },
+    Installing {
+        version: String,
+    },
     ReadyToRestart {
         version: String,
     },
@@ -259,13 +267,40 @@ impl UpdateBackendError {
 
 #[async_trait]
 pub trait UpdateBackend: Send + Sync {
+    async fn resolve(
+        &self,
+        _access: &AccessSnapshot,
+        _expected_version: &str,
+    ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+        Err(UpdateBackendError::new("update_protocol_unsupported"))
+    }
+    async fn prepare(
+        &self,
+        _access: &AccessSnapshot,
+        _resolved: &ResolvedUpdate,
+        _progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<PreparedUpdate, UpdateBackendError> {
+        Err(UpdateBackendError::new("update_protocol_unsupported"))
+    }
+    async fn install_prepared(
+        &self,
+        _prepared: &PreparedUpdate,
+        _barrier: UpdateBarrierPhase,
+    ) -> Result<InstallResult, UpdateBackendError> {
+        Err(UpdateBackendError::new("update_protocol_unsupported"))
+    }
+    // Source compatibility while Android's adapter is ported. The consent
+    // coordinator never calls this combined download/install operation.
+
     async fn install(
         &self,
-        access_token: &AccessSnapshot,
-        expected_version: &str,
-        barrier: UpdateBarrierPhase,
-        progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
-    ) -> Result<InstallResult, UpdateBackendError>;
+        _access_token: &AccessSnapshot,
+        _expected_version: &str,
+        _barrier: UpdateBarrierPhase,
+        _progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<InstallResult, UpdateBackendError> {
+        Err(UpdateBackendError::new("update_consent_required"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +326,12 @@ impl UpdateBarrierError {
 
 #[async_trait]
 pub trait UpdateInstallBarrier: Send + Sync {
+    /// Owner validates the current authenticated scope after each external await.
+    /// Default is fail-closed for an adapter that has not adopted consent yet.
+    async fn validate_authority(&self, _access: &AccessSnapshot) -> Result<(), UpdateBarrierError> {
+        Err(UpdateBarrierError::new("update_authority_unavailable"))
+    }
+
     async fn prepare(&self, target_version: &str)
         -> Result<UpdateBarrierPhase, UpdateBarrierError>;
     async fn installer_opened(&self) -> Result<(), UpdateBarrierError>;
@@ -305,233 +346,8 @@ pub enum UpdateError {
     Barrier(#[from] UpdateBarrierError),
 }
 
-pub struct UpdateCoordinator<B> {
-    backend: Arc<B>,
-    barrier: Arc<dyn UpdateInstallBarrier>,
-    phase: Arc<Mutex<UpdatePhase>>,
-    offer: Mutex<Option<UpdateOffer>>,
-    cancelled_version: Mutex<Option<String>>,
-    install_gate: AsyncMutex<()>,
-}
-
-impl<B: UpdateBackend> UpdateCoordinator<B> {
-    pub fn new(backend: Arc<B>, barrier: Arc<dyn UpdateInstallBarrier>) -> Self {
-        Self {
-            backend,
-            barrier,
-            phase: Arc::new(Mutex::new(UpdatePhase::Idle)),
-            offer: Mutex::new(None),
-            cancelled_version: Mutex::new(None),
-            install_gate: AsyncMutex::new(()),
-        }
-    }
-
-    pub fn observe(&self, offer: Option<UpdateOffer>) {
-        let mut current_offer = self.offer.lock().expect("update offer lock poisoned");
-        let mut phase = self.phase.lock().expect("update phase lock poisoned");
-        let mut cancelled = self
-            .cancelled_version
-            .lock()
-            .expect("update cancellation lock poisoned");
-        if offer.as_ref().is_some_and(|offer| {
-            cancelled
-                .as_ref()
-                .is_some_and(|version| version != &offer.version)
-        }) {
-            *cancelled = None;
-        }
-        *current_offer = offer.clone();
-        match (&*phase, offer) {
-            (UpdatePhase::ReadyToRestart { version }, Some(offer)) if version == &offer.version => {
-            }
-            (UpdatePhase::AwaitingInstallation { version }, Some(offer))
-                if version == &offer.version => {}
-            (UpdatePhase::Failed { version, .. }, Some(offer))
-                if version == &offer.version && cancelled.as_ref() == Some(version) => {}
-            (UpdatePhase::Downloading { .. }, _) => {}
-            (_, Some(offer)) => *phase = UpdatePhase::Available(offer),
-            (_, None) => *phase = UpdatePhase::Idle,
-        }
-    }
-
-    pub fn phase(&self) -> UpdatePhase {
-        self.phase
-            .lock()
-            .expect("update phase lock poisoned")
-            .clone()
-    }
-
-    pub async fn install_automatically(
-        &self,
-        access_token: &AccessSnapshot,
-        preferences: UpdatePreferences,
-    ) -> Result<UpdatePhase, UpdateError> {
-        if !preferences.automatic {
-            return Ok(self.phase());
-        }
-        let _guard = self.install_gate.lock().await;
-        let phase = self.phase();
-        if matches!(
-            phase,
-            UpdatePhase::ReadyToRestart { .. } | UpdatePhase::AwaitingInstallation { .. }
-        ) {
-            return Ok(phase);
-        }
-        {
-            let offer = self.offer.lock().expect("update offer lock poisoned");
-            let cancelled = self
-                .cancelled_version
-                .lock()
-                .expect("update cancellation lock poisoned");
-            if offer
-                .as_ref()
-                .is_some_and(|offer| cancelled.as_ref() == Some(&offer.version))
-            {
-                return Ok(phase);
-            }
-        }
-        self.install_locked(access_token).await
-    }
-
-    pub async fn install_now(
-        &self,
-        access_token: &AccessSnapshot,
-    ) -> Result<UpdatePhase, UpdateError> {
-        let _guard = self.install_gate.lock().await;
-        if matches!(self.phase(), UpdatePhase::ReadyToRestart { .. }) {
-            return Ok(self.phase());
-        }
-        self.install_locked(access_token).await
-    }
-
-    async fn install_locked(
-        &self,
-        access_token: &AccessSnapshot,
-    ) -> Result<UpdatePhase, UpdateError> {
-        let Some(offer) = self
-            .offer
-            .lock()
-            .expect("update offer lock poisoned")
-            .clone()
-        else {
-            return Ok(UpdatePhase::Idle);
-        };
-
-        let stopped = match self.barrier.prepare(&offer.version).await {
-            Ok(stopped @ UpdateBarrierPhase::LocalStopped) => stopped,
-            Err(error) => {
-                *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
-                    version: offer.version,
-                    code: error.code().to_string(),
-                };
-                return Err(error.into());
-            }
-        };
-
-        *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Downloading {
-            version: offer.version.clone(),
-            downloaded: 0,
-            total: None,
-        };
-        let phase = self.phase.clone();
-        let progress_version = offer.version.clone();
-        let progress = Arc::new(move |progress: DownloadProgress| {
-            *phase.lock().expect("update phase lock poisoned") = UpdatePhase::Downloading {
-                version: progress_version.clone(),
-                downloaded: progress.downloaded,
-                total: progress.total,
-            };
-        });
-
-        match self
-            .backend
-            .install(access_token, &offer.version, stopped, progress)
-            .await
-        {
-            Ok(InstallResult::NoUpdate) => {
-                if let Err(error) = self.barrier.installer_failed().await {
-                    self.set_barrier_failure(&offer.version, &error);
-                    return Err(error.into());
-                }
-                *self.offer.lock().expect("update offer lock poisoned") = None;
-                *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Idle;
-                Ok(UpdatePhase::Idle)
-            }
-            Ok(InstallResult::Installed(installed)) => {
-                if installed.version != offer.version {
-                    let error = UpdateBackendError::new("installed_update_version_mismatch");
-                    if let Err(barrier_error) = self.barrier.installer_failed().await {
-                        self.set_barrier_failure(&offer.version, &barrier_error);
-                        return Err(barrier_error.into());
-                    }
-                    *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
-                        version: offer.version,
-                        code: error.code().to_string(),
-                    };
-                    return Err(error.into());
-                }
-                if let Err(error) = self.barrier.installer_opened().await {
-                    self.set_barrier_failure(&offer.version, &error);
-                    return Err(error.into());
-                }
-                let phase = UpdatePhase::ReadyToRestart {
-                    version: installed.version,
-                };
-                *self.phase.lock().expect("update phase lock poisoned") = phase.clone();
-                Ok(phase)
-            }
-            Ok(InstallResult::InstallerOpened(installed)) => {
-                if installed.version != offer.version {
-                    let error = UpdateBackendError::new("installed_update_version_mismatch");
-                    if let Err(barrier_error) = self.barrier.installer_failed().await {
-                        self.set_barrier_failure(&offer.version, &barrier_error);
-                        return Err(barrier_error.into());
-                    }
-                    *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
-                        version: offer.version,
-                        code: error.code().to_string(),
-                    };
-                    return Err(error.into());
-                }
-                if let Err(error) = self.barrier.installer_opened().await {
-                    self.set_barrier_failure(&offer.version, &error);
-                    return Err(error.into());
-                }
-                let phase = UpdatePhase::AwaitingInstallation {
-                    version: installed.version,
-                };
-                *self.phase.lock().expect("update phase lock poisoned") = phase.clone();
-                Ok(phase)
-            }
-            Err(error) => {
-                if error.code() == "apk_install_cancelled" {
-                    // Keep the user's decision even if journal recovery fails.
-                    *self
-                        .cancelled_version
-                        .lock()
-                        .expect("update cancellation lock poisoned") = Some(offer.version.clone());
-                }
-                if let Err(barrier_error) = self.barrier.installer_failed().await {
-                    self.set_barrier_failure(&offer.version, &barrier_error);
-                    return Err(barrier_error.into());
-                }
-                let phase = UpdatePhase::Failed {
-                    version: offer.version,
-                    code: error.code().to_string(),
-                };
-                *self.phase.lock().expect("update phase lock poisoned") = phase;
-                Err(error.into())
-            }
-        }
-    }
-
-    fn set_barrier_failure(&self, version: &str, error: &UpdateBarrierError) {
-        *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
-            version: version.to_owned(),
-            code: error.code().to_string(),
-        };
-    }
-}
+mod coordinator;
+pub use coordinator::UpdateCoordinator;
 
 fn automatic_by_default() -> bool {
     true

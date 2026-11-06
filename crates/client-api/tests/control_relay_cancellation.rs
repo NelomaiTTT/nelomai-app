@@ -20,7 +20,7 @@ mod control_transport {
     mod local_close;
     mod relay {
         pub(super) async fn connect_test_client(listener: &Listener) -> tokio::net::UnixStream {
-            tokio::net::UnixStream::connect(&listener.path)
+            tokio::net::UnixStream::connect(listener.local_name())
                 .await
                 .unwrap()
         }

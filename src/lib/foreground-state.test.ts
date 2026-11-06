@@ -16,7 +16,7 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -94,7 +94,7 @@ function logoutFixture() {
   Object.assign(result.context, {
     startupRetry: { cancel: () => {}, schedule: () => {}, checkpoint: () => () => true }, startupPending: false,
     peers: [{ id: 1 }], selectedPeerId: "1", password: "test-password",
-    diagnosticsStatus: null, updateStatus: null, notifications: [],
+    diagnosticsStatus: null, updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0, notifications: [],
     notificationUnreadCount: 0, notificationNextCursor: null,
     notificationHistoryExpanded: false, notificationsOpen: false, changelogOpen: false,
     clearUpdateTimer: () => {},
@@ -754,7 +754,7 @@ describe("binding changed outside the open UI", () => {
     Object.assign(context, {
       startupRetry: { cancel: () => {}, checkpoint: () => () => true }, startupPending: false,
       selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
       refreshProbes: async () => {},
     });
     const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
@@ -778,7 +778,7 @@ describe("binding changed outside the open UI", () => {
     Object.assign(context, {
       startupRetry: { cancel: () => {}, checkpoint: () => () => true }, startupPending: false,
       selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
       refreshProbes: async () => {},
     });
     const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
@@ -934,7 +934,7 @@ describe("binding preferences across native Start", () => {
     const second = bindingFixture();
     let nativePhase = phase;
     Object.assign(second.c, { startupPending: false,
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: () => {}, refreshNotifications: () => {},
       refreshRuntimeStatus: async () => {}, refreshProbes: async () => {},
     });
     second.c.nativeClient.state = async () => ({ phase: nativePhase, connection: null,

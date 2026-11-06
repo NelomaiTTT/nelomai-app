@@ -136,6 +136,9 @@ pub(super) fn bind() -> io::Result<Listener> {
 }
 
 impl Listener {
+    pub fn local_name(&self) -> String {
+        self.name.clone()
+    }
     pub fn configure(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder.windows_named_pipe(self.name.as_str())
     }

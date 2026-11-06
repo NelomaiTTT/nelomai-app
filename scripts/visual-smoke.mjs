@@ -1,3 +1,7 @@
+import {tmpdir} from "node:os";
+import {mkdir} from "node:fs/promises";
+const outputDir=process.env.VISUAL_OUTPUT ?? tmpdir();
+await mkdir(outputDir,{recursive:true});
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { chromium } from "playwright-core";
@@ -111,6 +115,25 @@ try {
     executablePath,
     headless: true,
   });
+  if(process.env.UPDATE_REQUIRED_SMOKE){
+    for(const phase of ["ready", "downloading"]){
+      await capture(`update-required-${phase}-desktop`,{width:1280,height:800},`update-required-${phase}`);
+      await capture(`update-required-${phase}-mobile`,{width:390,height:844},`update-required-${phase}`);
+    }
+  } else if(process.env.UPDATE_MANUAL_RESULT_SMOKE){
+    for(const outcome of ["available", "error", "logout"]){
+      await capture(`update-manual-result-${outcome}-desktop`,{width:1280,height:800},`update-manual-result-${outcome}`);
+      await capture(`update-manual-result-${outcome}-mobile`,{width:390,height:844},`update-manual-result-${outcome}`);
+    }
+  } else if(process.env.UPDATE_STALE_SMOKE){
+    for(const action of ["later-status", "later-check", "later-error", "confirm-status", "later-check-manual", "later-check-manual-error"]){
+      await capture(`update-stale-${action}-desktop`,{width:1280,height:800},`update-stale-${action}`);
+      await capture(`update-stale-${action}-mobile`,{width:390,height:844},`update-stale-${action}`);
+    }
+  } else if(process.env.UPDATE_SMOKE){
+    await capture("update-consent-desktop",{width:1280,height:800},"update-consent");
+    await capture("update-consent-mobile",{width:390,height:844},"update-consent");
+  } else {
   for (const scenario of ["runtime-pending-auto", "runtime-pending-manual", "runtime-pending-logout-failed", "runtime-pending-logout"]) {
     await capture(scenario, { width: 1280, height: 800 }, scenario);
   }
@@ -125,6 +148,7 @@ try {
   await capture("personal-tic-mobile", { width: 390, height: 844 }, "personal-tic");
   await capture("pinned-stray-mobile", { width: 390, height: 844 }, "pinned-stray");
   await capture("connection-desktop", { width: 1280, height: 800 }, "connection");
+  }
 } finally {
   try {
     await browser?.close();
@@ -144,11 +168,58 @@ async function capture(name, viewport, scenario) {
   page.setDefaultTimeout(30000);
   await page.addInitScript(
     ({ fixture, peerFixture, currentScenario, desktop }) => {
+      fixture.device.platform = desktop ? "macos" : "android";
       let connection = null;
+      let update={supported:true,automatic:true,protocol:2,phase:"downloading",version:"0.4.1",notes:null,required:false,downloaded:1024,total:2048,errorCode:null,offerId:"fixture-offer",promptPending:true,updateAvailable:true};
+      if(currentScenario.startsWith("update-manual-result-"))update={...update,phase:"idle",version:null,offerId:null,promptPending:false,updateAvailable:false};
+      if(currentScenario.startsWith("update-required-")){
+        fixture.update.required=true;
+        fixture.update.update_available=true;
+        update={...update,required:true,phase:currentScenario.endsWith("ready")?"ready_to_install":"downloading"};
+      }
       window.__TAURI_CALLS__ = [];
+      window.__SET_UPDATE_PHASE__ = (phase) => { update = {...update, phase}; };
+      window.__UPDATE_CHECKING_READS__ = 0;
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
+          if(currentScenario.startsWith("update-manual-result-") && command.startsWith("app_update_")){
+            if(command==="app_update_status" && !window.__HELD_UPDATE_REPLY__){
+              window.__HELD_UPDATE_REPLY__=true;
+              const snapshot={...update};
+              await new Promise(resolve=>window.__RELEASE_UPDATE_REPLY__=resolve);
+              window.__OLD_UPDATE_REPLY_RETURNED__=true;
+              return snapshot;
+            }
+            if(command==="app_update_check" && args.reason==="manual"){
+              await new Promise(resolve=>window.__RELEASE_MANUAL_ACK__=resolve);
+              update={...update,phase:"checking",errorCode:"update_refresh_pending"};
+              window.__FINISH_MANUAL_CHECK__=()=>{
+                update=currentScenario.endsWith("error") ? {...update,phase:"idle",errorCode:"update_refresh_service"}
+                  : {...update,phase:"available",errorCode:null,version:"0.4.2",offerId:"offer-042",promptPending:true,updateAvailable:true};
+              };
+            }
+            if(command==="app_update_status" && update.phase==="checking")window.__UPDATE_CHECKING_READS__++;
+            if(command==="app_update_presented"||command==="app_update_defer")update={...update,promptPending:false};
+            return update;
+          }
+          if((currentScenario==="update-consent"||currentScenario.startsWith("update-stale-")||currentScenario.startsWith("update-required-"))&&command.startsWith("app_update_")){
+            const heldCommand=currentScenario.startsWith("update-stale-later-check") ? "app_update_check" : "app_update_status";
+            if(currentScenario.startsWith("update-stale-") && command===heldCommand && !window.__HELD_UPDATE_REPLY__){
+              window.__HELD_UPDATE_REPLY__=true;
+              const snapshot={...update};
+              await new Promise(resolve=>window.__RELEASE_UPDATE_REPLY__=resolve);
+              window.__OLD_UPDATE_REPLY_RETURNED__=true;
+              if(currentScenario==="update-stale-later-error")throw Error("delayed old status failure");
+              return snapshot;
+            }
+            if(currentScenario==="update-stale-later-check-manual-error" && command==="app_update_check" && args.reason==="manual")throw Error("manual check failed");
+            if(command==="app_update_status" && update.phase==="checking")window.__UPDATE_CHECKING_READS__++;
+            if(command==="app_update_presented"||command==="app_update_defer")update={...update,promptPending:false};
+            if(command==="app_update_confirm"){if(args.offerId!==update.offerId)throw Error("stale offer");update={...update,phase:"installing",promptPending:false};}
+            if(command==="app_update_check"&&args.reason==="manual")update={...update,promptPending:true};
+            return update;
+          }
           if (command === "app_bootstrap") {
             if (currentScenario.startsWith("runtime-pending") &&
                 window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === 1) {
@@ -296,7 +367,7 @@ async function capture(name, viewport, scenario) {
           }
           if (
             command === "app_update_status" ||
-            command === "app_update_refresh"
+            command === "app_update_check"
           ) {
             return {
               supported: true,
@@ -324,6 +395,136 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if(scenario.startsWith("update-required-")){
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});
+    const primary=page.locator(".message-panel").getByRole("button",{name:"Обновить",exact:true});
+    await page.getByRole("heading",{name:"Нужно обновить Nelomai",exact:true}).waitFor();
+    await dialog.waitFor({state:"visible"});
+    await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+    await dialog.waitFor({state:"hidden"});
+    // Reopening is presentation, never consent. Repeated Later must still work.
+    for(let attempt=0;attempt<2;attempt++){
+      await primary.click({timeout:3000});
+      await dialog.waitFor({state:"visible",timeout:3000});
+      const premature=await page.evaluate(()=>window.__TAURI_CALLS__.some(c=>["app_update_confirm","app_update_install"].includes(c.command)));
+      if(premature)throw Error(`${name}: primary action installed without Yes`);
+      if(attempt===0){
+        await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+        await dialog.waitFor({state:"hidden"});
+      }
+    }
+    await dialog.getByRole("button",{name:"Да",exact:true}).click();
+    await dialog.waitFor({state:"hidden"});
+    await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).waitFor();
+    if(await primary.isVisible())throw Error(`${name}: primary offers consent while installing`);
+    const calls=await page.evaluate(()=>window.__TAURI_CALLS__);
+    const confirms=calls.filter(c=>c.command==="app_update_confirm");
+    if(confirms.length!==1||confirms[0].args.offerId!=="fixture-offer"||calls.some(c=>c.command==="app_update_install"))throw Error(`${name}: incorrect pinned consent dispatch`);
+    console.log(`${name}: PASS`);
+    await context.close();return;
+  }
+  if(scenario.startsWith("update-manual-result-")){
+    await page.waitForFunction(()=>!!window.__RELEASE_UPDATE_REPLY__);
+    await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();
+    await page.waitForFunction(()=>!!window.__RELEASE_MANUAL_ACK__);
+    if(scenario.endsWith("logout")){
+      await page.getByRole("button",{name:"Выйти",exact:true}).click();
+      await page.getByRole("heading",{name:"Вход в Nelomai"}).waitFor();
+      const reads=await page.evaluate(()=>window.__TAURI_CALLS__.filter(c=>c.command==="app_update_status").length);
+      await page.evaluate(()=>{window.__RELEASE_UPDATE_REPLY__();window.__RELEASE_MANUAL_ACK__();});
+      await page.waitForTimeout(1200);
+      const after=await page.evaluate(()=>window.__TAURI_CALLS__.filter(c=>c.command==="app_update_status").length);
+      if(after!==reads)throw Error(`${name}: old ACK restarted polling after Logout`);
+      if(!await page.getByRole("heading",{name:"Вход в Nelomai"}).isVisible())throw Error(`${name}: old ACK replaced Logout`);
+      console.log(`${name}: PASS`);
+      await context.close();return;
+    }
+    await page.evaluate(()=>window.__RELEASE_UPDATE_REPLY__());
+    await page.waitForFunction(()=>window.__OLD_UPDATE_REPLY_RETURNED__);
+    // Allow Svelte to render the old snapshot before acknowledging Manual.
+    await page.waitForTimeout(100);
+    if(!await page.getByText("Проверяем…",{exact:true}).isVisible())throw Error(`${name}: pre-click poll finished Manual`);
+    await page.evaluate(()=>window.__RELEASE_MANUAL_ACK__());
+    await page.waitForFunction(()=>window.__UPDATE_CHECKING_READS__>0);
+    await page.evaluate(()=>window.__FINISH_MANUAL_CHECK__());
+    const expected=scenario.endsWith("error") ? "Не удалось проверить обновление. Повторите позже." : "Найдена версия 0.4.2";
+    await page.getByText(expected,{exact:true}).waitFor();
+    if(await page.getByText("У вас актуальная версия.",{exact:true}).isVisible())throw Error(`${name}: false up-to-date result`);
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});
+    if(scenario.endsWith("error")){
+      if(await dialog.isVisible())throw Error(`${name}: failed check opened prompt`);
+    }else{
+      await dialog.waitFor({state:"visible"});
+      await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+      await dialog.waitFor({state:"hidden"});
+    }
+    console.log(`${name}: PASS`);
+    await context.close();return;
+  }
+  if(scenario.startsWith("update-stale-")){
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});
+    await dialog.waitFor({state:"visible"});
+    await page.waitForFunction(()=>!!window.__RELEASE_UPDATE_REPLY__);
+    const confirm=scenario==="update-stale-confirm-status";
+    await dialog.getByRole("button",{name:confirm?"Да":"Нет, позже",exact:true}).click();
+    await dialog.waitFor({state:"hidden"});
+    if(confirm)await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).waitFor();
+    if(scenario.includes("-manual")){
+      await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();
+      await page.waitForFunction(()=>window.__TAURI_CALLS__.some(c=>c.command==="app_update_check"&&c.args.reason==="manual"),{},{timeout:3000});
+      if(scenario.endsWith("-error")){
+        await page.getByText("Не удалось проверить обновление. Повторите позже.",{exact:true}).waitFor();
+        if(await dialog.isVisible())throw Error("failed Manual reopened a prompt");
+      }else{
+        await dialog.waitFor({state:"visible"});
+        await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+        await dialog.waitFor({state:"hidden"});
+      }
+    }
+    await page.evaluate(()=>window.__RELEASE_UPDATE_REPLY__());
+    await page.waitForFunction(()=>window.__OLD_UPDATE_REPLY_RETURNED__);
+    await page.waitForTimeout(100);
+    if(await dialog.isVisible())throw Error(`${name}: stale reply reopened a completed decision`);
+    if(confirm){
+      if(!await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).isVisible())throw Error(`${name}: stale reply replaced installation status`);
+    } else if(!scenario.includes("-manual")) {
+      if(!await page.getByRole("button",{name:"Обновить",exact:true}).isVisible())throw Error(`${name}: stale error erased the newer status`);
+      await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();
+      await dialog.waitFor({state:"visible"});
+      await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+      await dialog.waitFor({state:"hidden"});
+    }
+    console.log(`${name}: PASS`);
+    await context.close();return;
+  }
+  if(scenario==="update-consent"){
+    if (viewport.width < 600) {
+      await page.getByText("Проверять при открытии приложения. Установка — с вашего согласия.", {exact:true}).waitFor();
+      if (await page.getByText("Проверять каждые 30 минут. Установка — с вашего согласия.", {exact:true}).count()) throw Error("Android UI advertises a desktop timer");
+    }
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});await dialog.waitFor({state:"visible"});
+    await page.screenshot({path:`${outputDir}/nelomai-${name}.png`,fullPage:true});
+    await page.evaluate(()=>window.__SET_UPDATE_PHASE__("checking"));
+    await page.waitForFunction(()=>window.__UPDATE_CHECKING_READS__>0);
+    await page.waitForTimeout(50);
+    if(!await dialog.isVisible())throw Error("unanswered prompt disappeared during same-offer checking");
+    if(!await dialog.getByRole("button",{name:"Да",exact:true}).isDisabled())throw Error("confirmation allowed during checking");
+    if((await page.evaluate(()=>window.__TAURI_CALLS__)).some(c=>c.command==="app_update_confirm"))throw Error("checking submitted consent");
+    await page.evaluate(()=>window.__SET_UPDATE_PHASE__("ready_to_install"));
+    await page.waitForFunction(()=>{const d=document.querySelector('dialog[open]');return d&&Array.from(d.querySelectorAll('button')).some(b=>b.textContent==='Да'&&!b.disabled)});
+    await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();await dialog.waitFor({state:"hidden"});
+    await page.evaluate(()=>document.dispatchEvent(new Event("visibilitychange")));await page.waitForTimeout(1100);
+    if(await dialog.isVisible())throw Error("deferred offer repeated on visibility/status polling");
+    await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();await dialog.waitFor({state:"visible"});
+    await dialog.getByRole("button",{name:"Да",exact:true}).click();await dialog.waitFor({state:"hidden"});
+    await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).waitFor();
+    const calls=await page.evaluate(()=>window.__TAURI_CALLS__);
+    if(calls.filter(c=>c.command==="app_update_confirm").length!==1||calls.some(c=>c.command==="app_update_install"))throw Error("install path bypasses pinned confirmation");
+    if(!calls.some(c=>c.command==="app_update_check"&&c.args.reason==="startup"))throw Error("missing authenticated startup retry");
+    if(calls.filter(c=>c.command==="app_update_check"&&c.args.reason==="manual").length!==1)throw Error("visibility made a network check");
+    const size=await page.evaluate(()=>({scroll:document.documentElement.scrollWidth,width:innerWidth}));if(size.scroll>size.width)throw Error("update dialog overflow");
+    await context.close();return;
+  }
   if (scenario.startsWith("runtime-pending")) {
     await page.getByRole("heading", { name: "Завершаем подготовку приложения" }).waitFor();
     if (scenario.includes("logout")) {
@@ -345,7 +546,7 @@ async function capture(name, viewport, scenario) {
     if (calls !== (scenario === "runtime-pending-logout" ? 1 : 2)) {
       throw new Error(`${scenario} lost or duplicated bootstrap: ${calls}`);
     }
-    await page.screenshot({ path: `/tmp/nelomai-${name}.png`, fullPage: true });
+    await page.screenshot({ path: `${outputDir}/nelomai-${name}.png`, fullPage: true });
     await context.close();
     return;
   }
@@ -364,7 +565,7 @@ async function capture(name, viewport, scenario) {
     await page.waitForFunction(
       () =>
         (window.__TAURI_CALLS__ ?? []).some(
-          (call) => call.command === "app_update_refresh",
+          (call) => call.command === "app_update_check",
         ),
       undefined,
       { timeout: 5_000 },
@@ -441,7 +642,7 @@ async function capture(name, viewport, scenario) {
   }
 
   await page.screenshot({
-    path: `/tmp/nelomai-${name}.png`,
+    path: `${outputDir}/nelomai-${name}.png`,
     fullPage: true,
   });
   await context.close();

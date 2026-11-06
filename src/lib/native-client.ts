@@ -204,8 +204,14 @@ export function createNativeClient(
       invoke("app_update_refresh") as Promise<UpdateStatus>,
     setAutomaticUpdates: (enabled: boolean) =>
       invoke("app_update_set_automatic", { enabled }) as Promise<UpdateStatus>,
-    installUpdate: () =>
-      invoke("app_update_install") as Promise<UpdateStatus>,
+    checkUpdate: (reason: "startup" | "manual") =>
+      invoke("app_update_check", { reason }) as Promise<UpdateStatus>,
+    confirmUpdate: (offerId: string) =>
+      invoke("app_update_confirm", { offerId }) as Promise<UpdateStatus>,
+    deferUpdate: (offerId: string) =>
+      invoke("app_update_defer", { offerId }) as Promise<UpdateStatus>,
+    presentedUpdate: (offerId: string) =>
+      invoke("app_update_presented", { offerId }) as Promise<UpdateStatus>,
     restartForUpdate: () =>
       invoke("app_update_restart") as Promise<void>,
     runtimeStatus: () => invoke("runtime_status") as Promise<RuntimeStatus>,

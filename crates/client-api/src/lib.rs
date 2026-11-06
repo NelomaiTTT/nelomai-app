@@ -34,6 +34,8 @@ use uuid::Uuid;
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod control_transport;
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+pub use control_transport::UpdateTransport;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseHistoryEntry {
@@ -559,6 +561,31 @@ impl fmt::Debug for RecoverableRefreshRequest {
     }
 }
 impl ClientApi {
+    /// Only native updater requests can borrow the physical connector. URLs are
+    /// constrained to the configured panel's update routes and exact origins.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub fn update_transport(
+        &self,
+        url: &Url,
+    ) -> Result<control_transport::UpdateTransport, ClientApiError> {
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !(url.path().starts_with("/api/client/v1/updates/manifest/")
+                || url.path().starts_with("/api/client/v1/updates/artifacts/"))
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_update_endpoint",
+            });
+        }
+        self.http
+            .control
+            .as_ref()
+            .ok_or(ClientApiError::ControlTransportUnavailable)?
+            .update_transport(url)
+    }
+
     /// Best-effort desktop dial failure diagnostics: allowlisted codes and
     /// elapsed time only, with no request data or authentication material.
     /// Runs outside async workers; events may be dropped if log jobs saturate.

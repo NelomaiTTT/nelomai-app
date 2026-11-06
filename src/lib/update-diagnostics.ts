@@ -5,7 +5,7 @@ export function updateStatusNeedsPolling(status: UpdateStatus): boolean {
   return (
     status.errorCode === "update_refresh_pending" ||
     status.errorCode === "update_install_preparing" ||
-    status.phase === "downloading" ||
+    status.phase === "downloading" || status.phase === "installing" || status.phase === "checking" ||
     (status.supported && status.automatic && status.phase === "available")
   );
 }
@@ -38,6 +38,9 @@ export function updateDiagnosticStage(
       return "update_awaiting_installation";
     case "failed":
       return "update_failed";
+    case "checking":
+    case "ready_to_install":
+    case "installing":
     case "idle":
       return null;
   }

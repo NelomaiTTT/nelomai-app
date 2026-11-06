@@ -312,6 +312,7 @@ mod unix {
             command
                 .arg("--private-runtime-v1")
                 .env_clear()
+                .env("NELOMAI_UPDATE_PROTOCOL", "2")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());

@@ -2,7 +2,7 @@ use super::{Dialer, Origin};
 use std::{future::Future, io, pin::Pin, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{oneshot, Semaphore},
+    sync::{oneshot, watch, Semaphore},
 };
 
 pub(super) type Observer = Arc<dyn Fn(&'static str, u64) + Send + Sync>;
@@ -58,6 +58,9 @@ impl Listener {
     pub fn configure(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         self.0.configure(builder)
     }
+    pub fn local_name(&self) -> String {
+        self.0.local_name()
+    }
     async fn accept(&mut self) -> io::Result<Local> {
         Ok(Local {
             io: self.0.accept().await?,
@@ -106,6 +109,9 @@ impl Listener {
 
     pub fn configure(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder.unix_socket(self.path.clone())
+    }
+    pub fn local_name(&self) -> std::path::PathBuf {
+        self.path.clone()
     }
 
     async fn accept(&mut self) -> io::Result<Local> {
@@ -271,13 +277,40 @@ async fn connect_with_preface(
     }
 }
 
+const IO_TIMEOUT: Duration = Duration::from_secs(120);
+
 async fn bridge(local: Local, remote: tokio::net::TcpStream) -> io::Result<()> {
+    let (activity, mut changes) = watch::channel(tokio::time::Instant::now());
+    let idle = async {
+        loop {
+            let deadline = *changes.borrow_and_update() + IO_TIMEOUT;
+            if !matches!(
+                tokio::time::timeout_at(deadline, changes.changed()).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+    };
+    // A GET's request half is normally idle while its response streams. Bound
+    // inactivity of the connection, not the time since either half last sent.
+    tokio::select! {
+        result = forward(local, remote, &activity) => result,
+        _ = idle => Err(io::ErrorKind::TimedOut.into()),
+    }
+}
+
+async fn forward(
+    local: Local,
+    remote: tokio::net::TcpStream,
+    activity: &watch::Sender<tokio::time::Instant>,
+) -> io::Result<()> {
     let Local { io, mut closed } = local;
     let (mut local_read, mut local_write) = tokio::io::split(io);
     let (mut remote_read, mut remote_write) = remote.into_split();
     let upload_finished = {
-        let upload = pump(&mut local_read, &mut remote_write);
-        let download = pump(&mut remote_read, &mut local_write);
+        let upload = pump(&mut local_read, &mut remote_write, activity);
+        let download = pump(&mut remote_read, &mut local_write, activity);
         tokio::pin!(upload, download);
         tokio::select! {
             result = &mut upload => {
@@ -305,7 +338,7 @@ async fn bridge(local: Local, remote: tokio::net::TcpStream) -> io::Result<()> {
     drop(closed);
     if !upload_finished {
         let _ = remote_write.shutdown().await;
-        pump(&mut local_read, tokio::io::sink()).await?;
+        pump(&mut local_read, tokio::io::sink(), activity).await?;
     }
     Ok(())
 }
@@ -313,24 +346,166 @@ async fn bridge(local: Local, remote: tokio::net::TcpStream) -> io::Result<()> {
 async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut read: R,
     mut write: W,
+    activity: &watch::Sender<tokio::time::Instant>,
 ) -> io::Result<()> {
     let mut buffer = [0; 8192];
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(120), read.read(&mut buffer))
-            .await
-            .map_err(|_| io::ErrorKind::TimedOut)??;
+        let n = read.read(&mut buffer).await?;
         if n == 0 {
             return write.shutdown().await;
         }
-        tokio::time::timeout(Duration::from_secs(120), write.write_all(&buffer[..n]))
+        // Preserve the independent bound on a blocked writer even when the
+        // reverse direction still makes progress. Buffers remain fixed-size.
+        tokio::time::timeout(IO_TIMEOUT, write.write_all(&buffer[..n]))
             .await
             .map_err(|_| io::ErrorKind::TimedOut)??;
+        activity.send_replace(tokio::time::Instant::now());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Network IO is real; keep virtual time from auto-advancing while the OS
+    // delivers bytes. Only explicit advance() calls move the inactivity clock.
+    async fn paused_io<T>(work: impl Future<Output = T>) -> T {
+        let started = std::time::Instant::now();
+        tokio::select! {
+            result = work => result,
+            _ = async {
+                loop {
+                    assert!(started.elapsed() < Duration::from_secs(5), "fixture IO stalled");
+                    tokio::task::yield_now().await;
+                }
+            } => unreachable!(),
+        }
+    }
+
+    async fn bridge_fixture(
+        capacity: usize,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::net::TcpStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let (client, socket) = tokio::io::duplex(capacity);
+        let local = Local {
+            io: Box::new(socket),
+            closed: Box::pin(std::future::pending()),
+        };
+        (client, peer, tokio::spawn(bridge(local, remote)))
+    }
+
+    async fn progressing_half_keeps_bridge_alive(upload: bool) {
+        let (mut client, mut peer, forwarding) = bridge_fixture(128).await;
+        tokio::time::pause();
+        paused_io(async {
+            client.write_all(b"request").await.unwrap();
+            let mut request = [0; 7];
+            peer.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+        })
+        .await;
+        for byte in [11, 22, 33] {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            let mut received = [0];
+            paused_io(async {
+                if upload {
+                    client.write_all(&[byte]).await.unwrap();
+                    peer.read_exact(&mut received).await.unwrap();
+                } else {
+                    peer.write_all(&[byte]).await.unwrap();
+                    client.read_exact(&mut received).await.unwrap();
+                }
+            })
+            .await;
+            assert_eq!(received, [byte]);
+            assert!(
+                !forwarding.is_finished(),
+                "idle half closed a progressing transfer"
+            );
+        }
+        forwarding.abort();
+        let _ = forwarding.await;
+    }
+
+    #[tokio::test]
+    async fn response_progress_survives_an_idle_request_half() {
+        progressing_half_keeps_bridge_alive(false).await;
+    }
+
+    #[tokio::test]
+    async fn request_progress_survives_an_idle_response_half() {
+        progressing_half_keeps_bridge_alive(true).await;
+    }
+
+    #[tokio::test]
+    async fn idle_bridge_expires_since_the_last_forwarded_bytes() {
+        let (mut client, mut peer, forwarding) = bridge_fixture(128).await;
+        tokio::time::pause();
+        paused_io(async {
+            client.write_all(b"q").await.unwrap();
+            peer.read_exact(&mut [0]).await.unwrap();
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(110)).await;
+        paused_io(async {
+            peer.write_all(b"a").await.unwrap();
+            client.read_exact(&mut [0]).await.unwrap();
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        // advance() wakes timers; let the relay poll them before supplying IO.
+        tokio::task::yield_now().await;
+        paused_io(async {
+            client.write_all(b"r").await.unwrap();
+            let mut request = [0];
+            peer.read_exact(&mut request)
+                .await
+                .expect("timeout ignored recent response progress");
+            assert_eq!(&request, b"r");
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), forwarding)
+            .await
+            .expect("idle bridge retained its streams")
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn blocked_write_still_expires_while_reverse_direction_progresses() {
+        let (mut client, mut peer, forwarding) = bridge_fixture(1).await;
+        tokio::time::pause();
+        paused_io(async {
+            peer.write_all(&[42; 8192]).await.unwrap();
+            // Observe forwarding begin, then stop draining the tiny local buffer.
+            client.read_exact(&mut [0]).await.unwrap();
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        paused_io(async {
+            client.write_all(b"q").await.unwrap();
+            let mut request = [0];
+            peer.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"q");
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), forwarding)
+            .await
+            .expect("blocked write retained its buffer")
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
     #[tokio::test]
     async fn short_preface_reads_never_consume_more_than_the_exact_limit() {
         use std::sync::atomic::{AtomicUsize, Ordering};

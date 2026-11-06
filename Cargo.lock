@@ -2881,6 +2881,7 @@ dependencies = [
  "ed25519-dalek",
  "jni 0.21.1",
  "libc",
+ "minisign-verify",
  "ndk-context",
  "nelomai-client-api",
  "nelomai-client-application",

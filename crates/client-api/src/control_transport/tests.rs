@@ -1452,3 +1452,61 @@ fn cancelled_native_job_waiting_for_a_blocking_thread_never_starts() {
         );
     });
 }
+
+#[tokio::test]
+async fn artifact_download_adapter_uses_physical_dialer_without_tunnel_fallback() {
+    let (ordinary, ordinary_hits, first) = server("tunnel").await;
+    let (physical, physical_hits, second) = server("signed-package").await;
+    let origin = Url::parse(&format!("http://{ordinary}")).unwrap();
+    let mut api = crate::ClientApi::new(origin.as_str()).unwrap();
+    api.http.control = Some(Arc::new(Slot::new(
+        origin.clone(),
+        Arc::new(Route {
+            target: Some(physical),
+        }),
+    )));
+    let url = origin
+        .join("/api/client/v1/updates/artifacts/test.bin")
+        .unwrap();
+    let transport = api.update_transport(&url).unwrap();
+    let builder = reqwest::Client::builder().no_proxy();
+    #[cfg(unix)]
+    let builder = builder.unix_socket(transport.unix_socket());
+    #[cfg(windows)]
+    let builder = builder.windows_named_pipe(transport.windows_named_pipe());
+    let response = builder
+        .build()
+        .unwrap()
+        .get(url.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(response, "signed-package");
+    assert_eq!(ordinary_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(physical_hits.load(Ordering::SeqCst), 1);
+    api.http.control = Some(Arc::new(Slot::new(
+        origin.clone(),
+        Arc::new(Route { target: None }),
+    )));
+    let failed = api.update_transport(&url).unwrap();
+    let builder = reqwest::Client::builder().no_proxy();
+    #[cfg(unix)]
+    let builder = builder.unix_socket(failed.unix_socket());
+    #[cfg(windows)]
+    let builder = builder.windows_named_pipe(failed.windows_named_pipe());
+    assert!(builder.build().unwrap().get(url).send().await.is_err());
+    assert_eq!(ordinary_hits.load(Ordering::SeqCst), 0);
+    assert!(api
+        .update_transport(&origin.join("/api/client/v1/profile").unwrap())
+        .is_err());
+    assert!(api
+        .update_transport(
+            &Url::parse("https://foreign.example/api/client/v1/updates/artifacts/x").unwrap()
+        )
+        .is_err());
+    first.abort();
+    second.abort();
+}

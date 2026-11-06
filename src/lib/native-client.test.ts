@@ -409,7 +409,7 @@ describe("native client", () => {
     await client.updateStatus();
     await client.refreshUpdate();
     await client.setAutomaticUpdates(false);
-    await client.installUpdate();
+    await client.confirmUpdate("opaque-offer");
     await client.restartForUpdate();
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_update_status");
@@ -417,7 +417,7 @@ describe("native client", () => {
     expect(invoke).toHaveBeenNthCalledWith(3, "app_update_set_automatic", {
       enabled: false,
     });
-    expect(invoke).toHaveBeenNthCalledWith(4, "app_update_install");
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_update_confirm", { offerId: "opaque-offer" });
     expect(invoke).toHaveBeenNthCalledWith(5, "app_update_restart");
   });
 

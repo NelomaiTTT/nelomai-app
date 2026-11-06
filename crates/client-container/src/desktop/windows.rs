@@ -337,6 +337,10 @@ fn environment() -> io::Result<Vec<u16>> {
             entries.push((name.to_ascii_uppercase(), wide(&entry)?));
         }
     }
+    entries.push((
+        "NELOMAI_UPDATE_PROTOCOL".into(),
+        wide(std::ffi::OsStr::new("NELOMAI_UPDATE_PROTOCOL=2"))?,
+    ));
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let mut result: Vec<u16> = entries.into_iter().flat_map(|(_, entry)| entry).collect();
     if result.is_empty() {

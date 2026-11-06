@@ -4032,7 +4032,10 @@ pub async fn app_update_status(
 pub async fn app_update_refresh(
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    updater.refresh().await.map_err(update_command_error)
+    updater
+        .check(nelomai_client_container::host::UpdateCheckReason::Manual)
+        .await
+        .map_err(update_command_error)
 }
 #[tauri::command]
 pub async fn app_update_set_automatic(
@@ -4049,6 +4052,40 @@ pub async fn app_update_install(
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
     updater.install().await.map_err(update_command_error)
+}
+#[tauri::command]
+pub async fn app_update_check(
+    updater: State<'_, Arc<NativeUpdater>>,
+    reason: nelomai_client_container::host::UpdateCheckReason,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater.check(reason).await.map_err(update_command_error)
+}
+#[tauri::command]
+pub async fn app_update_confirm(
+    updater: State<'_, Arc<NativeUpdater>>,
+    offer_id: String,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater
+        .confirm(offer_id)
+        .await
+        .map_err(update_command_error)
+}
+#[tauri::command]
+pub async fn app_update_defer(
+    updater: State<'_, Arc<NativeUpdater>>,
+    offer_id: String,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater.defer(offer_id).await.map_err(update_command_error)
+}
+#[tauri::command]
+pub async fn app_update_presented(
+    updater: State<'_, Arc<NativeUpdater>>,
+    offer_id: String,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater
+        .presented(offer_id)
+        .await
+        .map_err(update_command_error)
 }
 #[tauri::command]
 pub async fn app_update_restart(
