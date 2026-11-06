@@ -41,6 +41,8 @@ impl From<UpdateStatusV2> for UpdateStatusResponse {
 pub struct NativeUpdater {
     owner: Arc<PrivateRuntimeAuthClient>,
     protocol: u32,
+    // Desktop wiring lands with the separate 0.4.x integration; keep test lints.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     #[cfg(desktop)]
     desktop_visibility: tokio::sync::Mutex<Option<bool>>,
 }
@@ -62,10 +64,14 @@ impl NativeUpdater {
             desktop_visibility: tokio::sync::Mutex::new(None),
         }
     }
+    // Remove after desktop admission supplies the negotiated protocol.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     pub fn with_update_protocol(mut self, protocol: u32) -> Self {
         self.protocol = if protocol == 2 { 2 } else { 1 };
         self
     }
+    // Remove after desktop window lifecycle is wired in main.
+    #[cfg_attr(all(desktop, not(test)), allow(dead_code))]
     #[cfg(desktop)]
     pub async fn report_desktop_visibility(&self, foreground: bool) -> Result<(), String> {
         if self.protocol != 2 {
