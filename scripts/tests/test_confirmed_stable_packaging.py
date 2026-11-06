@@ -15,41 +15,79 @@ VERSION = module("release-candidate-gates").VERSION
 STABLE_VERSION = module("release-candidate-gates").STABLE_VERSION
 
 class ConfirmedStablePackagingTest(ArtifactFixture):
-    def test_download_authenticates_pinned_candidate_before_exposing_output(self):
+    def test_download_authenticates_archived_stable_before_exposing_output(self):
         _, stable, digest = self.inputs()
         downloader = module("download-confirmed-stable")
         real_run = subprocess.run
-        run = dict(id=int(downloader.gates.STABLE_RUN_ID), head_sha=SOURCE,
+        archive_run_id = "42123287698"
+        archive_source = "b" * 40
+        fail_download = False
+        run = dict(id=int(archive_run_id), head_sha=archive_source,
                    path=".github/workflows/release.yml", status="completed", conclusion="success")
 
         def network(command, **kwargs):
             if command[:2] == ["gh", "api"]:
                 return subprocess.CompletedProcess(command, 0, stdout=json.dumps(run))
             if command[:3] == ["gh", "run", "download"]:
+                self.assertEqual(command[3], archive_run_id)
                 destination = Path(command[command.index("--dir") + 1])
-                shutil.copytree(stable, destination / "release")
+                if fail_download:
+                    (destination / "confirmed-stable").mkdir()
+                    (destination / "confirmed-stable" / "partial").write_bytes(b"incomplete")
+                    raise subprocess.CalledProcessError(1, command)
+                shutil.copytree(stable, destination / "confirmed-stable")
+                # The carrier's current runtime must never become the stable input.
+                (destination / "release").mkdir()
+                (destination / "release" / "unexpected-latest").write_bytes(b"not stable")
                 return subprocess.CompletedProcess(command, 0)
             if command[0] == "gh":
-                raise AssertionError("must use the pinned candidate without publishing a release")
+                raise AssertionError("must use the pinned archive without publishing a release")
             return real_run(command, **kwargs)
 
-        with patch.object(downloader.gates, "STABLE_SOURCE", SOURCE), \
+        with patch.object(downloader, "STABLE_ARCHIVE_SOURCE", archive_source, create=True), \
+             patch.object(downloader.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(downloader.gates, "STABLE_ROOT_SHA256", digest), \
              patch.object(downloader.subprocess, "run", side_effect=network):
             output = self.root / "downloaded"
             downloader.download(output, self.public)
             self.assertEqual({p.name: p.read_bytes() for p in output.iterdir()},
                              {p.name: p.read_bytes() for p in stable.iterdir()})
-            run["conclusion"] = "failure"
-            with self.assertRaises(ValueError):
-                downloader.download(self.root / "failed-run", self.public)
-            self.assertFalse((self.root / "failed-run").exists())
-            run["conclusion"] = "success"
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                downloader.download(output, self.public)
+            for field, invalid in (("id", 1), ("head_sha", SOURCE),
+                                   ("path", ".github/workflows/other.yml"),
+                                   ("status", "in_progress"), ("conclusion", "failure")):
+                with self.subTest(field=field):
+                    original = run[field]
+                    run[field] = invalid
+                    rejected = self.root / ("invalid-" + field)
+                    with self.assertRaises(ValueError):
+                        downloader.download(rejected, self.public)
+                    self.assertFalse(rejected.exists())
+                    run[field] = original
             archive = next(stable.glob("*.zip"))
-            archive.write_bytes(archive.read_bytes() + b"tampered")
-            with self.assertRaises(Exception):
-                downloader.download(self.root / "tampered", self.public)
-            self.assertFalse((self.root / "tampered").exists())
+            signature = stable / f"nelomai-runtime-{STABLE_VERSION}-release-set.manifest.sig"
+            for label, path in (("tampered-payload", archive), ("tampered-signature", signature)):
+                original = path.read_bytes()
+                path.write_bytes(original + b"tampered")
+                with self.assertRaises(Exception):
+                    downloader.download(self.root / label, self.public)
+                self.assertFalse((self.root / label).exists())
+                path.write_bytes(original)
+            with patch.object(downloader.gates, "STABLE_ROOT_SHA256", "0" * 64):
+                with self.assertRaises(Exception):
+                    downloader.download(self.root / "wrong-root", self.public)
+                self.assertFalse((self.root / "wrong-root").exists())
+            fail_download = True
+            interrupted = self.root / "interrupted"
+            with self.assertRaises(subprocess.CalledProcessError):
+                downloader.download(interrupted, self.public)
+            self.assertFalse(interrupted.exists())
+            self.assertEqual(list(self.root.glob(".confirmed-stable-*")), [])
+            fail_download = False
+            downloader.download(interrupted, self.public)
+            self.assertEqual({p.name: p.read_bytes() for p in interrupted.iterdir()},
+                             {p.name: p.read_bytes() for p in stable.iterdir()})
 
     def test_android_common_host_version_matches_container_and_latest(self):
         expected = json.loads((ROOT / "src-tauri/tauri.conf.json").read_bytes())["version"]
