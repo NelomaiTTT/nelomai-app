@@ -1306,6 +1306,7 @@
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
       },
+      reason === "manual",
     );
     if (!result && reason === "manual" && sequence !== null && sequence >= updateAppliedSequence) {
       updateAppliedSequence = sequence;
