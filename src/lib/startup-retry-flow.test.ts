@@ -11,7 +11,7 @@ import { viewForAppState } from "./app-model";
 // native boundary replaced by controlled responses.
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
-const names = ["isAndroidRuntime", "restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout"];
+const names = ["isAndroidRuntime", "restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "observeUpdateStatus"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
@@ -61,14 +61,14 @@ function fixture(bootstrap: () => Promise<unknown>) {
     phaseLabels: { server_unavailable: "Сервер недоступен", error: "Ошибка" },
     window: { setTimeout, clearTimeout }, commandCode, commandMessage, isCurrentConnectionAction,
     viewForAppState, loadSplitTunnel: async () => {}, refreshProbes: async () => {},
-    refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+    refreshUpdateStatus: () => {}, refreshUpdateOffer: async () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
     scheduleRuntimeStatusRefresh: () => {}, runtimeStatusRefresher: { commit: () => {} },
     nativeClient: { bootstrap, state: async () => ({ phase: "ready", connection: null, warning: null,
       metrics: null, reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
       localStopPendingCleanup: false }),
       recordStartupStage: () => {}, runtimeSelect: async () => ({}), restartRuntime: async () => {},
       logout: async () => {} },
-    peers: [], selectedPeerId: "", password: "", updateStatus: null, splitTunnelState: null,
+    peers: [], selectedPeerId: "", password: "", updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0, splitTunnelState: null,
     splitTunnelApplications: [], splitTunnelLoaded: false, notifications: [], notificationUnreadCount: 0,
     notificationNextCursor: null, notificationHistoryExpanded: false, notificationsOpen: false,
     changelogOpen: false, clearUpdateTimer: () => {},

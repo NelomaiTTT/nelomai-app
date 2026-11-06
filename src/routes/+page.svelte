@@ -132,6 +132,8 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   let lastRecordedUpdateState: string | null = null;
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
+  let updateRequestSequence = 0;
+  let updateAppliedSequence = 0;
   const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
   let updateDialogId = $state<string|null>(null);
@@ -1103,7 +1105,7 @@
       selectedPeerId = "";
       password = "";
       diagnosticsStatus = null;
-      updateStatus = null;
+      observeUpdateStatus(null);
       updateDialogId = null;
       splitTunnelState = null;
       splitTunnelApplications = [];
@@ -1240,19 +1242,32 @@
   }
 
   async function refreshUpdateStatus() {
+    const sequence = ++updateRequestSequence;
     clearUpdateTimer();
     try {
       const status = await nativeClient.updateStatus();
-      observeUpdateStatus(status);
+      if (!observeUpdateStatus(status, sequence)) return;
       if (updateUiVisible && updateStatusNeedsPolling(status)) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);
       }
     } catch {
-      updateStatus = null;
+      observeUpdateStatus(null, sequence);
     }
   }
 
-  function observeUpdateStatus(status: UpdateStatus) {
+  function observeUpdateStatus(
+    status: UpdateStatus | null,
+    sequence = ++updateRequestSequence,
+  ): boolean {
+    // User-action replies commit a new sequence. Older polls/checks (including
+    // failures) must not overwrite a newer decision. Pending reads do not
+    // suppress completed reads, so a slow IPC cannot starve presentation.
+    if (sequence < updateAppliedSequence) return false;
+    updateAppliedSequence = sequence;
+    if (!status) {
+      updateStatus = null;
+      return true;
+    }
     const refreshStage = updateRefreshDiagnosticStage(
       updateStatus?.errorCode === "update_refresh_pending",
       status,
@@ -1272,22 +1287,31 @@
       lastRecordedUpdateState = key;
       void nativeClient.recordStartupStage(stage);
     }
+    return true;
   }
 
   async function refreshUpdateOffer(reason:"startup"|"manual"="manual") {
     if (!bootstrap) return;
     if(reason==="manual"){manualUpdatePending=true;manualUpdateResult="Проверяем…";}
+    let sequence: number | null = null;
     const result=await updateOfferRefresher.run(
-      () => nativeClient.checkUpdate(reason),
+      () => {
+        sequence = ++updateRequestSequence;
+        return nativeClient.checkUpdate(reason);
+      },
       (status) => {
-        observeUpdateStatus(status);
+        if (sequence === null || !observeUpdateStatus(status, sequence)) return;
         if (updateStatusNeedsPolling(status)) {
           clearUpdateTimer();
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
       },
     );
-    if(!result && reason==="manual"){manualUpdatePending=false;manualUpdateResult="Не удалось проверить обновление. Повторите позже.";}
+    if (!result && reason === "manual" && sequence !== null && sequence >= updateAppliedSequence) {
+      updateAppliedSequence = sequence;
+      manualUpdatePending = false;
+      manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+    }
   }
 
   function showUpdatePrompt(){if(updateStatus && canConfirmUpdate(updateStatus))updateDialogId=updateStatus.offerId!;}

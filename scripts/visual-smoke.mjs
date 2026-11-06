@@ -115,7 +115,12 @@ try {
     executablePath,
     headless: true,
   });
-  if(process.env.UPDATE_SMOKE){
+  if(process.env.UPDATE_STALE_SMOKE){
+    for(const action of ["later-status", "later-check", "later-error", "confirm-status"]){
+      await capture(`update-stale-${action}-desktop`,{width:1280,height:800},`update-stale-${action}`);
+      await capture(`update-stale-${action}-mobile`,{width:390,height:844},`update-stale-${action}`);
+    }
+  } else if(process.env.UPDATE_SMOKE){
     await capture("update-consent-desktop",{width:1280,height:800},"update-consent");
     await capture("update-consent-mobile",{width:390,height:844},"update-consent");
   } else {
@@ -162,7 +167,16 @@ async function capture(name, viewport, scenario) {
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
-          if(currentScenario==="update-consent"&&command.startsWith("app_update_")){
+          if((currentScenario==="update-consent"||currentScenario.startsWith("update-stale-"))&&command.startsWith("app_update_")){
+            const heldCommand=currentScenario==="update-stale-later-check" ? "app_update_check" : "app_update_status";
+            if(currentScenario.startsWith("update-stale-") && command===heldCommand && !window.__HELD_UPDATE_REPLY__){
+              window.__HELD_UPDATE_REPLY__=true;
+              const snapshot={...update};
+              await new Promise(resolve=>window.__RELEASE_UPDATE_REPLY__=resolve);
+              window.__OLD_UPDATE_REPLY_RETURNED__=true;
+              if(currentScenario==="update-stale-later-error")throw Error("delayed old status failure");
+              return snapshot;
+            }
             if(command==="app_update_status" && update.phase==="checking")window.__UPDATE_CHECKING_READS__++;
             if(command==="app_update_presented"||command==="app_update_defer")update={...update,promptPending:false};
             if(command==="app_update_confirm"){if(args.offerId!==update.offerId)throw Error("stale offer");update={...update,phase:"installing",promptPending:false};}
@@ -344,6 +358,30 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if(scenario.startsWith("update-stale-")){
+    const dialog=page.getByRole("dialog",{name:"Установить новую версию"});
+    await dialog.waitFor({state:"visible"});
+    await page.waitForFunction(()=>!!window.__RELEASE_UPDATE_REPLY__);
+    const confirm=scenario==="update-stale-confirm-status";
+    await dialog.getByRole("button",{name:confirm?"Да":"Нет, позже",exact:true}).click();
+    await dialog.waitFor({state:"hidden"});
+    if(confirm)await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).waitFor();
+    await page.evaluate(()=>window.__RELEASE_UPDATE_REPLY__());
+    await page.waitForFunction(()=>window.__OLD_UPDATE_REPLY_RETURNED__);
+    await page.waitForTimeout(100);
+    if(await dialog.isVisible())throw Error(`${name}: stale reply reopened a completed decision`);
+    if(confirm){
+      if(!await page.getByText("Устанавливаем обновление. Дождитесь завершения.",{exact:true}).isVisible())throw Error(`${name}: stale reply replaced installation status`);
+    } else {
+      if(!await page.getByRole("button",{name:"Обновить",exact:true}).isVisible())throw Error(`${name}: stale error erased the newer status`);
+      await page.getByRole("button",{name:"Проверить обновления",exact:true}).click();
+      await dialog.waitFor({state:"visible"});
+      await dialog.getByRole("button",{name:"Нет, позже",exact:true}).click();
+      await dialog.waitFor({state:"hidden"});
+    }
+    console.log(`${name}: PASS`);
+    await context.close();return;
+  }
   if(scenario==="update-consent"){
     if (viewport.width < 600) {
       await page.getByText("Проверять при открытии приложения. Установка — с вашего согласия.", {exact:true}).waitFor();
