@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-unix-service"
-version = "0.3.12"
+version = "0.3.13"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
