@@ -177,6 +177,7 @@ private const val KEY_SESSION_PROCESS_ID = "session_process_id"
 private const val KEY_STOPPED_SESSION_PENDING = "stopped_session_pending"
 private const val KEY_STOPPED_SESSION_TRIGGER = "stopped_session_trigger"
 private const val KEY_STOPPED_SESSION_ENDED_AT = "stopped_session_ended_at"
+private const val KEY_STOPPED_SESSION_IDENTITY = "stopped_session_identity"
 private const val KEY_PENDING_SEAL = "pending_seal"
 private const val KEY_RETRY_ATTEMPT = "retry_attempt"
 private const val KEY_NEXT_UPLOAD_AT = "next_upload_at"
@@ -214,7 +215,9 @@ private fun diagnosticOwnerScope(context: Context): NativeOwnerScope? = runCatch
     envelope.ownerScope?.takeIf { scope ->
         envelope.logoutState == null && !envelope.requiresFreshProvision &&
             envelope.ownerCancelEpoch?.let { it >= scope.authEpoch } != true &&
-            envelope.active?.ownerScope == scope && envelope.active.deviceId == scope.deviceId &&
+            // Credential.ownerScope is attached for dispatch, not serialized in the token.
+            // The protected envelope owns the persisted scope and fresh-provision fence.
+            envelope.active?.deviceId == scope.deviceId &&
             scope.slot == AndroidRuntimeNamespace.slot && scope.runtimeVersion == AndroidRuntimeNamespace.version
     }
 }.getOrNull()
@@ -826,6 +829,7 @@ internal object AutomaticDiagnostics {
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .remove(KEY_STOPPED_SESSION_TRIGGER)
                     .remove(KEY_STOPPED_SESSION_ENDED_AT)
+                    .remove(KEY_STOPPED_SESSION_IDENTITY)
                     .remove(KEY_PENDING_SEAL)
                     .commit(),
             ) { "automatic_diagnostics_session_write_failed" }
@@ -835,6 +839,20 @@ internal object AutomaticDiagnostics {
             scheduleMemoryGrowthWatchLocked(applicationContext)
             scheduleCheckpointLocked(applicationContext, CHECKPOINT_INTERVAL_SECONDS)
             scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
+        }
+    }
+
+    fun onRedundantDataplaneStopped(context: Context, ownerSessionId: String, deviceId: String) {
+        synchronized(gate) {
+            val preferences = preferences(context)
+            if (!preferences.getBoolean(KEY_SESSION_RUNNING, false) ||
+                preferences.getString(KEY_SESSION_OWNER_ID, null) != ownerSessionId ||
+                preferences.getString(KEY_SESSION_DEVICE_ID, null) != deviceId ||
+                preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)
+            ) return
+            // The updater may terminate this process as soon as Stop is acknowledged.
+            // Persist only the end marker here; report construction/upload can resume later.
+            markStoppedSessionPending(context, "tunnel_stopped", nowUnix(), captureRuntimeIdentity = true)
         }
     }
 
@@ -850,8 +868,10 @@ internal object AutomaticDiagnostics {
             recordMemorySnapshot(applicationContext, "tunnel_stopping")
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
-                val endedAt = nowUnix()
-                markStoppedSessionPending(applicationContext, "tunnel_stopped", endedAt)
+                val endedAt = if (preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
+                    stoppedSessionSeal(preferences).endedAt
+                } else nowUnix()
+                markStoppedSessionPending(applicationContext, "tunnel_stopped", endedAt, captureRuntimeIdentity = true)
                 if (!sealCurrentInterval(
                         applicationContext,
                         "tunnel_stopped",
@@ -1360,7 +1380,9 @@ internal object AutomaticDiagnostics {
 
     private fun checkpoint(context: Context) {
         synchronized(gate) {
-            if (!preferences(context).getBoolean(KEY_SESSION_RUNNING, false)) return
+            if (!preferences(context).getBoolean(KEY_SESSION_RUNNING, false) ||
+                preferences(context).getBoolean(KEY_STOPPED_SESSION_PENDING, false)
+            ) return
             if (sealCurrentInterval(context, "six_hour_checkpoint", tunnelRunning = true)) {
                 scheduleMemorySeriesLocked(context)
                 scheduleCheckpointLocked(context, CHECKPOINT_INTERVAL_SECONDS)
@@ -1416,7 +1438,12 @@ internal object AutomaticDiagnostics {
                     endedAt = (endedAtUnix ?: nowUnix()).coerceAtLeast(startedAt),
                     tunnelRunning = tunnelRunning,
                     connectionLeaseId = preferences.getString(KEY_SESSION_LEASE_ID, null),
-                    runtimeIdentity = if (!captureRuntimeIdentity || trigger == "tunnel_interrupted") null else captureDiagnosticIdentity(context).toString(),
+                    runtimeIdentity = when {
+                        !tunnelRunning && preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false) ->
+                            preferences.getString(KEY_STOPPED_SESSION_IDENTITY, null)
+                        !captureRuntimeIdentity || trigger == "tunnel_interrupted" -> null
+                        else -> captureDiagnosticIdentity(context).toString()
+                    },
                 )
                 val markerSaved = preferences.edit()
                     .putString(KEY_PENDING_SEAL, seal.toJson())
@@ -1466,6 +1493,7 @@ internal object AutomaticDiagnostics {
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .remove(KEY_STOPPED_SESSION_TRIGGER)
                     .remove(KEY_STOPPED_SESSION_ENDED_AT)
+                    .remove(KEY_STOPPED_SESSION_IDENTITY)
                     .putBoolean(KEY_SESSION_RUNNING, false)
             }
             check(editor.commit()) { "automatic_diagnostics_session_write_failed" }
@@ -2092,6 +2120,7 @@ internal object AutomaticDiagnostics {
                         .remove(KEY_STOPPED_SESSION_PENDING)
                         .remove(KEY_STOPPED_SESSION_TRIGGER)
                         .remove(KEY_STOPPED_SESSION_ENDED_AT)
+                        .remove(KEY_STOPPED_SESSION_IDENTITY)
                         .remove(KEY_PENDING_SEAL)
                         .apply()
                 } else if (preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
@@ -2271,11 +2300,22 @@ internal object AutomaticDiagnostics {
         context: Context,
         trigger: String,
         endedAtUnix: Long?,
+        captureRuntimeIdentity: Boolean = false,
     ) {
         check(trigger == "tunnel_stopped" || trigger == "tunnel_interrupted")
-        val editor = preferences(context).edit()
+        val preferences = preferences(context)
+        val editor = preferences.edit()
             .putBoolean(KEY_STOPPED_SESSION_PENDING, true)
             .putString(KEY_STOPPED_SESSION_TRIGGER, trigger)
+        if (!preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
+            // Freeze public provenance with the first end marker, before Stop ACK.
+            // Repeated cleanup must preserve both known identity and legacy absence.
+            if (captureRuntimeIdentity) {
+                editor.putString(KEY_STOPPED_SESSION_IDENTITY, captureDiagnosticIdentity(context).toString())
+            } else {
+                editor.remove(KEY_STOPPED_SESSION_IDENTITY)
+            }
+        }
         if (endedAtUnix == null) {
             editor.remove(KEY_STOPPED_SESSION_ENDED_AT)
         } else {
