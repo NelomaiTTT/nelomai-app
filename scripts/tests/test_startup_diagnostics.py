@@ -60,14 +60,21 @@ fn main() {
 static PUMP: AtomicBool = AtomicBool::new(false);
 #[derive(Clone)] struct App;
 impl App { fn handle(&self) -> &Self { self } }
+#[derive(Clone)] struct Host;
+impl Host { fn start_update_scheduler(&self) {} }
+struct State { host: Host }
 mod startup { pub fn stage(_: &str) {} }
-mod tauri { pub mod async_runtime { pub fn spawn_blocking(f: impl FnOnce()) { f(); } } }
+mod tauri { pub mod async_runtime {
+    // The unrelated scheduler may remain unpolled while native cleanup starts.
+    pub fn spawn(_: impl std::future::Future<Output = ()> + Send + 'static) {}
+    pub fn spawn_blocking(f: impl FnOnce()) { f(); }
+} }
 mod desktop { pub fn setup_tray(_: &super::App) -> Result<(), Box<dyn std::error::Error>> {
     Err(std::io::Error::other("synthetic tray unavailable").into())
 } }
-fn serve_native(_: App, _: Arc<()>, _: ()) { PUMP.store(true, Ordering::SeqCst); }
+fn serve_native(_: App, _: Arc<State>, _: ()) { PUMP.store(true, Ordering::SeqCst); }
 fn main() {
-    let app = &App; let state = Arc::new(()); let native = ();
+    let app = &App; let state = Arc::new(State { host: Host }); let native = ();
     let result = (|| -> Result<(), Box<dyn std::error::Error>> { %s Ok(()) })();
     assert!(result.is_err());
     assert!(PUMP.load(Ordering::SeqCst), "fallback Quit must have a live native cleanup pump");
@@ -77,7 +84,8 @@ fn main() {
             root = Path(directory)
             source, binary = root / "partial.rs", root / "probe"
             source.write_text(driver)
-            subprocess.run(["rustc", "--edition=2021", str(source), "-o", str(binary)], check=True, capture_output=True)
+            compiled = subprocess.run(["rustc", "--edition=2021", str(source), "-o", str(binary)], capture_output=True, text=True)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
             result = subprocess.run([str(binary)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 
