@@ -1021,6 +1021,54 @@ class NativeAuthScopeTest {
         store.withOwnerOperation(owner) { assertTrue(store.read() is CredentialStoreResult.Failure) }
     }
 
+    @Test fun cancelledUpdateAfterReloginReprovisionsWithoutRemovingOldLogoutFence() {
+        val backend = MemoryBackend()
+        var store = BackgroundCredentialStore(backend)
+        val old = operation(epoch = 3)
+        var current = store.beginOwnerOperation(0, old, false).value()
+        val provision = BackgroundCredentialProvision(old.scope.deviceId, "https://synthetic.invalid",
+            "old-token", 9999999999, "install", 1, BackgroundCapabilitySnapshot(0, false, 1))
+        current = store.configure(current.revision, provision).value()
+        current = store.fenceOwnerLogout(4).value()
+        current = store.beginLogoutCurrent("logout").value().envelope
+        current = store.finalizeLogout(current.revision, "logout").value()
+        var owner = operation(2, 5).let { it.copy(scope = it.scope.copy(family = "new-family")) }
+        current = store.beginOwnerOperation(current.revision, owner, false).value()
+        current = store.configure(current.revision, provision.copy(token = "new-login-token", installGeneration = 2)).value()
+        repeat(2) {
+            // Repeat Cancel/resume, including reopening the protected store.
+            store = BackgroundCredentialStore(backend)
+            val resumed = owner.copy(attempt = owner.attempt + 1,
+                scope = owner.scope.copy(sessionGeneration = owner.scope.sessionGeneration + 1),
+                provisionPredecessor = owner.scope)
+            val request = BackgroundUiProvisionRequest(current.revision, resumed.scope.deviceId,
+                "https://synthetic.invalid", "fresh-resume-bearer", "install", 2,
+                BackgroundCapabilitySnapshot(0, false, 1), resumed.scope)
+            val admitted = store.beginProvisionOperation(request, resumed)
+            assertTrue("valid resume after a newer login rejected: $admitted", admitted is CredentialStoreResult.Success)
+            current = admitted.value()
+            store = BackgroundCredentialStore(backend) // Reopen after admission, before HTTP completion.
+            current = store.withOwnerOperation(resumed) {
+                provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = current.revision), "noop", 100,
+                    provision = { error("disabled capability") }, rotate = { error("revoked token must not rotate") },
+                    legacy = { credential ->
+                        assertEquals("fresh-resume-bearer", credential.token)
+                        BackgroundCredential(resumed.scope.deviceId, request.panelBase, "resumed-token", 2000)
+                    })
+            }
+            assertEquals(4L, current.ownerCancelEpoch)
+            assertEquals(resumed.scope, current.ownerScope)
+            assertEquals("resumed-token", current.active?.token)
+            assertEquals(CredentialStoreResult.Failure("background_owner_cancelled"),
+                store.beginOwnerOperation(current.revision, old, false))
+            val atFence = resumed.copy(scope = resumed.scope.copy(authEpoch = 4))
+            assertEquals(CredentialStoreResult.Failure("background_owner_cancelled"),
+                store.beginProvisionOperation(request.copy(expectedRevision = current.revision, ownerScope = atFence.scope), atFence))
+            assertEquals(current, store.read().value())
+            owner = resumed
+        }
+    }
+
     private fun <T> CredentialStoreResult<T>.value(): T = (this as CredentialStoreResult.Success).value
     private class MemoryBackend : EncryptedRecordBackend {
         private var bytes: ByteArray? = null

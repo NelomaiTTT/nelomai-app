@@ -2469,6 +2469,22 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         startOperationId: String,
         result: RedundantRevokeResult,
     ) {
+        if (result.fenced && result.stopped && !serviceDestroyed &&
+            serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get()
+        ) {
+            runCatching {
+                val transaction = (recoveryStore.read() as? RecoveryStoreResult.Success)
+                    ?.value?.redundantTransaction
+                if (!serviceDestroyed && serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get() &&
+                    transaction?.startOperationId == startOperationId &&
+                    !transaction.desiredActive && transaction.stopOperationId != null
+                ) {
+                    AutomaticDiagnostics.onRedundantDataplaneStopped(
+                        applicationContext, transaction.sessionId, transaction.template.deviceId,
+                    )
+                }
+            }.onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+        }
         redundantStopWaiters.remove(startOperationId)?.forEach { waiter -> waiter(result) }
     }
 
@@ -5413,14 +5429,13 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             activeService?.finishService()
         }
 
-        /** Null means the owner's identity is unreadable or changed during observation. */
+        /** Null means unreadable/changing ownership or a Stop whose completion still owns diagnostics. */
         internal fun redundantDiagnosticsSessionRunning(sessionId: String, deviceId: String?): Boolean? {
             val service = activeService ?: return false
             if (service.serviceDestroyed || !service.serviceCallbackGate.isOpen() ||
                 service.serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get()
             ) return false
             val installed = service.redundantVpnOwnerSlot.snapshot() ?: return false
-            if (!installed.owner.isRunning()) return false
             val recovery = service.recoveryStore.read()
             val current = service.redundantVpnOwnerSlot.snapshot()
             // Route metadata replaces the record without replacing the VPN owner.
@@ -5432,6 +5447,18 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             ) return null
             if (service.serviceDestroyed || !service.serviceCallbackGate.isOpen()) return false
             if (recovery is RecoveryStoreResult.Failure) return null
+            val durable = (recovery as RecoveryStoreResult.Success).value.redundantTransaction
+            if (durable != null && (durable.startOperationId != installed.startOperationId ||
+                durable.sessionId != sessionId || durable.template.deviceId != deviceId)
+            ) return false
+            // Closing the dataplane and publishing its normal end run on different
+            // threads. Do not let JobService label that interval as a crash. The
+            // pending completion also covers cleanup that already removed recovery.
+            if (service.pendingRedundantStop?.let {
+                    it.startOperationId == installed.startOperationId &&
+                        it.serviceGeneration == service.serviceGeneration
+                } == true || (durable?.desiredActive == false && durable.stopOperationId != null)
+            ) return null
             val transaction = service.activeRedundantTransactionForCurrentWork(
                 recovery, installed.startOperationId,
             ) ?: return false

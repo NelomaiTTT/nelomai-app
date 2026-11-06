@@ -337,6 +337,276 @@ class RedundantAutomaticDiagnosticsTest {
         assertFalse(f.running())
     }
 
+    @Test fun localStopAckPersistsNormalEndBeforeRemoteCleanupAndProcessExit() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val id = f.session()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        val waiters = ReflectionHelpers.getField<MutableMap<String, MutableList<(RedundantRevokeResult) -> Unit>>>(
+            f.service, "redundantStopWaiters")
+        var acknowledged = false
+        waiters[f.tx.startOperationId] = mutableListOf({
+            assertTrue("normal stop must be durable before owner may kill VPN process",
+                f.prefs.getBoolean("stopped_session_pending", false))
+            assertEquals("tunnel_stopped", f.prefs.getString("stopped_session_trigger", null))
+            assertTrue("ACK must not wait for report construction", f.reports().isEmpty())
+            acknowledged = true
+        })
+        call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        assertTrue(acknowledged)
+        val endedAt = f.prefs.getLong("stopped_session_ended_at", 0)
+        assertTrue(endedAt > 0)
+        call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        f.diagnostics("checkpoint", f.context)
+        assertTrue(f.reports().isEmpty())
+        assertEquals(endedAt, f.prefs.getLong("stopped_session_ended_at", 0))
+        // Re-enter the real startup recovery, as after process death before remote cleanup.
+        f.service.installRedundantVpnOwner(null)
+        AutomaticDiagnostics.initialize(f.context)
+        AutomaticDiagnostics.initialize(f.context)
+        AutomaticDiagnostics.onTunnelStopped(f.context)
+        val report = f.reports().single()
+        assertEquals("tunnel_stopped", report.getString("trigger"))
+        assertEquals(id, report.getString("tunnel_session_id"))
+        assertEquals(endedAt, report.getLong("interval_ended_at_unix"))
+    }
+
+    @Test fun staleOrUnconfirmedStopCannotMarkCurrentDiagnosticsNormallyStopped() {
+        for (case in listOf("unfenced", "not_closed", "other_operation", "other_session", "other_device", "still_active", "retired_service")) fixture { f ->
+            val owner = f.owner()
+            assertTrue(owner.start(f.tx, configs())); f.idle()
+            if (case != "still_active") assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+            if (case == "other_session") f.prefs.edit().putString("session_owner_id", "other").commit()
+            if (case == "other_device") f.prefs.edit().putString("session_device_id", "other").commit()
+            if (case == "retired_service") ReflectionHelpers.setField(f.service, "serviceDestroyed", true)
+            call(f.service, "completeRedundantStopWaiters", if (case == "other_operation") "retired" else f.tx.startOperationId,
+                RedundantRevokeResult(case != "unfenced", case != "not_closed"))
+            assertFalse(case, f.prefs.getBoolean("stopped_session_pending", false))
+        }
+    }
+
+    @Test fun diagnosticReadFailureStillAcknowledgesClosedDataplane() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(owner.closeDataplaneForStop())
+        val waiters = ReflectionHelpers.getField<MutableMap<String, MutableList<(RedundantRevokeResult) -> Unit>>>(f.service, "redundantStopWaiters")
+        var acknowledged = false
+        waiters[f.tx.startOperationId] = mutableListOf({ acknowledged = it.fenced && it.stopped })
+        f.failRecoveryReads(true)
+        try {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+            assertTrue(acknowledged)
+        } finally { f.failRecoveryReads(false) }
+    }
+
+    @Test fun normalCleanupPreservesLocalStopTimeWithoutDuplicateReport() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        // Simulate time spent in remote cleanup without making the test sleep.
+        val end = System.currentTimeMillis() / 1000L - 10
+        f.prefs.edit().putLong("interval_started_at", end - 10).putLong("stopped_session_ended_at", end).commit()
+        AutomaticDiagnostics.onTunnelStopped(f.context)
+        AutomaticDiagnostics.onTunnelStopped(f.context)
+        assertEquals(end, f.reports().single().getLong("interval_ended_at_unix"))
+    }
+
+    @Test fun serviceRetiredDuringRecoveryReadCannotSealDiagnostics() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        f.duringRecoveryRead({ ReflectionHelpers.setField(f.service, "serviceDestroyed", true) }) {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        }
+        assertFalse(f.prefs.getBoolean("stopped_session_pending", false))
+    }
+
+
+    @Test fun scheduledUploadBeforeLocalAckRemainsNormalAfterProcessExit() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        // JobService may run while the cleanup thread has closed the dataplane,
+        // before restoreHandler processes the local close completion.
+        AutomaticDiagnostics.runScheduledUpload(f.context) {}
+        call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        f.service.installRedundantVpnOwner(null)
+        AutomaticDiagnostics.initialize(f.context)
+        AutomaticDiagnostics.initialize(f.context)
+        assertEquals("tunnel_stopped", f.reports().single().getString("trigger"))
+    }
+
+    @Test fun scheduledMaterializationBeforeLocalAckDoesNotReportInterruption() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        AutomaticDiagnostics.runScheduledUpload(f.context) {}
+        f.diagnostics("processNext", f.context)
+        assertTrue("no report before local closure is acknowledged", f.reports().isEmpty())
+        call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        AutomaticDiagnostics.onTunnelStopped(f.context)
+        assertEquals("tunnel_stopped", f.reports().single().getString("trigger"))
+    }
+
+
+    @Test fun scheduledUploadWaitsForPendingCleanupAfterRecoveryRecordIsRemoved() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val complete = f.stopCompletion(f.tx.startOperationId, owner)
+        assertTrue(owner.revoke())
+        assertNull((f.store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+        AutomaticDiagnostics.runScheduledUpload(f.context) {}
+        f.diagnostics("processNext", f.context)
+        assertTrue("the matching cleanup completion still owns normal termination", f.reports().isEmpty())
+        complete()
+        AutomaticDiagnostics.initialize(f.context)
+        assertEquals("tunnel_stopped", f.reports().single().getString("trigger"))
+    }
+
+    @Test fun scheduledUploadDoesNotHideUnrequestedOrForeignStop() {
+        for (case in listOf("not_fenced", "other_session", "other_device", "other_operation")) fixture { f ->
+            val owner = f.owner()
+            assertTrue(owner.start(f.tx, configs())); f.idle()
+            val id = f.session()
+            if (case != "not_fenced") {
+                assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+            }
+            if (case == "other_session") f.prefs.edit().putString("session_owner_id", "other").commit()
+            if (case == "other_device") f.prefs.edit().putString("session_device_id", "other").commit()
+            if (case == "other_operation") {
+                ReflectionHelpers.getField<RedundantVpnOwnerSlot>(f.service, "redundantVpnOwnerSlot")
+                    .install(owner, "other-start")
+            }
+            assertTrue(owner.closeDataplaneForStop())
+            AutomaticDiagnostics.runScheduledUpload(f.context) {}
+            f.diagnostics("processNext", f.context)
+            assertEquals(case, "tunnel_interrupted", f.reports()
+                .single { it.getString("tunnel_session_id") == id }.getString("trigger"))
+        }
+    }
+
+
+    @Test fun normalStopRetainsOriginalIdentityAfterContainerUpdate() = fixture { f ->
+        f.containerVersion("0.3.13")
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        f.withDiagnosticOwner("0.3.13") {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        }
+        assertTrue(f.reports().isEmpty())
+        f.service.installRedundantVpnOwner(null)
+        f.containerVersion("0.3.14")
+        AutomaticDiagnostics.initialize(f.context)
+        AutomaticDiagnostics.initialize(f.context)
+        f.assertOriginalIdentity(f.reports().single())
+    }
+
+    @Test fun normalStopKeepsIdentityWhenBackgroundJobSealsFirst() = fixture { f ->
+        f.containerVersion("0.3.13")
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        f.withDiagnosticOwner("0.3.13") {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        }
+        f.diagnostics("processNext", f.context)
+        AutomaticDiagnostics.onTunnelStopped(f.context)
+        f.assertOriginalIdentity(f.reports().single())
+    }
+
+    @Test fun normalStopIdentityIsNotReplacedByRepeatedAckOrCleanup() = fixture { f ->
+        f.containerVersion("0.3.13")
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        f.withDiagnosticOwner("0.3.13") {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        }
+        f.containerVersion("0.3.14")
+        f.withDiagnosticOwner("0.3.14") {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+            AutomaticDiagnostics.onTunnelStopped(f.context)
+        }
+        f.assertOriginalIdentity(f.reports().single())
+        // A later session must not inherit the earlier normal-stop identity.
+        AutomaticDiagnostics.onTunnelStarted(f.context, null, "amneziawg_3", "next-session", f.tx.template.deviceId)
+        AutomaticDiagnostics.initialize(f.context)
+        val interrupted = f.reports().single { it.getString("trigger") == "tunnel_interrupted" }
+        assertEquals("0.3.14", interrupted.getString("app_version"))
+        assertFalse(interrupted.has("container_version"))
+    }
+
+    @Test fun legacyNormalStopMarkerDoesNotAcquireCurrentRuntimeIdentity() = fixture { f ->
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        f.prefs.edit().putBoolean("stopped_session_pending", true)
+            .putString("stopped_session_trigger", "tunnel_stopped")
+            .putLong("stopped_session_ended_at", System.currentTimeMillis() / 1000L).commit()
+        f.containerVersion("0.3.14")
+        f.withDiagnosticOwner("0.3.14") { AutomaticDiagnostics.onTunnelStopped(f.context) }
+        val report = f.reports().single()
+        assertEquals("0.3.14", report.getString("app_version"))
+        assertFalse(report.has("container_version"))
+        assertFalse(report.has("runtime_version"))
+    }
+
+    @Test fun normalStopIdentitySurvivesUnfinishedCheckpointMaterialization() = fixture { f ->
+        f.containerVersion("0.3.13")
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        // Persisted seals validate lease UUIDs, unlike the coordinator's synthetic lease names.
+        f.prefs.edit().putString("session_lease_id", "44444444-4444-4444-8444-444444444444").commit()
+        val pending = f.diagnostics("pendingDirectory", f.context) as File
+        pending.deleteRecursively(); pending.parentFile!!.mkdirs(); pending.writeText("blocked")
+        try {
+            f.withDiagnosticOwner("0.3.13") { f.diagnostics("checkpoint", f.context) }
+            assertTrue(f.prefs.contains("pending_seal"))
+        } finally { pending.delete(); pending.mkdirs() }
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+        assertTrue(owner.closeDataplaneForStop())
+        f.withDiagnosticOwner("0.3.13") {
+            call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true))
+        }
+        f.containerVersion("0.3.14")
+        AutomaticDiagnostics.initialize(f.context)
+        AutomaticDiagnostics.initialize(f.context)
+        assertEquals(2, f.reports().size)
+        assertEquals(1, f.reports().count { it.getString("trigger") == "six_hour_checkpoint" })
+        f.assertOriginalIdentity(f.reports().single { it.getString("trigger") == "tunnel_stopped" })
+    }
+
+    @Test fun normalStopDoesNotClaimRuntimeFromCancelledOrUnprovisionedOwner() {
+        for (case in listOf("fenced", "fresh_provision_required", "logout", "foreign_namespace")) fixture { f ->
+            f.containerVersion("0.3.13")
+            val owner = f.owner()
+            assertTrue(owner.start(f.tx, configs())); f.idle()
+            val id = f.session()
+            assertTrue(f.store.cancelRedundantIntentAndDeferStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+            assertTrue(owner.closeDataplaneForStop())
+            f.withDiagnosticOwner("0.3.13", transform = {
+                when (case) {
+                    "fenced" -> it.copy(ownerCancelEpoch = 1)
+                    "fresh_provision_required" -> it.copy(requiresFreshProvision = true)
+                    "logout" -> it.copy(active = null, logoutState = BackgroundLogoutState("logout", 1, BackgroundLogoutPhase.PENDING))
+                    else -> it.copy(ownerScope = it.ownerScope!!.copy(runtimeVersion = "foreign-runtime"))
+                }
+            }) { call(f.service, "completeRedundantStopWaiters", f.tx.startOperationId, RedundantRevokeResult(true, true)) }
+            f.diagnostics("processNext", f.context)
+            val report = f.reports().single { it.getString("tunnel_session_id") == id }
+            assertEquals(case, "0.3.13", report.getString("container_version"))
+            assertFalse(case, report.has("runtime_version"))
+        }
+    }
+
     private class Fixture(val context: Context, val service: NelomaiVpnService,
         val store: AndroidRecoveryStore, val memorySample: () -> Unit,
         val failRecoveryReads: (Boolean) -> Unit) {
@@ -346,6 +616,38 @@ class RedundantAutomaticDiagnosticsTest {
             "22222222-2222-4222-8222-222222222222", "lease-a", "lease-b", "lease-a",
             true, 1, 1, "start", "fingerprint")
         val prefs = context.getSharedPreferences(AndroidRuntimeNamespace.record("nelomai-automatic-diagnostics"), 0)
+        fun containerVersion(version: String) {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0).apply { versionName = version }
+            shadowOf(context.packageManager).installPackage(info)
+        }
+        fun assertOriginalIdentity(report: JSONObject) {
+            assertEquals("tunnel_stopped", report.getString("trigger"))
+            assertEquals("0.3.13", report.getString("app_version"))
+            assertEquals("0.3.13", report.getString("container_version"))
+            assertEquals(AndroidRuntimeNamespace.version, report.getString("runtime_version"))
+            assertEquals(AndroidRuntimeNamespace.slot, report.getString("runtime_slot"))
+            assertEquals(1, report.getInt("runtime_contract_version"))
+            assertFalse(report.has("session_generation"))
+            assertFalse(report.has("family"))
+        }
+        fun withDiagnosticOwner(container: String,
+            transform: (BackgroundCredentialEnvelope) -> BackgroundCredentialEnvelope = { it },
+            block: () -> Unit) {
+            val scope = NativeOwnerScope(1, "private-family", tx.template.deviceId,
+                AndroidRuntimeNamespace.slot, container, AndroidRuntimeNamespace.version, 1, 7)
+            val envelope = transform(BackgroundCredentialEnvelope(revision = 1, deviceId = scope.deviceId,
+                panelBase = "https://synthetic.invalid", installSecret = "install", installGeneration = 1,
+                active = BackgroundCredential(scope.deviceId, "https://synthetic.invalid", "test-token", 9999999999),
+                ownerScope = scope))
+            val backend = object : EncryptedRecordBackend {
+                var bytes = BackgroundCredentialEnvelopeCodec.encode(envelope)
+                override fun read() = bytes.copyOf()
+                override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+            }
+            val old = ReflectionHelpers.getField<BackgroundCredentialStore?>(AndroidBackgroundCredentialStores, "instance")
+            ReflectionHelpers.setField(AndroidBackgroundCredentialStores, "instance", BackgroundCredentialStore(backend))
+            try { block() } finally { ReflectionHelpers.setField(AndroidBackgroundCredentialStores, "instance", old) }
+        }
         fun stopCompletion(operation: String, owner: RedundantVpnProcessOwner?): () -> Unit {
             val tombstones = RedundantCancelTombstoneStore(object : RedundantCancelTombstoneBackend {
                 var raw: String? = null

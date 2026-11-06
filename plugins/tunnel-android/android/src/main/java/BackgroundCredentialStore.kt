@@ -444,8 +444,10 @@ internal class BackgroundCredentialStore(
                 provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
                 current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
                 provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
-                current.ownerCancelEpoch == null && current.logoutState == null &&
-                current.cleanupCredential == null && current.active != null
+                // A completed earlier logout remains fenced after a new login.
+                // Only the newer authenticated epoch may advance its runtime scope.
+                current.ownerCancelEpoch?.let { operation.scope.authEpoch > it } != false &&
+                current.logoutState == null && current.cleanupCredential == null && current.active != null
             if (current.ownerScope != operation.scope &&
                 (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision &&
                     (current.ownerScope != null || hasCredentials)))
