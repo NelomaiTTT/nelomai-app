@@ -47,7 +47,7 @@ Assert ($global:Owned.Count -eq 0 -and $global:Excluded.Count -eq 0) 'Full clean
 # own the same exact DLL paths as the ordinary NSIS representation.
 $plainInstallDir = $env:NELOMAI_DEFENDER_INSTALL_DIR
 $plainPrivilegedDir = $env:NELOMAI_DEFENDER_PRIVILEGED_DIR
-$currentPaths = @($source, $stage, $final) | ForEach-Object { $_.Replace('0.2.16', '0.4.0') }
+$currentPaths = @($source, $stage, $final) | ForEach-Object { $_.Replace('0.2.16', '0.4.1') }
 foreach ($path in $currentPaths) { Invoke-Fixture 'add' $path }
 $ownershipNames = @($global:Owned.Keys | Sort-Object) -join ','
 try {

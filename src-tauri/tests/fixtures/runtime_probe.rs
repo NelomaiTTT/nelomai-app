@@ -42,14 +42,17 @@ fn main() {
             "DBUS_SESSION_BUS_ADDRESS",
             "LANG",
             "LC_ALL",
+            "NELOMAI_UPDATE_PROTOCOL",
         ]
         .contains(&name.as_str())
     }) as u8;
+    let wrong_update_protocol =
+        (std::env::var("NELOMAI_UPDATE_PROTOCOL").as_deref() != Ok("2")) as u8;
     let changed_xauthority = (cfg!(target_os = "linux")
         && std::env::var("XAUTHORITY").as_deref()
             != Ok("/tmp/nelomai-runtime-fixture.Xauthority")) as u8;
     native
-        .write_all(&[extra_args, unexpected_env | changed_xauthority])
+        .write_all(&[extra_args, unexpected_env | changed_xauthority | wrong_update_protocol])
         .unwrap();
     let _ = auth.read(&mut [0; 1]);
 }

@@ -19,7 +19,7 @@ on:
       version:
         description: "Проверяемая версия; исходники не переписываются"
         type: "string"
-        default: "0.4.0"
+        default: "0.4.1"
         required: true
       candidate_run_id:
         description: "Номер успешной sign_candidate сборки; повторные попытки поддерживаются"
@@ -79,7 +79,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -97,8 +97,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         name: "Pinned AmneziaWG source"
         run: |
@@ -166,7 +166,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -183,8 +183,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -237,7 +237,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -255,8 +255,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -335,7 +335,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -353,8 +353,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -421,7 +421,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -494,7 +494,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -512,8 +512,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -558,7 +558,7 @@ jobs:
         uses: "actions/upload-artifact@v4"
         id: "candidate"
         with:
-          name: "candidate-0.4.0"
+          name: "candidate-0.4.1"
           path: "finalized/candidate/"
           if-no-files-found: "error"
           overwrite: true
@@ -598,7 +598,7 @@ jobs:
           test "$SOURCE_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-          test "$RELEASE_VERSION" = 0.4.0
+          test "$RELEASE_VERSION" = 0.4.1
           python - <<'PY'
           import os
           lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -620,8 +620,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.4.0
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.0 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.4.1
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -655,8 +655,8 @@ jobs:
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
             --run-id "$CANDIDATE_RUN" --inventory-sha256 "$INVENTORY_SHA256"
-          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.4.0 --source-sha "$SOURCE_SHA"
+          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.4.1 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           expected_count=$(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print(len(g.PUBLISH_ASSETS))')
           test "${#assets[@]}" -eq "$expected_count"
-          gh release create v0.4.0 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.4.0" --notes "$RELEASE_NOTES"
+          gh release create v0.4.1 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.4.1" --notes "$RELEASE_NOTES"

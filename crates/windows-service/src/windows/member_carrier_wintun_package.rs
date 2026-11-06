@@ -714,6 +714,7 @@ fn pending_installation_root(source: &str) -> Option<&str> {
     [
         r"\runtime\engines\latest\0.3.3\wintun.dll",
         r"\runtime\engines\latest\0.4.0\wintun.dll",
+        r"\runtime\engines\latest\0.4.1\wintun.dll",
     ]
     .into_iter()
     .find_map(|suffix| {
@@ -2017,8 +2018,8 @@ pub(crate) mod native {
             bytes.truncate(length as usize);
             if bytes != [0, 0, 0, 0] {
                 // Keep the independently audited 0.3.3 layout and constrain
-                // candidate 0.4.0 to the same exact, test-reviewed layout.
-                // Native installed/pending-rename acceptance for 0.4.0 is UNRUN;
+                // candidates 0.4.0/0.4.1 to the same exact, test-reviewed layout.
+                // Native installed/pending-rename acceptance for 0.4.x is UNRUN;
                 // unknown layouts remain denied.
                 let source_path = final_path(source)?;
                 let source_text = source_path

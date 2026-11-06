@@ -166,8 +166,8 @@ class ReleaseAuthorizationTest(ArtifactFixture):
     def test_publishable_inventory_requires_every_exact_installer_digest(self):
         gates = module("release-candidate-gates")
         assets = {name: "d" * 64 for name in gates.PACKAGE_NAMES.values()}
-        assets.update({"nelomai-0.4.0-macos-aarch64.dmg": "d" * 64,
-                       "nelomai-0.4.0-macos-aarch64.dmg.sig": "e" * 64})
+        assets.update({"nelomai-0.4.1-macos-aarch64.dmg": "d" * 64,
+                       "nelomai-0.4.1-macos-aarch64.dmg.sig": "e" * 64})
         inventory = {"trust": "release", "mode": "sign_candidate", "source_sha": SOURCE,
                      "run_id": "42", "run_attempt": 1, "assets": assets,
                      "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12,

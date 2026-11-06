@@ -1,4 +1,4 @@
-"""Verify an explicitly selected retained 0.4.0 candidate; no install or publish."""
+"""Verify an explicitly selected retained 0.4.1 candidate; no install or publish."""
 import argparse
 import base64
 import importlib.util
@@ -20,7 +20,7 @@ parser.add_argument('--artifact', type=int, required=True)
 args = parser.parse_args()
 APP, ROOT = args.app.resolve(strict=True), args.root.resolve(strict=True)
 REPO, RUN, SOURCE = args.repository, args.run, args.source
-VERSION = '0.4.0'
+VERSION = '0.4.1'
 RUNTIME_PUBLIC_KEY_B64 = 'WtTc6wVyswcmE5LC0PuOJ+XX82GTW+iPgs4yvZBP2YY='
 MACOS_PIN = 'dde0dd9b1f84cc24f8527fd6f50f95355b33c4ba'
 

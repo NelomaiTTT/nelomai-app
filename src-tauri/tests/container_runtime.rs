@@ -188,6 +188,8 @@ fn actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_f
                 "actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_fds"
             ])
             .env("NELOMAI_TASK9_LAUNCHER_FIXTURE", "1")
+            // The common host must set its own protocol, never inherit a stale one.
+            .env("NELOMAI_UPDATE_PROTOCOL", "1")
             .env(
                 "NELOMAI_TEST_REFRESH_SECRET",
                 "synthetic-not-a-real-refresh"

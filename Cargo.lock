@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-android-container"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-app"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-unix-service"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3117,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-windows-service"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

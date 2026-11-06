@@ -46,7 +46,7 @@ class DesktopCandidateVerifierTest(unittest.TestCase):
                     path=".github/workflows/checks.yml", repository={"full_name": repo}, head_repository={"full_name": repo}),
                 prefix + "/actions/runs/42/jobs?per_page=100": {"jobs": [
                     {"name": "publish", "conclusion": "skipped"}, {"name": "macos_common_sign", "conclusion": "success"}]},
-                prefix + "/git/matching-refs/tags/v0.4.0": [],
+                prefix + "/git/matching-refs/tags/v0.4.1": [],
                 prefix + "/releases?per_page=100&page=1": [],
                 prefix + "/actions/variables/NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64": {"value": public_key},
             }

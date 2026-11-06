@@ -164,6 +164,8 @@ fn pending_install_layout_is_exact_and_unknown_unicode_cannot_panic() {
         r"D:\custom\runtime\engines\latest\0.3.3\wintun.dll",
         r"D:\custom\runtime\engines\latest\0.4.0\wintun.dll",
         r"D:\custom\RUNTIME\ENGINES\LATEST\0.4.0\WINTUN.DLL",
+        r"D:\custom\runtime\engines\latest\0.4.1\wintun.dll",
+        r"D:\custom\RUNTIME\ENGINES\LATEST\0.4.1\WINTUN.DLL",
     ] {
         assert_eq!(pending_installation_root(source), Some(r"D:\custom"));
     }
@@ -172,10 +174,13 @@ fn pending_install_layout_is_exact_and_unknown_unicode_cannot_panic() {
         "😀".repeat(21),
         r"C:\wrong\wintun.dll".into(),
         r"D:\custom\runtime\engines\latest\0.3.4\wintun.dll".into(),
-        r"D:\custom\runtime\engines\latest\0.4.1\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.4.2\wintun.dll".into(),
         r"D:\custom\runtime\engines\latest\0.4.0-beta\wintun.dll".into(),
         r"D:\custom\runtime\engines\stable\0.4.0\wintun.dll".into(),
         r"D:\custom\runtime\engines\latest\0.4.0\wintun.dll.extra".into(),
+        r"D:\custom\runtime\engines\latest\0.4.1-beta\wintun.dll".into(),
+        r"D:\custom\runtime\engines\stable\0.4.1\wintun.dll".into(),
+        r"D:\custom\runtime\engines\latest\0.4.1\wintun.dll.extra".into(),
     ] {
         assert_eq!(pending_installation_root(&source), None);
     }
