@@ -48,6 +48,8 @@ pub(crate) struct Plan {
 pub(crate) enum Presence {
     Absent,
     Exact,
+    // PF can retain an owned subset; nftables applies the whole batch atomically.
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     OwnedPartial,
     Conflict,
 }
