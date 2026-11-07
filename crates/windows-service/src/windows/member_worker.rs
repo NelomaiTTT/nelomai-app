@@ -202,6 +202,104 @@ impl Journal {
         }
         Ok(())
     }
+    /// Current cleanup target, never an adopted live interface. A historical
+    /// numeric index can be reused by Windows; stable GUID/LUID/name and the
+    /// exact terminal Wintun provider must independently agree on a new index.
+    pub(crate) fn cold_interface(&self) -> io::Result<Option<InterfaceProof>> {
+        let Some(old) = self.current.interface else {
+            return Ok(None);
+        };
+        if !self.cold || self.retained.is_some() {
+            return Ok(Some(old));
+        }
+        use super::member_carrier_provider as provider;
+        let name = format!(
+            "NeloWorker-{}",
+            self.current.scope.session_id.get(..8).ok_or_else(failed)?
+        );
+        let recorded = provider::Expected {
+            guid: old.guid,
+            luid: old.luid,
+            index: old.index,
+            name: name.clone(),
+            description: "WireGuard Tunnel".into(),
+            if_type: 53,
+            tunnel_type: 0,
+        };
+        checked(provider::validate_expected(&recorded))?;
+        let rows = checked(provider::native::table())?;
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.identity.guid == old.guid
+                    || r.identity.luid == old.luid
+                    || r.identity.name.eq_ignore_ascii_case(&name)
+            })
+            .collect();
+        let Some(row) = matching.first() else {
+            return Ok(None);
+        };
+        if matching.len() != 1 {
+            return Err(failed());
+        }
+        let current = &row.identity;
+        if (
+            current.guid,
+            current.luid,
+            current.name.as_str(),
+            current.if_type,
+            current.tunnel_type,
+        ) != (old.guid, old.luid, name.as_str(), 53, 0)
+            || !crate::member_interface_description::matches_requested(
+                "WireGuard Tunnel",
+                &current.description,
+            )
+        {
+            return Err(failed());
+        }
+        let p = InterfaceProof {
+            guid: current.guid,
+            luid: current.luid,
+            index: current.index,
+        };
+        if p == old {
+            return Ok(Some(p));
+        }
+        let mut seen = checked(provider::native::interfaces(current))?;
+        checked(provider::validate_interfaces(current, &seen))?;
+        let targets = [provider::AbsenceTarget {
+            guid: old.guid,
+            name,
+        }];
+        let snapshot = checked(provider::native::device_snapshot(&targets))?;
+        for device in snapshot.nodes {
+            if checked(provider::device_related(&targets, &device))? {
+                seen.devices.push(device)
+            }
+        }
+        if seen.devices.is_empty() {
+            // A previous process may have completed DIF_REMOVE but lost the
+            // MIB-rundown ACK. No device/DNS write is authorized in this state;
+            // only the already recorded empty intents and bounded rundown.
+            if self.current.dns.is_some() || self.current.address.is_some() {
+                return Err(failed());
+            }
+            checked(provider::validate_retired_reindex(&recorded, &seen))?;
+        } else {
+            checked(provider::validate_phantom_reindex(&recorded, &seen))?;
+        }
+        let after = checked(provider::native::interfaces(current))?;
+        checked(provider::validate_interfaces(current, &after))?;
+        Ok(Some(p))
+    }
+    fn cold_routes_absence_only(&self) -> io::Result<bool> {
+        Ok(self.current.version == 1
+            || self.current.creator.is_none()
+            || self.current.process.is_none()
+            || self.current.boot != super::member_boot::boot_id()?
+            || self.current.runtime != *self.source.identity()
+            || self.cold_interface()? != self.current.interface)
+    }
     pub(crate) fn verify(&mut self) -> io::Result<()> {
         if self.initial_attempt.is_some() || self.closing_attempt.is_some() {
             return Err(failed());
@@ -255,14 +353,15 @@ impl Journal {
                     super::member_carrier_recovery::native::absent_process(*process)?;
                 }
             }
-            let gone = absent(
-                self.current.requested_guid,
-                if changed_boot {
-                    None
-                } else {
-                    self.current.interface
-                },
-            )?;
+            let cleanup_interface = if self.retained.is_none() {
+                self.cold_interface()?
+            } else {
+                self.current.interface
+            };
+            let gone = absent(self.current.requested_guid, cleanup_interface)?;
+            // Reindexed/retired mappings never authorize deleting historical
+            // route indices, including old physical routes after a restart.
+            let routes_absence_only = absence_only || cleanup_interface != self.current.interface;
             if (self.retirement_verified || absence_only) && !gone {
                 return Err(failed());
             }
@@ -302,7 +401,7 @@ impl Journal {
                         .current
                         .interface
                         .is_some_and(|p| p.index == route.interface)
-                        || absence_only
+                        || routes_absence_only
                     {
                         use crate::member_routes::RowIo;
                         if !super::member_routes::NativeRowIo
@@ -1068,11 +1167,7 @@ impl WorkerIdentity {
             self.journal.borrow_mut().verify()?;
             let journal = self.journal.borrow();
             let interface = journal.current.interface;
-            let absence_only = journal.current.version == 1
-                || journal.current.creator.is_none()
-                || journal.current.process.is_none()
-                || journal.current.boot != super::member_boot::boot_id()?
-                || journal.current.runtime != *journal.source.identity();
+            let absence_only = journal.cold_routes_absence_only()?;
             if absence_only || interface.is_some_and(|p| p.index == index) {
                 return Ok(None);
             }
@@ -1087,11 +1182,7 @@ impl NetworkSystem for WorkerIdentity {
             let interface = self.journal.borrow().current.interface;
             let absence_only = {
                 let journal = self.journal.borrow();
-                journal.current.version == 1
-                    || journal.current.creator.is_none()
-                    || journal.current.process.is_none()
-                    || journal.current.boot != super::member_boot::boot_id()?
-                    || journal.current.runtime != *journal.source.identity()
+                journal.cold_routes_absence_only()?
             };
             if absence_only
                 || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
@@ -1145,11 +1236,7 @@ impl NetworkSystem for WorkerIdentity {
             let interface = self.journal.borrow().current.interface;
             let absence_only = {
                 let journal = self.journal.borrow();
-                journal.current.version == 1
-                    || journal.current.creator.is_none()
-                    || journal.current.process.is_none()
-                    || journal.current.boot != super::member_boot::boot_id()?
-                    || journal.current.runtime != *journal.source.identity()
+                journal.cold_routes_absence_only()?
             };
             if absence_only
                 || matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(index)) if interface.is_some_and(|p| p.index == *index))
@@ -1525,7 +1612,12 @@ impl Control {
             let journal = journal.borrow();
             (
                 journal.current.scope.clone(),
-                journal.current.interface.ok_or_else(failed)?,
+                (if original.is_none() {
+                    journal.cold_interface()?
+                } else {
+                    journal.current.interface
+                })
+                .ok_or_else(failed)?,
             )
         };
         checked(super::member_dns::owned(
@@ -1586,7 +1678,7 @@ impl Control {
                 if code == 0 {
                     unsafe { FreeInterfaceDnsSettings(&mut settings) };
                 } else if code == windows_sys::Win32::Foundation::ERROR_NOT_FOUND
-                    && absent(state.current.requested_guid, Some(p))?
+                    && state.cold_interface()?.is_none()
                 {
                     state.save(|record| record.dns = None)?;
                     return Ok(());
@@ -1598,21 +1690,21 @@ impl Control {
             let actual = owner.snapshot().map_err(|e| {
                 crate::member_diagnostic::PairFailure::dns("worker_dns_restore_read", e)
             })?;
-            if actual != saved.current && saved.pending.as_ref() != Some(&actual) {
+            let expected = checked(actual.at_mapping(&saved.current.interface))?;
+            if expected != saved.current && saved.pending.as_ref() != Some(&expected) {
                 return Err(failed());
             }
+            let baseline = checked(saved.baseline.at_mapping(&actual.interface))?;
             journal.borrow_mut().save(|r| {
                 let dns = r.dns.as_mut().expect("retained DNS");
                 // Preserve the independently read predecessor even when an
                 // earlier Set ACK was lost and it was recorded only as pending.
-                dns.current = actual.clone();
+                dns.current = expected.clone();
                 dns.pending = Some(saved.baseline.clone());
             })?;
-            owner
-                .compare_exchange(&actual, &saved.baseline)
-                .map_err(|e| {
-                    crate::member_diagnostic::PairFailure::dns("worker_dns_restore_cas", e)
-                })?;
+            owner.compare_exchange(&actual, &baseline).map_err(|e| {
+                crate::member_diagnostic::PairFailure::dns("worker_dns_restore_cas", e)
+            })?;
             journal.borrow_mut().save(|r| r.dns = None)?;
         }
         Ok(())
@@ -1857,8 +1949,8 @@ impl member_dns::Identity for WorkerDns {
                 return Err(member_dns::DnsError::Ownership);
             }
             journal
-                .current
-                .interface
+                .cold_interface()
+                .map_err(|_| member_dns::DnsError::Ownership)?
                 .ok_or(member_dns::DnsError::Ownership)?
         };
         if interface.scope != self.scope

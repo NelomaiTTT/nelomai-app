@@ -158,6 +158,42 @@ pub(crate) fn validate_interfaces(want: &Expected, seen: &Observed) -> Result<()
     }
     validate_row(want, matches[0])
 }
+/// Read-only terminal facts; not ownership or permission to adopt a device.
+pub(crate) fn validate_phantom_reindex(recorded: &Expected, seen: &Observed) -> Result<Expected> {
+    let current = validate_reindex_mapping(recorded, seen)?;
+    validate_provider_device(&current, ProviderKind::Wintun, &seen.devices, true)?;
+    Ok(current)
+}
+fn validate_reindex_mapping(recorded: &Expected, seen: &Observed) -> Result<Expected> {
+    validate_expected(recorded)?;
+    let mut current = recorded.clone();
+    current.index = seen.by_guid.identity.index;
+    current.description = seen.by_guid.identity.description.clone();
+    if !crate::member_interface_description::matches_requested(
+        &recorded.description,
+        &current.description,
+    ) {
+        return Err(Error::Conflict("recorded interface description"));
+    }
+    validate_expected(&current)?;
+    validate_interfaces(&current, seen)?;
+    Ok(current)
+}
+// Read-only continuation facts after PnP removal. Not device-removal, DNS or
+// creation authority: the caller requires durable DNS/address completion and
+// the same protected cleanup owner. Full related census, never a filtered ACK.
+pub(crate) fn validate_retired_reindex(recorded: &Expected, seen: &Observed) -> Result<Expected> {
+    if !seen.devices.is_empty() {
+        return Err(Error::Conflict("PnP node not retired"));
+    }
+    validate_reindex_mapping(recorded, seen)
+}
+pub(crate) fn collides_identity(want: &Expected, row: &Interface) -> bool {
+    row.identity.guid == want.guid
+        || row.identity.luid == want.luid
+        || row.identity.name.eq_ignore_ascii_case(&want.name)
+}
+
 fn inf_name(inf: &str) -> bool {
     // Installed published INF basename, for main's independently authenticated
     // package comparison; never a caller-selected file to load or execute.

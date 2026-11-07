@@ -40,6 +40,7 @@ use windows_sys::Win32::Security::{
 const TUNNEL_CONFIG_FILE: &str = "nelomai.conf";
 const DIAGNOSTIC_LOG_FILE: &str = "service-diagnostics.log";
 const MAX_DIAGNOSTIC_LOG_SIZE: u64 = 64 * 1024;
+const MANAGER_RECOVERY_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -131,6 +132,19 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(platform_error("read previous dispatcher pointer", error)),
         };
+    if install_root
+        .join(nelomai_contracts::dispatcher::ACTIVE_ENGINE_NAME)
+        .try_exists()
+        .map_err(|error| platform_error("inspect ordinary repair marker", error))?
+    {
+        recover_same_layout_via_manager(
+            &installation,
+            &source,
+            &executable,
+            &installed_client_path,
+            &options.owner_sid,
+        )?;
+    }
     // Retain the registration across recovery/preflight failure. The prior
     // manager remains explicitly stopped and can be repaired/retried; only
     // activation below replaces its registration under the rollback path.
@@ -223,6 +237,11 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
 }
 
 fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
+    // Modern SCM defaults to 10s. Leave room for the manager's bounded 40s
+    // cleanup watchdog before Windows terminates it during preshutdown.
+    service
+        .set_preshutdown_timeout(MANAGER_RECOVERY_TIMEOUT)
+        .map_err(|error| platform_error("configure manager preshutdown timeout", error))?;
     service
         .update_failure_actions(ServiceFailureActions {
             reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
@@ -495,6 +514,54 @@ fn recover_stale_engine(
     result.map_err(|_| ServiceError::Backend("dispatcher_recovery_pending".into()))
 }
 
+/// The colocated installer remains unable to perform worker cleanup. Its
+/// same-layout repair starts the signed, precisely owned installed dispatcher,
+/// which already has the supported Engine recovery path, then stops it cleanly.
+fn recover_same_layout_via_manager(
+    installation: &nelomai_contracts::dispatcher::Installation,
+    source: &Path,
+    executable: &Path,
+    broker: &Path,
+    owner: &str,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let executable = fs::canonicalize(executable)
+        .map_err(|error| platform_error("resolve ordinary repair helper", error))?;
+    // Protect the actual incoming helper/manifest and old broker against
+    // replacement across every authentication and SCM edge. Full signed trees
+    // are independently authenticated by the portable routing helper below.
+    let incoming = super::member_files::pin_installed_files(&[
+        (executable.clone(), None),
+        (source.join(d::MANIFEST_NAME), None),
+        (source.join(d::SIGNATURE_NAME), Some(64)),
+        (broker.to_owned(), None),
+    ])
+    .map_err(|_| ServiceError::UnauthorizedClient)?;
+    crate::install_recovery::recover_same_layout_with_manager(
+        installation,
+        source,
+        &executable,
+        broker,
+        owner,
+        |layout| {
+            incoming.verify().map_err(|_| d::blocked())?;
+            manager_for_recovery(
+                || Ok(recovery_dispatcher_payload(layout)),
+                ManagerRecovery::Start,
+            )
+            .map_err(|_| d::blocked())?;
+            incoming.verify().map_err(|_| d::blocked())
+        },
+        |layout| {
+            incoming.verify().map_err(|_| d::blocked())?;
+            stop_manager_for_recovery(|| Ok(recovery_dispatcher_payload(layout)), false)
+                .map_err(|_| d::blocked())?;
+            incoming.verify().map_err(|_| d::blocked())
+        },
+    )
+    .map_err(|_| ServiceError::Backend("dispatcher_recovery_pending".into()))
+}
+
 fn recovery_dispatcher_payload(
     layout: &nelomai_contracts::dispatcher::VerifiedLayout,
 ) -> (PathBuf, u64, String) {
@@ -506,21 +573,42 @@ fn stop_manager_for_recovery(
     expected: impl FnOnce() -> Result<(PathBuf, u64, String), ServiceError>,
     delete: bool,
 ) -> Result<(), ServiceError> {
+    manager_for_recovery(
+        expected,
+        if delete {
+            ManagerRecovery::Delete
+        } else {
+            ManagerRecovery::Stop
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ManagerRecovery {
+    Start,
+    Stop,
+    Delete,
+}
+
+fn manager_for_recovery(
+    expected: impl FnOnce() -> Result<(PathBuf, u64, String), ServiceError>,
+    action: ManagerRecovery,
+) -> Result<(), ServiceError> {
     let manager = service_manager(ServiceManagerAccess::CONNECT)?;
     let service = match manager.open_service(
         MANAGER_SERVICE_NAME,
         ServiceAccess::QUERY_STATUS
             | ServiceAccess::QUERY_CONFIG
-            | ServiceAccess::STOP
-            | if delete {
-                ServiceAccess::DELETE
-            } else {
-                ServiceAccess::empty()
+            | match action {
+                ManagerRecovery::Start => ServiceAccess::START,
+                ManagerRecovery::Stop => ServiceAccess::STOP,
+                ManagerRecovery::Delete => ServiceAccess::STOP | ServiceAccess::DELETE,
             },
     ) {
         Ok(service) => service,
         Err(windows_service::Error::Winapi(error))
-            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32)
+                && !matches!(action, ManagerRecovery::Start) =>
         {
             return Ok(())
         }
@@ -553,15 +641,30 @@ fn stop_manager_for_recovery(
             .map_err(|_| ServiceError::UnauthorizedClient)
     };
     verify()?;
+    // One absolute SCM phase deadline includes the action and all status polls.
+    // Ordinary tunnel-service waits retain their separate, shorter budget.
+    let deadline = Instant::now() + MANAGER_RECOVERY_TIMEOUT;
     let status = service
         .query_status()
         .map_err(|error| platform_error("inspect manager for recovery", error))?;
-    if status.current_state != ServiceState::Stopped {
-        let _ = service.stop();
-        wait_until_stopped(&service)?;
+    match action {
+        ManagerRecovery::Start => {
+            if status.current_state == ServiceState::Stopped {
+                service
+                    .start(&[] as &[&str])
+                    .map_err(|error| platform_error("start owned recovery manager", error))?;
+            }
+            wait_until_running_until(&service, deadline)?;
+        }
+        ManagerRecovery::Stop | ManagerRecovery::Delete => {
+            if status.current_state != ServiceState::Stopped {
+                let _ = service.stop();
+                wait_until_stopped_until(&service, deadline)?;
+            }
+        }
     }
     verify()?;
-    if delete {
+    if matches!(action, ManagerRecovery::Delete) {
         service
             .delete()
             .map_err(|error| platform_error("delete owned manager", error))?;

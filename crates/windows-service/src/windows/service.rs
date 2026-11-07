@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+    ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_dispatcher;
@@ -37,17 +37,22 @@ pub(crate) struct RequestWatchdog {
 
 impl RequestWatchdog {
     pub(crate) fn arm() -> Result<Self, ServiceError> {
+        Self::arm_with_wakeup(None)
+    }
+    fn arm_stop() -> Result<Self, ServiceError> {
+        Self::arm_with_wakeup(Some(wake_server))
+    }
+    fn arm_with_wakeup(wake: Option<fn()>) -> Result<Self, ServiceError> {
         let completed = Arc::new((Mutex::new(false), Condvar::new()));
         let completed_for_thread = Arc::clone(&completed);
         std::thread::Builder::new()
             .name("nelomai-service-watchdog".to_string())
             .spawn(move || {
-                let (lock, condition) = &*completed_for_thread;
-                let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (guard, timeout) = condition
-                    .wait_timeout_while(guard, REQUEST_WATCHDOG_TIMEOUT, |completed| !*completed)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if timeout.timed_out() && !*guard {
+                if !crate::service_lifecycle::wait_for_completion(
+                    &completed_for_thread,
+                    REQUEST_WATCHDOG_TIMEOUT,
+                    wake,
+                ) {
                     record_service_diagnostic(
                         "manager request watchdog",
                         &ServiceError::Backend("service_timeout".to_string()),
@@ -61,7 +66,7 @@ impl RequestWatchdog {
         Ok(Self { completed })
     }
 
-    pub(crate) fn complete(self) {
+    pub(crate) fn complete(&self) {
         let (lock, condition) = &*self.completed;
         let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *completed = true;
@@ -159,22 +164,30 @@ fn manager_service_entry(_arguments: Vec<OsString>) {
 
 fn manager_service_loop() -> Result<(), ServiceError> {
     let stopping = Arc::new(AtomicBool::new(false));
-    let stopping_for_handler = Arc::clone(&stopping);
-    let status_handle =
-        service_control_handler::register(MANAGER_SERVICE_NAME, move |event| match event {
-            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            ServiceControl::Stop => {
-                stopping_for_handler.store(true, Ordering::Release);
-                wake_server();
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        })
-        .map_err(|error| platform_error("register manager service control handler", error))?;
-    crate::service_lifecycle::run(
+    let stop = Arc::new(crate::service_lifecycle::StopRequest::new(Arc::clone(
+        &stopping,
+    )));
+    let stop_for_handler = Arc::clone(&stop);
+    let status_handle = service_control_handler::register(MANAGER_SERVICE_NAME, move |event| {
+        // Start one overall deadline before waking the service loop: a
+        // current GUI/idle exchange cannot add another full cleanup budget.
+        if stop_for_handler.handle(
+            event.raw_service_control_type(),
+            RequestWatchdog::arm_stop,
+            wake_server,
+        ) {
+            ServiceControlHandlerResult::NoError
+        } else {
+            ServiceControlHandlerResult::NotImplemented
+        }
+    })
+    .map_err(|error| platform_error("register manager service control handler", error))?;
+    let result = crate::service_lifecycle::run(
         |status| set_status(&status_handle, status),
-        |report| serve_manager(stopping, report),
-    )
+        |report| serve_manager(stopping, report).and(stop.arm_result()),
+    );
+    // Keep the deadline armed through the final SCM status publication.
+    result.and(stop.finish(RequestWatchdog::complete))
 }
 
 fn serve_manager(
@@ -276,25 +289,30 @@ fn serve_manager(
             }
         }
     }
-    drop(idle_broker);
-    record_service_message("manager lifecycle", "SCM stop requested");
-    if let Ok(mut dispatcher) = owner.lock() {
-        let identity = dispatcher.layout.identity.clone();
-        let response = dispatcher.handle(
-            d::DispatcherRequest::Stop {
-                contract_version: 1,
-                identity,
-            },
-            &mut |action, engine| super::install::engine_primitive(action, engine),
-        );
-        if !response.ok {
-            record_service_message("dispatcher stop", "cleanup remains pending");
+    crate::service_lifecycle::stop(report, || {
+        // STOP_PENDING is visible before joining an in-flight idle exchange or
+        // taking the shared dispatcher lock. The first control's watchdog bounds
+        // all of these operations and the existing identity-checked Stop.
+        drop(idle_broker);
+        record_service_message("manager lifecycle", "SCM stop requested");
+        if let Ok(mut dispatcher) = owner.lock() {
+            let identity = dispatcher.layout.identity.clone();
+            let response = dispatcher.handle(
+                d::DispatcherRequest::Stop {
+                    contract_version: 1,
+                    identity,
+                },
+                &mut |action, engine| super::install::engine_primitive(action, engine),
+            );
+            if !response.ok {
+                record_service_message("dispatcher stop", "cleanup remains pending");
+                return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
+            }
+        } else {
             return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
         }
-    } else {
-        return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn serve_owned_frame(
@@ -490,10 +508,19 @@ fn set_status(
         ),
         Status::Running => (
             ServiceState::Running,
-            ServiceControlAccept::STOP,
+            // Preshutdown precedes normal service shutdown, preserving the
+            // native cleanup window configured for this service at install.
+            ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
             ServiceExitCode::Win32(0),
             0,
             Duration::ZERO,
+        ),
+        Status::StopPending => (
+            ServiceState::StopPending,
+            ServiceControlAccept::empty(),
+            ServiceExitCode::Win32(0),
+            1,
+            REQUEST_WATCHDOG_TIMEOUT,
         ),
         Status::Stopped { failed } => (
             ServiceState::Stopped,

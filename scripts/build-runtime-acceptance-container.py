@@ -280,7 +280,9 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         raise ValueError("staged runtime UI is missing")
     # Reuse the UI already compiled and authenticated with this runtime. Tauri
     # would otherwise run the repository's beforeBuildCommand a second time.
-    configuration["build"] = {"beforeBuildCommand": "", "frontendDist": str(webview.resolve())}
+    # Resolve from tauri.conf.json; absolute Windows drive paths parse as URLs.
+    configuration["build"] = {"beforeBuildCommand": "", "frontendDist":
+        "./" + Path(os.path.relpath(webview.resolve(), root / "src-tauri")).as_posix()}
     resources = configuration["bundle"]["resources"]
     configuration["bundle"]["resources"] = {
         str(staged / source.removeprefix("platform-runtime/desktop-bundle/"))

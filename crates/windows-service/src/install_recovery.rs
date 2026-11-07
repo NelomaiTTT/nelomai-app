@@ -52,6 +52,62 @@ impl RecoveryExecutable {
     }
 }
 
+/// Ordinary repair must route cleanup through the authenticated installed manager.
+/// Native callbacks retain the exact owned SCM service and signed payload pins.
+pub(crate) fn recover_same_layout_with_manager(
+    installation: &Installation,
+    source: &Path,
+    executable: &Path,
+    broker: &Path,
+    owner: &str,
+    start_owned: impl FnOnce(&VerifiedLayout) -> io::Result<()>,
+    stop_owned: impl FnOnce(&VerifiedLayout) -> io::Result<()>,
+) -> io::Result<()> {
+    let marker = installation.root.join(d::ACTIVE_ENGINE_NAME);
+    if !marker.try_exists()? {
+        return Ok(());
+    }
+    let authenticate = || -> io::Result<VerifiedLayout> {
+        // This verifies the actual incoming helper and BOTH complete signed
+        // trees. A valid incoming upgrade alone cannot authorize starting the
+        // old manager: ordinary repair requires the same manifest and broker.
+        let layout = installation.load_installer_recovery(
+            source,
+            executable,
+            nelomai_contracts::RuntimeSlot::Latest,
+        )?;
+        if installation.manifest_identity(source)? != layout.identity
+            || std::fs::canonicalize(broker)? != layout.broker.executable
+            || owner != layout.broker.owner
+        {
+            return Err(d::blocked());
+        }
+        Ok(layout)
+    };
+    let layout = authenticate()?;
+    let recheck = || -> io::Result<()> {
+        let current = authenticate()?;
+        if current.identity != layout.identity
+            || current.directory != layout.directory
+            || current.broker != layout.broker
+        {
+            return Err(d::blocked());
+        }
+        Ok(())
+    };
+    // The installed dispatcher delegates cold cleanup to its authenticated
+    // Engine. SCM Running is reported only after that recovery succeeds.
+    start_owned(&layout)?;
+    recheck()?;
+    stop_owned(&layout)?;
+    recheck()?;
+    // An SCM ACK is never enough to publish over an unresolved lifetime.
+    if marker.try_exists()? {
+        return Err(d::blocked());
+    }
+    Ok(())
+}
+
 /// Read-only SCM configuration comparison. A familiar service name alone is
 /// never authority to stop/delete a possibly foreign registration.
 pub(crate) fn require_owned_manager_command(

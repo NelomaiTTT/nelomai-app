@@ -7,6 +7,7 @@ import contextlib
 import io
 import subprocess
 import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, ROOT, module
@@ -140,23 +141,40 @@ class ReleaseSimplificationTest(ArtifactFixture):
 
     def test_desktop_wrapper_uses_staged_ui_without_tauri_before_build_hook(self):
         consumer = module("build-runtime-acceptance-container")
-        staged = self.root / "staged"
+        root = self.root / "source with spaces"
+        (root / "src-tauri").mkdir(parents=True)
+        staged = self.root / "staged payload"
         ui = staged / "runtime/engines/latest/0.2.20/webview"
         ui.mkdir(parents=True)
         (ui / "index.html").write_text("signed UI")
         (staged / "runtime/container-manifest-v1.json").write_text(json.dumps({
             "slots": [{"slot": "latest", "manifest": {"runtime_version": "0.2.20"}}]}))
-        output = self.root / "package"
+        # Windows packaging also requires the authenticated dispatcher metadata.
+        helper = staged / "dispatcher/1/nelomai-windows-service.exe"
+        helper.parent.mkdir(parents=True)
+        helper.write_bytes(b"staged dispatcher")
+        (staged / "runtime/container-manifest-v1.sig").write_bytes(b"staged signature")
 
         class NativeBuildReached(Exception):
             pass
 
-        with patch.object(consumer.subprocess, "run", side_effect=NativeBuildReached):
-            with self.assertRaises(NativeBuildReached):
-                consumer.package_desktop(staged, output, self.public, "macos", "aarch64", root=ROOT)
-        config = json.loads((output / "bundle-config.json").read_bytes())
-        self.assertEqual(config.get("build", {}).get("beforeBuildCommand"), "")
-        self.assertEqual(config["build"]["frontendDist"], str(ui.resolve()))
+        for platform, architecture in (("macos", "aarch64"), ("windows", "x86_64"), ("linux", "x86_64")):
+            with self.subTest(platform=platform):
+                shutil.copyfile(ROOT / "src-tauri" / f"bundle.{platform}.conf.json",
+                                root / "src-tauri" / f"bundle.{platform}.conf.json")
+                output = self.root / (platform + " package")
+                with patch.object(consumer.subprocess, "run", side_effect=NativeBuildReached):
+                    with self.assertRaises(NativeBuildReached):
+                        consumer.package_desktop(staged, output, self.public, platform, architecture, root=root)
+                config = json.loads((output / "bundle-config.json").read_bytes())
+                self.assertEqual(config.get("build", {}).get("beforeBuildCommand"), "")
+                frontend = config["build"]["frontendDist"]
+                # A Windows drive path is parsed as FrontendDist::Url (scheme "d"),
+                # so joining startup-failure.html panics instead of opening the error UI.
+                self.assertTrue(frontend.startswith("./"), frontend)
+                self.assertEqual(frontend, "./../../staged payload/runtime/engines/latest/0.2.20/webview")
+                self.assertEqual((root / "src-tauri" / frontend).resolve(), ui.resolve())
+                self.assertEqual((root / "src-tauri" / frontend / "index.html").read_bytes(), b"signed UI")
 
     def test_publication_selects_exact_retained_artifact_after_rerun(self):
         consumer = module("check-publication-inputs")

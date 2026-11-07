@@ -711,3 +711,207 @@ fn recovery_mutation_lock_replacement_after_cleanup_cannot_retire_marker() {
         bytes
     );
 }
+
+fn repair_installer(temp: &tempfile::TempDir) -> PathBuf {
+    let path = temp.path().join("nelomai-windows-service.exe");
+    fs::copy(
+        temp.path()
+            .join("source/engines/latest/0.3.3/nelomai-windows-service.exe"),
+        &path,
+    )
+    .unwrap();
+    fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn same_layout_repair_restarts_owned_manager_before_reinstall() {
+    use std::cell::RefCell;
+    let (temp, installation, marker) = fixture();
+    let executable = repair_installer(&temp);
+    let layout = installation.load().unwrap();
+    let events = RefCell::new(Vec::new());
+    recover_same_layout_with_manager(
+        &installation,
+        &temp.path().join("source"),
+        &executable,
+        &layout.broker.executable,
+        "S-1-5-21-1000",
+        |verified| {
+            assert_eq!(verified.identity, layout.identity);
+            assert_eq!(
+                fs::read(installation.root.join(d::ACTIVE_ENGINE_NAME)).unwrap(),
+                marker
+            );
+            events.borrow_mut().push("start-owned-manager");
+            // SCM is the only fake: a ready native manager has already completed
+            // the real Engine-role recovery before reporting Running.
+            fs::remove_file(installation.root.join(d::ACTIVE_ENGINE_NAME))
+        },
+        |verified| {
+            assert_eq!(verified.directory, layout.directory);
+            events.borrow_mut().push("stop-owned-manager");
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        *events.borrow(),
+        ["start-owned-manager", "stop-owned-manager"]
+    );
+    assert!(!installation.root.join(d::ACTIVE_ENGINE_NAME).exists());
+    // Retrying after completed cleanup performs no additional SCM effect.
+    recover_same_layout_with_manager(
+        &installation,
+        &temp.path().join("source"),
+        &executable,
+        &layout.broker.executable,
+        "S-1-5-21-1000",
+        |_| panic!("completed recovery must not restart SCM"),
+        |_| panic!("completed recovery must not stop SCM"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn same_layout_repair_rejects_untrusted_or_different_identity_before_scm() {
+    for fault in [
+        "incoming-identity",
+        "incoming-signature",
+        "incoming-file",
+        "helper",
+        "old-dispatcher",
+        "broker-path",
+        "owner",
+    ] {
+        let (temp, installation, marker) = fixture();
+        let executable = repair_installer(&temp);
+        let source = temp.path().join("source");
+        let layout = installation.load().unwrap();
+        let mut broker = layout.broker.executable.clone();
+        let mut owner = "S-1-5-21-1000";
+        match fault {
+            "incoming-identity" => {
+                // A valid signature and identical helper bytes are insufficient:
+                // an incoming upgrade cannot restart an old broker's manager.
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(&fs::read(source.join(d::MANIFEST_NAME)).unwrap())
+                        .unwrap();
+                manifest["container_version"] = json!("0.3.4");
+                let bytes = serde_json::to_vec(&manifest).unwrap();
+                let mut message = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+                message.extend(&bytes);
+                fs::write(source.join(d::MANIFEST_NAME), &bytes).unwrap();
+                fs::write(
+                    source.join(d::SIGNATURE_NAME),
+                    SigningKey::from_bytes(&[81; 32]).sign(&message).to_bytes(),
+                )
+                .unwrap();
+            }
+            "incoming-signature" => fs::write(source.join(d::SIGNATURE_NAME), [0; 64]).unwrap(),
+            "incoming-file" => fs::write(
+                source.join("engines/latest/0.3.3/nelomai-windows-service.exe"),
+                b"changed incoming",
+            )
+            .unwrap(),
+            "helper" => fs::write(&executable, b"changed incoming helper").unwrap(),
+            "old-dispatcher" => {
+                fs::write(layout.dispatcher_path(), b"changed old dispatcher").unwrap()
+            }
+            "broker-path" => {
+                broker = temp.path().join("other-broker.exe");
+                fs::write(&broker, b"broker").unwrap();
+            }
+            _ => owner = "S-1-5-21-9999",
+        }
+        assert!(
+            recover_same_layout_with_manager(
+                &installation,
+                &source,
+                &executable,
+                &broker,
+                owner,
+                |_| panic!("{fault}: unverified SCM start"),
+                |_| panic!("{fault}: unverified SCM stop"),
+            )
+            .is_err(),
+            "{fault}"
+        );
+        assert_eq!(
+            fs::read(installation.root.join(d::ACTIVE_ENGINE_NAME)).unwrap(),
+            marker,
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn same_layout_repair_rechecks_authority_after_manager_start() {
+    let (temp, installation, marker) = fixture();
+    let executable = repair_installer(&temp);
+    let layout = installation.load().unwrap();
+    assert!(recover_same_layout_with_manager(
+        &installation,
+        &temp.path().join("source"),
+        &executable,
+        &layout.broker.executable,
+        "S-1-5-21-1000",
+        |_| { fs::write(&layout.broker.executable, b"replaced broker") },
+        |_| panic!("changed broker must fence subsequent SCM stop"),
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(installation.root.join(d::ACTIVE_ENGINE_NAME)).unwrap(),
+        marker
+    );
+}
+
+#[test]
+fn same_layout_repair_keeps_unresolved_lifetime_and_propagates_scm_failure() {
+    use std::cell::Cell;
+    for failure in ["start", "stop", "retained-marker"] {
+        let (temp, installation, marker) = fixture();
+        let executable = repair_installer(&temp);
+        let layout = installation.load().unwrap();
+        let started = Cell::new(false);
+        let stopped = Cell::new(false);
+        let result = recover_same_layout_with_manager(
+            &installation,
+            &temp.path().join("source"),
+            &executable,
+            &layout.broker.executable,
+            "S-1-5-21-1000",
+            |_| {
+                started.set(true);
+                if failure == "start" {
+                    Err(io::Error::other("start failed"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                stopped.set(true);
+                if failure == "stop" {
+                    Err(io::Error::other("stop failed"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(result.is_err(), "{failure}");
+        assert!(started.get());
+        assert_eq!(stopped.get(), failure != "start");
+        assert_eq!(
+            fs::read(installation.root.join(d::ACTIVE_ENGINE_NAME)).unwrap(),
+            marker
+        );
+        // The existing publication fence remains authoritative after any failure.
+        assert!(installation
+            .install(
+                &temp.path().join("source"),
+                &layout.broker.executable,
+                "S-1-5-21-1000",
+                &d::RealInstallIo
+            )
+            .is_err());
+    }
+}

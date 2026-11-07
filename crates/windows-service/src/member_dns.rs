@@ -106,6 +106,22 @@ pub(crate) struct OwnedDns<I, A> {
 }
 
 impl Snapshot {
+    /// Translate only a numeric mapping already attested by the enclosing owner.
+    /// Persisted historical snapshots remain unchanged; this grants no ownership.
+    pub(crate) fn at_mapping(&self, current: &OwnedInterface) -> Result<Self> {
+        validate_interface(&self.interface)?;
+        validate_interface(current)?;
+        if self.interface.scope != current.scope
+            || self.interface.guid != current.guid
+            || self.interface.luid != current.luid
+        {
+            return Err(DnsError::Ownership);
+        }
+        let mut local = self.clone();
+        local.interface = current.clone();
+        Ok(local)
+    }
+
     /// Build a journalable desired value without IO. To restore an empty owned
     /// baseline, pass the original journaled Snapshot, not an empty server list.
     pub(crate) fn with_servers(&self, servers: &[IpAddr]) -> Result<Self> {
@@ -807,6 +823,57 @@ mod tests {
             Err(DnsError::Indeterminate)
         );
         assert_eq!(s.borrow().writes, 1);
+    }
+    #[test]
+    fn historical_dns_mapping_changes_only_index_and_keeps_the_journal() {
+        let mut saved = snap();
+        saved.interface.index = 72;
+        let mut current = saved.interface.clone();
+        current.index = 6;
+        let local = saved
+            .at_mapping(&current)
+            .expect("same stable interface at a fresh index");
+        assert_eq!(local.interface.index, 6);
+        assert_eq!(saved.interface.index, 72);
+        assert_eq!(local.settings, saved.settings);
+        for change in 0..4 {
+            let mut foreign = current.clone();
+            match change {
+                0 => foreign.guid = [3; 16],
+                1 => foreign.luid += 1,
+                2 => foreign.scope.connection_generation += 1,
+                _ => foreign.index = 0,
+            }
+            assert!(saved.at_mapping(&foreign).is_err());
+        }
+    }
+    #[test]
+    fn reindexed_dns_restore_retries_a_lost_write_ack_without_rewriting_history() {
+        let (mut owner, state) = adapter();
+        state.borrow_mut().ownership = Ownership::NewlyCreated;
+        let actual = owner.snapshot().unwrap();
+        let mut historical = actual.clone();
+        historical.interface.index = 72;
+        let mut baseline = historical.clone();
+        baseline.settings.name_server = None;
+        let pending = baseline.clone(); // existing write-ahead journal
+        let expected = actual.at_mapping(&historical.interface).unwrap();
+        assert_eq!(expected, historical);
+        let desired = pending.at_mapping(&actual.interface).unwrap();
+        state.borrow_mut().write_error = true;
+        assert_eq!(
+            owner.compare_exchange(&actual, &desired),
+            Err(DnsError::Indeterminate)
+        );
+        assert_eq!(state.borrow().writes, 1);
+        // A fresh retry accepts exactly the journaled pending predecessor.
+        state.borrow_mut().write_error = false;
+        let after = owner.snapshot().unwrap();
+        assert_eq!(after.at_mapping(&historical.interface).unwrap(), pending);
+        owner.compare_exchange(&after, &desired).unwrap();
+        assert_eq!(state.borrow().writes, 1);
+        assert_eq!(historical.interface.index, 72);
+        assert_eq!(baseline.interface.index, 72);
     }
 }
 

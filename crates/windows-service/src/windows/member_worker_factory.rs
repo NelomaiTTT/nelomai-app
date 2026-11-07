@@ -253,7 +253,7 @@ impl PairFactory for WorkerPairFactory {
                     if allow_effects && journal.borrow().current.interface.is_some() {
                         use super::member_carrier_provider as provider;
                         use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
-                        let (proof, expected) = {
+                        let (proof, expected, mapped) = {
                             let mut state = journal.borrow_mut();
                             state.verify()?;
                             if !state.cold
@@ -272,12 +272,13 @@ impl PairFactory for WorkerPairFactory {
                             {
                                 return Err(io::Error::other("worker_cold_PnP_authority"));
                             }
+                            let mapped = state.cold_interface()?;
                             (
-                                state
-                                    .current
-                                    .interface
+                                mapped
+                                    .or(state.current.interface)
                                     .ok_or_else(|| io::Error::other("worker_cold_PnP_identity"))?,
                                 state.expected.clone(),
+                                mapped.is_some(),
                             )
                         };
                         let targets = [provider::AbsenceTarget {
@@ -300,7 +301,12 @@ impl PairFactory for WorkerPairFactory {
                         })?;
                         let matching = rows
                             .iter()
-                            .filter(|row| provider::collides(&want, row))
+                            .filter(|row| {
+                                // An absent original never owns a reused historical
+                                // number. Full GUID/LUID/name and PnP absence still apply.
+                                provider::collides_identity(&want, row)
+                                    || (mapped && row.identity.index == want.index)
+                            })
                             .collect::<Vec<_>>();
                         if matching.len() > 1 {
                             return Err(io::Error::other("worker_cold_PnP_MIB_namespace"));
@@ -450,7 +456,10 @@ impl PairFactory for WorkerPairFactory {
                                 let rows = provider::native::table().map_err(|e| {
                                     io::Error::other(format!("worker_cold_PnP_MIB:{e:?}"))
                                 })?;
-                                if rows.iter().any(|row| provider::collides(&want, row)) {
+                                if rows
+                                    .iter()
+                                    .any(|row| provider::collides_identity(&want, row))
+                                {
                                     return Err(io::Error::other(
                                         "worker_cold_PnP_MIB_absence_changed",
                                     ));
@@ -557,11 +566,7 @@ impl PairFactory for WorkerPairFactory {
                             let journal = journal.borrow();
                             member_worker::absent(
                                 journal.current.requested_guid,
-                                if selected.changed_boot {
-                                    None
-                                } else {
-                                    journal.current.interface
-                                },
+                                journal.cold_interface()?,
                             )
                             .map_err(|e| context("worker_cold_MIB_absence", e))?
                         };

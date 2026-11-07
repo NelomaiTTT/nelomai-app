@@ -3507,3 +3507,94 @@ fn unrelated_physical_table_churn_does_not_become_provider_identity_evidence() {
     );
     assert_eq!(q.requested_targets, [vec![], vec![]]);
 }
+
+fn reindexed_phantom() -> (Expected, Observed) {
+    let mut old = expected();
+    old.index = 72;
+    let mut seen = observed();
+    for row in [
+        &mut seen.by_luid,
+        &mut seen.by_index,
+        &mut seen.by_guid,
+        &mut seen.interfaces[0],
+    ] {
+        row.identity.index = 6;
+    }
+    seen.devices[0].presence = Presence::Phantom;
+    seen.devices[0].status = 0;
+    // Windows has reused the historical index for an unrelated Wi-Fi filter.
+    let mut foreign = seen.interfaces[0].clone();
+    foreign.identity.guid = [91; 16];
+    foreign.identity.luid = (71 << 48) | (5 << 24);
+    foreign.identity.index = 72;
+    foreign.identity.name = "Wi-Fi Direct filter".into();
+    foreign.identity.if_type = 71;
+    seen.interfaces.push(foreign);
+    (old, seen)
+}
+#[test]
+fn phantom_reindex_uses_stable_identity_and_never_the_reused_old_index() {
+    let (old, seen) = reindexed_phantom();
+    let current = validate_phantom_reindex(&old, &seen).expect("exact retained phantom");
+    assert_eq!(current.index, 6);
+    assert_eq!(
+        (current.guid, current.luid, current.name),
+        (old.guid, old.luid, old.name)
+    );
+    assert_eq!(seen.interfaces[1].identity.index, 72);
+}
+#[test]
+fn phantom_reindex_rejects_changed_identity_live_devices_and_incomplete_facts() {
+    let (old, seen) = reindexed_phantom();
+    for change in 0..10 {
+        let mut bad = seen.clone();
+        match change {
+            0 => bad.by_guid.identity.guid = [19; 16],
+            1 => bad.by_guid.identity.luid += 1 << 24,
+            2 => bad.by_guid.identity.name.push('x'),
+            3 => bad.devices[0].presence = Presence::Present,
+            4 => bad.devices[0].status = 0x200a,
+            5 => bad.devices[0].problem = 45,
+            6 => bad.devices[0].driver.provider = "foreign".into(),
+            7 => bad.devices.push(bad.devices[0].clone()),
+            8 => bad.interfaces.push(bad.interfaces[0].clone()),
+            _ => bad.by_index.identity.index = 72,
+        }
+        assert!(
+            validate_phantom_reindex(&old, &bad).is_err(),
+            "changed fact {change}"
+        );
+    }
+    let mut wrong_record = old.clone();
+    wrong_record.guid = [20; 16];
+    assert!(validate_phantom_reindex(&wrong_record, &seen).is_err());
+    wrong_record = old;
+    wrong_record.luid += 1 << 24;
+    assert!(validate_phantom_reindex(&wrong_record, &seen).is_err());
+}
+
+#[test]
+fn retired_reindex_allows_only_exact_mapping_with_no_related_pnp_node() {
+    let (old, mut seen) = reindexed_phantom();
+    seen.devices.clear();
+    assert_eq!(validate_retired_reindex(&old, &seen).unwrap().index, 6);
+    seen.by_index.identity.guid = [30; 16];
+    assert!(validate_retired_reindex(&old, &seen).is_err());
+    let (old, seen) = reindexed_phantom();
+    assert!(validate_retired_reindex(&old, &seen).is_err());
+}
+#[test]
+fn retained_collision_does_not_treat_a_reused_historical_index_as_identity() {
+    let (old, seen) = reindexed_phantom();
+    assert!(!collides_identity(&old, &seen.interfaces[1]));
+    assert!(collides_identity(&old, &seen.interfaces[0]));
+    for change in 0..3 {
+        let mut row = seen.interfaces[1].clone();
+        match change {
+            0 => row.identity.guid = old.guid,
+            1 => row.identity.luid = old.luid,
+            _ => row.identity.name = old.name.clone(),
+        }
+        assert!(collides_identity(&old, &row));
+    }
+}
