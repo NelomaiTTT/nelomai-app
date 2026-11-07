@@ -2,13 +2,20 @@ package ru.nelomai.tunnel
 
 import android.content.ComponentName
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
 import android.service.quicksettings.TileService
+import android.os.Looper
+import androidx.core.content.ContextCompat
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
@@ -285,6 +292,15 @@ class QuickTilePublicationTest {
     @Test fun everyCommittedTransitionWakesTileEvenWithoutUiChangeFlag() {
         val context = RuntimeEnvironment.getApplication()
         val observed = mutableListOf<String?>()
+        val listening = mutableListOf<String?>()
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                listening += context.getSharedPreferences(
+                    AndroidRuntimeNamespace.record("nelomai-quick-tunnel-state"), 0).getString("state", null)
+            }
+        }
+        ContextCompat.registerReceiver(context, receiver,
+            IntentFilter("ru.nelomai.tunnel.QUICK_TILE_UPDATE"), ContextCompat.RECEIVER_NOT_EXPORTED)
         TileRefreshRecorder.onRequest = { ctx, component ->
             assertEquals("ru.nelomai.client.NelomaiQuickTileService", component.className)
             assertEquals(ctx.packageName, component.packageName)
@@ -296,10 +312,58 @@ class QuickTilePublicationTest {
                 for (state in listOf(SessionState.STARTING, SessionState.RUNNING,
                         SessionState.STOPPING, SessionState.STOPPED)) {
                     assertTrue(QuickTunnelController.updateState(context, state, changed = false))
+                    shadowOf(Looper.getMainLooper()).idle()
                 }
             }
             assertEquals(listOf("starting", "running", "stopping", "stopped",
                 "starting", "running", "stopping", "stopped"), observed)
+            assertEquals(listOf("starting", "running", "stopping", "stopped",
+                "starting", "running", "stopping", "stopped"), listening)
+        } finally {
+            context.unregisterReceiver(receiver)
+            TileRefreshRecorder.onRequest = { _, _ -> }
+        }
+    }
+
+    @Test fun tileRefreshDoesNotRaiseRetireOrAdvanceUiNotification() {
+        val context = RuntimeEnvironment.getApplication()
+        QuickStateChangeNotifications.initialize(context)
+        assertFalse(QuickStateChangeNotifications.gate.current())
+        assertTrue(QuickTunnelController.updateState(context, SessionState.STARTING, changed = false))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(0L, QuickTunnelController.takeStateChangeRevision(context))
+        assertFalse(QuickStateChangeNotifications.gate.current())
+        assertTrue(QuickTunnelController.updateState(context, SessionState.RUNNING, changed = true))
+        shadowOf(Looper.getMainLooper()).idle()
+        val revision = QuickTunnelController.takeStateChangeRevision(context)
+        assertTrue(revision > 0L)
+        assertTrue(QuickStateChangeNotifications.gate.current())
+        assertEquals(revision, QuickStateChangeNotifications.gate.snapshot())
+        assertTrue(QuickTunnelController.updateState(context, SessionState.STOPPED, changed = false))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(revision, QuickTunnelController.takeStateChangeRevision(context))
+        assertEquals(revision, QuickStateChangeNotifications.gate.snapshot())
+        assertTrue(QuickStateChangeNotifications.gate.current())
+        assertTrue(QuickTunnelController.acknowledgeStateChange(context, revision).saved)
+        QuickStateChangeNotifications.gate.acknowledgeThrough(revision)
+        assertTrue(QuickTunnelController.updateState(context, SessionState.RUNNING, changed = false))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(0L, QuickTunnelController.takeStateChangeRevision(context))
+        assertFalse(QuickStateChangeNotifications.gate.current())
+    }
+
+    @Test fun failedListeningBroadcastStillWakesSystemUiAndKeepsCommittedState() {
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun sendBroadcast(intent: Intent) { throw IllegalStateException("broadcast_unavailable") }
+        }
+        val observed = mutableListOf<String?>()
+        TileRefreshRecorder.onRequest = { ctx, _ ->
+            observed += ctx.getSharedPreferences(AndroidRuntimeNamespace.record("nelomai-quick-tunnel-state"), 0)
+                .getString("state", null)
+        }
+        try {
+            assertTrue(QuickTunnelController.updateState(context, SessionState.STOPPED, changed = false))
+            assertEquals(listOf("stopped"), observed)
         } finally { TileRefreshRecorder.onRequest = { _, _ -> } }
     }
 }

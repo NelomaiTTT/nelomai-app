@@ -1,6 +1,9 @@
 package ru.nelomai.client
 
 import android.content.Context
+import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import org.junit.Assert.assertEquals
@@ -25,6 +28,7 @@ import org.robolectric.util.ReflectionHelpers
 class QuickTileLoggingTest {
     @Before fun setUp() {
         TileSelectionShadow.result = Result.success(selection)
+        TileSelectionShadow.pending = null
         LoggingTileServiceShadow.tile = ReflectionHelpers.callConstructor(Tile::class.java)
         LoggingTileShadow.updates = 0
         ShadowLog.clear()
@@ -102,6 +106,128 @@ class QuickTileLoggingTest {
         controller.destroy()
     }
 
+    @Test fun listeningTilePublishesAsyncStopAndStartWithoutAnotherListeningCallback() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val handler = ReflectionHelpers.getField<Handler>(controller.get(), "mHandler")
+        handler.sendEmptyMessage(1) // Android MSG_START_LISTENING.
+        idle()
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        for ((state, tile) in listOf("stopping" to Tile.STATE_UNAVAILABLE,
+                "stopped" to Tile.STATE_INACTIVE, "starting" to Tile.STATE_UNAVAILABLE,
+                "running" to Tile.STATE_ACTIVE)) {
+            engineState(state)
+            stateChanged()
+            // Android ignores this duplicate while already listening.
+            handler.sendEmptyMessage(1)
+            idle()
+            assertEquals(tile, LoggingTileServiceShadow.tile?.state)
+        }
+        controller.destroy()
+    }
+
+    @Test fun listenerStopsAndResumesWithoutDuplicateSubscriptions() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val service = controller.get()
+        repeat(3) { service.onStartListening() }
+        val before = LoggingTileShadow.updates
+        stateChanged()
+        idle()
+        assertEquals(before + 1, LoggingTileShadow.updates)
+        service.onStopListening()
+        engineState("stopped")
+        stateChanged()
+        idle()
+        assertEquals(before + 1, LoggingTileShadow.updates)
+        service.onStartListening()
+        assertEquals(Tile.STATE_INACTIVE, LoggingTileServiceShadow.tile?.state)
+        val resumed = LoggingTileShadow.updates
+        stateChanged()
+        idle()
+        assertEquals(resumed + 1, LoggingTileShadow.updates)
+        controller.destroy()
+        stateChanged()
+        idle()
+        assertEquals(resumed + 1, LoggingTileShadow.updates)
+    }
+
+    @Test fun oldListeningCallbackCannotPublishIntoANewerListeningSession() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val service = controller.get()
+        TileSelectionShadow.pending = mutableListOf()
+        service.onStartListening()
+        val old = TileSelectionShadow.pending!!.removeAt(0)
+        service.onStopListening()
+        service.onStartListening()
+        val current = TileSelectionShadow.pending!!.removeAt(0)
+        engineState("stopped")
+        current(Result.success(selection))
+        assertEquals(Tile.STATE_INACTIVE, LoggingTileServiceShadow.tile?.state)
+        val before = LoggingTileShadow.updates
+        engineState("running")
+        old(Result.success(selection))
+        assertEquals(before, LoggingTileShadow.updates)
+        assertEquals(Tile.STATE_INACTIVE, LoggingTileServiceShadow.tile?.state)
+        controller.destroy()
+    }
+
+    @Test fun pendingStateCallbackCannotPublishAfterDestroy() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        TileSelectionShadow.pending = mutableListOf()
+        controller.get().onStartListening()
+        val pending = TileSelectionShadow.pending!!.removeAt(0)
+        controller.destroy()
+        val before = LoggingTileShadow.updates
+        pending(Result.success(selection))
+        assertEquals(before, LoggingTileShadow.updates)
+    }
+
+    @Test fun oldToggleFailureCannotDisableANewerListeningSession() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val service = controller.get()
+        service.onStartListening()
+        TileSelectionShadow.pending = mutableListOf()
+        ReflectionHelpers.callInstanceMethod<Void>(service, "dispatchOrOpen")
+        val old = TileSelectionShadow.pending!!.removeAt(0)
+        service.onStopListening()
+        TileSelectionShadow.pending = null
+        service.onStartListening()
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        val before = LoggingTileShadow.updates
+        old(Result.failure(IllegalStateException("old_owner_read_failed")))
+        assertEquals(before, LoggingTileShadow.updates)
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        controller.destroy()
+    }
+
+    @Test fun realProducerRefreshesListeningTileWithoutUiChangeFlag() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val handler = ReflectionHelpers.getField<Handler>(controller.get(), "mHandler")
+        handler.sendEmptyMessage(1)
+        idle()
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        // Module-internal producer, with real persistence and notifications.
+        val type = Class.forName("ru.nelomai.tunnel.QuickTunnelController")
+        val method = type.declaredMethods.single { it.name.startsWith("updateState") && it.parameterCount == 4 }
+        val states = Class.forName("ru.nelomai.tunnel.SessionState").enumConstants
+        for ((name, tile) in listOf("STOPPED" to Tile.STATE_INACTIVE,
+                "STARTING" to Tile.STATE_UNAVAILABLE, "RUNNING" to Tile.STATE_ACTIVE)) {
+            assertEquals(true, method.invoke(type.getField("INSTANCE").get(null),
+                RuntimeEnvironment.getApplication(), states.single { (it as Enum<*>).name == name }, null, false))
+            // A second SystemUI listening request alone cannot deliver the update.
+            handler.sendEmptyMessage(1)
+            idle()
+            assertEquals(tile, LoggingTileServiceShadow.tile?.state)
+        }
+        controller.destroy()
+    }
+
+    private fun stateChanged() {
+        val context = RuntimeEnvironment.getApplication()
+        context.sendBroadcast(Intent("ru.nelomai.tunnel.STATE_CHANGED").setPackage(context.packageName))
+    }
+
+    private fun idle() = org.robolectric.Shadows.shadowOf(Looper.getMainLooper()).idle()
+
     private fun messages() = ShadowLog.getLogsForTag("NelomaiTile")
         .filter { it.msg.startsWith("state.updated") }.map { it.msg }
 
@@ -120,9 +246,15 @@ class QuickTileLoggingTest {
 // Only the owner Binder and SystemUI endpoints are replaced; tile logic and runtime state reads are real.
 @Implements(RuntimeSelectionStore::class)
 class TileSelectionShadow {
-    @Implementation fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) { callback(result) }
+    @Implementation fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) {
+        pending?.let { it.add(callback); return }
+        callback(result)
+    }
     @Implementation fun close() = Unit
-    companion object { var result: Result<RuntimeSelectionV1> = Result.failure(IllegalStateException()) }
+    companion object {
+        var result: Result<RuntimeSelectionV1> = Result.failure(IllegalStateException())
+        var pending: MutableList<(Result<RuntimeSelectionV1>) -> Unit>? = null
+    }
 }
 
 @Implements(TileService::class)
