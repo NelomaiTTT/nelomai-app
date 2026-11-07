@@ -10,7 +10,6 @@ import android.os.Message
 import android.os.Messenger
 import android.os.Process
 import android.os.Bundle
-import android.os.ResultReceiver
 import android.os.Handler
 import android.os.Looper
 import ru.nelomai.runtime.v1.RuntimeNativeBridgeV1
@@ -105,21 +104,20 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         val remaining = expiresAt - System.currentTimeMillis()
         require(remaining in 1..10_000)
         val done = CompletableFuture<Unit>()
-        val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
-            override fun onReceiveResult(code: Int, data: Bundle?) {
-                if (code == 1 && data != null) done.complete(Unit)
-                else done.completeExceptionally(IllegalStateException("background_owner_scope_mismatch"))
-            }
-        }
+        val receiver = Messenger(Handler(Looper.getMainLooper()) { reply ->
+            if (reply.what == 1) done.complete(Unit)
+            else done.completeExceptionally(IllegalStateException("background_owner_scope_mismatch"))
+            true
+        })
         // A preparation probe must not advance the started VPN service's
         // startId: stable still owns its pending Start/Stop and idle callbacks.
         val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
                 try {
                     Messenger(requireNotNull(binder)).send(Message.obtain(null, 1).apply {
+                        replyTo = receiver
                         data = Bundle().apply {
                             putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request)
-                            putParcelable("result_receiver", receiver)
                         }
                     })
                 } catch (error: Exception) { done.completeExceptionally(error) }

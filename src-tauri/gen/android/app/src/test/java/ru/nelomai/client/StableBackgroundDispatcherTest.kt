@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.os.ResultReceiver
 import android.os.Messenger
 import android.os.Message
+import android.os.Parcel
 import android.os.Looper
 import org.robolectric.Shadows.shadowOf
 import org.json.JSONObject
@@ -66,14 +67,21 @@ class StableBackgroundDispatcherTest {
     private fun dispatch(service: RuntimeVpnDispatcherService, wire: String): Pair<Int, Bundle?> {
         val previousEngine = ReflectionHelpers.getField<Any?>(service, "engine")
         var result: Pair<Int, Bundle?>? = null
-        val receiver = object : ResultReceiver(null) {
-            override fun onReceiveResult(code: Int, data: Bundle?) { result = code to data }
+        val receiver = Messenger(android.os.Handler(Looper.getMainLooper()) { reply ->
+            result = reply.what to reply.data
+            true
+        })
+        val request = Message.obtain(null, 1).apply {
+            replyTo = receiver
+            data = Bundle().apply { putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, wire) }
         }
-        Messenger(service.onBind(Intent(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND))).send(
-            Message.obtain(null, 1).apply { data = Bundle().apply {
-                putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, wire)
-                putParcelable("result_receiver", receiver)
-            } })
+        val parcel = Parcel.obtain()
+        val transferred = try {
+            request.writeToParcel(parcel, 0)
+            parcel.setDataPosition(0)
+            Message.CREATOR.createFromParcel(parcel)
+        } finally { parcel.recycle() }
+        Messenger(service.onBind(Intent(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND))).send(transferred)
         shadowOf(Looper.getMainLooper()).idle()
         assertSame(previousEngine, ReflectionHelpers.getField<Any?>(service, "engine"))
         return requireNotNull(result)
@@ -117,17 +125,15 @@ class StableBackgroundDispatcherTest {
         val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
         val before = StableEnvelopeIoShadow.bytes!!.clone()
         var replied = false
-        val receiver = object : ResultReceiver(null) {
-            override fun onReceiveResult(code: Int, data: Bundle?) { replied = true }
-        }
+        val receiver = Messenger(android.os.Handler(Looper.getMainLooper()) { replied = true; true })
         val previous = android.os.Binder.getCallingUid()
         try {
             org.robolectric.shadows.ShadowBinder.setCallingUid(android.os.Process.myUid() + 1)
             Messenger(controller.get().onBind(Intent(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND))).send(
-                Message.obtain(null, 1).apply { data = Bundle().apply {
-                    putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request())
-                    putParcelable("result_receiver", receiver)
-                } })
+                Message.obtain(null, 1).apply {
+                    replyTo = receiver
+                    data = Bundle().apply { putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request()) }
+                })
         } finally { org.robolectric.shadows.ShadowBinder.setCallingUid(previous) }
         shadowOf(Looper.getMainLooper()).idle()
         assertFalse(replied)
