@@ -416,7 +416,8 @@ internal class BackgroundCredentialStore(
             ) throw MutationFailure("background_owner_cancelled")
             val hasCredentials = current.deviceId != null || current.installSecret != null ||
                 current.active != null || current.pending != null || current.cleanupCredential != null
-            val finalizedClean = current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
+            val finalizedClean = (current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED ||
+                (current.logoutState == null && current.ownerCancelEpoch != null)) &&
                 current.installSecret == null && current.active == null && current.previous == null &&
                 current.pending == null && current.reservation == null && current.cleanupCredential == null &&
                 (current.ownerScope == null || operation.scope.authEpoch > current.ownerScope.authEpoch)
@@ -438,29 +439,56 @@ internal class BackgroundCredentialStore(
             // before the completed other-slot hop, only through bearer provisioning.
             // Unfinished mutations remain durable for the provision dispatcher;
             // logout and cleanup state remain fenced.
+            val unissued = current.installSecret == null && current.active == null && current.previous == null &&
+                current.pending == null && current.reservation == null && current.cleanupCredential == null
             val successorProvision = provision != null && provision.ownerScope == operation.scope &&
                 current.ownerScope?.let {
                     operation.scope.isSuccessorOf(it, operation.provisionPredecessor)
                 } == true &&
-                provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
-                current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
-                provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
+                provision.deviceId == operation.scope.deviceId && (unissued || current.deviceId == provision.deviceId) &&
+                ((unissued && current.panelBase == null) || current.panelBase == provision.panelBase) && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() && (unissued || current.installSecret == provision.installSecret) &&
                 // A completed earlier logout remains fenced after a new login.
                 // Only the newer authenticated epoch may advance its runtime scope.
                 current.ownerCancelEpoch?.let { operation.scope.authEpoch > it } != false &&
-                current.logoutState == null && current.cleanupCredential == null && current.active != null
+                (current.logoutState == null || unissued) && current.cleanupCredential == null &&
+                (current.active != null || unissued)
+            // Logout in the other slot revokes this retained token without
+            // rewriting its namespace. A strictly newer authenticated login
+            // may re-enrol it, but never replay old recovery or unfinished work.
+            val newLoginProvision = provision != null && provision.ownerScope == operation.scope &&
+                current.ownerScope?.let {
+                    operation.scope.authEpoch > it.authEpoch && operation.scope.deviceId == it.deviceId &&
+                        operation.scope.slot == it.slot && operation.scope.runtimeVersion == it.runtimeVersion &&
+                        operation.scope.runtimeContractVersion == it.runtimeContractVersion &&
+                        operation.scope.sessionGeneration > it.sessionGeneration
+                } == true &&
+                operation.provisionPredecessor?.let {
+                    it.authEpoch == operation.scope.authEpoch && it.deviceId == operation.scope.deviceId &&
+                        it.slot != operation.scope.slot && it.sessionGeneration == operation.scope.sessionGeneration - 1 &&
+                        it.sessionGeneration > requireNotNull(current.ownerScope).sessionGeneration
+                } == true &&
+                provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
+                current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
+                current.logoutState == null && current.cleanupCredential == null &&
+                current.pending == null && current.reservation == null && current.active != null
             if (current.ownerScope != operation.scope &&
-                (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision &&
+                (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision && !newLoginProvision &&
                     (current.ownerScope != null || hasCredentials)))
             ) throw MutationFailure("background_owner_scope_mismatch")
             if (current.ownerOperation == operation) return@mutate current
             if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
             current.copy(revision = current.revision.incrementRevision(), ownerScope = operation.scope,
                 ownerOperation = operation, ownerAttempt = operation.attempt,
-                requiresFreshProvision = current.requiresFreshProvision || legacyProvision || successorProvision,
+                requiresFreshProvision = current.requiresFreshProvision || legacyProvision || successorProvision || newLoginProvision,
                 // Retain the proof for owner-checked recovery/cleanup, but force
                 // bearer reprovision instead of treating it as a fresh token.
-                active = if (legacyProvision || successorProvision) {
+                // Completed other-slot admission in a new login retired the
+                // old token. It cannot authorize cleanup for this new login if
+                // fresh issuance fails; any new staged issuance stays durable.
+                previous = if (newLoginProvision) null else current.previous,
+                active = if (newLoginProvision) null else if (legacyProvision || successorProvision) {
                     current.active?.copy(expiresAtUnix = 1)
                 } else current.active)
         }
