@@ -133,13 +133,16 @@ class StableBackgroundProvisionTest {
     }
 
     @Test fun retainedStableGetsFreshProvisionOnlyAfterOldEngineExit() {
+        for (epoch in listOf(3L, 5L)) {
+        val next = operation.copy(scope = target.copy(authEpoch = epoch),
+            provisionPredecessor = source.copy(authEpoch = epoch))
         val backend = MemoryBackend(seed())
-        assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepare(backend, request(), true, 1000) }
+        assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepare(backend, request(next), true, 1000) }
         assertEquals(seed(), backend.envelope())
         assertEquals(0, backend.writes)
-        assertTrue(StableBackgroundProvision.prepare(backend, request(), false, 1000))
+        assertTrue(StableBackgroundProvision.prepare(backend, request(next), false, 1000))
         val prepared = backend.envelope()
-        assertEquals(target, prepared.ownerScope)
+        assertEquals(next.scope, prepared.ownerScope)
         assertEquals(3L, prepared.revision)
         assertEquals(1L, prepared.ownerAttempt)
         assertNull(prepared.ownerOperation)
@@ -149,9 +152,91 @@ class StableBackgroundProvisionTest {
         assertEquals(1L, prepared.installGeneration)
         // A crash before dispatch leaves a durable empty current scope. Retry
         // cannot restore the revoked token or repeatedly advance its revision.
-        assertTrue(StableBackgroundProvision.prepare(backend, request(), true, 1000))
+        assertTrue(StableBackgroundProvision.prepare(backend, request(next), true, 1000))
         assertEquals(prepared, backend.envelope())
         assertEquals(1, backend.writes)
+        }
+    }
+
+    @Test fun retainedStableFromOlderLoginCannotDiscardPendingWorkOrOwnerFences() {
+        val login = operation.copy(scope = target.copy(authEpoch = 5),
+            provisionPredecessor = source.copy(authEpoch = 5))
+        val records = listOf(seed().copy(ownerCancelEpoch = 5),
+            seed().copy(ownerAttempt = 3), seed().copy(cleanupCredential = seed().active),
+            seed().copy(active = null, cleanupCredential = seed().active,
+                logoutState = BackgroundLogoutState("logout", 1, BackgroundLogoutPhase.PENDING)),
+            seed().copy(reservation = BackgroundMutationReservation("prepare", "activate", device, 3000)),
+            seed().copy(reservation = BackgroundMutationReservation("prepare", "activate", device, 3000),
+                pending = BackgroundPendingToken("staged", 3000, 2, "prepare", "activate", 1)),
+            seed().copy(ownerScope = retained.copy(deviceId = "99999999-9999-4999-8999-999999999999")))
+        for (record in records) {
+            val backend = MemoryBackend(record)
+            assertThrows(IllegalArgumentException::class.java) {
+                StableBackgroundProvision.prepare(backend, retiredRequest(login), false, 1000)
+            }
+            assertEquals(record, backend.envelope())
+            assertEquals(0, backend.writes)
+        }
+    }
+
+    @Test fun emptyNotOwnedLogoutRetiresOldScopeForAuthenticatedLoginWithoutResumeProof() {
+        val record = seed().copy(active = null, installSecret = null, ownerCancelEpoch = 4)
+        val login = operation.copy(scope = target.copy(authEpoch = 5, family = "new-login"), provisionPredecessor = null)
+        val backend = MemoryBackend(record)
+        assertTrue(StableBackgroundProvision.prepare(backend, request(login), false, 1000))
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(login), false) { floor, _, _ -> floor })
+        val empty = backend.envelope()
+        assertNull(empty.ownerScope)
+        assertNull(empty.deviceId)
+        assertNull(empty.panelBase)
+        assertEquals(4L, empty.ownerCancelEpoch)
+        assertEquals(record.ownerAttempt, empty.ownerAttempt)
+        assertTrue(empty.requiresFreshProvision)
+        assertTrue(StableBackgroundProvision.prepare(backend, request(login), false, 1000))
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(login), true) { floor, _, _ -> floor })
+        assertEquals(empty, backend.envelope())
+        // Native admission can precede a lost/failed issuance. Its current
+        // empty owner is not an old NotOwned identity to retire again.
+        val store = BackgroundCredentialStore(backend, nowMillis = { 1000 })
+        val admitted = (store.beginOwnerOperation(empty.revision, login, false) as CredentialStoreResult.Success).value
+        assertTrue(StableBackgroundProvision.prepare(backend, request(login), true, 1000))
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(login), true) { floor, _, _ -> floor })
+        assertEquals(admitted, backend.envelope())
+        val returned = login.copy(attempt = 4, scope = login.scope.copy(sessionGeneration = 11),
+            provisionPredecessor = login.scope.copy(slot = "latest", runtimeVersion = "0.3.5", sessionGeneration = 10))
+        assertTrue(StableBackgroundProvision.prepare(backend, request(returned), false, 1000))
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(returned), false) { floor, _, _ -> floor })
+        assertNull(backend.envelope().ownerScope)
+        assertEquals(admitted.ownerAttempt, backend.envelope().ownerAttempt)
+    }
+
+    @Test fun historicalFinalizedCurrentOwnerCanRetryItsUnissuedLoginAfterRestartOrSlotHop() {
+        for (roundtrip in listOf(false, true)) {
+            val record = seed().copy(active = null, installSecret = null, ownerCancelEpoch = 4,
+                logoutState = BackgroundLogoutState("old-logout", 1, BackgroundLogoutPhase.FINALIZED))
+            val login = operation.copy(scope = target.copy(authEpoch = 5, family = "current-login"), provisionPredecessor = null)
+            val backend = MemoryBackend(record)
+            // Same admission written by the pinned engine before its network
+            // issuance. No configure/reservation/receipt follows the failure.
+            val store = BackgroundCredentialStore(backend, nowMillis = { 1000 })
+            val admitted = (store.beginOwnerOperation(record.revision, login, false) as CredentialStoreResult.Success).value
+            assertEquals(login.scope, admitted.ownerScope)
+            assertEquals(BackgroundLogoutPhase.FINALIZED, admitted.logoutState?.phase)
+            val retry = if (roundtrip) login.copy(attempt = 4, scope = login.scope.copy(sessionGeneration = 11),
+                provisionPredecessor = login.scope.copy(slot = "latest", runtimeVersion = "0.3.5", sessionGeneration = 10))
+                else login.copy(attempt = 4)
+            assertTrue(StableBackgroundProvision.prepare(backend, request(retry), false, 1000))
+            StableBackgroundProvision.prepareEngine(backend) { error("retained receipt is not an active enrollment") }
+            assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(retry), false) { floor, _, _ -> floor })
+            val empty = backend.envelope()
+            assertNull(empty.ownerScope)
+            assertNull(empty.logoutState)
+            assertEquals(2L, empty.installGeneration)
+            assertEquals(4L, empty.ownerCancelEpoch)
+            assertEquals(admitted.ownerAttempt, empty.ownerAttempt)
+            assertTrue(store.beginOwnerOperation(empty.revision, login, false) is CredentialStoreResult.Failure)
+            assertTrue(store.beginOwnerOperation(empty.revision, retry, false) is CredentialStoreResult.Success)
+        }
     }
 
     @Test fun completedLogoutLeavesNewLoginAdmissionToStableWithoutRewriting() {
@@ -339,7 +424,7 @@ class StableBackgroundProvisionTest {
     }
 
     @Test fun finalizedStableGenerationCannotBePreparedForAnOldOrCancelledLogin() {
-        for ((scope, fence) in listOf(target to 2L, target.copy(authEpoch = 4) to 4L)) {
+        for ((scope, fence) in listOf(target.copy(authEpoch = 2) to 2L, target.copy(authEpoch = 4) to 4L, target to null)) {
             val record = seed().copy(active = null, installSecret = null, ownerCancelEpoch = fence,
                 logoutState = BackgroundLogoutState("old-logout", 1, BackgroundLogoutPhase.FINALIZED))
             val backend = MemoryBackend(record)

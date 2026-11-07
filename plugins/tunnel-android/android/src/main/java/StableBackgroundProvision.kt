@@ -64,7 +64,8 @@ object StableBackgroundProvision {
     internal fun prepareGeneration(backend: EncryptedRecordBackend, request: String,
         engineLoaded: Boolean, reserve: (Long, String, Boolean) -> Long?): Boolean {
         val input = JSONObject(request)
-        val scope = NativeOwnerOperation.fromJson(JSONObject(input.getString("owner_operation"))).scope
+        val operation = NativeOwnerOperation.fromJson(JSONObject(input.getString("owner_operation")))
+        val scope = operation.scope
         require(scope.slot == "stable" && scope.runtimeContractVersion == 1L)
         require(input.getString("device_id") == scope.deviceId)
         require(input.getString("access_token").isNotBlank() && input.getString("install_secret").isNotBlank())
@@ -73,18 +74,27 @@ object StableBackgroundProvision {
             finally { bytes?.fill(0) }
         require(current.logoutState?.phase != BackgroundLogoutPhase.PENDING)
         val finalized = current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED
-        require(finalized || current.deviceId == null || current.deviceId == scope.deviceId)
+        val emptyNotOwned = current.logoutState == null && current.ownerCancelEpoch != null &&
+            (current.ownerScope?.let { scope.authEpoch > it.authEpoch } ?: (current.deviceId != null)) &&
+            current.installSecret == null && current.active == null && current.previous == null &&
+            current.pending == null && current.reservation == null && current.cleanupCredential == null
+        val retired = finalized || emptyNotOwned
+        require(retired || current.deviceId == null || current.deviceId == scope.deviceId)
         require(current.installSecret == null || current.installSecret == input.getString("install_secret"))
         require(current.ownerCancelEpoch?.let { scope.authEpoch > it } != false)
-        if (finalized) {
+        if (retired) {
             require(current.installSecret == null && current.pending == null && current.reservation == null)
-            require(current.ownerScope == null || scope.authEpoch > current.ownerScope.authEpoch)
+            // Old stable may have admitted this login before its bearer
+            // issuance failed, while still retaining the prior FINALIZED marker.
+            val currentUnissuedLogin = current.ownerCancelEpoch?.let { scope.authEpoch > it } == true &&
+                current.ownerScope?.let { scope == it || scope.isSuccessorOf(it, operation.provisionPredecessor) } == true
+            require(current.ownerScope == null || scope.authEpoch > current.ownerScope.authEpoch || currentUnissuedLogin)
         }
         val floor = maxOf(current.installGeneration ?: 0, current.logoutState?.installGeneration ?: 0)
         val minimum = if (finalized) Math.addExact(floor, 1) else floor
         val generation = reserve(minimum, generationKey(scope.runtimeVersion), !engineLoaded)
         check(generation != null) { "background_generation_unprepared" }
-        if (!finalized && current.installGeneration == generation) return true
+        if (!retired && current.installGeneration == generation) return true
         // FINALIZED fences credentials, not legacy foreground Start. An engine
         // may already own a live tunnel: defer counter migration until its normal
         // idle process recycle instead of asking the owner to force-kill :vpn.
@@ -93,12 +103,12 @@ object StableBackgroundProvision {
         // binds the new owner later; interruption/logout before that stays
         // recoverable. Preserve the generation and attempt/cancel fences.
         val prepared = current.copy(revision = Math.addExact(current.revision, 1), installGeneration = generation,
-            logoutState = if (finalized) null else current.logoutState,
-            deviceId = if (finalized) null else current.deviceId,
-            panelBase = if (finalized) null else current.panelBase,
-            ownerScope = if (finalized) null else current.ownerScope,
-            ownerOperation = if (finalized) null else current.ownerOperation,
-            requiresFreshProvision = current.requiresFreshProvision || finalized)
+            logoutState = if (retired) null else current.logoutState,
+            deviceId = if (retired) null else current.deviceId,
+            panelBase = if (retired) null else current.panelBase,
+            ownerScope = if (retired) null else current.ownerScope,
+            ownerOperation = if (retired) null else current.ownerOperation,
+            requiresFreshProvision = current.requiresFreshProvision || retired)
         val encoded = BackgroundCredentialEnvelopeCodec.encode(prepared)
         try { check(backend.write(encoded)) { "background_credential_persist_failed" } }
         finally { encoded.fill(0) }
@@ -121,24 +131,33 @@ object StableBackgroundProvision {
         if (retained == scope) return true
         // Authorize a newer login here; generation preparation retires the
         // completed marker before the immutable engine reads its counter.
-        if (current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
+        if ((current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED ||
+            (current.logoutState == null && current.ownerCancelEpoch?.let { scope.authEpoch > it } == true)) &&
             current.installSecret == null && current.active == null && current.previous == null &&
             current.pending == null && current.reservation == null && current.cleanupCredential == null &&
-            scope.authEpoch > retained.authEpoch) return true
+            (scope.authEpoch > retained.authEpoch ||
+                (current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
+                    current.ownerCancelEpoch?.let { scope.authEpoch > it } == true &&
+                    scope.isSuccessorOf(retained, operation.provisionPredecessor)))) return true
         val source = requireNotNull(operation.provisionPredecessor)
         require(source.slot == "latest" && source.authEpoch == scope.authEpoch &&
             source.deviceId == scope.deviceId && source.sessionGeneration == scope.sessionGeneration - 1)
         require(retained.slot == scope.slot && retained.runtimeVersion == scope.runtimeVersion &&
             retained.runtimeContractVersion == scope.runtimeContractVersion)
         require(retained.sessionGeneration < source.sessionGeneration)
-        require(scope.isSuccessorOf(retained, source))
-        require(current.deviceId == scope.deviceId && input.getString("device_id") == scope.deviceId)
-        require(current.panelBase == "https://nelomai.ru")
+        val newLogin = scope.authEpoch > retained.authEpoch && scope.deviceId == retained.deviceId
+        require(scope.isSuccessorOf(retained, source) || newLogin)
+        val unissued = current.deviceId == null && current.panelBase == null && current.installSecret == null &&
+            current.active == null && current.previous == null && current.pending == null &&
+            current.reservation == null && current.cleanupCredential == null && current.logoutState == null
+        require((unissued || current.deviceId == scope.deviceId) && input.getString("device_id") == scope.deviceId)
+        require(unissued || current.panelBase == "https://nelomai.ru")
         require(input.getString("access_token").isNotBlank())
-        require(current.installSecret != null && current.installSecret == input.getString("install_secret"))
+        require(unissued || (current.installSecret != null && current.installSecret == input.getString("install_secret")))
         require(operation.attempt > current.ownerAttempt)
         require(current.ownerCancelEpoch?.let { scope.authEpoch > it } != false &&
             current.logoutState == null && current.cleanupCredential == null)
+        require(!newLogin || (current.pending == null && current.reservation == null))
         if (current.pending != null || current.reservation != null) {
             // These IDs come only from the protected common owner's exact CLEAN
             // receipt + completed resume. That server transaction revokes all
@@ -155,7 +174,7 @@ object StableBackgroundProvision {
         // its revoked result. Retire the confirmed old projections atomically;
         // immutable stable must provision again with the current bearer.
         val prepared = current.copy(revision = Math.addExact(current.revision, 1),
-            ownerScope = scope, ownerOperation = null, active = null, previous = null,
+            ownerScope = if (unissued) null else scope, ownerOperation = null, active = null, previous = null,
             pending = null, reservation = null)
         val bytes = BackgroundCredentialEnvelopeCodec.encode(prepared)
         try { check(backend.write(bytes)) { "background_credential_persist_failed" } }
