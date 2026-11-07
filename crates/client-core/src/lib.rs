@@ -1956,7 +1956,13 @@ where
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.set_phase(phase_for_api_error(&error)).await;
+                // Android's owner recovers an expired access token after this
+                // preflight. Publishing SignedOut now strands concurrent UI
+                // polling on the login screen before that recovery completes.
+                // The ordinary bootstrap still publishes a final auth refusal.
+                if !matches!(error, CoreApiError::Unauthorized) {
+                    self.set_phase(phase_for_api_error(&error)).await;
+                }
                 return Err(error.into());
             }
         };

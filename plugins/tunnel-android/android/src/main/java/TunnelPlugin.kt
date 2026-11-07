@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.SystemClock
@@ -39,6 +40,7 @@ import org.json.JSONObject
 internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
+private const val QUICK_TILE_UPDATE = "ru.nelomai.tunnel.QUICK_TILE_UPDATE"
 private const val TUNNEL_OPERATION_WATCHDOG_MILLIS = 40_000L
 private const val METRICS_OPERATION_WATCHDOG_MILLIS = 1_500L
 private const val UDP_REBIND_QUEUE_TIMEOUT_MILLIS = 500L
@@ -2852,6 +2854,13 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         fun refreshQuickTile(context: Context) {
+            // requestListeningState does not re-enter an already listening tile.
+            // This wakeup must not advance or acknowledge the UI-change revision.
+            runCatching {
+                context.sendBroadcast(Intent(QUICK_TILE_UPDATE).setPackage(context.packageName))
+            }.onFailure { error ->
+                TunnelLog.warning("quick_state.tile_broadcast_failed", error = error)
+            }
             TileService.requestListeningState(
                 context,
                 ComponentName(context.packageName, QUICK_TILE_SERVICE),

@@ -2695,25 +2695,127 @@ async fn bootstrap_refreshes_an_expired_access_token_without_signing_out() {
 #[tokio::test(flavor = "current_thread")]
 async fn bootstrap_without_refresh_preserves_a_stale_session_for_external_recovery() {
     let api = Arc::new(MockApi::new(0));
-    api.reject_stale_bootstrap.store(true, Ordering::SeqCst);
+    let running = connection("22222222-2222-4222-8222-222222222222");
+    *api.bootstrap_connection.lock().unwrap() = Some(running.clone());
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
     let store = Arc::new(MemoryStore::new(auth()));
     let core = support::core(
         api.clone(),
         store.clone(),
-        Arc::new(MemoryTunnel::default()),
+        tunnel.clone(),
         Arc::new(MemoryLogger::default()),
     );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    let before = core.state().await;
+    assert_eq!(before.phase, Phase::Connected);
+    api.reject_stale_bootstrap.store(true, Ordering::SeqCst);
 
-    let error = core
-        .bootstrap_without_refresh(1_700_000_000)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, CoreError::SignedOut));
+    for _ in 0..2 {
+        let error = core
+            .bootstrap_without_refresh(1_700_000_001)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::SignedOut));
+        // This is an external-recovery preflight, not an authoritative logout.
+        // A concurrent UI poll must keep Stop available until recovery settles.
+        assert_eq!(core.state().await, before);
+    }
     assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 0);
     let stored = store.load().unwrap().unwrap();
     assert_eq!(stored.access_token.as_deref(), Some("stale-access"));
     assert_eq!(stored.refresh_token.as_deref(), Some("refresh-secret"));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+
+    // The existing ordinary fallback can still refresh and restore the same VPN.
+    core.bootstrap(1_700_000_002).await.unwrap();
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    assert_eq!(core.state().await.connection, Some(running));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_without_refresh_preserves_authoritative_non_auth_failures() {
+    for (error, expected) in [
+        (CoreApiError::AccessExpired, Phase::AccessExpired),
+        (
+            CoreApiError::Rejected {
+                code: "request_rejected".into(),
+                message: "Rejected".into(),
+                retry_after_seconds: None,
+            },
+            Phase::Error,
+        ),
+        (CoreApiError::Retryable, Phase::ServerUnavailable),
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        api.bootstrap_binding_without_connection
+            .store(true, Ordering::SeqCst);
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        assert_eq!(core.state().await.phase, Phase::Ready);
+        *api.bootstrap_error.lock().unwrap() = Some(error);
+        assert!(core.bootstrap_without_refresh(1_700_000_001).await.is_err());
+        assert_eq!(core.state().await.phase, expected);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_final_unauthorized_after_refresh_still_signs_out() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    *api.bootstrap_error.lock().unwrap() = Some(CoreApiError::Unauthorized);
+    assert!(matches!(
+        core.bootstrap_without_refresh(1_700_000_001).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(matches!(
+        core.bootstrap(1_700_000_002).await,
+        Err(CoreError::SignedOut)
+    ));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_without_refresh_cannot_restore_state_after_concurrent_logout() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    api.reject_stale_bootstrap.store(true, Ordering::SeqCst);
+    api.hold_bootstrap.store(true, Ordering::SeqCst);
+    let pending = core.bootstrap_without_refresh(1_700_000_001);
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = api.bootstrap_entered.notified() => {},
+        result = &mut pending => panic!("bootstrap must be held: {result:?}"),
+    }
+    core.sign_out().await.unwrap();
+    api.release_bootstrap.notify_one();
+    assert!(matches!(pending.await, Err(CoreError::StartCancelled)));
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
 }
 
 #[tokio::test(flavor = "current_thread")]
