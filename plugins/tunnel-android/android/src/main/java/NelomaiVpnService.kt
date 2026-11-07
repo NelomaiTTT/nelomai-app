@@ -6085,6 +6085,10 @@ internal class AndroidLogoutCoordinator(
         }
         val deviceId = envelope.deviceId ?: return AndroidLogoutStep.RETRY
         val installSecret = envelope.installSecret ?: return AndroidLogoutStep.RETRY
+        // Reissue/write failures can leave a newer tuple in SharedPreferences'
+        // cache. Never send it until this exact marker has a successful commit.
+        if (credentialStore.persistPendingLogout(envelope.revision, logout.operationId)
+            is CredentialStoreResult.Failure) return AndroidLogoutStep.RETRY
         val accepted = try {
             finalize(
                 cleanupCredential,
@@ -6093,6 +6097,11 @@ internal class AndroidLogoutCoordinator(
                 logout.operationId,
                 installSecret,
             )
+        } catch (error: BackgroundConnectionException) {
+            if (error.code == "operation_id_conflict") {
+                credentialStore.reissueRejectedLogout(envelope.revision, logout.operationId, operationId())
+            }
+            return AndroidLogoutStep.RETRY
         } catch (_: Throwable) {
             return AndroidLogoutStep.RETRY
         }
