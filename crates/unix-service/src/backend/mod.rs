@@ -1,4 +1,6 @@
 #[cfg(any(target_os = "linux", test))]
+mod forward_nat_reply;
+#[cfg(any(target_os = "linux", test))]
 mod kernel_rebind;
 #[cfg(target_os = "linux")]
 mod linux;

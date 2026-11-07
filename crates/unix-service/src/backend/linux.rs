@@ -25,6 +25,12 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct LinuxBackend {
     mode: ResourceMode,
+    forward_nat: crate::forward_nat::Owner<
+        crate::forward_nat::linux::Adapter<crate::forward_nat::NativeCommands>,
+    >,
+    nat_refresh_at: Option<Instant>,
+    nat_unavailable: bool,
+    nat_interface: Option<(String, u32)>,
     member_owner: Option<LinuxOwner>,
     member_receive: RefCell<Option<crate::member_network::counters::ReceiveCounter>>,
     wireguard_api: WGApi<Kernel>,
@@ -88,6 +94,13 @@ impl LinuxBackend {
                 .map_err(backend_error)?;
         let mut amneziawg_routes = LinuxUserspaceRouteManager::new(&runtime_directory)?;
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
+        let forward_nat = crate::forward_nat::Owner::open(
+            &runtime_directory,
+            &boot_identity()?,
+            0,
+            crate::forward_nat::linux::Adapter::new(crate::forward_nat::NativeCommands::default()),
+        )
+        .map_err(backend_error)?;
         // Reopened members expose cleanup only. Never adopt or configure a
         // resource by name, and never reconstruct a running session from disk.
         let wireguard_host = if mode.owns_network() {
@@ -118,9 +131,10 @@ impl LinuxBackend {
             }
             None
         };
-        let state = if member_owner
-            .as_ref()
-            .is_some_and(LinuxOwner::cleanup_pending)
+        let state = if forward_nat.is_recovering()
+            || member_owner
+                .as_ref()
+                .is_some_and(LinuxOwner::cleanup_pending)
         {
             ServiceTunnelState::Stopping
         } else if active_transport.is_some() {
@@ -143,6 +157,10 @@ impl LinuxBackend {
         );
         Ok(Self {
             mode,
+            forward_nat,
+            nat_refresh_at: None,
+            nat_unavailable: false,
+            nat_interface: None,
             member_owner,
             member_receive: RefCell::new(None),
             wireguard_api,
@@ -163,7 +181,8 @@ impl LinuxBackend {
         configuration: &ParsedConfiguration,
         options: &DesktopTunnelOptions,
     ) -> Result<(), ServiceError> {
-        if self.active_transport.is_some()
+        if self.forward_nat.has_resources()
+            || self.active_transport.is_some()
             || self.amneziawg_routes.has_routes()
             || self.routes.has_routes()
         {
@@ -219,9 +238,14 @@ impl LinuxBackend {
             }
         }
         self.active_transport = Some(configuration.transport);
-        if self.member_owner.is_some() {
-            self.member_interface_index()?;
+        let configured_interface_index = kernel_interface_index(interface_name)?;
+        if configured_interface_index == 0
+            || (self.member_owner.is_some()
+                && self.member_interface_index()? != configured_interface_index)
+        {
+            return Err(backend_error("owned_vpn_interface_changed"));
         }
+        self.nat_interface = Some((interface_name.into(), configured_interface_index));
 
         let configured = configure_interface_after_awg3(
             configuration.awg3.as_ref(),
@@ -290,11 +314,72 @@ impl LinuxBackend {
             let _ = self.stop_inner();
             return Err(error);
         }
+        if kernel_interface_index(interface_name)? != configured_interface_index
+            || (self.member_owner.is_some()
+                && self.member_interface_index()? != configured_interface_index)
+        {
+            return Err(backend_error("owned_vpn_interface_changed"));
+        }
+        super::forward_nat_reply::enable_owned_reply_path(
+            interface_name,
+            configured_interface_index,
+        )
+        .map_err(backend_error)?;
+        self.refresh_forward_nat()?;
         self.rebind_peers = rebind_peers_for_start(configuration, self.mode);
         Ok(())
     }
 
+    fn refresh_forward_nat(&mut self) -> Result<(), ServiceError> {
+        let Some(transport) = self.active_transport else {
+            return Ok(());
+        };
+        let Some((name, index)) = self.nat_interface.clone() else {
+            return Ok(());
+        };
+        if self.mode.linux_interface(transport) != name || kernel_interface_index(&name)? != index {
+            return Err(backend_error("vm_nat_interface_changed"));
+        }
+        self.read_active_interface()?;
+        if self.member_owner.is_some() && self.member_interface_index()? != index {
+            return Err(backend_error("vm_nat_interface_changed"));
+        }
+        match self.forward_nat.refresh(&name, index) {
+            Ok(()) => {
+                self.nat_unavailable = false;
+                Ok(())
+            }
+            Err(error)
+                if !self.forward_nat.has_resources()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                // NAT compatibility is optional on custom PF/minimal Linux hosts.
+                // Never disable an otherwise working host VPN for an absent tool.
+                if !self.nat_unavailable {
+                    self.diagnostics
+                        .record("vm_nat_unavailable", "native_support_unavailable");
+                }
+                self.nat_unavailable = true;
+                Ok(())
+            }
+            Err(error) => Err(backend_error(error)),
+        }
+    }
+
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        let nat = self.forward_nat.cleanup().map_err(backend_error);
+        let native = self.stop_native_inner();
+        if native.is_ok() {
+            self.nat_interface = None;
+        }
+        self.nat_refresh_at = None;
+        nat.and(native)
+    }
+
+    fn stop_native_inner(&mut self) -> Result<(), ServiceError> {
         // Monitoring never grants cleanup authority and must not pin the link.
         self.member_receive.get_mut().take();
         if let Some(owner) = &mut self.member_owner {
@@ -592,9 +677,11 @@ impl ServiceTunnelBackend for LinuxBackend {
         self.member_owner.as_ref().map(|owner| owner.scope.clone())
     }
     fn member_cleanup_pending(&self) -> bool {
-        self.member_owner
-            .as_ref()
-            .is_some_and(LinuxOwner::cleanup_pending)
+        self.forward_nat.is_recovering()
+            || self
+                .member_owner
+                .as_ref()
+                .is_some_and(LinuxOwner::cleanup_pending)
     }
     fn member_slot(&self) -> Option<TunnelSlot> {
         match self.mode {
@@ -702,6 +789,9 @@ impl ServiceTunnelBackend for LinuxBackend {
     }
 
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.forward_nat.is_recovering() {
+            return Ok(ServiceTunnelState::Stopping);
+        }
         if self.member_cleanup_pending() && self.active_transport.is_none() {
             return Ok(ServiceTunnelState::Stopping);
         }
@@ -716,6 +806,18 @@ impl ServiceTunnelBackend for LinuxBackend {
         } else {
             Ok(ServiceTunnelState::Failed)
         }
+    }
+
+    fn tick(&mut self, _now_ms: u64) -> Result<(), ServiceError> {
+        if self.state != ServiceTunnelState::Running
+            || self
+                .nat_refresh_at
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(2))
+        {
+            return Ok(());
+        }
+        self.nat_refresh_at = Some(Instant::now());
+        self.refresh_forward_nat()
     }
 
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {

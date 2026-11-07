@@ -23,6 +23,7 @@ pub struct SessionNativePair<B, N, S> {
     scope: SessionScope,
     network: SessionNetwork<B, N, S>,
     options: Option<nelomai_client_tunnel::DesktopTunnelOptions>,
+    native_tick_clock: std::time::Instant,
 }
 
 impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionNativePair<B, N, S> {
@@ -31,6 +32,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             scope,
             network,
             options: None,
+            native_tick_clock: std::time::Instant::now(),
         };
         pair.check_scope(&pair.scope)?;
         Ok(pair)
@@ -263,6 +265,17 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> NativePa
     for SessionNativePair<B, N, S>
 {
     type Socket = NativeProbeSocket;
+    fn check_integrity(&mut self) -> io::Result<()> {
+        self.check_scope(&self.scope)?;
+        let now = self
+            .native_tick_clock
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.network
+            .tick_member_backends(now)
+            .map_err(|error| self.network.operation_error(Stage::Network, error))
+    }
     fn sample(&mut self, slot: Slot) -> Option<NativeHealthSample> {
         let epoch_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -920,6 +933,33 @@ mod tests {
         assert!(PairControl::remove_standby(&mut pair, &wrong, Slot::B).is_err());
         assert!(PairControl::rebind_pair(&mut pair, &wrong).is_err());
         assert!(state.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn nat_integrity_keeps_native_health_and_promotion_available_after_member_loss() {
+        for missing in [TunnelSlot::A, TunnelSlot::B] {
+            let (mut pair, state) = setup();
+            pair.network
+                .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+                .unwrap();
+            {
+                let mut s = state.borrow_mut();
+                s.calls.clear();
+                s.absent_slot = Some(missing);
+            }
+            // This exact Unix bridge is invoked before the shared health tick.
+            NativePair::check_integrity(&mut pair).unwrap();
+            let (dead, survivor) = if missing == TunnelSlot::A {
+                (Slot::A, Slot::B)
+            } else {
+                (Slot::B, Slot::A)
+            };
+            assert!(pair.sample_at(dead, NOW).is_none());
+            assert!(pair.sample_at(survivor, NOW).is_some());
+            NativePair::select_active(&mut pair, &scope(), survivor).unwrap();
+            assert_eq!(pair.network.active(), Some(survivor));
+            assert!(!state.borrow().calls.contains(&"stop"));
+        }
     }
 
     #[test]

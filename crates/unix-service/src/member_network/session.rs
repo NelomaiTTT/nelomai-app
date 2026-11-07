@@ -111,6 +111,13 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                         .into_iter()
                         .any(|s| self.members.cleanup_needed(s))))
     }
+    pub(crate) fn tick_member_backends(&mut self, now: u64) -> Result<(), ServiceError> {
+        if self.closing || self.network.active().is_none() {
+            return Ok(());
+        }
+        self.members.tick_backends(&self.scope, now)
+    }
+
     pub fn members(&self) -> &SessionMembers<B> {
         &self.members
     }

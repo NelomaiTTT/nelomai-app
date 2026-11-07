@@ -33,11 +33,17 @@ const ENDPOINTS_STATE_FILE: &str = "endpoints-state.json";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 mod ordinary_routes;
-use crate::member_network::macos::NativeMacCommands;
+use crate::member_network::macos::{MacNetworkCommands, NativeMacCommands};
 use ordinary_routes::OrdinaryRoutes;
 
 pub struct MacosBackend {
     mode: ResourceMode,
+    forward_nat: crate::forward_nat::Owner<
+        crate::forward_nat::macos::Adapter<crate::forward_nat::NativeCommands>,
+    >,
+    nat_refresh_at: Option<Instant>,
+    nat_interface: Option<(String, u32)>,
+    nat_unavailable: bool,
     member_socket: Option<super::redundancy::SocketIdentity>,
     member_owner: Option<MemberOwner>,
     wireguard_go: PathBuf,
@@ -114,6 +120,13 @@ impl MacosBackend {
         } else {
             None
         };
+        let forward_nat = crate::forward_nat::Owner::open(
+            &runtime_directory,
+            &boot_identity()?,
+            0,
+            crate::forward_nat::macos::Adapter::new(crate::forward_nat::NativeCommands::default()),
+        )
+        .map_err(backend_error)?;
         let mut active_transport = None;
         let mut member_socket = None;
         let api = if let Some(owner) = &mut member_owner {
@@ -185,6 +198,7 @@ impl MacosBackend {
             Vec::new()
         };
         let state = if member_owner.as_ref().is_some_and(MemberOwner::stopping)
+            || forward_nat.is_recovering()
             || ordinary_routes
                 .as_ref()
                 .is_some_and(OrdinaryRoutes::has_resources)
@@ -206,6 +220,10 @@ impl MacosBackend {
         );
         let mut backend = Self {
             mode,
+            forward_nat,
+            nat_refresh_at: None,
+            nat_interface: None,
+            nat_unavailable: false,
             member_socket,
             member_owner,
             wireguard_go,
@@ -232,7 +250,8 @@ impl MacosBackend {
         configuration: &ParsedConfiguration,
         options: &DesktopTunnelOptions,
     ) -> Result<(), ServiceError> {
-        if self.api.is_some()
+        if self.forward_nat.has_resources()
+            || self.api.is_some()
             || self.dns_snapshot.is_some()
             || self.routes.has_routes()
             || self
@@ -304,6 +323,13 @@ impl MacosBackend {
         };
         self.endpoints = native.endpoints;
         self.api = Some(api);
+        let native_index = NativeMacCommands
+            .interface_index(&ifname)
+            .map_err(backend_error)?;
+        if native_index == 0 {
+            return Err(backend_error("vm_nat_interface_missing"));
+        }
+        self.nat_interface = Some((ifname.clone(), native_index));
         if !self.mode.owns_network() {
             self.member_socket = Some(super::redundancy::capture_userspace_member(&ifname)?);
             let owner = self.member_owner.as_mut().expect("member has owner");
@@ -382,11 +408,71 @@ impl MacosBackend {
                 return Err(error);
             }
         }
+        self.refresh_forward_nat()?;
         self.rebind_peers = rebind_peers_for_start(configuration, self.mode);
         Ok(())
     }
 
+    fn refresh_forward_nat(&mut self) -> Result<(), ServiceError> {
+        // A reopened ordinary UAPI alone is not fresh ownership of its utun.
+        // A new VPN Start captures the interface incarnation before configuring it.
+        let Some(binding) = self.nat_interface.as_ref() else {
+            return Ok(());
+        };
+        let Some(api) = self.api.as_ref() else {
+            return Ok(());
+        };
+        api.read_interface_data().map_err(backend_error)?;
+        let name = if let Some(owner) = &self.member_owner {
+            self.member_interface_index()?;
+            owner
+                .identity()
+                .ok_or_else(|| backend_error("vm_nat_identity_missing"))?
+                .interface
+                .clone()
+        } else {
+            read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?
+        };
+        let index = NativeMacCommands
+            .interface_index(&name)
+            .map_err(backend_error)?;
+        verify_nat_binding(binding, &name, index).map_err(backend_error)?;
+        match self.forward_nat.refresh(&name, index) {
+            Ok(()) => {
+                self.nat_unavailable = false;
+                Ok(())
+            }
+            Err(error)
+                if !self.forward_nat.has_resources()
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Unsupported | std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                // NAT compatibility is optional on custom PF/minimal Linux hosts.
+                // Never disable an otherwise working host VPN for an absent tool.
+                if !self.nat_unavailable {
+                    self.diagnostics
+                        .record("vm_nat_unavailable", "native_support_unavailable");
+                }
+                self.nat_unavailable = true;
+                Ok(())
+            }
+            Err(error) => Err(backend_error(error)),
+        }
+    }
+
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        let nat = self.forward_nat.cleanup().map_err(backend_error);
+        let native = self.stop_native_inner();
+        if native.is_ok() {
+            self.nat_interface = None;
+        }
+        self.nat_refresh_at = None;
+        nat.and(native)
+    }
+
+    fn stop_native_inner(&mut self) -> Result<(), ServiceError> {
         if let Some(owner) = &mut self.member_owner {
             let boot = boot_identity()?;
             owner
@@ -553,9 +639,11 @@ impl ServiceTunnelBackend for MacosBackend {
         self.member_owner.as_ref().map(|o| o.scope.clone())
     }
     fn member_cleanup_pending(&self) -> bool {
-        self.member_owner
-            .as_ref()
-            .is_some_and(MemberOwner::cleanup_pending)
+        self.forward_nat.is_recovering()
+            || self
+                .member_owner
+                .as_ref()
+                .is_some_and(MemberOwner::cleanup_pending)
     }
     fn member_slot(&self) -> Option<TunnelSlot> {
         match self.mode {
@@ -636,6 +724,9 @@ impl ServiceTunnelBackend for MacosBackend {
     }
 
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.forward_nat.is_recovering() {
+            return Ok(ServiceTunnelState::Stopping);
+        }
         if let Some(api) = &self.api {
             if api.read_interface_data().is_err() {
                 return Ok(ServiceTunnelState::Failed);
@@ -651,6 +742,18 @@ impl ServiceTunnelBackend for MacosBackend {
             return Ok(ServiceTunnelState::Failed);
         }
         Ok(self.state)
+    }
+
+    fn tick(&mut self, _now_ms: u64) -> Result<(), ServiceError> {
+        if self.state != ServiceTunnelState::Running
+            || self
+                .nat_refresh_at
+                .is_some_and(|last| last.elapsed() < Duration::from_secs(2))
+        {
+            return Ok(());
+        }
+        self.nat_refresh_at = Some(Instant::now());
+        self.refresh_forward_nat()
     }
 
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
@@ -1195,5 +1298,24 @@ mod tests {
             "utun42"
         );
         assert_eq!(rebind_interface_name(dir.path(), None).unwrap(), "utun99");
+    }
+}
+
+fn verify_nat_binding(binding: &(String, u32), name: &str, index: u32) -> std::io::Result<()> {
+    if index == 0 || binding.0 != name || binding.1 != index {
+        return Err(std::io::Error::other("vm_nat_interface_changed"));
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod forward_nat_binding_tests {
+    use super::verify_nat_binding;
+    #[test]
+    fn reused_utun_name_cannot_authorize_nat_on_another_incarnation() {
+        let binding = ("utun4".to_string(), 20);
+        assert!(verify_nat_binding(&binding, "utun4", 20).is_ok());
+        assert!(verify_nat_binding(&binding, "utun4", 21).is_err());
+        assert!(verify_nat_binding(&binding, "utun5", 20).is_err());
+        assert!(verify_nat_binding(&binding, "utun4", 0).is_err());
     }
 }

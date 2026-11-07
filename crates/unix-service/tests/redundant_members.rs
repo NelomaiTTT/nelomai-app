@@ -19,6 +19,9 @@ struct Events {
     rebind_stopped: bool,
     recovered_scope: Option<SessionScope>,
     recovered_pending: bool,
+    unavailable_label: Option<&'static str>,
+    fail_tick_label: Option<&'static str>,
+    disappear_on_tick: Option<&'static str>,
 }
 struct Backend {
     label: &'static str,
@@ -26,6 +29,17 @@ struct Backend {
     events: Arc<Mutex<Events>>,
 }
 impl ServiceTunnelBackend for Backend {
+    fn tick(&mut self, now: u64) -> Result<(), ServiceError> {
+        let mut events = self.events.lock().unwrap();
+        events.calls.push(format!("tick {} {now}", self.label));
+        if events.disappear_on_tick == Some(self.label) {
+            events.unavailable_label = Some(self.label);
+        }
+        if events.fail_tick_label == Some(self.label) {
+            return Err(ServiceError::Backend("forward_nat_partial_mutation".into()));
+        }
+        Ok(())
+    }
     fn member_recovery_scope(&self) -> Option<SessionScope> {
         self.events.lock().unwrap().recovered_scope.clone()
     }
@@ -64,12 +78,11 @@ impl ServiceTunnelBackend for Backend {
         Ok(ServiceTunnelState::Running)
     }
     fn member_interface_index(&self) -> Result<u32, ServiceError> {
-        Ok(self
-            .events
-            .lock()
-            .unwrap()
-            .index_override
-            .unwrap_or(self.index))
+        let events = self.events.lock().unwrap();
+        if events.unavailable_label == Some(self.label) {
+            return Err(ServiceError::Backend("member_not_running".into()));
+        }
+        Ok(events.index_override.unwrap_or(self.index))
     }
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         let mut events = self.events.lock().unwrap();
@@ -1234,4 +1247,105 @@ fn control_default_journal_survives_interrupted_session_and_cleans_after_reconst
         .values
         .values()
         .all(|v| matches!(v, NetworkValue::Dns(_))));
+}
+
+#[test]
+fn live_member_ticks_refresh_virtual_networks_without_ticking_absent_or_closed_members() {
+    let (mut members, events) = setup();
+    members.tick_backends(&scope(), 1).unwrap();
+    assert!(events.lock().unwrap().calls.is_empty());
+    members
+        .start(&scope(), Slot::A, &config(), probe())
+        .unwrap();
+    members.tick_backends(&scope(), 2).unwrap();
+    assert_eq!(events.lock().unwrap().calls, ["start A", "tick A 2"]);
+    members
+        .start(&scope(), Slot::B, &config(), probe())
+        .unwrap();
+    members.tick_backends(&scope(), 3).unwrap();
+    assert_eq!(
+        &events.lock().unwrap().calls[2..],
+        ["start B", "tick A 3", "tick B 3"]
+    );
+    let mut stale = scope();
+    stale.connection_generation -= 1;
+    let count = events.lock().unwrap().calls.len();
+    assert!(members.tick_backends(&stale, 4).is_err());
+    assert_eq!(events.lock().unwrap().calls.len(), count);
+    members.close(&scope()).unwrap();
+    let count = events.lock().unwrap().calls.len();
+    members.tick_backends(&scope(), 5).unwrap();
+    assert_eq!(events.lock().unwrap().calls.len(), count);
+}
+
+#[test]
+fn nat_ticks_leave_unavailable_active_or_retiring_standby_to_existing_health_recovery() {
+    for (unavailable, survivor) in [("A", "B"), ("B", "A")] {
+        let (mut members, events) = setup();
+        members
+            .start(&scope(), Slot::A, &config(), probe())
+            .unwrap();
+        members
+            .start(&scope(), Slot::B, &config(), probe())
+            .unwrap();
+        {
+            let mut e = events.lock().unwrap();
+            e.calls.clear();
+            e.unavailable_label = Some(unavailable);
+        }
+        members.tick_backends(&scope(), 9).unwrap();
+        assert_eq!(events.lock().unwrap().calls, [format!("tick {survivor} 9")]);
+        // The NAT maintenance pass neither retires membership nor erases its
+        // cleanup obligation. The original health/Stop path still owns both.
+        assert!(members.view(Slot::A).is_some());
+        assert!(members.view(Slot::B).is_some());
+        assert!(members.cleanup_needed(Slot::A));
+        assert!(members.cleanup_needed(Slot::B));
+    }
+}
+
+#[test]
+fn member_disappearance_after_successful_nat_tick_does_not_stop_the_other_member() {
+    let (mut members, events) = setup();
+    members
+        .start(&scope(), Slot::A, &config(), probe())
+        .unwrap();
+    members
+        .start(&scope(), Slot::B, &config(), probe())
+        .unwrap();
+    {
+        let mut e = events.lock().unwrap();
+        e.calls.clear();
+        e.disappear_on_tick = Some("A");
+    }
+    members.tick_backends(&scope(), 10).unwrap();
+    assert_eq!(events.lock().unwrap().calls, ["tick A 10", "tick B 10"]);
+}
+
+#[test]
+fn nat_partial_mutation_failure_remains_authoritative_even_if_member_also_disappears() {
+    for disappear in [false, true] {
+        let (mut members, events) = setup();
+        members
+            .start(&scope(), Slot::A, &config(), probe())
+            .unwrap();
+        members
+            .start(&scope(), Slot::B, &config(), probe())
+            .unwrap();
+        {
+            let mut e = events.lock().unwrap();
+            e.calls.clear();
+            e.fail_tick_label = Some("A");
+            if disappear {
+                e.disappear_on_tick = Some("A");
+            }
+        }
+        let error = members.tick_backends(&scope(), 11).unwrap_err();
+        assert!(
+            matches!(error,ServiceError::Backend(message) if message=="forward_nat_partial_mutation")
+        );
+        assert_eq!(events.lock().unwrap().calls, ["tick A 11"]);
+        assert!(members.cleanup_needed(Slot::A));
+        assert!(members.cleanup_needed(Slot::B));
+    }
 }

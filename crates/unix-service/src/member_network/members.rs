@@ -84,6 +84,26 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
             failure: FailureSlot::default(),
         })
     }
+    /// Serialized periodic work for verified live members, including virtual
+    /// networks created after the VPN. Absent/retired members are never ticked.
+    pub fn tick_backends(&mut self, scope: &SessionScope, now: u64) -> Result<(), ServiceError> {
+        self.check(scope)?;
+        if self.closing {
+            return Ok(());
+        }
+        for slot in [Slot::A, Slot::B] {
+            // Native disappearance/retirement belongs to the existing health
+            // reducer. NAT maintenance must not turn it into pair-wide Stop.
+            if self.check_live(scope, slot).is_err() {
+                continue;
+            }
+            // Once entered, a maintenance error may own partial native effects:
+            // preserve it even if the member disappears during the operation.
+            self.backends[index(slot)].tick(now)?;
+        }
+        Ok(())
+    }
+
     pub fn cleanup_needed(&self, slot: Slot) -> bool {
         self.needs_cleanup[index(slot)]
     }
