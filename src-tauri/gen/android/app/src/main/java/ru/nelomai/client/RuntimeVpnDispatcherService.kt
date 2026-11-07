@@ -10,9 +10,9 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.Bundle
-import android.os.ResultReceiver
 import android.os.IBinder
 import android.os.Messenger
+import android.os.Message
 import org.json.JSONObject
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -129,9 +129,13 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
     private val backgroundPreparation = Messenger(Handler(Looper.getMainLooper()) { message ->
         // Messenger supplies the Binder caller UID; this is container-private IPC.
         if (message.sendingUid != Process.myUid() || message.what != 1) return@Handler true
+        // replyTo parcels a framework Messenger/Binder. An anonymous application
+        // ResultReceiver in Bundle needs an app class loader in the remote process.
+        val receiver = message.replyTo ?: return@Handler true
+        fun respond(code: Int) {
+            try { receiver.send(Message.obtain(null, code)) } catch (_: android.os.RemoteException) { }
+        }
         val data = message.data
-        @Suppress("DEPRECATION")
-        val receiver = data.getParcelable<ResultReceiver>("result_receiver") ?: return@Handler true
         val request = data.getString(ru.nelomai.runtime.v1.RuntimeServiceIntents.STABLE_PROVISION_REQUEST)
         selection.read { result ->
             try {
@@ -140,7 +144,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
                 if (RuntimeProcessSelection.needsExit(active)) {
                     // As on the started-service path, a different owner incarnation
                     // requires physical exit; generation preparation alone never does.
-                    receiver.send(2, Bundle().apply { putString("error_code", "background_owner_scope_mismatch") })
+                    respond(2)
                     terminateProcess()
                     return@read
                 }
@@ -156,9 +160,9 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
                     identity.getLong("runtime_contract_version") == 1L &&
                     identity.getLong("session_generation") == active.sessionGeneration)
                 check(ru.nelomai.tunnel.StableBackgroundProvision.prepare(this, request, engineWasLoaded))
-                receiver.send(1, Bundle())
+                respond(1)
             } catch (_: Exception) {
-                receiver.send(2, Bundle().apply { putString("error_code", "background_owner_scope_mismatch") })
+                respond(2)
             }
         }
         true

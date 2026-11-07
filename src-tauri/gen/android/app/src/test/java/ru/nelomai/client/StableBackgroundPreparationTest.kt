@@ -9,7 +9,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Messenger
-import android.os.ResultReceiver
+import android.os.Message
+import android.os.Parcel
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -34,10 +35,25 @@ class StableBackgroundPreparationTest {
         var unbinds = 0
         var received: String? = null
         val messenger = Messenger(Handler(Looper.getMainLooper()) { message ->
-            received = message.data.getString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST)
-            @Suppress("DEPRECATION")
-            val receiver = message.data.getParcelable<ResultReceiver>("result_receiver")!!
-            if (mode != "timeout") receiver.send(if (mode == "reject") 2 else 1, Bundle())
+            val parcel = Parcel.obtain()
+            val transported = try {
+                message.writeToParcel(parcel, 0)
+                parcel.setDataPosition(0)
+                Message.CREATOR.createFromParcel(parcel)
+            } finally { parcel.recycle() }
+            // A Messenger Bundle is read with a framework class loader in :vpn.
+            // Only strings belong here; the callback is the platform replyTo field.
+            transported.data.classLoader = object : ClassLoader(null) {
+                override fun loadClass(name: String, resolve: Boolean): Class<*> {
+                    if (name.startsWith("ru.nelomai.")) throw ClassNotFoundException(name)
+                    return super.loadClass(name, resolve)
+                }
+            }
+            val receiver = transported.replyTo
+            assertNotNull("reply must survive actual Message parceling without an application Parcelable", receiver)
+            assertFalse(transported.data.containsKey("result_receiver"))
+            received = transported.data.getString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST)
+            if (mode != "timeout") receiver.send(Message.obtain(null, if (mode == "reject") 2 else 1))
             true
         })
         override fun bindService(intent: Intent, connection: ServiceConnection, flags: Int): Boolean {
