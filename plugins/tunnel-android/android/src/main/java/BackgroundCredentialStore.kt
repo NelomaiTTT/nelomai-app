@@ -377,6 +377,7 @@ internal object BackgroundCredentialEnvelopeCodec {
 internal class BackgroundCredentialStore(
     private val backend: EncryptedRecordBackend,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val logoutGeneration: ((Long, String) -> Long)? = null,
 ) {
     private val gate = Any()
     // The executor captures provenance once; it cannot acquire a newer revision
@@ -962,6 +963,49 @@ internal class BackgroundCredentialStore(
         }
     }
 
+    /** Only the caller's confirmed operation_id_conflict authorizes a new receipt identity. */
+    fun reissueRejectedLogout(
+        expectedRevision: Long,
+        rejectedOperationId: String,
+        replacementOperationId: String,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            val logout = current.logoutState
+                ?: throw MutationFailure("background_credential_logout_absent")
+            if (logout.phase != BackgroundLogoutPhase.PENDING ||
+                logout.operationId != rejectedOperationId || replacementOperationId == rejectedOperationId ||
+                current.pending != null) {
+                throw MutationFailure("background_credential_mutation_conflict")
+            }
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(replacementOperationId)
+            val allocate = logoutGeneration
+                ?: throw MutationFailure("background_generation_unavailable")
+            val generation = allocate(maxOf(current.installGeneration ?: 0, logout.installGeneration),
+                "logout:${current.deviceId}:$replacementOperationId")
+            require(generation > logout.installGeneration)
+            current.copy(revision = current.revision.incrementRevision(), installGeneration = generation,
+                logoutState = logout.copy(operationId = replacementOperationId, installGeneration = generation))
+        }
+    }
+
+    /** Confirm the exact replay tuple on disk: a failed commit may have changed only the cache. */
+    fun persistPendingLogout(
+        expectedRevision: Long,
+        operationId: String,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        val result = readLocked()
+        if (result is CredentialStoreResult.Failure) return@synchronized result
+        val current = (result as CredentialStoreResult.Success).value
+        if (current.revision != expectedRevision) {
+            return@synchronized CredentialStoreResult.Failure("background_credential_revision_conflict")
+        }
+        if (current.logoutState?.phase != BackgroundLogoutPhase.PENDING ||
+            current.logoutState.operationId != operationId) {
+            return@synchronized CredentialStoreResult.Failure("background_credential_mutation_conflict")
+        }
+        persist(current)
+    }
+
     fun finalizeLogout(
         expectedRevision: Long,
         operationId: String,
@@ -1044,6 +1088,9 @@ internal class BackgroundCredentialStore(
             }
             throw MutationFailure("background_credential_logout_pending")
         }
+        val generation = logoutGeneration?.invoke(maxOf(installGeneration, current.installGeneration ?: 0),
+            "logout:${current.deviceId}:$operationId") ?: installGeneration
+        require(generation >= installGeneration)
         val phase = BackgroundLogoutPhase.PENDING
         return current.copy(
             revision = current.revision.incrementRevision(),
@@ -1054,7 +1101,8 @@ internal class BackgroundCredentialStore(
             capability = null,
             reservation = current.reservation.takeIf { current.pending != null },
             cleanupCredential = current.active ?: current.cleanupCredential,
-            logoutState = BackgroundLogoutState(operationId, installGeneration, phase),
+            installGeneration = generation,
+            logoutState = BackgroundLogoutState(operationId, generation, phase),
         )
     }
 
@@ -1253,6 +1301,9 @@ internal object AndroidBackgroundCredentialStores {
                 recordName = BACKGROUND_RECORD,
                 keyAlias = BACKGROUND_KEY_ALIAS,
             ),
+            logoutGeneration = { minimum, key ->
+                requireNotNull(AndroidInstallGenerations.reserve(context, minimum, key))
+            },
         )
         // Legacy import is owned by the locked common migration before any
         // engine loads; a runtime must never fall back to another namespace.

@@ -11,6 +11,8 @@ import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.Bundle
 import android.os.ResultReceiver
+import android.os.IBinder
+import android.os.Messenger
 import org.json.JSONObject
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -91,11 +93,15 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
             try {
                 if (RuntimeProcessSelection.needsExit(active)) { terminateProcess(); return@read }
                 RuntimeProcessSelection.claim(active)
-                if (intent?.action == ru.nelomai.runtime.v1.RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND) {
-                    prepareStableBackground(intent, active, startId)
-                    return@read
-                }
                 val selectedEngine = engine ?: run {
+                    if (active.slot == "stable" && !engineWasLoaded) {
+                        try {
+                            ru.nelomai.tunnel.StableBackgroundProvision.prepareEngine(this, active.runtimeVersion)
+                        } catch (error: Exception) {
+                            rejectStart(intent, "background_credential_unavailable")
+                            throw error
+                        }
+                    }
                     engineWasLoaded = true
                     RuntimeAdapters.engine(active, this)
                 }.also {
@@ -120,29 +126,48 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
         return if (foregroundPromotionFailed) START_NOT_STICKY else START_STICKY
     }
 
-    private fun prepareStableBackground(intent: Intent, active: RuntimeSelectionV1, startId: Int) {
+    private val backgroundPreparation = Messenger(Handler(Looper.getMainLooper()) { message ->
+        // Messenger supplies the Binder caller UID; this is container-private IPC.
+        if (message.sendingUid != Process.myUid() || message.what != 1) return@Handler true
+        val data = message.data
         @Suppress("DEPRECATION")
-        val receiver = intent.getParcelableExtra<ResultReceiver>("result_receiver") ?: return
-        try {
-            require(RuntimeDispatchPolicy.mayStart(active) && active.slot == "stable")
-            val request = requireNotNull(intent.getStringExtra(
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.STABLE_PROVISION_REQUEST))
-            require(request.toByteArray().size <= 65536)
-            val identity = JSONObject(JSONObject(request).getString("owner_operation"))
-                .getJSONObject("ticket").getJSONObject("identity")
-            require(identity.getString("slot") == active.slot &&
-                identity.getString("runtime_version") == active.runtimeVersion &&
-                identity.getString("container_version") == active.containerVersion &&
-                identity.getLong("runtime_contract_version") == 1L &&
-                identity.getLong("session_generation") == active.sessionGeneration)
-            val ready = ru.nelomai.tunnel.StableBackgroundProvision.prepare(this, request, engineWasLoaded)
-            receiver.send(1, Bundle().apply { putBoolean("restart_required", !ready) })
-        } catch (_: Exception) {
-            receiver.send(2, Bundle().apply { putString("error_code", "background_owner_scope_mismatch") })
-        } finally {
-            if (engine == null) stopSelf(startId)
+        val receiver = data.getParcelable<ResultReceiver>("result_receiver") ?: return@Handler true
+        val request = data.getString(ru.nelomai.runtime.v1.RuntimeServiceIntents.STABLE_PROVISION_REQUEST)
+        selection.read { result ->
+            try {
+                check(!destroyed)
+                val active = result.getOrThrow()
+                if (RuntimeProcessSelection.needsExit(active)) {
+                    // As on the started-service path, a different owner incarnation
+                    // requires physical exit; generation preparation alone never does.
+                    receiver.send(2, Bundle().apply { putString("error_code", "background_owner_scope_mismatch") })
+                    terminateProcess()
+                    return@read
+                }
+                RuntimeProcessSelection.claim(active)
+                require(RuntimeDispatchPolicy.mayStart(active) && active.slot == "stable")
+                requireNotNull(request)
+                require(request.toByteArray().size <= 65536)
+                val identity = JSONObject(JSONObject(request).getString("owner_operation"))
+                    .getJSONObject("ticket").getJSONObject("identity")
+                require(identity.getString("slot") == active.slot &&
+                    identity.getString("runtime_version") == active.runtimeVersion &&
+                    identity.getString("container_version") == active.containerVersion &&
+                    identity.getLong("runtime_contract_version") == 1L &&
+                    identity.getLong("session_generation") == active.sessionGeneration)
+                check(ru.nelomai.tunnel.StableBackgroundProvision.prepare(this, request, engineWasLoaded))
+                receiver.send(1, Bundle())
+            } catch (_: Exception) {
+                receiver.send(2, Bundle().apply { putString("error_code", "background_owner_scope_mismatch") })
+            }
         }
-    }
+        true
+    })
+
+    override fun onBind(intent: Intent?): IBinder? =
+        if (intent?.action == ru.nelomai.runtime.v1.RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND)
+            backgroundPreparation.binder
+        else super.onBind(intent)
 
     private fun definitelyStartsVpn(intent: Intent?): Boolean = when (intent?.action) {
         null,

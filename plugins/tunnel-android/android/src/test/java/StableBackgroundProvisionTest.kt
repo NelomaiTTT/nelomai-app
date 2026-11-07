@@ -68,7 +68,7 @@ class StableBackgroundProvisionTest {
                     "66666666-6666-4666-8666-666666666666", 1, 500),
                 capability = BackgroundCapabilitySnapshot(7, true, 9999999999))
             val backend = MemoryBackend(record)
-            assertFalse(StableBackgroundProvision.prepare(backend, retiredRequest(), true, 1000))
+            assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepare(backend, retiredRequest(), true, 1000) }
             assertEquals(record, backend.envelope())
             assertEquals(0, backend.writes)
             assertTrue(StableBackgroundProvision.prepare(backend, retiredRequest(), false, 1000))
@@ -134,7 +134,7 @@ class StableBackgroundProvisionTest {
 
     @Test fun retainedStableGetsFreshProvisionOnlyAfterOldEngineExit() {
         val backend = MemoryBackend(seed())
-        assertFalse(StableBackgroundProvision.prepare(backend, request(), true, 1000))
+        assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepare(backend, request(), true, 1000) }
         assertEquals(seed(), backend.envelope())
         assertEquals(0, backend.writes)
         assertTrue(StableBackgroundProvision.prepare(backend, request(), false, 1000))
@@ -259,11 +259,108 @@ class StableBackgroundProvisionTest {
         }
     }
 
+    @Test fun sharedGenerationPreparationRetiresCompletedLogoutAndNeverRewritesPending() {
+        for (finalized in listOf(false, true)) {
+            val record = if (finalized) seed().copy(active = null, installSecret = null,
+                logoutState = BackgroundLogoutState("old-logout", 1, BackgroundLogoutPhase.FINALIZED))
+                else seed().copy(ownerScope = target)
+            val backend = MemoryBackend(record)
+            val wire = request(operation.copy(scope = target.copy(authEpoch = if (finalized) 4 else 3)))
+            val reserve = { _: Long, _: String, allow: Boolean -> if (allow) 8L else null }
+            if (finalized) {
+                assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepareGeneration(backend, wire, true, reserve) }
+                assertThrows(IllegalStateException::class.java) { StableBackgroundProvision.prepareGeneration(backend, wire, true) { _, _, _ -> 8L } }
+            } else {
+                assertThrows(IllegalStateException::class.java) {
+                    StableBackgroundProvision.prepareGeneration(backend, wire, true, reserve)
+                }
+                assertThrows(IllegalStateException::class.java) {
+                    StableBackgroundProvision.prepareGeneration(backend, wire, true) { _, _, _ -> 8L }
+                }
+            }
+            assertEquals(record, backend.envelope())
+            assertTrue(StableBackgroundProvision.prepareGeneration(backend, wire, false, reserve))
+            assertEquals(8L, backend.envelope().installGeneration)
+            assertNull(backend.envelope().logoutState)
+            assertEquals(record.ownerAttempt, backend.envelope().ownerAttempt)
+            assertEquals(record.ownerCancelEpoch, backend.envelope().ownerCancelEpoch)
+            val writes = backend.writes
+            assertTrue(StableBackgroundProvision.prepareGeneration(backend, wire, true) { _, _, _ -> 8L })
+            assertEquals(writes, backend.writes)
+        }
+        val pending = seed().copy(active = null, cleanupCredential = seed().active,
+            logoutState = BackgroundLogoutState("pending", 1, BackgroundLogoutPhase.PENDING))
+        val backend = MemoryBackend(pending)
+        assertThrows(IllegalArgumentException::class.java) {
+            StableBackgroundProvision.prepareGeneration(backend, request(), false) { _, _, _ -> error("must not allocate") }
+        }
+        assertEquals(pending, backend.envelope())
+    }
+
+    @Test fun preparedCompletedLogoutAdmitsANewLoginWithoutStableIncrementingTheOldCounter() {
+        val backend = MemoryBackend(seed().copy(active = null, installSecret = null, ownerCancelEpoch = 3,
+            logoutState = BackgroundLogoutState("old-logout", 1, BackgroundLogoutPhase.FINALIZED)))
+        val op = operation.copy(scope = target.copy(authEpoch = 4))
+        assertTrue(StableBackgroundProvision.prepare(backend, request(op), false, 1000))
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(op), false) { _, _, _ -> 8L })
+        val store = BackgroundCredentialStore(backend, nowMillis = { 1000 })
+        val prepared = backend.envelope()
+        val admitted = store.beginOwnerOperation(prepared.revision, op, false) as CredentialStoreResult.Success
+        val configured = store.configure(admitted.value.revision, BackgroundCredentialProvision(device,
+            "https://nelomai.ru", "fresh-token", 9999999999, "install-secret", 8,
+            BackgroundCapabilitySnapshot(0, false, 1))) as CredentialStoreResult.Success
+        assertEquals(8L, configured.value.installGeneration)
+        assertEquals(op.scope, configured.value.ownerScope)
+        assertEquals(3L, configured.value.ownerCancelEpoch)
+    }
+
+    @Test fun interruptedStableProjectionReusesItsDurableReservationAfterPhysicalExit() {
+        val backend = MemoryBackend(seed().copy(ownerScope = target))
+        var ledgerBytes: ByteArray? = null
+        val ledger = object : EncryptedRecordBackend {
+            override fun read() = ledgerBytes?.clone()
+            override fun write(plaintext: ByteArray): Boolean { ledgerBytes = plaintext.clone(); return true }
+        }
+        val generations = BackgroundInstallGenerationStore({ ledger }, { 7 })
+        val reserve = { floor: Long, key: String, allow: Boolean -> generations.reserve(floor, key, allow) }
+        backend.writable = false
+        assertThrows(IllegalStateException::class.java) {
+            StableBackgroundProvision.prepareGeneration(backend, request(), false, reserve)
+        }
+        val reservation = ledgerBytes!!.clone()
+        backend.writable = true
+        assertThrows(IllegalStateException::class.java) {
+            StableBackgroundProvision.prepareGeneration(backend, request(), true, reserve)
+        }
+        assertEquals(1L, backend.envelope().installGeneration)
+        assertTrue(StableBackgroundProvision.prepareGeneration(backend, request(), false, reserve))
+        assertEquals(8L, backend.envelope().installGeneration)
+        assertArrayEquals(reservation, ledgerBytes)
+    }
+
+    @Test fun finalizedStableGenerationCannotBePreparedForAnOldOrCancelledLogin() {
+        for ((scope, fence) in listOf(target to 2L, target.copy(authEpoch = 4) to 4L)) {
+            val record = seed().copy(active = null, installSecret = null, ownerCancelEpoch = fence,
+                logoutState = BackgroundLogoutState("old-logout", 1, BackgroundLogoutPhase.FINALIZED))
+            val backend = MemoryBackend(record)
+            assertThrows(IllegalArgumentException::class.java) {
+                StableBackgroundProvision.prepareGeneration(backend, request(operation.copy(scope = scope)), false) {
+                    _, _, _ -> error("invalid login must not reserve a generation")
+                }
+            }
+            assertEquals(record, backend.envelope())
+        }
+    }
+
     private class MemoryBackend(value: BackgroundCredentialEnvelope) : EncryptedRecordBackend {
         var bytes = BackgroundCredentialEnvelopeCodec.encode(value)
         var writes = 0
+        var writable = true
         override fun read() = bytes.clone()
-        override fun write(plaintext: ByteArray): Boolean { writes++; bytes = plaintext.clone(); return true }
+        override fun write(plaintext: ByteArray): Boolean {
+            if (!writable) return false
+            writes++; bytes = plaintext.clone(); return true
+        }
         fun envelope() = BackgroundCredentialEnvelopeCodec.decode(bytes)
     }
 }
