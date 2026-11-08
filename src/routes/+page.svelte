@@ -124,6 +124,7 @@
   let connectionMetrics = $state<ConnectionMetrics | null>(null);
   let reserveState = $state<ReserveState | "degraded" | null>(null);
   let desktopActiveSlot = $state<"A" | "B" | null>(null);
+  let desktopTunnelBackend = $state<"worker" | "legacy" | null>(null);
   let connectionPresentation = $derived(connectionView({
     reserveState: reserveState === "degraded" ? "unavailable" : reserveState,
   }));
@@ -131,6 +132,11 @@
     if (!value || typeof value !== "object" || !("desktopActiveSlot" in value)) return null;
     return value.desktopActiveSlot === "A" || value.desktopActiveSlot === "B"
       ? value.desktopActiveSlot : null;
+  }
+  function readDesktopTunnelBackend(value: unknown): "worker" | "legacy" | null {
+    if (!value || typeof value !== "object" || !("desktopTunnelBackend" in value)) return null;
+    return value.desktopTunnelBackend === "worker" || value.desktopTunnelBackend === "legacy"
+      ? value.desktopTunnelBackend : null;
   }
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
@@ -197,6 +203,7 @@
   let windowsDefender = $state<WindowsDefenderStatus | null>(null);
   let defenderRepairBusy = $state(false);
   let defenderRepairMessage = $state<string | null>(null);
+  let defenderStatusRevision = 0;
   let antivirusStartFailure = $state(false);
   let activeThirdPartyAntivirus = $derived(
     windowsDefender?.antivirusProducts.find(
@@ -211,10 +218,23 @@
       null,
   );
   let reportedThirdPartyBlocker = $derived(
-    antivirusStartFailure && windowsDefender?.state !== "missing"
-      ? activeThirdPartyAntivirus
-      : null,
+    antivirusStartFailure ? activeThirdPartyAntivirus : null,
   );
+  function usesLegacyAwgDll(): boolean {
+    if (runtimeChannelClosed) return false;
+    const plannedLegacy = selectedLayer === "stray" && !appPreferences?.useReserveConnection;
+    if (["connecting", "connected", "stopping", "error"].includes(phase)) {
+      // A missing/error status is unknown, never proof of the DLL transport.
+      if (desktopTunnelBackend !== "legacy") return false;
+      return connection ? connection.layer === "stray" : plannedLegacy;
+    }
+    return plannedLegacy;
+  }
+  function defenderBannerVisible(): boolean {
+    return Boolean(windowsDefender && (reportedThirdPartyBlocker ||
+      (usesLegacyAwgDll() &&
+        (windowsDefender.state === "missing" || !windowsDefender.dllPresent))));
+  }
   let nativeStateUnlisten: UnlistenFn | null = null;
   let connectionIntentNotificationUnlisten: UnlistenFn | null = null;
   let ownedConnectionIntentNotice: string | null = null;
@@ -384,24 +404,46 @@
     }
   }
 
+  function defenderRepairStatusMessage(status: WindowsDefenderStatus): string | null {
+    return status.state === "excluded"
+      ? status.dllPresent
+        ? null
+        : "Исключение подтверждено. Теперь переустановите последнюю версию Nelomai, чтобы восстановить удалённый компонент."
+      : status.state === "inactive"
+        ? "Microsoft Defender сейчас неактивен."
+        : "Defender не подтвердил действующее исключение. Проверьте настройки защиты Windows и повторите попытку.";
+  }
+
   async function refreshWindowsDefender() {
+    const revision = ++defenderStatusRevision;
+    const previous = windowsDefender;
     const status = await nativeClient.windowsDefenderStatus().catch(() => null);
-    if (status?.supported) windowsDefender = status;
+    if (!status?.supported || revision !== defenderStatusRevision) return;
+    windowsDefender = status;
+    if (defenderRepairMessage &&
+        (previous?.state !== status.state || previous?.dllPresent !== status.dllPresent)) {
+      defenderRepairMessage = defenderRepairStatusMessage(status);
+    }
   }
 
   async function repairWindowsDefender() {
     if (defenderRepairBusy) return;
+    defenderStatusRevision++;
     defenderRepairBusy = true;
     defenderRepairMessage = null;
     try {
       windowsDefender = await nativeClient.repairWindowsDefender();
-      defenderRepairMessage = windowsDefender.dllPresent
-        ? "Исключение добавлено. Stray снова готов к запуску."
-        : "Исключение добавлено. Теперь переустановите последнюю версию Nelomai, чтобы восстановить удалённый компонент.";
+      defenderRepairMessage = defenderRepairStatusMessage(windowsDefender);
     } catch (reason) {
-      defenderRepairMessage = commandMessage(reason, "start");
+      // Repair may change the exclusion before failing; confirm it again.
+      if (windowsDefender?.state === "excluded") {
+        windowsDefender = { ...windowsDefender, state: "unavailable" };
+      }
       await refreshWindowsDefender();
+      defenderRepairMessage = commandMessage(reason, "start");
     } finally {
+      // Retire status reads started while this repair was pending.
+      defenderStatusRevision++;
       defenderRepairBusy = false;
     }
   }
@@ -521,6 +563,7 @@
     // Keep the account/cleanup barrier; only retire unverified presentation.
     runtimeChannelClosed = true;
     desktopActiveSlot = null;
+    desktopTunnelBackend = null;
     startupRetry.cancel();
     splitTunnelOpen = false;
     phase = "error";
@@ -585,6 +628,7 @@
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
       desktopActiveSlot = readDesktopActiveSlot(current);
+      desktopTunnelBackend = readDesktopTunnelBackend(current);
       connectionIntentStatus = current.connectionIntentStatus;
       nextRetryAtUnix = current.nextRetryAtUnix;
       if (
@@ -666,6 +710,7 @@
       if (code === "signed_out" || code === "authentication_outcome_unknown" || code === "auth_recovery_required") {
         reserveState = null;
         desktopActiveSlot = null;
+        desktopTunnelBackend = null;
         phase = "signed_out";
         view = "sign_in";
         logoutRecoveryRequired = code === "auth_recovery_required";
@@ -743,6 +788,7 @@
     connectionMetrics = state.metrics;
     reserveState = state.reserveState;
     desktopActiveSlot = readDesktopActiveSlot(state);
+    desktopTunnelBackend = readDesktopTunnelBackend(state);
     runtimeWarning = state.warning;
     view = viewForAppState(state);
     if (view === "sign_in") {
@@ -856,11 +902,13 @@
         connectionMetrics = null;
         reserveState = null;
         desktopActiveSlot = null;
+        desktopTunnelBackend = null;
         connectionIntentStatus = "none";
         nextRetryAtUnix = null;
       } else {
         if (!startDeviceId) return;
         phase = "connecting";
+        desktopTunnelBackend = null;
         connectionMetrics = null;
         if (!await prepareConnectionStartForPlatform(
           startPlatform ?? "unknown",
@@ -903,6 +951,7 @@
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
       desktopActiveSlot = readDesktopActiveSlot(current);
+      desktopTunnelBackend = readDesktopTunnelBackend(current);
     } catch (reason) {
       if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       if (applyRuntimeChannelClosure(reason)) return;
@@ -935,6 +984,7 @@
       connectionMetrics = current?.metrics ?? connectionMetrics;
       reserveState = current?.reserveState ?? reserveState;
       desktopActiveSlot = current ? readDesktopActiveSlot(current) : null;
+      desktopTunnelBackend = readDesktopTunnelBackend(current);
       runtimeWarning = current?.warning ?? runtimeWarning;
       error =
         failureCode === "connection_intent_cancelled"
@@ -1035,6 +1085,7 @@
       connection = null;
       reserveState = null;
       desktopActiveSlot = null;
+      desktopTunnelBackend = null;
       pinnedStray = null;
       bootstrap = bootstrap
         ? { ...bootstrap, binding: null, connection: null, pinned_stray: null }
@@ -1456,6 +1507,7 @@
         phase = current.phase;
         localStopPendingCleanup = current.localStopPendingCleanup === true;
         connection = current.connection;
+        desktopTunnelBackend = readDesktopTunnelBackend(current);
         connectionIntentStatus = current.connectionIntentStatus;
         nextRetryAtUnix = current.nextRetryAtUnix;
         connectionMetrics = current.metrics;
@@ -1562,10 +1614,7 @@
   {#if diagnosticsStatus}
     <p class="diagnostics-status" aria-live="polite">{diagnosticsStatus}</p>
   {/if}
-  {#if windowsDefender &&
-  (windowsDefender.state === "missing" ||
-    !windowsDefender.dllPresent ||
-    reportedThirdPartyBlocker)}
+  {#if windowsDefender && defenderBannerVisible()}
     <section class="defender-banner" aria-live="polite">
       <div>
         <p class="eyebrow">
@@ -1602,6 +1651,8 @@
         </button>
       {/if}
     </section>
+  {:else if defenderRepairMessage && !(windowsDefender?.state === "excluded" && windowsDefender?.dllPresent)}
+    <p class="diagnostics-status" role="status">{defenderRepairMessage}</p>
   {/if}
   {#if updateDialogId && updateStatus && updateDialogId===updateStatus.offerId}
     <UpdatePrompt status={updateStatus} visible={updateUiVisible} busy={updateBusy} onconfirm={installUpdate} onlater={deferUpdate} onpresented={markUpdatePresented}/>

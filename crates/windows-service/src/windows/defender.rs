@@ -148,7 +148,7 @@ pub fn configure_exclusion(client_executable: &Path) -> Result<(), ServiceError>
         return Err(ServiceError::UnauthorizedClient);
     }
     let dll_path = layout.engine_path().with_file_name(AWG_DLL_NAME);
-    managed_exclusion(&client_executable, &dll_path, "add")
+    managed_exclusion(&client_executable, &dll_path, "repair")
 }
 
 /// Called only for exact verified install-layout destinations or a loaded
@@ -158,7 +158,7 @@ pub(crate) fn managed_exclusion(
     dll_path: &Path,
     action: &str,
 ) -> Result<(), ServiceError> {
-    if !matches!(action, "add" | "remove") {
+    if !matches!(action, "add" | "repair" | "remove") {
         return Err(ServiceError::InvalidRequest);
     }
     let powershell = powershell_path()

@@ -40,14 +40,32 @@ function Remove-OwnedPath($property) {
 }
 
 switch ($env:NELOMAI_DEFENDER_ACTION) {
-    'add' {
+    { $_ -eq 'add' -or $_ -eq 'repair' } {
         $path = Normalize-LocalPath $env:NELOMAI_DEFENDER_EXCLUSION_PATH
         if (-not (Test-ManagedPath $path)) { throw 'Unexpected DLL exclusion path' }
         $existing = @((Get-MpPreference).ExclusionPath)
         # Do not claim a user's pre-existing exception. Existing owned entries
         # stay recorded; a separate per-path property never overwrites them.
-        if ($existing -icontains $path) { return }
-        New-Item -Path $registry -Force | Out-Null
+        if ($existing -icontains $path) {
+            if ($env:NELOMAI_DEFENDER_ACTION -eq 'repair') {
+                $owned = @(Read-OwnedPaths | Where-Object { $_.Value -ieq $path })
+                if ($owned.Count -gt 0) {
+                    # Configured membership can lag Defender's effective state.
+                    # Refresh only our exact exception; retain its durable owner
+                    # record and attempt restoration even when removal fails.
+                    try { Remove-MpPreference -ExclusionPath $path }
+                    finally { Add-MpPreference -ExclusionPath $path }
+                }
+            }
+            return
+        }
+        if (-not (Test-Path -LiteralPath $registry)) {
+            # SOFTWARE exists on Windows; create the fixed manufacturer parent
+            # and Client separately without replacing either existing key.
+            $parent = Split-Path -Parent $registry
+            if (-not (Test-Path -LiteralPath $parent)) { New-Item -Path $parent | Out-Null }
+            New-Item -Path $registry | Out-Null
+        }
         # Persist intent before effect: an interrupted Add remains cleanable.
         New-ItemProperty -LiteralPath $registry -Name (Get-OwnershipName $path) -PropertyType String -Value $path -Force | Out-Null
         Add-MpPreference -ExclusionPath $path

@@ -1569,6 +1569,8 @@ pub struct AppStateResponse {
     reserve_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     desktop_active_slot: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop_tunnel_backend: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1761,11 +1763,17 @@ impl AppStateResponse {
             metrics,
             reserve_state,
             desktop_active_slot: None,
+            desktop_tunnel_backend: None,
         }
     }
 
     fn with_desktop_active_slot(mut self, slot: Option<&'static str>) -> Self {
         self.desktop_active_slot = slot;
+        self
+    }
+
+    fn with_desktop_tunnel_backend(mut self, backend: Option<&'static str>) -> Self {
+        self.desktop_tunnel_backend = backend;
         self
     }
 
@@ -1815,17 +1823,20 @@ async fn current_connection_metrics(
 
 #[cfg(not(target_os = "android"))]
 fn desktop_pair_presentation(
-    snapshot: Option<&nelomai_client_tunnel::redundancy::protocol::Snapshot>,
-) -> (Option<String>, Option<&'static str>) {
+    query: Result<Option<&nelomai_client_tunnel::redundancy::protocol::Snapshot>, ()>,
+) -> (Option<String>, Option<&'static str>, Option<&'static str>) {
     use nelomai_client_tunnel::redundancy::{session::SessionPhase, Slot};
-    let Some(snapshot) = snapshot else {
-        return (None, None);
+    // A failed query is unknown, not proof of an ordinary DLL connection.
+    let snapshot = match query {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => return (None, None, Some("legacy")),
+        Err(()) => return (None, None, None),
     };
     if matches!(
         snapshot.session.phase,
         SessionPhase::Stopping | SessionPhase::Stopped
     ) {
-        return (None, None);
+        return (None, None, Some("worker"));
     }
     let active = match snapshot.session.active {
         Slot::A => "A",
@@ -1854,6 +1865,7 @@ fn desktop_pair_presentation(
     (
         Some(reserve.into()),
         (snapshot.session.phase == SessionPhase::Running).then_some(active),
+        Some("worker"),
     )
 }
 
@@ -1884,30 +1896,63 @@ fn desktop_pair_ui_uses_exact_active_and_committed_readiness_without_private_pay
         warm_stop_v1: false,
     };
     assert_eq!(
-        desktop_pair_presentation(Some(&snapshot)),
-        (Some("degraded".into()), Some("A"))
+        desktop_pair_presentation(Ok(Some(&snapshot))),
+        (Some("degraded".into()), Some("A"), Some("worker"))
     );
     snapshot.session.installed[1] = true;
     snapshot.session.committed[1] = true;
     assert_eq!(
-        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        desktop_pair_presentation(Ok(Some(&snapshot))).0.as_deref(),
         Some("warming")
     );
     snapshot.standby_ready = true;
     assert_eq!(
-        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        desktop_pair_presentation(Ok(Some(&snapshot))).0.as_deref(),
         Some("ready")
     );
     snapshot.session.active = Slot::B;
-    assert_eq!(desktop_pair_presentation(Some(&snapshot)).1, Some("B"));
+    assert_eq!(desktop_pair_presentation(Ok(Some(&snapshot))).1, Some("B"));
     snapshot.session.role_confirmed = false;
     assert_eq!(
-        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        desktop_pair_presentation(Ok(Some(&snapshot))).0.as_deref(),
         Some("degraded")
     );
     snapshot.session.phase = nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped;
-    assert_eq!(desktop_pair_presentation(Some(&snapshot)), (None, None));
-    assert_eq!(desktop_pair_presentation(None), (None, None));
+    assert_eq!(
+        desktop_pair_presentation(Ok(Some(&snapshot))),
+        (None, None, Some("worker"))
+    );
+    assert_eq!(
+        desktop_pair_presentation(Ok(None)),
+        (None, None, Some("legacy"))
+    );
+    assert_eq!(desktop_pair_presentation(Err(())), (None, None, None));
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+#[test]
+fn desktop_pair_backend_wire_omits_unknown_and_distinguishes_legacy_from_worker() {
+    for backend in [None, Some("legacy"), Some("worker")] {
+        let response = AppStateResponse::new(
+            CoreState {
+                phase: Phase::Connected,
+                connection: None,
+            },
+            None,
+            None,
+            nelomai_client_core::ConnectionIntentStatus::None,
+            None,
+            None,
+        )
+        .with_desktop_tunnel_backend(backend);
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            json.get("desktopTunnelBackend")
+                .and_then(|value| value.as_str()),
+            backend
+        );
+        assert!(backend.is_some() || json.get("desktopTunnelBackend").is_none());
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1919,7 +1964,7 @@ async fn current_connection_intent(
     Option<i64>,
     Option<String>,
 ) {
-    let (status, retry, reserve, _) =
+    let (status, retry, reserve, _, _) =
         current_connection_projection(app, _status_unavailable_fallback).await;
     (status, retry, reserve)
 }
@@ -1932,11 +1977,12 @@ async fn current_connection_projection(
     Option<i64>,
     Option<String>,
     Option<&'static str>,
+    Option<&'static str>,
 ) {
     #[cfg(target_os = "android")]
     {
         let (status, retry, reserve) = current_connection_intent(app, fallback).await;
-        (status, retry, reserve, None)
+        (status, retry, reserve, None, None)
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -1953,13 +1999,20 @@ async fn current_connection_projection(
             application.desktop_redundancy_status(),
         )
         .await;
-        let pair = pair.ok().and_then(Result::ok).flatten();
-        let (reserve, active) = desktop_pair_presentation(pair.as_ref());
+        let pair = pair
+            .map_err(|_| ())
+            .and_then(|result| result.map_err(|_| ()));
+        let (reserve, active, backend) = desktop_pair_presentation(
+            pair.as_ref()
+                .map(|snapshot| snapshot.as_ref())
+                .map_err(|_| ()),
+        );
         (
             snapshot.status,
             snapshot.next_retry_at_unix,
             reserve,
             active,
+            backend,
         )
     }
 }
@@ -2216,8 +2269,13 @@ pub async fn app_state(
                 let current_metrics =
                     current_connection_metrics(&metrics, metrics_context.as_ref()).await;
                 let status_unavailable_fallback = android_status_unavailable_fallback();
-                let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
-                    current_connection_projection(&app, status_unavailable_fallback).await;
+                let (
+                    intent_status,
+                    next_retry_at_unix,
+                    reserve_state,
+                    desktop_active_slot,
+                    desktop_backend,
+                ) = current_connection_projection(&app, status_unavailable_fallback).await;
                 let local_cleanup = application.local_stop_pending_cleanup().await;
                 Ok(AppStateResponse::new(
                     state,
@@ -2228,6 +2286,7 @@ pub async fn app_state(
                     reserve_state,
                 )
                 .with_desktop_active_slot(desktop_active_slot)
+                .with_desktop_tunnel_backend(desktop_backend)
                 .with_local_stop_pending_cleanup(local_cleanup))
             }
         }),
@@ -2811,7 +2870,7 @@ pub(crate) async fn quick_toggle(
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
+    let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot, desktop_backend) =
         current_connection_projection(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
             .await;
     #[cfg(not(target_os = "android"))]
@@ -2830,6 +2889,7 @@ pub(crate) async fn quick_toggle(
         reserve_state,
     )
     .with_desktop_active_slot(desktop_active_slot)
+    .with_desktop_tunnel_backend(desktop_backend)
     .with_local_stop_pending_cleanup(local_cleanup))
 }
 

@@ -225,6 +225,7 @@ export interface PeerOptions {
 export interface AppState {
   phase: Phase;
   localStopPendingCleanup?: boolean;
+  desktopTunnelBackend?: "worker" | "legacy" | null;
   connection: Connection | null;
   connectionIntentStatus: ConnectionIntentStatus;
   nextRetryAtUnix: number | null;

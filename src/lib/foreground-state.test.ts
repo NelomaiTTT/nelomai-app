@@ -16,7 +16,7 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "readDesktopTunnelBackend", "defenderRepairStatusMessage"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -77,7 +77,7 @@ function fixture() {
     pinnedStray: null, loadPeers: async () => {},
     connectionActionState: initialConnectionActionState(),
     localStopPendingCleanup: false, connectionMetrics: null, reserveState: null,
-    desktopActiveSlot: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
+    desktopActiveSlot: null, desktopTunnelBackend: null as "worker" | "legacy" | null, connectionIntentStatus: "none", nextRetryAtUnix: null,
     ownedConnectionIntentNotice: null, error: null, view: "connection",
     nativeClient: { state: () => response, recordStartupStage: () => {} },
     readDesktopActiveSlot: () => null, viewForAppState: () => "connection",
@@ -85,7 +85,7 @@ function fixture() {
     beginRuntimeStateSync, initialRuntimeStateSync,
   };
   const state = { phase: "connected", connection: null, warning: null, metrics: null,
-    reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null };
+    reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null, desktopTunnelBackend: null as "worker" | "legacy" | null };
   return { context, reply, reject, state };
 }
 
@@ -1036,5 +1036,413 @@ describe("desktop async Stop", () => {
     expect(immediatePhase).toBe("stopping");
     expect(acceptedPhase).toBe("stopping");
     expect(context.phase).toBe("ready");
+  });
+});
+
+
+describe("Windows Defender repair and transport warning", () => {
+  function findBannerBlock(node: any): any {
+    if (!node || typeof node !== "object") return null;
+    if (node.type === "IfBlock" && node.consequent.nodes.some((child: any) => child.type === "RegularElement"
+      && child.name === "section" && child.attributes.some((a: any) => a.name === "class"
+        && a.value?.some((v: any) => v.data === "defender-banner")))) return node;
+    for (const child of Object.values(node)) {
+      for (const value of Array.isArray(child) ? child : [child]) {
+        const found = findBannerBlock(value);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+  const block = findBannerBlock(template.fragment);
+  const test = block.test as typeof block.test & { start: number; end: number };
+  const helpers = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
+    && ["usesLegacyAwgDll", "defenderBannerVisible"].includes(node.name?.text ?? ""))
+    .map((node) => node.getText(ast)).join("\n");
+  const visible = new Function("context", `with (context) { ${ts.transpile(helpers,
+    { target: ts.ScriptTarget.ES2022 })}; return !!(${page.slice(test.start, test.end)}); }`);
+  const feedback = block.alternate?.nodes.find((node: any) => node.type === "IfBlock")?.test;
+  const feedbackVisible = new Function("context", `with (context) { ${ts.transpile(helpers,
+    { target: ts.ScriptTarget.ES2022 })}; return !!(${feedback ? page.slice(feedback.start, feedback.end) : "false"}); }`);
+  const blockerDeclaration = ast.statements.filter(ts.isVariableStatement)
+    .flatMap((node) => [...node.declarationList.declarations])
+    .find((node) => node.name.getText(ast) === "reportedThirdPartyBlocker")!;
+  const blockerExpression = (blockerDeclaration.initializer as ts.CallExpression).arguments[0].getText(ast);
+  const readBlocker = new Function("context", `with (context) { return (${blockerExpression}); }`);
+  function defenderFixture(): any {
+    return {
+      phase: "ready", selectedLayer: "stray", connection: null,
+      desktopActiveSlot: null, reserveState: null, desktopTunnelBackend: "legacy",
+      runtimeChannelClosed: false,
+      appPreferences: { useReserveConnection: false },
+      reportedThirdPartyBlocker: null,
+      windowsDefender: { supported: true, state: "missing", dllPresent: true },
+      defenderRepairBusy: false, defenderRepairMessage: null,
+      defenderStatusRevision: 0,
+      nativeClient: { repairWindowsDefender: async () => ({ supported: true, state: "missing", dllPresent: true }) },
+    };
+  }
+  it("warns for the selected legacy DLL transport and a missing component", () => {
+    const c = defenderFixture();
+    expect(visible(c)).toBe(true);
+    c.windowsDefender.state = "excluded";
+    expect(visible(c)).toBe(false);
+    c.windowsDefender.dllPresent = false;
+    expect(visible(c)).toBe(true);
+  });
+  it("does not warn about the DLL for a prospective reserve worker or TIC", () => {
+    const c = defenderFixture();
+    c.appPreferences.useReserveConnection = true;
+    expect(visible(c)).toBe(false);
+    c.appPreferences.useReserveConnection = false;
+    c.selectedLayer = "tic";
+    expect(visible(c)).toBe(false);
+  });
+  it.each(["warming", "ready", "unavailable", "failover", "degraded"])("uses actual worker state %s after preferences change", (reserve) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", connection: { layer: "stray" }, reserveState: reserve, desktopTunnelBackend: "worker" });
+    expect(visible(c)).toBe(false);
+    c.windowsDefender.dllPresent = false;
+    expect(visible(c)).toBe(false);
+  });
+  it("uses the actual active slot before reserve status arrives", () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", connection: { layer: "stray" }, desktopActiveSlot: "A", desktopTunnelBackend: "worker" });
+    expect(visible(c)).toBe(false);
+  });
+  it("does not hide a running legacy DLL warning when next-start preferences change", () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", connection: { layer: "stray" }, selectedLayer: "tic" });
+    c.appPreferences.useReserveConnection = true;
+    expect(visible(c)).toBe(true);
+  });
+  it.each([null, undefined, "invalid"])("does not infer legacy from an unknown initial backend marker %s", (backend) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", connection: { layer: "stray", lease_id: "worker" }, desktopTunnelBackend: backend });
+    expect(visible(c)).toBe(false);
+  });
+  it.each([null, "worker"])("does not label a pending connection with backend %s as legacy", (backend) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connecting", desktopTunnelBackend: backend });
+    expect(visible(c)).toBe(false);
+  });
+  it("uses next-start preferences after a worker has stopped", () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "ready", desktopTunnelBackend: "worker" });
+    expect(visible(c)).toBe(true);
+  });
+  it.each([["legacy", true], ["worker", false], [null, false]])("uses confirmed backend %s rather than next-start preferences in error", (backend, warning) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "error", connection: { layer: "stray" }, desktopTunnelBackend: backend });
+    c.appPreferences.useReserveConnection = backend === "legacy";
+    expect(visible(c)).toBe(warning);
+  });
+  it("keeps a successful worker Start unknown after two non-EOF state failures", async () => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture(), {
+      bootstrap: { device: { id: "own-device", platform: "windows" }, binding: {} },
+      connectionAction: "start", runtimeStatus: null, splitTunnelBlocksStart: false,
+      runtimeStartBlocked: () => false, ticConnectionMode: "dynamic",
+      routeMode: "standalone", selectedEgressMode: "ipv4", antivirusStartFailure: false,
+      prepareConnectionStartForPlatform, canBeginConnectionAction, beginConnectionStart,
+      beginConnectionStop, finishConnectionStart, finishConnectionStop,
+      pendingBindingPreferenceRequest: () => null,
+    });
+    c.appPreferences.useReserveConnection = true;
+    let finishStart!: (value: unknown) => void;
+    let startRequested!: () => void;
+    const requested = new Promise<void>(resolve => { startRequested = resolve; });
+    c.nativeClient.start = () => {
+      startRequested();
+      return new Promise(resolve => { finishStart = resolve; });
+    };
+    let reads = 0;
+    c.nativeClient.state = async () => { reads++; throw { code: "tunnel_failed" }; };
+    const pending = toggle(c);
+    await requested;
+    // The new preference belongs to the next connection only.
+    c.appPreferences.useReserveConnection = false;
+    finishStart({ status: "connected", connection: { layer: "stray", lease_id: "worker" }, nextRetryAtUnix: null });
+    await pending;
+    expect(reads).toBe(2);
+    expect(c.phase).toBe("error");
+    expect(c.runtimeChannelClosed).toBe(false);
+    expect(c.connection.lease_id).toBe("worker");
+    expect(c.desktopTunnelBackend).toBeNull();
+    expect(c.busy).toBe(false);
+    expect(visible(c)).toBe(false);
+  });
+  it.each([["worker", false], ["legacy", true], [null, false]])("keeps backend %s unknown after runtime channel closure", (backend, before) => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture(), {
+      phase: "connected", connection: { layer: "stray" }, desktopTunnelBackend: backend,
+    });
+    // This preference applies to the next Start, not the unobserved runtime.
+    c.appPreferences.useReserveConnection = false;
+    expect(visible(c)).toBe(before);
+    executePageFunction("applyRuntimeChannelClosure", c, { code: "runtime_channel_closed" });
+    expect(c.runtimeChannelClosed).toBe(true);
+    expect(c.phase).toBe("error");
+    expect(c.desktopTunnelBackend).toBeNull();
+    expect(visible(c)).toBe(false);
+  });
+  it.each(["worker", "replacement"])("keeps worker status loss unknown and recognizes confirmed legacy lease %s", async (nextLease) => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture());
+    let current: any = { ...f.state, phase: "connected", connection: { layer: "stray", lease_id: "worker" },
+      reserveState: "ready", desktopActiveSlot: "A", desktopTunnelBackend: "worker" };
+    c.nativeClient.state = async () => current;
+    c.readDesktopActiveSlot = (value: unknown) => executePageFunction("readDesktopActiveSlot", c, value);
+    await synchronize(c);
+    expect(visible(c)).toBe(false);
+    // The native timeout/error reply omits both slot and backend. Actual async
+    // reconciliation must retire old values rather than guess a legacy DLL.
+    current = { ...current, reserveState: null, desktopActiveSlot: undefined, desktopTunnelBackend: undefined };
+    c.appPreferences.useReserveConnection = false;
+    await synchronize(c);
+    expect(c.desktopTunnelBackend).toBeNull();
+    expect(visible(c)).toBe(false);
+    // A new confirmed legacy start must not inherit the old worker kind,
+    // even when a pinned connection reuses the same lease identifier.
+    current = { ...current, connection: { layer: "stray", lease_id: nextLease }, desktopTunnelBackend: "legacy" };
+    c.appPreferences.useReserveConnection = true;
+    await synchronize(c);
+    expect(c.desktopTunnelBackend).toBe("legacy");
+    expect(visible(c)).toBe(true);
+  });
+  it("uses a confirmed legacy reply even if an error path retains old reserve presentation", () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", connection: { layer: "stray" }, reserveState: "ready", desktopActiveSlot: "A" });
+    expect(visible(c)).toBe(true);
+  });
+  it("keeps a specifically reported antivirus blocker visible", () => {
+    const c = defenderFixture();
+    Object.assign(c, { desktopActiveSlot: "B", reserveState: "ready", antivirusStartFailure: true,
+      activeThirdPartyAntivirus: { name: "Test AV" } });
+    c.reportedThirdPartyBlocker = readBlocker(c);
+    expect(visible(c)).toBe(true);
+    c.runtimeChannelClosed = true;
+    expect(visible(c)).toBe(true);
+  });
+  it.each(["missing", "unavailable", "inactive"])("does not report successful repair for %s status", async (state) => {
+    const c = defenderFixture();
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state, dllPresent: true });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(c.windowsDefender.state).toBe(state);
+    expect(c.defenderRepairMessage).not.toMatch(/Исключение добавлено|готов к запуску/);
+    expect(c.defenderRepairBusy).toBe(false);
+    expect(visible(c) || feedbackVisible(c)).toBe(true);
+  });
+  it.each(["missing", "unavailable", "inactive"])("keeps explicit %s repair feedback after an accepted unknown transport reply", async (state) => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture(), {
+      phase: "connected", connection: { layer: "stray", lease_id: "legacy" },
+    });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state, dllPresent: true });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(visible(c) || feedbackVisible(c)).toBe(true);
+    c.nativeClient.state = async () => ({ ...f.state, phase: "connected", connection: c.connection,
+      reserveState: null, desktopTunnelBackend: undefined });
+    await synchronize(c);
+    expect(c.desktopTunnelBackend).toBeNull();
+    expect(c.defenderRepairBusy).toBe(false);
+    expect(c.defenderRepairMessage).toBeTruthy();
+    expect(visible(c)).toBe(false);
+    expect(feedbackVisible(c)).toBe(true);
+  });
+  it.each(["defender_exclusion_repair_cancelled", "defender_exclusion_repair_failed"])("keeps explicit %s feedback under unknown transport", async (code) => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture(), {
+      phase: "connected", connection: { layer: "stray", lease_id: "legacy" }, commandMessage,
+    });
+    c.nativeClient.repairWindowsDefender = async () => { throw { code }; };
+    c.nativeClient.windowsDefenderStatus = async () => c.windowsDefender;
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    await executePageFunction("repairWindowsDefender", c);
+    c.nativeClient.state = async () => ({ ...f.state, phase: "connected", connection: c.connection,
+      reserveState: null, desktopTunnelBackend: undefined });
+    await synchronize(c);
+    expect(c.defenderRepairMessage).toBe(commandMessage({ code }, "start"));
+    expect(visible(c)).toBe(false);
+    expect(feedbackVisible(c)).toBe(true);
+    expect(c.defenderRepairBusy).toBe(false);
+  });
+  it("reports success only for a confirmed exclusion with an intact component", async () => {
+    const c = defenderFixture();
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: true });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(visible(c) || feedbackVisible(c)).toBe(false);
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(c.defenderRepairMessage).not.toMatch(/готов к запуску/);
+    expect(c.defenderRepairMessage).toMatch(/восстановить/);
+  });
+  it.each(["before", "after"])("keeps missing-component repair feedback when backend becomes unknown %s repair", async (order) => {
+    const f = fixture();
+    const c: any = Object.assign(f.context, defenderFixture(), {
+      phase: "connected", connection: { layer: "stray", lease_id: "legacy" },
+    });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    c.nativeClient.state = async () => ({ ...f.state, phase: "connected", connection: c.connection,
+      reserveState: null, desktopTunnelBackend: undefined });
+    if (order === "before") await synchronize(c);
+    await executePageFunction("repairWindowsDefender", c);
+    if (order === "after") await synchronize(c);
+    expect(c.desktopTunnelBackend).toBeNull();
+    expect(c.defenderRepairMessage).toMatch(/восстановить/);
+    expect(c.defenderRepairBusy).toBe(false);
+    expect(visible(c)).toBe(false);
+    expect(feedbackVisible(c)).toBe(true);
+  });
+  it("does not reveal completed repair success after a later missing-component status", async () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: "worker" });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: true });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(visible(c) || feedbackVisible(c)).toBe(false);
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    await executePageFunction("refreshWindowsDefender", c);
+    expect(c.windowsDefender.dllPresent).toBe(false);
+    expect(visible(c) || feedbackVisible(c)).toBe(false);
+  });
+  it.each(["missing", "unavailable"])("reconciles repair guidance with fresh %s status", async (state) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    await executePageFunction("repairWindowsDefender", c);
+    expect(feedbackVisible(c)).toBe(true);
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state, dllPresent: state === "missing" });
+    await executePageFunction("refreshWindowsDefender", c);
+    expect(c.defenderRepairMessage).not.toMatch(/Исключение подтверждено|переустановите/);
+    expect(feedbackVisible(c)).toBe(true);
+  });
+  it("does not restore obsolete reinstall guidance after a healthy status resolves it", async () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    await executePageFunction("repairWindowsDefender", c);
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state: "excluded", dllPresent: true });
+    await executePageFunction("refreshWindowsDefender", c);
+    expect(feedbackVisible(c)).toBe(false);
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state: "missing", dllPresent: true });
+    await executePageFunction("refreshWindowsDefender", c);
+    expect(feedbackVisible(c)).toBe(false);
+  });
+  it.each(["before", "during"])("does not overwrite a newer Repair result with a status request started %s Repair", async (order) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null });
+    let finishStatus!: (value: unknown) => void;
+    c.nativeClient.windowsDefenderStatus = () => new Promise(resolve => { finishStatus = resolve; });
+    let pending: any;
+    if (order === "before") pending = executePageFunction("refreshWindowsDefender", c);
+    let finishRepair!: (value: unknown) => void;
+    c.nativeClient.repairWindowsDefender = () => new Promise(resolve => { finishRepair = resolve; });
+    const repair = executePageFunction("repairWindowsDefender", c);
+    if (order === "during") pending = executePageFunction("refreshWindowsDefender", c);
+    finishRepair({ supported: true, state: "excluded", dllPresent: false });
+    await repair;
+    finishStatus({ supported: true, state: "excluded", dllPresent: true });
+    await pending;
+    expect(c.windowsDefender.dllPresent).toBe(false);
+    expect(feedbackVisible(c)).toBe(true);
+  });
+  it.each(["older", "newer"])("keeps the latest requested status when the %s reply completes first", async (first) => {
+    const c = defenderFixture();
+    const replies: Array<(value: unknown) => void> = [];
+    c.nativeClient.windowsDefenderStatus = () => new Promise(resolve => { replies.push(resolve); });
+    const older = executePageFunction("refreshWindowsDefender", c);
+    const newer = executePageFunction("refreshWindowsDefender", c);
+    const oldStatus = { supported: true, state: "excluded", dllPresent: false };
+    const newStatus = { supported: true, state: "unavailable", dllPresent: true };
+    if (first === "older") { replies[0](oldStatus); await older; replies[1](newStatus); }
+    else { replies[1](newStatus); await newer; replies[0](oldStatus); }
+    await Promise.all([older, newer]);
+    expect(c.windowsDefender).toEqual(newStatus);
+  });
+  it("preserves a newer Repair error when an older status request completes", async () => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null, commandMessage });
+    c.nativeClient.repairWindowsDefender = async () => ({ supported: true, state: "excluded", dllPresent: false });
+    await executePageFunction("repairWindowsDefender", c);
+    let finishStatus!: (value: unknown) => void;
+    let reads = 0;
+    c.nativeClient.windowsDefenderStatus = () => ++reads === 1
+      ? new Promise(resolve => { finishStatus = resolve; })
+      : Promise.reject({ code: "tunnel_failed" });
+    const pending = executePageFunction("refreshWindowsDefender", c);
+    c.nativeClient.repairWindowsDefender = async () => { throw { code: "tunnel_failed" }; };
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    await executePageFunction("repairWindowsDefender", c);
+    finishStatus({ supported: true, state: "unavailable", dllPresent: false });
+    await pending;
+    expect(c.defenderRepairMessage).toBe(commandMessage({ code: "tunnel_failed" }, "start"));
+    expect(feedbackVisible(c)).toBe(true);
+    expect(c.defenderRepairBusy).toBe(false);
+  });
+  it.each(["before", "during"])("preserves an identical newer Repair error when a status request starts %s Repair", async (order) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null, commandMessage });
+    c.nativeClient.repairWindowsDefender = async () => { throw { code: "tunnel_failed" }; };
+    c.nativeClient.windowsDefenderStatus = async () => { throw { code: "tunnel_failed" }; };
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    await executePageFunction("repairWindowsDefender", c);
+    let finishStatus!: (value: unknown) => void;
+    let reads = 0;
+    c.nativeClient.windowsDefenderStatus = () => ++reads === 1
+      ? new Promise(resolve => { finishStatus = resolve; })
+      : Promise.reject({ code: "tunnel_failed" });
+    let failRepair!: (reason: unknown) => void;
+    c.nativeClient.repairWindowsDefender = () => new Promise((_, reject) => { failRepair = reject; });
+    let pendingStatus: any;
+    if (order === "before") pendingStatus = executePageFunction("refreshWindowsDefender", c);
+    const pendingRepair = executePageFunction("repairWindowsDefender", c);
+    if (order === "during") pendingStatus = executePageFunction("refreshWindowsDefender", c);
+    failRepair({ code: "tunnel_failed" });
+    await pendingRepair;
+    finishStatus({ supported: true, state: "unavailable", dllPresent: false });
+    await pendingStatus;
+    expect(c.defenderRepairMessage).toBe(commandMessage({ code: "tunnel_failed" }, "start"));
+    expect(feedbackVisible(c)).toBe(true);
+    expect(c.defenderRepairBusy).toBe(false);
+  });
+  it.each(["defender_exclusion_repair_cancelled", "tunnel_failed"])("retains the current Repair error %s after a changed status refresh", async (code) => {
+    const c = defenderFixture();
+    Object.assign(c, { phase: "connected", desktopTunnelBackend: null, commandMessage });
+    c.nativeClient.repairWindowsDefender = async () => { throw { code }; };
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state: "unavailable", dllPresent: false });
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    await executePageFunction("repairWindowsDefender", c);
+    expect(c.defenderRepairMessage).toBe(commandMessage({ code }, "start"));
+    expect(feedbackVisible(c)).toBe(true);
+    expect(c.defenderRepairBusy).toBe(false);
+  });
+  it("does not hide a failed Repair behind an interim healthy status when confirmation fails", async () => {
+    const c = defenderFixture();
+    Object.assign(c, { commandMessage });
+    let failRepair!: (reason: unknown) => void;
+    c.nativeClient.repairWindowsDefender = () => new Promise((_, reject) => { failRepair = reject; });
+    let reads = 0;
+    c.nativeClient.windowsDefenderStatus = async () => {
+      if (++reads === 1) return { supported: true, state: "excluded", dllPresent: true };
+      throw { code: "tunnel_failed" };
+    };
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    const pending = executePageFunction("repairWindowsDefender", c);
+    await executePageFunction("refreshWindowsDefender", c);
+    failRepair({ code: "tunnel_failed" });
+    await pending;
+    expect(c.defenderRepairMessage).toBe(commandMessage({ code: "tunnel_failed" }, "start"));
+    expect(visible(c) || feedbackVisible(c)).toBe(true);
+    expect(c.defenderRepairBusy).toBe(false);
+  });
+  it("hides repair failure feedback if a fresh post-failure check confirms an intact exclusion", async () => {
+    const c = defenderFixture();
+    Object.assign(c, { commandMessage });
+    c.nativeClient.repairWindowsDefender = async () => { throw { code: "tunnel_failed" }; };
+    c.nativeClient.windowsDefenderStatus = async () => ({ supported: true, state: "excluded", dllPresent: true });
+    c.refreshWindowsDefender = () => executePageFunction("refreshWindowsDefender", c);
+    await executePageFunction("repairWindowsDefender", c);
+    expect(visible(c) || feedbackVisible(c)).toBe(false);
+    expect(c.defenderRepairBusy).toBe(false);
   });
 });
