@@ -86,7 +86,10 @@ jobs:
       - name: Проверить интерфейс приложения
         run: npm test
       - name: Проверить Windows-службу
-        run: cargo test --target x86_64-pc-windows-msvc -p nelomai-windows-service
+        run: |
+          ./scripts/windows/test-member-file-operations.ps1
+          cargo test --target x86_64-pc-windows-msvc -p nelomai-windows-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Подготовить системную часть
         shell: pwsh
         run: |

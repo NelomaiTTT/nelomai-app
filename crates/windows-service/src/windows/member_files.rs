@@ -1,5 +1,5 @@
 //! Private native files. Pure security/decoder policy is tested on the
-//! host; Windows IO is compiled only, never invoked by tests.
+//! host; native Win32 tests use isolated fixtures, with privileged IO opt-in.
 #![cfg_attr(not(windows), allow(dead_code))] // Portable fake tests have no native caller.
 
 use crate::member_owner::{OwnerError, Phase, Record, Result};
@@ -520,6 +520,8 @@ mod native {
             .map_err(|_| OwnerError::Conflict)
     }
     fn acl(file: &File, protection: Protection) -> Result<Acl> {
+        #[cfg(test)]
+        operation_tests::count_acl();
         let mut owner = ptr::null_mut();
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
@@ -665,6 +667,8 @@ mod native {
         Ok(unsafe { File::from_raw_handle(raw) })
     }
     fn open_directory(path: &Path) -> std::result::Result<File, u32> {
+        #[cfg(test)]
+        operation_tests::count_open_directory();
         open(
             path,
             FILE_READ_ATTRIBUTES | READ_CONTROL,
@@ -683,6 +687,8 @@ mod native {
     }
     impl Directory {
         fn verify(&self) -> Result<()> {
+            #[cfg(test)]
+            operation_tests::count_directory();
             let by_path = open_directory(&self.path).map_err(|_| OwnerError::Native)?;
             for file in [&self.file, &by_path] {
                 if stamp(file, true, 0)?.id != self.id || acl(file, self.protection)? != self.acl {
@@ -1249,16 +1255,22 @@ mod native {
                 TunnelSlot::B => "nelomai-b.owner.json",
             })
         }
-        fn lock(&self, slot: TunnelSlot) -> Result<File> {
+        fn lock(&mut self, slot: TunnelSlot) -> Result<File> {
             self.lock_named(match slot {
                 TunnelSlot::A => "nelomai-a.owner.lock",
                 TunnelSlot::B => "nelomai-b.owner.lock",
             })
         }
-        fn lock_named(&self, name: &'static str) -> Result<File> {
-            self.verify_directories()?;
+        fn lock_named(&mut self, name: &'static str) -> Result<File> {
+            // Own the fresh preflight here so session transactions do not
+            // repeat it immediately before acquiring the same private lock.
+            self.ready()?;
+            #[cfg(test)]
+            operation_tests::after_preflight(&self.root)?;
             let path = self.root.join(name);
             let security = Security::new(FILE_SDDL)?;
+            #[cfg(test)]
+            operation_tests::count_lock_open();
             let file = open(
                 &path,
                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL,
@@ -1270,6 +1282,8 @@ mod native {
             .map_err(|_| OwnerError::Native)?;
             stamp(&file, false, 0)?;
             acl(&file, Protection::File)?;
+            #[cfg(test)]
+            operation_tests::after_lock(&self.root)?;
             self.verify_directories()?;
             Ok(file)
         }
@@ -1579,8 +1593,6 @@ mod native {
             &mut self,
             action: impl FnOnce(&mut dyn PrivateRecords) -> std::io::Result<T>,
         ) -> std::io::Result<T> {
-            self.ready()
-                .map_err(|_| std::io::Error::other("protected_session_file_failed"))?;
             let _lock = self
                 .lock_named("nelomai-redundant.lock")
                 .map_err(|_| std::io::Error::other("protected_session_file_failed"))?;
@@ -1678,6 +1690,11 @@ mod native {
             .transpose()
         }
     }
+    #[cfg(test)]
+    mod operation_tests {
+        include!("member_files_operation_tests.rs");
+    }
+
     #[cfg(test)]
     mod payload_native_tests {
         use super::*;

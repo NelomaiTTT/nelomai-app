@@ -133,6 +133,96 @@ class ReleaseWorkflowTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 artifact.verify(output, source, digest)
 
+    def test_member_file_operations_require_explicit_native_gate(self):
+        import copy
+        checker = module("release-workflow-check")
+        checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        manual = yaml.safe_load((ROOT / ".github/workflows/windows-build.yml").read_text())
+        gate = './scripts/windows/test-member-file-operations.ps1'
+        suite = next(step for step in checks["jobs"]["windows-build"]["steps"]
+                     if step.get("run", "").startswith('cargo test -p nelomai-windows-service -- --skip '))
+        self.assertIn(gate, suite["run"].splitlines())
+        self.assertIn('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', suite["run"].splitlines())
+        manual_suite = next(step for step in manual["jobs"]["build"]["steps"]
+                            if gate in step.get("run", "").splitlines())
+        self.assertEqual(manual_suite["run"].splitlines()[0], gate)
+        checker.assert_windows_manual_member_file_gate(manual)
+        renamed = copy.deepcopy(manual)
+        renamed["name"] = "Cosmetic workflow label"
+        for job in renamed["jobs"].values():
+            job["name"] = "Cosmetic job label"
+            for step in job.get("steps", []):
+                step["name"] = "Cosmetic step label"
+        checker.assert_windows_manual_member_file_gate(renamed)
+        def parallel_ungated_job(workflow):
+            copied = copy.deepcopy(workflow["jobs"]["build"])
+            copied["steps"] = [step for step in copied["steps"] if gate not in step.get("run", "").splitlines()]
+            workflow["jobs"]["ungated"] = copied
+        for label, mutate_workflow in (
+            ("build-mode", lambda workflow: workflow["jobs"]["build"].update(**{"if": "${{ always() }}"})),
+            ("push-trigger", lambda workflow: workflow.get("on", workflow.get(True)).update(push={})),
+            ("diagnostic-default", lambda workflow: workflow.get("on", workflow.get(True))["workflow_dispatch"]["inputs"]["startup_diagnostics"].update(default=True)),
+            ("token-permissions", lambda workflow: workflow.update(permissions={"contents": "write"})),
+            ("workflow-shell", lambda workflow: workflow.update(defaults={"run": {"shell": 'pwsh -Command "exit 0" {0}'}})),
+            ("parallel-job", parallel_ungated_job),
+            ("workflow-env", lambda workflow: workflow.update(env={"PATH": "untrusted"})),
+            ("diagnostic-replaced", lambda workflow: workflow["jobs"].__setitem__("download-diagnostics", copy.deepcopy(workflow["jobs"]["build"]))),
+        ):
+            with self.subTest(mutation=label):
+                changed = copy.deepcopy(manual)
+                mutate_workflow(changed)
+                with self.assertRaises(RuntimeError):
+                    checker.assert_windows_manual_member_file_gate(changed)
+        def earlier_sign_with_decoy(job):
+            sign = next(step for step in job["steps"] if step.get("run", "").startswith("npm run tauri build --"))
+            job["steps"].remove(sign)
+            gate_index = next(i for i, step in enumerate(job["steps"]) if gate in step.get("run", "").splitlines())
+            job["steps"].insert(gate_index, sign)
+            job["steps"].insert(-1, {"name": "Собрать NSIS", "run": 'Write-Output "skipped"'})
+        def copied_sign_with_other_name(job):
+            sign = copy.deepcopy(next(step for step in job["steps"] if step.get("run", "").startswith("npm run tauri build --")))
+            sign["name"] = "Сборка до тестов"
+            job["steps"].insert(0, sign)
+        def copied_sign_with_disguised_program(job):
+            copied_sign_with_other_name(job)
+            job["steps"][0]["run"] = "# relocated\n" + job["steps"][0]["run"]
+        for mutate in (
+            earlier_sign_with_decoy,
+            copied_sign_with_other_name,
+            copied_sign_with_disguised_program,
+            lambda job: job["steps"].__setitem__(-1, {"name": "actions/upload-artifact@v4", "run": 'Write-Output "skipped"'}),
+            lambda job: job["steps"].append(job["steps"].pop(next(i for i, step in enumerate(job["steps"]) if gate in step.get("run", "").splitlines()))),
+            lambda job: [step.update(**{"if": "${{ always() }}"}) for step in job["steps"][-3:]],
+            lambda job: job["steps"][-1].update(**{"continue-on-error": True}),
+            lambda job: job["steps"][-1]["with"].update(name="foreign-artifact"),
+            lambda job: job["steps"][-1]["with"].update(path="unverified/*"),
+            lambda job: job["steps"].insert(0, {"uses": "actions/upload-artifact@v4", "with": {"path": "unsigned"}}),
+            lambda job: job["steps"].append(dict(manual_suite)),
+            lambda job: job.update(**{"continue-on-error": True}),
+            lambda job: next(step for step in job["steps"] if gate in step.get("run", "").splitlines()).update(**{"if": "false"}),
+            lambda job: next(step for step in job["steps"] if gate in step.get("run", "").splitlines()).update(**{"continue-on-error": True}),
+            lambda job: next(step for step in job["steps"] if gate in step.get("run", "").splitlines()).update(run=manual_suite["run"].replace('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', '')),
+            lambda job: next(step for step in job["steps"] if gate in step.get("run", "").splitlines()).update(run=manual_suite["run"].replace(gate, 'Write-Output "skipped"')),
+        ):
+            changed = copy.deepcopy(manual)
+            mutate(changed["jobs"]["build"])
+            self.assertNotEqual(changed, manual)
+            with self.assertRaises(RuntimeError):
+                checker.assert_windows_manual_member_file_gate(changed)
+        factory = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
+        checker.assert_windows_factory_jobs(checks, factory)
+        for before, after in (
+            (gate, 'Write-Output "skipped"'),
+            ('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }', ''),
+        ):
+            changed = copy.deepcopy(checks)
+            target = next(step for step in changed["jobs"]["windows-build"]["steps"]
+                          if step.get("run", "").startswith('cargo test -p nelomai-windows-service -- --skip '))
+            target["run"] = target["run"].replace(before, after)
+            self.assertNotEqual(target, suite)
+            with self.assertRaises(RuntimeError):
+                checker.assert_windows_factory_jobs(changed, factory)
+
     def test_loader_diagnostics_cannot_mask_updater_gate_or_supply_factory_artifact(self):
         import copy
         checker = module("release-workflow-check")

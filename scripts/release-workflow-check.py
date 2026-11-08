@@ -49,6 +49,137 @@ def assert_windows_defender_preflight_routing(intent: str, commands: str) -> Non
         raise RuntimeError("Windows Defender preflight must follow captured reserve routing and retain saved-Stray guard")
 
 
+def assert_windows_manual_member_file_gate(workflow: dict) -> None:
+    """Keep ordinary failure and explicit native execution authoritative."""
+    def execution_job(value):
+        # Display labels are not execution identity. Keep IDs and nested
+        # with.name (artifact identity), commands, shells and all other fields.
+        result = {key: item for key, item in value.items() if key != "name"}
+        if "steps" in result:
+            result["steps"] = [{key: item for key, item in step.items() if key != "name"}
+                               for step in result["steps"]]
+        return result
+
+    # No inherited shell/environment or parallel unaudited producer may
+    # bypass the source-bound build's required ordinary/native gates.
+    top_keys = {"on" if key is True else key for key in workflow}
+    if (top_keys - {"name"} != {"on", "permissions", "jobs"}
+            or set(workflow.get("jobs", {})) != {"startup-diagnostic", "download-diagnostics", "build"}):
+        raise RuntimeError("Manual Windows workflow must retain its closed graph without inherited execution overrides")
+    expected_control = {'name': 'Windows build',
+     'on': {'workflow_dispatch': {'inputs': {'startup_diagnostics': {'description': 'Диагностический '
+                                                                                    'Windows-установщик с '
+                                                                                    'журналом запуска, без '
+                                                                                    'публикации',
+                                                                     'type': 'boolean',
+                                                                     'default': False},
+                                             'download_diagnostics_only': {'description': 'Только сравнить '
+                                                                                          'загрузку '
+                                                                                          'закреплённого '
+                                                                                          'архива, без '
+                                                                                          'сборки и '
+                                                                                          'секретов',
+                                                                           'type': 'boolean',
+                                                                           'default': False}}}},
+     'permissions': {'contents': 'read'}}
+    if {"on": workflow.get("on", workflow.get(True)), "permissions": workflow.get("permissions")} != {
+            key: value for key, value in expected_control.items() if key != "name"}:
+        raise RuntimeError("Manual Windows workflow must preserve dispatch-only modes, inputs and readonly authorization")
+    expected_diagnostics = {'startup-diagnostic': {'if': 'inputs.startup_diagnostics && !inputs.download_diagnostics_only',
+                            'runs-on': 'windows-2022',
+                            'timeout-minutes': 45,
+                            'permissions': {'contents': 'read', 'actions': 'read'},
+                            'env': {'NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64': '${{ '
+                                                                               'vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 '
+                                                                               '}}'},
+                            'steps': [{'uses': 'actions/checkout@v4',
+                                       'with': {'submodules': 'recursive', 'persist-credentials': False}},
+                                      {'uses': './.github/actions/release-native-host',
+                                       'with': {'platform': 'windows', 'target': 'x86_64-pc-windows-msvc'}},
+                                      {'uses': 'actions/download-artifact@v4',
+                                       'with': {'artifact-ids': '10073502643',
+                                                'path': 'signed',
+                                                'run-id': 34267783952,
+                                                'merge-multiple': True,
+                                                'github-token': '${{ github.token }}'}},
+                                      {'name': 'Проверить диагностический журнал',
+                                       'run': 'python -m unittest '
+                                              'scripts/tests/test_startup_diagnostics.py'},
+                                      {'name': 'Собрать только диагностический управляющий слой',
+                                       'run': 'python scripts/windows/build-startup-diagnostic.py'},
+                                      {'uses': 'actions/upload-artifact@v4',
+                                       'with': {'name': 'nelomai-windows-startup-diagnostic',
+                                                'path': 'startup-diagnostic/delivery/',
+                                                'if-no-files-found': 'error',
+                                                'retention-days': 7}}]},
+     'download-diagnostics': {'if': 'inputs.download_diagnostics_only && !inputs.startup_diagnostics',
+                              'runs-on': 'windows-2022',
+                              'timeout-minutes': 5,
+                              'steps': [{'uses': 'actions/checkout@v4'},
+                                        {'name': 'Проверить TLS и SHA-256 двумя curl',
+                                         'shell': 'pwsh',
+                                         'run': './scripts/windows/check-toolchain-download.ps1'}]}}
+    if {name: execution_job(job) for name, job in workflow["jobs"].items() if name != "build"} != {
+            name: execution_job(job) for name, job in expected_diagnostics.items()}:
+        raise RuntimeError("Manual diagnostic jobs cannot replace or bypass the gated shipping build")
+    job = workflow.get("jobs", {}).get("build", {})
+    expected = [
+        "./scripts/windows/test-member-file-operations.ps1",
+        "cargo test --target x86_64-pc-windows-msvc -p nelomai-windows-service",
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ]
+    steps = [step for step in job.get("steps", [])
+             if step.get("run", "").strip().splitlines() == expected]
+    if ("continue-on-error" in job or len(steps) != 1
+            or set(steps[0]) - {"name"} != {"run"}
+            or steps[0]["run"].strip().splitlines() != expected):
+        raise RuntimeError("Manual Windows workflow must run the native gate first and preserve ordinary service test failure")
+    index = next(i for i, step in enumerate(job["steps"]) if step is steps[0])
+    suffix = job["steps"][index + 1:]
+    expected_suffix = [{'name': 'Подготовить системную часть',
+      'shell': 'pwsh',
+      'run': 'cargo build --release --target x86_64-pc-windows-msvc -p nelomai-windows-service\n'
+             './scripts/windows/prepare-runtime.ps1\n'},
+     {'name': 'Собрать NSIS',
+      'shell': 'bash',
+      'env': {'TAURI_SIGNING_PRIVATE_KEY': '${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}',
+              'TAURI_SIGNING_PRIVATE_KEY_PASSWORD': '${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}',
+              'NELOMAI_UPDATER_PUBLIC_KEY': '${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}'},
+      'run': 'npm run tauri build -- \\\n'
+             '  --target x86_64-pc-windows-msvc \\\n'
+             '  --config src-tauri/bundle.windows.conf.json \\\n'
+             '  --bundles nsis\n'},
+     {'uses': 'actions/upload-artifact@v4',
+      'with': {'name': 'nelomai-windows-x86_64',
+               'path': 'target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe\n'
+                       'target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig\n',
+               'if-no-files-found': 'error',
+               'retention-days': 3}}]
+    # Keep the setup prefix closed too: a renamed/copied signing command
+    # must not execute before the native gate and then be hidden by a decoy.
+    expected_prefix = [{'uses': 'actions/checkout@v4', 'with': {'submodules': 'recursive'}},
+     {'uses': 'actions/setup-node@v4', 'with': {'node-version-file': '.nvmrc', 'cache': 'npm'}},
+     {'name': 'Update Rustup trust before toolchain downloads',
+      'shell': 'bash',
+      'run': 'if command -v rustup >/dev/null; then if [[ "$RUNNER_OS" == macOS ]] && brew list --versions '
+             'rustup >/dev/null 2>&1; then brew update; brew upgrade rustup; echo "$(brew --prefix '
+             'rustup)/bin" >> "$GITHUB_PATH"; else rustup self update; fi; fi'},
+     {'uses': 'dtolnay/rust-toolchain@master',
+      'with': {'toolchain': '1.88.0', 'targets': 'x86_64-pc-windows-msvc'}},
+     {'uses': 'actions/setup-go@v5', 'with': {'go-version': '1.26.10'}},
+     {'run': 'npm ci'},
+     {'name': 'Проверить интерфейс приложения', 'run': 'npm test'}]
+    expected_build_mode = {'if': '${{ !inputs.download_diagnostics_only && !inputs.startup_diagnostics }}',
+     'name': 'Windows x86_64',
+     'runs-on': 'windows-2022'}
+    if (set(job) - {"name"} != {"if", "runs-on", "steps"}
+            or {key: value for key, value in job.items() if key not in {"steps", "name"}} != {
+                key: value for key, value in expected_build_mode.items() if key != "name"}
+            or execution_job({"steps": job["steps"][:index]}) != execution_job({"steps": expected_prefix})
+            or execution_job({"steps": suffix}) != execution_job({"steps": expected_suffix})):
+        raise RuntimeError("Manual Windows native gate must precede the exact build/sign/upload programs")
+
+
 def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
     """Require the actual producer/consumer graph and its critical programs."""
     def require(condition, message):
@@ -174,7 +305,9 @@ $testExit = $LASTEXITCODE
 python scripts/windows/prepare-lib-test-manifest.py verify --record $record
 if ($testExit -ne 0) { exit $testExit }
 exit $LASTEXITCODE""",
-        'cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair',
+        """cargo test -p nelomai-windows-service -- --skip windows::member_carrier_factory::actual_execution::carrier_factory_selects_new_path_for_supported_pair
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+./scripts/windows/test-member-file-operations.ps1""",
         """$tests = & cargo test --locked -p nelomai-windows-service --lib native_security_buffer_sizes_readonly_descriptor_without_capacity_padding -- --list
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $selected = @($tests | Where-Object { $_ -match 'native_security_buffer_sizes_readonly_descriptor_without_capacity_padding: test$' })
@@ -347,6 +480,7 @@ def run() -> None:
     # stand in for an executing build, digest comparison or failure gate.
     factory_test = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
     assert_windows_factory_jobs(yaml.safe_load(checks_workflow), factory_test)
+    assert_windows_manual_member_file_gate(yaml.safe_load(windows_workflow))
     submodule_entry = subprocess.run(
         ["git", "-C", str(ROOT), "ls-files", "--stage", "vendor/amneziawg-go"],
         check=True,
