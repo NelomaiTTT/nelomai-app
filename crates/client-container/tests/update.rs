@@ -835,6 +835,15 @@ async fn replacement_restart_reuses_only_matching_verified_stop_receipt() {
     assert!(barrier
         .stop_proof("0.2.17", UpdateJournalPhase::InstallerOpened)
         .is_err());
+    // Native common may exit after replacement and before InstallerOpened.
+    // The original exact durable receipt remains valid without reauthenticating
+    // the old executable against the replacement helper.
+    assert_eq!(
+        proof,
+        barrier
+            .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+            .unwrap()
+    );
     barrier.installer_opened().await.unwrap();
     assert_eq!(
         proof,
@@ -1495,48 +1504,55 @@ async fn restart_from_requested_replays_the_same_cleanup_before_old_container_ca
 
 #[tokio::test]
 async fn new_container_first_launch_reconciles_to_verified_latest_before_clearing_update() {
-    let (panel, api, server) = panel().await;
-    let root = tempfile::tempdir().unwrap();
-    write_selection(root.path(), "0.2.16", RuntimeSlot::Stable);
-    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
-    let store = enrolled_store(RuntimeSlot::Stable);
-    let old_control = Arc::new(Control::default());
-    let old = online_coordinator(
-        owner.clone(),
-        store.clone(),
-        old_control,
-        manifest("0.2.16", "0.2.16", true),
-        api.clone(),
-    );
-    let old_barrier = UpdateBarrier::open(old).unwrap();
-    old_barrier.prepare("0.2.17").await.unwrap();
-    old_barrier.installer_opened().await.unwrap();
-    drop(old_barrier);
+    for phase in [
+        UpdateJournalPhase::LocalStopped,
+        UpdateJournalPhase::InstallerOpened,
+    ] {
+        let (panel, api, server) = panel().await;
+        let root = tempfile::tempdir().unwrap();
+        write_selection(root.path(), "0.2.16", RuntimeSlot::Stable);
+        let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+        let store = enrolled_store(RuntimeSlot::Stable);
+        let old_control = Arc::new(Control::default());
+        let old = online_coordinator(
+            owner.clone(),
+            store.clone(),
+            old_control,
+            manifest("0.2.16", "0.2.16", true),
+            api.clone(),
+        );
+        let old_barrier = UpdateBarrier::open(old).unwrap();
+        old_barrier.prepare("0.2.17").await.unwrap();
+        if phase == UpdateJournalPhase::InstallerOpened {
+            old_barrier.installer_opened().await.unwrap();
+        }
+        drop(old_barrier);
 
-    write_selection(root.path(), "0.2.17", RuntimeSlot::Latest);
-    let new_control = Arc::new(Control::default());
-    let updated = online_coordinator(
-        owner,
-        store,
-        new_control.clone(),
-        manifest("0.2.17", "0.2.17", false),
-        api,
-    );
-    let barrier = UpdateBarrier::open(updated.clone()).unwrap();
+        write_selection(root.path(), "0.2.17", RuntimeSlot::Latest);
+        let new_control = Arc::new(Control::default());
+        let updated = online_coordinator(
+            owner,
+            store,
+            new_control.clone(),
+            manifest("0.2.17", "0.2.17", false),
+            api,
+        );
+        let barrier = UpdateBarrier::open(updated.clone()).unwrap();
 
-    barrier.recover("0.2.17").await.unwrap();
+        barrier.recover("0.2.17").await.unwrap();
 
-    assert!(barrier.snapshot().unwrap().is_none());
-    assert_eq!(updated.status().unwrap().selected_slot, RuntimeSlot::Latest);
-    assert_eq!(
-        updated.snapshot().unwrap().unwrap().phase(),
-        SwitchPhase::Complete
-    );
-    assert_eq!(panel.reconcile.load(Ordering::SeqCst), 1);
-    assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
-    assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
-    assert_eq!(new_control.completed.load(Ordering::SeqCst), 1);
-    server.abort();
+        assert!(barrier.snapshot().unwrap().is_none());
+        assert_eq!(updated.status().unwrap().selected_slot, RuntimeSlot::Latest);
+        assert_eq!(
+            updated.snapshot().unwrap().unwrap().phase(),
+            SwitchPhase::Complete
+        );
+        assert_eq!(panel.reconcile.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
+        assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
+        assert_eq!(new_control.completed.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 }
 
 #[tokio::test]

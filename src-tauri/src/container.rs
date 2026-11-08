@@ -154,10 +154,30 @@ struct NativeStop {
     tunnel: Arc<NativeController>,
     operation: Arc<tokio::sync::Mutex<NativeOperationState>>,
 }
+impl NativeStop {
+    async fn runtime_operation(
+        &self,
+    ) -> io::Result<tokio::sync::MutexGuard<'_, NativeOperationState>> {
+        // macOS authorization may keep the installer here for 120s. Native IPC
+        // has a shorter deadline: reject contention without closing its stream
+        // or allowing any command to bypass the held installation/stop gate.
+        #[cfg(target_os = "macos")]
+        return self
+            .operation
+            .try_lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "native operation busy"));
+        #[cfg(not(target_os = "macos"))]
+        Ok(self.operation.lock().await)
+    }
+}
 #[derive(Default)]
 struct NativeOperationState {
     replacement: Option<(nelomai_client_container::UpdateStopProof, bool)>,
     observed_helper_stop: bool,
+    #[cfg(target_os = "macos")]
+    broker_replaced: bool,
+    #[cfg(target_os = "macos")]
+    exit_requested: bool,
 }
 impl NativeOperationState {
     fn check_start(&self, update_pending: bool) -> io::Result<()> {
@@ -172,6 +192,26 @@ impl NativeOperationState {
         self.observed_helper_stop = false;
         Ok(())
     }
+    #[cfg(target_os = "macos")]
+    fn check_request(&self) -> io::Result<()> {
+        if self.broker_replaced || self.exit_requested {
+            return Err(io::Error::other("native broker was replaced by update"));
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    async fn exchange_request(
+        &self,
+        transport: &impl ServiceTransport,
+        request: Request,
+    ) -> io::Result<Vec<u8>> {
+        self.check_request()?;
+        let response = transport
+            .exchange(request)
+            .await
+            .map_err(|_| io::Error::other("engine unavailable"))?;
+        serde_json::to_vec(&response).map_err(Into::into)
+    }
     fn restart_proof(&self, host: &CommonHost) -> io::Result<()> {
         if !self.observed_helper_stop {
             return Err(io::Error::other("live helper stop receipt unavailable"));
@@ -183,16 +223,34 @@ impl NativeOperationState {
         else {
             return Err(io::Error::other("installed update receipt unavailable"));
         };
-        let current = host
-            .update_stop_proof(
+        let current = host.update_stop_proof(
+            proof.target(),
+            nelomai_client_container::UpdateJournalPhase::InstallerOpened,
+        );
+        // A successful native replacement can finish before the async updater
+        // writes InstallerOpened. The same exact durable stop proof still applies.
+        #[cfg(target_os = "macos")]
+        let current = current.or_else(|_| {
+            host.update_stop_proof(
                 proof.target(),
-                nelomai_client_container::UpdateJournalPhase::InstallerOpened,
+                nelomai_client_container::UpdateJournalPhase::LocalStopped,
             )
-            .map_err(|_| io::Error::other("installed update receipt changed"))?;
+        });
+        let current = current.map_err(|_| io::Error::other("installed update receipt changed"))?;
         if &current != proof {
             return Err(io::Error::other("installed update receipt changed"));
         }
         Ok(())
+    }
+}
+#[cfg(target_os = "macos")]
+impl NativeStop {
+    async fn stop_after_installation(&self) -> io::Result<()> {
+        // The caller holds the native gate and verified the installed stop proof.
+        // Reuse normal common teardown, including when unsolicited EOF already
+        // requested finish; that earlier EOF is not a competing update operation.
+        nelomai_client_container::desktop::stop_runtime_before_helper(&self.child, async { Ok(()) })
+            .await
     }
 }
 #[async_trait::async_trait]
@@ -201,6 +259,10 @@ impl LocalAuthStop for NativeStop {
         let mut operation = self.operation.clone().lock_owned().await;
         let tunnel = self.tunnel.clone();
         tokio::spawn(async move {
+            #[cfg(target_os = "macos")]
+            if operation.check_request().is_err() {
+                return Err(BrokerError::RecoveryRequired);
+            }
             operation.observed_helper_stop = false;
             tunnel
                 .stop()
@@ -265,12 +327,18 @@ impl CommonState {
         // A full process exit is acknowledged only after actual runtime exit
         // and independent helper stop; a closed window never enters here.
         let operation = self.stop.operation.lock().await;
+        #[cfg(target_os = "macos")]
+        if operation.exit_requested {
+            return;
+        }
         let stopped = nelomai_client_container::desktop::stop_runtime_before_helper(
             &self.stop.child,
             async {
                 if operation.restart_proof(&self.host).is_ok() {
                     return Ok(());
                 }
+                #[cfg(target_os = "macos")]
+                operation.check_request()?;
                 self.stop
                     .tunnel
                     .stop()
@@ -657,7 +725,9 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                         }
                         NativeControl::Prepare => {
                             let operation =
-                                tauri::async_runtime::block_on(state.stop.operation.lock());
+                                tauri::async_runtime::block_on(state.stop.runtime_operation())?;
+                            #[cfg(target_os = "macos")]
+                            operation.check_request()?;
                             // Never reinstall/rebind through a replaced common
                             // image. Stop may still contact the existing helper;
                             // all Start/Rebind requests remain fenced separately.
@@ -704,7 +774,7 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                                     {
                                         return Err(io::Error::other("update not ready"));
                                     }
-                                    tauri::async_runtime::block_on(state.stop.operation.lock())
+                                    tauri::async_runtime::block_on(state.stop.runtime_operation())?
                                         .restart_proof(&state.host)?;
                                 }
                                 NativeExitReason::RuntimeSwitch => {
@@ -782,7 +852,7 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
             .await
             .map_err(|_| io::Error::other("common start rejected"))?;
     }
-    let mut operation = state.stop.operation.lock().await;
+    let mut operation = state.stop.runtime_operation().await?;
     // A bound macOS capability query may start an idle engine, so it must
     // invalidate the same stop receipt and respect the update fence.
     if matches!(request, Request::Start { .. } | Request::RebindUdp { .. })
@@ -798,14 +868,23 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
                 || !runtime_is_alive(state),
         )?;
     }
-    let response = state
-        .stop
-        .tunnel
-        .transport()
-        .exchange(request)
-        .await
-        .map_err(|_| io::Error::other("engine unavailable"))?;
-    serde_json::to_vec(&response).map_err(Into::into)
+    #[cfg(target_os = "macos")]
+    {
+        operation
+            .exchange_request(state.stop.tunnel.transport(), request)
+            .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let response = state
+            .stop
+            .tunnel
+            .transport()
+            .exchange(request)
+            .await
+            .map_err(|_| io::Error::other("engine unavailable"))?;
+        serde_json::to_vec(&response).map_err(Into::into)
+    }
 }
 fn runtime_is_alive(state: &CommonState) -> bool {
     state
@@ -846,7 +925,7 @@ pub(crate) async fn begin_installation<R: tauri::Runtime>(
     operation.replacement = Some((proof.clone(), false));
     Ok(proof)
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 pub(crate) async fn installation_succeeded<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     proof: nelomai_client_container::UpdateStopProof,
@@ -874,6 +953,80 @@ pub(crate) async fn installation_succeeded<R: tauri::Runtime>(
     }
     operation.replacement = Some((proof, true));
     Ok(())
+}
+#[cfg(target_os = "macos")]
+pub(crate) async fn handoff_macos_installation<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    proof: nelomai_client_container::UpdateStopProof,
+    install: impl std::future::Future<Output = Result<(), nelomai_client_updater::UpdateBackendError>>
+        + Send
+        + 'static,
+) -> Result<(), nelomai_client_updater::UpdateBackendError> {
+    use nelomai_client_updater::UpdateBackendError;
+    let state = app
+        .try_state::<Arc<CommonState>>()
+        .ok_or_else(|| UpdateBackendError::new("update_stop_proof_unavailable"))?
+        .inner()
+        .clone();
+    let app = app.clone();
+    let mut operation = state.stop.operation.clone().lock_owned().await;
+    // Retain ordering even if the request waiter disappears during authorization.
+    // No old runtime command may invalidate the stop receipt while its bundle moves.
+    crate::macos_launch::run_update(async move {
+        let validate = |operation: &NativeOperationState| {
+            let current = state.host.update_stop_proof(
+                proof.target(),
+                nelomai_client_container::UpdateJournalPhase::LocalStopped,
+            );
+            if !operation.observed_helper_stop
+                || operation.replacement.as_ref() != Some(&(proof.clone(), false))
+                || current.as_ref().ok() != Some(&proof)
+            {
+                return Err(UpdateBackendError::new("update_stop_proof_changed"));
+            }
+            Ok(())
+        };
+        validate(&operation)?;
+        install
+            .await
+            .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        // OS replacement and its validated journal receipt are separate facts:
+        // even a later proof error must never send the old broker to the new helper.
+        operation.broker_replaced = true;
+        validate(&operation)?;
+        operation.replacement = Some((proof, true));
+        // The exact LocalStopped proof is durable and no Start can pass the held
+        // native gate. Reap only our owned runtime; do not ask the new dispatcher
+        // to authenticate a broker whose bundle has just been moved away.
+        let mut was_finishing = None;
+        let finish = crate::macos_launch::finish_update(
+            async {
+                was_finishing = Some(state.finishing.swap(true, Ordering::AcqRel));
+                state.stop.stop_after_installation().await
+            },
+            || {
+                crate::macos_launch::prepare_restart_after_exit(Path::new(
+                    "/Library/Application Support/Nelomai/common/Nelomai.app",
+                ))
+            },
+            || {
+                operation.exit_requested = true;
+                state.finishing.store(true, Ordering::Release);
+                app.exit(0);
+            },
+        )
+        .await;
+        if finish.is_err() {
+            if let Some(previous) = was_finishing {
+                state.finishing.store(previous, Ordering::Release);
+            }
+        }
+        // If arming the relaunch or reaping the child failed, keep the installed
+        // result for existing manual Restart/EOF handling. Never reinterpret a
+        // completed replacement as installer failure/cancellation.
+        Ok(())
+    })
+    .await
 }
 #[cfg(windows)]
 pub(crate) async fn handoff_windows_installer<R: tauri::Runtime>(
@@ -1105,6 +1258,224 @@ fn pre_auth_handoff() -> io::Result<bool> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn pending_installer_rejects_native_frames_without_losing_channel_after_cancel() {
+        use nelomai_client_container::desktop::{read_native_frame, write_native_frame};
+        use std::{sync::atomic::AtomicUsize, time::Duration};
+        struct Transport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ServiceTransport for Transport {
+            async fn exchange(
+                &self,
+                _: Request,
+            ) -> Result<nelomai_unix_service::Response, nelomai_unix_service::ServiceError>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(nelomai_unix_service::Response::success(None))
+            }
+        }
+        let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState::default()));
+        let stop = Arc::new(stop_fixture(operation.clone()));
+        // Authorization is still pending: the installer owns the actual gate.
+        let installation = operation.lock_owned().await;
+        let transport = Arc::new(Transport(AtomicUsize::new(0)));
+        let (stream, mut peer) = NativeStream::pair().unwrap();
+        let client = Arc::new(crate::runtime::NativeClient::new(stream).unwrap());
+        let worker = {
+            let transport = transport.clone();
+            std::thread::spawn(move || {
+                // Real framed channel and native request boundary; only the
+                // privileged service response is synthetic, with counted calls.
+                for _ in 0..2 {
+                    let (tag, body) = read_native_frame(&mut peer).unwrap();
+                    assert_eq!(tag, 1);
+                    let request = serde_json::from_slice(&body).unwrap();
+                    let reply = tauri::async_runtime::block_on(async {
+                        stop.runtime_operation()
+                            .await?
+                            .exchange_request(&*transport, request)
+                            .await
+                    });
+                    match reply {
+                        Ok(body) => write_native_frame(&mut peer, tag, &body).unwrap(),
+                        Err(_) => {
+                            write_native_frame(&mut peer, 255, b"common operation failed").unwrap()
+                        }
+                    }
+                }
+            })
+        };
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .exchange(1, serde_json::to_vec(&Request::status()).unwrap())
+                    .await
+            })
+        };
+        let mut pending = pending;
+        let while_authorizing =
+            tokio::time::timeout(Duration::from_millis(500), &mut pending).await;
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        // User cancels; release the unchanged broker, even on the RED path.
+        drop(installation);
+        if while_authorizing.is_err() {
+            let _ = pending.await;
+        }
+        let after_cancel = client
+            .exchange(1, serde_json::to_vec(&Request::status()).unwrap())
+            .await;
+        worker.join().unwrap();
+        assert!(
+            matches!(while_authorizing, Ok(Ok(Err(_)))),
+            "native IPC must reject promptly while installer owns the gate"
+        );
+        assert!(
+            after_cancel.is_ok(),
+            "Cancel must leave the same native channel usable"
+        );
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stop_fixture(operation: Arc<tokio::sync::Mutex<NativeOperationState>>) -> NativeStop {
+        let root = tempfile::tempdir().unwrap();
+        NativeStop {
+            child: Mutex::new(None),
+            exit_owner: Default::default(),
+            tunnel: Arc::new(nelomai_unix_service::UnixTunnelController::new(
+                nelomai_unix_service::UnixSocketTransport::new(
+                    root.path().join("old-update-helper.sock"),
+                ),
+            )),
+            operation,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn failed_relaunch_keeps_stop_receipt_sealed_against_late_logout() {
+        let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState {
+            broker_replaced: true,
+            observed_helper_stop: true,
+            exit_requested: false,
+            ..Default::default()
+        }));
+        let stop = stop_fixture(operation.clone());
+        assert!(matches!(
+            stop.stop_local().await,
+            Err(BrokerError::RecoveryRequired)
+        ));
+        assert!(
+            operation.lock().await.observed_helper_stop,
+            "installed receipt must survive Stop even when auto relaunch was not armed"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn completed_update_can_finish_after_native_eof_already_claimed_shutdown() {
+        let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState {
+            broker_replaced: true,
+            observed_helper_stop: true,
+            ..Default::default()
+        }));
+        let stop = stop_fixture(operation);
+        assert!(stop.exit_owner.finish_on_native_eof());
+        stop.stop_after_installation()
+            .await
+            .expect("verified update must finish despite earlier EOF ownership");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn queued_engine_requests_never_reach_replacement_helper() {
+        use std::sync::atomic::AtomicUsize;
+        struct Transport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ServiceTransport for Transport {
+            async fn exchange(
+                &self,
+                _: Request,
+            ) -> Result<nelomai_unix_service::Response, nelomai_unix_service::ServiceError>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(nelomai_unix_service::Response::success(None))
+            }
+        }
+        for request in [Request::stop(), Request::status(), Request::version()] {
+            let transport = Arc::new(Transport(AtomicUsize::new(0)));
+            let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState::default()));
+            let mut installation = operation.lock().await;
+            let queued = {
+                let operation = operation.clone();
+                let transport = transport.clone();
+                tokio::spawn(async move {
+                    operation
+                        .lock()
+                        .await
+                        .exchange_request(&*transport, request)
+                        .await
+                })
+            };
+            tokio::task::yield_now().await;
+            assert!(!queued.is_finished());
+            installation.broker_replaced = true;
+            drop(installation);
+            assert!(
+                queued.await.unwrap().is_err(),
+                "old request must be rejected after replacement"
+            );
+            assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+        }
+        let transport = Transport(AtomicUsize::new(0));
+        NativeOperationState::default()
+            .exchange_request(&transport, Request::status())
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.0.load(Ordering::SeqCst),
+            1,
+            "ordinary helper requests remain available"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn queued_stop_cannot_invalidate_receipt_after_update_exit_is_requested() {
+        let root = tempfile::tempdir().unwrap();
+        let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState {
+            observed_helper_stop: true,
+            ..Default::default()
+        }));
+        let stop = Arc::new(NativeStop {
+            child: Mutex::new(None),
+            exit_owner: Default::default(),
+            tunnel: Arc::new(nelomai_unix_service::UnixTunnelController::new(
+                nelomai_unix_service::UnixSocketTransport::new(root.path().join("replaced.sock")),
+            )),
+            operation: operation.clone(),
+        });
+        let mut installation = operation.lock().await;
+        let waiter = tokio::spawn(async move { stop.stop_local().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "installer must retain native ordering"
+        );
+        installation.exit_requested = true;
+        drop(installation);
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(BrokerError::RecoveryRequired)
+        ));
+        assert!(
+            operation.lock().await.observed_helper_stop,
+            "a late Stop must not erase the verified update stop receipt"
+        );
+    }
+
     #[tokio::test]
     async fn common_stop_receipt_and_queued_native_start_require_completed_native_operations() {
         #[cfg(target_os = "macos")]

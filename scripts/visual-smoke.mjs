@@ -115,7 +115,11 @@ try {
     executablePath,
     headless: true,
   });
-  if(process.env.UPDATE_REQUIRED_SMOKE){
+  if(process.env.UPDATE_RESTART_RECOVERY_SMOKE){
+    for(const outcome of ["installed", "not-installed"]){
+      await capture(`update-restart-recovery-${outcome}`,{width:1280,height:800},`update-restart-recovery-${outcome}`);
+    }
+  } else if(process.env.UPDATE_REQUIRED_SMOKE){
     for(const phase of ["ready", "downloading"]){
       await capture(`update-required-${phase}-desktop`,{width:1280,height:800},`update-required-${phase}`);
       await capture(`update-required-${phase}-mobile`,{width:390,height:844},`update-required-${phase}`);
@@ -183,6 +187,14 @@ async function capture(name, viewport, scenario) {
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
+          if(currentScenario.startsWith("update-restart-recovery-")){
+            if(command==="app_bootstrap")throw {code:"runtime_startup_pending",message:"Preparation pending"};
+            if(command==="app_update_status")return {...update,
+              phase:currentScenario.endsWith("not-installed")?"ready_to_install":"ready_to_restart",
+              promptPending:currentScenario.endsWith("not-installed")};
+            if(command==="app_update_restart")return;
+            if(command.startsWith("app_update_"))throw Error("Recovery must only read status or request confirmed Restart");
+          }
           if(currentScenario.startsWith("update-manual-result-") && command.startsWith("app_update_")){
             if(command==="app_update_status" && !window.__HELD_UPDATE_REPLY__){
               window.__HELD_UPDATE_REPLY__=true;
@@ -395,6 +407,26 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if(scenario.startsWith("update-restart-recovery-")){
+    await page.waitForFunction(()=>window.__TAURI_CALLS__.some(c=>c.command==="app_update_status"),{},{timeout:3000});
+    const restart=page.getByRole("button",{name:"Перезапустить",exact:true});
+    if(scenario.endsWith("not-installed")){
+      if(await restart.count() || await page.getByRole("dialog").count() || await page.locator(".update-banner").count())throw Error("Recovery offered an uninstalled update before admission");
+    }else{
+      await restart.waitFor({state:"visible",timeout:3000});
+      await page.getByRole("button",{name:"Повторить",exact:true}).click();
+      await page.waitForFunction(()=>window.__TAURI_CALLS__.filter(c=>c.command==="app_bootstrap").length>=2);
+      await restart.waitFor({state:"visible"});
+      await page.reload({waitUntil:"networkidle"});
+      await restart.waitFor({state:"visible",timeout:3000});
+      await restart.click();
+      if(await page.evaluate(()=>window.__TAURI_CALLS__.filter(c=>c.command==="app_update_restart").length)!==1)throw Error("Manual Restart was not dispatched once");
+    }
+    if(await page.evaluate(()=>window.__TAURI_CALLS__.some(c=>["app_update_confirm","app_update_install","app_update_check"].includes(c.command))))throw Error("Recovery read started a check or installation");
+    console.log(`PASS ${name}: pending admission, read-only status, correct Restart/installation visibility`);
+    await page.screenshot({path:`${outputDir}/nelomai-${name}.png`,fullPage:true});
+    await context.close();return;
+  }
   if(scenario.startsWith("update-required-")){
     const dialog=page.getByRole("dialog",{name:"Установить новую версию"});
     const primary=page.locator(".message-panel").getByRole("button",{name:"Обновить",exact:true});

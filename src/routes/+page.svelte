@@ -727,6 +727,8 @@
         view = "unavailable";
         error = commandMessage(reason, "startup");
       }
+      // An installed update can itself keep the old runtime unadmitted.
+      if (code === "runtime_startup_pending") void refreshUpdateStatus(true);
     } finally {
       const ownsStartup = startupTimer === timer;
       window.clearTimeout(timer);
@@ -1298,13 +1300,14 @@
     }
   }
 
-  async function refreshUpdateStatus() {
+  async function refreshUpdateStatus(restartOnly = false) {
     const sequence = ++updateRequestSequence;
     // Only reads started after this Manual's acknowledgement can finish it.
     const manualCheck = manualUpdatePending?.acknowledged ? manualUpdatePending : null;
     clearUpdateTimer();
     try {
       const status = await nativeClient.updateStatus();
+      if (restartOnly && status.phase !== "ready_to_restart") return;
       if (!observeUpdateStatus(status, sequence, manualCheck)) return;
       if (updateUiVisible && updateStatusNeedsPolling(status)) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);

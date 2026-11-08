@@ -292,6 +292,15 @@ impl HostUpdater {
             .install_recovery_gate
             .try_lock()
             .map_err(|_| PrivateError::RecoveryRequired)?;
+        // A successful replacement can leave this old common alive if relaunch
+        // failed. RuntimeReady must preserve its exact installed stop proof;
+        // only a fresh process may reconcile the durable update journal.
+        #[cfg(not(target_os = "android"))]
+        if self.coordinator.as_ref().is_some_and(|coordinator| {
+            matches!(coordinator.phase(), UpdatePhase::ReadyToRestart { .. })
+        }) {
+            return Err(PrivateError::RecoveryRequired);
+        }
         self.barrier
             .recover_before(&self.version, deadline)
             .await
@@ -1581,6 +1590,60 @@ mod tests {
         confirm(&updater).await;
         wait_for_idle(&updater).await;
         assert_eq!(backend.versions.lock().unwrap().as_slice(), ["0.2.21"]);
+        server.abort();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn installed_update_survives_old_runtime_ready_recovery_until_restart() {
+        let (updater, panel, backend, _, server, root) = updater(false).await;
+        discover(&updater, &panel).await;
+        confirm(&updater).await;
+        wait_for_idle(&updater).await;
+        assert_eq!(backend.versions.lock().unwrap().as_slice(), ["0.2.21"]);
+        assert_eq!(updater.status().unwrap().phase, "ready_to_restart");
+        let path = root.path().join("common/update-journal-v1.json");
+        let before = std::fs::read(&path).unwrap();
+        let proof = updater
+            .stop_proof("0.2.21", crate::UpdateJournalPhase::InstallerOpened)
+            .unwrap();
+        let reconciles = panel.reconciles.load(Ordering::SeqCst);
+        let resumes = panel.resumes.load(Ordering::SeqCst);
+        // Relaunch was not armed, so the same old common/UI remains. This is
+        // the actual recovery entry called by every repeated RuntimeReady.
+        for _ in 0..2 {
+            let result = updater.recover(None).await;
+            assert_eq!(
+                std::fs::read(&path).ok(),
+                Some(before.clone()),
+                "old RuntimeReady must not cancel an already installed update"
+            );
+            assert!(matches!(result, Err(PrivateError::RecoveryRequired)));
+            assert_eq!(
+                updater
+                    .stop_proof("0.2.21", crate::UpdateJournalPhase::InstallerOpened)
+                    .unwrap(),
+                proof
+            );
+            assert!(updater.native_start_blocked().unwrap());
+        }
+        assert_eq!(panel.reconciles.load(Ordering::SeqCst), reconciles);
+        assert_eq!(panel.resumes.load(Ordering::SeqCst), resumes);
+        // A new coordinator has no in-process Installed result. Source-version
+        // recovery must still run normally instead of inheriting the exemption.
+        let fresh = HostUpdater::new_with_policy(
+            root.path(),
+            updater.api.clone(),
+            updater.broker.clone(),
+            updater.barrier.clone(),
+            updater.version.clone(),
+            updater.backend.clone(),
+            false,
+        )
+        .unwrap();
+        fresh.recover(None).await.unwrap();
+        assert!(!path.exists());
+        assert!(!fresh.native_start_blocked().unwrap());
         server.abort();
     }
 

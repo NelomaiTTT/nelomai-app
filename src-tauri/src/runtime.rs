@@ -80,7 +80,7 @@ pub(crate) struct NativeClient {
     stream: Arc<StdMutex<Option<NativeStream>>>,
 }
 impl NativeClient {
-    fn new(stream: NativeStream) -> io::Result<Self> {
+    pub(crate) fn new(stream: NativeStream) -> io::Result<Self> {
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         Ok(Self {

@@ -306,13 +306,21 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         #[cfg(not(windows))]
         {
             #[cfg(target_os = "linux")]
-            let install = install_linux_common(bytes).await;
+            {
+                install_linux_common(bytes)
+                    .await
+                    .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+                crate::container::installation_succeeded(&self.app, stop_proof)
+                    .await
+                    .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
+            }
             #[cfg(target_os = "macos")]
-            let install = install_macos_common(bytes, macos_package).await;
-            install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
-            crate::container::installation_succeeded(&self.app, stop_proof)
-                .await
-                .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
+            crate::container::handoff_macos_installation(
+                &self.app,
+                stop_proof,
+                install_macos_common(bytes, macos_package),
+            )
+            .await?;
             let _ = self.cache.consumed(prepared); // Startup recovery retries cleanup if filesystem is temporarily unavailable.
             Ok(InstallResult::Installed(InstalledUpdate {
                 version: update.version,

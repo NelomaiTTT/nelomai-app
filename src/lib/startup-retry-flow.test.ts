@@ -6,12 +6,15 @@ import { StartupRetry } from "./startup-retry";
 import { beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction } from "./connection-action";
 import { commandCode, commandMessage } from "./native-client";
 import { viewForAppState } from "./app-model";
+import { canConfirmUpdate, updatePrompt } from "./update-presentation";
+import { updateDiagnosticStage, updateRefreshDiagnosticStage, updateStatusNeedsPolling } from "./update-diagnostics";
+import type { UpdateStatus } from "./app-model";
 
 // Exercise the page's real restore/retry and lifecycle callbacks, with only the
 // native boundary replaced by controlled responses.
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
-const names = ["restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "submitLogin", "observeUpdateStatus"];
+const names = ["restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure", "selectRuntime", "restartRuntime", "logout", "submitLogin", "observeUpdateStatus", "refreshUpdateStatus", "restartForUpdate", "readDesktopTunnelBackend"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
@@ -47,6 +50,9 @@ const statusPhase = statusElement.attributes.find((attribute: any) => attribute.
 const headerPhase = new Function("context", `with (context) { return ${page.slice(statusPhase.start, statusPhase.end)}; }`);
 const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
   update: { required: false }, access: { can_connect: true }, binding: {}, device: { id: "own-device" } };
+const installedUpdate: UpdateStatus = { protocol: 2, supported: true, automatic: true,
+  phase: "ready_to_restart", version: "0.4.1", notes: null, required: false, downloaded: 0,
+  total: null, errorCode: null, offerId: null, promptPending: false, updateAvailable: true };
 
 function fixture(bootstrap: () => Promise<unknown>) {
   const context: Record<string, any> = {
@@ -62,13 +68,17 @@ function fixture(bootstrap: () => Promise<unknown>) {
     phaseLabels: { server_unavailable: "Сервер недоступен", error: "Ошибка" },
     window: { setTimeout, clearTimeout }, commandCode, commandMessage, isCurrentConnectionAction,
     viewForAppState, loadSplitTunnel: async () => {}, refreshProbes: async () => {},
-    refreshUpdateStatus: () => {}, refreshUpdateOffer: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+    refreshUpdateOffer: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+    manualUpdatePending: null, updateDialogId: null, updateUiVisible: true, updateBusy: false,
+    updateTimer: null, lastRecordedUpdateState: null,
+    canConfirmUpdate, updatePrompt, updateDiagnosticStage, updateRefreshDiagnosticStage, updateStatusNeedsPolling,
     scheduleRuntimeStatusRefresh: () => {}, runtimeStatusRefresher: { commit: () => {} },
     nativeClient: { bootstrap, state: async () => ({ phase: "ready", connection: null, warning: null,
       metrics: null, reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
       localStopPendingCleanup: false }),
       recordStartupStage: () => {}, runtimeSelect: async () => ({}), restartRuntime: async () => {},
-      logout: async () => {} },
+      logout: async () => {}, updateStatus: vi.fn(async () => ({ ...installedUpdate, phase: "idle", version: null, updateAvailable: false })),
+      restartForUpdate: vi.fn(async () => {}) },
     peers: [], selectedPeerId: "", password: "", updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0, splitTunnelState: null,
     splitTunnelApplications: [], splitTunnelLoaded: false, notifications: [], notificationUnreadCount: 0,
     notificationNextCursor: null, notificationHistoryExpanded: false, notificationsOpen: false,
@@ -80,6 +90,57 @@ function fixture(bootstrap: () => Promise<unknown>) {
 describe("bounded bootstrap recovery", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("keeps installed-update Restart available on a fresh UI when admission is pending", async () => {
+    const f = fixture(async () => { throw { code: "runtime_startup_pending" }; });
+    f.context.nativeClient.updateStatus.mockResolvedValue(installedUpdate);
+    await f.page.restore();
+    expect(f.context.bootstrap).toBeNull();
+    expect(f.context.view).toBe("unavailable");
+    expect(f.context.updateStatus?.phase).toBe("ready_to_restart");
+    expect(f.context.updateDialogId).toBeNull();
+    await f.page.restartForUpdate();
+    expect(f.context.nativeClient.restartForUpdate).toHaveBeenCalledOnce();
+    expect(f.context.updateBusy).toBe(true);
+  });
+
+  it("does not offer installation before admission when reading recovery status", async () => {
+    const f = fixture(async () => { throw { code: "runtime_startup_pending" }; });
+    f.context.nativeClient.updateStatus.mockResolvedValue({ ...installedUpdate,
+      phase: "ready_to_install", offerId: "not-installed", promptPending: true });
+    await f.page.restore();
+    expect(f.context.nativeClient.updateStatus).toHaveBeenCalledOnce();
+    expect(f.context.updateStatus).toBeNull();
+    expect(f.context.updateDialogId).toBeNull();
+    expect(f.context.updateTimer).toBeNull();
+    expect(f.context.view).toBe("unavailable");
+  });
+
+  it("keeps the original preparation error when the recovery status read fails", async () => {
+    const f = fixture(async () => { throw { code: "runtime_startup_pending", message: "Preparation pending" }; });
+    f.context.nativeClient.updateStatus.mockRejectedValue(new Error("Status unavailable"));
+    await f.page.restore();
+    expect(f.context.nativeClient.updateStatus).toHaveBeenCalledOnce();
+    expect(f.context.updateStatus).toBeNull();
+    expect(f.context.view).toBe("unavailable");
+    expect(f.context.error).toBe("Preparation pending");
+    expect(f.context.busy).toBe(false);
+  });
+
+  it("does not restore update presentation from a recovery read overtaken by logout", async () => {
+    let finish!: (status: UpdateStatus) => void;
+    const f = fixture(async () => { throw { code: "runtime_startup_pending" }; });
+    f.context.nativeClient.updateStatus.mockReturnValue(new Promise<UpdateStatus>((resolve) => { finish = resolve; }));
+    await f.page.restore();
+    expect(f.context.nativeClient.updateStatus).toHaveBeenCalledOnce();
+    await f.page.logout();
+    finish(installedUpdate);
+    await Promise.resolve();
+    expect(f.context.view).toBe("sign_in");
+    expect(f.context.bootstrap).toBeNull();
+    expect(f.context.updateStatus).toBeNull();
+    expect(f.context.updateDialogId).toBeNull();
+  });
 
   it("shows preparation instead of an outage while bootstrap is in flight", async () => {
     let finish!: (value: unknown) => void;
