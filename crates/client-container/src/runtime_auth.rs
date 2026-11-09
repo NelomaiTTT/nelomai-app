@@ -288,11 +288,11 @@ impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
         }
         let matches = match (&receipt.source.identity, &snapshot.auth_scope) {
             (None, None) => snapshot.cleanup_only,
-            (None, Some(_)) => {
-                // Only the selected namespace receives a legacy receipt. The
-                // owner has confirmed logout and stopped the local tunnel under
-                // writer quiescence. Recover an empty orphan binding, never
-                // erase another scope's leases, pending work or split state.
+            (None, Some(_)) | (Some(_), None) if exact_runtime => {
+                // The owner confirmed logout and stopped the tunnel under
+                // writer quiescence. This covers a legacy orphan scope or an
+                // exact record that never bound the accepted login. Neither
+                // receipt may discard operational state from an unproven scope.
                 return self
                     .owner
                     .complete_empty_logout(&snapshot)
@@ -355,6 +355,12 @@ impl OwnerRuntimeAuth {
             .stop_runtime_logout_cleanup(&receipt)
             .await
             .map_err(map_error)?;
+        if let Some(coordinator) = &self.switch_coordinator {
+            coordinator
+                .check_logout_covers_pending_switch(&receipt)
+                .await
+                .map_err(|_| CoreError::AuthRecoveryRequired)?;
+        }
         self.admission.complete_logout(&receipt, &quiescence)?;
         if let Some(coordinator) = &self.switch_coordinator {
             coordinator

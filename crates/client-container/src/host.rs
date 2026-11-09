@@ -11,7 +11,7 @@ use crate::ipc::{
 use crate::{
     AuthBroker, BrokerError, LocalAuthStop, LocalStopReceiptV1, RuntimeCleanupHandoff,
     RuntimeClientProfile, RuntimeForceStop, RuntimeSwitchControl, SelectionRecovery,
-    SwitchCoordinator, TransitionSourceSnapshot,
+    SwitchCoordinator, SwitchPhase, TransitionSourceSnapshot,
 };
 use crate::{InstalledRuntimeSelection, SelectionStartupError};
 use nelomai_client_api::{AccessSnapshot, ClientApi, RuntimeTarget};
@@ -235,6 +235,10 @@ pub enum HostResponseV1 {
 }
 #[async_trait::async_trait]
 pub trait PrivateOwnerCommands: Send + Sync {
+    fn check_fenced_login(&self) -> Result<(), PrivateError> {
+        Ok(())
+    }
+
     async fn dispatch(
         &self,
         target: &RuntimeTarget,
@@ -254,6 +258,12 @@ struct HostCommands {
 }
 #[async_trait::async_trait]
 impl PrivateOwnerCommands for HostCommands {
+    fn check_fenced_login(&self) -> Result<(), PrivateError> {
+        self.coordinator
+            .check_fenced_login()
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
+
     async fn dispatch(
         &self,
         target: &RuntimeTarget,
@@ -643,13 +653,12 @@ impl CommonHost {
             architecture,
             create_records,
         )?;
+        let selected_state = storage.runtime.load().map_err(BrokerError::from)?;
         let requires_transition = matches!(
             selection.recovery(),
             Some(SelectionRecovery::ContainerVersionChanged)
-        ) || storage
-            .runtime
-            .load()
-            .map_err(BrokerError::from)?
+        ) || selected_state
+            .as_ref()
             .is_some_and(|state| state.cleanup_only);
         if let Some(native_storage) = &native.storage {
             // Native migration adapters are runtime classes too. Verify their
@@ -721,7 +730,40 @@ impl CommonHost {
             .map_err(|_| HostError::RecoveryRequired)?
             .attach(broker.clone(), bridge.clone());
         if requires_transition {
-            coordinator = coordinator.require_initial_transition(selection.state().selected_slot);
+            // Before launching the child, the owner can prepare an empty
+            // runtime for sign-in if there is no pending runtime work.
+            let selected_empty = selected_state
+                .as_ref()
+                .is_some_and(|state| state.auth_scope.is_none() && state.operationally_empty());
+            let desktop = profile.platform != nelomai_contracts::Platform::Android;
+            let slot = selection.state().selected_slot;
+            let can_prepare_empty_runtime = desktop
+                && selection.state().pending_slot.is_none()
+                && selected_empty
+                && broker.can_prepare_empty_runtime_at_startup()?
+                && coordinator
+                    .snapshot()
+                    .map_err(|_| HostError::RecoveryRequired)?
+                    .is_none_or(|journal| journal.phase() == SwitchPhase::Complete)
+                && matches!(crate::update_barrier_pending(&owner), Ok(false))
+                && storage.retained.iter().all(|record| {
+                    matches!(record.load(), Ok(Some(state)) if state.operationally_empty())
+                });
+            if can_prepare_empty_runtime {
+                if let Some(mut state) = selected_state.filter(|state| state.cleanup_only) {
+                    state.complete_legacy_cleanup();
+                    storage.runtime.save(&state).map_err(BrokerError::from)?;
+                }
+            } else if desktop
+                && slot == RuntimeSlot::Latest
+                && selected_state.is_some_and(|state| state.cleanup_only)
+            {
+                coordinator = coordinator
+                    .require_fenced_initial_transition(slot)
+                    .map_err(|_| HostError::RecoveryRequired)?;
+            } else {
+                coordinator = coordinator.require_initial_transition(slot);
+            }
         }
         let coordinator = Arc::new(coordinator);
         crate::startup_diagnostics::stage("host.updater");

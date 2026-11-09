@@ -466,6 +466,283 @@ fn common_host_keeps_exclusive_owner_and_preserves_install_identity_on_reopen() 
 
 #[cfg(unix)]
 struct NoNativeWork;
+
+#[cfg(unix)]
+#[tokio::test]
+async fn manual_upgrade_after_completed_logout_admits_only_empty_runtime_state() {
+    use nelomai_client_container::host::{CommonHost, HostNativePorts};
+    use nelomai_client_container::{
+        CleanupEngineRoleV1, CleanupEnvelopeV1, LocalStopReceiptV1, SwitchJournalV1,
+    };
+    use nelomai_client_storage::{
+        AuthStore, BrokerRequestKind, BrokerRequestV1, LogoutState, ProtectedAuthStore,
+        ProtectedRuntimeStore, RuntimeAuthScope, RuntimeCleanupSnapshotV1, RuntimePaths,
+        RuntimeStateStore, RuntimeStateV1, StoredPendingCompensationStop,
+    };
+    enum Retained {
+        Empty,
+        Work,
+        ScopeOnly,
+        StaleScope,
+    }
+    enum Auth {
+        Pristine,
+        LoggedOut,
+        Active,
+        InterruptedLogin,
+    }
+    for (retained, update_pending, auth_state, historical_completion) in [
+        (Retained::Empty, false, Auth::InterruptedLogin, false),
+        (Retained::Empty, false, Auth::Pristine, false),
+        (Retained::Empty, false, Auth::LoggedOut, false),
+        (Retained::Work, false, Auth::LoggedOut, false),
+        (Retained::Work, false, Auth::LoggedOut, true),
+        (Retained::ScopeOnly, false, Auth::LoggedOut, false),
+        (Retained::ScopeOnly, false, Auth::Active, false),
+        (Retained::StaleScope, false, Auth::Active, false),
+        (Retained::ScopeOnly, false, Auth::InterruptedLogin, false),
+        (Retained::Empty, true, Auth::LoggedOut, false),
+        (Retained::Empty, false, Auth::Active, false),
+    ] {
+        let retained_work = matches!(retained, Retained::Work);
+        let retained_scope = matches!(retained, Retained::ScopeOnly | Retained::StaleScope);
+        let active_auth = matches!(auth_state, Auth::Active);
+        let interrupted_login = matches!(auth_state, Auth::InterruptedLogin);
+        let data = tempfile::tempdir().unwrap();
+        let resources = tempfile::tempdir().unwrap();
+        let key = install_manifest(resources.path(), "0.4.1", false);
+        let records = Records::default();
+        let open = || {
+            CommonHost::open(
+                data.path(),
+                resources.path(),
+                Some(&key),
+                "linux",
+                "x86_64",
+                || records.clone(),
+                nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+                nelomai_client_container::RuntimeClientProfile {
+                    platform: nelomai_contracts::Platform::Linux,
+                    platform_version: None,
+                    architecture: "x86_64".into(),
+                },
+                HostNativePorts {
+                    stop: Arc::new(NoNativeWork),
+                    force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+                    background: Arc::new(NoNativeWork),
+                    updater: None,
+                    storage: None,
+                    relaunch: None,
+                },
+            )
+            .unwrap()
+        };
+        let host = open();
+        let auth = ProtectedAuthStore::new(records.record("auth-v1"));
+        let mut auth_before = auth.load().unwrap().unwrap();
+        if active_auth {
+            auth_before.access_token = Some("synthetic-access".into());
+            auth_before.refresh_token = Some("synthetic-refresh".into());
+        }
+        auth_before.logout_state = if matches!(auth_state, Auth::LoggedOut) {
+            LogoutState::LoggedOut
+        } else {
+            LogoutState::Active
+        };
+        if !matches!(auth_state, Auth::Pristine) {
+            auth_before.confirmed_identity = Some(host.native_target().identity(Some(7)).unwrap());
+            auth_before.session_generation = Some(7);
+        }
+        let meta = auth_before.broker.as_mut().unwrap();
+        if !matches!(auth_state, Auth::Pristine) {
+            meta.confirmed_device_id = Some("device-a".into());
+        }
+        if interrupted_login {
+            auth_before.auth_epoch += 1;
+            meta.next_attempt += 1;
+            meta.authentication_outcome_unknown = true;
+            meta.pending_login_account = Some("synthetic".into());
+            meta.pending_request = Some(BrokerRequestV1 {
+                kind: BrokerRequestKind::Login,
+                operation_id: "22222222-2222-4222-8222-222222222222".into(),
+                attempt: meta.next_attempt,
+                auth_epoch: auth_before.auth_epoch,
+                source_identity: auth_before.confirmed_identity.clone(),
+                source_device_id: meta.confirmed_device_id.clone(),
+                prior_login_outcome_unknown: false,
+                resume: None,
+                refresh: None,
+            });
+        }
+        auth.save(&auth_before).unwrap();
+        let old_paths = RuntimePaths::new(data.path(), RuntimeSlot::Latest, "0.4.1").unwrap();
+        let old = ProtectedRuntimeStore::new(records.record(old_paths.namespace()), old_paths);
+        let mut old_state = old.load().unwrap().unwrap();
+        if retained_work {
+            old_state.pending_compensation_stop = Some(StoredPendingCompensationStop {
+                operation_id: "old-stop".into(),
+                lease_id: "old-lease".into(),
+                recovery_contract_version: None,
+                redundant_session_id: None,
+                accept_warm: false,
+                failure_code: None,
+            });
+            old.save(&old_state).unwrap();
+        } else if retained_scope {
+            old_state.auth_scope = Some(RuntimeAuthScope {
+                auth_epoch: auth_before.auth_epoch,
+                family: if matches!(retained, Retained::StaleScope) {
+                    "previous-login".into()
+                } else {
+                    auth_before.broker.as_ref().unwrap().family.clone()
+                },
+                identity: auth_before.confirmed_identity.clone().unwrap(),
+            });
+            old.save(&old_state).unwrap();
+        }
+        let update_path = data.path().join("common/update-journal-v1.json");
+        let update = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "operation_id": "11111111-1111-4111-8111-111111111111",
+            "source_container": "0.4.1",
+            "source_runtime": auth_before.confirmed_identity,
+            "target_container": "0.4.2",
+            "previous_slot": "latest",
+            "phase": "installer_opened",
+        }))
+        .unwrap();
+        if update_pending {
+            std::fs::write(&update_path, &update).unwrap();
+        }
+        drop(host);
+        assert_eq!(install_manifest(resources.path(), "0.4.2", false), key);
+        let paths = RuntimePaths::new(data.path(), RuntimeSlot::Latest, "0.4.2").unwrap();
+        let selected = ProtectedRuntimeStore::new(records.record(paths.namespace()), paths);
+        if retained_work || retained_scope {
+            // Model a previously admitted namespace. The old version can
+            // still own work, hold the active session, or retain idle scope.
+            let previous_selection = std::fs::read(selection_path(data.path())).unwrap();
+            let prepare = || {
+                nelomai_client_container::host::prepare_host(
+                    data.path(),
+                    resources.path(),
+                    Some(&key),
+                    "linux",
+                    "x86_64",
+                    || records.clone(),
+                )
+            };
+            let previous_install = prepare().unwrap();
+            let previous_target = previous_install.selection.target().clone();
+            selected
+                .save(&RuntimeStateV1::empty(selected.paths(), false))
+                .unwrap();
+            drop(previous_install);
+            if retained_work || active_auth || interrupted_login {
+                std::fs::write(selection_path(data.path()), &previous_selection).unwrap();
+            }
+            if retained_work {
+                *records.fail_once.lock().unwrap() = Some(selected.paths().namespace().into());
+                assert!(prepare().is_err());
+                assert_eq!(
+                    std::fs::read(selection_path(data.path())).unwrap(),
+                    previous_selection,
+                    "a failed fence write must not commit the new selection"
+                );
+            }
+            if historical_completion {
+                // Reuse a terminal journal for the same target from an earlier
+                // install. It predates the outstanding retained operation.
+                let operation_id = "33333333-3333-4333-8333-333333333333".to_owned();
+                let fingerprint = "a".repeat(64);
+                let snapshot = RuntimeCleanupSnapshotV1 {
+                    slot: RuntimeSlot::Latest,
+                    runtime_version: "0.4.1".into(),
+                    auth_scope: None,
+                    lease_ids: vec![],
+                    redundant_session_ids: vec![],
+                    operations: vec![],
+                    cleanup_only: true,
+                };
+                let envelope = CleanupEnvelopeV1::from_runtime_snapshot(
+                    &snapshot,
+                    CleanupEngineRoleV1::Primary,
+                    None,
+                )
+                .unwrap();
+                let mut journal = serde_json::to_value(SwitchJournalV1::requested(
+                    operation_id.clone(),
+                    "b".repeat(64),
+                    None,
+                    None,
+                    fingerprint.clone(),
+                    previous_target,
+                    None,
+                    envelope,
+                ))
+                .unwrap();
+                journal["phase"] = serde_json::json!("complete");
+                journal["decision"] = serde_json::json!("apply");
+                journal["resume_operation_id"] =
+                    serde_json::json!("44444444-4444-4444-8444-444444444444");
+                journal["local_stop_receipt"] = serde_json::to_value(LocalStopReceiptV1 {
+                    operation_id,
+                    source_scope_fingerprint: fingerprint,
+                    runtime_slot: snapshot.slot,
+                    runtime_version: snapshot.runtime_version.clone(),
+                    forced: false,
+                })
+                .unwrap();
+                journal["runtime_snapshot"] = serde_json::to_value(snapshot).unwrap();
+                std::fs::write(
+                    data.path().join("common/runtime-switch-v1.json"),
+                    serde_json::to_vec(&journal).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let host = open();
+        let blocked = retained_work || update_pending || active_auth;
+        assert_eq!(
+            host.coordinator().before_tunnel_start().await.is_err(),
+            blocked
+        );
+        drop(host);
+        if retained_scope && !active_auth && !interrupted_login {
+            // Also recover records fenced by a previous attempt.
+            selected
+                .save(&RuntimeStateV1::empty(selected.paths(), true))
+                .unwrap();
+        }
+        let host = open();
+        assert_eq!(
+            host.coordinator().before_tunnel_start().await.is_err(),
+            blocked,
+            "restarting the owner must preserve the cleanup requirement"
+        );
+        assert_eq!(
+            selected.load().unwrap(),
+            Some(RuntimeStateV1::empty(selected.paths(), blocked))
+        );
+        assert_eq!(old.load().unwrap().as_ref(), Some(&old_state));
+        assert_eq!(auth.load().unwrap(), Some(auth_before));
+        if update_pending {
+            assert_eq!(std::fs::read(update_path).unwrap(), update);
+        }
+        if retained_work {
+            drop(host);
+            // Simulate the durable result of finishing the older cleanup.
+            old_state.pending_compensation_stop = None;
+            old.save(&old_state).unwrap();
+            let host = open();
+            host.coordinator().before_tunnel_start().await.unwrap();
+            assert_eq!(
+                selected.load().unwrap(),
+                Some(RuntimeStateV1::empty(selected.paths(), false))
+            );
+        }
+    }
+}
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl nelomai_client_container::LocalAuthStop for NoNativeWork {

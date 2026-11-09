@@ -614,6 +614,13 @@ impl RemoteOwner {
             .stop_runtime_logout_cleanup(&receipt)
             .await
             .map_err(broker_error)?;
+        timeout_at(
+            recovery_deadline,
+            coordinator.check_logout_covers_pending_switch(&receipt),
+        )
+        .await
+        .map_err(|_| PrivateError::RecoveryRequired)?
+        .map_err(|_| PrivateError::RecoveryRequired)?;
         match self
             .control(
                 ControlV1::CompleteLogout {
@@ -715,6 +722,9 @@ impl RemoteOwner {
                     granted: false,
                 };
                 self.live(deadline)?;
+                if let Some(commands) = &self.commands {
+                    commands.check_fenced_login()?;
+                }
                 let request = LoginRequest {
                     login: request.login,
                     password: request.password,
@@ -730,6 +740,7 @@ impl RemoteOwner {
                         &request,
                         &self.binding.target,
                         &fence,
+                        self.commands.is_some(),
                         || self.live(deadline).map_err(|_| BrokerError::Cancelled),
                         |ticket| {
                             // Lock order is broker state -> peer map. Logout clones

@@ -2079,6 +2079,43 @@ impl AuthBroker {
             && meta.transition_authorities.is_empty()
     }
 
+    /// Only used before the common owner admits any child or broker requests.
+    pub(crate) fn can_prepare_empty_runtime_at_startup(&self) -> Result<bool, BrokerError> {
+        let auth = self.load()?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        if auth.access_token.is_some()
+            || auth.refresh_token.is_some()
+            || auth.pending_resume.is_some()
+            || auth.completed_runtime_logout.is_some()
+            || auth.pending_runtime_supersede.is_some()
+            || meta.completed_resume.is_some()
+            || meta.pending_logout.is_some()
+            || meta.pending_recovery.is_some()
+            || meta.cancelled_login.is_some()
+        {
+            return Ok(false);
+        }
+        Ok(match auth.logout_state {
+            LogoutState::LoggedOut => {
+                meta.pending_request.is_none()
+                    && !meta.authentication_outcome_unknown
+                    && meta.pending_login_account.is_none()
+            }
+            // A persisted password ticket has not bound a runtime. Keep it
+            // intact so only the broker's same-account retry can resolve it.
+            LogoutState::Active => {
+                Self::is_pristine_auth(&auth, meta)
+                    || (meta.authentication_outcome_unknown
+                        && meta.pending_login_account.is_some()
+                        && meta
+                            .pending_request
+                            .as_ref()
+                            .is_some_and(|request| request.kind == BrokerRequestKind::Login))
+            }
+            LogoutState::Pending => false,
+        })
+    }
+
     /// Container-only password ingress. Install identity is read from protected
     /// ownership, never accepted from the caller's request. No password is stored.
     pub async fn login(
@@ -2155,7 +2192,7 @@ impl AuthBroker {
         target: &RuntimeTarget,
         fence: &LoginFence,
     ) -> Result<AccessSnapshot, BrokerError> {
-        self.login_fenced_with_ticket(request, target, fence, || Ok(()), |_| {})
+        self.login_fenced_with_ticket(request, target, fence, false, || Ok(()), |_| {})
             .await
     }
 
@@ -2164,6 +2201,7 @@ impl AuthBroker {
         request: &LoginRequest,
         target: &RuntimeTarget,
         fence: &LoginFence,
+        require_logout_cleanup: bool,
         check_request: impl Fn() -> Result<(), BrokerError> + Send,
         on_ticket: impl FnOnce(&BrokerRequestV1) + Send,
     ) -> Result<AccessSnapshot, BrokerError> {
@@ -2177,7 +2215,12 @@ impl AuthBroker {
             if auth.auth_epoch != fence.epoch || meta.family != fence.family {
                 return Err(BrokerError::Cancelled);
             }
-            if meta.pending_logout.is_some() {
+            // A hosted runtime must finish durable logout cleanup before a
+            // new password request can replace the auth scope. Check it under
+            // issuance: a pending logout can gain its receipt while we wait.
+            if meta.pending_logout.is_some()
+                || (require_logout_cleanup && auth.completed_runtime_logout.is_some())
+            {
                 return Err(BrokerError::RecoveryRequired);
             }
             // Acquiring issuance above proves no previous in-process password

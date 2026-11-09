@@ -11,7 +11,9 @@ use nelomai_client_api::{
     RuntimeTarget,
 };
 use nelomai_client_core::{CoreError, RuntimeStartPreflight, RuntimeWriterQuiescence};
-use nelomai_client_storage::{ContainerOwnerLock, RuntimeCleanupSnapshotV1};
+use nelomai_client_storage::{
+    CompletedRuntimeLogoutV1, ContainerOwnerLock, RuntimeCleanupSnapshotV1,
+};
 use nelomai_contracts::{RuntimeIdentity, VerifiedContainerManifest};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -288,6 +290,8 @@ pub struct SwitchCoordinator {
     broker: Option<Arc<AuthBroker>>,
     control: Option<Arc<dyn RuntimeSwitchControl>>,
     required_initial_target: Option<nelomai_contracts::RuntimeSlot>,
+    fenced_initial_transition: bool,
+    stale_initial_completion: Option<String>,
     initial_transition_satisfied: AtomicBool,
     execution: tokio::sync::Mutex<()>,
 }
@@ -315,6 +319,8 @@ impl SwitchCoordinator {
             broker: None,
             control: None,
             required_initial_target: None,
+            fenced_initial_transition: false,
+            stale_initial_completion: None,
             initial_transition_satisfied: AtomicBool::new(false),
             execution: tokio::sync::Mutex::new(()),
         };
@@ -335,6 +341,29 @@ impl SwitchCoordinator {
     pub fn require_initial_transition(mut self, target: nelomai_contracts::RuntimeSlot) -> Self {
         self.required_initial_target = Some(target);
         self
+    }
+
+    pub(crate) fn require_fenced_initial_transition(
+        mut self,
+        target: nelomai_contracts::RuntimeSlot,
+    ) -> Result<Self, SwitchJournalError> {
+        // The protected record is still fenced. A completion left by an
+        // earlier launch cannot prove that this incarnation cleared it.
+        self.stale_initial_completion = self
+            .snapshot()?
+            .filter(|journal| journal.phase == SwitchPhase::Complete)
+            .map(|journal| journal.operation_id);
+        self.fenced_initial_transition = true;
+        Ok(self.require_initial_transition(target))
+    }
+
+    pub(crate) fn check_fenced_login(&self) -> Result<(), SwitchError> {
+        if self.fenced_initial_transition
+            && self.initial_transition_required(self.snapshot()?.as_ref())?
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        Ok(())
     }
 
     /// Checkpoint-one primitive used by the later request orchestration. It
@@ -682,12 +711,46 @@ impl SwitchCoordinator {
         self.execution.lock().await
     }
 
+    /// Called under the switch execution lock before a logout can release a
+    /// runtime record. An already completed switch no longer gates admission.
+    pub(crate) async fn check_logout_covers_pending_switch(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+    ) -> Result<(), SwitchError> {
+        let Some(journal) = self
+            .snapshot()?
+            .filter(|journal| journal.phase != SwitchPhase::Complete)
+        else {
+            return Ok(());
+        };
+        if !self.logout_covers_journal(receipt, &journal).await? {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    async fn logout_covers_journal(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        journal: &SwitchJournalV1,
+    ) -> Result<bool, SwitchError> {
+        let (broker, _) = self.components()?;
+        Ok(broker
+            .logout_covers_transition(
+                receipt,
+                &journal.operation_id,
+                &journal.source_scope_fingerprint,
+                journal.source_device_id.as_deref(),
+            )
+            .await?)
+    }
+
     /// Caller holds execution and writer quiescence and has successfully
     /// stopped/cleared the exact logout source. Keep the protected ACK until
     /// selection and journal retirement are both durable.
     pub(crate) async fn retire_logout_journal(
         &self,
-        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+        receipt: &CompletedRuntimeLogoutV1,
     ) -> Result<(), SwitchError> {
         let (broker, _) = self.components()?;
         if broker.completed_runtime_logout().await?.as_ref() != Some(receipt) {
@@ -700,16 +763,17 @@ impl SwitchCoordinator {
                 .store(true, Ordering::SeqCst);
             return Ok(());
         };
-        if !broker
-            .logout_covers_transition(
-                receipt,
-                &journal.operation_id,
-                &journal.source_scope_fingerprint,
-                journal.source_device_id.as_deref(),
-            )
-            .await?
-        {
-            return Ok(());
+        if !self.logout_covers_journal(receipt, &journal).await? {
+            return match journal.phase {
+                SwitchPhase::Complete => {
+                    // Cleanup opened the selected record. Keep the unrelated
+                    // terminal journal without reviving a transition from it.
+                    self.initial_transition_satisfied
+                        .store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                _ => Err(SwitchError::RecoveryRequired),
+            };
         }
         let selection =
             current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
@@ -972,7 +1036,10 @@ impl SwitchCoordinator {
                 .map_err(|_| SwitchError::RecoveryRequired)?,
         );
         let completed_target = journal
-            .filter(|journal| journal.phase == SwitchPhase::Complete)
+            .filter(|journal| {
+                journal.phase == SwitchPhase::Complete
+                    && self.stale_initial_completion.as_deref() != Some(journal.operation_id())
+            })
             .and_then(|journal| match journal.decision {
                 Some(SwitchDecision::Apply) => Some(journal.target_identity.clone()),
                 Some(SwitchDecision::Cancel) => journal

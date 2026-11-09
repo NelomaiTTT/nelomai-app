@@ -1,5 +1,7 @@
 //! Lost completion acknowledgements must not strand an already committed update.
-use nelomai_client_container::ipc::{ChildAdmission, RuntimeRecordInventory, REQUEST_BUDGET};
+use nelomai_client_container::ipc::{
+    ChildAdmission, RuntimeRecordInventory, ScopeAdmission, REQUEST_BUDGET,
+};
 use nelomai_client_core::RuntimeWriterGates;
 use nelomai_client_storage::*;
 use nelomai_contracts::{RuntimeIdentity, RuntimeSlot};
@@ -419,4 +421,169 @@ async fn newer_container_can_complete_old_cleanup_into_its_verified_empty_target
     assert_eq!(fixture.source.load_record().unwrap(), source_before);
     assert_eq!(fixture.target.load_record().unwrap(), previous_before);
     assert_eq!(store.load().unwrap().unwrap().auth_scope, Some(scope));
+}
+
+fn logout_receipt(fixture: &Fixture) -> CompletedRuntimeLogoutV1 {
+    let scope = fixture.frozen.auth_scope.as_ref().unwrap();
+    CompletedRuntimeLogoutV1 {
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        source: RuntimeLogoutSourceV1 {
+            auth_epoch: scope.auth_epoch,
+            family: scope.family.clone(),
+            identity: Some(scope.identity.clone()),
+            device_id: "test-device".into(),
+            scope_fingerprint: "a".repeat(64),
+        },
+        code: "session_revoked_cleanup_accepted".into(),
+        cleanup_reconcile_operation_id: Some("22222222-2222-4222-8222-222222222222".into()),
+    }
+}
+
+#[tokio::test]
+async fn confirmed_logout_unlocks_empty_successor_after_source_cleanup() {
+    for source_was_admitted in [true, false] {
+        let fixture = Fixture::new(false);
+        if !source_was_admitted {
+            // A previous release accepted login in the owner but never bound
+            // the cleanup-only record. Its confirmed logout remains durable.
+            fixture
+                .source_store()
+                .save(&RuntimeStateV1::empty(&fixture.source_paths, true))
+                .unwrap();
+        }
+        let inventory = || {
+            RuntimeRecordInventory::new(
+                RuntimeRecordOwner::new(fixture.target_store()),
+                vec![RuntimeRecordOwner::new(fixture.source_store())],
+            )
+        };
+        let receipt = logout_receipt(&fixture);
+        let writers = RuntimeWriterGates::default();
+        let quiescence = writers.quiesce().await;
+        *fixture.target.fail_save.lock().unwrap() = true;
+        assert!(inventory().complete_logout(&receipt, &quiescence).is_err());
+        assert_eq!(
+            fixture.source_store().load().unwrap().unwrap(),
+            RuntimeStateV1::empty(&fixture.source_paths, false)
+        );
+        assert!(fixture.target_store().load().unwrap().unwrap().cleanup_only);
+
+        // A new process can finish either interrupted write using the same receipt.
+        let restarted = inventory();
+        for _ in 0..2 {
+            restarted.complete_logout(&receipt, &quiescence).unwrap();
+        }
+        assert_eq!(
+            fixture.target_store().load().unwrap().unwrap(),
+            RuntimeStateV1::empty(&fixture.target_paths, false)
+        );
+        restarted
+            .bind_empty_scope(&fixture.scope, &quiescence)
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn confirmed_logout_keeps_successor_fenced_when_cleanup_is_unproven() {
+    for case in [
+        "foreign-source",
+        "unbound-source-debt",
+        "unbound-source-split",
+        "target-scope",
+        "target-split",
+    ] {
+        let fixture = Fixture::new(false);
+        let mut receipt = logout_receipt(&fixture);
+        let mut target = fixture.target_store().load().unwrap().unwrap();
+        match case {
+            "foreign-source" => {
+                receipt.source.identity.as_mut().unwrap().runtime_version = "0.3.1".into()
+            }
+            "unbound-source-debt" => {
+                let mut source = fixture.source_store().load().unwrap().unwrap();
+                source.auth_scope = None;
+                source.cleanup_only = true;
+                fixture.source_store().save(&source).unwrap();
+            }
+            "unbound-source-split" => {
+                let mut source = RuntimeStateV1::empty(&fixture.source_paths, false);
+                source.applied_split_tunnel.working_policy_hash = Some("split".into());
+                fixture.source_store().save(&source).unwrap();
+            }
+            "target-scope" => target.auth_scope = Some(fixture.scope.clone()),
+            "target-split" => {
+                target.applied_split_tunnel.working_policy_hash = Some("split".into())
+            }
+            _ => unreachable!(),
+        }
+        fixture.target_store().save(&target).unwrap();
+        let inventory = RuntimeRecordInventory::new(
+            RuntimeRecordOwner::new(fixture.target_store()),
+            vec![RuntimeRecordOwner::new(fixture.source_store())],
+        );
+        let writers = RuntimeWriterGates::default();
+        let quiescence = writers.quiesce().await;
+        assert!(
+            inventory.complete_logout(&receipt, &quiescence).is_err(),
+            "{case}"
+        );
+        assert_eq!(
+            fixture.target_store().load().unwrap(),
+            Some(target),
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn confirmed_logout_blocks_retained_work_and_preserves_idle_scopes() {
+    for (same_record, scope_only) in [(true, false), (false, false), (true, true), (false, true)] {
+        let fixture = Fixture::new(same_record);
+        if same_record {
+            fixture
+                .source_store()
+                .save(&RuntimeStateV1::empty(&fixture.source_paths, true))
+                .unwrap();
+        }
+        let older_paths =
+            RuntimePaths::new(fixture._root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+        let older_record = MemoryRecord::default();
+        let older_store = ProtectedRuntimeStore::new(older_record.clone(), older_paths.clone());
+        let mut older = RuntimeStateV1::empty(older_store.paths(), false);
+        if scope_only {
+            let mut scope = fixture.scope.clone();
+            scope.identity.runtime_version = older_paths.runtime_version().into();
+            scope.identity.container_version = scope.identity.runtime_version.clone();
+            older.auth_scope = Some(scope);
+        } else {
+            older.pending_compensation_stop = Some(pending("older-lease"));
+        }
+        older_store.save(&older).unwrap();
+        let mut retained = vec![RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
+            older_record,
+            older_paths,
+        ))];
+        if !same_record {
+            retained.push(RuntimeRecordOwner::new(fixture.source_store()));
+        }
+        let inventory =
+            RuntimeRecordInventory::new(RuntimeRecordOwner::new(fixture.target_store()), retained);
+        let source_before = fixture.source_store().load().unwrap();
+        let target_before = fixture.target_store().load().unwrap();
+        let writers = RuntimeWriterGates::default();
+        let quiescence = writers.quiesce().await;
+        let result = inventory.complete_logout(&logout_receipt(&fixture), &quiescence);
+        if scope_only {
+            result.unwrap();
+            assert_eq!(
+                fixture.target_store().load().unwrap(),
+                Some(RuntimeStateV1::empty(&fixture.target_paths, false))
+            );
+        } else {
+            assert!(result.is_err());
+            assert_eq!(fixture.source_store().load().unwrap(), source_before);
+            assert_eq!(fixture.target_store().load().unwrap(), target_before);
+        }
+        assert_eq!(older_store.load().unwrap(), Some(older));
+    }
 }

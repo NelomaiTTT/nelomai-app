@@ -2900,7 +2900,7 @@ async fn logout_cleanup_replays_after_journal_retirement_before_receipt_consumpt
 }
 
 #[tokio::test]
-async fn old_logout_cleanup_cannot_stop_new_login_or_retire_barrier_with_unrelated_ack() {
+async fn unrelated_logout_preserves_pending_and_completed_switch_journals() {
     exercise_logout_switch_cleanup(true, false, false).await;
 }
 
@@ -2954,8 +2954,9 @@ async fn exercise_logout_switch_cleanup(
     let local = CoreLocalStop::new(tunnel.clone());
     let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), local.clone()).unwrap());
     let root = tempfile::tempdir().unwrap();
+    let runtime_record = Record::default();
     let backend = ProtectedRuntimeStore::new(
-        Record::default(),
+        runtime_record.clone(),
         RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap(),
     );
     let auth = store.load().unwrap().unwrap();
@@ -3099,6 +3100,42 @@ async fn exercise_logout_switch_cleanup(
             .unwrap()
             .completed_runtime_logout
             .is_some());
+
+        // An older runtime could accept B's login without binding its empty
+        // record. B's receipt is exact for that record, but A's switch remains.
+        let backend = ProtectedRuntimeStore::new(runtime_record, record.paths().clone());
+        let fenced = RuntimeStateV1::empty(backend.paths(), true);
+        backend.save(&fenced).unwrap();
+        let receipt = broker.completed_runtime_logout().await.unwrap().unwrap();
+        assert!(port.recover_logout_cleanup().await.is_err());
+        assert_eq!(backend.load().unwrap(), Some(fenced));
+        assert_eq!(coordinator.snapshot().unwrap(), pending);
+        assert_eq!(
+            broker.completed_runtime_logout().await.unwrap(),
+            Some(receipt)
+        );
+
+        // A terminal journal from the previous installation is retained for
+        // provenance but cannot require another transition after this logout.
+        let mut terminal = serde_json::to_value(pending.unwrap()).unwrap();
+        terminal["phase"] = json!("complete");
+        let path = root.path().join("common/runtime-switch-v1.json");
+        let bytes = serde_json::to_vec(&terminal).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        write_test_selection(root.path(), "0.2.17");
+        let reopened = Arc::new(
+            SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.16"))
+                .unwrap()
+                .attach(broker.clone(), control)
+                .require_initial_transition(RuntimeSlot::Latest),
+        );
+        make_port(reopened.clone())
+            .recover_logout_cleanup()
+            .await
+            .unwrap();
+        reopened.before_tunnel_start().await.unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(broker.completed_runtime_logout().await.unwrap().is_none());
         server.abort();
         return;
     }

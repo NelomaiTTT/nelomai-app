@@ -68,25 +68,58 @@ impl<S: RuntimeStateStore> ScopeAdmission for RuntimeRecordInventory<S> {
         use crate::RuntimeAdmission;
         // Only the exact receipt source is eligible, never all old namespaces.
         let mut matches = Vec::new();
+        let mut selected_fenced = false;
+        let mut unrelated_cleanup = false;
         for owner in self.retained.iter().chain([&self.target]) {
-            let snapshot = owner
-                .cleanup_snapshot()
-                .map_err(|_| PrivateError::RecoveryRequired)?;
+            let state = owner
+                .operational()
+                .load()
+                .map_err(|_| PrivateError::RecoveryRequired)?
+                .ok_or(PrivateError::RecoveryRequired)?;
+            let selected = Arc::ptr_eq(owner, &self.target);
+            if selected {
+                selected_fenced = state.cleanup_only;
+            }
             if receipt.source.identity.as_ref().map_or_else(
-                || Arc::ptr_eq(owner, &self.target),
+                || selected,
                 |identity| {
-                    identity.slot == snapshot.slot
-                        && identity.runtime_version == snapshot.runtime_version
+                    identity.slot == state.slot && identity.runtime_version == state.runtime_version
                 },
             ) {
                 matches.push(owner);
+            } else if !selected && !state.operationally_empty() {
+                unrelated_cleanup = true;
             }
         }
-        if matches.len() != 1 {
+        let [source] = matches.as_slice() else {
+            return Err(PrivateError::RecoveryRequired);
+        };
+        // A legacy owner could replace an older receipt before its record was
+        // cleared. A receipt for this source cannot authorize skipping that work.
+        if selected_fenced && unrelated_cleanup {
             return Err(PrivateError::RecoveryRequired);
         }
-        crate::RuntimeCacheAdmission::new(matches[0].clone())
+        crate::RuntimeCacheAdmission::new((*source).clone())
             .complete_logout(receipt, writers)
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        if Arc::ptr_eq(source, &self.target) {
+            return Ok(());
+        }
+        let selected = self.cleanup_snapshot()?;
+        if !selected.cleanup_only {
+            return Ok(());
+        }
+        if selected.auth_scope.is_some() {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        // The old logout can discharge the startup barrier. Complete the
+        // empty successor under the same lease before the owner retires the
+        // journal or consumes the receipt. A failed write leaves it replayable.
+        source
+            .check_completed_cleanup(None)
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        self.target
+            .complete_empty_logout(&selected)
             .map_err(|_| PrivateError::RecoveryRequired)
     }
     fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), PrivateError> {

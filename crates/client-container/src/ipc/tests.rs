@@ -2618,6 +2618,93 @@ async fn logout_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle
     (api, calls, server)
 }
 
+#[derive(Default)]
+struct LoginAdmissionCommands {
+    fenced: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::host::PrivateOwnerCommands for LoginAdmissionCommands {
+    fn check_fenced_login(&self) -> Result<(), PrivateError> {
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
+    async fn dispatch(
+        &self,
+        _: &RuntimeTarget,
+        _: crate::host::HostRequestV1,
+        _: Instant,
+    ) -> Result<crate::host::HostResponseV1, PrivateError> {
+        panic!("the password request must not dispatch a host command")
+    }
+}
+
+#[tokio::test]
+async fn owner_login_preserves_auth_until_logout_and_startup_cleanup_finish() {
+    let (api, _, server) = logout_panel().await;
+    let fixture = Fixture::new(api, true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id =
+        Some("11111111-1111-4111-8111-111111111111".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture.broker.logout().await.unwrap();
+    let pending = fixture.auth.load().unwrap().unwrap();
+    assert!(pending.completed_runtime_logout.is_some());
+
+    let (owner_socket, runtime_socket) = private_socketpair().unwrap();
+    let commands = Arc::new(LoginAdmissionCommands::default());
+    let owner = RemoteOwner::new_with_owner(
+        owner_socket,
+        LaunchBinding::fixture(
+            RuntimeTarget {
+                container_version: "0.2.16".into(),
+                runtime_version: "0.2.16".into(),
+                runtime_contract_version: 1,
+                runtime_slot: RuntimeSlot::Stable,
+            },
+            "logout-recovery",
+        ),
+        RuntimeClientProfile {
+            platform: Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        None,
+        Some(commands.clone()),
+    )
+    .unwrap();
+    let _service = owner.serve(fixture.broker.clone()).unwrap();
+    let child = Arc::new(ChildAdmission::new(
+        "logout-recovery".into(),
+        fixture.local.runtime_writer_gates(),
+        Arc::new(RuntimeRecordInventory::new(fixture.record.clone(), vec![])),
+    ));
+    let client = PrivateRuntimeAuthClient::new(runtime_socket, child, fixture.local.clone());
+    assert!(matches!(
+        client.login(password_login()).await,
+        Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+    ));
+    assert_eq!(fixture.auth.load().unwrap().unwrap(), pending);
+
+    let receipt = pending.completed_runtime_logout.unwrap();
+    fixture
+        .broker
+        .finish_runtime_logout_cleanup(&receipt)
+        .await
+        .unwrap();
+    commands.fenced.store(true, Ordering::SeqCst);
+    let before = fixture.auth.load().unwrap().unwrap();
+    assert!(matches!(
+        client.login(password_login()).await,
+        Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+    ));
+    assert_eq!(fixture.auth.load().unwrap().unwrap(), before);
+    server.abort();
+}
+
 async fn timed_out_logout_can_retry_and_login(budget: Duration) {
     use std::sync::atomic::AtomicBool;
 

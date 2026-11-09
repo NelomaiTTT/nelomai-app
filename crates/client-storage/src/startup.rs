@@ -181,12 +181,30 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     if known.len() > 64 {
         return recovery();
     }
+    let current_auth = auth.load()?;
+    // An interrupted password request still carries the previous identity.
+    // Only a confirmed session with credentials needs a runtime transition.
+    let active_runtime = current_auth
+        .as_ref()
+        .filter(|auth| {
+            auth.logout_state == LogoutState::Active
+                && (auth.access_token.is_some() || auth.refresh_token.is_some())
+                && auth.broker.as_ref().is_some_and(|meta| {
+                    !meta.authentication_outcome_unknown
+                        && meta
+                            .pending_request
+                            .as_ref()
+                            .is_none_or(|request| request.kind != BrokerRequestKind::Login)
+                })
+        })
+        .and_then(|auth| auth.confirmed_identity.as_ref());
     let mut occupied = Vec::new();
     let mut pending = Vec::new();
     // The owner lock excludes live writers during startup. Keep just the
     // selected validated value for pre-write decisions, not a lasting cache.
     // Post-write verification below must still read the protected store anew.
     let mut current_runtime = None;
+    let mut retained_needs_cleanup = false;
     for namespace in &known {
         let paths = paths_from_namespace(root, namespace)?;
         let state = ProtectedRuntimeStore::new(records.record(namespace), paths.clone());
@@ -196,6 +214,15 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         }
         if namespace == selected_paths.namespace() {
             current_runtime = loaded;
+        } else if loaded.as_ref().is_some_and(|state| {
+            // The current session needs a transition even if its record has
+            // no tunnel state or the process exited before binding its scope.
+            !state.operationally_empty()
+                || active_runtime.is_some_and(|identity| {
+                    identity.slot == state.slot && identity.runtime_version == state.runtime_version
+                })
+        }) {
+            retained_needs_cleanup = true;
         }
         let staging = ProtectedTransactionStore::new(
             records.record(&format!("{namespace}:pending-write-v1")),
@@ -205,7 +232,6 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
             pending.push((namespace.clone(), value));
         }
     }
-    let current_auth = auth.load()?;
     let split = FileSplitTunnelStore::new(root);
     let split_exists = match fs::symlink_metadata(split.path()) {
         Ok(_) => true,
@@ -335,6 +361,23 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                 }
                 // A committed staging residue must never rewind newer broker data.
                 staging.clear()?;
+            }
+            // Version changes select Latest, whose namespace can already exist.
+            // Protect an empty desktop record before committing the selection,
+            // so a restart cannot forget work in an older record.
+            if selected == RuntimeSlot::Latest
+                && retained_needs_cleanup
+                && matches!(
+                    manifest.latest().platform.as_str(),
+                    "macos" | "linux" | "windows"
+                )
+            {
+                if let Some(mut state) = current_runtime.filter(|state| {
+                    !state.cleanup_only && state.auth_scope.is_none() && state.operationally_empty()
+                }) {
+                    state.cleanup_only = true;
+                    runtime.save(&state)?;
+                }
             }
             write_inventory(
                 root,
