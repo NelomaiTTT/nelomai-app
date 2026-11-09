@@ -34,7 +34,7 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
                 signature = path.with_name(name + ".sig").read_text().strip()
             artifacts.append(dict(platform=platform, architecture=architecture, package_kind=kind, asset_name=name, size_bytes=path.stat().st_size,
                 sha256=module("verify-runtime-artifact").digest(path), signature=signature))
-        image = candidate / "nelomai-0.4.1-macos-aarch64.dmg"
+        image = candidate / "nelomai-0.4.2-macos-aarch64.dmg"
         original_image = image.read_bytes()
         raw = json.dumps(dict(schema_version=1, version=gates.VERSION, artifacts=artifacts)).encode()
         manifest = candidate / "nelomai-release-manifest.json"
@@ -76,7 +76,7 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
                 gates.verify_updater_release(candidate, self.public, public, "")
         manifest.write_bytes(raw)
         (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))
-        (candidate / gates.PACKAGE_NAMES["macos"]).write_bytes(b"changed bytes")
+        (candidate / gates.PACKAGE_NAMES["windows"]).write_bytes(b"changed bytes")
         with self.assertRaisesRegex(ValueError, "digest"):
             gates.verify_updater_release(candidate, self.public, public, "d" * 64)
 

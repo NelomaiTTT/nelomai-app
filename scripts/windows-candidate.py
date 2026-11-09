@@ -22,8 +22,8 @@ container = verifier.load_script("build-runtime-acceptance-container.py")
 canonical = container.release_set.canonical
 REPOSITORY = "NelomaiTTT/nelomai-app"
 REF = "refs/heads/Future/desktop-0.4.0"
-VERSION = "0.4.1"
-LATEST = "nelomai-runtime-0.4.1-windows-x86_64"
+VERSION = "0.4.2"
+LATEST = "nelomai-runtime-0.4.2-windows-x86_64"
 SUFFIXES = (".zip", ".manifest.json", ".manifest.sig")
 
 
@@ -157,7 +157,7 @@ def source(sha, *, root=builder.ROOT, environment=None, native=False):
     versions = [json.loads((root / p).read_bytes())["version"] for p in ("package.json", "src-tauri/tauri.conf.json")]
     versions.append(tomllib.loads((root / "src-tauri/Cargo.toml").read_text())["package"]["version"])
     if versions != [VERSION] * 3 or gates.git(root, "status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
-        raise ValueError("Windows candidate requires clean exact 0.4.1 source")
+        raise ValueError("Windows candidate requires clean exact 0.4.2 source")
     gates.verify_source(root, sha, VERSION, base=gates.BASE, mode="sign_candidate")
 
 

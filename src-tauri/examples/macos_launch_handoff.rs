@@ -1,5 +1,9 @@
 //! Isolated native handoff regression driver: no auth, installer or VPN.
 #[cfg(target_os = "macos")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "this driver only exercises the launch handoff")
+)]
 #[path = "../src/macos_launch.rs"]
 mod macos_launch;
 

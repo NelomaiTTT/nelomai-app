@@ -34,7 +34,7 @@ jobs:
       - name: Verify exact source and Linux regressions
         shell: bash
         run: |
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode build_only
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.2 --mode build_only
           cargo fmt --all --check
           cargo test --locked -p nelomai-unix-service --lib
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
@@ -589,6 +589,9 @@ jobs:
           -p nelomai-contracts -p nelomai-client-tunnel
           -p nelomai-client-core -p nelomai-client-application
           -p nelomai-client-api -p nelomai-client-updater
+      - name: macOS runtime and Keychain rollback regressions
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}
+        run: python3 scripts/test-macos-rollback.py
       - name: macOS updater authorization and recovery tests
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: >-

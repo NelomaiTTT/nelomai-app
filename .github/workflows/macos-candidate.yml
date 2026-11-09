@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable macOS 0.4.1 candidate
+        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable macOS 0.4.2 candidate
         type: string
         required: true
 
@@ -96,6 +96,8 @@ jobs:
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
           cargo build --locked -p nelomai-client-updater --example verify-updater-signature
           python -m unittest scripts.tests.test_macos_candidate scripts.tests.test_macos_common_signing
+      - name: macOS runtime and Keychain rollback regressions
+        run: python3 scripts/test-macos-rollback.py
       - name: Build macOS latest on GitHub-hosted Apple Silicon with production public pins only
         run: |
           python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUN_ROOT/runtime-public.raw"

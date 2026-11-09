@@ -38,7 +38,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.draft = self.root / 'draft'
         self.stable = self.root / 'stable'
         self.signed = self.root / 'signed'
-        self.runtime(self.draft / 'latest', '0.4.1', self.sha, self.old_key)
+        self.runtime(self.draft / 'latest', '0.4.2', self.sha, self.old_key)
         shutil.copyfile(self.old_public, self.draft / 'draft-public-key.raw')
         shutil.copyfile(self.public, self.draft / 'runtime-public-key.raw')
         self.runtime(self.stable, '0.2.20', self.old_sha, self.old_key)
@@ -100,7 +100,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.sign()
         doc, files = self.c.verified(self.signed, self.sha, self.public, self.old_public)
         self.assertEqual([(s['slot'], s['manifest']['runtime_version']) for s in doc['slots']],
-                         [('latest', '0.4.1'), ('stable', '0.2.20')])
+                         [('latest', '0.4.2'), ('stable', '0.2.20')])
         self.assertEqual(doc['release_set_id'], 'macos-candidate-' + self.sha)
         self.assertEqual(before, (self.c.snapshot(self.draft), self.c.snapshot(self.stable)))
         self.assertFalse(any('/release/' in n or any(p in n for p in ('linux', 'windows', 'android')) for n in files))
@@ -116,9 +116,9 @@ class MacosCandidateTest(unittest.TestCase):
         with patch.object(self.c.verifier, 'inspect', side_effect=native_inspect):
             self.c.stage(self.signed, staged, self.sha, self.public, self.old_public)
         service = b'structural service fixture; never executed'
-        self.assertEqual(inspected, [('0.4.1', service), ('0.2.20', service)])
+        self.assertEqual(inspected, [('0.4.2', service), ('0.2.20', service)])
         self.assertEqual((staged / 'dispatcher/1/nelomai-unix-service').read_bytes(), service)
-        for slot, version in (('latest', '0.4.1'), ('stable', '0.2.20')):
+        for slot, version in (('latest', '0.4.2'), ('stable', '0.2.20')):
             path = staged / 'runtime/engines' / slot / version / 'nelomai-unix-service'
             self.assertEqual(path.read_bytes(), service)
             self.assertEqual(path.stat().st_mode & 0o777, 0o755)
@@ -195,7 +195,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.assertIn(self.c.PACKAGE + '.sig', inventory['assets'])
         self.assertEqual(inventory['assets'][self.c.DMG], self.digest(image))
         self.assertIn(self.c.DMG + '.sig', inventory['assets'])
-        self.assertFalse(any('0.4.1-release-set' in n or 'release-manifest' in n for n in inventory['assets']))
+        self.assertFalse(any('0.4.2-release-set' in n or 'release-manifest' in n for n in inventory['assets']))
         self.assertEqual(before, self.c.snapshot(packages))
         self.assertEqual(len(calls), 4)
 
@@ -213,6 +213,157 @@ class MacosCandidateTest(unittest.TestCase):
 
 
 class MacosCandidateWorkflowTest(unittest.TestCase):
+    def test_rollback_runner_reads_literal_default_keychain_path(self):
+        runner = module('test-macos-rollback')
+        path = r'/tmp/Original "Keychain"\\store.keychain-db'
+        result = subprocess.CompletedProcess([], 0, os.fsencode(f'    "{path}"\n'), b'')
+        with patch.object(runner.subprocess, 'run', return_value=result):
+            self.assertEqual(runner.default_keychain(), [path])
+
+    def test_rollback_runner_rejects_partial_keychain_list(self):
+        runner = module('test-macos-rollback')
+        partial = subprocess.CompletedProcess([], 0, b' "/tmp/existing.keychain-db"\n',
+            b'security: SecKeychainGetPath failed\n')
+        with (
+            patch.object(runner.subprocess, 'run', return_value=partial),
+            patch.object(runner.sys.stderr, 'write'),
+            self.assertRaisesRegex(RuntimeError, 'reported incomplete results'),
+        ):
+            runner.security('list-keychains', '-d', 'user', require_quiet=True)
+
+    def test_rollback_runner_checks_default_is_restorable_before_creation(self):
+        runner = module('test-macos-rollback')
+        old = '/tmp/missing.keychain-db'
+        calls = []
+
+        def security(operation, *args, **kwargs):
+            calls.append((operation, *args))
+            if (operation, args) == ('list-keychains', ('-d', 'user')):
+                return f'    "{old}"\n'
+            self.assertEqual((operation, args), ('default-keychain', ('-d', 'user', '-s', old)))
+            self.assertTrue(kwargs.get('require_quiet'))
+            raise RuntimeError('default is not restorable')
+
+        with (
+            patch.dict(os.environ, {
+                'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted',
+                'RUNNER_TEMP': tempfile.gettempdir(),
+            }),
+            patch.object(runner.sys, 'platform', 'darwin'),
+            patch.object(runner, 'default_keychain', return_value=[old]),
+            patch.object(runner, 'security', side_effect=security),
+            patch.object(runner.subprocess, 'check_output',
+                         return_value=''.join(f'{name}: test\n' for name in runner.TESTS)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'default is not restorable'):
+                runner.main()
+        self.assertEqual(calls, [
+            ('list-keychains', '-d', 'user'),
+            ('default-keychain', '-d', 'user', '-s', old),
+        ])
+
+    def test_rollback_runner_restores_keychain_settings_after_test_failure(self):
+        runner = module('test-macos-rollback')
+        search = r'/Users/runner/Library/Keychains/Original "Keychain"\\store.keychain-db'
+        listed = os.fsencode(f'    "{search}"\n')
+        expected = [
+            'common_host_preserves_runtime_record_across_version_rollback',
+            'common_host_preserves_legacy_install_identity_after_completed_migration',
+        ]
+        for default in ([search], []):
+            calls = []
+
+            def run(command, **kwargs):
+                if command[0] == 'cargo':
+                    self.assertEqual(command[-3:], ['--exact', *expected])
+                    self.assertIn('--include-ignored', command[command.index('--') + 1:])
+                    self.assertEqual(kwargs['env']['NELOMAI_TEST_ROLLBACK_KEYCHAIN'],
+                                     str(calls[-1][-1]))
+                    raise subprocess.CalledProcessError(101, command)
+                operation, *args = command[1:]
+                calls.append((operation, *args))
+                if (operation, args) == ('default-keychain', ['-d', 'user']):
+                    if default:
+                        return subprocess.CompletedProcess(command, 0, listed, b'')
+                    return subprocess.CompletedProcess(command, 1, b'',
+                        b'security: SecKeychainCopyDomainDefault user: A default keychain could not be found.\n')
+                if operation == 'error':
+                    self.assertEqual(args, ['-25307'])
+                    return subprocess.CompletedProcess(command, 1,
+                        b'Error: 0xFFFF9D25 -25307 A default keychain could not be found.\n', b'')
+                if (operation, args) == ('list-keychains', ['-d', 'user']):
+                    return subprocess.CompletedProcess(command, 0, listed, b'')
+                if operation == 'create-keychain':
+                    args[-1].touch()
+                return subprocess.CompletedProcess(command, 0, b'', b'')
+
+            with (
+                self.subTest(default=default),
+                tempfile.TemporaryDirectory() as temp,
+                patch.dict(os.environ, {
+                    'GITHUB_ACTIONS': 'true', 'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_TEMP': temp,
+                }),
+                patch.object(runner.sys, 'platform', 'darwin'),
+                patch.object(runner.subprocess, 'check_output',
+                             return_value=''.join(f'{name}: test\n' for name in expected)),
+                patch.object(runner.subprocess, 'run', side_effect=run),
+                patch.object(runner, 'security', wraps=runner.security) as security,
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    runner.main()
+                keychain = next(args[-1] for operation, *args in calls if operation == 'create-keychain')
+                self.assertEqual(keychain.parent.parent, Path(temp).resolve())
+                cleanup = [
+                    ('default-keychain', '-d', 'user', '-s', *default),
+                ] if default else []
+                if default:
+                    self.assertEqual(calls[2], cleanup[0])
+                self.assertEqual(calls[-(3 + len(cleanup)):], [
+                    ('default-keychain', '-d', 'user', '-s', keychain),
+                    *cleanup,
+                    ('delete-keychain', keychain),
+                    ('list-keychains', '-d', 'user', '-s', search),
+                ])
+                security.assert_called_with('list-keychains', '-d', 'user', '-s', search,
+                                            require_quiet=True)
+
+    def test_rollback_runner_rejects_an_unreadable_default_keychain(self):
+        runner = module('test-macos-rollback')
+        denied = subprocess.CompletedProcess([], 1, b'',
+            b'security: SecKeychainCopyDomainDefault user: User interaction is not allowed.\n')
+        missing = subprocess.CompletedProcess([], 1,
+            b'Error: 0xFFFF9D25 -25307 A default keychain could not be found.\n', b'')
+        with patch.object(runner.subprocess, 'run', side_effect=[denied, missing]):
+            with self.assertRaisesRegex(RuntimeError, "cannot identify"):
+                runner.default_keychain()
+
+    def test_rollback_regressions_run_on_native_macos_jobs(self):
+        for workflow_file, job_name in (('checks.yml', 'macos-development'),
+                                        ('macos-candidate.yml', 'build'),
+                                        ('release.yml', 'native_drafts')):
+            with self.subTest(workflow=workflow_file):
+                workflow = yaml.safe_load((ROOT / '.github/workflows' / workflow_file).read_text())
+                job = workflow['jobs'][job_name]
+                step = next((step for step in job['steps']
+                             if step.get('run') == 'python3 scripts/test-macos-rollback.py'), None)
+                self.assertIsNotNone(step)
+                self.assertFalse(step.get('continue-on-error', False))
+                if workflow_file == 'release.yml':
+                    self.assertEqual(step['if'], "matrix.platform == 'macos'")
+                    matrix = job['strategy']['matrix']['include']
+                    self.assertEqual([item['runner'] for item in matrix if item['platform'] == 'macos'],
+                                     ['macos-15'])
+                    continue
+                self.assertEqual(job['runs-on'], 'macos-15')
+                if workflow_file == 'checks.yml':
+                    self.assertEqual(step['if'],
+                        "${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' }}")
+                else:
+                    self.assertNotIn('if', step)
+                    self.assertGreater(job['steps'].index(step), next(
+                        i for i, candidate in enumerate(job['steps'])
+                        if 'scripts/macos-candidate.py source --source-sha' in candidate.get('run', '')))
+
     def test_development_compilation_uses_hosted_apple_silicon(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
         self.assertEqual(workflow['jobs']['macos-development']['runs-on'],

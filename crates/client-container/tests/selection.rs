@@ -205,6 +205,143 @@ fn common_host_rejects_second_owner_before_constructing_secret_backend() {
 }
 
 #[test]
+fn common_host_preserves_runtime_record_across_version_rollback() {
+    use nelomai_client_storage::{AuthStore, RuntimeStateStore};
+
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let records = Records::default();
+    let open = |version| {
+        let key = install_manifest(resources.path(), version, false);
+        nelomai_client_container::host::prepare_host(
+            data.path(),
+            resources.path(),
+            Some(&key),
+            "linux",
+            "x86_64",
+            || records.clone(),
+        )
+    };
+
+    let old = open("0.3.0").unwrap();
+    let original_runtime = old.storage.runtime.load().unwrap().unwrap();
+    let original_auth = old.storage.auth.load().unwrap().unwrap();
+    drop(old);
+
+    let updated = open("0.4.1").unwrap();
+    assert_eq!(updated.selection.target().runtime_version, "0.4.1");
+    drop(updated);
+
+    let rolled_back = open("0.3.0").expect("the previous runtime can reopen inventoried state");
+    assert_eq!(
+        rolled_back.storage.runtime.load().unwrap(),
+        Some(original_runtime)
+    );
+    assert_eq!(
+        rolled_back.storage.auth.load().unwrap(),
+        Some(original_auth)
+    );
+}
+
+#[test]
+fn common_host_preserves_legacy_install_identity_after_completed_migration() {
+    #[cfg(target_os = "macos")]
+    if let Some(keychain) = std::env::var_os("NELOMAI_TEST_ROLLBACK_KEYCHAIN") {
+        let keychain = keychain
+            .into_string()
+            .expect("expected a UTF-8 Keychain path");
+        let current = std::process::Command::new("/usr/bin/security")
+            .args(["default-keychain", "-d", "user"])
+            .output()
+            .unwrap();
+        assert!(current.status.success());
+        assert_eq!(
+            std::str::from_utf8(&current.stdout).unwrap().trim(),
+            format!("\"{keychain}\""),
+            "native rollback test requires its disposable default Keychain"
+        );
+        use nelomai_client_storage::{SystemRecordFactory, SystemSecretStore};
+        const ACCOUNT: &str = "nelomai-ci-rollback";
+        assert_legacy_install_identity_after_completed_migration(
+            &SystemSecretStore::new(ACCOUNT, None),
+            || SystemRecordFactory::new(ACCOUNT, None),
+        );
+        return;
+    }
+    let records = Records::default();
+    assert_legacy_install_identity_after_completed_migration(records.legacy(), || records.clone());
+}
+
+fn assert_legacy_install_identity_after_completed_migration<F: ProtectedRecordFactory>(
+    legacy_store: &dyn SecretStore,
+    create_records: impl Fn() -> F,
+) {
+    use nelomai_client_storage::{
+        acknowledge_migration_bootstrap, AuthStore, FileMigrationJournal, FileSplitTunnelStore,
+        LegacyMigrationSource, MigrationOutcome, RuntimeStateStore,
+    };
+
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    assert!(legacy_store.load().unwrap().is_none());
+    let mut legacy = StoredAuth::new_install();
+    legacy.access_token = Some("synthetic-access".into());
+    legacy.refresh_token = Some("synthetic-refresh".into());
+    legacy_store.save(&legacy).unwrap();
+
+    let open = |version| {
+        let key = install_manifest(resources.path(), version, false);
+        nelomai_client_container::host::prepare_host(
+            data.path(),
+            resources.path(),
+            Some(&key),
+            "linux",
+            "x86_64",
+            &create_records,
+        )
+    };
+    let host = open("0.2.16").unwrap();
+    let mut auth = host.storage.auth.load().unwrap().unwrap();
+    auth.session_generation = Some(1);
+    auth.confirmed_identity = Some(
+        host.selection
+            .manifest()
+            .identity(RuntimeSlot::Latest, Some(1))
+            .unwrap(),
+    );
+    host.storage.auth.save(&auth).unwrap();
+    let mut runtime = host.storage.runtime.load().unwrap().unwrap();
+    runtime.complete_legacy_cleanup();
+    host.storage.runtime.save(&runtime).unwrap();
+
+    let split = FileSplitTunnelStore::new(data.path());
+    let journal = FileMigrationJournal::new(data.path().join("common/auth-migration-v1.json"));
+    assert_eq!(
+        acknowledge_migration_bootstrap(
+            &LegacyMigrationSource::new(legacy_store, &split),
+            &host.storage.auth,
+            &host.storage.runtime,
+            &journal,
+        )
+        .unwrap(),
+        MigrationOutcome::Complete
+    );
+    drop(host);
+
+    let updated = open("0.4.1").unwrap();
+    assert_eq!(updated.selection.target().runtime_version, "0.4.1");
+    drop(updated);
+
+    let rollback_auth = legacy_store
+        .load()
+        .unwrap()
+        .expect("the pre-migration app can still read its installation identity");
+    assert_eq!(rollback_auth.install_secret, legacy.install_secret);
+    assert!(rollback_auth.access_token.is_none());
+    assert!(rollback_auth.refresh_token.is_none());
+}
+
+#[test]
 fn durable_requested_intent_recovers_pending_and_next_startup_target_without_second_write() {
     use nelomai_client_container::{
         CleanupEngineRoleV1, CleanupEnvelopeV1, SwitchCoordinator, SwitchJournalV1,

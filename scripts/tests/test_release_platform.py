@@ -45,12 +45,12 @@ class ReleasePlatformTest(ArtifactFixture):
             windows = SimpleNamespace(**{**vars(args), "platform": "windows"})
             with self.assertRaisesRegex(StopIteration, "ordinary Windows service test command observed"):
                 builder.desktop(windows, work, {})
-        self.assertEqual(manifest["runtime_version"], "0.4.1")
+        self.assertEqual(manifest["runtime_version"], "0.4.2")
         for slot in ("stable", "latest"):
             self.assertEqual(sorted(path.name for path in (output / slot).iterdir()), [
-                "nelomai-runtime-0.4.1-linux-x86_64.manifest.json",
-                "nelomai-runtime-0.4.1-linux-x86_64.manifest.sig",
-                "nelomai-runtime-0.4.1-linux-x86_64.zip",
+                "nelomai-runtime-0.4.2-linux-x86_64.manifest.json",
+                "nelomai-runtime-0.4.2-linux-x86_64.manifest.sig",
+                "nelomai-runtime-0.4.2-linux-x86_64.zip",
             ])
 
     def test_build_capture_decodes_utf8_independently_of_windows_locale(self):

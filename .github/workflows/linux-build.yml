@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex HEAD of Future/desktop-0.4.0; diagnostic 0.4.1 only
+        description: Full 40-hex HEAD of Future/desktop-0.4.0; diagnostic 0.4.2 only
         type: string
         required: true
 
@@ -25,7 +25,7 @@ jobs:
       github.repository == 'NelomaiTTT/nelomai-app' &&
       github.ref == 'refs/heads/Future/desktop-0.4.0' &&
       github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha
-    name: Linux 0.4.1 test AppImage (not a release)
+    name: Linux 0.4.2 test AppImage (not a release)
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
@@ -69,9 +69,9 @@ jobs:
         run: |
           sudo apt-get install -y xdg-utils
           test -x /usr/bin/xdg-open
-      - name: Verify exact 0.4.1 source and Linux regressions
+      - name: Verify exact 0.4.2 source and Linux regressions
         run: |
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.1 --mode build_only
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.2 --mode build_only
           cargo fmt --all --check
           cargo test --locked -p nelomai-unix-service
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
@@ -107,7 +107,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: nelomai-test-0.4.1-linux-x86_64-${{ env.SOURCE_SHA }}
+          name: nelomai-test-0.4.2-linux-x86_64-${{ env.SOURCE_SHA }}
           path: ${{ env.RUN_ROOT }}/packages-linux/
           if-no-files-found: error
           retention-days: 14

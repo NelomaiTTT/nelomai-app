@@ -19,9 +19,9 @@ spec.loader.exec_module(builder)
 verifier, gates = builder.verifier, builder.gates
 container = verifier.load_script('build-runtime-acceptance-container.py')
 canonical = container.release_set.canonical
-VERSION = '0.4.1'
-LATEST = 'nelomai-runtime-0.4.1-linux-x86_64'
-PACKAGE = 'nelomai-0.4.1-linux-x86_64.AppImage'
+VERSION = '0.4.2'
+LATEST = 'nelomai-runtime-0.4.2-linux-x86_64'
+PACKAGE = 'nelomai-0.4.2-linux-x86_64.AppImage'
 SUFFIXES = ('.zip', '.manifest.json', '.manifest.sig')
 UPDATER_PUBLIC = json.loads((builder.ROOT / 'src-tauri/tauri.conf.json').read_bytes())['plugins']['updater']['pubkey']
 PRIVATE_ENV = ('NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64', 'TAURI_SIGNING_PRIVATE_KEY',
@@ -47,7 +47,7 @@ def source(sha, *, root=builder.ROOT, environment=None, keyless=False):
     versions = [json.loads((root / name).read_bytes())['version'] for name in ('package.json', 'src-tauri/tauri.conf.json')]
     versions.append(tomllib.loads((root / 'src-tauri/Cargo.toml').read_text())['package']['version'])
     if versions != [VERSION] * 3 or gates.git(root, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none'):
-        raise ValueError('Linux candidate requires clean exact 0.4.1 source')
+        raise ValueError('Linux candidate requires clean exact 0.4.2 source')
     gates.verify_source(root, sha, VERSION, base=gates.BASE, mode='sign_candidate')
 
 
@@ -182,7 +182,7 @@ def stage(signed, output, sha, public, stable_public):
             verifier.inspect(payload, manifest)
         dispatcher = staged / 'dispatcher/1/nelomai-unix-service'
         dispatcher.parent.mkdir(parents=True)
-        shutil.copy2(staged / 'runtime/engines/latest/0.4.1/nelomai-unix-service', dispatcher)
+        shutil.copy2(staged / 'runtime/engines/latest/0.4.2/nelomai-unix-service', dispatcher)
         for suffix in ('.json', '.sig'):
             shutil.copyfile(signed / 'containers/linux/shipping' / ('container-manifest-v1' + suffix),
                             staged / 'runtime' / ('container-manifest-v1' + suffix))

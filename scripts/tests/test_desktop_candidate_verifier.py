@@ -19,6 +19,12 @@ class DesktopCandidateVerifierTest(unittest.TestCase):
     def test_exact_desktop_dmg_inventory_reaches_signature_verification_without_android(self):
         publication = module("check-publication-inputs")
         signer = module("sign-macos-common-package")
+        gates = publication.gates
+        # This verifier targets the retained 0.4.1 bridge candidate.
+        self.enterContext(patch.multiple(gates, VERSION="0.4.1",
+            PACKAGE_NAMES={platform: name.replace(gates.VERSION, "0.4.1")
+                           for platform, name in gates.PACKAGE_NAMES.items()},
+            PUBLISH_ASSETS=gates.publication_assets("0.4.1")))
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             candidate = root / "candidate"

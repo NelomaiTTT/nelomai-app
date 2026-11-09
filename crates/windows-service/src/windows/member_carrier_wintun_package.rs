@@ -715,6 +715,7 @@ fn pending_installation_root(source: &str) -> Option<&str> {
         r"\runtime\engines\latest\0.3.3\wintun.dll",
         r"\runtime\engines\latest\0.4.0\wintun.dll",
         r"\runtime\engines\latest\0.4.1\wintun.dll",
+        r"\runtime\engines\latest\0.4.2\wintun.dll",
     ]
     .into_iter()
     .find_map(|suffix| {
