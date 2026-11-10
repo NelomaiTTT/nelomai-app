@@ -35,6 +35,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
@@ -44,13 +45,19 @@ private const val BACKGROUND_REFRESH_WINDOW_SECONDS = 7L * 24 * 60 * 60
 
 /** Serializes recovery-v2 work and coalesces high-frequency health/network callbacks. */
 internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
+    private data class NetworkUpdate(val startOperationId: String?, val apply: () -> Unit)
+
     private val tickQueued = AtomicBoolean(false)
     private val resumeQueued = AtomicBoolean(false)
     private val networkGate = Any()
     private var networkQueued = false
-    private var pendingAvailable: Boolean? = null
+    private var pendingNetworkUpdate: NetworkUpdate? = null
 
     fun execute(action: () -> Unit) = executor.execute(action)
+
+    fun networkUpdatePending(startOperationId: String): Boolean = synchronized(networkGate) {
+        pendingNetworkUpdate?.startOperationId == startOperationId
+    }
 
     fun tick(action: () -> Unit): Boolean {
         if (!tickQueued.compareAndSet(false, true)) return false
@@ -76,9 +83,9 @@ internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
         return true
     }
 
-    fun network(available: Boolean, action: (Boolean) -> Unit): Boolean {
+    fun network(available: Boolean, startOperationId: String? = null, action: (Boolean) -> Unit): Boolean {
         val schedule = synchronized(networkGate) {
-            pendingAvailable = available
+            pendingNetworkUpdate = NetworkUpdate(startOperationId) { action(available) }
             if (networkQueued) false else {
                 networkQueued = true
                 true
@@ -88,12 +95,12 @@ internal class RedundantVpnWorkDispatcher(private val executor: Executor) {
         executor.execute {
             while (true) {
                 val current = synchronized(networkGate) {
-                    pendingAvailable?.also { pendingAvailable = null } ?: run {
+                    pendingNetworkUpdate?.also { pendingNetworkUpdate = null } ?: run {
                         networkQueued = false
                         return@execute
                     }
                 }
-                action(current)
+                current.apply()
             }
         }
         return true
@@ -239,6 +246,7 @@ internal data class InstalledRedundantVpnOwner(
     val startOperationId: String,
     val routeBaseline: RedundantVpnRouteBaseline? = null,
     val effectiveOptions: EffectiveAndroidTunnelOptions? = null,
+    val tunNetworkFingerprint: String? = null,
 )
 
 internal class RedundantVpnOwnerSlot {
@@ -300,10 +308,15 @@ internal class RedundantVpnOwnerSlot {
     }
 
     @Synchronized
-    fun updateRouteBaseline(owner: RedundantVpnProcessOwner, baseline: RedundantVpnRouteBaseline?,
-        options: EffectiveAndroidTunnelOptions) {
+    fun updateRouteBaseline(
+        owner: RedundantVpnProcessOwner,
+        baseline: RedundantVpnRouteBaseline?,
+        options: EffectiveAndroidTunnelOptions,
+        tunNetworkFingerprint: String? = null,
+    ) {
         installed?.takeIf { it.owner === owner }?.let {
-            installed = it.copy(routeBaseline = baseline, effectiveOptions = options)
+            installed = it.copy(routeBaseline = baseline, effectiveOptions = options,
+                tunNetworkFingerprint = tunNetworkFingerprint)
         }
     }
 }
@@ -394,6 +407,7 @@ private data class PendingRedundantStop(
     val serviceGeneration: Long,
     val localClosed: Boolean,
     val allowRestart: Boolean,
+    val startFailureReply: (() -> Unit)? = null,
 )
 
 private data class PendingRedundantStopAttempt(
@@ -407,6 +421,25 @@ private data class DeferredRedundantTotalLoss(
     val startOperationId: String,
     val owner: RedundantConnectionCoordinator,
 )
+
+private data class DeferredRedundantReadiness(
+    val operationId: String,
+    val owner: RedundantVpnProcessOwner,
+    val ready: Boolean,
+)
+
+private data class RedundantPhysicalNetworkUpdate(
+    val identity: RedundantPhysicalNetworkCallbackIdentity,
+    val options: EffectiveAndroidTunnelOptions?,
+    val owner: RedundantConnectionCoordinator,
+    val state: PhysicalNetworkState,
+    var rebindGeneration: Long,
+) {
+    var rebindFingerprint: String? = null
+    var rebindProgress = RedundantNetworkRebindProgress()
+}
+
+private enum class PhysicalNetworkUpdateResult { HANDLED, WAIT_FOR_BARRIER, RETRY_LATER }
 
 internal fun runRedundantStopCleanupAttempt(
     transaction: AndroidRedundantTransaction,
@@ -815,30 +848,49 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private val retainedRedundantOwnerRetry = Runnable { retryRetainedRedundantOwners() }
     @Volatile private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
+    // The main handler keeps only the latest update while the VPN worker is busy.
+    private var pendingPhysicalNetworkUpdate: RedundantPhysicalNetworkUpdate? = null
+    private val unappliedPhysicalNetworkUpdate = AtomicReference<RedundantPhysicalNetworkUpdate?>()
+    private var physicalNetworkUpdateRunning = false
+    private val physicalNetworkRebindGeneration = AtomicLong()
+    private var deferredRedundantReadiness: DeferredRedundantReadiness? = null
+    // The VPN worker can see a network before its own Android callback arrives.
+    private var resampledPhysicalNetworkUpdate: RedundantPhysicalNetworkUpdate? = null
     private var nextRetiredReconcileAtMillis = 0L
     // Accessed only by the serial cleanup executor; at most eight retired Stops.
     private val rejectedRetiredStopCredentials = mutableMapOf<String, BackgroundCredential>()
     private val redundantHealthTick = object : Runnable {
         override fun run() {
-            if (redundantVpnOwner != null && !redundantStartBlocked()) {
+            if (redundantVpnOwner != null) {
+                restoreHandler.postDelayed(this, REDUNDANT_HEALTH_TICK_MILLIS)
+                flushRedundantRecoveryReadiness()
+                if (redundantStartBlocked()) return
                 val now = android.os.SystemClock.elapsedRealtime()
                 if (now >= nextRetiredReconcileAtMillis) {
                     nextRetiredReconcileAtMillis = now + 60_000L
                     reconcileRetiredStops()
                 }
                 redundantWork.tick {
-                    val installed = redundantVpnOwnerSlot.snapshot()
+                    val installed = redundantVpnOwnerSlot.snapshot() ?: return@tick
+                    val recovery = recoveryStore.read()
                     val transaction = activeRedundantTransactionForCurrentWork(
-                        recovery = recoveryStore.read(),
-                        expectedStartOperationId = installed?.startOperationId,
+                        recovery = recovery,
+                        expectedStartOperationId = installed.startOperationId,
                     )
-                    installed?.owner?.takeIf { transaction != null }?.let { owner ->
-                        runCatching(owner::tick).onFailure {
-                            TunnelLog.warning("redundant.health_tick_failed", error = it)
-                        }
+                    val owner = installed.owner
+                    runCatching {
+                        if (transaction != null) {
+                            owner.tick()
+                        } else if (recovery is RecoveryStoreResult.Failure &&
+                            owner is RedundantConnectionCoordinator && !redundantStartBlocked() &&
+                            redundantVpnOwnerSlot.snapshot()?.owner === owner
+                        ) {
+                            owner.tickWaitingForNetworkUpdate()
+                        } else Unit
+                    }.onFailure {
+                        TunnelLog.warning("redundant.health_tick_failed", error = it)
                     }
                 }
-                restoreHandler.postDelayed(this, REDUNDANT_HEALTH_TICK_MILLIS)
             }
         }
     }
@@ -1298,7 +1350,6 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         val startedAt = System.nanoTime()
         val clientOperationId = requireNotNull(args.clientOperationId)
         val quickPlan = args.copyForQuickPlan()
-        var nativeOwner: ServiceRedundantConnectionNative? = null
         var coordinatorOwner: RedundantConnectionCoordinator? = null
         try {
             if (args.apiVersion != TUNNEL_API_VERSION) {
@@ -1317,12 +1368,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 Build.VERSION.SDK_INT,
             )
             val physicalState = PhysicalNetworks(applicationContext).snapshotState()
-            val (coordinator, native) = createRedundantCoordinator(
+            val (coordinator, _) = createRedundantCoordinator(
                 transaction,
                 redundancy.virtualAddressV4,
                 physicalState,
             )
-            nativeOwner = native
             coordinatorOwner = coordinator
             val configurations = linkedMapOf(redundancy.primary.leaseId to args.configuration)
             redundancy.standby?.let { configurations[it.member.leaseId] = it.configuration }
@@ -1392,21 +1442,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     }
                 },
                 onPrimaryFailed = {
-                    coordinator.fenceRevoke()
-                    coordinator.revoke()
-                    installRedundantVpnOwner(null)
-                    restoreHandler.post {
-                        redundantStartOperation.completeFailure(clientOperationId) {
-                            QuickTunnelController.updateState(
-                                applicationContext,
-                                SessionState.FAILED,
-                                desiredActive = true,
-                            )
-                            receiver.sendError("redundant_start_failed")
-                        }
-                        finishRedundantStart(clientOperationId)
-                        stopIfIdle()
-                    }
+                    failRedundantClientStart(clientOperationId, coordinator, receiver, "redundant_start_failed")
                 },
                 onPrimaryCancelled = {
                     restoreHandler.post {
@@ -1424,50 +1460,49 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 ) {
                     redundantStartOperation.cancel(clientOperationId)
                 }
-                coordinator.fenceRevoke()
-                coordinator.revoke()
-                installRedundantVpnOwner(null)
-                restoreHandler.post {
-                    redundantStartOperation.completeFailure(clientOperationId) {
-                        QuickTunnelController.updateState(
-                            applicationContext,
-                            SessionState.FAILED,
-                            desiredActive = true,
-                        )
-                        receiver.sendError("redundant_start_failed")
-                    }
-                    finishRedundantStart(clientOperationId)
-                    stopIfIdle()
-                }
+                failRedundantClientStart(clientOperationId, coordinator, receiver, "redundant_start_failed")
             }
         } catch (error: Throwable) {
-            coordinatorOwner?.let { coordinator ->
-                runCatching {
-                    if (coordinator.fenceRevoke()) coordinator.revoke()
-                }
-            }
-            if (coordinatorOwner != null) {
-                installRedundantVpnOwner(null)
-            } else {
-                nativeOwner?.stop()
-            }
             val code = (error as? BackgroundConnectionException)?.code
                 ?: "redundant_start_failed"
             TunnelLog.warning("redundant.start_failed", code)
-            restoreHandler.post {
-                redundantStartOperation.completeFailure(clientOperationId) {
-                    QuickTunnelController.updateState(
-                        applicationContext,
-                        SessionState.FAILED,
-                        desiredActive = true,
-                    )
-                    receiver.sendError(code)
-                }
-                finishRedundantStart(clientOperationId)
-                stopIfIdle()
-            }
+            failRedundantClientStart(clientOperationId, coordinatorOwner, receiver, code)
         } finally {
             args.clearSensitiveConfigurations()
+        }
+    }
+
+    private fun failRedundantClientStart(
+        operationId: String,
+        owner: RedundantConnectionCoordinator?,
+        receiver: ResultReceiver?,
+        code: String,
+    ) {
+        val needsStop = if (owner == null) false else when (val recovery = recoveryStore.read()) {
+            is RecoveryStoreResult.Failure -> true
+            is RecoveryStoreResult.Success -> recovery.value.redundantTransaction?.startOperationId == operationId
+        }
+        if (needsStop) {
+            redundantMutationFence.cancel(operationId)
+        } else if (owner != null && redundantOwnerForOperation(operationId) === owner) {
+            installRedundantVpnOwner(null)
+        }
+        restoreHandler.post {
+            val installed = redundantVpnOwnerSlot.snapshot()
+            if (needsStop && (installed == null || (installed.startOperationId == operationId && installed.owner === owner))) {
+                beginFailClosedRedundantStop(
+                    operationId, installed?.owner, startFailureReply = { receiver.sendError(code) },
+                )
+            } else {
+                redundantStartOperation.completeFailure(operationId) {
+                    if (!needsStop) {
+                        QuickTunnelController.updateState(applicationContext, SessionState.FAILED, desiredActive = true)
+                    }
+                    receiver.sendError(code)
+                }
+            }
+            finishRedundantStart(operationId)
+            stopIfIdle()
         }
     }
 
@@ -1530,9 +1565,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 val effective = AndroidSplitTunnel.resolveConfigurationOptions(Build.VERSION.SDK_INT,
                     preparingOptions.toTunnelOptionsArgs(), transaction.template.egressMode, config,
                     AndroidSplitTunnel.privateDnsHostname(applicationContext))
-                val routes = if (effective.splitSupported && effective.excludeLocalNetworks) {
-                    PhysicalNetworks(applicationContext).snapshotState().localRoutes
-                } else emptyList()
+                val physicalForTun = if (effective.splitSupported && effective.excludeLocalNetworks) {
+                    PhysicalNetworks(applicationContext).snapshotState()
+                } else null
+                val routes = physicalForTun?.localRoutes.orEmpty()
                 AndroidSplitTunnel.replaceVpnRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(effective.excludedRoutes, routes),
                     config.getInterface().dnsServers.toList(),
@@ -1543,7 +1579,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                         currentOptions.set(effective)
                         coordinatorOwner?.let { owner ->
                             redundantVpnOwnerSlot.updateRouteBaseline(owner,
-                                redundantVpnRouteBaseline(effective, routes), effective)
+                                redundantVpnRouteBaseline(effective, routes), effective, physicalForTun?.fingerprint)
                         }
                         true
                     }
@@ -1615,6 +1651,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             },
             expectedStartOperationId = transaction.startOperationId,
             mutationFence = redundantMutationFence,
+            startupNetworkUpdatePending = { coordinatorOwner?.let(::startupNetworkUpdatePending) == true },
+            onRestartDataplaneStopped = ::markRedundantDataplaneStopped,
         )
         coordinatorOwner = coordinator
         if (!installActive) return coordinator to native
@@ -1762,6 +1800,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                                     privateDnsHostname = AndroidSplitTunnel.privateDnsHostname(applicationContext)),
                                 owner, PhysicalNetworks(applicationContext).snapshotState())
                         }
+                        dispatchRedundantPhysicalNetworkUpdate()
                     }
                 }
             }
@@ -1770,6 +1809,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             ownedPolicyCancelled.complete(cancellation)
             ownedPolicyInFlight.set(false)
             connectionIntentCoordinator.completeLocalRestart()
+            dispatchRedundantPhysicalNetworkUpdate()
             receiver.sendError("android_service_dispatch_unavailable")
         }
     }
@@ -1825,6 +1865,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     startOperationId = accepted.startOperationId,
                     owner = accepted.owner,
                     allowRestart = restartPrepared,
+                    restartingSession = transaction.takeIf { restartPrepared },
                 )
             },
             failClosedStop = { accepted ->
@@ -1836,86 +1877,266 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun applyRedundantPhysicalNetworks(
         identity: RedundantPhysicalNetworkCallbackIdentity,
-        options: EffectiveAndroidTunnelOptions,
+        options: EffectiveAndroidTunnelOptions?,
         owner: RedundantConnectionCoordinator,
         state: PhysicalNetworkState,
     ) {
-        if (ownedPolicyInFlight.get() || owner.policyFailed()) return
-        var routeRefreshRequired = false
-        var observedOwner: InstalledRedundantVpnOwner? = null
-        identity.applyIfCurrent(
-            mutationFence = redundantMutationFence,
-            current = ::currentRedundantPhysicalNetworkCallbackState,
-        ) {
-            if (ownedPolicyInFlight.get() || owner.policyFailed()) return@applyIfCurrent
+        if (owner.policyFailed() || !physicalNetworkOwnerCurrent(identity)) return
+        // Preserve a loss even when its callback is replaced by an online update.
+        if (!state.available) physicalNetworkRebindGeneration.incrementAndGet()
+        val update = RedundantPhysicalNetworkUpdate(
+            identity, options, owner, state, physicalNetworkRebindGeneration.get(),
+        )
+        // A tick already queued on the VPN worker must not accept old-network proof.
+        unappliedPhysicalNetworkUpdate.set(update)
+        pendingPhysicalNetworkUpdate = update
+        dispatchRedundantPhysicalNetworkUpdate()
+    }
+
+    private fun physicalNetworkOwnerCurrent(identity: RedundantPhysicalNetworkCallbackIdentity): Boolean =
+        !serviceDestroyed && serviceCallbackGate.isOpen() &&
+            identity.matchesOwner(currentRedundantPhysicalNetworkCallbackState())
+
+    internal fun startupNetworkUpdatePending(owner: RedundantConnectionCoordinator): Boolean {
+        if (unappliedPhysicalNetworkUpdate.get()?.owner === owner) return true
+        val installed = redundantVpnOwnerSlot.snapshot()?.takeIf { it.owner === owner } ?: return false
+        return redundantWork.networkUpdatePending(installed.startOperationId)
+    }
+
+    private fun dispatchRedundantPhysicalNetworkUpdate() {
+        if (physicalNetworkUpdateRunning || ownedPolicyInFlight.get() || redundantStartBlocked()) return
+        val update = pendingPhysicalNetworkUpdate ?: return
+        pendingPhysicalNetworkUpdate = null
+        if (!physicalNetworkOwnerCurrent(update.identity) || update.owner.policyFailed()) {
+            unappliedPhysicalNetworkUpdate.compareAndSet(update, null)
+            return
+        }
+
+        physicalNetworkUpdateRunning = true
+        runCatching {
+            redundantWork.execute {
+                var result = PhysicalNetworkUpdateResult.HANDLED
+                try {
+                    result = reconcileRedundantPhysicalNetworks(update)
+                } finally {
+                    if (result == PhysicalNetworkUpdateResult.HANDLED || update.rebindProgress.availabilityApplied) {
+                        unappliedPhysicalNetworkUpdate.compareAndSet(update, null)
+                    }
+                    restoreHandler.post {
+                        physicalNetworkUpdateRunning = false
+                        if (result != PhysicalNetworkUpdateResult.HANDLED && pendingPhysicalNetworkUpdate == null &&
+                            physicalNetworkOwnerCurrent(update.identity)
+                        ) {
+                            pendingPhysicalNetworkUpdate = update
+                            if (result == PhysicalNetworkUpdateResult.RETRY_LATER) {
+                                redundantTotalLossRetry.schedule()
+                                return@post
+                            }
+                        }
+                        dispatchRedundantPhysicalNetworkUpdate()
+                    }
+                }
+            }
+        }.onFailure {
+            physicalNetworkUpdateRunning = false
+            unappliedPhysicalNetworkUpdate.compareAndSet(update, null)
+            TunnelLog.warning("redundant.network_change_failed", error = it)
+        }
+    }
+
+    private fun reconcileRedundantPhysicalNetworks(update: RedundantPhysicalNetworkUpdate): PhysicalNetworkUpdateResult {
+        val (identity, options, owner, state) = update
+        if (!physicalNetworkOwnerCurrent(identity) || owner.policyFailed()) return PhysicalNetworkUpdateResult.HANDLED
+        val rebindGeneration = physicalNetworkRebindGeneration.get()
+        if (update.rebindGeneration != rebindGeneration) {
+            update.rebindGeneration = rebindGeneration
+            update.rebindFingerprint = null
+            update.rebindProgress = RedundantNetworkRebindProgress()
+        }
+
+        fun shouldDefer(current: RedundantPhysicalNetworkCallbackState): Boolean =
+            identity.matchesOwner(current) && !current.pendingStop &&
+                (ownedPolicyInFlight.get() || !identity.isCurrent(current))
+
+        var result = PhysicalNetworkUpdateResult.HANDLED
+        fun updateAllowed(current: RedundantPhysicalNetworkCallbackState): Boolean {
+            if (shouldDefer(current)) result = PhysicalNetworkUpdateResult.WAIT_FOR_BARRIER
+            return result == PhysicalNetworkUpdateResult.HANDLED && identity.isCurrent(current) &&
+                serviceCallbackGate.isOpen() && !serviceDestroyed
+        }
+        fun deferUpdate() {
+            if (updateAllowed(currentRedundantPhysicalNetworkCallbackState())) {
+                result = PhysicalNetworkUpdateResult.RETRY_LATER
+            }
+        }
+        fun pauseProbesForNetworkLoss() {
+            val progress = update.rebindProgress
+            if (!progress.availabilityApplied) {
+                progress.availabilityApplied = owner.onPhysicalNetworkUnavailable(identity.startOperationId) {
+                    updateAllowed(currentRedundantPhysicalNetworkCallbackState())
+                }
+            }
+        }
+        val physicalNetworks = PhysicalNetworks(applicationContext)
+        val latest = runCatching(physicalNetworks::snapshotState).getOrElse {
+            // A new offline callback can pause probes even if resampling fails.
+            if (!state.available && update.rebindFingerprint == null) {
+                pauseProbesForNetworkLoss()
+                if (update.rebindProgress.availabilityApplied) update.rebindFingerprint = state.fingerprint
+            }
+            deferUpdate()
+            return result
+        }
+        var refresh = false
+        var canApply = false
+        val prepared = identity.applyIfCurrent(redundantMutationFence, {
+            currentRedundantPhysicalNetworkCallbackState().also { canApply = updateAllowed(it) }
+        }) {
+            if (!canApply) return@applyIfCurrent
             val installed = redundantVpnOwnerSlot.snapshot()
-            observedOwner = installed
-            // The callback may have been queued under an earlier policy of this
-            // SAME owner. Read the installed policy and baseline inside the gate.
-            val latestOptions = installed?.effectiveOptions ?: options
-            if (redundantLocalRouteRefreshRequired(
-                    installed?.routeBaseline,
-                    latestOptions,
-                    state.localRoutes,
-                )
+            val effectiveOptions = installed?.effectiveOptions ?: options
+            refresh = effectiveOptions != null &&
+                redundantLocalRouteRefreshRequired(installed?.routeBaseline, effectiveOptions, latest.localRoutes)
+            applyUnderlyingNetworksToVpn(latest.networks)
+        }
+        if (!prepared || !canApply) return result
+        if (update.rebindFingerprint != latest.fingerprint) {
+            val resampled = resampledPhysicalNetworkUpdate
+            update.rebindProgress = if (
+                state.fingerprint == latest.fingerprint && resampled != null &&
+                resampled.identity == identity && resampled.rebindFingerprint == latest.fingerprint &&
+                resampled.rebindGeneration == update.rebindGeneration
             ) {
-                routeRefreshRequired = true
-                return@applyIfCurrent
+                resampled.rebindProgress
+            } else {
+                RedundantNetworkRebindProgress()
             }
-            candidateProbeCache.invalidateNetwork()
-            setUnderlyingNetworks(state.networks.toTypedArray().takeIf { it.isNotEmpty() })
-            redundantWork.network(state.available) { latestAvailable ->
-                if (!identity.isCurrent(currentRedundantPhysicalNetworkCallbackState())) {
-                    return@network
-                }
-                val transaction = activeRedundantTransactionForCurrentWork(
-                    recovery = recoveryStore.read(),
-                    expectedStartOperationId = identity.startOperationId,
-                )
-                if (transaction != null &&
-                    redundantOwnerForOperation(transaction.startOperationId)
-                        ?.onUnderlyingNetworkChanged(latestAvailable) != true
-                ) {
-                    TunnelLog.warning("redundant.network_change_failed")
+            update.rebindFingerprint = latest.fingerprint
+        }
+        resampledPhysicalNetworkUpdate = update.takeIf { state.fingerprint != latest.fingerprint }
+        val networkProgress = update.rebindProgress
+        // An offline event can only pause the current owner's network probes.
+        // Publish it before route work can be deferred by either store.
+        if (!latest.available) pauseProbesForNetworkLoss()
+        if (!latest.available && state.available) {
+            // The monitor may still remember the online fingerprint and suppress its return.
+            deferUpdate()
+            return result
+        }
+        if (!refresh) {
+            if (!latest.available || networkProgress.tunRebuilt) return result
+            val rebound = owner.onUnderlyingNetworkChanged(
+                available = true, progress = networkProgress, onRebindDeferred = ::deferUpdate,
+            ) { readable ->
+                if (!readable) deferUpdate()
+                readable && updateAllowed(currentRedundantPhysicalNetworkCallbackState())
+            }
+            if (!rebound && result == PhysicalNetworkUpdateResult.HANDLED) {
+                TunnelLog.warning("redundant.network_change_failed")
+            }
+            return result
+        }
+
+        fun replacementAllowed(): Boolean {
+            if (!updateAllowed(currentRedundantPhysicalNetworkCallbackState())) return false
+            return when (backgroundLogoutState()) {
+                BackgroundLogoutReadState.NONE -> true
+                BackgroundLogoutReadState.PENDING -> false
+                BackgroundLogoutReadState.UNREADABLE -> {
+                    deferUpdate()
+                    false
                 }
             }
         }
-        if (routeRefreshRequired && !ownedPolicyInFlight.get() &&
-            redundantVpnOwnerSlot.snapshot() === observedOwner
-        ) {
-            handleRedundantTotalLoss(
-                ownerServiceGeneration = identity.serviceGeneration,
-                startOperationId = identity.startOperationId,
-                owner = owner,
+        if (!replacementAllowed()) return result
+        val refreshed = runCatching {
+            owner.refreshLocalRoutes(
+                latest.available,
+                networkProgress = networkProgress,
+                onDeferred = ::deferUpdate,
+                shouldCancel = { !replacementAllowed() },
             )
+        }.getOrDefault(false)
+        if (refreshed) {
+            val installed = redundantVpnOwnerSlot.snapshot()
+            if (resampledPhysicalNetworkUpdate === update && installed?.owner === owner &&
+                installed.tunNetworkFingerprint == latest.fingerprint &&
+                runCatching(physicalNetworks::snapshotState).getOrNull()?.fingerprint == latest.fingerprint
+            ) {
+                networkProgress.tunRebuilt = true
+            }
+            runCatching { TunnelLog.info("redundant.local_routes_refreshed") }
+            return PhysicalNetworkUpdateResult.HANDLED
         }
+        if (result != PhysicalNetworkUpdateResult.HANDLED && !owner.policyFailed()) return result
+
+        restoreHandler.post {
+            if (!physicalNetworkOwnerCurrent(identity)) return@post
+            if (!owner.policyFailed()) {
+                val current = currentRedundantPhysicalNetworkCallbackState()
+                if (shouldDefer(current)) {
+                    if (pendingPhysicalNetworkUpdate == null) pendingPhysicalNetworkUpdate = update
+                    dispatchRedundantPhysicalNetworkUpdate()
+                    return@post
+                }
+                if (!identity.isCurrent(current)) return@post
+                val installed = redundantVpnOwnerSlot.snapshot()
+                val effectiveOptions = installed?.effectiveOptions ?: options ?: return@post
+                val routes = runCatching(physicalNetworks::snapshotState).getOrDefault(latest).localRoutes
+                if (!redundantLocalRouteRefreshRequired(
+                        installed?.routeBaseline, effectiveOptions, routes,
+                    )
+                ) return@post
+            }
+            // A closed dataplane must reach recovery even during a Stop lookup.
+            runCatching { TunnelLog.warning("redundant.local_routes_refresh_failed", "restart_required") }
+            handleRedundantTotalLoss(identity.serviceGeneration, identity.startOperationId, owner)
+        }
+        return PhysicalNetworkUpdateResult.HANDLED
     }
 
     private fun applyPluginPhysicalNetworks(
         networks: List<Network>,
     ) {
-        val installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId
+        val installed = redundantVpnOwnerSlot.snapshot()
+        val installedStartOperationId = installed?.startOperationId
+        val applyOnWorker = installed?.owner is RedundantConnectionCoordinator
         val apply = {
+            val blocked = redundantStartBlocked()
             if (redundantVpnOwnerSlot.snapshot()?.startOperationId != installedStartOperationId ||
-                redundantStartBlocked()
+                (blocked && !applyOnWorker)
             ) {
                 false
             } else {
-                candidateProbeCache.invalidateNetwork()
-                setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
-                redundantWork.network(networks.isNotEmpty()) { latestAvailable ->
+                if (!applyOnWorker) applyUnderlyingNetworksToVpn(networks)
+                redundantWork.network(networks.isNotEmpty(), installedStartOperationId) { latestAvailable ->
                     val recovery = recoveryStore.read()
-                    if (!shouldEnterLegacyVpnRecovery(recovery)) {
+                    if (blocked || redundantStartBlocked() || recovery is RecoveryStoreResult.Failure) {
+                        deferPluginPhysicalNetworkUpdate(installedStartOperationId, networks)
+                    } else if (!shouldEnterLegacyVpnRecovery(recovery)) {
                         val transaction = activeRedundantTransactionForCurrentWork(
                             recovery = recovery,
                             expectedStartOperationId = installedStartOperationId,
                         )
-                        val changed = transaction?.let {
-                            redundantOwnerForOperation(it.startOperationId)
-                                ?.onUnderlyingNetworkChanged(latestAvailable)
-                        } == true
-                        if (transaction != null && !changed) {
-                            TunnelLog.warning("redundant.network_change_failed")
+                        val owner = transaction?.let { redundantOwnerForOperation(it.startOperationId) }
+                        if (applyOnWorker && owner != null) {
+                            val applied = redundantMutationFence.runSerializedIfActive(installedStartOperationId) {
+                                if (redundantStartBlocked() || redundantVpnOwnerSlot.snapshot()?.owner !== owner) {
+                                    false
+                                } else {
+                                    applyUnderlyingNetworksToVpn(networks)
+                                    true
+                                }
+                            }
+                            if (!applied) {
+                                deferPluginPhysicalNetworkUpdate(installedStartOperationId, networks)
+                                return@network
+                            }
+                        }
+                        val changed = owner?.onUnderlyingNetworkChanged(latestAvailable) == true
+                        if (transaction != null) {
+                            if (!latestAvailable || !changed) physicalNetworkRebindGeneration.incrementAndGet()
+                            if (!changed) TunnelLog.warning("redundant.network_change_failed")
                         }
                     } else {
                         restoreHandler.post {
@@ -1932,6 +2153,31 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             }
         }
         redundantMutationFence.runSerializedIfActive(installedStartOperationId, apply)
+    }
+
+    private fun applyUnderlyingNetworksToVpn(networks: List<Network>) {
+        candidateProbeCache.invalidateNetwork()
+        // Android's VPN metadata update can fail independently of the socket rebind.
+        runCatching { setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() }) }
+            .onFailure { runCatching { TunnelLog.warning("vpn.underlying_networks_update_failed", error = it) } }
+    }
+
+    private fun deferPluginPhysicalNetworkUpdate(startOperationId: String?, networks: List<Network>) {
+        val installed = redundantVpnOwnerSlot.snapshot()?.takeIf { it.startOperationId == startOperationId }
+            ?: return
+        val owner = installed.owner as? RedundantConnectionCoordinator ?: return
+        val identity = RedundantPhysicalNetworkCallbackIdentity(serviceGeneration, installed.startOperationId, owner)
+        // Invalidate the old probes before letting the worker run another health tick.
+        val paused = owner.onPhysicalNetworkUnavailable(installed.startOperationId) { physicalNetworkOwnerCurrent(identity) }
+        restoreHandler.post {
+            if (!physicalNetworkOwnerCurrent(identity)) return@post
+            val state = runCatching { PhysicalNetworks(applicationContext).snapshotState() }.getOrElse {
+                PhysicalNetworkState(emptyList(), networks, validated = false, fingerprint = "")
+            }
+            // Progress from before this pause cannot resume the owner, even on the same network.
+            if (paused && state.available) physicalNetworkRebindGeneration.incrementAndGet()
+            applyRedundantPhysicalNetworks(identity, installed.effectiveOptions, owner, state)
+        }
     }
 
     private fun ensureRedundantCoordinator(
@@ -2008,30 +2254,47 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         ready: Boolean,
     ) {
         restoreHandler.post {
-            if (!serviceCallbackGate.isOpen() || serviceDestroyed || redundantStartBlocked() ||
-                redundantOwnerForOperation(operationId) !== owner
-            ) return@post
-            val transaction = (recoveryStore.read() as? RecoveryStoreResult.Success)
-                ?.value?.redundantTransaction ?: return@post
-            if (transaction.startOperationId != operationId || !transaction.desiredActive ||
-                transaction.retry.stopState != RedundantStopState.NONE
-            ) return@post
-            if (ready && owner.isRunning()) {
-                QuickTunnelController.updateState(applicationContext, SessionState.RUNNING,
-                    desiredActive = null, changed = true)
-                runCatching {
-                    AutomaticDiagnostics.onTunnelStarted(
-                        applicationContext,
-                        transaction.localActiveLeaseId,
-                        "amneziawg_3",
-                        ownerSessionId = transaction.sessionId,
-                        deviceId = transaction.template.deviceId,
-                    )
-                }.onFailure { TunnelLog.warning("diagnostics.session_start_failed") }
-            } else if (!ready && !owner.isRunning()) {
-                // A failed first handshake must not leave a tile stuck at STARTING.
+            if (redundantOwnerForOperation(operationId) !== owner) return@post
+            deferredRedundantReadiness = DeferredRedundantReadiness(operationId, owner, ready)
+            flushRedundantRecoveryReadiness()
+        }
+    }
+
+    private fun flushRedundantRecoveryReadiness() {
+        val (operationId, owner, ready) = deferredRedundantReadiness ?: return
+        if (!serviceCallbackGate.isOpen() || serviceDestroyed || redundantOwnerForOperation(operationId) !== owner) {
+            deferredRedundantReadiness = null
+            return
+        }
+        if (redundantStartBlocked()) return
+        val recovery = recoveryStore.read()
+        if (recovery is RecoveryStoreResult.Failure) {
+            if (!ready && !owner.isRunning()) {
+                deferredRedundantReadiness = null
                 beginFailClosedRedundantStop(operationId, owner)
             }
+            return
+        }
+        deferredRedundantReadiness = null
+        val transaction = (recovery as RecoveryStoreResult.Success).value.redundantTransaction ?: return
+        if (transaction.startOperationId != operationId || !transaction.desiredActive ||
+            transaction.retry.stopState != RedundantStopState.NONE
+        ) return
+        if (ready && owner.isRunning()) {
+            QuickTunnelController.updateState(applicationContext, SessionState.RUNNING,
+                desiredActive = null, changed = true)
+            runCatching {
+                AutomaticDiagnostics.onTunnelStarted(
+                    applicationContext,
+                    transaction.localActiveLeaseId,
+                    "amneziawg_3",
+                    ownerSessionId = transaction.sessionId,
+                    deviceId = transaction.template.deviceId,
+                )
+            }.onFailure { TunnelLog.warning("diagnostics.session_start_failed") }
+        } else if (!ready && !owner.isRunning()) {
+            // A failed first handshake must not leave a tile stuck at STARTING.
+            beginFailClosedRedundantStop(operationId, owner)
         }
     }
 
@@ -2046,6 +2309,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         owner: RedundantVpnProcessOwner?,
         allowRestart: Boolean = false,
         retainActivePeer: Boolean = false,
+        restartingSession: AndroidRedundantTransaction? = null,
+        startFailureReply: (() -> Unit)? = null,
     ): Boolean {
         val existing = pendingRedundantStop
         if (existing != null && existing.startOperationId != startOperationId) {
@@ -2062,6 +2327,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 existing.localClosed
             },
             allowRestart = existing.allowRestart && allowRestart,
+            startFailureReply = existing.startFailureReply ?: startFailureReply,
         ) ?: PendingRedundantStop(
                 startOperationId = startOperationId,
                 tombstone = null,
@@ -2069,6 +2335,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 serviceGeneration = serviceGeneration,
                 localClosed = owner == null,
                 allowRestart = allowRestart,
+                startFailureReply = startFailureReply,
         )
         pendingRedundantStop = pending
         invalidateConnectionIntentStarts()
@@ -2113,6 +2380,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 }
             }
         }
+        if (!durablePending.allowRestart && (durableStopFence || effectiveTombstone?.allowRestart == false)) {
+            publishRedundantStartFailureAfterStop(durablePending)
+        }
         if (owner == null && durablePending.tombstone != null) {
             redundantStartOperation.completeCancelled(startOperationId)
         }
@@ -2142,6 +2412,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 val locallyStopped = runCatching(owner::closeDataplaneForStop).getOrDefault(false)
                 if (!locallyStopped) {
                     TunnelLog.warning("redundant.local_stop_failed")
+                } else if (restartingSession != null &&
+                    pendingRedundantStop?.startOperationId == startOperationId
+                ) {
+                    runCatching { markRedundantDataplaneStopped(restartingSession) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
                 }
                 restoreHandler.post {
                     if (locallyStopped &&
@@ -2168,6 +2443,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun schedulePendingRedundantStopRetry() {
         redundantStopRetry.schedule()
+    }
+
+    private fun publishRedundantStartFailureAfterStop(pending: PendingRedundantStop) {
+        val reply = pending.startFailureReply ?: return
+        pendingRedundantStop = pending.copy(startFailureReply = null)
+        redundantStartOperation.completeFailure(pending.startOperationId, reply)
     }
 
     private fun retryPendingRedundantStop() {
@@ -2229,6 +2510,16 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 is RecoveryStoreResult.Failure -> {
                     restoreHandler.post { schedulePendingRedundantStopRetry() }
                     return@executeRedundantCleanup
+                }
+            }
+            if (pending.startFailureReply != null && !tombstone.allowRestart) {
+                // The restart barrier is durable now; a panel Stop may take much longer.
+                restoreHandler.post {
+                    val current = pendingRedundantStop?.takeIf {
+                        it.startOperationId == pending.startOperationId &&
+                            it.serviceGeneration == pending.serviceGeneration
+                    } ?: return@post
+                    publishRedundantStartFailureAfterStop(current.copy(tombstone = tombstone))
                 }
             }
             val recovery = recoveryStore.read()
@@ -2338,7 +2629,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         ) {
             return
         }
-        pendingRedundantStop = current.copy(tombstone = attempt.tombstone)
+        val durablePending = current.copy(tombstone = attempt.tombstone)
+        pendingRedundantStop = durablePending
+        if (!durablePending.allowRestart && (attempt.result.fenced || !attempt.tombstone.allowRestart)) {
+            publishRedundantStartFailureAfterStop(durablePending)
+        }
         if (shouldCompleteRedundantCancellation(
                 tombstonePersisted = true,
                 localClosed = current.localClosed,
@@ -2479,13 +2774,19 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     transaction?.startOperationId == startOperationId &&
                     !transaction.desiredActive && transaction.stopOperationId != null
                 ) {
-                    AutomaticDiagnostics.onRedundantDataplaneStopped(
-                        applicationContext, transaction.sessionId, transaction.template.deviceId,
-                    )
+                    markRedundantDataplaneStopped(transaction)
                 }
             }.onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
         }
         redundantStopWaiters.remove(startOperationId)?.forEach { waiter -> waiter(result) }
+    }
+
+    private fun markRedundantDataplaneStopped(transaction: AndroidRedundantTransaction) {
+        if (!serviceDestroyed && serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get()) {
+            AutomaticDiagnostics.onRedundantDataplaneStopped(
+                applicationContext, transaction.sessionId, transaction.template.deviceId,
+            )
+        }
     }
 
     private fun executeRedundantCleanup(
@@ -3029,6 +3330,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     PhysicalNetworks(applicationContext).snapshotState().available
                 }.getOrDefault(false)
                 val rebound = owner?.onUnderlyingNetworkChanged(available = available) == true
+                if (current != null && (!available || !rebound)) physicalNetworkRebindGeneration.incrementAndGet()
                 restoreHandler.post {
                     if (rebound) receiver.sendOperation(SessionState.RUNNING, 0)
                     else receiver.sendError("redundant_rebind_failed")
@@ -4440,6 +4742,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 )
             },
             resumeDurableWork = {
+                flushRedundantRecoveryReadiness()
+                dispatchRedundantPhysicalNetworkUpdate()
                 redundantTotalLossLifecycle.onCleanupAcknowledged(serviceGeneration)
             },
         )
@@ -5451,18 +5755,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             if (durable != null && (durable.startOperationId != installed.startOperationId ||
                 durable.sessionId != sessionId || durable.template.deviceId != deviceId)
             ) return false
-            // Closing the dataplane and publishing its normal end run on different
-            // threads. Do not let JobService label that interval as a crash. The
-            // pending completion also covers cleanup that already removed recovery.
-            if (service.pendingRedundantStop?.let {
-                    it.startOperationId == installed.startOperationId &&
-                        it.serviceGeneration == service.serviceGeneration
-                } == true || (durable?.desiredActive == false && durable.stopOperationId != null)
+            // A cleanup barrier can block work without establishing that the
+            // dataplane stopped. Wait for the matching closure to be recorded.
+            if (service.redundantStartBlocked() ||
+                (durable?.desiredActive == false && durable.stopOperationId != null)
             ) return null
-            val transaction = service.activeRedundantTransactionForCurrentWork(
-                recovery, installed.startOperationId,
-            ) ?: return false
-            return transaction.sessionId == sessionId && transaction.template.deviceId == deviceId &&
+            return durable?.desiredActive == true && durable.retry.stopState == RedundantStopState.NONE &&
                 installed.owner.isRunning()
         }
 

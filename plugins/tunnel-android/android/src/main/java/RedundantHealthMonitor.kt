@@ -23,7 +23,13 @@ internal data class SlotObservation(
     val consecutiveProbeSuccesses: Int = 0,
     val stableSinceMs: Long? = null,
     val standbyProbeState: StandbyProbeState = StandbyProbeState.NOT_REQUIRED,
-)
+    val successfulProbeValidThroughElapsedMs: Long? = null,
+    val standbyCheckDeadlineElapsedMs: Long? = null,
+    val rebindFailureRetryable: Boolean = false,
+) {
+    fun hasFreshSuccessfulProbe(nowMs: Long): Boolean =
+        successfulProbeValidThroughElapsedMs?.let { nowMs <= it } == true
+}
 
 internal data class FailoverDecision(
     val switchTo: Int?,
@@ -45,7 +51,8 @@ internal class RedundantHealthMonitor(
     // Readiness is established by our handshake and tunneled probes below.
     initialNetworkAvailable: Boolean = true,
 ) {
-    private var networkAvailable = initialNetworkAvailable
+    var networkAvailable = initialNetworkAvailable
+        private set
     private var suppressFailoverUntilMs = Long.MIN_VALUE
     private var sessionStalledEmitted = false
 

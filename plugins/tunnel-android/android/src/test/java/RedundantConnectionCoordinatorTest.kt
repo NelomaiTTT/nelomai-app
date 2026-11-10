@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -120,7 +121,8 @@ class RedundantConnectionCoordinatorTest {
                 assertTrue(owner.submit<Boolean> {
                     coordinator.onHealthObservations(listOf(waiting,
                         healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
-                            consecutiveProbeSuccesses = 3, stableSinceMs = 0)))
+                            consecutiveProbeSuccesses = 3, stableSinceMs = 0,
+                            successfulProbeValidThroughElapsedMs = now)))
                 }.get(1, TimeUnit.SECONDS))
                 assertEquals(listOf(true), readiness)
                 assertEquals(if (prepared) 0 else 1, primaryStarts)
@@ -240,7 +242,8 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(2, native.rebindAttempts.size)
         assertEquals(0, ready)
         assertTrue(coordinator.onHealthObservations(listOf(silent.copy(
-            handshakeFresh = true, probeFailed = false, consecutiveProbeSuccesses = 1))))
+            handshakeFresh = true, probeFailed = false, consecutiveProbeSuccesses = 1,
+            successfulProbeValidThroughElapsedMs = now))))
         assertEquals(1, ready)
         assertTrue(coordinator.isRunning())
     }
@@ -320,7 +323,8 @@ class RedundantConnectionCoordinatorTest {
         now = 20_000
         assertTrue(coordinator.onHealthObservations(listOf(primary,
             healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
-                consecutiveProbeSuccesses = 3, stableSinceMs = 0))))
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0,
+                successfulProbeValidThroughElapsedMs = now))))
         assertEquals(listOf(true), readiness)
         assertEquals(listOf("lease-a", "candidate"), native.activated)
         assertEquals(0, panel.recoverCalls)
@@ -488,7 +492,8 @@ class RedundantConnectionCoordinatorTest {
         now = 20_000
         assertTrue(coordinator.onHealthObservations(listOf(primary,
             healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
-                consecutiveProbeSuccesses = 3, stableSinceMs = 1_000))))
+                consecutiveProbeSuccesses = 3, stableSinceMs = 1_000,
+                successfulProbeValidThroughElapsedMs = now))))
         assertEquals(1, panel.commitCalls)
         assertEquals("candidate", coordinator.status()?.slotBLeaseId)
         assertEquals("candidate", coordinator.status()?.localActiveLeaseId)
@@ -1207,6 +1212,7 @@ class RedundantConnectionCoordinatorTest {
                     handshakeFresh = true,
                     consecutiveProbeSuccesses = 3,
                     stableSinceMs = 0,
+                    successfulProbeValidThroughElapsedMs = 20_000L,
                 ),
             )))
 
@@ -1339,6 +1345,7 @@ class RedundantConnectionCoordinatorTest {
                 handshakeFresh = true,
                 consecutiveProbeSuccesses = 3,
                 stableSinceMs = 0,
+                successfulProbeValidThroughElapsedMs = elapsedMs,
             ),
         )))
 
@@ -1389,6 +1396,7 @@ class RedundantConnectionCoordinatorTest {
                 handshakeFresh = true,
                 consecutiveProbeSuccesses = 3,
                 stableSinceMs = 5_000L,
+                successfulProbeValidThroughElapsedMs = elapsedMs,
             ),
         )))
         assertTrue(coordinator.isRunning())
@@ -2335,6 +2343,184 @@ class RedundantConnectionCoordinatorTest {
         assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
         assertEquals(listOf("lease-b", "lease-b"), native.activationAttempts)
         assertEquals(null, coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun processRecoveryOfStartupJournalWaitsForFreshProofBeforeChoosingSlot() {
+        for (provenLease in listOf("lease-a", "lease-b", null)) {
+            var now = 45_000L
+            val pending = pendingNativeSwitch().let {
+                it.copy(retry = it.retry.copy(pendingNativeSwitchReason = "primary_ready"))
+            }
+            val panel = FakePanel(recoveredSession = session("lease-a", 2, 1),
+                recoveryHealthProbes = buildMap {
+                    if (provenLease == "lease-a") put("lease-a", probe())
+                    put("lease-b", probe())
+                })
+            val native = FakeNative()
+            val diagnostics = mutableListOf<RedundantDiagnosticEvent>()
+            val readiness = mutableListOf<Boolean>()
+            val coordinator = testRedundantCoordinator(store(pending), panel, native,
+                monotonicMs = { now }, onDiagnosticEvent = diagnostics::add,
+                onRecoveryReadiness = readiness::add)
+
+            assertTrue(coordinator.recover())
+            assertEquals(listOf("lease-a", "lease-b"), native.started)
+            assertEquals(listOf("lease-a"), native.activationAttempts)
+            assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+            assertEquals("lease-b", coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            assertTrue(diagnostics.isEmpty())
+            assertTrue(readiness.isEmpty())
+            assertEquals(0, panel.roleCalls)
+
+            val primary = healthSlot(0, active = true, handshakeFresh = true, consecutiveProbeSuccesses = 1,
+                successfulProbeValidThroughElapsedMs = null)
+            val standby = healthSlot(1, health = BackendHealth.READY).copy(
+                standbyProbeState = StandbyProbeState.SUCCEEDED,
+                successfulProbeValidThroughElapsedMs = now,
+            )
+            now += 1
+            assertTrue(coordinator.onHealthObservations(listOf(primary, standby)))
+            assertEquals(listOf("lease-a"), native.activationAttempts)
+            assertTrue(readiness.isEmpty())
+            assertTrue(diagnostics.isEmpty())
+
+            when (provenLease) {
+                "lease-a" -> {
+                    assertTrue(coordinator.onHealthObservations(listOf(
+                        primary.copy(successfulProbeValidThroughElapsedMs = now), standby)))
+                    assertEquals(listOf("lease-a"), native.activationAttempts)
+                    assertTrue(diagnostics.isEmpty())
+                    assertNull(coordinator.status()?.retry?.acquireReplaceLeaseId)
+                }
+                "lease-b" -> {
+                    assertTrue(coordinator.onHealthObservations(listOf(
+                        primary, standby.copy(successfulProbeValidThroughElapsedMs = now))))
+                    assertEquals(listOf("lease-a", "lease-b"), native.activationAttempts)
+                    assertEquals(listOf(RedundantDiagnosticEvent.FAILOVER), diagnostics)
+                    assertEquals("lease-a", coordinator.status()?.retry?.acquireReplaceLeaseId)
+                }
+                else -> {
+                    now = 75_000L
+                    assertFalse(coordinator.tick())
+                    assertEquals(listOf("lease-a"), native.activationAttempts)
+                    assertEquals(listOf(false), readiness)
+                    assertTrue(diagnostics.isEmpty())
+                    continue
+                }
+            }
+            assertEquals(listOf(true), readiness)
+            assertEquals(provenLease, coordinator.status()?.localActiveLeaseId)
+            assertNull(coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        }
+    }
+
+    @Test
+    fun exhaustedStartupJournalWaitsForProvenSourceWithoutReplacingReserve() {
+        for (failAccountingWrite in listOf(false, true)) {
+            var now = 0L
+            val pending = pendingNativeSwitch().let {
+                it.copy(retry = it.retry.copy(pendingNativeSwitchReason = "primary_ready",
+                    pendingNativeSwitchAttempt = 2))
+            }
+            val panel = FakePanel(recoveredSession = session("lease-a", 2, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            val native = FakeNative(activateResults = ArrayDeque(listOf(true, false)))
+            val readiness = mutableListOf<Boolean>()
+            val record = CoordinatorRecordBackend()
+            val coordinator = testRedundantCoordinator(store(pending, record), panel, native,
+                monotonicMs = { now }, onRecoveryReadiness = readiness::add)
+            assertTrue(coordinator.recover())
+            now = 20_000
+            val standby = healthSlot(1, health = BackendHealth.READY).copy(
+                standbyProbeState = StandbyProbeState.SUCCEEDED,
+                successfulProbeValidThroughElapsedMs = 22_000,
+            )
+            val unproven = listOf(healthSlot(0, active = true, hardFailure = true), standby)
+            if (failAccountingWrite) record.failOnWriteNumber = record.writeCount + 1
+            assertFalse(coordinator.onHealthObservations(unproven))
+            val exhausted = requireNotNull(coordinator.status())
+            assertNull("Exhaustion must not replace a proven reserve", exhausted.retry.acquireReplaceLeaseId)
+            assertEquals("lease-b", exhausted.retry.pendingNativeActiveLeaseId)
+            assertEquals(if (failAccountingWrite) 2 else 3, exhausted.retry.pendingNativeSwitchAttempt)
+            assertTrue(coordinator.onHealthObservations(unproven))
+            assertEquals(listOf("lease-a", "lease-b"), native.activationAttempts)
+            assertTrue(readiness.isEmpty())
+            assertTrue(coordinator.onHealthObservations(listOf(
+                healthSlot(0, active = true, handshakeFresh = true, consecutiveProbeSuccesses = 1,
+                    successfulProbeValidThroughElapsedMs = 22_000), standby)))
+            assertEquals(listOf(true), readiness)
+            assertEquals(listOf("lease-a", "lease-b"), native.activationAttempts)
+            assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+            assertNull(coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            assertNull(coordinator.status()?.retry?.acquireReplaceLeaseId)
+        }
+    }
+
+    @Test
+    fun journaledStartupRetryCannotBeginOnTheDeadline() {
+        for (crossesDeadline in listOf(false, true)) {
+            var testingBoundary = false
+            var clockReads = 0
+            val pending = pendingNativeSwitch().let {
+                it.copy(retry = it.retry.copy(pendingNativeSwitchReason = "primary_ready"))
+            }
+            val panel = FakePanel(recoveredSession = session("lease-a", 2, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            val native = FakeNative()
+            val coordinator = testRedundantCoordinator(store(pending), panel, native,
+                monotonicMs = {
+                    if (!testingBoundary) 0L
+                    else if (crossesDeadline && ++clockReads >= 2) 30_000L
+                    else 29_999L
+                })
+            assertTrue(coordinator.recover())
+            testingBoundary = true
+            assertEquals(!crossesDeadline, coordinator.onHealthObservations(listOf(
+                healthSlot(1, health = BackendHealth.READY,
+                    successfulProbeValidThroughElapsedMs = 30_001L),
+            )))
+            assertEquals(if (crossesDeadline) listOf("lease-a") else listOf("lease-a", "lease-b"),
+                native.activationAttempts)
+            assertEquals(!crossesDeadline, coordinator.isRunning())
+        }
+    }
+
+    @Test
+    fun recoveredSourceProofMustStillBeValidAfterReadingJournalForCommit() {
+        for (afterRead in listOf(12_000L, 12_001L, 30_000L)) {
+            var now = 0L
+            val pending = pendingNativeSwitch().let {
+                it.copy(retry = it.retry.copy(pendingNativeSwitchReason = "primary_ready"))
+            }
+            val record = CoordinatorRecordBackend()
+            val panel = FakePanel(recoveredSession = session("lease-a", 2, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            val readiness = mutableListOf<Boolean>()
+            val coordinator = testRedundantCoordinator(store(pending, record), panel, FakeNative(),
+                monotonicMs = { now }, onRecoveryReadiness = readiness::add)
+            assertTrue(coordinator.recover())
+            now = 10_000
+            var reads = 0
+            record.beforeRead = {
+                if (++reads == 3) {
+                    record.beforeRead = {}
+                    now = afterRead
+                }
+            }
+            val primary = healthSlot(0, active = true, handshakeFresh = true, consecutiveProbeSuccesses = 1,
+                successfulProbeValidThroughElapsedMs = if (afterRead == 30_000L) 30_001L else 12_000L)
+            assertEquals(afterRead != 30_000L, coordinator.onHealthObservations(listOf(primary)))
+            assertEquals(afterRead, now)
+            val expectedReadiness = when (afterRead) {
+                12_000L -> listOf(true)
+                30_000L -> listOf(false)
+                else -> emptyList()
+            }
+            assertEquals(expectedReadiness, readiness)
+            assertEquals(if (afterRead == 12_000L) null else "lease-b",
+                coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        }
     }
 
     @Test
@@ -3323,7 +3509,8 @@ class RedundantConnectionCoordinatorTest {
 
             now += 1_000L
             assertTrue(coordinator.onHealthObservations(listOf(primary,
-                standby.copy(standbyProbeState = StandbyProbeState.SUCCEEDED))))
+                standby.copy(standbyProbeState = StandbyProbeState.SUCCEEDED,
+                    successfulProbeValidThroughElapsedMs = now))))
             assertEquals(listOf("lease-a", "lease-b"), native.activated)
             assertEquals(listOf(true), readiness)
                 assertEquals(if (recovering) 0 else 1, primaryStarts)
@@ -3407,7 +3594,8 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(coordinator.onHealthObservations(listOf(
             healthSlot(0, active = true, health = BackendHealth.UNHEALTHY, hardFailure = true),
             healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
-                consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0,
+                successfulProbeValidThroughElapsedMs = 20_000L),
         )))
 
         assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
@@ -3494,7 +3682,8 @@ class RedundantConnectionCoordinatorTest {
             assertFalse(coordinator.onHealthObservations(listOf(
                 healthSlot(0, active = true, hardFailure = true),
                 healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
-                    consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+                    consecutiveProbeSuccesses = 3, stableSinceMs = 0,
+                    successfulProbeValidThroughElapsedMs = 20_000L),
             )))
 
             assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
@@ -3834,6 +4023,7 @@ class RedundantConnectionCoordinatorTest {
         handshakeFresh: Boolean = false,
         consecutiveProbeSuccesses: Int = 0,
         stableSinceMs: Long? = null,
+        successfulProbeValidThroughElapsedMs: Long? = Long.MAX_VALUE.takeIf { consecutiveProbeSuccesses > 0 },
     ) = SlotObservation(
         index = index,
         active = active,
@@ -3846,6 +4036,7 @@ class RedundantConnectionCoordinatorTest {
         handshakeFresh = handshakeFresh,
         consecutiveProbeSuccesses = consecutiveProbeSuccesses,
         stableSinceMs = stableSinceMs,
+        successfulProbeValidThroughElapsedMs = successfulProbeValidThroughElapsedMs,
     )
 
     private fun probe() = BackgroundRedundantHealthProbe(
@@ -3859,9 +4050,11 @@ class RedundantConnectionCoordinatorTest {
 private class CoordinatorRecordBackend : EncryptedRecordBackend {
     var record: ByteArray? = null
     var failReads = false
+    var beforeRead: () -> Unit = {}
     var failOnWriteNumber: Int? = null
     var writeCount = 0
     override fun read(): ByteArray? {
+        beforeRead()
         if (failReads) throw IllegalStateException("read_failed")
         return record?.copyOf()
     }
@@ -3926,8 +4119,12 @@ private class FakeNative(
         rebindAttempts += leaseId
         if (it) rebound += leaseId
     }
-    override fun healthObservations(initialReadiness: Boolean,
-        committedStandbyLeaseId: String?, freshStart: Boolean): List<SlotObservation> {
+    override fun healthObservations(
+        initialReadiness: Boolean,
+        committedStandbyLeaseId: String?,
+        freshStart: Boolean,
+        startupStandbyRetryDeadlineMs: Long?,
+    ): List<SlotObservation> {
         if (initialReadiness) initialFreshStarts += freshStart
         if (healthSnapshotFailures > 0) {
             healthSnapshotFailures -= 1

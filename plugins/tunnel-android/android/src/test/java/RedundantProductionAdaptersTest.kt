@@ -359,6 +359,655 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun failedActivationCanRenewExpiredReserveProofBeforeStartupDeadline() {
+        val (fixture, resumeAt) = startupWithExpiredReserveCheck()
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        val probesBeforeResume = fixture.backend.probeLaunches.count { it.second == 1 }
+        fixture.tick(resumeAt)
+        assertEquals("The expired result cannot authorize activation", attemptsBeforeResume, fixture.backend.activeSlots.size)
+        for (now in (resumeAt + 100) until 30_000 step 100L) {
+            fixture.tick(now)
+            if (fixture.ready > 0) break
+        }
+        assertTrue(fixture.backend.probeLaunches.count { it.second == 1 } > probesBeforeResume)
+        assertEquals(1, fixture.ready)
+        assertEquals(0, fixture.failed)
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun activeButUncommittedReserveCannotReuseExpiredProof() {
+        val fixture = startupWithUncommittedReserve()
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.receiveFrozenAtMs = fixture.now
+        val probesBeforeResume = fixture.backend.probeLaunches.count { it.second == 1 }
+        fixture.tick(fixture.now + 8_100)
+        assertEquals(probesBeforeResume + 1, fixture.backend.probeLaunches.count { it.second == 1 })
+        assertEquals("The first fresh probe is pending; the old reserve verdict cannot publish readiness",
+            0, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+
+        fixture.dnsBlockedSlots = emptySet()
+        fixture.receiveFrozenAtMs = null
+        fixture.tick(fixture.now + 100)
+        assertEquals(1, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+        assertEquals(null, fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun coldHealthTickReconstructsStartupJournalBeforeRetryingActivation() {
+        val old = startupWithFailedReserveActivation()
+        val journal = requireNotNull(old.coordinator.status())
+        val fixture = StartupFixture(0, ::prepared, replay = journal, initialElapsed = old.now,
+            recoverOnCreation = false)
+        assertTrue(fixture.backend.activeSlots.isEmpty())
+        fixture.healthySlots = setOf(1)
+
+        fixture.tick(old.now)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+        assertEquals(journal.retry.pendingNativeSwitchAttempt,
+            fixture.coordinator.status()?.retry?.pendingNativeSwitchAttempt)
+        assertFalse(fixture.coordinator.isRunning())
+
+        for (time in (old.now + 100) until (old.now + 30_000) step 100L) {
+            fixture.tick(time)
+            if (fixture.coordinator.isRunning()) break
+        }
+        assertTrue(fixture.coordinator.isRunning())
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun recoveredStartupJournalRetriesColdSocketsWithinReadinessDeadline() {
+        val old = startupWithFailedReserveActivation()
+        val journal = requireNotNull(old.coordinator.status())
+        assertEquals("primary_ready", journal.retry.pendingNativeSwitchReason)
+        for (workingSlot in listOf(0, 1)) {
+            for ((failedFirstRebind, handshakeOnOldSocket) in listOf(false to false, true to false, true to true)) {
+                val fixture = StartupFixture(0, ::prepared, replay = journal, initialElapsed = old.now)
+                fixture.healthySlots = emptySet()
+                if (failedFirstRebind) fixture.backend.rebindFailures += workingSlot
+                assertEquals(listOf(0), fixture.backend.activeSlots)
+                val requiredRebinds = if (failedFirstRebind) 2 else 1
+                for (time in old.now until (old.now + 30_000) step 1_000L) {
+                    val rebinds = fixture.backend.reboundSlots.count { it == workingSlot }
+                    if (rebinds == 1) fixture.backend.rebindFailures -= workingSlot
+                    if (rebinds >= requiredRebinds || (handshakeOnOldSocket && rebinds == 1)) {
+                        fixture.healthySlots = setOf(workingSlot)
+                    }
+                    fixture.tick(time)
+                    if (fixture.coordinator.isRunning()) break
+                }
+                assertEquals("Rebind attempts for slot $workingSlot (old handshake=$handshakeOnOldSocket)",
+                    requiredRebinds, fixture.backend.reboundSlots.count { it == workingSlot })
+                assertTrue("Rebind should restore slot $workingSlot (failedFirstRebind=$failedFirstRebind)",
+                    fixture.coordinator.isRunning())
+                assertEquals(if (workingSlot == 1) listOf(0, 1) else listOf(0), fixture.backend.activeSlots)
+                assertEquals(if (workingSlot == 0) "lease-a" else "lease-b",
+                    fixture.coordinator.status()?.localActiveLeaseId)
+                assertEquals(null, fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            }
+        }
+    }
+
+    @Test
+    fun periodicRebindUnblocksJournalTargetAfterNetworkRebindFailsWithoutProgress() {
+        val old = startupWithFailedReserveActivation()
+        val journal = requireNotNull(old.coordinator.status())
+        val fixture = StartupFixture(0, ::prepared, replay = journal, initialElapsed = old.now)
+        fixture.healthySlots = emptySet()
+        fixture.backend.rebindFailures += 1
+        assertFalse(fixture.coordinator.onUnderlyingNetworkChanged(true))
+        assertEquals(listOf(0, 1), fixture.backend.reboundSlots)
+        fixture.backend.rebindFailures -= 1
+
+        for (time in old.now until (old.now + 30_000) step 1_000L) {
+            if (fixture.backend.reboundSlots.count { it == 1 } == 2) fixture.healthySlots = setOf(1)
+            fixture.tick(time)
+            if (fixture.coordinator.isRunning()) break
+        }
+        assertEquals(2, fixture.backend.reboundSlots.count { it == 1 })
+        assertTrue("A successful timed rebind must unblock fresh reserve proof", fixture.coordinator.isRunning())
+        assertEquals(listOf(0, 1), fixture.backend.activeSlots)
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+        assertEquals(null, fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun networkChangeChecksStartupDeadlineBeforeEachSocketRebind() {
+        for (withProgress in listOf(false, true)) {
+            for (startsBeforeDeadline in listOf(false, true)) {
+                val fixture = StartupFixture(0, ::prepared)
+                fixture.now = if (startsBeforeDeadline) 29_999 else 30_000
+                fixture.backend.beforeRebind = { fixture.now = 30_000 }
+                val progress = RedundantNetworkRebindProgress().takeIf { withProgress }
+                assertFalse(fixture.coordinator.onUnderlyingNetworkChanged(true, progress) { true })
+                assertEquals(if (startsBeforeDeadline) listOf(0) else emptyList(),
+                    fixture.backend.reboundSlots)
+                if (withProgress) {
+                    assertEquals(if (startsBeforeDeadline) setOf("lease-a") else emptySet(),
+                        progress?.reboundLeases)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun primarySkippedByNetworkRebindDeadlineCannotReuseOldProof() {
+        for (afterRebind in listOf(30_000L, 31_000L)) {
+            val fixture = StartupFixture(1, ::prepared)
+            fixture.healthySlots = setOf(1)
+            fixture.now = 24_000
+            assertTrue(fixture.coordinator.onUnderlyingNetworkChanged(true))
+            fixture.tick(24_000)
+            fixture.tick(25_000)
+            assertTrue(fixture.lastPrimaryProbeSuccesses > 0)
+            assertEquals(0, fixture.ready)
+
+            fixture.now = 26_000
+            fixture.backend.beforeRebind = { fixture.now = afterRebind }
+            assertFalse(fixture.coordinator.onUnderlyingNetworkChanged(true))
+            assertEquals(listOf(0, 1, 0), fixture.backend.reboundSlots)
+            fixture.tick(afterRebind)
+            assertEquals(0, fixture.ready)
+            assertEquals(1, fixture.failed)
+            assertEquals(listOf(1), fixture.backend.activeSlots)
+        }
+    }
+
+    @Test
+    fun networkChangeBeforeFinalizingStartupSwitchKeepsJournalPending() {
+        for (replay in listOf(false, true)) {
+            val old = startupWithFailedReserveActivation()
+            val journal = requireNotNull(old.coordinator.status()).takeIf { replay }
+            val fixture = StartupFixture(0, ::prepared, replay = journal, initialElapsed = old.now)
+            fixture.healthySlots = setOf(1)
+            fixture.beforeJournalRead = {
+                if (fixture.backend.activeSlots.last() == 1) {
+                    fixture.beforeJournalRead = {}
+                    fixture.startupNetworkUpdatePending = true
+                }
+            }
+            for (time in old.now until (old.now + 20_000) step 100L) {
+                fixture.tick(time)
+                if (fixture.startupNetworkUpdatePending) break
+            }
+            assertTrue(fixture.startupNetworkUpdatePending)
+            assertEquals(listOf(0, 1), fixture.backend.activeSlots)
+            assertFalse(fixture.coordinator.isRunning())
+            val pending = requireNotNull(fixture.coordinator.status())
+            assertEquals("lease-a", pending.localActiveLeaseId)
+            assertEquals("lease-b", pending.retry.pendingNativeActiveLeaseId)
+            assertEquals(null, pending.retry.acquireReplaceLeaseId)
+
+            assertTrue(fixture.coordinator.onUnderlyingNetworkChanged(true))
+            fixture.startupNetworkUpdatePending = false
+            val resumedAt = fixture.now + 100
+            for (time in resumedAt until (old.now + 30_000) step 100L) {
+                fixture.tick(time)
+                if (fixture.coordinator.isRunning()) break
+            }
+            assertTrue(fixture.coordinator.isRunning())
+            assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+        }
+    }
+
+    @Test
+    fun startupSwitchCannotAdmitFinalCommitAfterProbeOrDeadlineExpires() {
+        val activationTime = startupWithFailedReserveActivation().now
+        for (delayNative in listOf(false, true)) {
+            val fixture = StartupFixture(0, ::prepared)
+            fixture.healthySlots = setOf(1)
+            for (time in 0L until activationTime step 100L) fixture.tick(time)
+            if (delayNative) {
+                fixture.backend.beforeSwitchActive = { slot ->
+                    if (slot == 1) fixture.now = 30_001
+                }
+            } else {
+                fixture.beforeJournalRead = {
+                    if (fixture.backend.activeSlots.last() == 1) {
+                        fixture.beforeJournalRead = {}
+                        val proof = requireNotNull(fixture.lastStandbyObservation)
+                        fixture.now = requireNotNull(proof.successfulProbeValidThroughElapsedMs) + 1
+                    }
+                }
+            }
+            fixture.tick(activationTime)
+            assertEquals(listOf(0, 1), fixture.backend.activeSlots)
+            assertFalse(fixture.coordinator.isRunning())
+            assertEquals(if (delayNative) 1 else 0, fixture.failed)
+            assertEquals("lease-a", fixture.coordinator.status()?.localActiveLeaseId)
+            assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        }
+    }
+
+    @Test
+    fun firstPrimaryProofCannotExpireDuringReadinessCommit() {
+        val fixture = StartupFixture(0, ::prepared)
+        fixture.tick(0)
+        var reads = 0
+        fixture.beforeJournalRead = {
+            if (++reads == 3) {
+                fixture.beforeJournalRead = {}
+                fixture.now = 3_001
+            }
+        }
+        fixture.tick(1_000)
+        assertEquals(3_001L, fixture.now)
+        assertFalse(fixture.coordinator.isRunning())
+        assertEquals(0, fixture.failed)
+        fixture.tick(4_000)
+        fixture.tick(5_000)
+        assertTrue(fixture.coordinator.isRunning())
+    }
+
+    @Test
+    fun firstReserveActivationRequiresFreshProofAcrossJournalIo() {
+        val activationTime = startupWithFailedReserveActivation().now
+        for (readToDelay in listOf(2, 4, null)) {
+            for (pastExpiry in listOf(false, true)) {
+                val fixture = StartupFixture(0, ::prepared)
+                fixture.healthySlots = setOf(1)
+                for (time in 0L until activationTime step 100L) fixture.tick(time)
+                val delayJournal = {
+                    val standby = requireNotNull(fixture.lastStandbyObservation)
+                    assertTrue(standby.hasFreshSuccessfulProbe(fixture.now))
+                    fixture.now = requireNotNull(standby.successfulProbeValidThroughElapsedMs) +
+                        if (pastExpiry) 1 else 0
+                    assertTrue(fixture.now < 30_000)
+                    assertTrue(standby.standbyCheckDeadlineElapsedMs?.let { fixture.now < it } != false)
+                }
+                if (readToDelay == null) {
+                    fixture.beforeJournalWrite = {
+                        fixture.beforeJournalWrite = {}
+                        delayJournal()
+                    }
+                } else {
+                    var journalReads = 0
+                    fixture.beforeJournalRead = {
+                        if (++journalReads == readToDelay) {
+                            fixture.beforeJournalRead = {}
+                            delayJournal()
+                        }
+                    }
+                }
+                fixture.tick(activationTime)
+                assertTrue(fixture.now > activationTime)
+                if (pastExpiry) {
+                    assertEquals("Expired proof must prevent native activation (readToDelay=$readToDelay)",
+                        listOf(0), fixture.backend.activeSlots)
+                    assertEquals(0, fixture.ready)
+                    val retry = requireNotNull(fixture.coordinator.status()?.retry)
+                    assertEquals(if (readToDelay == null) "lease-b" else null, retry.pendingNativeActiveLeaseId)
+                    assertEquals(0, retry.pendingNativeSwitchAttempt)
+                    for (time in (fixture.now + 100) until 30_000 step 100L) {
+                        fixture.tick(time)
+                        if (fixture.ready > 0) break
+                    }
+                }
+                assertEquals(listOf(0, 1), fixture.backend.activeSlots)
+                assertEquals(1, fixture.ready)
+                assertEquals(0, fixture.failed)
+                assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+            }
+        }
+    }
+
+    @Test
+    fun firstReserveActivationChecksStartupDeadlineAfterJournalWrite() {
+        for (pastDeadline in listOf(false, true)) {
+            val fixture = StartupFixture(0, ::prepared)
+            fixture.now = 29_900
+            val afterWrite = if (pastDeadline) 30_001L else 30_000L
+            fixture.beforeJournalWrite = {
+                fixture.beforeJournalWrite = {}
+                fixture.now = afterWrite
+            }
+            fixture.coordinator.onHealthObservations(listOf(
+                SlotObservation(0, active = true, health = BackendHealth.UNHEALTHY, hardFailure = true),
+                SlotObservation(1, active = false, health = BackendHealth.READY,
+                    standbyProbeState = StandbyProbeState.SUCCEEDED,
+                    successfulProbeValidThroughElapsedMs = 30_500,
+                    standbyCheckDeadlineElapsedMs = 31_000),
+            ))
+            assertEquals(afterWrite, fixture.now)
+            assertEquals(if (pastDeadline) listOf(0) else listOf(0, 1), fixture.backend.activeSlots)
+            assertEquals(if (pastDeadline) 0 else 1, fixture.ready)
+            assertEquals(if (pastDeadline) 1 else 0, fixture.failed)
+        }
+    }
+
+    @Test
+    fun pendingSwitchChecksProbeExpiryAfterJournalRead() {
+        for (pastExpiry in listOf(false, true)) {
+            val fixture = startupWithUncommittedReserve()
+            val activationAttempts = fixture.backend.activeSlots.size
+            val probeStarted = fixture.backend.probeLaunches.last { it.second == 1 }.first
+            val afterRead = probeStarted + 3_000 + if (pastExpiry) 1 else 0
+            val sampleTime = fixture.now + 100
+            assertTrue(sampleTime < afterRead)
+            assertTrue(afterRead < 30_000)
+
+            var journalReads = 0
+            fixture.beforeJournalRead = {
+                if (++journalReads == 2) {
+                    fixture.beforeJournalRead = {}
+                    fixture.dnsBlockedSlots = setOf(1)
+                    fixture.receiveFrozenAtMs = fixture.now
+                    fixture.now = afterRead
+                }
+            }
+            fixture.tick(sampleTime)
+            assertEquals(afterRead, fixture.now)
+            if (pastExpiry) {
+                assertEquals("A delayed journal read cannot authorize startup with an expired probe",
+                    0, fixture.ready)
+                assertEquals(activationAttempts, fixture.backend.activeSlots.size)
+                assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            } else {
+                assertEquals(1, fixture.ready)
+                assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+                assertEquals(null, fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            }
+        }
+    }
+
+    @Test
+    fun pendingSwitchChecksStandbyWindowAfterJournalRead() {
+        for (readCrossesDeadline in listOf(false, true)) {
+            val fixture = startupWithFailedReserveActivation()
+            while (fixture.standbyCheckStartedAt() == null && fixture.now < 12_000) {
+                fixture.failNextWrite()
+                fixture.tick(fixture.now + 100)
+            }
+            val checkStartedAt = requireNotNull(fixture.standbyCheckStartedAt())
+            val checkDeadline = checkStartedAt + 8_000
+            fixture.tick(checkDeadline - 1_500)
+            assertEquals(checkStartedAt, fixture.standbyCheckStartedAt())
+            assertEquals(0, fixture.ready)
+            assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            fixture.clearWriteFailure()
+            fixture.backend.failedActivationSlot = null
+            val attempts = fixture.backend.activeSlots.size
+
+            val afterRead = checkDeadline - if (readCrossesDeadline) 0 else 1
+            var journalReads = 0
+            fixture.beforeJournalRead = {
+                if (++journalReads == 2) {
+                    fixture.beforeJournalRead = {}
+                    fixture.now = afterRead
+                }
+            }
+            fixture.tick(checkDeadline - 1)
+            assertEquals(afterRead, fixture.now)
+            val standby = requireNotNull(fixture.lastStandbyObservation)
+            assertEquals(StandbyProbeState.SUCCEEDED, standby.standbyProbeState)
+            assertTrue(standby.hasFreshSuccessfulProbe(checkDeadline))
+            if (readCrossesDeadline) {
+                assertEquals("An expired check window cannot authorize activation",
+                    attempts, fixture.backend.activeSlots.size)
+                assertEquals(0, fixture.ready)
+                assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+            } else {
+                assertEquals(attempts + 1, fixture.backend.activeSlots.size)
+                assertEquals(1, fixture.ready)
+                assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+            }
+        }
+    }
+
+    @Test
+    fun rejectedStandbyCheckCannotBecomeActiveProofWithoutAnotherProbe() {
+        val fixture = startupWithFailedReserveActivation()
+        while (fixture.standbyCheckStartedAt() == null && fixture.now < 12_000) {
+            fixture.failNextWrite()
+            fixture.tick(fixture.now + 100)
+        }
+        val deadline = requireNotNull(fixture.standbyCheckStartedAt()) + 8_000
+        fixture.tick(deadline - 1_500)
+        fixture.clearWriteFailure()
+        fixture.backend.failedActivationSlot = null
+        fixture.backend.beforeSwitchActive = { slot -> if (slot == 1) fixture.now = deadline }
+        val attempts = fixture.backend.activeSlots.size
+        fixture.tick(deadline - 1)
+        assertEquals(attempts + 1, fixture.backend.activeSlots.size)
+        assertTrue(requireNotNull(fixture.lastStandbyObservation).hasFreshSuccessfulProbe(deadline))
+        assertFalse(fixture.coordinator.isRunning())
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+
+        fixture.backend.beforeSwitchActive = {}
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.tick(deadline)
+        assertFalse(fixture.coordinator.isRunning())
+        assertEquals(attempts + 1, fixture.backend.activeSlots.size)
+        fixture.dnsBlockedSlots = emptySet()
+        for (time in (deadline + 100) until 30_000 step 100L) {
+            fixture.tick(time)
+            if (fixture.coordinator.isRunning()) break
+        }
+        assertTrue(fixture.coordinator.isRunning())
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun failedJournalIoKeepsStandbyCheckDeadlineAfterActivation() {
+        checkStandbyDeadlineAfterJournalFailure(failRead = false)
+        checkStandbyDeadlineAfterJournalFailure(failRead = true)
+    }
+
+    private fun checkStandbyDeadlineAfterJournalFailure(failRead: Boolean) {
+        val fixture = startupWithFailedReserveActivation()
+        while (fixture.standbyCheckStartedAt() == null && fixture.now < 12_000) {
+            fixture.failNextWrite()
+            fixture.tick(fixture.now + 100)
+        }
+        val deadline = requireNotNull(fixture.standbyCheckStartedAt()) + 8_000
+        fixture.tick(deadline - 1_500)
+        fixture.backend.failedActivationSlot = null
+        if (failRead) {
+            fixture.backend.beforeSwitchActive = { slot ->
+                if (slot == 1) {
+                    fixture.beforeJournalRead = {
+                        fixture.beforeJournalRead = {}
+                        error("journal temporarily unreadable")
+                    }
+                }
+            }
+        } else {
+            fixture.failNextWrite()
+        }
+        val attempts = fixture.backend.activeSlots.size
+
+        fixture.tick(deadline - 1)
+        assertEquals(attempts + 1, fixture.backend.activeSlots.size)
+        assertTrue(requireNotNull(fixture.lastStandbyObservation).hasFreshSuccessfulProbe(deadline))
+        assertFalse(fixture.coordinator.isRunning())
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+
+        fixture.backend.beforeSwitchActive = {}
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.tick(deadline)
+        assertFalse(fixture.coordinator.isRunning())
+        assertEquals(attempts + 1, fixture.backend.activeSlots.size)
+        fixture.dnsBlockedSlots = emptySet()
+        for (time in (deadline + 100) until 30_000 step 100L) {
+            fixture.tick(time)
+            if (fixture.coordinator.isRunning()) break
+        }
+        assertTrue(fixture.coordinator.isRunning())
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun rollbackFromUncommittedReserveCannotReuseExpiredPrimaryProof() {
+        val fixture = startupWithUncommittedReserve()
+        fixture.healthySlots = setOf(0, 1)
+        fixture.dnsBlockedSlots = setOf(1)
+        var elapsed = fixture.now + 100
+        while (elapsed < 16_000 && fixture.lastPrimaryProbeSuccesses == 0) {
+            fixture.failNextWrite()
+            fixture.tick(elapsed)
+            elapsed += 100
+        }
+        assertTrue(fixture.lastPrimaryProbeSuccesses > 0)
+        assertEquals(0, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        assertEquals(1, fixture.backend.activeSlots.last())
+
+        val metrics = requireNotNull(fixture.backend.metricsOverride)
+        fixture.backend.metricsOverride = {
+            metrics()?.replace("\"slot\":1,\"admitted\":true", "\"slot\":1,\"admitted\":false")
+        }
+        fixture.dnsBlockedSlots = setOf(0, 1)
+        fixture.receiveFrozenAtMs = fixture.now
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        fixture.tick(fixture.now + 8_100)
+        assertEquals("The rollback cannot use a stale primary probe",
+            attemptsBeforeResume, fixture.backend.activeSlots.size)
+        assertEquals(0, fixture.ready)
+
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.receiveFrozenAtMs = null
+        fixture.tick(fixture.now + 100)
+        assertEquals(1, fixture.ready)
+        assertEquals("lease-a", fixture.coordinator.status()?.localActiveLeaseId)
+        assertEquals(null, fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun activeButUncommittedReserveWithoutProofStopsAtStartupDeadline() {
+        val fixture = startupWithUncommittedReserve()
+        fixture.dnsBlockedSlots = setOf(1)
+        fixture.receiveFrozenAtMs = fixture.now
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        val resumeAt = fixture.now + 8_100
+        for (now in resumeAt until 30_000 step 100L) fixture.tick(now)
+        fixture.tick(29_999)
+        assertEquals(0, fixture.ready)
+        assertEquals(0, fixture.failed)
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        val probesBeforeDeadline = fixture.backend.probeLaunches.size
+        fixture.tick(30_000)
+        assertEquals(1, fixture.failed)
+        assertEquals(attemptsBeforeResume, fixture.backend.activeSlots.size)
+        assertEquals(probesBeforeDeadline, fixture.backend.probeLaunches.size)
+    }
+
+    private fun startupWithUncommittedReserve(): StartupFixture {
+        val fixture = startupWithFailedReserveActivation()
+        fixture.backend.failedActivationSlot = null
+        fixture.failNextWrite()
+        val beforeActivation = fixture.backend.activeSlots.size
+        var elapsed = fixture.now + 100
+        while (elapsed < 15_000 && fixture.backend.activeSlots.size == beforeActivation) {
+            fixture.tick(elapsed)
+            elapsed += 100
+        }
+        assertEquals(beforeActivation + 1, fixture.backend.activeSlots.size)
+        assertEquals(1, fixture.backend.activeSlots.last())
+        assertEquals(0, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        assertEquals("lease-a", fixture.coordinator.status()?.localActiveLeaseId)
+
+        return fixture
+    }
+
+    @Test
+    fun renewedReserveProofDoesNotExtendStartupDeadline() {
+        val (fixture, resumeAt) = startupWithExpiredReserveCheck()
+        fixture.dnsBlockedSlots = setOf(1)
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        val probesBeforeResume = fixture.backend.probeLaunches.count { it.second == 1 }
+        for (now in resumeAt until 30_000 step 100L) fixture.tick(now)
+        fixture.tick(29_999)
+        assertEquals(0, fixture.ready)
+        assertEquals(0, fixture.failed)
+        val probesBeforeDeadline = fixture.backend.probeLaunches.count { it.second == 1 }
+        assertTrue(probesBeforeDeadline > probesBeforeResume)
+        fixture.tick(30_000)
+        assertEquals(1, fixture.failed)
+        assertEquals(attemptsBeforeResume, fixture.backend.activeSlots.size)
+        assertEquals(probesBeforeDeadline, fixture.backend.probeLaunches.count { it.second == 1 })
+    }
+
+    @Test
+    fun pendingStartupSwitchCanConsumeSlowSuccessfulReserveProbe() {
+        val fixture = startupWithFailedReserveActivation()
+        fixture.backend.failedActivationSlot = null
+        fixture.healthySlots = setOf(0, 1)
+        fixture.dnsBlockedSlots = setOf(0)
+        fixture.reserveProbeAnswerDelayMs = 1_500
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        val resumeAt = fixture.now + 8_100
+
+        for (time in resumeAt until 30_000 step 1_000L) {
+            fixture.tick(time)
+            if (fixture.coordinator.isRunning()) break
+        }
+
+        assertTrue(fixture.backend.probeLaunches.any { (time, slot) -> time >= resumeAt && slot == 1 })
+        assertTrue("The startup tick must see a completed reserve probe", fixture.coordinator.isRunning())
+        assertEquals(attemptsBeforeResume + 1, fixture.backend.activeSlots.size)
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun startupSwitchCannotReuseExpiredProofOnSameNetwork() {
+        val fixture = startupWithFailedReserveActivation()
+        fixture.backend.failedActivationSlot = null
+        fixture.dnsBlockedSlots = setOf(1)
+        val attemptsBeforeResume = fixture.backend.activeSlots.size
+        val resumeAt = fixture.now + 8_100
+        fixture.tick(resumeAt)
+        assertEquals(attemptsBeforeResume, fixture.backend.activeSlots.size)
+        assertEquals(0, fixture.ready)
+        fixture.dnsBlockedSlots = emptySet()
+        for (now in (resumeAt + 100) until 30_000 step 100L) {
+            fixture.tick(now)
+            if (fixture.ready > 0) break
+        }
+        assertEquals(1, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.localActiveLeaseId)
+    }
+
+    private fun startupWithFailedReserveActivation(): StartupFixture {
+        val fixture = StartupFixture(0, ::prepared)
+        fixture.healthySlots = setOf(1)
+        fixture.backend.failedActivationSlot = 1
+        var elapsed = 0L
+        while (elapsed <= 10_000 && fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId == null) {
+            fixture.tick(elapsed)
+            elapsed += 100
+        }
+        assertEquals("The first activation must leave a pending switch",
+            "lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        return fixture
+    }
+
+    private fun startupWithExpiredReserveCheck(): Pair<StartupFixture, Long> {
+        val fixture = startupWithFailedReserveActivation()
+        var elapsed = fixture.now + 100
+        assertTrue(fixture.coordinator.onPhysicalNetworkUnavailable("start") { true })
+        fixture.backend.rebindFailures += 0
+        assertFalse(fixture.coordinator.onUnderlyingNetworkChanged(true, RedundantNetworkRebindProgress()) { true })
+        val beforeRetry = fixture.backend.activeSlots.size
+        while (elapsed <= 20_000 && fixture.backend.activeSlots.size == beforeRetry) {
+            fixture.tick(elapsed)
+            elapsed += 100
+        }
+        assertEquals("The rebound reserve must obtain fresh proof and attempt activation",
+            beforeRetry + 1, fixture.backend.activeSlots.size)
+        assertEquals(0, fixture.ready)
+        assertEquals("lease-b", fixture.coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        assertEquals(2, fixture.coordinator.status()?.retry?.pendingNativeSwitchAttempt)
+        fixture.backend.failedActivationSlot = null
+        elapsed += 8_100
+        assertTrue("There must be time left in the original startup budget", elapsed < 27_000)
+        return fixture to elapsed
+    }
+
+    @Test
     fun failedFreshReserveCheckStillRebindsPrimaryAndNeverPublishesReady() {
         val fixture = StartupFixture(0, ::prepared, initialStandby = false)
         fixture.healthySlots = setOf(1)
@@ -1468,36 +2117,63 @@ class RedundantProductionAdaptersTest {
         standbyExecutor: Executor = Executor { it.run() },
         beforeCommitReply: () -> Unit = {},
         onStop: (AndroidRedundantTransaction) -> Boolean = { true },
+        private val replay: AndroidRedundantTransaction? = null,
+        initialElapsed: Long = 0L,
+        recoverOnCreation: Boolean = true,
     ) {
-        @Volatile var now = 0L
+        @Volatile var now = initialElapsed
         var healthySlots = setOf(0, 1)
         var dnsBlockedSlots = emptySet<Int>()
         var receiveFrozenAtMs: Long? = null
+        var reserveProbeAnswerDelayMs = 0L
+        var startupNetworkUpdatePending = false
         var cancel = false
         var ready = 0
         var failed = 0
         var cancelled = 0
         var stalled = 0
         var maxPrimaryCorroboration = 0
+        var lastPrimaryProbeSuccesses = 0
+        var lastStandbyObservation: SlotObservation? = null
+        var beforeJournalRead: () -> Unit = {}
+        var beforeJournalWrite: () -> Unit = {}
         val reportedRoles = mutableListOf<Pair<String, String?>>()
         var onRole: (String) -> Unit = {}
         val backend = RecordingSessionBackend { 1_800_000_000_000L }
+        private val healthProbe = BackgroundRedundantHealthProbe("dns_a", "77.88.8.8", "nelomai.ru", 4000)
         private val adapter = ServiceRedundantConnectionNative(backend, { 41 }, prepare,
             probeSourceIpv4 = "10.241.0.1/32",
             epochNowMs = { 1_800_000_000_000L }, elapsedNowMs = { now })
         private val native = object : RedundantConnectionNative by adapter {
-            override fun healthObservations(initialReadiness: Boolean,
-                committedStandbyLeaseId: String?, freshStart: Boolean): List<SlotObservation> =
-                adapter.healthObservations(initialReadiness, committedStandbyLeaseId, freshStart).also { observations ->
+            override fun healthObservations(
+                initialReadiness: Boolean,
+                committedStandbyLeaseId: String?,
+                freshStart: Boolean,
+                startupStandbyRetryDeadlineMs: Long?,
+            ): List<SlotObservation> =
+                adapter.healthObservations(
+                    initialReadiness, committedStandbyLeaseId, freshStart, startupStandbyRetryDeadlineMs,
+                ).also { observations ->
+                    lastStandbyObservation = observations.firstOrNull { it.index != primary }
                     observations.firstOrNull { it.index == primary }?.let {
                         maxPrimaryCorroboration = maxOf(maxPrimaryCorroboration, it.corroboratedProbeFailures)
+                        lastPrimaryProbeSuccesses = it.consecutiveProbeSuccesses
                     }
                 }
         }
         private val record = object : EncryptedRecordBackend {
             var bytes = AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1))
-            override fun read(): ByteArray = bytes.clone()
+            var failNext = false
+            override fun read(): ByteArray {
+                beforeJournalRead()
+                return bytes.clone()
+            }
             override fun write(plaintext: ByteArray): Boolean {
+                beforeJournalWrite()
+                if (failNext) {
+                    failNext = false
+                    return false
+                }
                 bytes = plaintext.clone()
                 return true
             }
@@ -1517,8 +2193,16 @@ class RedundantProductionAdaptersTest {
             startOperationId = "start", startRequestFingerprint = "f".repeat(64),
         )
         private val panel = object : RedundantConnectionPanel {
-            override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
-                error("unexpected recovery")
+            override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
+                check(replay != null)
+                return RedundantRecoveryResponse(
+                    BackgroundRedundantSession(transaction.sessionId, "connected",
+                        transaction.localActiveLeaseId, transaction.slotALeaseId, transaction.slotBLeaseId,
+                        true, transaction.roleGeneration, transaction.membershipGeneration, null),
+                    mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                    mapOf("lease-a" to healthProbe, "lease-b" to healthProbe),
+                )
+            }
             override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
                 reportedRoles += reason to transaction.localActiveLeaseId
                 onRole(reason)
@@ -1553,7 +2237,7 @@ class RedundantProductionAdaptersTest {
         }
         val coordinator = RedundantConnectionCoordinator(store, panel, native,
             epochNowMs = { now }, monotonicMs = { now }, onAllSlotsStalled = { stalled++ },
-            standbyExecutor = standbyExecutor)
+            standbyExecutor = standbyExecutor, startupNetworkUpdatePending = { startupNetworkUpdatePending })
 
         init {
             backend.probeClock = { now }
@@ -1567,15 +2251,24 @@ class RedundantProductionAdaptersTest {
                     """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_errors":0,"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
                 }
             }
-            val probe = BackgroundRedundantHealthProbe("dns_a", "77.88.8.8", "nelomai.ru", 4000)
-            assertTrue(coordinator.start(transaction,
-                listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
-                    .associateWith { byteArrayOf(1) },
-                listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
-                    .associateWith { probe },
-                shouldCancel = { cancel }, onPrimaryStarted = { ready += 1 },
-                onPrimaryFailed = { failed += 1 }, onPrimaryCancelled = { cancelled += 1 }))
+            if (replay != null) {
+                assertTrue(store.beginRedundant(replay) is RecoveryStoreResult.Success)
+                if (recoverOnCreation) assertTrue(coordinator.recover())
+            } else {
+                val leases = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
+                assertTrue(coordinator.start(transaction,
+                    leases.associateWith { byteArrayOf(1) }, leases.associateWith { healthProbe },
+                    shouldCancel = { cancel }, onPrimaryStarted = { ready += 1 },
+                    onPrimaryFailed = { failed += 1 }, onPrimaryCancelled = { cancelled += 1 }))
+            }
         }
+
+        fun failNextWrite() { record.failNext = true }
+        fun clearWriteFailure() { record.failNext = false }
+
+        fun standbyCheckStartedAt(): Long? = adapter.javaClass
+            .getDeclaredField("standbyCheckStartedAtMs").apply { isAccessible = true }.get(adapter) as Long?
+
 
         fun awaitInitialStandbyCommit(): Long {
             for (elapsed in 0L..8_000L step 100L) {
@@ -1594,9 +2287,10 @@ class RedundantProductionAdaptersTest {
         fun tick(elapsed: Long) {
             now = elapsed
             backend.probeStatuses.replaceAll { token, status ->
-                val slot = backend.probeDetails.getValue(token).second
+                val (startedAt, slot) = backend.probeDetails.getValue(token)
+                val delay = if (slot != primary) reserveProbeAnswerDelayMs else 0L
                 if (status == NativeProbeStatus.PENDING && slot in healthySlots &&
-                    slot !in dnsBlockedSlots) NativeProbeStatus.SUCCEEDED else status
+                    slot !in dnsBlockedSlots && elapsed - startedAt >= delay) NativeProbeStatus.SUCCEEDED else status
             }
             coordinator.tick()
         }
@@ -1750,6 +2444,9 @@ internal class RecordingSessionBackend(
     val sendErrorsBySlot = mutableMapOf<Int, Long>()
     val failedProbeSendSlots = mutableSetOf<Int>()
     val rebindFailures = mutableSetOf<Int>()
+    var beforeRebind: () -> Unit = {}
+    var beforeSwitchActive: (Int) -> Unit = {}
+    var failedActivationSlot: Int? = null
     val reboundSlots = mutableListOf<Int>()
     var latestProbeToken: Long? = null
     var countProbeSend = true
@@ -1783,13 +2480,15 @@ internal class RecordingSessionBackend(
         return true
     }
 
-    override fun switchActive(session: NativeSession, slot: Int): Boolean = true.also {
+    override fun switchActive(session: NativeSession, slot: Int): Boolean = (slot != failedActivationSlot).also {
+        beforeSwitchActive(slot)
         activeSlots += slot
     }
 
     override fun stopSlot(session: NativeSession, slot: Int): Boolean = admitted.remove(slot)
 
     override fun rebind(session: NativeSession, slot: Int): Boolean {
+        beforeRebind()
         reboundSlots += slot
         return slot in admitted && slot !in rebindFailures
     }

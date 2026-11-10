@@ -71,6 +71,53 @@ class RedundantAutomaticDiagnosticsTest {
         assertTrue(f.reports().isEmpty())
     }
 
+    @Test fun automaticRestartSealsTheOldSessionAfterItsStopRecordIsRetired() = fixture { f ->
+        var stoppedBeforePanelAck = false
+        val owner = f.owner(onPanelStop = {
+            stoppedBeforePanelAck = f.prefs.getBoolean("stopped_session_pending", false)
+        })
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val oldSession = f.session()
+        assertTrue(f.store.prepareRedundantTotalLoss(f.tx.startOperationId,
+            redundantTotalLossRestartReplay(f.tx, "replacement")) is RecoveryStoreResult.Success)
+        assertTrue(f.store.deferRedundantStop("stop", f.tx.startOperationId) is RecoveryStoreResult.Success)
+
+        assertTrue(owner.revoke())
+        assertTrue("Mark the old session before requesting panel cleanup", stoppedBeforePanelAck)
+        assertNull(owner.status())
+        AutomaticDiagnostics.onTunnelStarted(f.context, "lease-new", "amneziawg",
+            "new-owner", f.tx.template.deviceId)
+
+        val report = f.reports().single()
+        assertEquals(oldSession, report.getString("tunnel_session_id"))
+        assertEquals("tunnel_stopped", report.getString("trigger"))
+        assertTrue(f.running())
+        assertNotEquals(oldSession, f.session())
+    }
+
+    @Test fun failedRouteReplacementSealsAsStoppedEvenIfUploadRunsDuringClosure() = fixture { f ->
+        val barrier = ReflectionHelpers.getField<RedundantStopLookupBarrier>(f.service, "redundantStopLookupBarrier")
+        val owner = f.owner(onNativeStop = {
+            val lookup = barrier.begin()
+            try {
+                AutomaticDiagnostics.runScheduledUpload(f.context) {}
+                f.diagnostics("processNext", f.context)
+            } finally {
+                barrier.complete(lookup)
+            }
+        })
+        assertTrue(owner.start(f.tx, configs())); f.idle()
+        val oldSession = f.session()
+
+        assertFalse(owner.refreshLocalRoutes(true) { false })
+        AutomaticDiagnostics.runScheduledUpload(f.context) {}
+        f.diagnostics("processNext", f.context)
+
+        val report = f.reports().single()
+        assertEquals(oldSession, report.getString("tunnel_session_id"))
+        assertEquals("tunnel_stopped", report.getString("trigger"))
+    }
+
     @Test fun recoveryOpensSessionAndRepeatedReadinessAndRoleSwitchDoNotDuplicateIt() = fixture { f ->
         assertTrue(f.store.beginRedundant(f.tx) is RecoveryStoreResult.Success)
         val owner = f.owner()
@@ -168,7 +215,7 @@ class RedundantAutomaticDiagnosticsTest {
         assertFalse(f.running())
         assertTrue(owner.onHealthObservations(listOf(SlotObservation(index = 0, active = true,
             health = BackendHealth.READY, handshakeFresh = true, consecutiveProbeSuccesses = 3,
-            stableSinceMs = 0))))
+            stableSinceMs = 0, successfulProbeValidThroughElapsedMs = Long.MAX_VALUE))))
         f.idle()
         assertTrue(owner.isRunning())
         assertTrue(f.running())
@@ -184,6 +231,21 @@ class RedundantAutomaticDiagnosticsTest {
         f.diagnostics("processNext", f.context)
         assertTrue(f.running())
         assertTrue(f.reports().isEmpty())
+    }
+
+    @Test fun recoveredReadinessIsPublishedAfterTemporaryStopLookup() = fixture { f ->
+        val owner = f.owner()
+        val barrier = ReflectionHelpers.getField<RedundantStopLookupBarrier>(f.service, "redundantStopLookupBarrier")
+        val lookup = barrier.begin()
+        assertTrue(owner.start(f.tx, configs()))
+        f.idle()
+        assertTrue(owner.isRunning())
+        assertFalse(f.running())
+
+        assertTrue(barrier.complete(lookup))
+        ReflectionHelpers.getField<Runnable>(f.service, "redundantHealthTick").run()
+        f.idle()
+        assertTrue(f.running())
     }
 
     @Test fun livenessSamplePreservesRecentHistoryOnProcessRecovery() = fixture { f ->
@@ -673,8 +735,8 @@ class RedundantAutomaticDiagnosticsTest {
             ))
             // The real async cleanup result enters the service's completion callback.
             val pendingType = Class.forName("ru.nelomai.tunnel.PendingRedundantStop")
-            val pending = pendingType.declaredConstructors.single().apply { isAccessible = true }
-                .newInstance(operation, tombstone, owner, generation, true, false)
+            val pending = pendingType.declaredConstructors.single { !it.isSynthetic }.apply { isAccessible = true }
+                .newInstance(operation, tombstone, owner, generation, true, false, null)
             ReflectionHelpers.setField(service, "pendingRedundantStop", pending)
             val attempt = Class.forName("ru.nelomai.tunnel.PendingRedundantStopAttempt")
                 .declaredConstructors.single().apply { isAccessible = true }
@@ -706,7 +768,11 @@ class RedundantAutomaticDiagnosticsTest {
         fun publish(owner: RedundantConnectionCoordinator) {
             call(service, "publishRedundantRecoveryReadiness", tx.startOperationId, owner, true)
         }
-        fun owner(usable: Boolean = true): RedundantConnectionCoordinator {
+        fun owner(
+            usable: Boolean = true,
+            onPanelStop: () -> Unit = {},
+            onNativeStop: () -> Unit = {},
+        ): RedundantConnectionCoordinator {
             val method = service.javaClass.declaredMethods.single { it.name == "createRedundantCoordinator" }
             // The 0.5 factory has an extra TUN readiness argument.
             val args = mutableListOf<Any>(tx, "10.241.0.2/32",
@@ -720,7 +786,10 @@ class RedundantAutomaticDiagnosticsTest {
                     healthProbe: BackgroundRedundantHealthProbe?) = usable
                 override fun activate(leaseId: String) = usable
                 override fun stopSlot(leaseId: String) = true
-                override fun stop() = true
+                override fun stop(): Boolean {
+                    onNativeStop()
+                    return true
+                }
                 override fun isUsable(leaseId: String) = usable
             }
             ReflectionHelpers.setField(pair.first, "native", native)
@@ -735,7 +804,10 @@ class RedundantAutomaticDiagnosticsTest {
                     RedundantRecoveryResponse(session(transaction), configs())
                 override fun reportRole(transaction: AndroidRedundantTransaction, reason: String) =
                     RedundantRoleResponse("acknowledged", requireNotNull(transaction.localActiveLeaseId), session(transaction))
-                override fun stop(transaction: AndroidRedundantTransaction) = true
+                override fun stop(transaction: AndroidRedundantTransaction): Boolean {
+                    onPanelStop()
+                    return true
+                }
             })
             fencelessInstall(pair.first)
             return pair.first

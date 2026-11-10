@@ -2069,8 +2069,13 @@ class NelomaiVpnServiceTest {
         assertFalse(dispatcher.tick { ticks += 100 })
         assertTrue(dispatcher.resume { resumes += 1 })
         assertFalse(dispatcher.resume { resumes += 100 })
-        assertTrue(dispatcher.network(available = false, networks::add))
-        assertFalse(dispatcher.network(available = true, networks::add))
+        assertTrue(dispatcher.network(available = false, startOperationId = "old") {
+            error("The superseded owner must not receive the latest network state")
+        })
+        assertTrue(dispatcher.networkUpdatePending("old"))
+        assertFalse(dispatcher.network(available = true, startOperationId = "current", action = networks::add))
+        assertFalse(dispatcher.networkUpdatePending("old"))
+        assertTrue(dispatcher.networkUpdatePending("current"))
         assertEquals(3, queued.size)
 
         queued.removeFirst().run()
@@ -2080,6 +2085,7 @@ class NelomaiVpnServiceTest {
         assertEquals(1, ticks)
         assertEquals(1, resumes)
         assertEquals(listOf(true), networks)
+        assertFalse(dispatcher.networkUpdatePending("current"))
         assertTrue(dispatcher.tick { ticks += 1 })
     }
 
