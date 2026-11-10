@@ -943,6 +943,7 @@ fn start_connection_metrics_scheduler(
         let mut last_diagnostics_sample = None;
         let mut last_incident_sample = None;
         let mut skipped_probe_session: Option<String> = None;
+        let mut probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
         #[cfg(not(target_os = "android"))]
         let mut desktop_coordination = DesktopCoordinationSchedule::default();
         #[cfg(any(target_os = "macos", windows))]
@@ -963,6 +964,7 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
                 skipped_probe_session = None;
+                probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
                 #[cfg(not(target_os = "android"))]
                 {
                     desktop_coordination = DesktopCoordinationSchedule::default();
@@ -1049,6 +1051,7 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
                 failure_recorded = false;
+                probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
                 #[cfg(any(target_os = "macos", windows))]
                 stall_recovery_limiter.reset();
                 #[cfg(target_os = "macos")]
@@ -1122,27 +1125,42 @@ fn start_connection_metrics_scheduler(
                     // HTTP request from the app process cannot validate the tunnel there.
                     // Desktop probes use the panel rather than the VPN endpoint, whose host
                     // route is intentionally kept outside the tunnel.
-                    let probe_result = if probe && !cfg!(target_os = "android") {
+                    let probe = probe && !cfg!(target_os = "android");
+                    let request_id = if probe {
+                        probe_diagnostics.request_id(diagnostics_due)
+                    } else {
+                        None
+                    };
+                    let probe_result = if probe {
+                        // nginx records the query even without a custom header log format.
+                        let url = match &request_id {
+                            Some(id) => format!("{PANEL_BASE}/health?probe_id={id}"),
+                            None => format!("{PANEL_BASE}/health"),
+                        };
                         Some(
                             application
-                                .probe_connection_latency_ms(&format!("{PANEL_BASE}/health"))
+                                .probe_connection_latency_ms(&url)
                                 .await
                                 .map(|latency| latency.ceil().clamp(1.0, u32::MAX as f64) as u32),
                         )
                     } else {
                         None
                     };
-                    if diagnostics_due {
+                    if probe_diagnostics.should_record(
+                        diagnostics_due,
+                        probe_result.as_ref().is_some_and(Result::is_err),
+                    ) {
                         diagnostics.record_tunnel_metrics(
                             &context.session_id,
                             &sample,
                             last_diagnostics_sample.as_ref(),
-                            probe_result,
+                            probe_result.as_ref(),
+                            request_id.as_deref(),
                         );
                         last_diagnostics_sample = Some(sample.clone());
                     }
                     tracker
-                        .record(&context.session_id, sample, probe_result)
+                        .record(&context.session_id, sample, probe_result.map(Result::ok))
                         .await;
                 }
                 Ok(None) => {

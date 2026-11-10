@@ -15,8 +15,11 @@ use crate::{
 };
 use crate::{InstalledRuntimeSelection, SelectionStartupError};
 use nelomai_client_api::{AccessSnapshot, ClientApi, RuntimeTarget};
+use nelomai_client_storage::{
+    CompletedRuntimeLogoutV1, ProtectedRecordStore, ProtectedRuntimeStore, RuntimeAuthScope,
+    RuntimeCleanupSnapshotV1, RuntimeRecordOwner, RuntimeStateStore,
+};
 use nelomai_client_storage::{ContainerOwnerLock, PreparedRuntimeStorage, ProtectedRecordFactory};
-use nelomai_client_storage::{RuntimeCleanupSnapshotV1, RuntimeStateStore};
 use nelomai_contracts::RuntimeSlot;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
@@ -308,8 +311,13 @@ impl PrivateOwnerCommands for HostCommands {
                     .and_then(std::sync::Weak::upgrade)
                     .ok_or(PrivateError::Closed)?;
                 let peer = bridge.peer().map_err(|_| PrivateError::Closed)?;
-                peer.recover_logout(&broker, &self.coordinator, deadline)
-                    .await?;
+                peer.recover_logout(
+                    &broker,
+                    &self.coordinator,
+                    bridge.legacy_records.as_deref(),
+                    deadline,
+                )
+                .await?;
                 if Instant::now() >= recovery_deadline {
                     return Err(PrivateError::RecoveryRequired);
                 }
@@ -465,12 +473,236 @@ struct HostPeer {
     owner: Arc<RemoteOwner>,
     _service: OwnerService,
 }
+pub(crate) trait LegacyRuntimeRecords: Send + Sync {
+    fn snapshot(&self, scope: &RuntimeAuthScope) -> Result<RuntimeCleanupSnapshotV1, BrokerError>;
+    fn check_unscoped_source(
+        &self,
+        covered: Option<&RuntimeCleanupSnapshotV1>,
+    ) -> Result<(), BrokerError>;
+    fn prepare_retained_cleanup(
+        &self,
+        snapshot: &RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError>;
+    fn complete_cleanup(&self, snapshot: &RuntimeCleanupSnapshotV1) -> Result<(), BrokerError>;
+    fn prepare_logout(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        interrupted: Option<&RuntimeCleanupSnapshotV1>,
+    ) -> Result<LegacyLogout, BrokerError>;
+}
+
+pub(crate) enum LegacyLogoutChild {
+    Complete(CompletedRuntimeLogoutV1),
+    Verify(RuntimeCleanupSnapshotV1),
+}
+
+pub(crate) struct LegacyLogout {
+    pub(crate) child: LegacyLogoutChild,
+    pub(crate) retained: Vec<RuntimeCleanupSnapshotV1>,
+}
+
+pub(crate) struct LegacyRecords<R: ProtectedRecordStore> {
+    pub(crate) stable: Arc<RuntimeRecordOwner<ProtectedRuntimeStore<R>>>,
+    pub(crate) retained: Vec<Arc<RuntimeRecordOwner<ProtectedRuntimeStore<R>>>>,
+}
+
+impl<R: ProtectedRecordStore> LegacyRecords<R> {
+    fn source(
+        &self,
+        slot: RuntimeSlot,
+        version: &str,
+    ) -> Result<&RuntimeRecordOwner<ProtectedRuntimeStore<R>>, BrokerError> {
+        let mut matching = self.retained.iter().filter(|owner| {
+            owner.paths().slot() == slot && owner.paths().runtime_version() == version
+        });
+        let source = matching.next().ok_or(BrokerError::RecoveryRequired)?;
+        if matching.next().is_some() {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(source)
+    }
+
+    fn check_retained_cleanup(
+        &self,
+        snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), BrokerError> {
+        let source = self.source(snapshot.slot, &snapshot.runtime_version)?;
+        if source.cleanup_snapshot()? != *snapshot {
+            source.check_completed_cleanup(None)?;
+        }
+        Ok(())
+    }
+}
+
+impl<R: ProtectedRecordStore> LegacyRuntimeRecords for LegacyRecords<R> {
+    fn snapshot(&self, scope: &RuntimeAuthScope) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
+        let snapshot = self
+            .source(scope.identity.slot, &scope.identity.runtime_version)?
+            .cleanup_snapshot()?;
+        if snapshot.auth_scope.as_ref() != Some(scope) {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(snapshot)
+    }
+
+    fn check_unscoped_source(
+        &self,
+        covered: Option<&RuntimeCleanupSnapshotV1>,
+    ) -> Result<(), BrokerError> {
+        for owner in &self.retained {
+            if covered.is_some_and(|snapshot| {
+                owner.paths().slot() == snapshot.slot
+                    && owner.paths().runtime_version() == snapshot.runtime_version
+            }) {
+                continue;
+            }
+            let state = owner
+                .operational()
+                .load()?
+                .ok_or(BrokerError::RecoveryRequired)?;
+            // The old child cannot see these records. No unscoped snapshot
+            // can prove that a different record's outstanding work is covered.
+            if state.auth_scope.is_none() && !state.operationally_empty() {
+                return Err(BrokerError::RecoveryRequired);
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_retained_cleanup(
+        &self,
+        snapshot: &RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
+        self.check_retained_cleanup(snapshot)?;
+        let target = self
+            .stable
+            .operational()
+            .load()?
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if !target.operationally_empty()
+            || target
+                .auth_scope
+                .as_ref()
+                .is_some_and(|current| current != scope)
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(target.cleanup_snapshot())
+    }
+
+    fn complete_cleanup(&self, snapshot: &RuntimeCleanupSnapshotV1) -> Result<(), BrokerError> {
+        let source = self.source(snapshot.slot, &snapshot.runtime_version)?;
+        // Only Common owns this namespace. Replay still requires it to be
+        // empty and unbound if the frozen cleanup was already applied.
+        source
+            .complete_cleanup(snapshot)
+            .or_else(|error| source.check_completed_cleanup(None).map_err(|_| error))?;
+        Ok(())
+    }
+
+    fn prepare_logout(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        interrupted: Option<&RuntimeCleanupSnapshotV1>,
+    ) -> Result<LegacyLogout, BrokerError> {
+        let target = self
+            .stable
+            .operational()
+            .load()?
+            .ok_or(BrokerError::RecoveryRequired)?;
+        let is_selected =
+            |slot, version: &str| slot == target.slot && version == target.runtime_version;
+        let mut retained = Vec::new();
+        if let Some(snapshot) =
+            interrupted.filter(|state| !is_selected(state.slot, &state.runtime_version))
+        {
+            self.check_retained_cleanup(snapshot)?;
+            retained.push(snapshot.clone());
+        }
+        let identity = receipt.source.identity.as_ref();
+        let retained_receipt =
+            identity.filter(|identity| !is_selected(identity.slot, &identity.runtime_version));
+        if let Some(identity) = retained_receipt.filter(|identity| {
+            !retained.iter().any(|snapshot| {
+                snapshot.slot == identity.slot
+                    && snapshot.runtime_version == identity.runtime_version
+            })
+        }) {
+            let owner = self.source(identity.slot, &identity.runtime_version)?;
+            let snapshot = owner.cleanup_snapshot()?;
+            if snapshot.auth_scope.as_ref().is_some_and(|scope| {
+                &scope.identity == identity
+                    && scope.auth_epoch == receipt.source.auth_epoch
+                    && scope.family == receipt.source.family
+            }) {
+                retained.push(snapshot);
+            } else {
+                owner.check_completed_cleanup(None)?;
+            }
+        }
+        if target.cleanup_only || interrupted.is_some() {
+            // A pending journal can be the only fence after a lost child ACK.
+            // Preserve it if another namespace still owns operational work.
+            for owner in &self.retained {
+                if !retained.iter().any(|snapshot| {
+                    owner.paths().slot() == snapshot.slot
+                        && owner.paths().runtime_version() == snapshot.runtime_version
+                }) && !owner
+                    .operational()
+                    .load()?
+                    .ok_or(BrokerError::RecoveryRequired)?
+                    .operationally_empty()
+                {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+            }
+        }
+        let target_snapshot = target.cleanup_snapshot();
+        let mut wire = receipt.clone();
+        if target.auth_scope.is_none() && !target.operationally_empty() {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        if target.cleanup_only && target.auth_scope.is_none() {
+            // 0.3.11 accepts a legacy receipt for its empty startup fence.
+            wire.source.identity = None;
+        } else if Some(&target_snapshot) == interrupted {
+            if let Some(scope) = &target.auth_scope {
+                if scope.family != receipt.source.family
+                    || scope.auth_epoch != receipt.source.auth_epoch
+                {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+                // A cancelled switch can advance the generation before local
+                // binding. Project its covered old scope on this IPC only.
+                wire.source.identity = Some(scope.identity.clone());
+            }
+        } else if retained_receipt.is_some() {
+            if target.cleanup_only || (interrupted.is_some() && !target.operationally_empty()) {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            // Still validate the child's lease, without mutating a different
+            // selected scope for a receipt that only covers retained state.
+            return Ok(LegacyLogout {
+                child: LegacyLogoutChild::Verify(target_snapshot),
+                retained,
+            });
+        }
+        Ok(LegacyLogout {
+            child: LegacyLogoutChild::Complete(wire),
+            retained,
+        })
+    }
+}
+
 struct HostBridge {
     peer: Mutex<Option<HostPeer>>,
     native: HostNativePorts,
     broker: std::sync::OnceLock<std::sync::Weak<AuthBroker>>,
     updater: std::sync::OnceLock<std::sync::Weak<HostUpdater>>,
     push_gate: Arc<tokio::sync::Mutex<()>>,
+    legacy_records: Option<Box<dyn LegacyRuntimeRecords>>,
 }
 impl HostBridge {
     async fn replay_push_cleanup(&self) -> Result<(), BrokerError> {
@@ -554,7 +786,7 @@ impl RuntimeSwitchControl for HostBridge {
         source: &TransitionSourceSnapshot,
     ) -> Result<RuntimeCleanupHandoff, BrokerError> {
         self.peer()?
-            .runtime_cleanup_handoff(source)
+            .runtime_cleanup_handoff(source, self.legacy_records.as_deref())
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }
@@ -596,14 +828,14 @@ impl RuntimeSwitchControl for HostBridge {
             .and_then(std::sync::Weak::upgrade)
             .ok_or(BrokerError::RecoveryRequired)?;
         self.peer()?
-            .complete_runtime_cleanup(&broker, snapshot, access)
+            .complete_runtime_cleanup(&broker, snapshot, access, self.legacy_records.as_deref())
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }
 }
 
-/// UI-independent common owner. Runtime record wrappers are dropped at startup;
-/// selected child alone opens the declared runtime namespaces for full writes.
+/// UI-independent common owner. The selected child writes runtime state.
+/// Legacy rollback can also complete a stopped, retained source in Common.
 pub struct CommonHost {
     owner: Arc<ContainerOwnerLock>,
     installed: InstalledRuntimeSelection,
@@ -683,6 +915,20 @@ impl CommonHost {
                 native_storage.acknowledge()?;
             }
         }
+        let legacy_records =
+            RemoteOwner::legacy_cleanup_target(profile.platform, selection.target()).then(|| {
+                let open = |store: &ProtectedRuntimeStore<F::Record>| {
+                    let paths = store.paths().clone();
+                    RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
+                        records.record(paths.namespace()),
+                        paths,
+                    ))
+                };
+                Box::new(LegacyRecords {
+                    stable: open(&storage.runtime),
+                    retained: storage.retained.iter().map(open).collect(),
+                }) as Box<dyn LegacyRuntimeRecords>
+            });
         let migration = matches!(
             storage.migration,
             Some(nelomai_client_storage::MigrationOutcome::AwaitingBootstrap)
@@ -695,8 +941,11 @@ impl CommonHost {
                 native: native.storage.clone(),
             }) as Arc<dyn MigrationCompletion>
         });
+        // 0.3.11 cannot decode newer retained records. Give the verified
+        // child only its selected namespace. Common owns the remaining
+        // namespaces under the container owner and switch execution locks.
         let namespaces = std::iter::once(&storage.runtime)
-            .chain(storage.retained.iter())
+            .chain(storage.retained.iter().filter(|_| legacy_records.is_none()))
             .map(|record| record.paths().namespace().to_owned())
             .collect();
         let bridge = Arc::new(HostBridge {
@@ -705,6 +954,7 @@ impl CommonHost {
             broker: std::sync::OnceLock::new(),
             updater: std::sync::OnceLock::new(),
             push_gate: Arc::new(tokio::sync::Mutex::new(())),
+            legacy_records,
         });
         let api = api
             .with_app_version(&selection.target().container_version)

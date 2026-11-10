@@ -596,6 +596,10 @@ jobs:
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: >-
           cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib -- platform::updater:: connection_intent::recovery_integration::
+      - name: macOS relaunch after runtime switch and update
+        if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
+        run: >-
+          cargo test --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --lib macos_launch::update_tests::
       - name: Clippy desktop application and runtime targets
         if: ${{ !cancelled() && steps.guard.outcome == 'success' && steps.rust.outcome == 'success' && steps.frontend.outcome == 'success' }}
         run: cargo clippy --locked --target "$CARGO_BUILD_TARGET" -p nelomai-app --features desktop-runtime --all-targets -- -D warnings

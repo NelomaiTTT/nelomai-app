@@ -1,4 +1,5 @@
 use super::{transport::*, *};
+use crate::host::{LegacyLogoutChild, LegacyRuntimeRecords};
 use crate::{AuthBroker, BrokerAuthState, BrokerError, LocalAuthStop, RuntimeClientProfile};
 use async_trait::async_trait;
 use nelomai_client_api::{LoginRequest, RuntimeTarget};
@@ -457,9 +458,10 @@ impl RemoteOwner {
             .map_err(broker_error)
     }
 
-    pub async fn runtime_cleanup_handoff(
+    pub(crate) async fn runtime_cleanup_handoff(
         &self,
         source: &crate::TransitionSourceSnapshot,
+        legacy: Option<&dyn LegacyRuntimeRecords>,
     ) -> Result<crate::RuntimeCleanupHandoff, PrivateError> {
         let deadline = Instant::now() + REQUEST_BUDGET;
         let lease = self.prepare(deadline).await?;
@@ -472,18 +474,40 @@ impl RemoteOwner {
             family: source.family().into(),
             identity: identity.clone(),
         });
-        let snapshot = match self
-            .control(
-                ControlV1::CleanupSourceSnapshot {
-                    lease,
-                    scope: source_scope,
-                },
-                deadline,
-            )
-            .await?
+        if source_scope.is_none()
+            && Self::legacy_cleanup_target(self.profile.platform, &self.binding.target)
         {
-            ControlAckV1::CleanupSnapshot { snapshot } => snapshot,
-            _ => return Err(PrivateError::Protocol),
+            legacy
+                .ok_or(PrivateError::RecoveryRequired)?
+                .check_unscoped_source(None)
+                .map_err(broker_error)?;
+        }
+        let snapshot = if let Some(scope) = source_scope.as_ref().filter(|scope| {
+            Self::legacy_cleanup_target(self.profile.platform, &self.binding.target)
+                && (scope.identity.slot != self.binding.target.runtime_slot
+                    || scope.identity.runtime_version != self.binding.target.runtime_version)
+        }) {
+            // The selected legacy child holds writer quiescence but cannot
+            // decode the retained latest record. Common only reads it here.
+            self.live(deadline)?;
+            legacy
+                .ok_or(PrivateError::RecoveryRequired)?
+                .snapshot(scope)
+                .map_err(broker_error)?
+        } else {
+            match self
+                .control(
+                    ControlV1::CleanupSourceSnapshot {
+                        lease,
+                        scope: source_scope,
+                    },
+                    deadline,
+                )
+                .await?
+            {
+                ControlAckV1::CleanupSnapshot { snapshot } => snapshot,
+                _ => return Err(PrivateError::Protocol),
+            }
         };
         if !source.matches_runtime_scope(snapshot.auth_scope.as_ref())
             || source.identity().is_some_and(|identity| {
@@ -496,11 +520,18 @@ impl RemoteOwner {
         Ok(crate::RuntimeCleanupHandoff::remote(snapshot, held))
     }
 
-    pub async fn complete_runtime_cleanup(
+    pub(crate) fn legacy_cleanup_target(platform: Platform, target: &RuntimeTarget) -> bool {
+        platform != Platform::Android
+            && target.runtime_slot == nelomai_contracts::RuntimeSlot::Stable
+            && target.runtime_version == "0.3.11"
+    }
+
+    pub(crate) async fn complete_runtime_cleanup(
         &self,
         broker: &AuthBroker,
         snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
         access: &AccessSnapshot,
+        legacy: Option<&dyn LegacyRuntimeRecords>,
     ) -> Result<(), PrivateError> {
         self.check_target(access)?;
         let deadline = Instant::now() + REQUEST_BUDGET;
@@ -510,12 +541,39 @@ impl RemoteOwner {
             lease: lease.clone(),
             granted: false,
         };
+        let scope = scope(access);
+        let legacy_target =
+            Self::legacy_cleanup_target(self.profile.platform, &self.binding.target);
+        let retained = legacy_target
+            && (snapshot.slot != self.binding.target.runtime_slot
+                || snapshot.runtime_version != self.binding.target.runtime_version);
+        if legacy_target && snapshot.auth_scope.is_none() {
+            legacy
+                .ok_or(PrivateError::RecoveryRequired)?
+                .check_unscoped_source(retained.then_some(snapshot))
+                .map_err(broker_error)?;
+        }
+        let legacy = if retained {
+            Some(legacy.ok_or(PrivateError::RecoveryRequired)?)
+        } else {
+            None
+        };
+        let wire_snapshot = if let Some(legacy) = legacy {
+            // Stable only knows its own namespace. Bind its exact empty
+            // record under the child lease before Common completes the
+            // previously stopped retained source. No admission is granted yet.
+            legacy
+                .prepare_retained_cleanup(snapshot, &scope)
+                .map_err(broker_error)?
+        } else {
+            snapshot.clone()
+        };
         match self
             .control(
                 ControlV1::CompleteCleanup {
                     lease: lease.clone(),
-                    snapshot: snapshot.clone(),
-                    scope: scope(access),
+                    snapshot: wire_snapshot,
+                    scope,
                 },
                 deadline,
             )
@@ -523,6 +581,15 @@ impl RemoteOwner {
         {
             ControlAckV1::Committed => {}
             _ => return Err(PrivateError::Protocol),
+        }
+        if let Some(legacy) = legacy {
+            broker
+                .with_current_access(access, || {
+                    self.live(deadline).map_err(|_| BrokerError::Cancelled)?;
+                    legacy.complete_cleanup(snapshot)
+                })
+                .await
+                .map_err(broker_error)?;
         }
         self.grant_committed(broker, access.clone(), lease, None, deadline)
             .await?;
@@ -602,6 +669,7 @@ impl RemoteOwner {
         &self,
         broker: &AuthBroker,
         coordinator: &crate::SwitchCoordinator,
+        legacy: Option<&dyn LegacyRuntimeRecords>,
         deadline: Instant,
     ) -> Result<(), PrivateError> {
         // Only observation/lock acquisition is cancellable here. Once native
@@ -627,26 +695,22 @@ impl RemoteOwner {
             .stop_runtime_logout_cleanup(&receipt)
             .await
             .map_err(broker_error)?;
-        timeout_at(
+        let interrupted = timeout_at(
             recovery_deadline,
             coordinator.check_logout_covers_pending_switch(&receipt),
         )
         .await
         .map_err(|_| PrivateError::RecoveryRequired)?
         .map_err(|_| PrivateError::RecoveryRequired)?;
-        match self
-            .control(
-                ControlV1::CompleteLogout {
-                    lease,
-                    receipt: receipt.clone(),
-                },
-                deadline,
-            )
-            .await?
-        {
-            ControlAckV1::Done => {}
-            _ => return Err(PrivateError::RecoveryRequired),
-        }
+        self.complete_logout_under_lease(
+            broker,
+            lease,
+            &receipt,
+            interrupted.as_ref(),
+            legacy,
+            deadline,
+        )
+        .await?;
         coordinator
             .retire_logout_journal(&receipt)
             .await
@@ -656,6 +720,76 @@ impl RemoteOwner {
             .await
             .map_err(broker_error)
     }
+
+    pub(super) async fn complete_logout_under_lease(
+        &self,
+        broker: &AuthBroker,
+        lease: PreparedLease,
+        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+        interrupted: Option<&nelomai_client_storage::RuntimeCleanupSnapshotV1>,
+        legacy: Option<&dyn LegacyRuntimeRecords>,
+        deadline: Instant,
+    ) -> Result<(), PrivateError> {
+        let legacy = if Self::legacy_cleanup_target(self.profile.platform, &self.binding.target) {
+            Some(legacy.ok_or(PrivateError::RecoveryRequired)?)
+        } else {
+            None
+        };
+        let (child, retained) = if let Some(legacy) = legacy {
+            let plan = broker
+                .with_completed_runtime_logout(receipt, || {
+                    self.live(deadline - AUTH_REPLY_MARGIN)
+                        .map_err(|_| BrokerError::Cancelled)?;
+                    legacy.prepare_logout(receipt, interrupted)
+                })
+                .await
+                .map_err(broker_error)?;
+            (plan.child, plan.retained)
+        } else {
+            (LegacyLogoutChild::Complete(receipt.clone()), Vec::new())
+        };
+        match child {
+            LegacyLogoutChild::Complete(receipt) => {
+                if !matches!(
+                    self.control(ControlV1::CompleteLogout { lease, receipt }, deadline)
+                        .await?,
+                    ControlAckV1::Done
+                ) {
+                    return Err(PrivateError::RecoveryRequired);
+                }
+            }
+            LegacyLogoutChild::Verify(expected) => {
+                if !matches!(
+                    self.control(
+                        ControlV1::CleanupSourceSnapshot {
+                            lease,
+                            scope: expected.auth_scope.clone(),
+                        },
+                        deadline,
+                    )
+                    .await?,
+                    ControlAckV1::CleanupSnapshot { snapshot } if snapshot == expected
+                ) {
+                    return Err(PrivateError::RecoveryRequired);
+                }
+            }
+        }
+        if let Some(legacy) = legacy {
+            broker
+                .with_completed_runtime_logout(receipt, || {
+                    self.live(deadline - AUTH_REPLY_MARGIN)
+                        .map_err(|_| BrokerError::Cancelled)?;
+                    for snapshot in &retained {
+                        legacy.complete_cleanup(snapshot)?;
+                    }
+                    Ok(())
+                })
+                .await
+                .map_err(broker_error)?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn request(
         &self,
         broker: &AuthBroker,

@@ -1,4 +1,4 @@
-name: Windows build
+name: Windows checks and diagnostics
 
 on:
   workflow_dispatch:
@@ -62,7 +62,7 @@ jobs:
         run: ./scripts/windows/check-toolchain-download.ps1
   build:
     if: ${{ !inputs.download_diagnostics_only && !inputs.startup_diagnostics }}
-    name: Windows x86_64
+    name: Windows x86_64 checks
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -90,27 +90,6 @@ jobs:
           ./scripts/windows/test-member-file-operations.ps1
           cargo test --target x86_64-pc-windows-msvc -p nelomai-windows-service
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Подготовить системную часть
+      - name: Где собрать установщик
         shell: pwsh
-        run: |
-          cargo build --release --target x86_64-pc-windows-msvc -p nelomai-windows-service
-          ./scripts/windows/prepare-runtime.ps1
-      - name: Собрать NSIS
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
-        run: |
-          npm run tauri build -- \
-            --target x86_64-pc-windows-msvc \
-            --config src-tauri/bundle.windows.conf.json \
-            --bundles nsis
-      - uses: actions/upload-artifact@v4
-        with:
-          name: nelomai-windows-x86_64
-          path: |
-            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig
-          if-no-files-found: error
-          retention-days: 3
+        run: Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value 'Установщик Windows собирается через release.yml. Для подписанного кандидата без публикации выберите sign_candidate.'

@@ -768,17 +768,17 @@ impl SwitchCoordinator {
     pub(crate) async fn check_logout_covers_pending_switch(
         &self,
         receipt: &CompletedRuntimeLogoutV1,
-    ) -> Result<(), SwitchError> {
+    ) -> Result<Option<RuntimeCleanupSnapshotV1>, SwitchError> {
         let Some(journal) = self
             .snapshot()?
             .filter(|journal| journal.phase != SwitchPhase::Complete)
         else {
-            return Ok(());
+            return Ok(None);
         };
         if !self.logout_covers_journal(receipt, &journal).await? {
             return Err(SwitchError::RecoveryRequired);
         }
-        Ok(())
+        Ok(journal.runtime_snapshot)
     }
 
     async fn logout_covers_journal(

@@ -8,6 +8,7 @@ use crate::resource_usage::ResourceSnapshot;
 use nelomai_client_api::{DiagnosticRuntimeIdentity, DiagnosticUploadRequest};
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
 use nelomai_client_tunnel::TunnelMetrics;
+use nelomai_contracts::ProbeFailureCode;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -302,6 +303,10 @@ struct TunnelMetricsLogRecord<'a> {
     handshake_age_seconds: Option<u64>,
     probe_succeeded: Option<bool>,
     latency_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_failure_code: Option<&'a ProbeFailureCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -489,7 +494,8 @@ impl AppDiagnostics {
         operation_id: &str,
         sample: &TunnelMetrics,
         previous: Option<&TunnelMetrics>,
-        probe_result: Option<Option<u32>>,
+        probe_result: Option<&Result<u32, ProbeFailureCode>>,
+        request_id: Option<&str>,
     ) {
         let timestamp_unix = now_unix();
         let now_millis = timestamp_unix.max(0) as u64 * 1_000;
@@ -511,8 +517,10 @@ impl AppDiagnostics {
             handshake_age_seconds: sample
                 .latest_handshake_epoch_millis
                 .map(|handshake| now_millis.saturating_sub(handshake) / 1_000),
-            probe_succeeded: probe_result.map(|result| result.is_some()),
-            latency_ms: probe_result.flatten(),
+            probe_succeeded: probe_result.map(Result::is_ok),
+            latency_ms: probe_result.and_then(|result| result.as_ref().ok().copied()),
+            probe_failure_code: probe_result.and_then(|result| result.as_ref().err()),
+            request_id,
         };
         self.append_serialized(&record);
     }
@@ -2078,22 +2086,49 @@ mod tests {
             probe_target: None,
         };
 
-        diagnostics.record_tunnel_metrics("session-1", &sample, Some(&previous), Some(Some(42)));
+        diagnostics.record_tunnel_metrics(
+            "session-1",
+            &sample,
+            Some(&previous),
+            Some(&Ok(42)),
+            Some("probe-success"),
+        );
+        diagnostics.record_tunnel_metrics(
+            "session-2",
+            &sample,
+            None,
+            Some(&Err(ProbeFailureCode::Timeout)),
+            Some("probe-timeout"),
+        );
+        diagnostics.record_tunnel_metrics("session-3", &sample, None, None, None);
 
         let report = diagnostics
             .build_report(ResourceSnapshot::capture_for_test())
             .unwrap();
-        let record = report
+        let records: Vec<_> = report
             .application_log
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .find(|record| record["kind"] == "tunnel.data_plane_snapshot")
-            .unwrap();
+            .filter(|record| record["kind"] == "tunnel.data_plane_snapshot")
+            .collect();
+        assert_eq!(records.len(), 3);
+        let [record, failed, skipped] = records.as_slice() else {
+            unreachable!()
+        };
         assert_eq!(record["received_delta_bytes"], 45);
         assert_eq!(record["sent_delta_bytes"], 15);
         assert_eq!(record["latest_handshake_epoch_millis"], 1);
         assert_eq!(record["probe_succeeded"], true);
         assert_eq!(record["latency_ms"], 42);
+        assert!(record.get("probe_failure_code").is_none());
+        assert_eq!(record["request_id"], "probe-success");
+        assert_eq!(failed["probe_succeeded"], false);
+        assert_eq!(failed["latency_ms"], serde_json::Value::Null);
+        assert_eq!(failed["probe_failure_code"], "timeout");
+        assert_eq!(failed["request_id"], "probe-timeout");
+        assert_eq!(skipped["probe_succeeded"], serde_json::Value::Null);
+        assert!(skipped.get("probe_failure_code").is_none());
+        assert!(skipped.get("request_id").is_none());
         let _ = fs::remove_dir_all(directory);
     }
 

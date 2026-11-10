@@ -269,7 +269,7 @@ async fn remote_cleanup_rebinds_only_after_broker_generation_changes() {
     let access = fixture.broker.access_token(None).await.unwrap();
     fixture
         .parent
-        .complete_runtime_cleanup(&fixture.broker, &frozen, &access)
+        .complete_runtime_cleanup(&fixture.broker, &frozen, &access, None)
         .await
         .unwrap();
     let current = fixture.record.cleanup_snapshot().unwrap();
@@ -290,6 +290,618 @@ async fn remote_cleanup_rebinds_only_after_broker_generation_changes() {
 }
 
 #[tokio::test]
+async fn stable_0311_admission_replays_after_redundant_source_cleanup() {
+    check_stable_0311_cleanup(
+        Platform::Macos,
+        RuntimeSlot::Latest,
+        None,
+        true,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_admission_replays_after_redundant_source_cleanup_linux() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        None,
+        true,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_replays_before_target_binding() {
+    check_stable_0311_cleanup(
+        Platform::Windows,
+        RuntimeSlot::Latest,
+        Some(RuntimeSlot::Stable),
+        true,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_replays_before_server_resume() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        Some(RuntimeSlot::Latest),
+        true,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_clears_ordinary_latest_source() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        Some(RuntimeSlot::Stable),
+        false,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_clears_same_namespace_after_cancel_resume() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Stable,
+        Some(RuntimeSlot::Stable),
+        false,
+        LegacyDebt::None,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_keeps_fence_with_unrelated_retained_debt() {
+    for target_fenced in [true, false] {
+        check_stable_0311_cleanup(
+            Platform::Linux,
+            RuntimeSlot::Latest,
+            Some(RuntimeSlot::Stable),
+            false,
+            LegacyDebt::Retained,
+            target_fenced,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn stable_0311_logout_keeps_pending_switch_with_unrelated_selected_debt() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        Some(RuntimeSlot::Latest),
+        false,
+        LegacyDebt::Selected,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_logout_keeps_pending_switch_with_unbound_selected_split_debt() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        Some(RuntimeSlot::Stable),
+        false,
+        LegacyDebt::SelectedSplit,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stable_0311_unscoped_handoff_and_resume_preserve_retained_debt() {
+    check_stable_0311_cleanup(
+        Platform::Linux,
+        RuntimeSlot::Latest,
+        None,
+        false,
+        LegacyDebt::UnscopedRetained,
+        true,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegacyDebt {
+    None,
+    Retained,
+    Selected,
+    SelectedSplit,
+    UnscopedRetained,
+}
+
+async fn check_stable_0311_cleanup(
+    platform: Platform,
+    source_slot: RuntimeSlot,
+    logout: Option<RuntimeSlot>,
+    with_pair: bool,
+    unrelated_debt: LegacyDebt,
+    target_fenced: bool,
+) {
+    use nelomai_client_core::RuntimeWriterQuiescence;
+
+    struct LegacyChild {
+        inventory: RuntimeRecordInventory<ProtectedRuntimeStore<Record>>,
+        stable: Arc<RuntimeRecordOwner<ProtectedRuntimeStore<Record>>>,
+        fail_completion: std::sync::atomic::AtomicBool,
+    }
+    impl ScopeAdmission for LegacyChild {
+        fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), PrivateError> {
+            self.inventory.check_scope(scope)
+        }
+        fn bind_empty_scope(
+            &self,
+            scope: &RuntimeAuthScope,
+            writers: &RuntimeWriterQuiescence,
+        ) -> Result<(), PrivateError> {
+            self.inventory.bind_empty_scope(scope, writers)
+        }
+        fn cleanup_snapshot_for(
+            &self,
+            scope: Option<&RuntimeAuthScope>,
+        ) -> Result<RuntimeCleanupSnapshotV1, PrivateError> {
+            self.inventory.cleanup_snapshot_for(scope)
+        }
+        fn complete_cleanup(
+            &self,
+            snapshot: &RuntimeCleanupSnapshotV1,
+            scope: &RuntimeAuthScope,
+            writers: &RuntimeWriterQuiescence,
+        ) -> Result<(), PrivateError> {
+            // The exact 0.3.11 parser rejects this field before calling admission.
+            assert!(serde_json::to_value(snapshot)
+                .unwrap()
+                .get("redundant_session_ids")
+                .is_none());
+            if self.fail_completion.swap(false, Ordering::SeqCst) {
+                return Err(PrivateError::RecoveryRequired);
+            }
+            self.inventory.complete_cleanup(snapshot, scope, writers)
+        }
+        fn complete_logout(
+            &self,
+            receipt: &CompletedRuntimeLogoutV1,
+            writers: &RuntimeWriterQuiescence,
+        ) -> Result<(), PrivateError> {
+            use crate::{RuntimeAdmission, RuntimeCacheAdmission};
+
+            // 0.3.11 knows only the supplied selected namespace here. It
+            // rejects an identified receipt while the target is unbound
+            // and still fenced, unlike current RuntimeCacheAdmission.
+            let snapshot = self.stable.cleanup_snapshot().unwrap();
+            if receipt.source.identity.as_ref().is_some_and(|identity| {
+                identity.slot != snapshot.slot
+                    || identity.runtime_version != snapshot.runtime_version
+                    || (snapshot.auth_scope.is_none() && snapshot.cleanup_only)
+            }) {
+                return Err(PrivateError::RecoveryRequired);
+            }
+            RuntimeCacheAdmission::new(self.stable.clone())
+                .complete_logout(receipt, writers)
+                .map_err(|_| PrivateError::RecoveryRequired)
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let stable_paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.3.11").unwrap();
+    let same_namespace = source_slot == RuntimeSlot::Stable;
+    let source_paths = if same_namespace {
+        stable_paths.clone()
+    } else {
+        RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.4.2").unwrap()
+    };
+    let target = RuntimeTarget {
+        container_version: "0.4.2".into(),
+        runtime_version: "0.3.11".into(),
+        runtime_contract_version: 1,
+        runtime_slot: RuntimeSlot::Stable,
+    };
+    let auth_store = Arc::new(ProtectedAuthStore::new(Record::default()));
+    let mut auth = AuthStoreV1::from_legacy(&StoredAuth::new_install());
+    auth.access_token = Some("synthetic-access".into());
+    auth.refresh_token = Some("synthetic-refresh".into());
+    let source_identity = RuntimeTarget {
+        runtime_version: source_paths.runtime_version().into(),
+        runtime_slot: source_slot,
+        ..target.clone()
+    }
+    .identity(Some(8))
+    .unwrap();
+    auth.confirmed_identity = Some(source_identity.clone());
+    auth.session_generation = Some(8);
+    auth_store.save(&auth).unwrap();
+    let unscoped = unrelated_debt == LegacyDebt::UnscopedRetained;
+    let (api, bootstrap) = if unscoped {
+        auth.confirmed_identity = None;
+        auth.session_generation = None;
+        auth_store.save(&auth).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let router = axum::Router::new().route(
+            "/api/client/v1/bootstrap",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "device": {"id":"device", "name":"fixture", "platform":"linux",
+                        "runtime_version":null, "runtime_contract_version":null,
+                        "runtime_slot":null, "session_generation":null}
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (api, Some(server))
+    } else {
+        (ClientApi::new("http://127.0.0.1:9").unwrap(), None)
+    };
+    let (parent_socket, child_socket) = private_socketpair().unwrap();
+    let parent = RemoteOwner::new(
+        parent_socket,
+        LaunchBinding::fixture(target.clone(), "legacy-stable"),
+        RuntimeClientProfile {
+            platform,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+    )
+    .unwrap();
+    let broker = Arc::new(AuthBroker::new(api, auth_store.clone(), parent.clone()).unwrap());
+    let mut auth = auth_store.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    auth_store.save(&auth).unwrap();
+    let source_backend = Record::default();
+    let source = ProtectedRuntimeStore::new(source_backend.clone(), source_paths.clone());
+    let mut state = RuntimeStateV1::empty(&source_paths, unscoped);
+    state.auth_scope = (!unscoped).then(|| RuntimeAuthScope {
+        auth_epoch: 0,
+        family: auth.broker.as_ref().unwrap().family.clone(),
+        identity: source_identity,
+    });
+    if with_pair {
+        state.desktop_redundancy = Some(
+        serde_json::from_value(serde_json::json!({
+            "runtime_generation": 1, "connection_generation": 1, "start_operation_id": "start",
+            "request_fingerprint": "ab".repeat(32),
+            "connection": {"lease_id":"primary", "session_id":"pair", "layer":"stray",
+                "tic_connection_mode":"personal", "route_mode":"standalone",
+                "status":"connected", "pinned":false, "stopped_at":null},
+            "session": {"session_id":"pair", "state":"ready", "role_generation":1,
+                "membership_generation":1, "virtual_address_v4":"192.0.2.2", "standby_desired":true}
+        }))
+        .unwrap(),
+        );
+    } else {
+        state.saved_connection = Some(StoredConnection {
+            lease_id: "ordinary-lease".into(),
+            pool_id: None,
+            layer: nelomai_contracts::Layer::Stray,
+            tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+            route_mode: nelomai_contracts::RouteMode::Standalone,
+            egress_mode: nelomai_contracts::EgressMode::Ipv4,
+            probe_url: None,
+            kind: StoredConnectionKind::DynamicWarm,
+            configuration: "synthetic".into(),
+            valid_until_unix: Some(1_900_000_000),
+        });
+    }
+    source.save(&state).unwrap();
+    let frozen = state.cleanup_snapshot();
+    let stable = if same_namespace {
+        ProtectedRuntimeStore::new(source_backend.clone(), stable_paths)
+    } else {
+        let store = ProtectedRuntimeStore::new(Record::default(), stable_paths.clone());
+        let mut selected = RuntimeStateV1::empty(&stable_paths, target_fenced);
+        if unrelated_debt == LegacyDebt::Selected {
+            let mut scope = state.auth_scope.clone().unwrap();
+            scope.identity = target.identity(Some(7)).unwrap();
+            selected.auth_scope = Some(scope);
+            selected.saved_connection = Some(state.saved_connection.clone().unwrap());
+        }
+        if unrelated_debt == LegacyDebt::SelectedSplit {
+            selected.applied_split_tunnel.last_full_sync_unix = Some(1);
+        }
+        store.save(&selected).unwrap();
+        store
+    };
+    let stable = RuntimeRecordOwner::new(stable);
+    let old_paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.4.1").unwrap();
+    let old = ProtectedRuntimeStore::new(Record::default(), old_paths.clone());
+    let mut old_state = RuntimeStateV1::empty(&old_paths, false);
+    old_state.auth_scope = state.auth_scope.clone().map(|mut scope| {
+        scope.identity.slot = old_paths.slot();
+        scope.identity.runtime_version = old_paths.runtime_version().into();
+        scope
+    });
+    if unrelated_debt == LegacyDebt::Retained {
+        old_state.saved_connection = Some(state.saved_connection.clone().unwrap());
+    }
+    old.save(&old_state).unwrap();
+    let old = RuntimeRecordOwner::new(old);
+    let _service = parent.serve(broker.clone()).unwrap();
+    let local = CoreLocalStop::new(Arc::new(Tunnel::default()));
+    let child = Arc::new(ChildAdmission::new(
+        "legacy-stable".into(),
+        local.runtime_writer_gates(),
+        Arc::new(LegacyChild {
+            inventory: RuntimeRecordInventory::new(stable.clone(), Vec::new()),
+            stable: stable.clone(),
+            fail_completion: (!unscoped).into(),
+        }),
+    ));
+    let client = PrivateRuntimeAuthClient::new(child_socket, child.clone(), local);
+    let open_source = || ProtectedRuntimeStore::new(source_backend.clone(), source_paths.clone());
+    let legacy = crate::host::LegacyRecords {
+        stable: stable.clone(),
+        retained: (!same_namespace)
+            .then(|| RuntimeRecordOwner::new(open_source()))
+            .into_iter()
+            .chain([old.clone()])
+            .collect(),
+    };
+    if let Some(bootstrap) = bootstrap {
+        let original = broker.transition_source().await.unwrap();
+        bootstrap.abort();
+        assert!(original.identity().is_none());
+        let selected = stable.cleanup_snapshot().unwrap();
+        assert!(selected.cleanup_only);
+        assert_eq!(
+            parent
+                .runtime_cleanup_handoff(&original, Some(&legacy))
+                .await
+                .err(),
+            Some(PrivateError::RecoveryRequired)
+        );
+        assert_eq!(
+            open_source().load().unwrap().unwrap().cleanup_snapshot(),
+            frozen
+        );
+        open_source()
+            .save(&RuntimeStateV1::empty(&source_paths, false))
+            .unwrap();
+        let handoff = parent
+            .runtime_cleanup_handoff(&original, Some(&legacy))
+            .await
+            .unwrap();
+        assert_eq!(handoff.snapshot(), &selected);
+        drop(handoff);
+
+        // An older journal could already contain the unscoped selected
+        // snapshot. A resumed generation must still check the omitted debt.
+        open_source().save(&state).unwrap();
+        auth.confirmed_identity = Some(target.identity(Some(9)).unwrap());
+        auth.session_generation = Some(9);
+        auth_store.save(&auth).unwrap();
+        let access = broker.access_token(None).await.unwrap();
+        assert_eq!(
+            parent
+                .complete_runtime_cleanup(&broker, &selected, &access, Some(&legacy))
+                .await,
+            Err(PrivateError::RecoveryRequired)
+        );
+        assert_eq!(stable.cleanup_snapshot().unwrap(), selected);
+        assert_eq!(
+            open_source().load().unwrap().unwrap().cleanup_snapshot(),
+            frozen
+        );
+        return;
+    }
+    if !same_namespace {
+        let original = broker.transition_source().await.unwrap();
+        let handoff = parent
+            .runtime_cleanup_handoff(&original, Some(&legacy))
+            .await
+            .unwrap();
+        assert_eq!(handoff.snapshot(), &frozen);
+        assert_eq!(
+            open_source().load().unwrap().unwrap().cleanup_snapshot(),
+            frozen
+        );
+        drop(handoff);
+    }
+    if logout != Some(RuntimeSlot::Latest) {
+        auth.confirmed_identity = Some(target.identity(Some(9)).unwrap());
+        auth.session_generation = Some(9);
+        auth_store.save(&auth).unwrap();
+    }
+    if logout.is_some() {
+        let stable_state_before = stable.operational().load().unwrap();
+        let stable_before = stable.cleanup_snapshot().unwrap();
+        let resumed = broker.transition_source().await.unwrap();
+        let receipt = CompletedRuntimeLogoutV1 {
+            operation_id: "11111111-1111-4111-8111-111111111111".into(),
+            source: RuntimeLogoutSourceV1 {
+                auth_epoch: resumed.auth_epoch(),
+                family: resumed.family().into(),
+                identity: resumed.identity().cloned(),
+                device_id: resumed.device_id().into(),
+                scope_fingerprint: resumed.scope_fingerprint().into(),
+            },
+            code: "session_revoked_cleanup_accepted".into(),
+            cleanup_reconcile_operation_id: None,
+        };
+        auth.logout_state = LogoutState::LoggedOut;
+        auth.access_token = None;
+        auth.refresh_token = None;
+        auth.completed_runtime_logout = Some(receipt.clone());
+        auth_store.save(&auth).unwrap();
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = parent.prepare(deadline).await.unwrap();
+        if target_fenced || same_namespace {
+            assert!(parent
+                .control(
+                    ControlV1::CompleteLogout {
+                        lease: lease.clone(),
+                        receipt: receipt.clone(),
+                    },
+                    deadline
+                )
+                .await
+                .is_err());
+        }
+        let mut wrong = receipt.clone();
+        wrong.operation_id = "22222222-2222-4222-8222-222222222222".into();
+        assert!(parent
+            .complete_logout_under_lease(
+                &broker,
+                lease.clone(),
+                &wrong,
+                Some(&frozen),
+                Some(&legacy),
+                deadline
+            )
+            .await
+            .is_err());
+        assert_eq!(stable.cleanup_snapshot().unwrap(), stable_before);
+        assert_eq!(
+            open_source().load().unwrap().unwrap().cleanup_snapshot(),
+            frozen
+        );
+        if unrelated_debt != LegacyDebt::None {
+            let pending = [Some(&frozen)]
+                .into_iter()
+                .chain((unrelated_debt == LegacyDebt::SelectedSplit).then_some(None));
+            for interrupted in pending {
+                assert_eq!(
+                    parent
+                        .complete_logout_under_lease(
+                            &broker,
+                            lease.clone(),
+                            &receipt,
+                            interrupted,
+                            Some(&legacy),
+                            deadline,
+                        )
+                        .await,
+                    Err(PrivateError::RecoveryRequired)
+                );
+            }
+            assert_eq!(stable.operational().load().unwrap(), stable_state_before);
+            assert_eq!(
+                old.cleanup_snapshot().unwrap(),
+                old_state.cleanup_snapshot()
+            );
+            assert_eq!(
+                open_source().load().unwrap().unwrap().cleanup_snapshot(),
+                frozen
+            );
+            assert_eq!(
+                broker.completed_runtime_logout().await.unwrap(),
+                Some(receipt)
+            );
+            return;
+        }
+
+        child.abort(&lease);
+        assert!(parent
+            .complete_logout_under_lease(
+                &broker,
+                lease,
+                &receipt,
+                Some(&frozen),
+                Some(&legacy),
+                deadline,
+            )
+            .await
+            .is_err());
+        assert_eq!(stable.cleanup_snapshot().unwrap(), stable_before);
+        assert_eq!(
+            open_source().load().unwrap().unwrap().cleanup_snapshot(),
+            frozen
+        );
+        let lease = parent.prepare(deadline).await.unwrap();
+        for interrupted in [Some(&frozen), Some(&frozen), None] {
+            parent
+                .complete_logout_under_lease(
+                    &broker,
+                    lease.clone(),
+                    &receipt,
+                    interrupted,
+                    Some(&legacy),
+                    deadline,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(open_source().load().unwrap().unwrap().operationally_empty());
+        let selected = stable.cleanup_snapshot().unwrap();
+        assert!(!selected.cleanup_only);
+        assert!(selected.auth_scope.is_none());
+        assert_eq!(
+            old.cleanup_snapshot().unwrap(),
+            old_state.cleanup_snapshot()
+        );
+        assert_eq!(
+            broker.completed_runtime_logout().await.unwrap(),
+            Some(receipt)
+        );
+        return;
+    }
+    let access = broker.access_token(None).await.unwrap();
+    let mut wrong = frozen.clone();
+    wrong.redundant_session_ids = vec!["other-pair".into()];
+    assert!(parent
+        .complete_runtime_cleanup(&broker, &wrong, &access, Some(&legacy))
+        .await
+        .is_err());
+    assert_eq!(
+        open_source().load().unwrap().unwrap().cleanup_snapshot(),
+        frozen
+    );
+
+    assert_eq!(
+        parent
+            .complete_runtime_cleanup(&broker, &frozen, &access, Some(&legacy))
+            .await,
+        Err(PrivateError::RecoveryRequired)
+    );
+    assert_eq!(
+        open_source().load().unwrap().unwrap().cleanup_snapshot(),
+        frozen
+    );
+    assert!(stable.cleanup_snapshot().unwrap().cleanup_only);
+    parent
+        .complete_runtime_cleanup(&broker, &frozen, &access, Some(&legacy))
+        .await
+        .unwrap();
+    assert!(open_source().load().unwrap().unwrap().operationally_empty());
+    let cleaned: serde_json::Value =
+        serde_json::from_slice(&source_backend.load_record().unwrap().unwrap()).unwrap();
+    assert!(cleaned["payload"].get("desktop_redundancy").is_none());
+    assert_eq!(
+        client
+            .access(None)
+            .await
+            .unwrap()
+            .identity()
+            .session_generation,
+        Some(9)
+    );
+    // Both completed writes are replayable if the journal commit was interrupted.
+    parent
+        .complete_runtime_cleanup(&broker, &frozen, &access, Some(&legacy))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn remote_handoff_closes_admission_until_explicit_recovery() {
     let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
     let mut auth = fixture.auth.load().unwrap().unwrap();
@@ -303,7 +915,7 @@ async fn remote_handoff_closes_admission_until_explicit_recovery() {
     let source = fixture.broker.transition_source().await.unwrap();
     let handoff = fixture
         .parent
-        .runtime_cleanup_handoff(&source)
+        .runtime_cleanup_handoff(&source, None)
         .await
         .unwrap();
     assert_eq!(handoff.snapshot().runtime_version, "0.2.16");

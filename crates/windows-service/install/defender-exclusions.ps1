@@ -12,12 +12,13 @@ function Normalize-LocalPath([string]$value) {
 }
 $installDir = Normalize-LocalPath $env:NELOMAI_DEFENDER_INSTALL_DIR
 $privilegedDir = Normalize-LocalPath $env:NELOMAI_DEFENDER_PRIVILEGED_DIR
+$legacySource = $installDir + '\amneziawg-tunnel.dll'
 $version = '[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?'
 $generation = '(?:\.stage-)?[0-9a-f]{64}-[0-9a-f]{1,31}'
 $sourcePattern = '^' + [regex]::Escape($installDir) + '\\runtime\\engines\\(?:latest|stable)\\' + $version + '\\amneziawg-tunnel\.dll$'
 $enginePattern = '^' + [regex]::Escape($privilegedDir) + '\\releases\\' + $generation + '\\engines\\(?:latest|stable)\\' + $version + '\\amneziawg-tunnel\.dll$'
 function Test-ManagedPath([string]$path) {
-    return ($path -ieq ($installDir + '\amneziawg-tunnel.dll')) -or ($path -imatch $sourcePattern) -or ($path -imatch $enginePattern)
+    return ($path -ieq $legacySource) -or ($path -imatch $sourcePattern) -or ($path -imatch $enginePattern)
 }
 function Get-OwnershipName([string]$path) {
     $hash = [Security.Cryptography.SHA256]::Create()
@@ -75,6 +76,23 @@ switch ($env:NELOMAI_DEFENDER_ACTION) {
         if (-not (Test-ManagedPath $path)) { throw 'Unexpected DLL exclusion path' }
         foreach ($property in (Read-OwnedPaths)) {
             if ($property.Value -ieq $path) { Remove-OwnedPath $property }
+        }
+    }
+    'prune-source' {
+        $latest = $env:NELOMAI_DEFENDER_KEEP_LATEST_VERSION
+        $stable = $env:NELOMAI_DEFENDER_KEEP_STABLE_VERSION
+        if (($latest -notmatch "^$version$") -or ($stable -cne 'none' -and $stable -notmatch "^$version$")) {
+            throw 'Invalid current runtime versions for Defender exclusion pruning'
+        }
+        $keepPaths = @("$installDir\runtime\engines\latest\$latest\amneziawg-tunnel.dll")
+        if ($stable -cne 'none') {
+            $keepPaths += "$installDir\runtime\engines\stable\$stable\amneziawg-tunnel.dll"
+        }
+        foreach ($property in (Read-OwnedPaths)) {
+            if (($property.Value -ieq $legacySource -or $property.Value -imatch $sourcePattern) -and
+                ($keepPaths -inotcontains $property.Value)) {
+                Remove-OwnedPath $property
+            }
         }
     }
     'cleanup' {

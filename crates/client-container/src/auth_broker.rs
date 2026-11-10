@@ -3411,6 +3411,21 @@ impl AuthBroker {
         Ok(self.load()?.completed_runtime_logout)
     }
 
+    pub(crate) async fn with_completed_runtime_logout<T>(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        finish: impl FnOnce() -> Result<T, BrokerError>,
+    ) -> Result<T, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        if auth.completed_runtime_logout.as_ref() != Some(receipt)
+            || auth.logout_state != LogoutState::LoggedOut
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        finish()
+    }
+
     pub(crate) async fn stop_runtime_logout_cleanup(
         &self,
         receipt: &CompletedRuntimeLogoutV1,

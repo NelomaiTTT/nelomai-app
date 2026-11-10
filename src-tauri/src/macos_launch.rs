@@ -76,6 +76,18 @@ impl Drop for Relaunch {
     }
 }
 
+const RESTART_SCRIPT: &str = concat!(
+    "nelomai_wait_count=0; ",
+    "while /bin/kill -0 \"$1\" 2>/dev/null; do ",
+    "[ \"$nelomai_wait_count\" -lt 300 ] || exit 1; ",
+    "/bin/sleep 0.1; nelomai_wait_count=$((nelomai_wait_count + 1)); done; ",
+    // launchd can reap the PID before LaunchServices forgets the old instance.
+    // Reopening by bundle still lets LaunchServices reuse a concurrent manual launch.
+    "for nelomai_attempt in 1 2 3 4 5 6 7 8 9 10; do ",
+    "\"$3\" -a \"$2\" && exit 0; ",
+    "/bin/sleep 0.1; done; exit 1"
+);
+
 pub(crate) fn prepare_restart_after_exit(bundle: &Path) -> io::Result<Relaunch> {
     use std::process::Stdio;
     // The existing owner still holds auth/journal locks. A short-lived helper
@@ -83,16 +95,11 @@ pub(crate) fn prepare_restart_after_exit(bundle: &Path) -> io::Result<Relaunch> 
     // No -n: concurrent user opens must reuse that owner as well.
     let child = Command::new("/bin/sh")
         .arg("-c")
-        .arg(concat!(
-            "nelomai_wait_count=0; ",
-            "while /bin/kill -0 \"$1\" 2>/dev/null; do ",
-            "[ \"$nelomai_wait_count\" -lt 300 ] || exit 1; ",
-            "/bin/sleep 0.1; nelomai_wait_count=$((nelomai_wait_count + 1)); done; ",
-            "exec /usr/bin/open -a \"$2\""
-        ))
+        .arg(RESTART_SCRIPT)
         .arg("nelomai-relaunch")
         .arg(std::process::id().to_string())
         .arg(bundle)
+        .arg("/usr/bin/open")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -134,6 +141,33 @@ mod update_tests {
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     };
+
+    #[test]
+    fn restart_retries_transient_launchservices_failure_after_exit() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let open = root.path().join("open");
+        fs::write(
+            &open,
+            "#!/bin/sh\n[ \"$1\" = -a ] || exit 2\nprintf '%s\\n' \"$2\" >> \"$0.calls\"\n[ \"$(wc -l < \"$0.calls\")\" -ge 2 ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&open, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut previous = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = previous.id();
+        assert!(previous.wait().unwrap().success());
+        let status = Command::new("/bin/sh")
+            .args(["-c", RESTART_SCRIPT, "nelomai-relaunch", &pid.to_string()])
+            .arg("/Test Applications/Nelomai.app")
+            .arg(&open)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            fs::read_to_string(root.path().join("open.calls")).unwrap(),
+            "/Test Applications/Nelomai.app\n/Test Applications/Nelomai.app\n"
+        );
+    }
 
     struct Runtime(Mutex<std::process::Child>);
     impl Runtime {

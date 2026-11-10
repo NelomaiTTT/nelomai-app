@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tarfile
@@ -298,18 +299,32 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
     # Build-only/test trust and release trust must use separate output/cache roots.
     environment["CARGO_TARGET_DIR"] = str(output / "target")
     if platform == "windows":
-        # NSIS needs the NEW recovery code before it overwrites installed files.
-        # Never inherit a caller-selected helper or execute the broken old binary.
-        helper = staged / "dispatcher/1/nelomai-windows-service.exe"
-        if helper.is_symlink() or not helper.is_file():
-            raise ValueError("staged Windows update helper is missing or linked")
-        environment["NELOMAI_WINDOWS_UPDATE_HELPER"] = str(helper.resolve())
-        for variable, name in [("NELOMAI_WINDOWS_UPDATE_MANIFEST", "container-manifest-v1.json"),
-                               ("NELOMAI_WINDOWS_UPDATE_SIGNATURE", "container-manifest-v1.sig")]:
-            metadata = staged / "runtime" / name
-            if metadata.is_symlink() or not metadata.is_file():
-                raise ValueError("staged Windows update metadata is missing or linked")
-            environment[variable] = str(metadata.resolve())
+        # Before extraction NSIS uses the new dispatcher and the exact DLL paths
+        # from the staged container, never inherited build environment values.
+        slots = manifest["slots"]
+        if [slot["slot"] for slot in slots] not in (["latest"], ["latest", "stable"]):
+            raise ValueError("invalid Windows container slots")
+        versions = {"stable": "none"}
+        for slot in slots:
+            name = slot["slot"]
+            version = slot["manifest"]["runtime_version"]
+            if not isinstance(version, str) or len(version) > 64 or not re.fullmatch(
+                r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", version
+            ):
+                raise ValueError(f"invalid Windows Defender DLL version for {name}")
+            versions[name] = version
+        for name, version in versions.items():
+            environment[f"NELOMAI_WINDOWS_AWG_{name.upper()}_VERSION"] = version
+        environment["NELOMAI_WINDOWS_AWG_MANIFEST_VERSIONS"] = "1"
+
+        for variable, path in (
+            ("NELOMAI_WINDOWS_UPDATE_HELPER", staged / "dispatcher/1/nelomai-windows-service.exe"),
+            ("NELOMAI_WINDOWS_UPDATE_MANIFEST", staged / "runtime/container-manifest-v1.json"),
+            ("NELOMAI_WINDOWS_UPDATE_SIGNATURE", staged / "runtime/container-manifest-v1.sig"),
+        ):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"NSIS requires a staged signed Windows container: missing or linked {path}")
+            environment[variable] = str(path.resolve())
     if platform == "linux":
         # Keep the exact output plugin used by Tauri in a known private cache.
         environment["XDG_CACHE_HOME"] = str(output / "tools-cache")

@@ -550,8 +550,11 @@ where
         Ok(options)
     }
 
-    pub async fn probe_connection_latency_ms(&self, probe_url: &str) -> Option<f64> {
-        self.api.probe_latency_ms(probe_url).await
+    pub async fn probe_connection_latency_ms(
+        &self,
+        probe_url: &str,
+    ) -> Result<f64, ProbeFailureCode> {
+        self.api.probe_candidate_latency_ms(probe_url).await
     }
 
     pub async fn probe_fresh_connection_latency_ms(&self, probe_url: &str) -> Option<f64> {

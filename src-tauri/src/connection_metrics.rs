@@ -24,6 +24,22 @@ pub struct ConnectionMetricsResponse {
 }
 
 #[derive(Default)]
+pub(crate) struct ProbeDiagnostics {
+    failure_recorded: bool,
+}
+
+impl ProbeDiagnostics {
+    pub(crate) fn request_id(&self, snapshot_due: bool) -> Option<String> {
+        (snapshot_due || !self.failure_recorded).then(|| uuid::Uuid::new_v4().to_string())
+    }
+
+    pub(crate) fn should_record(&mut self, snapshot_due: bool, failed: bool) -> bool {
+        let first_failure = failed && !std::mem::replace(&mut self.failure_recorded, true);
+        snapshot_due || first_failure
+    }
+}
+
+#[derive(Default)]
 struct SessionMetrics {
     lease_id: String,
     received_offset: u64,
@@ -222,6 +238,25 @@ impl ConnectionMetricsTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_probe_failure_is_recorded_between_snapshots_once_per_session() {
+        let mut diagnostics = ProbeDiagnostics::default();
+        assert!(diagnostics.should_record(true, false));
+        assert!(diagnostics.request_id(false).is_some());
+        assert!(!diagnostics.should_record(false, false));
+        assert!(diagnostics.request_id(false).is_some());
+        assert!(diagnostics.should_record(false, true));
+        assert!(diagnostics.request_id(false).is_none());
+        assert!(!diagnostics.should_record(false, true));
+        assert!(diagnostics.request_id(true).is_some());
+        assert!(diagnostics.should_record(true, true));
+
+        let mut next_session = ProbeDiagnostics::default();
+        assert!(next_session.request_id(true).is_some());
+        assert!(next_session.should_record(true, true));
+        assert!(next_session.request_id(false).is_none());
+    }
 
     #[tokio::test]
     async fn aggregates_session_counters_restarts_and_probe_loss() {

@@ -133,6 +133,52 @@ class ReleaseWorkflowTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 artifact.verify(output, source, digest)
 
+    def test_windows_release_requires_elevated_member_file_gate_before_signing(self):
+        import copy
+        checker = module("release-workflow-check")
+        workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+        checker.assert_windows_release_member_file_gate(workflow)
+        steps = workflow["jobs"]["native_drafts"]["steps"]
+        index = next(index for index, step in enumerate(steps)
+                     if step.get("run") == "./scripts/windows/test-member-file-operations.ps1")
+        for label, mutate in (
+            ("missing", lambda steps: steps.pop(index)),
+            ("different-platform", lambda steps: steps[index].update({"if": "matrix.platform == 'linux'"})),
+            ("masked-failure", lambda steps: steps[index].update({"continue-on-error": True})),
+            ("after-draft", lambda steps: steps.append(steps.pop(index))),
+        ):
+            with self.subTest(mutation=label):
+                changed = copy.deepcopy(workflow)
+                mutate(changed["jobs"]["native_drafts"]["steps"])
+                with self.assertRaisesRegex(RuntimeError, "elevated member file gate"):
+                    checker.assert_windows_release_member_file_gate(changed)
+        for program in (
+            steps[index + 1]["run"].replace("scripts/", "scripts/./"),
+            "npm run tauri build -- --bundles nsis",
+        ):
+            with self.subTest(early_producer=program):
+                early = copy.deepcopy(workflow)
+                early["jobs"]["native_drafts"]["steps"].insert(
+                    index, {"if": "matrix.platform == 'windows'", "shell": "pwsh", "run": program}
+                )
+                with self.assertRaisesRegex(RuntimeError, "elevated member file gate"):
+                    checker.assert_windows_release_member_file_gate(early)
+
+        upload = copy.deepcopy(workflow)
+        upload["jobs"]["native_drafts"]["steps"][-1]["if"] = "always()"
+        with self.assertRaisesRegex(RuntimeError, "elevated member file gate"):
+            checker.assert_windows_release_member_file_gate(upload)
+
+        for label, mutate in (
+            ("no-draft-dependency", lambda sign: sign["needs"].remove("native_drafts")),
+            ("sign-failed-draft", lambda sign: sign.update({"if": f"always() && ({sign['if']})"})),
+        ):
+            with self.subTest(mutation=label):
+                changed = copy.deepcopy(workflow)
+                mutate(changed["jobs"]["sign"])
+                with self.assertRaisesRegex(RuntimeError, "elevated member file gate"):
+                    checker.assert_windows_release_member_file_gate(changed)
+
     def test_member_file_operations_require_explicit_native_gate(self):
         import copy
         checker = module("release-workflow-check")
@@ -174,28 +220,19 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     checker.assert_windows_manual_member_file_gate(changed)
         def earlier_sign_with_decoy(job):
-            sign = next(step for step in job["steps"] if step.get("run", "").startswith("npm run tauri build --"))
-            job["steps"].remove(sign)
             gate_index = next(i for i, step in enumerate(job["steps"]) if gate in step.get("run", "").splitlines())
-            job["steps"].insert(gate_index, sign)
-            job["steps"].insert(-1, {"name": "Собрать NSIS", "run": 'Write-Output "skipped"'})
-        def copied_sign_with_other_name(job):
-            sign = copy.deepcopy(next(step for step in job["steps"] if step.get("run", "").startswith("npm run tauri build --")))
-            sign["name"] = "Сборка до тестов"
-            job["steps"].insert(0, sign)
-        def copied_sign_with_disguised_program(job):
-            copied_sign_with_other_name(job)
-            job["steps"][0]["run"] = "# relocated\n" + job["steps"][0]["run"]
+            job["steps"].insert(gate_index, {"name": "Подготовка", "run": "npm run tauri build -- --bundles nsis"})
+        def disguised_signing_summary(job):
+            job["steps"][-1]["run"] += "\nnpm run tauri build -- --bundles nsis"
         for mutate in (
             earlier_sign_with_decoy,
-            copied_sign_with_other_name,
-            copied_sign_with_disguised_program,
+            disguised_signing_summary,
             lambda job: job["steps"].__setitem__(-1, {"name": "actions/upload-artifact@v4", "run": 'Write-Output "skipped"'}),
             lambda job: job["steps"].append(job["steps"].pop(next(i for i, step in enumerate(job["steps"]) if gate in step.get("run", "").splitlines()))),
             lambda job: [step.update(**{"if": "${{ always() }}"}) for step in job["steps"][-3:]],
             lambda job: job["steps"][-1].update(**{"continue-on-error": True}),
-            lambda job: job["steps"][-1]["with"].update(name="foreign-artifact"),
-            lambda job: job["steps"][-1]["with"].update(path="unverified/*"),
+            lambda job: job["steps"][-1].update(env={"TAURI_SIGNING_PRIVATE_KEY": "unexpected"}),
+            lambda job: job["steps"].append({"uses": "actions/upload-artifact@v4", "with": {"path": "unverified/*"}}),
             lambda job: job["steps"].insert(0, {"uses": "actions/upload-artifact@v4", "with": {"path": "unsigned"}}),
             lambda job: job["steps"].append(dict(manual_suite)),
             lambda job: job.update(**{"continue-on-error": True}),

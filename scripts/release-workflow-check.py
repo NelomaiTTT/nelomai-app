@@ -61,12 +61,12 @@ def assert_windows_manual_member_file_gate(workflow: dict) -> None:
         return result
 
     # No inherited shell/environment or parallel unaudited producer may
-    # bypass the source-bound build's required ordinary/native gates.
+    # bypass the manual native checks or reintroduce an installer producer.
     top_keys = {"on" if key is True else key for key in workflow}
     if (top_keys - {"name"} != {"on", "permissions", "jobs"}
             or set(workflow.get("jobs", {})) != {"startup-diagnostic", "download-diagnostics", "build"}):
         raise RuntimeError("Manual Windows workflow must retain its closed graph without inherited execution overrides")
-    expected_control = {'name': 'Windows build',
+    expected_control = {'name': 'Windows checks and diagnostics',
      'on': {'workflow_dispatch': {'inputs': {'startup_diagnostics': {'description': 'Диагностический '
                                                                                     'Windows-установщик с '
                                                                                     'журналом запуска, без '
@@ -121,7 +121,7 @@ def assert_windows_manual_member_file_gate(workflow: dict) -> None:
                                          'run': './scripts/windows/check-toolchain-download.ps1'}]}}
     if {name: execution_job(job) for name, job in workflow["jobs"].items() if name != "build"} != {
             name: execution_job(job) for name, job in expected_diagnostics.items()}:
-        raise RuntimeError("Manual diagnostic jobs cannot replace or bypass the gated shipping build")
+        raise RuntimeError("Manual Windows workflow must preserve the exact diagnostic jobs")
     job = workflow.get("jobs", {}).get("build", {})
     expected = [
         "./scripts/windows/test-member-file-operations.ps1",
@@ -136,27 +136,13 @@ def assert_windows_manual_member_file_gate(workflow: dict) -> None:
         raise RuntimeError("Manual Windows workflow must run the native gate first and preserve ordinary service test failure")
     index = next(i for i, step in enumerate(job["steps"]) if step is steps[0])
     suffix = job["steps"][index + 1:]
-    expected_suffix = [{'name': 'Подготовить системную часть',
-      'shell': 'pwsh',
-      'run': 'cargo build --release --target x86_64-pc-windows-msvc -p nelomai-windows-service\n'
-             './scripts/windows/prepare-runtime.ps1\n'},
-     {'name': 'Собрать NSIS',
-      'shell': 'bash',
-      'env': {'TAURI_SIGNING_PRIVATE_KEY': '${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}',
-              'TAURI_SIGNING_PRIVATE_KEY_PASSWORD': '${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}',
-              'NELOMAI_UPDATER_PUBLIC_KEY': '${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}'},
-      'run': 'npm run tauri build -- \\\n'
-             '  --target x86_64-pc-windows-msvc \\\n'
-             '  --config src-tauri/bundle.windows.conf.json \\\n'
-             '  --bundles nsis\n'},
-     {'uses': 'actions/upload-artifact@v4',
-      'with': {'name': 'nelomai-windows-x86_64',
-               'path': 'target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe\n'
-                       'target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig\n',
-               'if-no-files-found': 'error',
-               'retention-days': 3}}]
-    # Keep the setup prefix closed too: a renamed/copied signing command
-    # must not execute before the native gate and then be hidden by a decoy.
+    expected_suffix = [{
+        "shell": "pwsh",
+        "run": "Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "
+               "'Установщик Windows собирается через release.yml. "
+               "Для подписанного кандидата без публикации выберите sign_candidate.'",
+    }]
+    # Keep the setup prefix closed too, so no alternate signing step can run.
     expected_prefix = [{'uses': 'actions/checkout@v4', 'with': {'submodules': 'recursive'}},
      {'uses': 'actions/setup-node@v4', 'with': {'node-version-file': '.nvmrc', 'cache': 'npm'}},
      {'name': 'Update Rustup trust before toolchain downloads',
@@ -170,14 +156,103 @@ def assert_windows_manual_member_file_gate(workflow: dict) -> None:
      {'run': 'npm ci'},
      {'name': 'Проверить интерфейс приложения', 'run': 'npm test'}]
     expected_build_mode = {'if': '${{ !inputs.download_diagnostics_only && !inputs.startup_diagnostics }}',
-     'name': 'Windows x86_64',
+     'name': 'Windows x86_64 checks',
      'runs-on': 'windows-2022'}
     if (set(job) - {"name"} != {"if", "runs-on", "steps"}
             or {key: value for key, value in job.items() if key not in {"steps", "name"}} != {
                 key: value for key, value in expected_build_mode.items() if key != "name"}
             or execution_job({"steps": job["steps"][:index]}) != execution_job({"steps": expected_prefix})
             or execution_job({"steps": suffix}) != execution_job({"steps": expected_suffix})):
-        raise RuntimeError("Manual Windows native gate must precede the exact build/sign/upload programs")
+        raise RuntimeError("Manual Windows checks must retain the native gate and leave packaging to release.yml")
+
+
+def assert_windows_release_member_file_gate(workflow: dict) -> None:
+    jobs = workflow["jobs"]
+    draft = jobs["native_drafts"]
+    sign = jobs["sign"]
+    # Allow only the reviewed draft steps. An earlier producer need not use
+    # our packaging script, so matching that script's name is insufficient.
+    expected = yaml.safe_load(r'''
+-
+  uses: "actions/checkout@v7.0.1"
+  with:
+    ref: "${{ inputs.source_sha }}"
+    fetch-depth: 0
+    submodules: "recursive"
+    persist-credentials: false
+- name: "Exact desktop release source before local code"
+  run: |
+    set -euo pipefail
+    test "$GITHUB_EVENT_NAME" = workflow_dispatch
+    test "$GITHUB_REPOSITORY" = NelomaiTTT/nelomai-app
+    test "$GITHUB_REF" = refs/heads/Future/desktop-0.4.0
+    [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+    test "$SOURCE_SHA" = "$GITHUB_SHA"
+    test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+    test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+    test "$RELEASE_VERSION" = 0.4.2
+    python - <<'PY'
+    import os
+    lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
+    if not lines or any(not line.startswith("- ") or not line[2:].strip() for line in lines):
+        raise SystemExit("release_notes: required nonempty bullet list (- пункт)")
+    PY
+-
+  uses: "./.github/actions/release-native-host"
+  with:
+    node24: "true"
+    platform: "${{ matrix.platform }}"
+    target: "${{ matrix.rust_target }}"
+-
+  name: "Exact source before generated inputs"
+  run: |
+    test "$GITHUB_SHA" = "$SOURCE_SHA"
+    test "$RELEASE_VERSION" = 0.4.2
+    python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.2 --mode "$RELEASE_MODE"
+- name: "macOS runtime and Keychain rollback regressions"
+  if: "matrix.platform == 'macos'"
+  run: "python3 scripts/test-macos-rollback.py"
+-
+  run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+-
+  name: "Native final payloads; ephemeral draft signatures only"
+  if: "matrix.platform != 'windows'"
+  run: |
+    python scripts/build-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+      --platform "$PLATFORM" --architecture "$ARCHITECTURE" --public-key "$RUNNER_TEMP/runtime-public.raw" \
+      --output "$RUNNER_TEMP/draft/$PLATFORM" --work "$RUNNER_TEMP/native-work"
+- name: "Windows elevated member file operation tests"
+  if: "matrix.platform == 'windows'"
+  shell: "pwsh"
+  run: ./scripts/windows/test-member-file-operations.ps1
+-
+  name: "Windows native final payloads; ephemeral draft signatures only"
+  if: "matrix.platform == 'windows'"
+  shell: "pwsh"
+  run: |
+    python scripts/build-release-platform.py --mode "$env:RELEASE_MODE" --source-sha "$env:SOURCE_SHA" `
+      --platform "$env:PLATFORM" --architecture "$env:ARCHITECTURE" --public-key "$env:RUNNER_TEMP/runtime-public.raw" `
+      --output "$env:RUNNER_TEMP/draft/$env:PLATFORM" --work "$env:RUNNER_TEMP/native-work"
+-
+  uses: "actions/upload-artifact@v4"
+  with:
+    name: "draft-${{ matrix.platform }}"
+    path: "${{ runner.temp }}/draft/"
+    if-no-files-found: "error"
+    overwrite: true
+    retention-days: 14''')
+    source_guard = ("github.repository == 'NelomaiTTT/nelomai-app' && "
+                    "github.ref == 'refs/heads/Future/desktop-0.4.0' && "
+                    "github.event_name == 'workflow_dispatch' && github.sha == inputs.source_sha")
+    steps = [{key: value for key, value in step.items() if key != "name"}
+             for step in draft["steps"]]
+    expected_steps = [{key: value for key, value in step.items() if key != "name"}
+                      for step in expected]
+    if (steps != expected_steps or "continue-on-error" in draft or "defaults" in draft
+            or workflow.get("defaults", {}).get("run") != {"shell": "bash"}
+            or sign.get("if") != source_guard
+            or set(sign.get("needs", [])) != {"verify", "native_drafts"}):
+        raise RuntimeError("Windows release drafts must pass the elevated member file gate before signing")
 
 
 def assert_windows_factory_jobs(workflow: dict, factory_test: str) -> None:
@@ -481,6 +556,7 @@ def run() -> None:
     factory_test = (ROOT / "crates/windows-service/src/windows/member_carrier_factory_native_tests.rs").read_text()
     assert_windows_factory_jobs(yaml.safe_load(checks_workflow), factory_test)
     assert_windows_manual_member_file_gate(yaml.safe_load(windows_workflow))
+    assert_windows_release_member_file_gate(yaml.safe_load(workflow))
     submodule_entry = subprocess.run(
         ["git", "-C", str(ROOT), "ls-files", "--stage", "vendor/amneziawg-go"],
         check=True,
@@ -543,8 +619,8 @@ def run() -> None:
         "workflow_dispatch:",
         "windows-2022",
         "cargo test --target x86_64-pc-windows-msvc",
-        "prepare-runtime.ps1",
-        "bundle.windows.conf.json",
+        "release.yml",
+        "sign_candidate",
         "actions/upload-artifact@v4",
     ):
         if token not in windows_workflow:

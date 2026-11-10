@@ -197,6 +197,10 @@ jobs:
           python scripts/build-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
             --platform "$PLATFORM" --architecture "$ARCHITECTURE" --public-key "$RUNNER_TEMP/runtime-public.raw" \
             --output "$RUNNER_TEMP/draft/$PLATFORM" --work "$RUNNER_TEMP/native-work"
+      - name: "Windows elevated member file operation tests"
+        if: "matrix.platform == 'windows'"
+        shell: "pwsh"
+        run: ./scripts/windows/test-member-file-operations.ps1
       -
         name: "Windows native final payloads; ephemeral draft signatures only"
         if: "matrix.platform == 'windows'"

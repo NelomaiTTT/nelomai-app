@@ -38,6 +38,12 @@ Var NelomaiDefenderExclusionPath
   IntOp $2 $2 & $0
   System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_EXCLUSION_PATH", t "$NelomaiDefenderExclusionPath") i.r0'
   IntOp $2 $2 & $0
+  !if "${ACTION}" == "prune-source"
+    System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_KEEP_LATEST_VERSION", t "$%NELOMAI_WINDOWS_AWG_LATEST_VERSION%") i.r0'
+    IntOp $2 $2 & $0
+    System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_KEEP_STABLE_VERSION", t "$%NELOMAI_WINDOWS_AWG_STABLE_VERSION%") i.r0'
+    IntOp $2 $2 & $0
+  !endif
   ${If} $2 = 0
     DetailPrint "Unable to prepare managed Defender exclusion environment"
   ${Else}
@@ -148,8 +154,17 @@ Var NelomaiDefenderExclusionPath
   ; Exclude only the AWG runtime DLL, not the application directory. This hook
   ; runs before NSIS extracts files, so real-time protection cannot quarantine
   ; the DLL between extraction and service installation.
-  StrCpy $NelomaiDefenderExclusionPath "$INSTDIR\runtime\engines\latest\0.2.16\amneziawg-tunnel.dll"
-  !insertmacro NelomaiManagedDefender "add"
+  ; NSIS leaves an unset $%...% reference literal. Require the packager marker.
+  !if "$%NELOMAI_WINDOWS_AWG_MANIFEST_VERSIONS%" == "1"
+    StrCpy $NelomaiDefenderExclusionPath "$INSTDIR\runtime\engines\latest\$%NELOMAI_WINDOWS_AWG_LATEST_VERSION%\amneziawg-tunnel.dll"
+    !insertmacro NelomaiManagedDefender "add"
+    !if "$%NELOMAI_WINDOWS_AWG_STABLE_VERSION%" != "none"
+      StrCpy $NelomaiDefenderExclusionPath "$INSTDIR\runtime\engines\stable\$%NELOMAI_WINDOWS_AWG_STABLE_VERSION%\amneziawg-tunnel.dll"
+      !insertmacro NelomaiManagedDefender "add"
+    !endif
+  !else
+    !error "Prepare the staged Windows container and NSIS bundle inputs before compiling"
+  !endif
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -159,6 +174,8 @@ Var NelomaiDefenderExclusionPath
     MessageBox MB_ICONSTOP "Не удалось установить службу подключения Nelomai." /SD IDOK
     Abort
   ${EndIf}
+  ; Common launch and uninstall still verify the source DLLs of this bundle.
+  !insertmacro NelomaiManagedDefender "prune-source"
 
   ; Tauri keeps the original Start menu shortcut during /UPDATE. Refresh
   ; existing shortcuts so Windows Search picks up the current executable icon.
