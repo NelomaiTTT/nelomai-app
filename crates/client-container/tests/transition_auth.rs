@@ -284,6 +284,8 @@ impl TunnelController for SwitchTunnel {
 struct SwitchControl {
     handoffs: AtomicUsize,
     stops: AtomicUsize,
+    reject_stop: AtomicUsize,
+    force_attempts: AtomicUsize,
     completions: AtomicUsize,
     writer_gates: Arc<RuntimeWriterGates>,
     race_writer: AtomicUsize,
@@ -345,6 +347,9 @@ impl RuntimeSwitchControl for SwitchControl {
     ) -> Result<(), BrokerError> {
         assert_eq!(self.writer_acquired.load(Ordering::SeqCst), 0);
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if self.reject_stop.load(Ordering::SeqCst) == 1 {
+            return Err(BrokerError::RecoveryRequired);
+        }
         Ok(())
     }
     async fn force_stop(
@@ -352,6 +357,10 @@ impl RuntimeSwitchControl for SwitchControl {
         _operation_id: &str,
         _snapshot: &RuntimeCleanupSnapshotV1,
     ) -> Result<(), BrokerError> {
+        self.force_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.reject_stop.load(Ordering::SeqCst) == 1 {
+            return Err(BrokerError::RecoveryRequired);
+        }
         panic!("graceful stop must not force")
     }
     async fn complete_cleanup_and_admit(
@@ -3403,6 +3412,67 @@ async fn unknown_legacy_refresh_is_durable_and_never_automatically_resent() {
 }
 
 #[tokio::test]
+async fn inherited_forced_switch_retries_cleanup_without_stopping_the_new_runtime() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let latest =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let stable =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Stable, None).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest.clone())
+        .unwrap()
+        .preserve_startup_runtime()
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    control.reject_stop.store(1, Ordering::SeqCst);
+    assert!(coordinator.request(RuntimeSlot::Stable).await.is_err());
+    let retained = coordinator.snapshot().unwrap().unwrap();
+    assert_eq!(retained.phase(), SwitchPhase::RuntimeStopping);
+    assert_eq!(control.force_attempts.load(Ordering::SeqCst), 1);
+    assert!(!coordinator.status().unwrap().local_stop_confirmed());
+    drop(coordinator);
+
+    // The new Common can launch the same slot/version as the old one. It
+    // still cannot use the prior incarnation's journal to kill this child.
+    let successor = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .preserve_startup_runtime()
+        .unwrap()
+        .attach(broker, control.clone());
+    assert_eq!(
+        successor.startup_engine_source(&stable).unwrap(),
+        Some(latest.clone())
+    );
+    assert_eq!(successor.startup_engine_source(&latest).unwrap(), None);
+    assert!(successor.recover().await.is_err());
+    assert_eq!(successor.snapshot().unwrap().unwrap(), retained);
+    assert_eq!(control.force_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 0);
+
+    control.reject_stop.store(0, Ordering::SeqCst);
+    assert!(matches!(
+        successor.recover().await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    assert!(successor.status().unwrap().local_stop_confirmed());
+    assert_eq!(
+        successor.startup_engine_source(&stable).unwrap(),
+        Some(latest)
+    );
+    assert_eq!(control.stops.load(Ordering::SeqCst), 3);
+    assert_eq!(control.force_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn restart_after_durable_local_stop_does_not_wait_for_server_cleanup() {
     let state = Arc::new(Panel::default());
     state.return_retry.store(1, Ordering::SeqCst);
@@ -3414,6 +3484,8 @@ async fn restart_after_durable_local_stop_does_not_wait_for_server_cleanup() {
     let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
     let active =
         RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let stable =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Stable, None).unwrap());
     let control = Arc::new(SwitchControl::default());
     let coordinator = SwitchCoordinator::open(owner.clone(), manifest.clone())
         .unwrap()
@@ -3458,6 +3530,14 @@ async fn restart_after_durable_local_stop_does_not_wait_for_server_cleanup() {
     assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_err());
     state.hold_reconcile.store(0, Ordering::SeqCst);
     assert_eq!(successor.recover().await.unwrap(), SwitchProgress::Ready);
+    assert_eq!(
+        successor.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::Complete
+    );
+    assert_eq!(
+        successor.startup_engine_source(&stable).unwrap(),
+        Some(active)
+    );
     assert!(nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&successor).is_ok());
     server.abort();
 }

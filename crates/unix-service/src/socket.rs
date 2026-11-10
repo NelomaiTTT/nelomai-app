@@ -4,6 +4,7 @@ use crate::{
     ServiceTunnelBackend, TunnelRequestHandler, MAX_FRAME_SIZE,
 };
 use async_trait::async_trait;
+use nelomai_contracts::dispatcher::{BrokerPolicy, ProcessDispatcher};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -14,6 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DISPATCHER_BUSY: &str = "dispatcher_busy";
 const REQUEST_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
 
 struct RequestWatchdog {
@@ -243,14 +245,26 @@ fn dispatcher_exchange_at(
     request: &nelomai_contracts::dispatcher::DispatcherRequest,
 ) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
     use nelomai_contracts::dispatcher as d;
-    let mut stream = UnixStream::connect(path).map_err(transport_error)?;
+    let mut stream = UnixStream::connect(path).map_err(dispatcher_transport_error)?;
     configure_stream(&stream)?;
     stream
         .write_all(&d::encode_frame(request).map_err(transport_error)?)
-        .map_err(transport_error)?;
-    let frame = d::read_frame(&mut stream, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?;
-    serde_json::from_slice(d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?)
-        .map_err(|_| ServiceError::InvalidRequest)
+        .map_err(dispatcher_transport_error)?;
+    let frame =
+        d::read_frame(&mut stream, d::MAX_DISPATCHER_FRAME).map_err(dispatcher_transport_error)?;
+    let response: d::DispatcherResponse = serde_json::from_slice(
+        d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?,
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    if response.contract_version == 1
+        && !response.ok
+        && !response.running
+        && response.identity.is_none()
+        && response.error.as_deref() == Some(DISPATCHER_BUSY)
+    {
+        return Err(ServiceError::DispatcherBusy);
+    }
+    Ok(response)
 }
 
 #[async_trait]
@@ -433,8 +447,26 @@ fn validate_parent_directory(path: &Path) -> io::Result<()> {
 
 pub fn serve_dispatcher_one(
     listener: &UnixListener,
-    owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+    owner: &Arc<Mutex<ProcessDispatcher>>,
     private: bool,
+) -> Result<(), ServiceError> {
+    serve_dispatcher_connection(listener, owner, private, None)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn serve_dispatcher_lifecycle_one(
+    listener: &UnixListener,
+    owner: &Arc<Mutex<ProcessDispatcher>>,
+    broker: &BrokerPolicy,
+) -> Result<(), ServiceError> {
+    serve_dispatcher_connection(listener, owner, false, Some(broker))
+}
+
+fn serve_dispatcher_connection(
+    listener: &UnixListener,
+    owner: &Arc<Mutex<ProcessDispatcher>>,
+    private: bool,
+    busy_broker: Option<&BrokerPolicy>,
 ) -> Result<(), ServiceError> {
     let (mut stream, _) = listener.accept().map_err(transport_error)?;
     configure_stream(&stream)?;
@@ -446,23 +478,56 @@ pub fn serve_dispatcher_one(
             .as_pathname()
             .and_then(Path::parent)
             .ok_or(ServiceError::InvalidRequest)?;
-        serve_dispatcher_stream(&mut stream, &identity, owner, private, directory)
+        match (
+            serve_dispatcher_stream(&mut stream, &identity, owner, private, directory),
+            busy_broker,
+        ) {
+            (Err(ServiceError::DispatcherBusy), Some(broker)) => {
+                reply_dispatcher_busy(&mut stream, &identity, broker)
+            }
+            (result, _) => result,
+        }
     })();
     watchdog.complete();
     result
 }
 
+fn reply_dispatcher_busy(
+    stream: &mut (impl Read + Write),
+    identity: &ClientIdentity,
+    broker: &BrokerPolicy,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    broker
+        .authorize(&identity.uid.to_string(), &identity.process_path)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+
+    // Drain the authorized request before closing the socket so the peer
+    // receives the negative reply. The retry passes normal dispatch checks.
+    let frame = d::read_frame(stream, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?;
+    let mut response = d::DispatcherResponse::failure();
+    if d::decode_request(&frame).is_ok() {
+        response.error = Some(DISPATCHER_BUSY.into());
+    }
+    let output = d::encode_frame(&response).map_err(transport_error)?;
+    stream.write_all(&output).map_err(transport_error)?;
+    stream.flush().map_err(transport_error)
+}
+
 fn serve_dispatcher_stream(
     stream: &mut (impl Read + Write),
     identity: &ClientIdentity,
-    owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+    owner: &Arc<Mutex<ProcessDispatcher>>,
     private: bool,
     _runtime_directory: &Path,
 ) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
-    let mut dispatcher = owner
-        .try_lock()
-        .map_err(|_| ServiceError::Backend("dispatcher_busy".into()))?;
+    let mut dispatcher = owner.try_lock().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => ServiceError::DispatcherBusy,
+        std::sync::TryLockError::Poisoned(_) => {
+            ServiceError::Backend("dispatcher_lock_poisoned".into())
+        }
+    })?;
     dispatcher
         .authorize_broker(&identity.uid.to_string(), &identity.process_path)
         .map_err(|_| ServiceError::UnauthorizedClient)?;
@@ -563,6 +628,14 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ServiceError> {
         .read_exact(&mut frame[4..])
         .map_err(|_| ServiceError::TruncatedFrame)?;
     Ok(frame)
+}
+
+fn dispatcher_transport_error(error: io::Error) -> ServiceError {
+    match error.kind() {
+        // Unix socket deadlines can surface as EAGAIN (WouldBlock).
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ServiceError::DispatcherTimeout,
+        _ => transport_error(error),
+    }
 }
 
 fn transport_error(error: io::Error) -> ServiceError {
@@ -747,6 +820,56 @@ mod dispatcher_response_tests {
     }
 
     #[test]
+    fn busy_lifecycle_socket_returns_a_retryable_error() {
+        let (root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        let socket = root.path().join("lifecycle.sock");
+        let listener = bind_listener(&socket, unsafe { libc::geteuid() }).unwrap();
+        let guard = owner.lock().unwrap();
+        let expected = guard.layout.identity.clone();
+        let broker = guard.layout.broker.clone();
+        let server_owner = owner.clone();
+        let server = std::thread::spawn(move || {
+            let busy = serve_dispatcher_lifecycle_one(&listener, &server_owner, &broker);
+            serve_dispatcher_lifecycle_one(&listener, &server_owner, &broker).unwrap();
+            busy
+        });
+        let version = d::DispatcherRequest::Version {
+            contract_version: 1,
+        };
+        let busy = dispatcher_exchange_at(&socket, &version);
+        drop(guard);
+
+        let verified = dispatcher_exchange_at(&socket, &version).unwrap();
+        let published = server.join().unwrap();
+        assert!(
+            matches!(busy, Err(ServiceError::DispatcherBusy)),
+            "{busy:?}"
+        );
+        assert!(published.is_ok(), "{published:?}");
+        assert!(verified.ok);
+        assert_eq!(verified.identity, Some(expected));
+        assert!(!root.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    }
+
+    #[test]
+    fn busy_reply_requires_verified_broker_before_reading() {
+        let (_root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        let mut broker = owner.lock().unwrap().layout.broker.clone();
+        let identity = ClientIdentity {
+            uid: unsafe { libc::geteuid() },
+            process_path: broker.executable.clone(),
+        };
+        broker.sha256 = "0".repeat(64);
+        let mut stream = io::Cursor::new(Vec::<u8>::new());
+
+        assert_eq!(
+            reply_dispatcher_busy(&mut stream, &identity, &broker),
+            Err(ServiceError::UnauthorizedClient),
+        );
+        assert!(stream.into_inner().is_empty());
+    }
+
+    #[test]
     fn dispatcher_still_rejects_a_request_while_mutation_owns_state() {
         let (_root, owner) = super::dispatcher_test_support::owned_dispatcher();
         let guard = owner.lock().unwrap();
@@ -761,8 +884,8 @@ mod dispatcher_response_tests {
             .unwrap(),
         );
         assert_eq!(
-            serve_dispatcher_stream(&mut stream, &peer, &owner, false, _root.path()),
-            Err(ServiceError::Backend("dispatcher_busy".into()))
+            serve_dispatcher_stream(&mut stream, &peer, &owner, true, _root.path()),
+            Err(ServiceError::DispatcherBusy)
         );
         assert_eq!(
             stream.position(),

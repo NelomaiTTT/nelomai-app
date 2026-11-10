@@ -391,12 +391,13 @@ async fn timed_out_dispatcher_stop_is_drained_before_retry_ack_and_new_start() {
     })
     .await
     .unwrap();
-    assert!(
+    assert_eq!(
         tokio::time::timeout(Duration::from_secs(7), first)
             .await
             .unwrap()
             .unwrap()
-            .is_err(),
+            .unwrap_err(),
+        ServiceError::DispatcherTimeout,
         "real socket timeout must occur while the dispatcher is still executing Stop"
     );
     assert!(root.path().join(d::ACTIVE_ENGINE_NAME).exists());

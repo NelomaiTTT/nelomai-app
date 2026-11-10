@@ -772,6 +772,57 @@ impl nelomai_client_container::ipc::PrivateBackgroundDispatcher for NoNativeWork
 }
 
 #[cfg(unix)]
+#[test]
+fn windows_runtime_handoff_fences_native_engine_creation_until_restart() {
+    use nelomai_client_container::host::{CommonHost, HostNativePorts};
+
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest_platform(resources.path(), "0.2.16", true, "windows", "x86_64");
+    let host = CommonHost::open(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "windows",
+        "x86_64",
+        Records::default,
+        nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+        nelomai_client_container::RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Windows,
+            platform_version: None,
+            architecture: "x86_64".into(),
+        },
+        HostNativePorts {
+            stop: Arc::new(NoNativeWork),
+            force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+            background: Arc::new(NoNativeWork),
+            updater: None,
+            storage: None,
+            relaunch: None,
+        },
+    )
+    .unwrap();
+    for (selected_slot, pending_slot, blocked) in [
+        (RuntimeSlot::Latest, None, false),
+        (RuntimeSlot::Latest, Some(RuntimeSlot::Stable), true),
+        (RuntimeSlot::Stable, None, true),
+        (RuntimeSlot::Latest, None, false),
+    ] {
+        let selection = SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot,
+            pending_slot,
+        };
+        std::fs::write(
+            selection_path(data.path()),
+            selection.to_persisted_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(host.runtime_switch_blocks_native_start().unwrap(), blocked);
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn common_owner_is_ready_without_loading_product_runtime_and_rejects_foreign_uid() {
     use nelomai_client_container::host::{CommonHost, HostNativePorts, RuntimeAttachRequest};

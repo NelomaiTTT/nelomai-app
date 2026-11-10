@@ -292,6 +292,7 @@ pub struct SwitchCoordinator {
     required_initial_target: Option<nelomai_contracts::RuntimeSlot>,
     fenced_initial_transition: bool,
     stale_initial_completion: Option<String>,
+    inherited_stop_operation: Option<String>,
     initial_transition_satisfied: AtomicBool,
     execution: tokio::sync::Mutex<()>,
 }
@@ -321,6 +322,7 @@ impl SwitchCoordinator {
             required_initial_target: None,
             fenced_initial_transition: false,
             stale_initial_completion: None,
+            inherited_stop_operation: None,
             initial_transition_satisfied: AtomicBool::new(false),
             execution: tokio::sync::Mutex::new(()),
         };
@@ -336,6 +338,54 @@ impl SwitchCoordinator {
         self.broker = Some(broker);
         self.control = Some(control);
         self
+    }
+
+    /// Before launching a new runtime, record the unfinished transition whose
+    /// original child cannot be this owner's newly attached child.
+    pub fn preserve_startup_runtime(mut self) -> Result<Self, SwitchJournalError> {
+        self.inherited_stop_operation = self
+            .snapshot()?
+            .filter(|journal| journal.phase != SwitchPhase::Complete)
+            .map(|journal| journal.operation_id);
+        Ok(self)
+    }
+
+    /// Source eligible for retirement before binding a new Common to the
+    /// destination. Older journals can have a scoped Stop receipt while the
+    /// source engine is still alive, so even Complete may require retirement.
+    pub fn startup_engine_source(
+        &self,
+        target: &RuntimeTarget,
+    ) -> Result<Option<RuntimeTarget>, SwitchJournalError> {
+        let Some(journal) = self.snapshot()? else {
+            return Ok(None);
+        };
+        if &journal.target_identity != target
+            || !self.is_verified_manifest_target(target)
+            || journal.decision == Some(SwitchDecision::Cancel)
+            || journal.decision.is_none() && journal.cancel_requested
+        {
+            return Ok(None);
+        }
+        let Some(snapshot) = journal.runtime_snapshot.as_ref() else {
+            return Ok(None);
+        };
+        if snapshot.slot == target.runtime_slot {
+            return Ok(None);
+        }
+        let Ok(identity) = self.manifest.identity(snapshot.slot, None) else {
+            return Ok(None);
+        };
+        let source = RuntimeTarget::from_identity(&identity);
+        if source.runtime_version != snapshot.runtime_version
+            || journal
+                .source_identity
+                .as_ref()
+                .is_some_and(|identity| RuntimeTarget::from_identity(identity) != source)
+        {
+            return Ok(None);
+        }
+        Ok(Some(source))
     }
 
     pub fn require_initial_transition(mut self, target: nelomai_contracts::RuntimeSlot) -> Self {
@@ -420,11 +470,13 @@ impl SwitchCoordinator {
         if !self.is_verified_manifest_target(active) {
             return Err(SwitchError::RecoveryRequired);
         }
+        // Completion follows the selection write. Read the journal first so
+        // a terminal switch cannot be paired with the previous selection.
+        let journal = self.snapshot()?;
         let selection =
             current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
         let latest = self.manifest.latest();
         let stable = self.manifest.stable();
-        let journal = self.snapshot()?;
         Ok(RuntimeSwitchStatusV1 {
             container_version: self.manifest.manifest().container_version.clone(),
             selected_slot: selection.selected_slot,
@@ -1537,7 +1589,9 @@ impl SwitchCoordinator {
             self.update(|journal| journal.phase = SwitchPhase::CleanupHandedOff)?;
         }
         self.update(|journal| journal.phase = SwitchPhase::RuntimeStopping)?;
-        let forced = if journal.force_stop_requested {
+        let preserve_child =
+            self.inherited_stop_operation.as_deref() == Some(journal.operation_id.as_str());
+        let forced = if journal.force_stop_requested && !preserve_child {
             control.force_stop(&journal.operation_id, snapshot).await?;
             true
         } else {
@@ -1548,6 +1602,10 @@ impl SwitchCoordinator {
             .await
             {
                 Ok(Ok(())) => false,
+                // The previous owner's force intent is not authority to kill
+                // the successor, even if it launched the same slot/version.
+                Ok(Err(error)) if preserve_child => return Err(error.into()),
+                Err(_) if preserve_child => return Err(SwitchError::RecoveryRequired),
                 Ok(Err(_)) | Err(_) => {
                     self.update(|journal| journal.force_stop_requested = true)?;
                     control.force_stop(&journal.operation_id, snapshot).await?;

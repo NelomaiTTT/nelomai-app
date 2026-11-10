@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use nelomai_client_api::{LoginRequest, RuntimeTarget};
 use nelomai_client_core::{CoreError, RuntimeAuthProvider};
 use nelomai_client_storage::BrokerRequestV1;
+use nelomai_contracts::Platform;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
@@ -149,7 +150,7 @@ impl Drop for RemoteOwner {
     }
 }
 
-fn owns_completion(request: &AuthRequestV1) -> bool {
+fn can_start_after_eof(request: &AuthRequestV1) -> bool {
     matches!(
         request,
         AuthRequestV1::Logout { .. }
@@ -157,6 +158,19 @@ fn owns_completion(request: &AuthRequestV1) -> bool {
                 request: crate::host::HostRequestV1::RuntimeRestart
             }
     )
+}
+
+fn owns_completion(request: &AuthRequestV1, platform: Platform) -> bool {
+    can_start_after_eof(request)
+        || (matches!(platform, Platform::Windows | Platform::Linux)
+            && matches!(
+                request,
+                AuthRequestV1::Owner {
+                    request: crate::host::HostRequestV1::RuntimeSelect { .. }
+                        | crate::host::HostRequestV1::RuntimeReady
+                        | crate::host::HostRequestV1::RuntimeCancel
+                }
+            ))
 }
 
 impl RemoteOwner {
@@ -282,9 +296,8 @@ impl RemoteOwner {
         tokio::spawn(async move {
             let slots = Arc::new(Semaphore::new(MAX_PENDING));
             let mut operations = tokio::task::JoinSet::new();
-            // Logout and runtime restart already accepted by this pump own their
-            // bounded completion; peer EOF cannot abort common-owned cleanup or
-            // the owner reload release caused by intentionally stopping runtime.
+            // Accepted owner operations that can intentionally stop runtime
+            // must retain bounded cleanup after the resulting peer EOF.
             let mut continuations = tokio::task::JoinSet::new();
             loop {
                 let (frame, deadline) = tokio::select! { biased;
@@ -306,7 +319,7 @@ impl RemoteOwner {
                         let Ok(permit) = slots.clone().try_acquire_owned() else {
                             break;
                         };
-                        let owns_completion = owns_completion(&request);
+                        let owns_completion = owns_completion(&request, owner.profile.platform);
                         let owner = owner.clone();
                         let broker = broker.clone();
                         let task = async move {
@@ -650,9 +663,9 @@ impl RemoteOwner {
         request: AuthRequestV1,
         deadline: Instant,
     ) -> Result<(), PrivateError> {
-        // Accepted cleanup/restart continuations may outlive EOF. Other requests
-        // never issue after their peer is closed.
-        if !owns_completion(&request) {
+        // A switch may keep running after it closes its own peer, but must
+        // enter the owner while that peer is still live.
+        if !can_start_after_eof(&request) {
             self.live(deadline)?;
         }
         let response = match request {

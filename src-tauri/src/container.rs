@@ -253,9 +253,105 @@ impl NativeStop {
             .await
     }
 }
-#[async_trait::async_trait]
-impl LocalAuthStop for NativeStop {
-    async fn stop_local(&self) -> Result<(), BrokerError> {
+fn verified_native_engine(
+    installation: &nelomai_contracts::dispatcher::Installation,
+    resources: &Path,
+    target: &nelomai_client_api::RuntimeTarget,
+) -> io::Result<nelomai_contracts::dispatcher::EngineIdentity> {
+    let engine = installation.manifest_identity_for(resources, target.runtime_slot)?;
+    if engine.runtime_version != target.runtime_version
+        || engine.runtime_contract_version != target.runtime_contract_version
+        || engine.container_version != target.container_version
+    {
+        return Err(io::Error::other("common native identity mismatch"));
+    }
+    Ok(engine)
+}
+
+#[cfg(any(windows, target_os = "linux", test))]
+fn retire_startup_engine(
+    source: &nelomai_contracts::dispatcher::EngineIdentity,
+    target: &nelomai_contracts::dispatcher::EngineIdentity,
+    mut exchange: impl FnMut(
+        &nelomai_contracts::dispatcher::DispatcherRequest,
+    ) -> io::Result<nelomai_contracts::dispatcher::DispatcherResponse>,
+) -> io::Result<()> {
+    const MAX_RETRIES: usize = 2;
+    // A timed-out Stop can still be running. Each retry rechecks the
+    // dispatcher identity before sending another Stop for the source.
+    for _ in 0..MAX_RETRIES {
+        match retire_startup_engine_once(source, target, &mut exchange) {
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            result => return result,
+        }
+    }
+    retire_startup_engine_once(source, target, exchange)
+}
+
+#[cfg(any(windows, target_os = "linux", test))]
+fn retire_startup_engine_once(
+    source: &nelomai_contracts::dispatcher::EngineIdentity,
+    target: &nelomai_contracts::dispatcher::EngineIdentity,
+    mut exchange: impl FnMut(
+        &nelomai_contracts::dispatcher::DispatcherRequest,
+    ) -> io::Result<nelomai_contracts::dispatcher::DispatcherResponse>,
+) -> io::Result<()> {
+    use nelomai_contracts::dispatcher::DispatcherRequest;
+    if source.manifest_sha256 != target.manifest_sha256 {
+        return Err(io::Error::other("native switch manifest changed"));
+    }
+    let observed = exchange(&DispatcherRequest::Version {
+        contract_version: 1,
+    })?;
+    if !observed.ok || observed.contract_version != 1 {
+        return Err(io::Error::other("native switch identity unavailable"));
+    }
+    if observed.identity.as_ref() == Some(target) {
+        return Ok(());
+    }
+    if observed.identity.as_ref() != Some(source) {
+        return Err(io::Error::other("native switch identity mismatch"));
+    }
+
+    // Even a non-running source can have pending dispatcher cleanup.
+    let stopped = exchange(&DispatcherRequest::Stop {
+        contract_version: 1,
+        identity: source.clone(),
+    })?;
+    if stopped.ok
+        && !stopped.running
+        && stopped.contract_version == 1
+        && stopped.identity.as_ref() == Some(source)
+    {
+        Ok(())
+    } else {
+        Err(io::Error::other("native switch stop receipt unavailable"))
+    }
+}
+
+// Only the installed Common owner calls this under its native operation gate.
+async fn stop_helper_for_exit(
+    tunnel: &NativeController,
+) -> Result<(), nelomai_client_tunnel::TunnelError> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        // Dispatcher Stop cleans the owned pair and waits for the engine to
+        // exit. A scoped Stop alone leaves a reusable engine in the old slot.
+        tunnel.retire_engine().await
+    }
+    #[cfg(target_os = "macos")]
+    {
+        tunnel.stop().await?;
+        tunnel.retire_engine().await?;
+        Ok(())
+    }
+}
+
+impl NativeStop {
+    async fn stop_native(&self, for_transition: bool) -> Result<(), BrokerError> {
         let mut operation = self.operation.clone().lock_owned().await;
         let tunnel = self.tunnel.clone();
         tokio::spawn(async move {
@@ -264,17 +360,12 @@ impl LocalAuthStop for NativeStop {
                 return Err(BrokerError::RecoveryRequired);
             }
             operation.observed_helper_stop = false;
-            tunnel
-                .stop()
-                .await
-                .map_err(|_| BrokerError::RecoveryRequired)?;
-            // Scoped pair cleanup leaves a reusable engine. Common's macOS stop
-            // receipt also requires the dispatcher to retire that engine.
-            #[cfg(target_os = "macos")]
-            tunnel
-                .retire_engine()
-                .await
-                .map_err(|_| BrokerError::RecoveryRequired)?;
+            let result = if for_transition || cfg!(target_os = "macos") {
+                stop_helper_for_exit(&tunnel).await
+            } else {
+                tunnel.stop().await
+            };
+            result.map_err(|_| BrokerError::RecoveryRequired)?;
             operation.observed_helper_stop = true;
             Ok(())
         })
@@ -282,12 +373,23 @@ impl LocalAuthStop for NativeStop {
         .map_err(|_| BrokerError::RecoveryRequired)?
     }
 }
+
+#[async_trait::async_trait]
+impl LocalAuthStop for NativeStop {
+    async fn stop_local(&self) -> Result<(), BrokerError> {
+        self.stop_native(false).await
+    }
+
+    async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
+        self.stop_native(true).await
+    }
+}
 #[async_trait::async_trait]
 impl RuntimeForceStop for NativeStop {
     async fn force_stop(&self, _: &str) -> Result<(), BrokerError> {
         self.exit_owner
             .stop_for_transition(&self.child, async {
-                self.stop_local()
+                self.stop_local_for_transition()
                     .await
                     .map_err(|_| io::Error::other("helper stop receipt unavailable"))
             })
@@ -339,18 +441,9 @@ impl CommonState {
                 }
                 #[cfg(target_os = "macos")]
                 operation.check_request()?;
-                self.stop
-                    .tunnel
-                    .stop()
+                stop_helper_for_exit(&self.stop.tunnel)
                     .await
-                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))?;
-                #[cfg(target_os = "macos")]
-                self.stop
-                    .tunnel
-                    .retire_engine()
-                    .await
-                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))?;
-                Ok(())
+                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))
             },
         )
         .await;
@@ -572,14 +665,33 @@ pub fn run() {
                 )?);
                 startup::stage("native.bind_identity");
                 let target = host.native_target();
-                let engine =
-                    nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?
-                        .manifest_identity_for(&resources.join("runtime"), target.runtime_slot)?;
-                if engine.runtime_version != target.runtime_version
-                    || engine.runtime_contract_version != target.runtime_contract_version
-                    || engine.container_version != target.container_version
-                {
-                    return Err(io::Error::other("common native identity mismatch").into());
+                let runtime_resources = resources.join("runtime");
+                let installation =
+                    nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?;
+                let engine = verified_native_engine(&installation, &runtime_resources, target)?;
+                #[cfg(any(windows, target_os = "linux"))]
+                if let Some(source) = host.coordinator().startup_engine_source(target)? {
+                    let source =
+                        verified_native_engine(&installation, &runtime_resources, &source)?;
+                    #[cfg(windows)]
+                    let exchange = nelomai_windows_service::windows::dispatcher_exchange;
+                    #[cfg(target_os = "linux")]
+                    let exchange = nelomai_unix_service::dispatcher_exchange;
+                    retire_startup_engine(&source, &engine, |request| {
+                        exchange(request).map_err(|error| {
+                            #[cfg(target_os = "linux")]
+                            match error {
+                                nelomai_unix_service::ServiceError::DispatcherTimeout => {
+                                    return io::Error::new(io::ErrorKind::TimedOut, error);
+                                }
+                                nelomai_unix_service::ServiceError::DispatcherBusy => {
+                                    return io::Error::new(io::ErrorKind::WouldBlock, error);
+                                }
+                                _ => {}
+                            }
+                            io::Error::other(error)
+                        })
+                    })?;
                 }
                 native_binding.bind(engine)?;
                 startup::stage("runtime.launch");
@@ -853,10 +965,10 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
             .map_err(|_| io::Error::other("common start rejected"))?;
     }
     let mut operation = state.stop.runtime_operation().await?;
-    // A bound macOS capability query may start an idle engine, so it must
-    // invalidate the same stop receipt and respect the update fence.
+    // A bound capability query can create an engine.
+    // It must share the start fence and cannot reuse an earlier stop receipt.
     if matches!(request, Request::Start { .. } | Request::RebindUdp { .. })
-        || cfg!(target_os = "macos")
+        || cfg!(any(windows, target_os = "linux", target_os = "macos"))
             && (matches!(request, Request::Version { .. })
                 || matches!(&request, Request::Redundant { request, .. } if request.is_start()))
     {
@@ -865,6 +977,11 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
                 .host
                 .native_start_blocked()
                 .map_err(|_| io::Error::other("update state unavailable"))?
+                || (cfg!(any(windows, target_os = "linux"))
+                    && state
+                        .host
+                        .runtime_switch_blocks_native_start()
+                        .map_err(|_| io::Error::other("runtime switch state unavailable"))?)
                 || !runtime_is_alive(state),
         )?;
     }
@@ -1257,6 +1374,163 @@ fn pre_auth_handoff() -> io::Result<bool> {
 
 #[cfg(test)]
 mod lifecycle_tests {
+
+    fn startup_switch_identities() -> (
+        nelomai_contracts::dispatcher::EngineIdentity,
+        nelomai_contracts::dispatcher::EngineIdentity,
+    ) {
+        use nelomai_contracts::{dispatcher as d, RuntimeSlot};
+
+        let target = d::EngineIdentity {
+            slot: RuntimeSlot::Latest,
+            runtime_version: "0.4.2".into(),
+            runtime_contract_version: 1,
+            container_version: "0.4.2".into(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let source = d::EngineIdentity {
+            slot: RuntimeSlot::Stable,
+            runtime_version: "0.3.11".into(),
+            ..target.clone()
+        };
+        (source, target)
+    }
+
+    #[test]
+    fn startup_retires_only_the_verified_source_and_requires_its_stop_ack() {
+        use nelomai_contracts::dispatcher as d;
+        let (source, target) = startup_switch_identities();
+        let mut foreign = source.clone();
+        foreign.manifest_sha256 = "b".repeat(64);
+        for (reported, running, ack, expected_stop, succeeds) in [
+            (
+                &source,
+                true,
+                d::DispatcherResponse::success(source.clone(), false),
+                true,
+                true,
+            ),
+            (
+                &source,
+                false,
+                d::DispatcherResponse::success(source.clone(), false),
+                true,
+                true,
+            ),
+            (
+                &source,
+                true,
+                d::DispatcherResponse::success(source.clone(), true),
+                true,
+                false,
+            ),
+            (
+                &source,
+                true,
+                d::DispatcherResponse::success(target.clone(), false),
+                true,
+                false,
+            ),
+            (&target, true, d::DispatcherResponse::failure(), false, true),
+            (
+                &foreign,
+                true,
+                d::DispatcherResponse::failure(),
+                false,
+                false,
+            ),
+        ] {
+            let mut calls = 0;
+            let result = retire_startup_engine(&source, &target, |request| {
+                calls += 1;
+                match (calls, request) {
+                    (
+                        1,
+                        d::DispatcherRequest::Version {
+                            contract_version: 1,
+                        },
+                    ) => Ok(d::DispatcherResponse::success(reported.clone(), running)),
+                    (
+                        2,
+                        d::DispatcherRequest::Stop {
+                            contract_version: 1,
+                            identity,
+                        },
+                    ) => {
+                        assert_eq!(identity, &source);
+                        Ok(ack.clone())
+                    }
+                    _ => panic!("unexpected dispatcher request"),
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(calls, 1 + usize::from(expected_stop));
+        }
+    }
+
+    #[test]
+    fn startup_stop_rechecks_identity_after_temporary_error() {
+        use nelomai_contracts::dispatcher as d;
+        let (source, target) = startup_switch_identities();
+        let mut foreign = source.clone();
+        foreign.manifest_sha256 = "b".repeat(64);
+
+        for (temporary_error, observed, expected_calls, succeeds) in [
+            (io::ErrorKind::TimedOut, &source, 4, true),
+            (io::ErrorKind::TimedOut, &target, 3, true),
+            (io::ErrorKind::TimedOut, &foreign, 3, false),
+            (io::ErrorKind::WouldBlock, &source, 4, true),
+        ] {
+            let mut calls = 0;
+            let result = retire_startup_engine(&source, &target, |request| {
+                calls += 1;
+                match (calls, request) {
+                    (1, d::DispatcherRequest::Version { .. }) => {
+                        Ok(d::DispatcherResponse::success(source.clone(), true))
+                    }
+                    (2, d::DispatcherRequest::Stop { identity, .. }) => {
+                        assert_eq!(identity, &source);
+                        Err(temporary_error.into())
+                    }
+                    (3, d::DispatcherRequest::Version { .. }) => {
+                        Ok(d::DispatcherResponse::success(observed.clone(), false))
+                    }
+                    (4, d::DispatcherRequest::Stop { identity, .. }) => {
+                        assert_eq!(observed, &source);
+                        assert_eq!(identity, &source);
+                        Ok(d::DispatcherResponse::success(source.clone(), false))
+                    }
+                    _ => panic!("unexpected dispatcher request after timeout"),
+                }
+            });
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(calls, expected_calls);
+        }
+    }
+
+    #[test]
+    fn startup_stop_retries_end_after_repeated_timeouts() {
+        use nelomai_contracts::dispatcher as d;
+        let (source, target) = startup_switch_identities();
+        let mut calls = 0;
+        let error = retire_startup_engine(&source, &target, |request| {
+            calls += 1;
+            match (calls, request) {
+                (1, d::DispatcherRequest::Version { .. }) => {
+                    Ok(d::DispatcherResponse::success(source.clone(), true))
+                }
+                (2, d::DispatcherRequest::Stop { .. })
+                | (3..=4, d::DispatcherRequest::Version { .. }) => {
+                    Err(io::ErrorKind::TimedOut.into())
+                }
+                _ => panic!("startup retry exceeded its request budget"),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(calls, 4);
+    }
+
     use super::*;
     #[cfg(target_os = "macos")]
     #[tokio::test]

@@ -391,6 +391,33 @@ mod selected_transport_tests {
             );
         }
     }
+
+    struct RetireTransport(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl ServiceTransport for RetireTransport {
+        async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
+            if !matches!(request, Request::Stop { .. }) {
+                return Err(ServiceError::Backend("expected dispatcher Stop".into()));
+            }
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Response::success(Some(ServiceTunnelState::Stopped)))
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_an_engine_uses_dispatcher_stop_instead_of_scoped_tunnel_stop() {
+        let tunnel = WindowsTunnelController::new(RetireTransport(Default::default()));
+        tunnel.retire_engine().await.unwrap();
+        assert_eq!(
+            tunnel
+                .transport()
+                .0
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
     #[test]
     fn stop_then_passive_polls_do_not_reopen_the_engine() {
         let identity = dispatcher::EngineIdentity {
@@ -1725,6 +1752,17 @@ impl<T> WindowsTunnelController<T> {
 }
 
 impl<T: ServiceTransport> WindowsTunnelController<T> {
+    /// On Common's bound transport, dispatcher Stop confirms owned cleanup
+    /// and engine exit before it acknowledges retirement.
+    pub async fn retire_engine(&self) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::stop())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Stopped)
+    }
+
     /// Capture the authenticated helper's current scope at command time, never
     /// a GUI-cached session. Failed Status must not authorize a legacy fallback.
     async fn current_redundancy_snapshot(
@@ -1917,12 +1955,7 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         // Authority remains checked by the serialized backend at execution.
         // Do not turn old ordinary cleanup into a Stop of a newer native pair.
-        let response = self
-            .transport
-            .exchange(Request::stop())
-            .await
-            .map_err(to_tunnel_error)?;
-        require_state(response, ServiceTunnelState::Stopped)
+        self.retire_engine().await
     }
 
     async fn status(&self) -> Result<TunnelStatus, TunnelError> {

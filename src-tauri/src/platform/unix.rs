@@ -1,5 +1,9 @@
-use nelomai_contracts::dispatcher::{DispatcherRequest, EngineIdentity, Installation};
-use nelomai_unix_service::{UnixSocketTransport, UnixTunnelController, DEFAULT_SOCKET_PATH};
+use nelomai_contracts::dispatcher::{
+    DispatcherRequest, DispatcherResponse, EngineIdentity, Installation,
+};
+use nelomai_unix_service::{
+    ServiceError, UnixSocketTransport, UnixTunnelController, DEFAULT_SOCKET_PATH,
+};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -29,7 +33,7 @@ pub async fn prepare_tunnel(
     let expected = Installation::production(Path::new("/unused"))
         .and_then(|trust| trust.manifest_identity(&resources.join("runtime")))
         .map_err(|_| tunnel_error("verified_helper_identity_unavailable"))?;
-    if helper_is_current(&expected).await {
+    if helper_is_current(&expected).await? {
         return Ok(());
     }
     #[cfg(target_os = "macos")]
@@ -38,7 +42,7 @@ pub async fn prepare_tunnel(
         let readiness_deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < readiness_deadline {
             sleep(Duration::from_millis(100)).await;
-            if helper_is_current(&expected).await {
+            if helper_is_current(&expected).await? {
                 return Ok(());
             }
         }
@@ -64,7 +68,7 @@ pub async fn prepare_tunnel(
         if Instant::now() >= readiness_deadline {
             break;
         }
-        if helper_is_current(&expected).await {
+        if helper_is_current(&expected).await? {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
@@ -72,23 +76,59 @@ pub async fn prepare_tunnel(
     Err(tunnel_error("service_unavailable"))
 }
 
-async fn helper_is_current(expected: &EngineIdentity) -> bool {
+async fn helper_is_current(
+    expected: &EngineIdentity,
+) -> Result<bool, nelomai_client_tunnel::TunnelError> {
     let expected = expected.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        nelomai_unix_service::dispatcher_exchange(&DispatcherRequest::Version {
-            contract_version: 1,
-        })
-        .is_ok_and(|response| {
-            response.ok
-                && response.contract_version == 1
-                && response.identity.as_ref().is_some_and(|actual| {
-                    actual.manifest_sha256 == expected.manifest_sha256
-                        && actual.container_version == expected.container_version
-                })
+        let retries = if cfg!(target_os = "linux") { 2 } else { 0 };
+        probe_helper(&expected, retries, || {
+            nelomai_unix_service::dispatcher_exchange(&DispatcherRequest::Version {
+                contract_version: 1,
+            })
         })
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(Ok(false))
+}
+
+fn probe_helper(
+    expected: &EngineIdentity,
+    retries: usize,
+    mut version: impl FnMut() -> Result<DispatcherResponse, ServiceError>,
+) -> Result<bool, nelomai_client_tunnel::TunnelError> {
+    let mut response = version();
+    let retryable = |response: &Result<_, ServiceError>| {
+        matches!(
+            response,
+            Err(ServiceError::DispatcherTimeout | ServiceError::DispatcherBusy)
+        )
+    };
+    let recovering = retries > 0 && retryable(&response);
+    if recovering {
+        for _ in 0..retries {
+            if matches!(response, Err(ServiceError::DispatcherBusy)) {
+                thread::sleep(Duration::from_millis(250));
+            }
+            response = version();
+            if !retryable(&response) {
+                break;
+            }
+        }
+    }
+
+    let actual = response
+        .ok()
+        .filter(|response| response.ok && response.contract_version == 1)
+        .and_then(|response| response.identity);
+    match actual {
+        Some(actual) => Ok(actual.manifest_sha256 == expected.manifest_sha256
+            && actual.container_version == expected.container_version),
+        // A busy dispatcher must return a valid identity before startup can
+        // decide whether its installation needs repair.
+        None if recovering => Err(tunnel_error("service_unavailable")),
+        None => Ok(false),
+    }
 }
 
 fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelError> {
@@ -207,6 +247,72 @@ fn tunnel_error(code: &str) -> nelomai_client_tunnel::TunnelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_helper_probe_distinguishes_temporary_errors_from_installation() {
+        let expected = EngineIdentity {
+            slot: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_version: "0.4.2".into(),
+            runtime_contract_version: 1,
+            container_version: "0.4.2".into(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let mut stable = expected.clone();
+        stable.slot = nelomai_contracts::RuntimeSlot::Stable;
+        stable.runtime_version = "0.3.11".into();
+        let mut outdated = expected.clone();
+        outdated.manifest_sha256 = "b".repeat(64);
+        let timeout = Err(ServiceError::DispatcherTimeout);
+        let busy = Err(ServiceError::DispatcherBusy);
+
+        for (responses, outcome) in [
+            (
+                vec![
+                    busy.clone(),
+                    Ok(DispatcherResponse::success(stable.clone(), false)),
+                ],
+                Ok(true),
+            ),
+            (
+                vec![busy.clone(), timeout.clone(), busy],
+                Err(tunnel_error("service_unavailable")),
+            ),
+            (
+                vec![
+                    timeout.clone(),
+                    Ok(DispatcherResponse::success(stable, false)),
+                ],
+                Ok(true),
+            ),
+            (
+                vec![
+                    timeout.clone(),
+                    Ok(DispatcherResponse::success(outdated, false)),
+                ],
+                Ok(false),
+            ),
+            (
+                vec![timeout.clone(), timeout.clone(), timeout.clone()],
+                Err(tunnel_error("service_unavailable")),
+            ),
+            (
+                vec![timeout, Ok(DispatcherResponse::failure())],
+                Err(tunnel_error("service_unavailable")),
+            ),
+            (
+                vec![Err(ServiceError::Backend("helper unavailable".into()))],
+                Ok(false),
+            ),
+        ] {
+            let mut responses = responses.into_iter();
+            let result = probe_helper(&expected, 2, || responses.next().expect("probe budget"));
+            assert_eq!(
+                result.map_err(|error| error.to_string()),
+                outcome.map_err(|error| error.to_string())
+            );
+            assert!(responses.next().is_none());
+        }
+    }
 
     #[test]
     fn installer_wait_has_a_deadline() {

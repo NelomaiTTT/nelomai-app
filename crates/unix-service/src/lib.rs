@@ -24,6 +24,8 @@ use nelomai_client_tunnel::{
 };
 pub use nelomai_contracts::dispatcher;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+pub use socket::serve_dispatcher_lifecycle_one;
 pub use socket::{
     bind_listener, dispatcher_exchange, peer_identity, peer_uid, prepare_runtime_directory,
     recover_dispatcher, serve_dispatcher_one, serve_one, UnixSocketTransport,
@@ -564,6 +566,10 @@ pub enum ServiceError {
     InvalidRequest,
     #[error("IPC client is not authorized")]
     UnauthorizedClient,
+    #[error("dispatcher exchange timed out")]
+    DispatcherTimeout,
+    #[error("dispatcher is busy")]
+    DispatcherBusy,
     #[error("service protocol version is unsupported")]
     UnsupportedProtocol,
     #[error("WireGuard configuration is invalid")]
@@ -579,6 +585,7 @@ impl ServiceError {
             Self::TruncatedFrame => "truncated_frame",
             Self::InvalidRequest => "invalid_request",
             Self::UnauthorizedClient => "unauthorized_client",
+            Self::DispatcherTimeout | Self::DispatcherBusy => "service_unavailable",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::InvalidConfiguration => "invalid_configuration",
             Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),

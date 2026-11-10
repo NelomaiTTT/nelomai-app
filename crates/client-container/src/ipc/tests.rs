@@ -641,24 +641,25 @@ async fn dropping_client_logout_waiter_does_not_abort_already_started_owner_revo
     server.abort();
 }
 
-struct HeldRuntimeRestart {
+struct HeldRuntimeCommand {
+    expected: crate::host::HostRequestV1,
     entered: tokio::sync::Notify,
     stop_checks_complete: tokio::sync::Notify,
     stage: AtomicUsize,
 }
 
 #[async_trait::async_trait]
-impl crate::host::PrivateOwnerCommands for HeldRuntimeRestart {
+impl crate::host::PrivateOwnerCommands for HeldRuntimeCommand {
     async fn dispatch(
         &self,
         _: &RuntimeTarget,
         request: crate::host::HostRequestV1,
         _: Instant,
     ) -> Result<crate::host::HostResponseV1, PrivateError> {
-        assert!(matches!(
-            request,
-            crate::host::HostRequestV1::RuntimeRestart
-        ));
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::to_value(&self.expected).unwrap(),
+        );
         self.stage.store(1, Ordering::SeqCst);
         self.entered.notify_one();
         self.stop_checks_complete.notified().await;
@@ -669,8 +670,36 @@ impl crate::host::PrivateOwnerCommands for HeldRuntimeRestart {
 
 #[tokio::test]
 async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
+    assert_runtime_command_survives_peer_eof(
+        Platform::Android,
+        crate::host::HostRequestV1::RuntimeRestart,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn windows_and_linux_runtime_switch_commands_survive_peer_eof() {
+    use crate::host::HostRequestV1;
+    for platform in [Platform::Windows, Platform::Linux] {
+        for request in [
+            HostRequestV1::RuntimeSelect {
+                slot: RuntimeSlot::Stable,
+            },
+            HostRequestV1::RuntimeCancel,
+            HostRequestV1::RuntimeReady,
+        ] {
+            assert_runtime_command_survives_peer_eof(platform, request).await;
+        }
+    }
+}
+
+async fn assert_runtime_command_survives_peer_eof(
+    platform: Platform,
+    request: crate::host::HostRequestV1,
+) {
     let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
-    let commands = Arc::new(HeldRuntimeRestart {
+    let commands = Arc::new(HeldRuntimeCommand {
+        expected: request.clone(),
         entered: tokio::sync::Notify::new(),
         stop_checks_complete: tokio::sync::Notify::new(),
         stage: AtomicUsize::new(0),
@@ -688,7 +717,7 @@ async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
             "restart-eof",
         ),
         RuntimeClientProfile {
-            platform: Platform::Android,
+            platform,
             platform_version: None,
             architecture: "aarch64".into(),
         },
@@ -699,19 +728,14 @@ async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
     let _service = owner.serve(fixture.broker.clone()).unwrap();
     write_frame(
         &mut runtime_socket,
-        FrameV1::new(
-            42,
-            MessageV1::Request(AuthRequestV1::Owner {
-                request: crate::host::HostRequestV1::RuntimeRestart,
-            }),
-        ),
+        FrameV1::new(42, MessageV1::Request(AuthRequestV1::Owner { request })),
         Instant::now() + REQUEST_BUDGET,
     )
     .await
     .unwrap();
     tokio::time::timeout(Duration::from_secs(1), commands.entered.notified())
         .await
-        .expect("restart must enter common owner dispatch");
+        .expect("command must enter common owner dispatch");
     drop(runtime_socket);
     tokio::time::timeout(Duration::from_secs(1), async {
         while owner.is_connected() {
@@ -728,7 +752,7 @@ async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
         }
     })
     .await
-    .expect("accepted restart must release owner after stop checks despite peer EOF");
+    .expect("accepted command must release owner after stop checks despite peer EOF");
 }
 
 #[derive(Clone, Default)]

@@ -569,7 +569,7 @@ impl RuntimeSwitchControl for HostBridge {
             Ok(peer) => peer.stop_local_for_transition().await,
             Err(_) => Ok(()),
         };
-        let native = self.native.stop.stop_local().await;
+        let native = self.native.stop.stop_local_for_transition().await;
         runtime.and(native)
     }
     async fn force_stop(
@@ -729,6 +729,14 @@ impl CommonHost {
         let mut coordinator = SwitchCoordinator::open(owner.clone(), selection.manifest().clone())
             .map_err(|_| HostError::RecoveryRequired)?
             .attach(broker.clone(), bridge.clone());
+        if matches!(
+            profile.platform,
+            nelomai_contracts::Platform::Windows | nelomai_contracts::Platform::Linux
+        ) {
+            coordinator = coordinator
+                .preserve_startup_runtime()
+                .map_err(|_| HostError::RecoveryRequired)?;
+        }
         if requires_transition {
             // Before launching the child, the owner can prepare an empty
             // runtime for sign-in if there is no pending runtime work.
@@ -852,6 +860,18 @@ impl CommonHost {
         self.updater
             .native_start_blocked()
             .map_err(|_| HostError::RecoveryRequired)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn runtime_switch_blocks_native_start(&self) -> Result<bool, HostError> {
+        let status = self
+            .coordinator
+            .status_for(self.installed.target())
+            .map_err(|_| HostError::RecoveryRequired)?;
+        Ok(status.restart_required()
+            || status
+                .phase
+                .is_some_and(|phase| phase != SwitchPhase::Complete))
     }
 
     #[cfg(not(target_os = "android"))]

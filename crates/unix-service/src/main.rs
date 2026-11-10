@@ -85,6 +85,10 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
     }
     let private = bind_listener(Path::new(DEFAULT_SOCKET_PATH), uid)?;
     let lifecycle = bind_listener(Path::new(DISPATCHER_SOCKET_PATH), uid)?;
+    // The verified broker policy belongs to this installed dispatcher. Keep
+    // a copy for temporary lifecycle replies while the engine lock is held.
+    #[cfg(target_os = "linux")]
+    let broker = dispatcher.layout.broker.clone();
     let dispatcher = Arc::new(Mutex::new(dispatcher));
     let private_owner = Arc::clone(&dispatcher);
     std::thread::spawn(move || {
@@ -104,7 +108,12 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
     });
     let mut failures = 0_u64;
     loop {
-        match serve_dispatcher_one(&lifecycle, &dispatcher, false) {
+        #[cfg(target_os = "linux")]
+        let result =
+            nelomai_unix_service::serve_dispatcher_lifecycle_one(&lifecycle, &dispatcher, &broker);
+        #[cfg(target_os = "macos")]
+        let result = serve_dispatcher_one(&lifecycle, &dispatcher, false);
+        match result {
             Ok(()) => failures = 0,
             Err(error) => {
                 failures = failures.saturating_add(1);
