@@ -2247,6 +2247,36 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun retiredOwnerCannotCommitADurableStartAfterValidation() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val before = store.load()
+        var ownerCurrent = true
+        val result = coordinator(store).beginDispatched(
+            template = template(),
+            expectedGeneration = before.intent.generation,
+            canCommitNewIntent = { true },
+            ownerCurrent = { ownerCurrent },
+            validateNewIntent = { ownerCurrent = false },
+        )
+        assertEquals(AndroidCoordinatorResult.Failure("connection_intent_generation_conflict"), result)
+        assertEquals(before, store.load())
+    }
+
+    @Test
+    fun retirementDuringCommitDisarmsTheExactNewStart() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        var ownerChecks = 0
+        val result = coordinator(store).beginDispatched(
+            template = template(),
+            expectedGeneration = store.load().intent.generation,
+            canCommitNewIntent = { true },
+            ownerCurrent = { ++ownerChecks == 1 },
+        )
+        assertEquals(AndroidCoordinatorResult.Failure("tunnel_start_cancelled"), result)
+        assertFalse(store.load().intent.desiredActive)
+    }
+
+    @Test
     fun capabilityTransportFailureLeavesNoDurableIntentEpisodeOrOperationId() {
         val store = recoveryStore(ServiceRecoveryBackend())
         val operationIds = AtomicInteger(0)
@@ -2900,6 +2930,19 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun stopOnlyNeverArmsStartAndRepeatedCancellationKeepsTheDurableStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        val dispatch = AndroidConnectionIntentDispatchState()
+        assertTrue(coordinator.quickToggle(dispatch, stopOnly = true).quickDispatch() is AndroidQuickToggleDispatch.Stop)
+        assertFalse(dispatch.hasPendingWork())
+        assertTrue(coordinator.cancelCurrentForQuickToggle() is AndroidCoordinatorResult.Accepted)
+        assertTrue(coordinator.cancelCurrent() is AndroidCoordinatorResult.Accepted)
+        assertEquals("legacy_runtime_stop", store.load().intent.retry.pendingAction)
+        assertFalse(store.load().intent.desiredActive)
+    }
+
+    @Test
     fun failedLegacyRuntimeStopRemainsDurableAndRetriesAfterCoordinatorRestart() {
         val backend = ServiceRecoveryBackend()
         val store = recoveryStore(backend)
@@ -3042,7 +3085,7 @@ class NelomaiVpnServiceTest {
     fun lateLegacyStartCallbackCannotRearmQuickOffProjection() {
         assertNull(legacyStartCallbackDesiredActive(false, SessionState.RUNNING))
         assertNull(legacyStartCallbackDesiredActive(false, SessionState.STARTING))
-        assertEquals(true, legacyStartCallbackDesiredActive(true, SessionState.RUNNING))
+        assertNull(legacyStartCallbackDesiredActive(true, SessionState.RUNNING))
         assertEquals(false, legacyStartCallbackDesiredActive(true, SessionState.FAILED))
     }
 
@@ -3107,6 +3150,29 @@ class NelomaiVpnServiceTest {
         assertEquals(cancelledGeneration, stopped.intent.generation)
         assertNull(stopped.intent.retry.pendingAction)
         assertNull(stopped.leaseTransaction)
+    }
+
+    @Test
+    fun legacyQuickCompletionCannotRearmStopCommittedDuringTheCallback() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        QuickDesiredActiveProjection.update(store, true).successIntent()
+        var completed: ((SessionState, Long) -> Unit)? = null
+        serviceWithoutAndroidRuntime().performLegacyBackgroundStart(
+            receiver = null,
+            boundary = LegacyBackgroundStartServiceBoundary(
+                start = { onSuccess, _ -> completed = onSuccess },
+                runtimeState = { SessionState.RUNNING },
+                durableDesiredActive = { store.load().intent.desiredActive },
+                complete = { _, _, desiredActive ->
+                    assertTrue(coordinator(store).cancelCurrentForQuickToggle() is AndroidCoordinatorResult.Accepted)
+                    desiredActive?.let { QuickDesiredActiveProjection.update(store, it).successIntent() }
+                },
+                status = { connectionIntentServiceStatus(store.load()) },
+            ),
+        )
+        requireNotNull(completed)(SessionState.RUNNING, 25)
+        assertFalse(store.load().intent.desiredActive)
+        assertEquals("legacy_runtime_stop", store.load().intent.retry.pendingAction)
     }
 
     @Test
@@ -4778,6 +4844,22 @@ class NelomaiVpnServiceTest {
         assertEquals(0, recoverySchedules)
         assertEquals(1, frameworkStops)
         assertTrue(store.load().intent.desiredActive)
+    }
+
+    @Test
+    fun revokeOfLeaseLessRuntimeJournalsPhysicalStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.setDesiredActive(0, true).successEnvelope()
+        val connection = coordinator(store)
+        val disposition = routeAndroidVpnRevoke(
+            AndroidConnectionIntentDispatchState(), connection, AndroidRuntimeStartDispatchFence(),
+            updateStopping = {}, resumePendingWork = { true }, stopLocalRuntime = true,
+        )
+        assertTrue(disposition.keepForeground)
+        assertEquals("legacy_runtime_stop", store.load().intent.retry.pendingAction)
+        val runtime = ServiceRuntimeFake(running = true, stopResults = ArrayDeque(listOf(true)))
+        assertEquals(AndroidCoordinatorStep.IDLE, connection.runOnce(ServicePanelFake(), runtime))
+        assertFalse(runtime.isRunning())
     }
 
     @Test
@@ -7609,6 +7691,25 @@ class NelomaiVpnServiceTest {
 
         assertTrue(result is AndroidLogoutResult.NotOwned)
         assertFalse(recovery.load().intent.desiredActive)
+    }
+
+    @Test
+    fun logoutWithoutAProvisionedCredentialStillQueuesThePhysicalLegacyStop() {
+        val backend = ServiceRecoveryBackend()
+        val recovery = recoveryStore(backend)
+        QuickDesiredActiveProjection.update(recovery, true).successIntent()
+        val credentials = BackgroundCredentialStore(ServiceRecoveryBackend())
+        val logout = AndroidLogoutCoordinator(credentials, coordinator(recovery))
+
+        assertTrue(logout.begin(stopLocalRuntime = true) is AndroidLogoutResult.NotOwned)
+        assertFalse(recovery.load().intent.desiredActive)
+        assertEquals("legacy_runtime_stop", recovery.load().intent.retry.pendingAction)
+
+        val runtime = ServiceRuntimeFake(running = true)
+        assertEquals(AndroidCoordinatorStep.IDLE,
+            coordinator(recoveryStore(backend)).runOnce(ServicePanelFake(), runtime))
+        assertEquals(1, runtime.stopCalls)
+        assertNull(recovery.load().intent.retry.pendingAction)
     }
 
     @Test

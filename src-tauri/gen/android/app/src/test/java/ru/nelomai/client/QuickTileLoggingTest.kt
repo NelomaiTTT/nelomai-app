@@ -207,12 +207,13 @@ class QuickTileLoggingTest {
         assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
         // Module-internal producer, with real persistence and notifications.
         val type = Class.forName("ru.nelomai.tunnel.QuickTunnelController")
-        val method = type.declaredMethods.single { it.name.startsWith("updateState") && it.parameterCount == 4 }
+        val method = type.declaredMethods.single { it.name.startsWith("updateState") && it.parameterCount == 5 }
         val states = Class.forName("ru.nelomai.tunnel.SessionState").enumConstants
         for ((name, tile) in listOf("STOPPED" to Tile.STATE_INACTIVE,
                 "STARTING" to Tile.STATE_UNAVAILABLE, "RUNNING" to Tile.STATE_ACTIVE)) {
             assertEquals(true, method.invoke(type.getField("INSTANCE").get(null),
-                RuntimeEnvironment.getApplication(), states.single { (it as Enum<*>).name == name }, null, false))
+                RuntimeEnvironment.getApplication(), states.single { (it as Enum<*>).name == name },
+                null, false, { true }))
             // A second SystemUI listening request alone cannot deliver the update.
             handler.sendEmptyMessage(1)
             idle()

@@ -104,17 +104,28 @@ impl<T: TunnelController> CoreLocalStop<T> {
         self.writers.clone()
     }
     pub async fn stop_local(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::SignedOut).await
+        self.stop_local_with_success_phase(Phase::SignedOut, self.tunnel.stop())
+            .await
     }
     pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Ready).await
+        self.stop_local_with_success_phase(Phase::Ready, self.tunnel.stop())
+            .await
     }
     /// A lost owner channel closes admission without revoking persisted auth.
     /// Error does not grant Start or assert that operational cleanup completed.
     pub async fn stop_local_on_disconnect(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Error).await
+        self.stop_local_with_success_phase(Phase::Error, self.tunnel.stop())
+            .await
     }
-    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
+    pub async fn stop_local_on_peer_eof(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Error, self.tunnel.stop_on_owner_eof())
+            .await
+    }
+    async fn stop_local_with_success_phase(
+        &self,
+        success_phase: Phase,
+        stop: impl Future<Output = Result<(), TunnelError>>,
+    ) -> Result<(), CoreError> {
         {
             let mut state = self.state.lock().await;
             // Publish the owner stop with its cancellation epoch so a retired
@@ -126,7 +137,7 @@ impl<T: TunnelController> CoreLocalStop<T> {
                 connection: None,
             };
         }
-        let result = self.tunnel.stop().await;
+        let result = stop.await;
         let mut state = self.state.lock().await;
         if result.is_ok() {
             *state = CoreState {

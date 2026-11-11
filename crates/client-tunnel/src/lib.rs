@@ -486,6 +486,10 @@ pub fn owned_policy_rejection_code(code: &str) -> Option<&str> {
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
+    /// A separately supervised native VPN may verify a replacement owner.
+    async fn stop_on_owner_eof(&self) -> Result<(), TunnelError> {
+        self.stop().await
+    }
     /// Prepare a same-lease local restart, not a user cancellation. Android
     /// replaces the transport at Start so its durable intent stays armed.
     async fn stop_for_restart(&self) -> Result<(), TunnelError> {

@@ -9,9 +9,10 @@ import android.service.quicksettings.TileService
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
+import ru.nelomai.runtime.v1.RuntimeServiceIntents
 
 class NelomaiQuickTileService : TileService() {
-    private val selection by lazy { RuntimeSelectionStore(this) }
+    private val selection by lazy { RuntimeSelectionStore(this, readOffMain = true) }
     private val handler = Handler(Looper.getMainLooper())
     private val pendingDispatches = mutableSetOf<AutoCloseable>()
     private var lastLoggedState: Pair<String?, Int>? = null
@@ -64,11 +65,22 @@ class NelomaiQuickTileService : TileService() {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
+        val vpnOwner = RuntimeProcessSelection.vpnOwnerForStop()
+        if (vpnOwner != null && runCatching {
+                RuntimeAdapters.quick(vpnOwner).desiredActive(applicationContext)
+            }.getOrDefault(false)
+        ) {
+            // This is a Stop of the admitted local VPN, never an offline toggle.
+            runCatching { startService(RuntimeServiceIntents.quickStopVpn(applicationContext)) }
+                .onFailure { updateTile() }
+            finishDispatch(dispatch)
+            return
+        }
         selection.read { result ->
             try {
                 result.onSuccess { selected ->
                     runCatching {
-                        if (RuntimeProcessSelection.needsExit(selected)) { android.os.Process.killProcess(android.os.Process.myPid()); return@onSuccess }
+                        if (rejectWrongRuntime(selected)) return@onSuccess
                         RuntimeProcessSelection.claim(selected)
                         val quick = RuntimeAdapters.quick(selected)
                         if (RuntimeDispatchPolicy.mayToggle(selected, quick.desiredActive(applicationContext)) && quick.toggle(applicationContext)) return@onSuccess
@@ -94,7 +106,7 @@ class NelomaiQuickTileService : TileService() {
             label = getString(R.string.app_name)
             val selected = result.getOrNull()
             val engineState = selected?.let { runCatching {
-                if (RuntimeProcessSelection.needsExit(it)) { android.os.Process.killProcess(android.os.Process.myPid()); return@runCatching null }
+                if (rejectWrongRuntime(it)) return@runCatching null
                 RuntimeProcessSelection.claim(it)
                 RuntimeAdapters.quick(it).state(applicationContext)
             }.getOrNull() }
@@ -113,6 +125,13 @@ class NelomaiQuickTileService : TileService() {
     }
     private fun finishDispatch(dispatch: AutoCloseable) {
         if (pendingDispatches.remove(dispatch)) dispatch.close()
+    }
+
+    private fun rejectWrongRuntime(selected: RuntimeSelectionV1): Boolean {
+        if (!RuntimeProcessSelection.needsExit(selected)) return false
+        // The running dispatcher owns tunnel teardown and durable cancellation.
+        if (!RuntimeProcessSelection.hasVpnOwner()) android.os.Process.killProcess(android.os.Process.myPid())
+        return true
     }
 
     override fun onDestroy() {

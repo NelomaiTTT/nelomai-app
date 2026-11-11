@@ -474,10 +474,12 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeSelection(
 ) -> jstring {
     let result = (|| -> Result<_, ()> {
         let host = host(id)?;
-        let selection = host
+        let (selection, authorization) = host
             .runtime
-            .block_on(host.owner.selection())
+            .block_on(host.owner.android_selection())
             .map_err(|_| ())?;
+        let mut selection = serde_json::to_value(selection).map_err(|_| ())?;
+        selection["vpn_authorization"] = serde_json::to_value(authorization).map_err(|_| ())?;
         let json = serde_json::to_string(&selection).map_err(|_| ())?;
         env.new_string(json).map(|s| s.into_raw()).map_err(|_| ())
     })();

@@ -67,6 +67,7 @@ def generate(root, output):
         value = value.replace(NAMESPACE + '.RuntimeUpdateVisibility', 'ru.nelomai.client.RuntimeUpdateVisibility')
         value = value.replace(NAMESPACE + '.RuntimeSelectionStore', 'ru.nelomai.client.RuntimeSelectionStore')
         value = value.replace(NAMESPACE + '.RuntimeDispatchGuard', 'ru.nelomai.client.RuntimeDispatchGuard')
+        value = value.replace(NAMESPACE + '.RuntimeDispatchPolicy', 'ru.nelomai.client.RuntimeDispatchPolicy')
         value = value.replace(NAMESPACE + '.RuntimeProcessSelection', 'ru.nelomai.client.RuntimeProcessSelection')
         value = value.replace('nelomai_app_lib', 'nelomai_runtime_stable')
         for before, after in [('"wg-go"', '"stable_runtime_wg_go"'), ('"wg"', '"stable_runtime_wg"'), ('"wg-quick"', '"stable_runtime_wg_quick"')]:

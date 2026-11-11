@@ -8,7 +8,15 @@ data class RuntimeSelectionV1(
     val sessionGeneration: Long?,
     val pendingSlot: String?,
     val incarnation: String,
-)
+) {
+    // Binder-only metadata. Keep the existing V1 constructor, equality and
+    // attach identity used by both shipped runtimes.
+    internal var vpnAuthorization: VpnBrokerAuthorization? = null
+    var brokerVerifiedAtUptimeMillis: Long? = null
+        internal set
+}
+
+internal data class VpnBrokerAuthorization(val scope: String?, val blocked: Boolean, val logoutEpoch: Long?)
 
 object RuntimeDispatchPolicy {
     private fun valid(value: RuntimeSelectionV1): Boolean =
@@ -43,6 +51,29 @@ object RuntimeDispatchPolicy {
         loaded: RuntimeSelectionV1,
         result: Result<RuntimeSelectionV1>,
     ): Boolean = result.getOrNull()?.let { mustExitProcess(loaded, it) } == true
+
+    fun mayStartVpn(active: RuntimeSelectionV1): Boolean =
+        mayStart(active) && (active.slot != "latest" ||
+            active.vpnAuthorization?.let { !it.blocked && it.scope != null } != false)
+
+    internal fun sameVpnImage(admitted: RuntimeSelectionV1, active: RuntimeSelectionV1): Boolean =
+        admitted.slot == "latest" && active.slot == admitted.slot &&
+            admitted.runtimeVersion == active.runtimeVersion &&
+            admitted.containerVersion == active.containerVersion
+
+    internal fun mayRetainVpnOwner(admitted: RuntimeSelectionV1, active: RuntimeSelectionV1): Boolean {
+        if (!sameVpnImage(admitted, active) || !valid(active) ||
+            active.vpnAuthorization?.blocked == true ||
+            admitted.sessionGeneration != active.sessionGeneration ||
+            (active.pendingSlot != null && admitted.incarnation != active.incarnation)
+        ) return false
+        val scope = admitted.vpnAuthorization?.scope
+        val currentScope = active.vpnAuthorization?.scope
+        return if (scope != null) scope == currentScope
+        else admitted.incarnation == active.incarnation
+    }
+
+    fun vpnLogoutEpoch(active: RuntimeSelectionV1): Long? = active.vpnAuthorization?.logoutEpoch
 
     fun library(active: RuntimeSelectionV1): String {
         require(valid(active)) { "Invalid verified runtime selection" }

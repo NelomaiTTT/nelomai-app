@@ -216,7 +216,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
     deadline: Instant,
 ) -> Result<FrameV1, PrivateError> {
     timeout_at(deadline, async {
-        let length = reader.read_u32().await.map_err(|_| PrivateError::Closed)? as usize;
+        let length = reader.read_u32().await.map_err(frame_io_error)? as usize;
         if length == 0 || length > MAX_FRAME_BYTES {
             return Err(PrivateError::Protocol);
         }
@@ -224,7 +224,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         reader
             .read_exact(&mut bytes)
             .await
-            .map_err(|_| PrivateError::Closed)?;
+            .map_err(frame_io_error)?;
         let frame: FrameV1 = serde_json::from_slice(&bytes).map_err(|_| PrivateError::Protocol)?;
         if frame.version != 1
             || frame.id == 0
@@ -260,15 +260,24 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
         writer
             .write_u32(bytes.len() as u32)
             .await
-            .map_err(|_| PrivateError::Closed)?;
-        writer
-            .write_all(&bytes)
-            .await
-            .map_err(|_| PrivateError::Closed)?;
-        writer.flush().await.map_err(|_| PrivateError::Closed)
+            .map_err(frame_io_error)?;
+        writer.write_all(&bytes).await.map_err(frame_io_error)?;
+        writer.flush().await.map_err(frame_io_error)
     })
     .await
     .map_err(|_| PrivateError::Timeout)?
+}
+
+fn frame_io_error(error: std::io::Error) -> PrivateError {
+    use std::io::ErrorKind;
+    match error.kind() {
+        ErrorKind::UnexpectedEof
+        | ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::NotConnected => PrivateError::Closed,
+        _ => PrivateError::Service,
+    }
 }
 
 pub(super) fn validate_frame_size(frame: &FrameV1) -> Result<(), PrivateError> {

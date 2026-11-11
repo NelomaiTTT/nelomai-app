@@ -158,6 +158,8 @@ pub enum BrokerAuthState {
 pub struct BrokerObservation {
     pub state: BrokerAuthState,
     pub access: Option<AccessSnapshot>,
+    pub(crate) confirmed_vpn_scope: bool,
+    pub(crate) logout_epoch: Option<u64>,
 }
 
 /// Nonsecret live provenance. This is not launcher or executable authority.
@@ -230,6 +232,9 @@ pub trait LocalAuthStop: Send + Sync {
     /// adapters with shared presentation keep authorization unavailable.
     async fn stop_local_on_disconnect(&self) -> Result<(), BrokerError> {
         self.stop_local().await
+    }
+    async fn stop_local_on_peer_eof(&self) -> Result<(), BrokerError> {
+        self.stop_local_on_disconnect().await
     }
     async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
         self.stop_local().await
@@ -1934,6 +1939,10 @@ impl AuthBroker {
         } else {
             None
         };
+        // Pending refresh or native credential issuance does not change the
+        // locally confirmed owner. This proof never authorizes a broker RPC.
+        let confirmed_vpn_scope = access.is_some()
+            || (state == BrokerAuthState::RecoveryRequired && Self::snapshot(&auth).is_ok());
         Ok((
             ScopeStamp::of(&auth)?,
             BrokerObservation {
@@ -1943,6 +1952,8 @@ impl AuthBroker {
                     state
                 },
                 access,
+                confirmed_vpn_scope,
+                logout_epoch: (auth.logout_state != LogoutState::Active).then_some(auth.auth_epoch),
             },
         ))
     }

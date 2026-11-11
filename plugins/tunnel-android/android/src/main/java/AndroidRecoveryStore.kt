@@ -993,6 +993,7 @@ internal class AndroidRecoveryStore(
 
     fun beginRedundant(
         transaction: AndroidRedundantTransaction,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1001,6 +1002,7 @@ internal class AndroidRecoveryStore(
         if (current.leaseTransaction != null || current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_pending")
         }
+        if (!ownerCurrent()) return@synchronized generationConflict()
         try {
             persist(current.copy(
                 intent = current.intent.copy(
@@ -1269,6 +1271,7 @@ internal class AndroidRecoveryStore(
         expectedGeneration: Long,
         template: AndroidIntentTemplate,
         replay: AndroidStartReplay,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1319,17 +1322,20 @@ internal class AndroidRecoveryStore(
         } catch (_: Throwable) {
             return@synchronized RecoveryStoreResult.Failure("connection_intent_invalid")
         }
+        if (!ownerCurrent()) return@synchronized generationConflict()
         persist(next)
     }
 
     fun setDesiredActive(
         expectedGeneration: Long,
         desiredActive: Boolean,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
+        if (!ownerCurrent()) return@synchronized generationConflict()
         setDesiredActiveLocked(current, desiredActive)
     }
 
@@ -1381,7 +1387,8 @@ internal class AndroidRecoveryStore(
                     desiredActive = desiredActive,
                     retry = AndroidRetryState(
                         pendingAction = "legacy_runtime_stop".takeIf {
-                            leaseLessRuntimeStop && !desiredActive
+                            !desiredActive && (leaseLessRuntimeStop ||
+                                current.intent.retry.pendingAction == "legacy_runtime_stop")
                         },
                     ),
                 ),
@@ -1434,6 +1441,7 @@ internal class AndroidRecoveryStore(
         template: AndroidIntentTemplate,
         replay: AndroidStartReplay,
         stopOperationId: String,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1485,6 +1493,7 @@ internal class AndroidRecoveryStore(
             replay = normalizeReplay(replay),
             localStopPending = false,
         )
+        if (!ownerCurrent()) return@synchronized generationConflict()
         persist(
             current.copy(
                 intent = current.intent.copy(

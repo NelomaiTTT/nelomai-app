@@ -104,7 +104,7 @@ where
                 value = read.read_u8() => match value {
                     Ok(value) => value,
                     Err(error) => {
-                        reader_box.close_with_reason(if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        reader_box.close_with_reason(if super::frame_io_error(error) == PrivateError::Closed {
                             "peer_eof"
                         } else { "read_failed" });
                         break;
@@ -119,9 +119,11 @@ where
                 result = read_frame(&mut prefixed, started + REQUEST_BUDGET) => match result {
                     Ok(frame) => frame,
                     Err(error) => {
-                        reader_box.close_with_reason(if matches!(error, PrivateError::Timeout) {
-                            "read_frame_timeout"
-                        } else { "read_frame_failed" });
+                        reader_box.close_with_reason(match error {
+                            PrivateError::Closed => "peer_eof",
+                            PrivateError::Timeout => "read_frame_timeout",
+                            _ => "read_frame_failed",
+                        });
                         break;
                     }
                 },
@@ -146,8 +148,12 @@ where
                 _ = closed(&mut writer_cancel) => break,
                 result = write_frame(&mut write, item.0, item.1) => result,
             };
-            if result.is_err() {
-                writer_box.close_with_reason("write_frame_failed");
+            if let Err(error) = result {
+                writer_box.close_with_reason(if error == PrivateError::Closed {
+                    "peer_write_closed"
+                } else {
+                    "write_frame_failed"
+                });
                 break;
             }
         }

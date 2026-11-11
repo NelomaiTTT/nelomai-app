@@ -1165,6 +1165,8 @@ impl PrivateRuntimeAuthClient {
             let mut controls = tokio::task::JoinSet::new();
             let mut confirmed_logout = false;
             let mut observed_logout = false;
+            let mut transition_stop = false;
+            let mut peer_eof = false;
             // Causal history, not the current admission latch: an attempted
             // Prepare retires State evidence even before Access/Grant, and
             // expiry cannot make a delayed State authoritative again.
@@ -1172,10 +1174,19 @@ impl PrivateRuntimeAuthClient {
             let mut expiry = tokio::time::interval(Duration::from_millis(10));
             loop {
                 let (frame, deadline) = tokio::select! { biased;
-                    _ = closed(&mut cancel) => break,
+                    _ = closed(&mut cancel) => {
+                        peer_eof = matches!(*cancel.borrow(), Some("peer_eof" | "peer_write_closed"));
+                        break;
+                    },
                     _ = expiry.tick() => { client_child.expire(); continue; },
                     Some(_) = controls.join_next(), if !controls.is_empty() => continue,
-                    frame = incoming.recv() => match frame { Some(frame) => frame, None => break },
+                    frame = incoming.recv() => match frame {
+                        Some(frame) => frame,
+                        None => {
+                            peer_eof = matches!(*cancel.borrow(), Some("peer_eof" | "peer_write_closed"));
+                            break;
+                        }
+                    },
                 };
                 if Instant::now() >= deadline {
                     break;
@@ -1275,6 +1286,7 @@ impl PrivateRuntimeAuthClient {
                                 }
                                 confirmed_logout = false;
                                 observed_logout = false;
+                                transition_stop = false;
                                 admission_seen = true;
                                 if let Some((reply_to, response)) = *response {
                                     if client_pending.finish(reply_to, response).is_err() {
@@ -1330,6 +1342,7 @@ impl PrivateRuntimeAuthClient {
                                 continue;
                             }
                             ControlV1::StopForTransition => {
+                                transition_stop = true;
                                 if controls.len() >= MAX_PENDING {
                                     break;
                                 }
@@ -1367,14 +1380,41 @@ impl PrivateRuntimeAuthClient {
                 }
             }
             client_child.close();
+            if peer_eof {
+                // Keep stop evidence already decoded by the reader. Ordinary
+                // replies cannot grant admission after the transport closes.
+                incoming.close();
+                while let Some((frame, _)) = incoming.recv().await {
+                    match frame.message {
+                        MessageV1::Control(ControlV1::Revoke | ControlV1::Stop) => {
+                            confirmed_logout = true;
+                        }
+                        MessageV1::Control(ControlV1::StopForTransition) => {
+                            transition_stop = true;
+                        }
+                        MessageV1::Control(ControlV1::Prepare { .. }) => {
+                            observed_logout = false;
+                            admission_seen = true;
+                        }
+                        MessageV1::Response(AuthResponseV1::State {
+                            state: RuntimeAuthState::LoggedOut,
+                            ..
+                        }) if !admission_seen => observed_logout = true,
+                        MessageV1::Response(_) | MessageV1::Control(_) => {}
+                        _ => peer_eof = false,
+                    }
+                }
+            }
             client_box.close_with_reason("response_or_control_rejected");
             client_pending.clear();
             controls.abort_all();
-            // Physical stop is independent of held writer guards and is polled
-            // even when the peer disappeared before an explicit Stop command.
+            // Revoke UI admission for every channel loss. Only a clean EOF
+            // can use the platform's separately supervised VPN policy.
             let _ = timeout_at(Instant::now() + REQUEST_BUDGET, async {
                 if confirmed_logout || observed_logout {
                     stop.stop_local().await
+                } else if peer_eof && !transition_stop {
+                    stop.stop_local_on_peer_eof().await
                 } else {
                     stop.stop_local_on_disconnect().await
                 }

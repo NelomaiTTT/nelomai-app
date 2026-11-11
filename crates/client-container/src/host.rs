@@ -8,15 +8,16 @@ use crate::ipc::{
     LaunchBinding, OwnerService, PrivateBackgroundDispatcher, PrivateError, RemoteOwner,
     AUTH_REPLY_MARGIN,
 };
+use crate::switch::SwitchPhase;
 use crate::{
-    AuthBroker, BrokerError, LocalAuthStop, LocalStopReceiptV1, RuntimeCleanupHandoff,
-    RuntimeClientProfile, RuntimeForceStop, RuntimeSwitchControl, SelectionRecovery,
-    SwitchCoordinator, TransitionSourceSnapshot,
+    AuthBroker, BrokerAuthState, BrokerError, LocalAuthStop, LocalStopReceiptV1,
+    RuntimeCleanupHandoff, RuntimeClientProfile, RuntimeForceStop, RuntimeSwitchControl,
+    SelectionRecovery, SwitchCoordinator, TransitionSourceSnapshot,
 };
 use crate::{InstalledRuntimeSelection, SelectionStartupError};
 use nelomai_client_api::{AccessSnapshot, ClientApi, RuntimeTarget};
 use nelomai_client_storage::{ContainerOwnerLock, PreparedRuntimeStorage, ProtectedRecordFactory};
-use nelomai_client_storage::{RuntimeCleanupSnapshotV1, RuntimeStateStore};
+use nelomai_client_storage::{RuntimeAuthScope, RuntimeCleanupSnapshotV1, RuntimeStateStore};
 use nelomai_contracts::RuntimeSlot;
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc};
@@ -147,6 +148,126 @@ pub struct RuntimeBootstrapV1 {
     pub data_root: PathBuf,
     pub runtime_namespaces: Vec<String>,
     pub pending_slot: Option<RuntimeSlot>,
+}
+
+/// Android Binder selection metadata, separate from the runtime attach contract.
+#[derive(Serialize)]
+pub struct AndroidVpnAuthorization {
+    scope: Option<String>,
+    blocked: bool,
+    logout_epoch: Option<u64>,
+}
+
+impl AndroidVpnAuthorization {
+    fn from_observation(
+        state: BrokerAuthState,
+        scope: Option<RuntimeAuthScope>,
+        confirmed_vpn_scope: bool,
+        logout_epoch: Option<u64>,
+        switch_phase: Option<SwitchPhase>,
+    ) -> Self {
+        let blocked = logout_epoch.is_some()
+            || matches!(
+                switch_phase,
+                Some(
+                    SwitchPhase::RuntimeStopping
+                        | SwitchPhase::LocalStopped
+                        | SwitchPhase::ServerReconciling
+                        | SwitchPhase::AuthResuming
+                )
+            )
+            || matches!(
+                state,
+                BrokerAuthState::LogoutPending
+                    | BrokerAuthState::LoggedOut
+                    | BrokerAuthState::AuthenticationOutcomeUnknown
+            );
+        Self {
+            scope: if confirmed_vpn_scope && !blocked {
+                scope.and_then(|scope| crate::auth_broker::digest_json(&scope).ok())
+            } else {
+                None
+            },
+            blocked,
+            logout_epoch,
+        }
+    }
+}
+
+#[cfg(test)]
+mod android_vpn_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn vpn_proof_tracks_auth_scope_and_pending_logout_blocks_admission() {
+        let scope = RuntimeAuthScope {
+            auth_epoch: 4,
+            family: "test-family".into(),
+            identity: nelomai_contracts::RuntimeIdentity {
+                slot: RuntimeSlot::Latest,
+                runtime_version: "0.3.14".into(),
+                runtime_contract_version: 1,
+                container_version: "0.3.14".into(),
+                session_generation: Some(7),
+            },
+        };
+        let active = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::Active,
+            Some(scope.clone()),
+            true,
+            None,
+            None,
+        );
+        let reopened = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::Active,
+            Some(scope.clone()),
+            true,
+            None,
+            Some(SwitchPhase::Complete),
+        );
+        assert!(active.scope.is_some() && !active.blocked);
+        assert_eq!(active.scope, reopened.scope);
+        let refreshing = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::RecoveryRequired,
+            Some(scope.clone()),
+            true,
+            None,
+            None,
+        );
+        assert_eq!(active.scope, refreshing.scope);
+
+        let mut changed = scope;
+        changed.auth_epoch += 1;
+        let pending = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::LogoutPending,
+            Some(changed.clone()),
+            true,
+            Some(changed.auth_epoch),
+            None,
+        );
+        assert!(pending.scope.is_none() && pending.blocked);
+        let authenticated = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::Active,
+            Some(changed),
+            true,
+            None,
+            None,
+        );
+        assert_ne!(active.scope, authenticated.scope);
+    }
+
+    #[test]
+    fn same_slot_update_journal_blocks_vpn_during_local_stop() {
+        let authority = AndroidVpnAuthorization::from_observation(
+            BrokerAuthState::Active,
+            None,
+            true,
+            None,
+            Some(SwitchPhase::RuntimeStopping),
+        );
+        assert!(authority.blocked);
+        assert_eq!(authority.logout_epoch, None);
+    }
 }
 
 impl RuntimeBootstrapV1 {
@@ -958,19 +1079,48 @@ impl CommonHost {
     }
     pub async fn selection(&self) -> Result<RuntimeBootstrapV1, HostError> {
         let (stamp, _) = self.broker.observe_stamped().await?;
-        let generation = stamp.session_generation();
+        self.selection_for_generation(stamp.session_generation())
+            .map(|(selection, _)| selection)
+    }
+
+    pub async fn android_selection(
+        &self,
+    ) -> Result<(RuntimeBootstrapV1, AndroidVpnAuthorization), HostError> {
+        let (stamp, observation) = self.broker.observe_stamped().await?;
+        let scope = stamp.runtime_scope().ok().filter(|scope| {
+            RuntimeTarget::from_identity(&scope.identity) == *self.installed.target()
+        });
+        let (selection, switch_phase) =
+            self.selection_for_generation(stamp.session_generation())?;
+        let authorization = AndroidVpnAuthorization::from_observation(
+            observation.state,
+            scope,
+            observation.confirmed_vpn_scope,
+            observation.logout_epoch,
+            switch_phase,
+        );
+        Ok((selection, authorization))
+    }
+
+    fn selection_for_generation(
+        &self,
+        generation: Option<u64>,
+    ) -> Result<(RuntimeBootstrapV1, Option<SwitchPhase>), HostError> {
         let status = self
             .coordinator
             .status()
             .map_err(|_| HostError::RecoveryRequired)?;
-        Ok(RuntimeBootstrapV1 {
-            target: self.installed.target().clone(),
-            session_generation: generation,
-            incarnation: self.incarnation.clone(),
-            data_root: self.owner.root().to_owned(),
-            runtime_namespaces: self.namespaces.clone(),
-            pending_slot: status.pending_slot,
-        })
+        Ok((
+            RuntimeBootstrapV1 {
+                target: self.installed.target().clone(),
+                session_generation: generation,
+                incarnation: self.incarnation.clone(),
+                data_root: self.owner.root().to_owned(),
+                runtime_namespaces: self.namespaces.clone(),
+                pending_slot: status.pending_slot,
+            },
+            status.phase,
+        ))
     }
     /// Caller UID/PID are supplied by the common non-exported Binder service,
     /// never decoded from the runtime's request. It transfers the endpoint to

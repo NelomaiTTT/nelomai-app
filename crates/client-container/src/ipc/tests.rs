@@ -918,7 +918,7 @@ impl ProtectedRecordStore for Record {
     }
 }
 #[derive(Default)]
-struct Tunnel(AtomicUsize, AtomicUsize, AtomicBool, AtomicBool);
+struct Tunnel(AtomicUsize, AtomicUsize, AtomicBool, AtomicBool, AtomicBool);
 #[async_trait::async_trait]
 impl TunnelController for Tunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
@@ -945,6 +945,13 @@ impl TunnelController for Tunnel {
     }
     async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
         Ok(self.3.load(Ordering::SeqCst))
+    }
+    async fn stop_on_owner_eof(&self) -> Result<(), TunnelError> {
+        if self.4.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            self.stop().await
+        }
     }
 }
 
@@ -1284,18 +1291,248 @@ async fn nlm071_peer_eof_stops_real_core_without_claiming_logout_or_ready() {
 }
 
 #[tokio::test]
+async fn clean_owner_eof_closes_core_admission_without_stopping_a_supervised_tunnel() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    fixture.client.access(None).await.unwrap();
+    fixture.tunnel.4.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        fixture.client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    let before = fixture.tunnel.0.load(Ordering::SeqCst);
+    fixture.parent.revoke_peer();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while core.state().await.phase != Phase::Error {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.tunnel.0.load(Ordering::SeqCst), before);
+    assert!(fixture.client.check_start_barrier().is_err());
+}
+
+#[tokio::test]
+async fn writer_detects_peer_death_without_stopping_a_supervised_tunnel() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), false);
+    let (reader, _keep_read_open) = tokio::io::duplex(8);
+    let (writer, peer) = tokio::io::duplex(8);
+    drop(peer);
+    fixture.tunnel.4.store(true, Ordering::SeqCst);
+    let client = Arc::new(PrivateRuntimeAuthClient::new(
+        tokio::io::join(reader, writer),
+        fixture.child.clone(),
+        fixture.local.clone(),
+    ));
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    let before = fixture.tunnel.0.load(Ordering::SeqCst);
+    let _ = client
+        .request(
+            AuthRequestV1::State,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+    assert_eq!(client.wait_for_channel_close().await, "peer_write_closed");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while core.state().await.phase != Phase::Error {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.tunnel.0.load(Ordering::SeqCst), before);
+    assert!(client.check_start_barrier().is_err());
+}
+
+#[tokio::test]
+async fn truncated_frame_keeps_supervised_tunnel_but_invalid_frame_stops_it() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    for (bytes, physical_stop) in [(vec![0], false), (vec![0; 4], true)] {
+        let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+        let fixture = Fixture::new(api.clone(), false);
+        fixture.tunnel.4.store(true, Ordering::SeqCst);
+        let (mut peer, socket) = tokio::io::duplex(4096);
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            socket,
+            fixture.child.clone(),
+            fixture.local.clone(),
+        ));
+        let core = ClientCore::new(
+            Arc::new(api),
+            Arc::new(fixture.record.operational()),
+            client.clone(),
+            fixture.local.clone(),
+            Arc::new(NoopLogger),
+        );
+        let before = fixture.tunnel.0.load(Ordering::SeqCst);
+        peer.write_all(&bytes).await.unwrap();
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while core.state().await.phase != Phase::Error {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.tunnel.0.load(Ordering::SeqCst) > before,
+            physical_stop
+        );
+        assert!(client.check_start_barrier().is_err());
+    }
+}
+
+#[tokio::test]
+async fn non_eof_io_error_inside_frame_stops_a_supervised_tunnel() {
+    use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct HeaderThenError(bool);
+    impl AsyncRead for HeaderThenError {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.0 {
+                Poll::Ready(Err(io::Error::other("fixture input failure")))
+            } else {
+                self.0 = true;
+                buffer.put_slice(&[0]);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+    let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+    let fixture = Fixture::new(api.clone(), false);
+    fixture.tunnel.4.store(true, Ordering::SeqCst);
+    let client = Arc::new(PrivateRuntimeAuthClient::new(
+        tokio::io::join(HeaderThenError(false), tokio::io::sink()),
+        fixture.child.clone(),
+        fixture.local.clone(),
+    ));
+    let core = ClientCore::new(
+        Arc::new(api),
+        Arc::new(fixture.record.operational()),
+        client.clone(),
+        fixture.local.clone(),
+        Arc::new(NoopLogger),
+    );
+    let before = fixture.tunnel.0.load(Ordering::SeqCst);
+    assert_eq!(client.wait_for_channel_close().await, "read_frame_failed");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while core.state().await.phase != Phase::Error {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(fixture.tunnel.0.load(Ordering::SeqCst) > before);
+}
+
+#[tokio::test]
+async fn buffered_peer_eof_only_stops_supervised_tunnel_for_stop_control() {
+    let messages = [
+        MessageV1::Response(AuthResponseV1::Error {
+            error: PrivateError::RecoveryRequired,
+        }),
+        MessageV1::Control(ControlV1::Prepare {
+            incarnation: "synthetic".into(),
+        }),
+        MessageV1::Control(ControlV1::Stop),
+    ];
+    for message in messages {
+        use nelomai_client_core::{ClientCore, NoopLogger, Phase};
+        let api = ClientApi::new("http://127.0.0.1:9").unwrap();
+        let fixture = Fixture::new(api.clone(), false);
+        let (mut peer, socket) = tokio::io::duplex(4096);
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            socket,
+            fixture.child.clone(),
+            fixture.local.clone(),
+        ));
+        let core = ClientCore::new(
+            Arc::new(api),
+            Arc::new(fixture.record.operational()),
+            client.clone(),
+            fixture.local.clone(),
+            Arc::new(NoopLogger),
+        );
+        fixture.tunnel.4.store(true, Ordering::SeqCst);
+        fixture.local.stop_local_for_transition().await.unwrap();
+        let before = fixture.tunnel.0.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let request = client.request(AuthRequestV1::State, deadline);
+        tokio::pin!(request);
+        poll_pending(request.as_mut()).await;
+        let sent = read_frame(&mut peer, deadline).await.unwrap();
+        let stop_requested = matches!(message, MessageV1::Control(ControlV1::Stop));
+        write_frame(&mut peer, FrameV1::new(sent.id, message), deadline)
+            .await
+            .unwrap();
+        drop(peer);
+        let expected = if stop_requested {
+            Phase::SignedOut
+        } else {
+            Phase::Error
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while core.state().await.phase != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.tunnel.0.load(Ordering::SeqCst) > before,
+            stop_requested
+        );
+        assert!(client.check_start_barrier().is_err());
+    }
+}
+
+#[tokio::test]
 async fn nlm071_delayed_logged_out_observation_cannot_turn_new_access_eof_into_logout() {
-    nlm071_delayed_logged_out(false, false).await;
+    nlm071_delayed_logged_out(false, false, false).await;
 }
 
 #[derive(Clone, Copy)]
 enum Nlm071LogoutEvidenceStage {
     Fresh,
+    BufferedPrepare,
     Prepared,
     Committed,
     DelayedState,
     Revoked,
     Stopped,
+}
+
+#[tokio::test]
+async fn nlm071_logout_evidence_initial_logged_out_buffered_prepare_eof_is_error() {
+    nlm071_logout_evidence_eof(Nlm071LogoutEvidenceStage::BufferedPrepare, false).await;
 }
 
 #[tokio::test]
@@ -1404,7 +1641,7 @@ async fn nlm071_logout_evidence_eof(stage: Nlm071LogoutEvidenceStage, expire: bo
     } else {
         None
     };
-    let login = if matches!(stage, Prepared | Committed | DelayedState) {
+    let login = if matches!(stage, BufferedPrepare | Prepared | Committed | DelayedState) {
         let task = tokio::spawn({
             let client = client.clone();
             async move {
@@ -1459,7 +1696,7 @@ async fn nlm071_logout_evidence_eof(stage: Nlm071LogoutEvidenceStage, expire: bo
         .identity(Some(1))
         .unwrap(),
     };
-    if !matches!(stage, Fresh) {
+    if !matches!(stage, Fresh | BufferedPrepare) {
         write_frame(
             &mut peer,
             FrameV1::new(
@@ -1540,6 +1777,20 @@ async fn nlm071_logout_evidence_eof(stage: Nlm071LogoutEvidenceStage, expire: bo
     let auth_before = fixture.auth.load().unwrap();
     let runtime_before = fixture.record.operational().load().unwrap();
     let stops = fixture.tunnel.0.load(Ordering::SeqCst);
+    if matches!(stage, BufferedPrepare) {
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                901,
+                MessageV1::Control(ControlV1::Prepare {
+                    incarnation: "logout-evidence-child".into(),
+                }),
+            ),
+            deadline,
+        )
+        .await
+        .unwrap();
+    }
     drop(peer);
     if let Some(login) = login {
         assert!(login.await.unwrap().is_err());
@@ -1570,15 +1821,20 @@ async fn nlm071_logout_evidence_eof(stage: Nlm071LogoutEvidenceStage, expire: bo
 
 #[tokio::test]
 async fn nlm071_delayed_logged_out_after_grant_cannot_claim_logout() {
-    nlm071_delayed_logged_out(true, false).await;
+    nlm071_delayed_logged_out(true, false, false).await;
 }
 
 #[tokio::test]
 async fn nlm071_delayed_logged_out_after_grant_and_expired_prepare_cannot_claim_logout() {
-    nlm071_delayed_logged_out(true, true).await;
+    nlm071_delayed_logged_out(true, true, false).await;
 }
 
-async fn nlm071_delayed_logged_out(grant_control: bool, expired_prepare: bool) {
+#[tokio::test]
+async fn grant_after_transition_clears_stop_evidence_for_supervised_tunnel() {
+    nlm071_delayed_logged_out(true, false, true).await;
+}
+
+async fn nlm071_delayed_logged_out(grant_control: bool, expired_prepare: bool, transition: bool) {
     use nelomai_client_core::{ClientCore, NoopLogger, Phase};
     let api = ClientApi::new("http://127.0.0.1:9").unwrap();
     let fixture = Fixture::new(api.clone(), true);
@@ -1607,6 +1863,20 @@ async fn nlm071_delayed_logged_out(grant_control: bool, expired_prepare: bool) {
     fixture.local.stop_local_for_transition().await.unwrap();
     let before = fixture.auth.load().unwrap();
     let deadline = Instant::now() + REQUEST_BUDGET;
+    if transition {
+        write_frame(
+            &mut peer,
+            FrameV1::new(800, MessageV1::Control(ControlV1::StopForTransition)),
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_frame(&mut peer, deadline).await.unwrap().message,
+            MessageV1::Ack(ControlAckV1::Done)
+        ));
+        fixture.tunnel.4.store(true, Ordering::SeqCst);
+    }
     let delayed = tokio::spawn({
         let client = client.clone();
         async move { client.state().await }
@@ -1698,13 +1968,13 @@ async fn nlm071_delayed_logged_out(grant_control: bool, expired_prepare: bool) {
     let stops = fixture.tunnel.0.load(Ordering::SeqCst);
     drop(peer);
     tokio::time::timeout(Duration::from_secs(1), async {
-        while fixture.tunnel.0.load(Ordering::SeqCst) == stops {
+        while core.state().await.phase != Phase::Error {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    assert_eq!(core.state().await.phase, Phase::Error);
+    assert_eq!(fixture.tunnel.0.load(Ordering::SeqCst) > stops, !transition);
     assert!(client.check_start_barrier().is_err());
     assert_eq!(fixture.auth.load().unwrap(), before);
 }

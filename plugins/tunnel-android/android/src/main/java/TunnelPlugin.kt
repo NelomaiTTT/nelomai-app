@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val TUNNEL_API_VERSION = 2
+internal const val TUNNEL_API_VERSION = ru.nelomai.runtime.v1.RuntimeServiceIntents.VPN_API_VERSION
 private const val TUNNEL_NAME = "nelomai"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
 private const val QUICK_TILE_UPDATE = "ru.nelomai.tunnel.QUICK_TILE_UPDATE"
@@ -329,77 +329,60 @@ internal class TunnelStateGate(
         REBINDING,
     }
 
-    private val state = AtomicReference(initialState.toGateState())
+    data class Start(val decision: TransitionDecision, val revision: Long)
 
-    fun current(): SessionState = state.get().toSessionState()
+    private var state = initialState.toGateState()
+    private var revision = 0L
 
-    fun beginStart(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.RUNNING -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.REPLACE
-                    }
-                }
-                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
-                    return TransitionDecision.BUSY
-                }
-                GateState.STOPPED -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.FAILED -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.REPLACE
-                    }
-                }
-            }
+    @Synchronized fun current(): SessionState = state.toSessionState()
+
+    fun beginStart(): TransitionDecision = beginTrackedStart().decision
+
+    @Synchronized fun beginTrackedStart(): Start {
+        val decision = when (state) {
+            GateState.RUNNING, GateState.FAILED -> TransitionDecision.REPLACE
+            GateState.STOPPED -> TransitionDecision.PROCEED
+            GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> return Start(TransitionDecision.BUSY, revision)
         }
+        advance(GateState.STARTING)
+        return Start(decision, revision)
     }
 
-    fun beginStop(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
-                GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
-                GateState.STARTING -> {
-                    if (state.compareAndSet(current, GateState.STOPPING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.RUNNING, GateState.FAILED -> {
-                    if (state.compareAndSet(current, GateState.STOPPING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-            }
-        }
+    @Synchronized fun completeStart(start: Start, next: SessionState): Boolean {
+        if (start.revision != revision) return false
+        state = next.toGateState()
+        return true
     }
 
-    fun beginRebind(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.RUNNING -> {
-                    if (state.compareAndSet(current, GateState.REBINDING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
-                    return TransitionDecision.BUSY
-                }
-                GateState.STOPPED, GateState.FAILED -> {
-                    return TransitionDecision.ALREADY_COMPLETE
-                }
-            }
+    @Synchronized fun beginStop(): TransitionDecision {
+        when (state) {
+            GateState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
+            GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
+            else -> advance(GateState.STOPPING)
         }
+        return TransitionDecision.PROCEED
     }
 
-    fun cancelRebind(): Boolean =
-        state.compareAndSet(GateState.REBINDING, GateState.RUNNING)
+    @Synchronized fun beginRebind(): TransitionDecision {
+        when (state) {
+            GateState.RUNNING -> advance(GateState.REBINDING)
+            GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
+            GateState.STOPPED, GateState.FAILED -> return TransitionDecision.ALREADY_COMPLETE
+        }
+        return TransitionDecision.PROCEED
+    }
 
-    fun complete(next: SessionState) {
-        state.set(next.toGateState())
+    @Synchronized fun cancelRebind(): Boolean {
+        if (state != GateState.REBINDING) return false
+        advance(GateState.RUNNING)
+        return true
+    }
+
+    @Synchronized fun complete(next: SessionState) = advance(next.toGateState())
+
+    private fun advance(next: GateState) {
+        state = next
+        revision++
     }
 
     private fun SessionState.toGateState(): GateState = when (this) {
@@ -815,7 +798,8 @@ internal object TunnelRuntime {
             onError(errorCode(error))
             return
         }
-        val replaceExisting = when (stateGate.beginStart()) {
+        val admission = stateGate.beginTrackedStart()
+        val replaceExisting = when (admission.decision) {
             TransitionDecision.REPLACE -> true
             TransitionDecision.BUSY -> {
                 args.clearSensitiveConfigurations()
@@ -833,6 +817,7 @@ internal object TunnelRuntime {
             val memoryBaselineRssBytes = processRssBytes(android.os.Process.myPid())
             var memoryDiagnosticsForFailure: TunnelStartMemoryDiagnostics? = null
             var startTransport: String? = null
+            var startedBackend: GoBackend? = null
             TunnelLog.info(
                 "start.begin",
                 mapOf(
@@ -982,7 +967,13 @@ internal object TunnelRuntime {
                     "before_backend_up",
                     transport,
                 )
-                var state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                startedBackend = activeBackend
+                suppressBackendStateChanges.set(true)
+                var state = try {
+                    activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                } finally {
+                    suppressBackendStateChanges.set(false)
+                }
                 startMemoryDiagnostics.record(
                     applicationContext,
                     "after_backend_up",
@@ -1001,6 +992,7 @@ internal object TunnelRuntime {
                         try {
                             activeBackend.setState(tunnel, Tunnel.State.DOWN, null)
                             activeBackend = replaceBackend(applicationContext)
+                            startedBackend = activeBackend
                             state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
                         } finally {
                             suppressBackendStateChanges.set(false)
@@ -1041,22 +1033,8 @@ internal object TunnelRuntime {
                         )
                     }
                 }
-                if (state == Tunnel.State.UP &&
-                    (isClientStartCancelled(args.clientOperationId) || !ownerCurrent())
-                ) {
-                    suppressBackendStateChanges.set(true)
-                    try {
-                        requireState(
-                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
-                            Tunnel.State.DOWN,
-                        )
-                    } finally {
-                        suppressBackendStateChanges.set(false)
-                    }
-                    AndroidSplitTunnel.clear()
-                    throw TunnelOperationException("tunnel_start_cancelled")
-                }
                 if (state == Tunnel.State.UP) {
+                    requireCurrentStart()
                     NelomaiVpnService.setPhysicalNetworks(
                         physicalState.networks,
                     )
@@ -1102,9 +1080,13 @@ internal object TunnelRuntime {
                     } catch (_: Throwable) {
                         activeSession = null
                         monitor.stop()
+                        suppressBackendStateChanges.set(true)
                         runCatching {
-                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                            if (activeBackend.setState(tunnel, Tunnel.State.DOWN, null) == Tunnel.State.DOWN) {
+                                startedBackend = null
+                            }
                         }
+                        suppressBackendStateChanges.set(false)
                         AndroidSplitTunnel.clear()
                         throw TunnelOperationException(
                             "physical_network_monitor_unavailable",
@@ -1116,7 +1098,9 @@ internal object TunnelRuntime {
                     AndroidSplitTunnel.clear()
                     SessionState.FAILED
                 }
-                stateGate.complete(resolved)
+                if (!stateGate.completeStart(admission, resolved)) {
+                    throw TunnelOperationException("tunnel_start_cancelled")
+                }
                 if (resolved == SessionState.RUNNING) {
                     runCatching {
                         AutomaticDiagnostics.onTunnelStarted(
@@ -1167,24 +1151,27 @@ internal object TunnelRuntime {
                     }
                 }
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
+                requireCurrentStart()
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 args.clearSensitiveConfigurations()
                 quickPlan?.clearSensitiveConfigurations()
-                if (args.startSource == "local_restart") {
-                    // A Stop may have invalidated the generation after native
-                    // UP. Do not leave a rejected replacement physically open.
+                if (startedBackend != null || args.startSource == "local_restart") {
+                    // Rejection from the completion callback can arrive after native UP.
                     clearActiveSession()
                     suppressBackendStateChanges.set(true)
                     try {
-                        runCatching { requireBackend().setState(tunnel, Tunnel.State.DOWN, null) }
+                        runCatching {
+                            val closingBackend = startedBackend ?: requireBackend()
+                            requireState(closingBackend.setState(tunnel, Tunnel.State.DOWN, null), Tunnel.State.DOWN)
+                        }
                             .onFailure { TunnelLog.warning("start.cancel_cleanup_failed", error = it) }
                     } finally {
                         suppressBackendStateChanges.set(false)
                     }
                 }
                 AndroidSplitTunnel.clear()
-                stateGate.complete(SessionState.FAILED)
+                stateGate.completeStart(admission, SessionState.FAILED)
                 if (!keepForegroundServiceOnFailure) {
                     runTunnelFailureCleanup(
                         optionalDiagnostics = {
@@ -1271,9 +1258,14 @@ internal object TunnelRuntime {
         context: Context,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
+        ownerCurrent: () -> Boolean = { true },
     ) {
         val applicationContext = context.applicationContext
         initialize(applicationContext)
+        if (!ownerCurrent()) {
+            onError("tunnel_start_cancelled")
+            return
+        }
         if (!backgroundOperationGate.begin()) {
             onError("tunnel_operation_in_progress")
             return
@@ -1302,6 +1294,7 @@ internal object TunnelRuntime {
             applicationContext,
             SessionState.STARTING,
             desiredActive = true,
+            ownerCurrent = ownerCurrent,
         )) {
             backgroundOperationGate.complete()
             onError("quick_state_persist_failed")
@@ -1313,6 +1306,7 @@ internal object TunnelRuntime {
                 mapOf("layer" to template.connection.layer, "route" to template.connection.routeMode),
             )
             try {
+                if (!ownerCurrent()) throw TunnelOperationException("tunnel_start_cancelled")
                 val result = BackgroundConnectionClient.start(
                     applicationContext,
                     credential,
@@ -1330,7 +1324,7 @@ internal object TunnelRuntime {
                 }
                 fun finishFailedStart(code: String) {
                     scheduleBackgroundStartFailure(
-                        scheduleCleanup = backgroundExecutor::execute,
+                        scheduleCleanup = { cleanup -> backgroundExecutor.execute { cleanup() } },
                         cleanupLease = {
                             BackgroundConnectionClient.stop(
                                 credential,
@@ -1354,17 +1348,15 @@ internal object TunnelRuntime {
                     { state, duration ->
                         val failureCode = backgroundStartFailureCode(state)
                         if (failureCode == null) {
-                            try {
-                                onSuccess(state, duration)
-                            } finally {
-                                backgroundOperationGate.complete()
-                            }
+                            onSuccess(state, duration)
+                            backgroundOperationGate.complete()
                         } else {
                             finishFailedStart(failureCode)
                         }
                     },
                     ::finishFailedStart,
                     keepForegroundServiceOnFailure = true,
+                    ownerCurrent = ownerCurrent,
                 )
             } catch (error: Throwable) {
                 val code = (error as? BackgroundConnectionException)?.code ?: errorCode(error)
@@ -1859,6 +1851,8 @@ internal object TunnelRuntime {
         clearActiveSession()
         AndroidSplitTunnel.clear()
     }
+
+    fun nativeOperationsBarrier(): java.util.concurrent.Future<*> = executor.submit {}
 
     fun releaseBackend() {
         if (stateGate.current() != SessionState.STOPPED || activeSession != null) return

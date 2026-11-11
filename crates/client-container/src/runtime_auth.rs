@@ -593,4 +593,9 @@ impl<T: TunnelController> LocalAuthStop for CoreLocalStop<T> {
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }
+    async fn stop_local_on_peer_eof(&self) -> Result<(), BrokerError> {
+        CoreLocalStop::stop_local_on_peer_eof(self)
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
 }

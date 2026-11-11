@@ -552,15 +552,16 @@ internal class RedundantConnectionCoordinator(
         onPrimaryStarted: () -> Unit = {},
         onPrimaryFailed: () -> Unit = {},
         onPrimaryCancelled: () -> Unit = {},
+        ownerCurrent: () -> Boolean = { true },
     ): Boolean = synchronized(gate) {
-        if (totalLossCommandEmitted) return@synchronized false
+        if (totalLossCommandEmitted || !ownerCurrent()) return@synchronized false
         val expected = boundStartOperationId
         if (expected != null && expected != transaction.startOperationId) return@synchronized false
         boundStartOperationId = transaction.startOperationId
         val active = transaction.localActiveLeaseId ?: return@synchronized false
         val activeConfiguration = configurations[active] ?: return@synchronized false
         if (!mutationFence.runIfActive(transaction.startOperationId) {
-                when (val saved = store.beginRedundant(transaction)) {
+                when (val saved = store.beginRedundant(transaction, ownerCurrent)) {
                     is RecoveryStoreResult.Success -> true
                     is RecoveryStoreResult.Failure -> {
                         // Do not collapse a durable admission refusal into an
@@ -573,7 +574,11 @@ internal class RedundantConnectionCoordinator(
         ) return@synchronized false
         primaryReadinessFailed = false
         if (shouldCancel()) {
-            fenceRevoke()
+            val retired = !ownerCurrent() && store.cancelRedundantIntentAndDeferStop(
+                    transaction.stopOperationId ?: operationId(),
+                    transaction.startOperationId,
+                ) is RecoveryStoreResult.Success
+            if (retired) mutationFence.cancel(transaction.startOperationId) else fenceRevoke()
             return@synchronized false
         }
         val activeSlot = transaction.slot(active) ?: return@synchronized false
