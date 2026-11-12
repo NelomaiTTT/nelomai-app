@@ -190,7 +190,7 @@ def assert_windows_release_member_file_gate(workflow: dict) -> None:
     test "$SOURCE_SHA" = "$GITHUB_SHA"
     test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
     test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-    test "$RELEASE_VERSION" = 0.4.2
+    test "$RELEASE_VERSION" = 0.4.3
     python - <<'PY'
     import os
     lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -207,8 +207,8 @@ def assert_windows_release_member_file_gate(workflow: dict) -> None:
   name: "Exact source before generated inputs"
   run: |
     test "$GITHUB_SHA" = "$SOURCE_SHA"
-    test "$RELEASE_VERSION" = 0.4.2
-    python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.2 --mode "$RELEASE_MODE"
+    test "$RELEASE_VERSION" = 0.4.3
+    python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.3 --mode "$RELEASE_MODE"
 - name: "macOS runtime and Keychain rollback regressions"
   if: "matrix.platform == 'macos'"
   run: "python3 scripts/test-macos-rollback.py"

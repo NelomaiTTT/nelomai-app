@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable Linux 0.4.2 candidate
+        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable Linux 0.4.3 candidate
         type: string
         required: true
 
@@ -305,7 +305,7 @@ jobs:
             --public-key "$RUN_ROOT/runtime-public.raw" --stable-public-key "$RUN_ROOT/runtime-public.raw"
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-test-candidate-0.4.2-${{ env.SOURCE_SHA }}
+          name: linux-test-candidate-0.4.3-${{ env.SOURCE_SHA }}
           path: ${{ env.RUN_ROOT }}/candidate/
           if-no-files-found: error
           retention-days: 14

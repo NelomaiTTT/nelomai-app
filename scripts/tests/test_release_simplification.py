@@ -23,7 +23,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
         self.check_finalizer("0.4.1")
 
     def test_post_bridge_finalizer_ships_dmg_without_legacy_archive(self):
-        self.check_finalizer("0.4.2")
+        self.check_finalizer("0.4.3")
 
     def check_finalizer(self, version):
         signed = self.root / "signed"
@@ -82,11 +82,11 @@ class ReleaseSimplificationTest(ArtifactFixture):
         self.assertIn(f"nelomai-{version}-macos-aarch64.dmg", inventory["assets"])
         self.assertIn(f"nelomai-{version}-macos-aarch64.dmg.sig", inventory["assets"])
         artifacts = json.loads((output / "candidate/nelomai-release-manifest.json").read_bytes())["artifacts"]
-        mac_formats = {"dmg"} if version == "0.4.2" else {"app", "dmg"}
+        mac_formats = {"dmg"} if version == "0.4.3" else {"app", "dmg"}
         self.assertEqual(len(artifacts), 2 + len(mac_formats))
         self.assertEqual({item["package_kind"] for item in artifacts if item["platform"] == "macos"}, mac_formats)
-        self.assertEqual(len(inventory["assets"]), 17 if version == "0.4.2" else 18)
-        if version == "0.4.2":
+        self.assertEqual(len(inventory["assets"]), 17 if version == "0.4.3" else 18)
+        if version == "0.4.3":
             self.assertFalse((output / "candidate" / consumer.gates.PACKAGE_NAMES["macos"]).exists())
             self.assertFalse((work / ("shipping-" + consumer.gates.PACKAGE_NAMES["macos"])).exists())
         self.assertEqual(inventory["purpose"], "shipping")

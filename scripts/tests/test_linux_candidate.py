@@ -39,7 +39,7 @@ class LinuxCandidateTest(ArtifactFixture):
             shutil.copyfile(path, self.stable / path.name)
         self.source = 'b' * 40
         self.draft = self.root / 'draft'
-        module('build-runtime-manifest').package(self.payload, self.draft / 'latest', '0.4.2', self.source,
+        module('build-runtime-manifest').package(self.payload, self.draft / 'latest', '0.4.3', self.source,
                                                 'linux', 'x86_64', self.keyfile)
         self.final_private, self.final_public = self.root / 'final-private', self.root / 'final-public'
         final = Ed25519PrivateKey.generate()
@@ -64,11 +64,11 @@ class LinuxCandidateTest(ArtifactFixture):
         self.candidate.stage(self.signed, staged, self.source, self.final_public, self.public)
         doc, inventory = self.candidate.verified(self.signed, self.source, self.final_public, self.public)
         self.assertEqual([(slot['slot'], slot['manifest']['runtime_version']) for slot in doc['slots']],
-                         [('latest', '0.4.2'), ('stable', '0.2.20')])
+                         [('latest', '0.4.3'), ('stable', '0.2.20')])
         self.assertEqual(before, self.candidate.snapshot(self.stable))
         self.assertFalse(any('/release/' in path or any(p in path for p in ('windows', 'android', 'macos'))
                              for path in inventory))
-        for slot, version in (('latest', '0.4.2'), ('stable', '0.2.20')):
+        for slot, version in (('latest', '0.4.3'), ('stable', '0.2.20')):
             self.assertEqual((staged / 'runtime/engines' / slot / version / 'nelomai-runtime').read_bytes(),
                              (self.payload / 'nelomai-runtime').read_bytes())
         self.assertEqual((staged / 'dispatcher/1/nelomai-unix-service').read_bytes(),
@@ -76,7 +76,7 @@ class LinuxCandidateTest(ArtifactFixture):
         self.assertNotIn(self.final_private.read_bytes(), [path.read_bytes() for path in self.signed.rglob('*') if path.is_file()])
 
     def test_sign_rejects_compile_pin_wrong_source_payload_and_unscoped_input(self):
-        archive = self.draft / 'latest/nelomai-runtime-0.4.2-linux-x86_64.zip'
+        archive = self.draft / 'latest/nelomai-runtime-0.4.3-linux-x86_64.zip'
         raw = archive.read_bytes()
         archive.write_bytes(b'tampered payload')
         with self.assertRaises(Exception): self.sign()
@@ -134,8 +134,8 @@ class LinuxCandidateTest(ArtifactFixture):
         root = self.root / 'checkout'
         (root / 'src-tauri').mkdir(parents=True)
         for name in ('package.json', 'src-tauri/tauri.conf.json'):
-            (root / name).write_text('{"version":"0.4.2"}')
-        (root / 'src-tauri/Cargo.toml').write_text('[package]\nversion="0.4.2"\n')
+            (root / name).write_text('{"version":"0.4.3"}')
+        (root / 'src-tauri/Cargo.toml').write_text('[package]\nversion="0.4.3"\n')
         for args in (('init', '-q'), ('add', '.'), ('-c', 'user.name=Fixture', '-c',
                      'user.email=fixture@invalid', 'commit', '-qm', 'fixture')):
             subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
@@ -180,7 +180,7 @@ class LinuxCandidateTest(ArtifactFixture):
         # Mirror the workflow's retained artifact: no native staging/build work.
         shutil.copytree(self.root / 'native-package/shipping', packages / 'shipping')
         shutil.copyfile(self.root / 'native-package/package-digests.json', packages / 'package-digests.json')
-        appimage = packages / 'shipping/nelomai-0.4.2-linux-x86_64.AppImage'
+        appimage = packages / 'shipping/nelomai-0.4.3-linux-x86_64.AppImage'
         self.assertEqual(json.loads((packages / 'package-digests.json').read_bytes())['sha256'],
                          hashlib.sha256(appimage.read_bytes()).hexdigest())
         keydir = self.root / 'updater'
@@ -194,7 +194,7 @@ class LinuxCandidateTest(ArtifactFixture):
             inventory = json.loads((output / 'candidate-inventory.json').read_bytes())
             self.assertIs(inventory['publishable'], False)
             self.assertEqual(inventory['purpose'], 'linux-candidate')
-            self.assertEqual(inventory['version'], '0.4.2')
+            self.assertEqual(inventory['version'], '0.4.3')
             self.assertEqual(set(inventory['assets']), {p.relative_to(output).as_posix() for p in output.rglob('*')
                 if p.is_file() and p.name != 'candidate-inventory.json'})
             appimage.write_bytes(b'tampered')

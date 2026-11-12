@@ -40,7 +40,7 @@ class WindowsCandidateTest(ArtifactFixture):
             shutil.copyfile(path, self.stable / path.name)
         self.source = "b" * 40
         self.draft = self.root / "draft"
-        module("build-runtime-manifest").package(self.payload, self.draft / "latest", "0.4.2", self.source,
+        module("build-runtime-manifest").package(self.payload, self.draft / "latest", "0.4.3", self.source,
                                                 "windows", "x86_64", self.keyfile)
         self.final_private, self.final_public = self.root / "final-private", self.root / "final-public"
         final = Ed25519PrivateKey.generate()
@@ -66,12 +66,12 @@ class WindowsCandidateTest(ArtifactFixture):
         container = verifier.authenticated("container", docs / "container-manifest-v1.json",
             docs / "container-manifest-v1.sig", self.final_public, "windows", "x86_64")
         self.assertEqual([(s["slot"], s["manifest"]["runtime_version"], s["manifest"]["source_commit"])
-                          for s in container["slots"]], [("latest", "0.4.2", self.source), ("stable", "0.2.20", SOURCE)])
+                          for s in container["slots"]], [("latest", "0.4.3", self.source), ("stable", "0.2.20", SOURCE)])
         self.assertEqual(container["stable_release_set_sha256"], self.stable_digest)
         self.assertFalse((self.signed / "release").exists(), "no fabricated current four-platform root")
         staged = self.root / "staged"
         self.candidate.stage(self.signed, staged, self.source, self.final_public)
-        for slot, version in (("latest", "0.4.2"), ("stable", "0.2.20")):
+        for slot, version in (("latest", "0.4.3"), ("stable", "0.2.20")):
             for p in self.payload.rglob("*"):
                 if p.is_file():
                     self.assertEqual(p.read_bytes(), (staged / "runtime/engines" / slot / version / p.relative_to(self.payload)).read_bytes())
@@ -146,8 +146,8 @@ class WindowsCandidateTest(ArtifactFixture):
     def test_source_and_native_keyless_boundaries_fail_before_build(self):
         root = self.root / "checkout"; (root / "src-tauri").mkdir(parents=True)
         for name in ("package.json", "src-tauri/tauri.conf.json"):
-            (root / name).write_text('{"version":"0.4.2"}')
-        (root / "src-tauri/Cargo.toml").write_text('[package]\nversion="0.4.2"\n')
+            (root / name).write_text('{"version":"0.4.3"}')
+        (root / "src-tauri/Cargo.toml").write_text('[package]\nversion="0.4.3"\n')
         for args in (("init", "-b", "Future/desktop-0.4.0"), ("add", "."),
                      ("-c", "user.name=Fixture", "-c", "user.email=fixture@invalid", "commit", "-m", "fixture")):
             subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
@@ -172,7 +172,7 @@ class WindowsCandidateTest(ArtifactFixture):
     def test_final_updater_signature_verifies_and_installer_mutation_is_refused(self):
         self.sign()
         packages = self.root / "packages"; (packages / "shipping").mkdir(parents=True)
-        name = "nelomai-0.4.2-windows-x86_64.exe"
+        name = "nelomai-0.4.3-windows-x86_64.exe"
         installer = packages / "shipping" / name; installer.write_bytes(b"Windows fixture, never executed")
         index = dict(source_sha=self.source, purpose="windows-candidate", container_sha256=module("verify-runtime-artifact").digest(
             self.signed / "containers/windows/shipping/container-manifest-v1.json"),
