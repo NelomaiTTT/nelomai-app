@@ -920,7 +920,7 @@ fn private_directory(path: &Path) -> Result<bool, UpdateBackendError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return Ok(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0);
+        Ok(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0)
     }
     #[cfg(not(unix))]
     Ok(false)

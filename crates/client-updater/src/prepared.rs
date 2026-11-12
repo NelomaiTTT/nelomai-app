@@ -768,9 +768,8 @@ fn staging_file_has_no_other_writers(file: &File) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        return file
-            .metadata()
-            .is_ok_and(|metadata| metadata.mode() & 0o022 == 0);
+        file.metadata()
+            .is_ok_and(|metadata| metadata.mode() & 0o022 == 0)
     }
     // Windows file_identity verifies the handle's owner and DACL.
     #[cfg(not(unix))]

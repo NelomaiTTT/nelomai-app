@@ -114,7 +114,7 @@ fn download_request(
 
 enum DownloadFile {
     Fresh(StagedFile),
-    Resumed(ResumedDownload),
+    Resumed(Box<ResumedDownload>),
 }
 
 impl DownloadFile {
@@ -215,7 +215,10 @@ async fn download_response(
     let (mut file, initial) = match saved {
         Some(saved) if resume => {
             let initial = saved.received();
-            (DownloadFile::Resumed(cache.begin_resume(saved)?), initial)
+            (
+                DownloadFile::Resumed(Box::new(cache.begin_resume(saved)?)),
+                initial,
+            )
         }
         saved => {
             if let Some(saved) = saved {
@@ -262,7 +265,7 @@ async fn download_response(
                 let _guard = guard;
                 match file {
                     DownloadFile::Fresh(file) => cache.save_partial(file, &identity, &validator),
-                    DownloadFile::Resumed(file) => cache.checkpoint_resume(file),
+                    DownloadFile::Resumed(file) => cache.checkpoint_resume(*file),
                 }
             })
             .await
@@ -272,7 +275,7 @@ async fn download_response(
     }
     let temporary = match file {
         DownloadFile::Fresh(file) => file,
-        DownloadFile::Resumed(file) => cache.finish_resume(file)?,
+        DownloadFile::Resumed(file) => cache.finish_resume(*file)?,
     };
     Ok((temporary, guard))
 }
