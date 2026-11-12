@@ -1298,13 +1298,15 @@ internal class RedundantConnectionCoordinator(
             if (candidate != null && switchIndex == candidateIndex) {
                 // Native already replaced the old member at this index. Commit its new
                 // identity before switching; never activate the stale canonical lease.
-                val committed = advanceCandidateLocked(transaction, bounded, forFailover = true)
+                val advanced = advanceCandidateLocked(transaction, bounded, forFailover = true)
                 val current = status() ?: return@synchronized false
+                // A successful advance may only have restarted a staged candidate.
+                // Wait for its new probe within a live standby-check window.
                 if (current.candidateLeaseId != null &&
-                    (committed || standbyWorkPending ||
-                        (checkDeadline != null && !standbyHasFailoverProof(standby, checkDeadline)))
+                    (standbyWorkPending || (checkDeadline != null &&
+                        (advanced || !standbyHasFailoverProof(standby, checkDeadline))))
                 ) return@synchronized true
-                if (!committed || current.candidateLeaseId != null ||
+                if (!advanced || current.candidateLeaseId != null ||
                     current.leaseIdAt(switchIndex) != candidate
                 ) {
                     emitTotalLossCommandLocked(current, "standby_commit_failed")
