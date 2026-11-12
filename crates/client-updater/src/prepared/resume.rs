@@ -844,6 +844,8 @@ fn recover_claim(
         || (super::is_staging_entry(&record.original)
             && !super::staging_file_has_no_other_writers(&file))
     {
+        #[cfg(all(test, windows))]
+        tests::trace_claim_identity(&record, &file, &path);
         return;
     }
     let slot = CHECKPOINTS
@@ -1152,7 +1154,12 @@ fn windows_object_id(file: &File, control: u32) -> Result<Option<[u8; 16]>, Upda
         match unsafe { GetLastError() } {
             ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED => return Ok(None),
             ERROR_FILE_NOT_FOUND if control == FSCTL_GET_OBJECT_ID => return Ok(None),
-            _ => return Err(cache_error()),
+            error => {
+                #[cfg(test)]
+                eprintln!("cache object id query control={control} code={error}");
+                let _ = error;
+                return Err(cache_error());
+            }
         }
     }
     if written != capacity || object.ObjectId == [0; 16] {
@@ -1550,6 +1557,43 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(windows)]
+    pub(super) fn trace_claim_identity(record: &ClaimRecord, file: &File, path: &Path) {
+        use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
+
+        let stat = file_stat_identity(file).ok().flatten();
+        let object = windows_object_id(file, FSCTL_GET_OBJECT_ID);
+        eprintln!(
+            "cache claim refused name={} acl={} stat={} same_file={} has_id={} id_result={} same_id={} path={}",
+            record.original,
+            windows_security::private_file(file),
+            stat.is_some(),
+            stat.as_ref().is_some_and(|stat| stat.volume == record.identity.volume && stat.index == record.identity.index),
+            record.identity.object_id.is_some(),
+            match &object { Ok(Some(_)) => "present", Ok(None) => "missing", Err(_) => "error" },
+            object.is_ok_and(|id| id == record.identity.object_id),
+            open_partial_metadata(file, path).is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    fn trace_collision_data(stage: &str, claim: &ClaimedEntry, data_path: &Path) {
+        let record: ClaimRecord =
+            serde_json::from_slice(&fs::read(claim.directory.join(CLAIM_IDENTITY)).unwrap())
+                .unwrap();
+        let claimed_path = claim.entry();
+        let file = open_partial(&claimed_path, false).unwrap();
+        eprintln!(
+            "cache collision phase={stage} claim_private={}",
+            private_directory(&claim.directory).unwrap()
+        );
+        trace_claim_identity(&record, &file, &claimed_path);
+        if let Ok(foreign) = open_partial(data_path, false) {
+            eprintln!("cache collision canonical object");
+            trace_claim_identity(&record, &foreign, data_path);
+        }
+    }
+
     #[test]
     fn startup_preserves_a_checkpoint_claim_until_the_foreign_sidecar_is_gone() {
         let (root, cache, descriptor) = partial_fixture();
@@ -1692,7 +1736,11 @@ mod tests {
         let sidecar = cache.root.join(PARTIAL_METADATA);
         let checkpoint = fs::read(&sidecar).unwrap();
         assert!(!data_path.exists());
+        #[cfg(windows)]
+        trace_collision_data("before-occupant", &claim, &data_path);
         fs::write(&data_path, b"foreign data").unwrap();
+        #[cfg(windows)]
+        trace_collision_data("after-occupant", &claim, &data_path);
         drop((claim, resumed, cache));
 
         let cache = PreparedCache::open(root.path().join("packages")).unwrap();
