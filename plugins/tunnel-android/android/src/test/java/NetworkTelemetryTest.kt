@@ -34,70 +34,13 @@ class NetworkTelemetryTest {
     }
 
     @Test
-    fun wireGuardCollectsPassiveTelemetryWithoutEnablingUdpRecovery() {
-        assertEquals(
-            NetworkTelemetryMode.PASSIVE,
-            networkTelemetryMode("wireguard"),
-        )
-        assertEquals(
-            NetworkTelemetryMode.UDP_RECOVERY,
-            networkTelemetryMode("amneziawg_3"),
-        )
-        assertEquals(
-            NetworkTelemetryMode.DISABLED,
-            networkTelemetryMode("unsupported"),
-        )
-    }
-
-    @Test
-    fun passiveTelemetryUsesTenSecondCadenceWhileUdpRecoveryKeepsEveryTick() {
-        assertTrue(
-            shouldPollNetworkTelemetry(
-                mode = NetworkTelemetryMode.PASSIVE,
-                nowElapsedMillis = 20_000L,
-                lastPollElapsedMillis = null,
-            ),
-        )
-        assertFalse(
-            shouldPollNetworkTelemetry(
-                mode = NetworkTelemetryMode.PASSIVE,
-                nowElapsedMillis = 20_000L,
-                lastPollElapsedMillis = 15_000L,
-            ),
-        )
-        assertTrue(
-            shouldPollNetworkTelemetry(
-                mode = NetworkTelemetryMode.PASSIVE,
-                nowElapsedMillis = 25_000L,
-                lastPollElapsedMillis = 15_000L,
-            ),
-        )
-        assertTrue(
-            shouldPollNetworkTelemetry(
-                mode = NetworkTelemetryMode.UDP_RECOVERY,
-                nowElapsedMillis = 20_000L,
-                lastPollElapsedMillis = 19_999L,
-            ),
-        )
-        assertFalse(
-            shouldPollNetworkTelemetry(
-                mode = NetworkTelemetryMode.DISABLED,
-                nowElapsedMillis = 20_000L,
-                lastPollElapsedMillis = null,
-            ),
-        )
-    }
-
-    @Test
-    fun periodicPassiveSnapshotPersistsCurrentGoMemoryWithoutRecentSampleRing() {
+    fun periodicSnapshotPersistsCurrentGoMemoryWithoutRecentSampleRing() {
         val details = networkTelemetrySnapshotDetails(
             reason = "periodic",
             sample = telemetrySampleWithGoMemory(),
             recentSamples = null,
         )
 
-        assertTrue(shouldPersistPeriodicNetworkTelemetry(NetworkTelemetryMode.PASSIVE))
-        assertFalse(shouldPersistPeriodicNetworkTelemetry(NetworkTelemetryMode.UDP_RECOVERY))
         assertEquals(1_048_576L, details["go_heap_alloc_bytes"])
         assertEquals(4_194_304L, details["go_heap_sys_bytes"])
         assertFalse(details.containsKey("samples"))
@@ -232,8 +175,8 @@ class NetworkTelemetryTest {
     }
 
     @Test
-    fun recoveryNeverRunsForWireGuardOrWhileDisarmed() {
-        assertFalse(
+    fun wireGuardCanRecoverAStallWithTrafficDemandButIdleOrUnsupportedTunnelsDoNot() {
+        assertTrue(
             shouldRecoverUdpStall(
                 transport = "wireguard",
                 uptimeMillis = 30_000,
@@ -246,7 +189,29 @@ class NetworkTelemetryTest {
         )
         assertFalse(
             shouldRecoverUdpStall(
-                transport = "amneziawg_3",
+                transport = "wireguard",
+                uptimeMillis = 30_000,
+                millisSinceTunActivity = 10_000,
+                millisSinceTunWrite = 10_000,
+                stallDurationMillis = 10_000,
+                millisSinceRecovery = null,
+                armed = true,
+            ),
+        )
+        assertFalse(
+            shouldRecoverUdpStall(
+                transport = "unsupported",
+                uptimeMillis = 30_000,
+                millisSinceTunActivity = 500,
+                millisSinceTunWrite = 6_000,
+                stallDurationMillis = 6_000,
+                millisSinceRecovery = null,
+                armed = true,
+            ),
+        )
+        assertFalse(
+            shouldRecoverUdpStall(
+                transport = "wireguard",
                 uptimeMillis = 30_000,
                 millisSinceTunActivity = 500,
                 millisSinceTunWrite = 6_000,

@@ -50,6 +50,21 @@ class NativeLocalRestartCompletionTest {
         assertEquals(listOf("up"), CompletionNative.events)
     }
 
+    @Test fun wireGuardBindsRecoveryToItsStartAfterATemporaryStoreReadError() = withRuntime { f ->
+        assertTrue(f.store.setDesiredActive(0, true) is RecoveryStoreResult.Success)
+        val generation = f.envelope().intent.generation
+        f.record.readFails = true
+        CompletionNative.onUp = { f.record.readFails = false }
+        val replies = mutableListOf<String>()
+        TunnelRuntime.start(f.context, args(), { _, _ -> replies += "up" },
+            { replies += it }, keepForegroundServiceOnFailure = true)
+        f.work.runNext()
+        assertEquals(listOf("up"), replies)
+        val session = ReflectionHelpers.getField<Any>(TunnelRuntime, "activeSession")
+        val boundGeneration = ReflectionHelpers.getField<Long?>(session, "wireGuardRecoveryOwnerGeneration")
+        assertEquals("the successful start captured its owner", generation as Long?, boundGeneration)
+    }
+
     @Test fun thrownLateCallbackRejectionClosesNativeBeforeError() = withRuntime { f ->
         var callbacks = 0
         TunnelRuntime.start(f.context, args(), { state, _ ->
@@ -174,6 +189,138 @@ class NativeLocalRestartCompletionTest {
         assertTrue(started)
         assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
         f.work.runNext()
+    }
+
+    @Test fun timedOutLegacyStartDisarmsOnlyItsOwnDesiredConnection() = withRuntime { f ->
+        val operation = "11111111-1111-4111-8111-111111111111"
+        var failure: String? = null
+        f.startService(Receiver { code, data ->
+            assertEquals(SERVICE_RESULT_ERROR, code)
+            failure = data?.getString(EXTRA_ERROR_CODE)
+        }, source = "ui", operationId = operation)
+        assertTrue(f.envelope().intent.desiredActive)
+        f.cancelClientStart(operation)
+        f.work.runNext()
+        assertEquals("tunnel_start_cancelled", failure)
+        assertFalse("the timed-out start still owns its desired state", f.envelope().intent.desiredActive)
+        f.work.runNext()
+        assertTrue(CompletionNative.events.isEmpty())
+    }
+
+    @Test fun timedOutLegacyStartCannotDisarmANewerDurableIntent() = withRuntime { f ->
+        val operation = "11111111-1111-4111-8111-111111111111"
+        var failure: String? = null
+        f.startService(Receiver { _, data -> failure = data?.getString(EXTRA_ERROR_CODE) },
+            source = "ui", operationId = operation)
+        f.cancelClientStart(operation)
+        val replacement = f.beginReplacement()
+        f.work.runNext()
+        f.work.runNext()
+        assertEquals("tunnel_start_cancelled", failure)
+        assertEquals(replacement, f.envelope())
+    }
+
+    @Test fun cancellationAfterNativeUpCannotDisarmAReplacementDuringDown() = withRuntime { f ->
+        val operation = "22222222-2222-4222-8222-222222222222"
+        f.startService(Receiver { code, _ -> assertEquals(SERVICE_RESULT_OK, code) },
+            source = "ui", operationId = operation)
+        f.work.runNext()
+        f.cancelClientStart(operation)
+        f.work.runNext()
+        assertFalse(f.envelope().intent.desiredActive)
+        val replacement = f.beginReplacement()
+        f.work.runNext()
+        assertEquals(listOf("up", "down"), CompletionNative.events)
+        assertEquals(replacement, f.envelope())
+    }
+
+    @Test fun startImmediatelyAfterStopReplyIsAdmitted() = withRuntime { f ->
+        TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+        f.work.runNext()
+        var started = false
+        var failure: String? = null
+        TunnelRuntime.stop(TUNNEL_API_VERSION, { state, _ ->
+            if (state == SessionState.STOPPED) {
+                TunnelRuntime.start(f.context, args(), { _, _ -> started = true }, { failure = it },
+                    keepForegroundServiceOnFailure = true)
+            }
+        }, { fail(it) }, keepForegroundService = true)
+        f.work.runNext()
+        assertNull(failure)
+        assertEquals(listOf("up", "down"), CompletionNative.events)
+        f.work.runNext()
+        assertTrue(started)
+        assertEquals(SessionState.RUNNING, TunnelRuntime.state())
+    }
+
+    @Test fun staleStopReplyDoesNotPublishStoppedOverANewerIntent() = withRuntime { f ->
+        f.startService(Receiver { code, _ -> assertEquals(SERVICE_RESULT_OK, code) }, source = "ui")
+        f.work.runNext()
+        var replied = false
+        f.stopLegacyService(Receiver { code, _ -> replied = code == SERVICE_RESULT_OK })
+        val replacement = f.beginReplacement()
+        assertTrue(QuickTunnelController.updateState(f.context, SessionState.STARTING))
+        f.work.runNext()
+        assertTrue(replied)
+        assertEquals(replacement, f.envelope())
+        assertEquals("starting", QuickTunnelController.state(f.context))
+    }
+
+    @Test fun directStopRejectedDuringRebindKeepsTheRunningIntent() = withRuntime { f ->
+        f.startService(Receiver { code, _ -> assertEquals(SERVICE_RESULT_OK, code) }, source = "ui")
+        f.work.runNext()
+        val gate = ReflectionHelpers.getField<TunnelStateGate>(TunnelRuntime, "stateGate")
+        assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+        var failure: String? = null
+        f.stopLegacyService(Receiver { _, data -> failure = data?.getString(EXTRA_ERROR_CODE) })
+        assertEquals("tunnel_operation_in_progress", failure)
+        assertTrue(gate.cancelRebind())
+        assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+        assertTrue(f.envelope().intent.desiredActive)
+    }
+
+    @Test fun busyStopDoesNotDisarmAConnectionWithAnActiveLease() = withRuntime { f ->
+        f.armCheckpoint()
+        var started = false
+        f.startService(Receiver { code, _ -> started = code == SERVICE_RESULT_OK })
+        f.work.runNext()
+        assertTrue(started)
+        val connected = f.envelope()
+        assertNotNull(connected.leaseTransaction)
+        val gate = ReflectionHelpers.getField<TunnelStateGate>(TunnelRuntime, "stateGate")
+        assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+        var failure: String? = null
+        f.stopLegacyService(Receiver { _, data -> failure = data?.getString(EXTRA_ERROR_CODE) })
+        assertEquals("tunnel_operation_in_progress", failure)
+        assertEquals(connected, f.envelope())
+    }
+
+    @Test fun busyStopCannotUndoAnAlreadyJournalledStop() = withRuntime { f ->
+        f.startService(Receiver { code, _ -> assertEquals(SERVICE_RESULT_OK, code) }, source = "ui")
+        f.work.runNext()
+        val gate = ReflectionHelpers.getField<TunnelStateGate>(TunnelRuntime, "stateGate")
+        assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+        f.stopFromUi()
+        val acceptedStop = f.envelope()
+        assertEquals("legacy_runtime_stop", acceptedStop.intent.retry.pendingAction)
+        var failure: String? = null
+        f.stopLegacyService(Receiver { _, data -> failure = data?.getString(EXTRA_ERROR_CODE) })
+        assertEquals("tunnel_operation_in_progress", failure)
+        assertEquals(acceptedStop, f.envelope())
+    }
+
+    @Test fun aSecondStopWaitsForTheSamePhysicalClose() = withRuntime { f ->
+        TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+        f.work.runNext()
+        val results = mutableListOf<String>()
+        repeat(2) {
+            TunnelRuntime.stop(TUNNEL_API_VERSION, { state, _ -> results += state.wireName },
+                { code -> results += code }, keepForegroundService = true)
+        }
+        assertTrue("both callers must wait until native DOWN completes", results.isEmpty())
+        f.work.runNext()
+        assertEquals(listOf("up", "down"), CompletionNative.events)
+        assertEquals(listOf("stopped", "stopped"), results)
     }
 
     @Test fun matchingLocalRestartRemainsCancelledAfterRecoveryLookupFails() = withRuntime { f ->
@@ -448,6 +595,13 @@ class NativeLocalRestartCompletionTest {
         val backend: GoBackend, val tunnel: Tunnel, val work: Work,
         val credentialsWork: Work, val backgroundWork: Work, val lookupWork: Work, val record: Record) {
         fun envelope() = (store.read() as RecoveryStoreResult.Success).value
+        fun beginReplacement(): AndroidRecoveryEnvelope {
+            assertTrue(coordinator.begin(AndroidIntentTemplate(
+                "11111111-1111-4111-8111-111111111111", "scope",
+                "tic", "dynamic", "standalone", "ipv4", false,
+            )) is AndroidCoordinatorResult.Accepted)
+            return envelope()
+        }
         fun prepareQuick(): StartTunnelArgs {
             val sample = args()
             CompletionQuickPlan.template = QuickTunnelTemplate(sample.options, sample.quickConnection!!)
@@ -463,6 +617,11 @@ class NativeLocalRestartCompletionTest {
                 "scope", "tic", "dynamic", "standalone", "ipv4", false), AndroidStartReplay("initial", 1, "fp"))
             store.recordLease(envelope().intent.generation, "lease")
             store.activateCheckpoint(envelope().intent.generation)
+        }
+        fun stopLegacyService(receiver: ResultReceiver) {
+            ReflectionHelpers.callInstanceMethod<Unit>(service, "beginLegacyClientStop",
+                ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType!!, TUNNEL_API_VERSION),
+                ReflectionHelpers.ClassParameter.from(ResultReceiver::class.java, receiver))
         }
         fun stopFromUi() {
             ReflectionHelpers.callInstanceMethod<Unit>(service, "handleCancelCurrentConnectionIntent",

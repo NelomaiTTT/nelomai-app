@@ -1419,6 +1419,25 @@ internal class AndroidRecoveryStore(
         )
     }
 
+    fun dispatchLegacyRuntimeStop(
+        expectedGeneration: Long,
+        dispatch: () -> Unit,
+    ): RecoveryStoreResult<Boolean> = synchronized(gate) {
+        when (val result = readLocked()) {
+            is RecoveryStoreResult.Failure -> result
+            is RecoveryStoreResult.Success -> {
+                val current = result.value
+                val matches = current.intent.generation == expectedGeneration &&
+                    !current.intent.desiredActive && current.leaseTransaction == null &&
+                    current.intent.retry.pendingAction == "legacy_runtime_stop"
+                // Reserve the native operation before any new intent can commit.
+                // The caller waits for native completion outside the store gate.
+                if (matches) dispatch()
+                RecoveryStoreResult.Success(matches)
+            }
+        }
+    }
+
     fun completeLegacyRuntimeStop(
         expectedGeneration: Long,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {

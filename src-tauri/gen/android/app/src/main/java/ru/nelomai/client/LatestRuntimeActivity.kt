@@ -1,10 +1,13 @@
 package ru.nelomai.client
 
+import ru.nelomai.client.RuntimeProcessSelection
 import ru.nelomai.client.RuntimeUpdateVisibility
+import ru.nelomai.runtime.v1.RuntimeActivityRecovery
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import io.crates.keyring.Keyring
 
 class LatestRuntimeActivity : TauriActivity() {
@@ -15,6 +18,12 @@ class LatestRuntimeActivity : TauriActivity() {
 
   private var startupWebView: android.webkit.WebView? = null
   private var runtimeResumed = false
+  private var ownerChanged = false
+  private var ownerRelaunchRequested = false
+  private val ownerRecovery = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+    ownerRelaunchRequested = false
+    relaunchIfOwnerChanged()
+  }
   private val bootstrapNetworks by lazy { BootstrapNetworkMonitor(this, ::wakeStartup) }
 
   override fun onWebViewCreate(webView: android.webkit.WebView) {
@@ -49,12 +58,18 @@ class LatestRuntimeActivity : TauriActivity() {
       val allowRetry = RuntimeEntrypoint.canRetryBootstrap()
       android.util.Log.e("NelomaiStartup", if (allowRetry) "code=startup.runtime.admission_missing"
         else "code=startup.runtime.native_attachment_incomplete")
-      ru.nelomai.runtime.v1.RuntimeActivityRecovery.showFailure(this,
+      RuntimeActivityRecovery.showFailure(this,
         allowRetry = allowRetry)
       return
     }
     if (RuntimeEntrypoint.supportsUpdates()) RuntimeEntrypoint.updateUiCreated(if (savedInstanceState == null) intent.getStringExtra("nelomai_update_launch_session") else null)
     intent.removeExtra("nelomai_update_launch_session")
+    ownerConnection.observeOwnerConnections { selected ->
+      if (RuntimeProcessSelection.needsExit(selected)) {
+        ownerChanged = true
+        relaunchIfOwnerChanged()
+      }
+    }
     ownerConnection.read { result ->
       if (result.isFailure) finish()
     }
@@ -84,6 +99,7 @@ class LatestRuntimeActivity : TauriActivity() {
     bootstrapNetworks.start()
     wakeStartup()
     StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("resumed"))
+    relaunchIfOwnerChanged()
   }
 
   override fun onPause() {
@@ -104,6 +120,22 @@ class LatestRuntimeActivity : TauriActivity() {
     super.onWindowFocusChanged(hasFocus)
     if (runtimeLifecycleEnabled && hasFocus) {
       StartupDiagnostics.record(applicationContext, "startup.android.window_focused")
+      relaunchIfOwnerChanged()
+    }
+  }
+
+  private fun relaunchIfOwnerChanged() {
+    if (!ownerChanged || ownerRelaunchRequested || !runtimeResumed || !hasWindowFocus() ||
+      isFinishing || isDestroyed) return
+    // Bootstrap rechecks the broker incarnation and retires only this runtime.
+    runCatching {
+      ownerRecovery.launch(RuntimeActivityRecovery.bootstrapIntent(this)
+        .putExtra(RuntimeActivityRecovery.OWNER_RECOVERY, true))
+    }.onSuccess {
+      ownerRelaunchRequested = true
+      ownerChanged = false
+    }.onFailure {
+      android.util.Log.w("NelomaiStartup", "code=startup.runtime.owner_relaunch_failed")
     }
   }
 

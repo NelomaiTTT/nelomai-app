@@ -89,8 +89,14 @@ class RuntimeSelectionBindingTest {
             }
         }
         RuntimeSelectionStore(context).use { store ->
-            store.read { assertEquals(selected, it.getOrThrow()) }
+            var initial: Result<RuntimeSelectionV1>? = null
+            store.read { initial = it }
+            dead = true
             connection.onServiceConnected(component, owner())
+            assertNull("first dead Binder must leave the read queued", initial)
+            dead = false
+            connection.onServiceConnected(component, owner())
+            assertEquals(selected, initial?.getOrThrow())
             dead = true
             var result: Result<RuntimeSelectionV1>? = null
             store.read { result = it }
@@ -98,6 +104,15 @@ class RuntimeSelectionBindingTest {
             dead = false
             connection.onServiceConnected(component, owner())
             assertEquals(selected, result?.getOrThrow())
+
+            result = null
+            dead = true
+            store.read { result = it }
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(9))
+            connection.onServiceConnected(component, owner())
+            assertNull(result)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            assertEquals("runtime_owner_unavailable", result?.exceptionOrNull()?.message)
         }
     }
 

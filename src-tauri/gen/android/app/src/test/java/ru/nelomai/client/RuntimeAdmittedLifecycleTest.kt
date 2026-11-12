@@ -1,9 +1,16 @@
 package ru.nelomai.client
 
+import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.os.Binder
 import android.os.Bundle
+import android.os.DeadObjectException
 import android.os.Looper
+import android.os.Parcel
+import android.os.Process
+import android.widget.Button
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.After
@@ -15,10 +22,12 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
+import ru.nelomai.runtime.v1.RuntimeActivityRecovery
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], shadows = [AdmittedRustShadow::class, KeyringContextShadow::class, RuntimeUpdateNativeShadow::class])
 class RuntimeAdmittedLifecycleTest {
+    private val selected = RuntimeSelectionV1("latest", "0.3.3", "0.3.3", 1L, null, "admitted-test")
     @After fun cleanProcess() = resetRuntimeProcessForTest()
     @Before fun admittedProcess() {
         resetRuntimeProcessForTest()
@@ -28,7 +37,6 @@ class RuntimeAdmittedLifecycleTest {
             it.isAccessible = true
             it.set(null, it.type.getDeclaredConstructor().newInstance())
         }
-        val selected = RuntimeSelectionV1("latest", "0.3.3", "0.3.3", 1L, null, "admitted-test")
         RuntimeProcessSelection.claim(selected)
         RuntimeProcessSelection.markAdmitted()
         // Only JNI admission is unavailable on the host JVM. The subsequent
@@ -38,6 +46,190 @@ class RuntimeAdmittedLifecycleTest {
         }
         RuntimeEntrypoint::class.java.getDeclaredField("updateProtocolVersion").apply { isAccessible = true; setInt(null, 2) }
         bindRecoveryOwnerForTest(selected = selected)
+    }
+
+    @Test fun replacementBrokerRelaunchesTheFocusedRuntimeOnlyOnce() {
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        val activity = controller.get()
+        shadowOf(Looper.getMainLooper()).idle()
+        controller.windowFocusChanged(true)
+        reconnect(activity, selected)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        reconnect(activity, selected.copy(incarnation = "replacement-broker"))
+        val launch = shadowOf(activity).nextStartedActivity
+        assertNotNull("a replacement broker must request a fresh runtime admission", launch)
+        assertEquals(RuntimeBootstrapActivity::class.java.name, launch.component?.className)
+        assertFalse(launch.hasExtra("runtime_endpoint_v1"))
+        assertFalse(launch.hasExtra("nelomai_update_launch_session"))
+        controller.windowFocusChanged(true)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+
+        bindRecoveryOwnerForTest(selected = selected.copy(incarnation = "replacement-broker"))
+        val bootstrap = Robolectric.buildActivity(RuntimeBootstrapActivity::class.java, launch).setup().windowFocusChanged(true)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(MainActivity::class.java.name, shadowOf(bootstrap.get()).nextStartedActivity?.component?.className)
+        assertTrue(org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+        assertNull(shadowOf(activity.application).nextStoppedService)
+        bootstrap.pause().stop().destroy()
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun retryAfterRecoveryReadFailureCanReplaceTheAdmittedRuntime() {
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        val activity = controller.get()
+        shadowOf(Looper.getMainLooper()).idle()
+        controller.windowFocusChanged(true)
+        reconnect(activity, selected.copy(incarnation = "replacement-broker"))
+        val recovery = shadowOf(activity).nextStartedActivity
+        assertNotNull(recovery)
+
+        bindRecoveryOwnerForTest(failRead = true)
+        val failed = Robolectric.buildActivity(RuntimeBootstrapActivity::class.java, recovery).setup().windowFocusChanged(true)
+        shadowOf(Looper.getMainLooper()).idle()
+        failed.get().findViewById<Button>(0x00d10007).performClick()
+        val retry = shadowOf(failed.get()).nextStartedActivity
+        assertNotNull(retry)
+        assertTrue(retry.flags and Intent.FLAG_ACTIVITY_FORWARD_RESULT != 0)
+        assertFalse(retry.getBooleanExtra("nelomai_manual_runtime_retry", false))
+        failed.pause().stop().destroy()
+
+        bindRecoveryOwnerForTest(selected = selected.copy(incarnation = "healthy-broker"))
+        val retried = Robolectric.buildActivity(RuntimeBootstrapActivity::class.java, retry).setup().windowFocusChanged(true)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(MainActivity::class.java.name, shadowOf(retried.get()).nextStartedActivity?.component?.className)
+        assertTrue(org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+        assertNull(shadowOf(activity.application).nextStoppedService)
+        retried.pause().stop().destroy()
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun cancelingRecoveryAllowsTheNextBrokerConnectionToRecover() {
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        val activity = controller.get()
+        shadowOf(Looper.getMainLooper()).idle()
+        controller.windowFocusChanged(true)
+        reconnect(activity, selected.copy(incarnation = "replacement-broker"))
+        val recovery = shadowOf(activity).nextStartedActivityForResult
+        assertNotNull("recovery must deliver its result to the runtime", recovery)
+        assertTrue("recovery must request a result", recovery.requestCode >= 0)
+        controller.windowFocusChanged(false).pause().stop()
+        shadowOf(activity).receiveResult(recovery.intent, Activity.RESULT_CANCELED, null)
+        controller.restart().start().resume().windowFocusChanged(true)
+        assertNull("canceling must not immediately reopen the same recovery",
+            shadowOf(activity).nextStartedActivityForResult)
+
+        reconnect(activity, selected.copy(incarnation = "healthy-broker"))
+        val secondRecovery = shadowOf(activity).nextStartedActivityForResult
+        assertEquals(RuntimeBootstrapActivity::class.java.name, secondRecovery?.intent?.component?.className)
+        controller.windowFocusChanged(false).pause().stop()
+        reconnect(activity, selected.copy(incarnation = "next-broker"))
+        assertNull(shadowOf(activity).nextStartedActivityForResult)
+        shadowOf(activity).receiveResult(secondRecovery.intent, Activity.RESULT_CANCELED, null)
+        controller.restart().start().resume().windowFocusChanged(true)
+        assertEquals(RuntimeBootstrapActivity::class.java.name,
+            shadowOf(activity).nextStartedActivityForResult?.intent?.component?.className)
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun replacementBrokerInBackgroundWaitsForWindowFocus() {
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        val activity = controller.get()
+        shadowOf(Looper.getMainLooper()).idle()
+        controller.windowFocusChanged(false).pause().stop()
+        reconnect(activity, selected.copy(incarnation = "replacement-broker"))
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+        controller.start().resume()
+        assertNull(shadowOf(activity).nextStartedActivity)
+        controller.windowFocusChanged(true)
+        assertEquals(RuntimeBootstrapActivity::class.java.name, shadowOf(activity).nextStartedActivity?.component?.className)
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun firstSelectionReadCanFindThatTheBrokerAlreadyRestarted() {
+        bindRecoveryOwnerForTest(selected = selected.copy(incarnation = "replacement-broker"))
+        val controller = Robolectric.buildActivity(LatestRuntimeActivity::class.java, Intent()).setup()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertNull(shadowOf(controller.get()).nextStartedActivity)
+        controller.windowFocusChanged(true)
+        assertEquals(RuntimeBootstrapActivity::class.java.name,
+            shadowOf(controller.get()).nextStartedActivity?.component?.className)
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun homeBeforeOwnerReplyDefersRuntimeReplacementUntilForeground() {
+        val firstReplacement = selected.copy(incarnation = "first-replacement")
+        var initialReads = 0
+        bindRecoveryOwnerForTest(onRequest = {
+            initialReads++
+            throw DeadObjectException()
+        })
+        val recovery = Intent().putExtra(RuntimeActivityRecovery.OWNER_RECOVERY, true)
+        val bootstrap = Robolectric.buildActivity(RuntimeBootstrapActivity::class.java, recovery)
+            .setup().windowFocusChanged(true)
+        val activity = bootstrap.get()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, initialReads)
+
+        // Home can pause the Activity before the window reports focus loss.
+        bootstrap.pause().stop()
+        assertTrue(activity.hasWindowFocus())
+        reconnect(activity, firstReplacement)
+        assertFalse("late Binder response must not kill the background runtime",
+            org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(activity.isFinishing)
+        bootstrap.windowFocusChanged(false)
+
+        val current = selected.copy(incarnation = "current-broker")
+        var currentReads = 0
+        reconnect(activity, current) { currentReads++ }
+        bootstrap.restart().start().resume()
+        assertEquals(1, currentReads)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        bootstrap.windowFocusChanged(true)
+        assertEquals("refocus must read the current Binder", 2, currentReads)
+        val handoff = shadowOf(activity).nextStartedActivity
+        assertEquals(MainActivity::class.java.name, handoff?.component?.className)
+        assertTrue(org.robolectric.shadows.ShadowProcess.wasKilled(Process.myPid()))
+        bootstrap.windowFocusChanged(true)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertNull(shadowOf(activity.application).nextStoppedService)
+        bootstrap.pause().stop().destroy()
+
+        // Robolectric keeps the process in the test JVM. Clear process-local
+        // admission to follow the existing launcher and request a new socket.
+        resetRuntimeProcessForTest()
+        val requests = mutableListOf<Int>()
+        bindRecoveryOwnerForTest(selected = current, onRequest = { requests += it })
+        val launcher = Robolectric.buildActivity(MainActivity::class.java, handoff).setup()
+            .windowFocusChanged(true)
+        shadowOf(Looper.getMainLooper()).idle()
+        val freshLaunch = shadowOf(launcher.get()).nextStartedActivity
+        assertEquals(RuntimeBootstrapActivity::class.java.name, freshLaunch?.component?.className)
+        launcher.pause().stop().destroy()
+        val fresh = Robolectric.buildActivity(RuntimeBootstrapActivity::class.java, freshLaunch).setup()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(listOf(RuntimeOwnerProtocol.SELECTION, RuntimeOwnerProtocol.SELECTION, RuntimeOwnerProtocol.ATTACH), requests)
+        fresh.pause().stop().destroy()
+    }
+
+    private fun reconnect(activity: Activity, next: RuntimeSelectionV1, onRead: () -> Unit = {}) {
+        val connection = shadowOf(activity.application).boundServiceConnections.single()
+        val component = ComponentName(activity, RuntimeAuthBrokerService::class.java)
+        connection.onServiceDisconnected(component)
+        connection.onServiceConnected(component, object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                assertEquals(RuntimeOwnerProtocol.SELECTION, code)
+                data.enforceInterface(RuntimeOwnerProtocol.DESCRIPTOR)
+                onRead()
+                requireNotNull(reply).writeNoException()
+                reply.writeString(RuntimeSelectionStore.encode(next))
+                return true
+            }
+        })
+        shadowOf(Looper.getMainLooper()).idle()
     }
 
     @Test fun admittedReopenRetainsNativeLifecycleAndSuperclassState() {

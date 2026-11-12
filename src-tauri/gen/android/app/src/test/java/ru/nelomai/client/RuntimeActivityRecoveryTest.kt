@@ -186,13 +186,13 @@ class RecoveryDispatchFailureActivity : android.app.Activity() {
 
 internal fun bindRecoveryOwnerForTest(failRead: Boolean = false,
         selected: RuntimeSelectionV1 = RuntimeSelectionV1("latest", "0.3.3", "0.3.3", 1L, null, "owner-test"),
-        onRequest: () -> Unit = {}) {
+        onRequest: (Int) -> Unit = {}) {
         val application = RuntimeEnvironment.getApplication()
         shadowOf(application).setComponentNameAndServiceForBindService(
             ComponentName(application, RuntimeAuthBrokerService::class.java), object : Binder() {
                 override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
                     data.enforceInterface(RuntimeOwnerProtocol.DESCRIPTOR)
-                    onRequest()
+                    onRequest(code)
                     val response = requireNotNull(reply)
                     if (failRead) {
                         response.writeException(IllegalStateException("owner unavailable"))

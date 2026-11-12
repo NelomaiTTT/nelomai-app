@@ -39,6 +39,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
     private var selectionVerificationInFlight = false
     private var lastStartId = 0
     private var lastEngineStartId = 0
+    private var pendingStartReads = 0
     private var stopRevision = 0L
     private val waitingStartsAndToggles = mutableSetOf<Intent>()
     @Volatile private var lastBrokerVerificationAt = 0L
@@ -141,71 +142,94 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
             action != "ru.nelomai.tunnel.ENSURE_RUNNING"
         ) {
             rejectStart(intent, "vpn_permission_required")
-            stopSelf(startId)
+            if (retirementStarted) settleRetiredStartIds() else stopSelf(startId)
             return START_NOT_STICKY
         }
         if (waitingCommand != null) waitingStartsAndToggles += waitingCommand
+        pendingStartReads++
         selection.read { result ->
-            val cancelled = waitingCommand != null && !waitingStartsAndToggles.remove(waitingCommand)
-            if (destroyed) return@read
-            val active = result.getOrElse {
-                rejectStart(intent, "runtime_owner_unavailable")
-                if (!RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
-                return@read
-            }
             try {
-                if (!acceptSelection(active)) { rejectStart(intent); return@read }
-                val selectedEngine = engine ?: run {
-                    if (active.slot == "stable" && !engineWasLoaded) {
-                        try {
-                            ru.nelomai.tunnel.StableBackgroundProvision.prepareEngine(this, active.runtimeVersion)
-                        } catch (error: Exception) {
-                            rejectStart(intent, "background_credential_unavailable")
-                            throw error
+                val cancelled = waitingCommand != null && !waitingStartsAndToggles.remove(waitingCommand)
+                if (destroyed) return@read
+                val active = result.getOrElse {
+                    rejectStart(intent, "runtime_owner_unavailable")
+                    if (!retirementStarted && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
+                    return@read
+                }
+                try {
+                    if (!acceptSelection(active)) { rejectStart(intent); return@read }
+                    val selectedEngine = engine ?: run {
+                        if (active.slot == "stable" && !engineWasLoaded) {
+                            try {
+                                ru.nelomai.tunnel.StableBackgroundProvision.prepareEngine(this, active.runtimeVersion)
+                            } catch (error: Exception) {
+                                rejectStart(intent, "background_credential_unavailable")
+                                throw error
+                            }
+                        }
+                        engineWasLoaded = true
+                        RuntimeAdapters.engine(active, this)
+                    }.also {
+                        engine = it; it.create()
+                    }
+                    if (active.slot == "latest" && RuntimeDispatchPolicy.vpnLogoutEpoch(active) != null) {
+                        retireVpn(active)
+                        if (!isTeardownCommand(intent)) {
+                            rejectStart(intent)
+                            return@read
                         }
                     }
-                    engineWasLoaded = true
-                    RuntimeAdapters.engine(active, this)
-                }.also {
-                    engine = it; it.create()
-                }
-                if (active.slot == "latest" && RuntimeDispatchPolicy.vpnLogoutEpoch(active) != null) {
-                    retireVpn(active)
-                    if (!isTeardownCommand(intent)) {
-                        rejectStart(intent)
+                    val requiresStartAdmission = selectedEngine.requiresStartAdmission(intent)
+                    if (!vpnAuthorityCurrent() && !isTeardownCommand(intent)) {
+                        rejectStart(intent, "runtime_vpn_authority_retired")
                         return@read
                     }
-                }
-                val requiresStartAdmission = selectedEngine.requiresStartAdmission(intent)
-                if (!vpnAuthorityCurrent() && !isTeardownCommand(intent)) {
-                    rejectStart(intent, "runtime_vpn_authority_retired")
-                    return@read
-                }
-                if (cancelled || (admissionRevision != stopRevision &&
-                        (requiresStartAdmission || (waitingCommand != null && action == RuntimeServiceIntents.QUICK_TOGGLE)))
-                ) {
-                    rejectStart(intent, "runtime_start_cancelled")
-                    return@read
-                }
-                if (foregroundPromotionFailed && requiresStartAdmission) {
+                    if (cancelled || (admissionRevision != stopRevision &&
+                            (requiresStartAdmission || (waitingCommand != null && action == RuntimeServiceIntents.QUICK_TOGGLE)))
+                    ) {
+                        rejectStart(intent, "runtime_start_cancelled")
+                        return@read
+                    }
+                    if (foregroundPromotionFailed && requiresStartAdmission) {
+                        rejectStart(intent, "vpn_permission_required")
+                        stopSelf(startId)
+                        return@read
+                    }
+                    if (requiresStartAdmission && !RuntimeDispatchPolicy.mayStartVpn(active)) {
+                        rejectStart(intent)
+                        if (foregroundRequested && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
+                        return@read
+                    }
+                    RuntimeProcessSelection.rememberVpnOwner(active)
+                    if (RuntimeProcessSelection.hasVpnOwner()) superviseTransport()
+                    startEngine(selectedEngine, intent, flags, startId)
+                } catch (_: SecurityException) {
                     rejectStart(intent, "vpn_permission_required")
                     stopSelf(startId)
-                    return@read
-                }
-                if (requiresStartAdmission && !RuntimeDispatchPolicy.mayStartVpn(active)) {
-                    rejectStart(intent)
-                    if (foregroundRequested && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
-                    return@read
-                }
-                RuntimeProcessSelection.rememberVpnOwner(active)
-                if (RuntimeProcessSelection.hasVpnOwner()) superviseTransport()
-                startEngine(selectedEngine, intent, flags, startId)
-            } catch (_: SecurityException) {
-                rejectStart(intent, "vpn_permission_required")
-                stopSelf(startId)
-            } catch (_: Exception) { stopSelf(startId) }
+                } catch (_: Exception) { stopSelf(startId) }
+            } finally {
+                pendingStartReads--
+                settleRetiredStartIds()
+            }
         }
         return if (foregroundPromotionFailed) START_NOT_STICKY else START_STICKY
+    }
+
+    private fun settleRetiredStartIds() {
+        if (!retirementStarted || destroyed || pendingStartReads != 0 || lastStartId <= lastEngineStartId) return
+        val target = engine ?: return
+        val startId = lastStartId
+        // All delivered commands have now run or been rejected. Retire using
+        // the current Android startId without executing a rejected command.
+        runCatching {
+            if (target is RuntimeVpnTransportV1) {
+                target.retiredStartRejected(startId)
+            } else {
+                // The pinned stable engine accepts the old ABI only. This command
+                // reads the pending change revision and runs its guarded idle check.
+                target.start(Intent("ru.nelomai.runtime.stable.tunnel.TAKE_STATE_CHANGE"), 0, startId)
+            }
+        }.onSuccess { lastEngineStartId = maxOf(lastEngineStartId, startId) }
     }
 
     private fun startEngine(target: RuntimeVpnEngineV1, intent: Intent?, flags: Int, startId: Int) {
@@ -282,7 +306,8 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         "ru.nelomai.tunnel.CANCEL_CONNECTION_INTENT",
         "ru.nelomai.tunnel.CANCEL_CURRENT_CONNECTION_INTENT",
         "ru.nelomai.tunnel.BEGIN_BACKGROUND_LOGOUT",
-        "ru.nelomai.tunnel.CLEAR_BACKGROUND" -> true
+        "ru.nelomai.tunnel.CLEAR_BACKGROUND",
+        "ru.nelomai.tunnel.CLEAR_QUICK_PLAN" -> true
         RuntimeServiceIntents.QUICK_TOGGLE -> intent?.getBooleanExtra(RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false) == true
         else -> false
     }
@@ -336,7 +361,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
                     if (resultCode != 1) failedLogout()
                 }
             })
-        runCatching { startEngine(current, logout, 0, lastStartId) }.onFailure { failedLogout() }
+        runCatching { startEngine(current, logout, 0, lastEngineStartId) }.onFailure { failedLogout() }
     }
 
     private fun beginRetirement(): Boolean {
@@ -344,6 +369,8 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         retirementStarted = true
         invalidateQueuedVpnStarts()
         superviseTransport(retiring = true)
+        // A read rejected before retirement may already have advanced AMS's ID.
+        settleRetiredStartIds()
         return true
     }
 

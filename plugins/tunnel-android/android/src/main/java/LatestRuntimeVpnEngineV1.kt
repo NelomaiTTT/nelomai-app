@@ -17,6 +17,7 @@ class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1, Run
     override fun taskRemoved(intent: Intent?) = engine.onTaskRemoved(intent)
     override fun destroy() = engine.onDestroy()
     override fun localTransportClosed(): Boolean = engine.localTransportClosed()
+    override fun retiredStartRejected(startId: Int) = engine.retiredStartRejected(startId)
 }
 
 internal fun requiresVpnStartAdmission(context: android.content.Context, intent: Intent?): Boolean =

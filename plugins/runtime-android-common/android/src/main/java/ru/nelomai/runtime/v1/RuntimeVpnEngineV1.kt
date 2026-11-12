@@ -50,6 +50,7 @@ interface RuntimeVpnAuthorityV1 {
 
 interface RuntimeVpnTransportV1 {
     fun localTransportClosed(): Boolean
+    fun retiredStartRejected(startId: Int)
 }
 
 /** The name is container-owned and cannot be supplied by a runtime command. */

@@ -65,6 +65,7 @@ class RuntimeVpnBrokerRecoveryTest {
         BrokerRecoveryAdaptersShadow.established = 0
         BrokerRecoveryAdaptersShadow.actions.clear()
         BrokerRecoveryAdaptersShadow.startIds.clear()
+        BrokerRecoveryAdaptersShadow.rejectedStartIds.clear()
         BrokerRecoveryAdaptersShadow.revoked = 0
         BrokerRecoveryAdaptersShadow.logoutEpochs.clear()
         BrokerRecoveryAdaptersShadow.beforeEstablish = null
@@ -453,6 +454,64 @@ class RuntimeVpnBrokerRecoveryTest {
         replacement.destroy()
     }
 
+    @Test fun logoutCleanupClearsTheQuickPlanWithAWarmOrColdService() {
+        val clear = "ru.nelomai.tunnel.CLEAR_QUICK_PLAN"
+        val warm = connectedService()
+        BrokerRecoverySelectionShadow.selected = selection("old-broker", scope = null, blocked = true, logoutEpoch = 8)
+        reconcileNewOwner()
+        warm.get().onStartCommand(Intent(clear), 0, 2)
+        assertEquals("warm retired service must execute cleanup", clear, BrokerRecoveryAdaptersShadow.actions.last())
+        warm.destroy()
+        ReflectionHelpers.setStaticField(RuntimeProcessSelection::class.java, "loaded", null)
+        val cold = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        cold.get().onStartCommand(Intent(clear), 0, 1)
+        assertEquals("fresh service after Logout must execute cleanup", clear, BrokerRecoveryAdaptersShadow.actions.last())
+        assertEquals(1, BrokerRecoveryAdaptersShadow.established)
+        cold.destroy()
+    }
+
+    @Test fun rejectedStatusCannotStrandTheRetiredServiceAtItsOldStartId() {
+        val old = connectedService()
+        BrokerRecoverySelectionShadow.selected = selection("old-broker", scope = null, blocked = true, logoutEpoch = 8)
+        reconcileNewOwner()
+        old.get().onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STATUS"), 0, 2)
+        assertEquals("retired engine must be able to stop at the latest startId", listOf(2),
+            BrokerRecoveryAdaptersShadow.rejectedStartIds)
+        assertFalse(BrokerRecoveryAdaptersShadow.actions.contains("ru.nelomai.tunnel.CLIENT_STATUS"))
+        old.destroy()
+    }
+
+    @Test fun retirementReconcilesAStatusRejectedBeforeTheBrokerDeadline() {
+        val old = connectedService()
+        BrokerRecoverySelectionShadow.unavailable = true
+        old.get().onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STATUS"), 0, 2)
+        assertTrue(BrokerRecoveryAdaptersShadow.rejectedStartIds.isEmpty())
+        assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
+        BrokerRecoveryAdaptersShadow.onRevoke = {
+            assertEquals(listOf(2), BrokerRecoveryAdaptersShadow.rejectedStartIds)
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(11))
+        assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
+        assertEquals(listOf(2), BrokerRecoveryAdaptersShadow.rejectedStartIds)
+        old.destroy()
+    }
+
+    @Test fun retiredStableEngineUsesTheExistingReadCommandToSettleStartId() {
+        BrokerRecoverySelectionShadow.selected =
+            RuntimeSelectionV1("stable", "0.2.21", "0.3.14", 7, null, "old-broker")
+        ReflectionHelpers.setStaticField(RuntimeVpnDispatcherService::class.java, "engineWasLoaded", true)
+        val old = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        val prefix = "ru.nelomai.runtime.stable.tunnel."
+        old.get().onStartCommand(RuntimeServiceIntents.foreground(Intent(prefix + "CLIENT_START")), 0, 1)
+        old.get().onRevoke()
+        old.get().onStartCommand(Intent(prefix + "CLIENT_STATUS"), 0, 2)
+        assertEquals(listOf(prefix + "CLIENT_START", prefix + "TAKE_STATE_CHANGE"),
+            BrokerRecoveryAdaptersShadow.actions)
+        assertEquals(listOf(1, 2), BrokerRecoveryAdaptersShadow.startIds)
+        assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
+        old.destroy()
+    }
+
     @Test fun asynchronousFailureOfNativeLogoutFallsBackToRevocation() {
         val old = connectedService()
         BrokerRecoveryAdaptersShadow.logoutResult = 2
@@ -505,8 +564,8 @@ class BrokerRecoverySelectionShadow {
 
 @Implements(RuntimeAdapters::class, isInAndroidSdk = false)
 class BrokerRecoveryAdaptersShadow {
-    @Implementation fun engine(selected: RuntimeSelectionV1, host: RuntimeVpnHostV1): RuntimeVpnEngineV1 =
-        object : RuntimeVpnEngineV1, RuntimeVpnTransportV1 {
+    @Implementation fun engine(selected: RuntimeSelectionV1, host: RuntimeVpnHostV1): RuntimeVpnEngineV1 {
+        val adapter = object : RuntimeVpnEngineV1, RuntimeVpnTransportV1 {
             override fun requiresStartAdmission(intent: Intent?) =
                 intent == null || intent.action == "ru.nelomai.tunnel.CLIENT_START" ||
                     intent.action == "ru.nelomai.runtime.stable.tunnel.CLIENT_START" ||
@@ -545,7 +604,10 @@ class BrokerRecoveryAdaptersShadow {
             override fun taskRemoved(intent: Intent?) = Unit
             override fun destroy() { destroyed++ }
             override fun localTransportClosed(): Boolean = transportClosed
+            override fun retiredStartRejected(startId: Int) { rejectedStartIds += startId }
         }
+        return if (selected.slot == "stable") object : RuntimeVpnEngineV1 by adapter {} else adapter
+    }
 
     @Implementation fun quick(selected: RuntimeSelectionV1): RuntimeQuickActionsV1 =
         object : RuntimeQuickActionsV1 {
@@ -560,6 +622,7 @@ class BrokerRecoveryAdaptersShadow {
         var revoked = 0
         val actions = mutableListOf<String?>()
         val startIds = mutableListOf<Int>()
+        val rejectedStartIds = mutableListOf<Int>()
         val logoutEpochs = mutableListOf<Long>()
         var beforeEstablish: (() -> Unit)? = null
         var logoutResult: Int? = null

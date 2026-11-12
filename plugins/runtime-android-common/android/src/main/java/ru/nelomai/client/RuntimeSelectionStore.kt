@@ -26,6 +26,7 @@ class RuntimeSelectionStore @JvmOverloads constructor(
     private val handler = Handler(Looper.getMainLooper())
     @Volatile private var remote: IBinder? = null
     private var bound = false
+    private var ownerConnectionObserver: ((RuntimeSelectionV1) -> Unit)? = null
     private val pending = PendingSelectionReads<RuntimeSelectionV1>(8)
     private val worker = if (readOffMain) ThreadPoolExecutor(
         1, 1, 0, TimeUnit.MILLISECONDS, ArrayBlockingQueue(2),
@@ -41,7 +42,18 @@ class RuntimeSelectionStore @JvmOverloads constructor(
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             readVersion++
             remote = binder
-            if (readOffMain) readPending() else complete(runCatching { snapshot() })
+            if (readOffMain) {
+                readPending()
+            } else {
+                val result = runCatching { snapshot() }
+                if (result.exceptionOrNull() is DeadObjectException) {
+                    // Keep the pending reads and their deadline for the next Binder.
+                    remote = null
+                    return
+                }
+                complete(result)
+                if (remote === binder) result.onSuccess { ownerConnectionObserver?.invoke(it) }
+            }
         }
         override fun onServiceDisconnected(name: ComponentName?) { readVersion++; remote = null }
         override fun onNullBinding(name: ComponentName?) {
@@ -52,6 +64,12 @@ class RuntimeSelectionStore @JvmOverloads constructor(
             invalidateBinding()
             complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         }
+    }
+
+    /** Observe successful snapshots from each Binder connection of the runtime UI. */
+    fun observeOwnerConnections(observer: (RuntimeSelectionV1) -> Unit) {
+        check(!readOffMain)
+        ownerConnectionObserver = observer
     }
 
     fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) {
@@ -215,6 +233,7 @@ class RuntimeSelectionStore @JvmOverloads constructor(
     }
 
     override fun close() {
+        ownerConnectionObserver = null
         handler.removeCallbacks(timeout)
         pending.complete(Result.failure(IllegalStateException("runtime_selection_store_closed")))
         invalidateBinding()

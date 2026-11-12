@@ -74,6 +74,11 @@ pub struct UpdateStatusV2 {
     pub prompt_pending: bool,
     pub update_available: bool,
 }
+#[derive(Clone, Copy)]
+struct RefreshFailure {
+    code: &'static str,
+    manual: bool,
+}
 struct Backend(Arc<dyn UpdateBackend>);
 #[async_trait::async_trait]
 impl UpdateBackend for Backend {
@@ -157,14 +162,13 @@ pub(crate) struct HostUpdater {
     broker: Arc<AuthBroker>,
     preferences: FileUpdatePreferenceStore,
     current: Mutex<UpdatePreferences>,
-    offer: Mutex<Option<UpdateOffer>>,
     backend: Option<Arc<dyn UpdateBackend>>,
     coordinator: Option<UpdateCoordinator<Backend>>,
     barrier: Arc<UpdateBarrier>,
     version: String,
     operation: Mutex<UpdateOperation>,
     install_recovery_gate: Arc<tokio::sync::Mutex<()>>,
-    refresh_error: Mutex<Option<String>>,
+    refresh_error: Mutex<Option<RefreshFailure>>,
     prompt_path: std::path::PathBuf,
     prompt_session: Mutex<PromptSession>,
     startup_checked: std::sync::atomic::AtomicBool,
@@ -264,7 +268,6 @@ impl HostUpdater {
             broker,
             preferences,
             current: Mutex::new(current),
-            offer: Mutex::new(None),
             backend,
             coordinator,
             barrier,
@@ -310,13 +313,14 @@ impl HostUpdater {
             .lock()
             .map_err(|_| PrivateError::Closed)?
             .automatic;
-        let offer = self.offer.lock().map_err(|_| PrivateError::Closed)?.clone();
-        let phase = self
+        // A refresh cannot finish between observing its offer and deciding
+        // whether this reply is still checking.
+        let operation = self.operation.lock().map_err(|_| PrivateError::Closed)?;
+        let (phase, offer, prompt_pending) = self
             .coordinator
             .as_ref()
-            .map(|c| c.phase())
-            .unwrap_or(UpdatePhase::Idle);
-        let operation = *self.operation.lock().map_err(|_| PrivateError::Closed)?;
+            .map(|c| c.presentation())
+            .unwrap_or((UpdatePhase::Idle, None, false));
         let (v2_phase, legacy_phase, version, downloaded, total, error) = match phase {
             UpdatePhase::Idle => ("idle", "idle", None, 0, None, None),
             UpdatePhase::Available(o) => ("available", "available", Some(o.version), 0, None, None),
@@ -368,38 +372,46 @@ impl HostUpdater {
                 ("failed", "failed", Some(version), 0, None, Some(code))
             }
         };
-        let checking = operation == UpdateOperation::Refreshing
+        let checking = *operation == UpdateOperation::Refreshing
             || *self
                 .manual_pending
                 .lock()
                 .map_err(|_| PrivateError::Closed)?;
+        let error_code = if checking {
+            Some("update_refresh_pending".into())
+        } else {
+            let refresh_error = *self
+                .refresh_error
+                .lock()
+                .map_err(|_| PrivateError::Closed)?;
+            let refresh_code = refresh_error.map(|failure| failure.code.into());
+            if v2_phase == "failed" && refresh_error.is_some_and(|failure| failure.manual) {
+                // A manual check can fail while recovering a previous install.
+                // Its result must be visible even when the offer is retained.
+                refresh_code
+            } else {
+                error.or(refresh_code)
+            }
+        };
         let status = HostUpdateStatusV1 {
             supported: self.coordinator.is_some(),
             automatic,
             phase: legacy_phase.into(),
             version,
-            notes: offer.as_ref().and_then(|o| o.notes.clone()),
-            required: offer.as_ref().is_some_and(|o| o.required),
+            notes: offer.as_ref().and_then(|(_, o)| o.notes.clone()),
+            required: offer.as_ref().is_some_and(|(_, o)| o.required),
             downloaded,
             total,
-            error_code: if checking {
-                Some("update_refresh_pending".into())
-            } else {
-                error.or(self
-                    .refresh_error
-                    .lock()
-                    .map_err(|_| PrivateError::Closed)?
-                    .clone())
-            },
+            error_code,
         };
-        let coordinator = self.coordinator.as_ref();
+        let update_available =
+            offer.is_some() && !matches!(v2_phase, "ready_to_restart" | "awaiting_installation");
         Ok(UpdateStatusV2 {
             status,
             phase: if checking { "checking" } else { v2_phase }.into(),
-            offer_id: coordinator.and_then(|c| c.offer_id()),
-            prompt_pending: coordinator.is_some_and(|c| c.prompt_pending()),
-            update_available: coordinator.and_then(|c| c.offer_id()).is_some()
-                && !matches!(v2_phase, "ready_to_restart" | "awaiting_installation"),
+            offer_id: offer.map(|(id, _)| id),
+            prompt_pending,
+            update_available,
         })
     }
     pub fn set_automatic(
@@ -453,10 +465,6 @@ impl HostUpdater {
         }
         self.broker
             .with_current_access(&access, || {
-                *self
-                    .offer
-                    .lock()
-                    .map_err(|_| crate::BrokerError::RecoveryRequired)? = offer.clone();
                 if let Some(coordinator) = &self.coordinator {
                     coordinator.observe_resolved(offer.zip(resolved), &access);
                 }
@@ -552,11 +560,7 @@ impl HostUpdater {
                 }
                 *owner.refresh_error.lock().expect("update error poisoned") = None;
             } else {
-                owner.record_refresh_error(PrivateError::RecoveryRequired);
-                *owner
-                    .manual_pending
-                    .lock()
-                    .expect("update manual request poisoned") = false;
+                owner.fail_pending_refresh(PrivateError::RecoveryRequired);
                 owner
                     .startup_pending
                     .store(false, std::sync::atomic::Ordering::Release);
@@ -606,16 +610,12 @@ impl HostUpdater {
                             coordinator.suppress_notification();
                         }
                         if let Err(error) = owner.save_prompt() {
-                            owner.record_refresh_error(error);
+                            owner.record_refresh_error(error, true);
                         }
                     }
                 }
                 Err(error) => {
-                    *owner
-                        .manual_pending
-                        .lock()
-                        .expect("update manual request poisoned") = false;
-                    owner.record_refresh_error(error);
+                    owner.fail_pending_refresh(error);
                     if let Some(c) = &owner.coordinator {
                         c.invalidate();
                     }
@@ -918,9 +918,19 @@ impl HostUpdater {
             c.set_ui_lifecycle(false, false);
         }
     }
-    fn record_refresh_error(&self, error: PrivateError) {
+    fn fail_pending_refresh(&self, error: PrivateError) {
+        let mut pending = self
+            .manual_pending
+            .lock()
+            .expect("update manual request poisoned");
+        self.record_refresh_error(error, std::mem::take(&mut *pending));
+    }
+    fn record_refresh_error(&self, error: PrivateError, manual: bool) {
         if let Ok(mut slot) = self.refresh_error.lock() {
-            *slot = Some(refresh_error_code(error).into());
+            *slot = Some(RefreshFailure {
+                code: refresh_error_code(error),
+                manual,
+            });
         }
     }
     fn resume_pending_check(self: &Arc<Self>) -> bool {
@@ -1848,6 +1858,14 @@ mod tests {
             "cancel_requested"
         );
         let old_offer = updater.status_v2().unwrap().offer_id;
+        updater.check(UpdateCheckReason::Manual).unwrap();
+        wait_for_idle(&updater).await;
+        assert_eq!(panel.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            updater.status_v2().unwrap().status.error_code.as_deref(),
+            Some("update_refresh_recovery_required"),
+            "the manual check failed before discovery and must report that failure"
+        );
         panel.fail_resume.store(false, Ordering::SeqCst);
         updater.check(UpdateCheckReason::Foreground).unwrap();
         wait_for_idle(&updater).await;
@@ -2368,6 +2386,43 @@ mod tests {
         assert_eq!(panel.calls.load(Ordering::SeqCst), 2);
         server.abort();
     }
+    #[tokio::test]
+    async fn status_metadata_tracks_only_the_coordinators_current_offer() {
+        let (owner, panel, _, _, server, _root) = updater(false).await;
+        owner.check(UpdateCheckReason::Startup).unwrap();
+        wait_for_calls(&panel, 1).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        let access = owner.broker.access_token(None).await.unwrap();
+        let coordinator = owner.coordinator.as_ref().unwrap();
+        coordinator.invalidate();
+
+        let idle = owner.status_v2().unwrap();
+        assert_eq!(idle.phase, "idle");
+        assert!(idle.offer_id.is_none());
+        assert!(!idle.update_available);
+        assert!(idle.status.notes.is_none());
+        assert!(!idle.status.required);
+
+        let offer = UpdateOffer {
+            version: "0.2.22".into(),
+            notes: Some("current offer notes".into()),
+            required: true,
+        };
+        coordinator.observe_resolved(Some((offer, test_descriptor("0.2.22"))), &access);
+        let available = owner.status_v2().unwrap();
+        assert_eq!(available.phase, "available");
+        assert!(available.offer_id.is_some());
+        assert!(available.update_available);
+        assert_eq!(available.status.version.as_deref(), Some("0.2.22"));
+        assert_eq!(
+            available.status.notes.as_deref(),
+            Some("current offer notes")
+        );
+        assert!(available.status.required);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn later_during_manual_refresh_wins_over_completion() {
         let (owner, panel, _, _, server, _root) = updater(false).await;

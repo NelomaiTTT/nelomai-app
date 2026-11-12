@@ -139,7 +139,7 @@
   let updateDialogId = $state<string|null>(null);
   let updateUiVisible = $state(true);
   let manualUpdateResult = $state<string|null>(null);
-  let manualUpdatePending = false;
+  let manualUpdatePending: { acknowledged: boolean } | null = null;
   let runtimeStatus = $state<RuntimeStatus | null>(null);
   let runtimeSelectionBusy = $state(false);
   let updateTimer: number | null = null;
@@ -1105,6 +1105,8 @@
       selectedPeerId = "";
       password = "";
       diagnosticsStatus = null;
+      manualUpdatePending = null;
+      manualUpdateResult = null;
       observeUpdateStatus(null);
       updateDialogId = null;
       splitTunnelState = null;
@@ -1243,21 +1245,24 @@
 
   async function refreshUpdateStatus() {
     const sequence = ++updateRequestSequence;
+    // Only reads started after this Manual's acknowledgement can finish it.
+    const manualCheck = manualUpdatePending?.acknowledged ? manualUpdatePending : null;
     clearUpdateTimer();
-    try {
-      const status = await nativeClient.updateStatus();
-      if (!observeUpdateStatus(status, sequence)) return;
-      if (updateUiVisible && updateStatusNeedsPolling(status)) {
-        updateTimer = window.setTimeout(refreshUpdateStatus, 500);
-      }
-    } catch {
-      observeUpdateStatus(null, sequence);
+    const status = await nativeClient.updateStatus().catch(() => null);
+    const applied = observeUpdateStatus(status, sequence, manualCheck);
+    // An unrelated reply can supersede this read without finishing Manual.
+    // In that case, a new read keeps Manual tied to its own acknowledgement.
+    const retryManualRead = !applied && bootstrap && manualCheck && manualCheck === manualUpdatePending;
+    if (updateUiVisible && updateTimer === null &&
+        (retryManualRead || (applied && status && updateStatusNeedsPolling(status)))) {
+      updateTimer = window.setTimeout(refreshUpdateStatus, 500);
     }
   }
 
   function observeUpdateStatus(
     status: UpdateStatus | null,
     sequence = ++updateRequestSequence,
+    manualCheck: typeof manualUpdatePending = null,
   ): boolean {
     // User-action replies commit a new sequence. Older polls/checks (including
     // failures) must not overwrite a newer decision. Pending reads do not
@@ -1266,6 +1271,10 @@
     updateAppliedSequence = sequence;
     if (!status) {
       updateStatus = null;
+      if (manualCheck && manualCheck === manualUpdatePending) {
+        manualUpdatePending = null;
+        manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+      }
       return true;
     }
     const refreshStage = updateRefreshDiagnosticStage(
@@ -1276,9 +1285,17 @@
     const checkingSameOffer = status.phase === "checking" && status.protocol === 2 && status.supported;
     if(updateDialogId && (updateDialogId!==status.offerId || (!canConfirmUpdate(status) && !checkingSameOffer)))updateDialogId=null;
     if(!updateDialogId)updateDialogId=updatePrompt(status,updateUiVisible && view!=="sign_in");
-    if(manualUpdatePending && status.phase!=="checking" && status.errorCode!=="update_refresh_pending") {
-      manualUpdatePending=false;
-      manualUpdateResult=status.errorCode ? "Не удалось проверить обновление. Повторите позже." : status.updateAvailable ? `Найдена версия ${status.version}` : "У вас актуальная версия.";
+    if(manualCheck && manualCheck === manualUpdatePending && status.phase!=="checking" && status.errorCode!=="update_refresh_pending") {
+      manualUpdatePending=null;
+      if (status.errorCode?.startsWith("update_refresh_")) {
+        manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+      } else if (status.phase === "ready_to_restart" || status.phase === "awaiting_installation") {
+        manualUpdateResult = updateMessage(status);
+      } else {
+        manualUpdateResult = status.updateAvailable && status.version
+          ? `Найдена версия ${status.version}`
+          : "У вас актуальная версия.";
+      }
     }
     if (refreshStage) void nativeClient.recordStartupStage(refreshStage);
     const stage = updateDiagnosticStage(status.phase);
@@ -1292,7 +1309,8 @@
 
   async function refreshUpdateOffer(reason:"startup"|"manual"="manual") {
     if (!bootstrap) return;
-    if(reason==="manual"){manualUpdatePending=true;manualUpdateResult="Проверяем…";}
+    const manualCheck = reason === "manual" ? { acknowledged: false } : null;
+    if(manualCheck){manualUpdatePending=manualCheck;manualUpdateResult="Проверяем…";}
     let sequence: number | null = null;
     const result=await updateOfferRefresher.run(
       () => {
@@ -1300,17 +1318,23 @@
         return nativeClient.checkUpdate(reason);
       },
       (status) => {
-        if (sequence === null || !observeUpdateStatus(status, sequence)) return;
-        if (updateStatusNeedsPolling(status)) {
+        if (sequence === null) return;
+        if (manualCheck === manualUpdatePending && manualCheck) manualCheck.acknowledged = true;
+        const applied = observeUpdateStatus(status, sequence, manualCheck);
+        // A pre-ACK poll may already have applied a newer sequence. Preserve
+        // that presentation fence, but still request a fresh Manual result.
+        // Successful logout clears bootstrap and must not resurrect polling.
+        if ((!applied && bootstrap && manualCheck && manualCheck === manualUpdatePending)
+          || (applied && updateStatusNeedsPolling(status))) {
           clearUpdateTimer();
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
       },
       reason === "manual",
     );
-    if (!result && reason === "manual" && sequence !== null && sequence >= updateAppliedSequence) {
-      updateAppliedSequence = sequence;
-      manualUpdatePending = false;
+    if (!result && manualCheck && manualCheck === manualUpdatePending && sequence !== null) {
+      updateAppliedSequence = Math.max(updateAppliedSequence, sequence);
+      manualUpdatePending = null;
       manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
     }
   }
@@ -2003,7 +2027,9 @@
                 onchange={setAutomaticUpdates}
               />
             </label>
-            <button class="secondary-button" type="button" onclick={()=>refreshUpdateOffer("manual")} disabled={updateStatus.phase==="checking"}>Проверить обновления</button>
+          {/if}
+          {#if updateStatus?.supported || (updateStatus === null && manualUpdateResult !== null)}
+            <button class="secondary-button" type="button" onclick={()=>refreshUpdateOffer("manual")} disabled={updateStatus?.phase==="checking"}>Проверить обновления</button>
             {#if manualUpdateResult}<p aria-live="polite">{manualUpdateResult}</p>{/if}
           {/if}
           {#if runtimeStatus}
@@ -2096,11 +2122,11 @@
             >
               {updateBusy ? "Открываем…" : "Открыть снова"}
             </button>
-          {:else if updateStatus.phase !== "downloading"}
+          {:else if canConfirmUpdate(updateStatus)}
             <button
               class="primary-button"
               type="button"
-              onclick={installUpdate}
+              onclick={showUpdatePrompt}
               disabled={updateBusy}
             >
               {updateBusy ? "Начинаем…" : "Обновить"}

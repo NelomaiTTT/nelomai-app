@@ -2,10 +2,13 @@ package ru.nelomai.client
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Button
 import android.widget.EditText
+import android.widget.TextView
+import androidx.core.graphics.ColorUtils
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +26,25 @@ import javax.xml.parsers.DocumentBuilderFactory
 @RunWith(org.robolectric.RobolectricTestRunner::class)
 @Config(sdk = [28])
 class SupportDiagnosticsActivityTest {
+    @Test @Config(qualifiers = "notnight")
+    fun diagnosticsTextHasContrastInLightTheme() = assertReadableWindow()
+
+    @Test @Config(qualifiers = "night")
+    fun diagnosticsTextHasContrastInDarkTheme() = assertReadableWindow()
+
+    private fun assertReadableWindow() {
+        val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
+        try {
+            val activity = controller.get()
+            val background = activity.window.decorView.background as? ColorDrawable
+            assertNotNull("The diagnostics window needs a plain, opaque background", background)
+            val status = activity.findViewById<TextView>(SupportDiagnosticsActivity.STATUS_VIEW)
+            assertTrue(ColorUtils.calculateContrast(status.currentTextColor, background!!.color) >= 4.5)
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
     @Test fun verboseButtonsControlRealCollectorWithoutLoginUploadOrExtendingOnRecreation() {
         val controller = Robolectric.buildActivity(SupportDiagnosticsActivity::class.java).setup()
         val activity = controller.get()

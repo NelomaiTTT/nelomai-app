@@ -258,8 +258,18 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         self.changed.notify_one();
         Ok(())
     }
-    pub fn prompt_pending(&self) -> bool {
+    pub fn presentation(&self) -> (UpdatePhase, Option<(String, UpdateOffer)>, bool) {
         let state = self.state.lock().expect("update state poisoned");
+        let offer = state
+            .offer
+            .as_ref()
+            .map(|o| (o.id.clone(), o.offer.clone()));
+        (state.phase.clone(), offer, Self::has_pending_prompt(&state))
+    }
+    pub fn prompt_pending(&self) -> bool {
+        Self::has_pending_prompt(&self.state.lock().expect("update state poisoned"))
+    }
+    fn has_pending_prompt(state: &State) -> bool {
         state.offer.as_ref().is_some_and(|o| {
             !Self::terminal(&state.phase)
                 && !state.consent

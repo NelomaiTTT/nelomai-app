@@ -3,6 +3,7 @@ package ru.nelomai.client
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import ru.nelomai.runtime.v1.RuntimeActivityRecovery
 import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
 
 /** Launcher only: no Tauri, keyring or versioned engine is loaded here. */
@@ -65,6 +66,11 @@ class MainActivity : Activity() {
 class RuntimeBootstrapActivity : Activity() {
     private lateinit var selection: RuntimeSelectionStore
     private var failureStage: SupportStartupStage? = null
+    private var resumed = false
+    private var recoveryReadPending = false
+    private val ownerRecovery get() = intent.getBooleanExtra(RuntimeActivityRecovery.OWNER_RECOVERY, false)
+    private val recoveryForeground get() = resumed && hasWindowFocus()
+
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         selection = RuntimeSelectionStore(this)
@@ -74,8 +80,39 @@ class RuntimeBootstrapActivity : Activity() {
             showFailure(stage, IllegalStateException("bootstrap_failure_restored"))
             return
         }
+        if (ownerRecovery) recoveryReadPending = true else readOwner()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        readRecoveryWhenFocused()
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) readRecoveryWhenFocused()
+    }
+
+    private fun readRecoveryWhenFocused() {
+        if (!recoveryReadPending || !recoveryForeground || isFinishing || isDestroyed) return
+        recoveryReadPending = false
+        readOwner()
+    }
+
+    private fun readOwner() {
         selection.read { result ->
             if (isFinishing || isDestroyed) return@read
+            if (ownerRecovery && !recoveryForeground) {
+                // Read again on return: the broker may have changed while we were away.
+                recoveryReadPending = true
+                return@read
+            }
             if (result.isFailure) {
                 showFailure(SupportStartupStage.BOOTSTRAP_OWNER_READ, requireNotNull(result.exceptionOrNull()))
                 return@read
@@ -84,7 +121,7 @@ class RuntimeBootstrapActivity : Activity() {
                 var stage = SupportStartupStage.BOOTSTRAP_PROCESS_CLAIM
                 runCatching {
                     if (RuntimeProcessSelection.needsExit(selected)) {
-                        check(!intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeActivityRecovery.MANUAL_RETRY, false)) {
+                        check(!intent.getBooleanExtra(RuntimeActivityRecovery.MANUAL_RETRY, false)) {
                             "runtime_recovery_process_conflict"
                         }
                         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -120,7 +157,7 @@ class RuntimeBootstrapActivity : Activity() {
     }
     private fun showFailure(stage: SupportStartupStage, error: Throwable) {
         failureStage = stage
-        SupportDiagnosticsStartup.showFailure(this, stage, error)
+        SupportDiagnosticsStartup.showFailure(this, stage, error, ownerRecovery = ownerRecovery)
     }
     override fun onSaveInstanceState(state: Bundle) {
         super.onSaveInstanceState(state)

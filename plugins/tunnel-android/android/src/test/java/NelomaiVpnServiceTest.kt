@@ -2977,6 +2977,27 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun staleLegacyStopDoesNotDispatchNativeStopForANewerGeneration() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        store.setDesiredActive(0, true).successEnvelope()
+        val coordinator = coordinator(store)
+        assertTrue(coordinator.cancelCurrentForQuickToggle() is AndroidCoordinatorResult.Accepted)
+        val stopped = store.load()
+        val stoppedRecord = backend.snapshotRecord()
+        val replacement = store.setDesiredActive(stopped.intent.generation, true).successEnvelope()
+        val replacementRecord = backend.snapshotRecord()
+        assertTrue(backend.write(stoppedRecord))
+        backend.replaceRecordAfterReads(1, replacementRecord)
+
+        val runtime = ServiceRuntimeFake(running = true)
+        assertEquals(AndroidCoordinatorStep.BUSY, coordinator.runOnce(ServicePanelFake(), runtime))
+        assertEquals(0, runtime.stopCalls)
+        assertTrue(runtime.isRunning())
+        assertEquals(replacement, store.load())
+    }
+
+    @Test
     fun leaseLessQuickOffQueuesRealRuntimeStopBehindAnInProgressLegacyStart() {
         val gate = TunnelStateGate()
         assertEquals(TransitionDecision.PROCEED, gate.beginStart())
