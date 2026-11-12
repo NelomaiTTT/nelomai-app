@@ -34,6 +34,7 @@ pub struct PreparedHost<F: ProtectedRecordFactory> {
     pub selection: InstalledRuntimeSelection,
     pub storage: PreparedRuntimeStorage<F::Record>,
     pub records: F,
+    resource_root: PathBuf,
 }
 
 pub fn prepare_host<F: ProtectedRecordFactory>(
@@ -66,6 +67,7 @@ pub fn prepare_host<F: ProtectedRecordFactory>(
         selection,
         storage,
         records,
+        resource_root: resource_root.to_owned(),
     })
 }
 
@@ -872,12 +874,7 @@ impl CommonHost {
     where
         F::Record: 'static,
     {
-        let PreparedHost {
-            owner,
-            selection,
-            storage,
-            records,
-        } = prepare_host(
+        let prepared = prepare_host(
             data_root,
             resource_root,
             pinned_key,
@@ -885,6 +882,26 @@ impl CommonHost {
             architecture,
             create_records,
         )?;
+        Self::from_prepared(prepared, api, profile, native)
+    }
+
+    /// Continue startup with the same verified resources and owner lock.
+    pub fn from_prepared<F: ProtectedRecordFactory + Send + 'static>(
+        prepared: PreparedHost<F>,
+        api: ClientApi,
+        profile: RuntimeClientProfile,
+        native: HostNativePorts,
+    ) -> Result<Self, HostError>
+    where
+        F::Record: 'static,
+    {
+        let PreparedHost {
+            owner,
+            selection,
+            storage,
+            records,
+            resource_root,
+        } = prepared;
         let selected_state = storage.runtime.load().map_err(BrokerError::from)?;
         let requires_transition = matches!(
             selection.recovery(),
@@ -897,7 +914,7 @@ impl CommonHost {
             // selected payload before a JNI callback can load any such class.
             #[cfg(unix)]
             verify_android_payload(
-                resource_root,
+                &resource_root,
                 selection.manifest(),
                 selection.target().runtime_slot,
                 unsafe { libc::geteuid() },
@@ -1047,7 +1064,7 @@ impl CommonHost {
         Ok(Self {
             owner,
             installed: selection,
-            resources: resource_root.to_owned(),
+            resources: resource_root,
             broker,
             coordinator,
             updater,

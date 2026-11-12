@@ -2599,6 +2599,157 @@ fn desktop_pair_fixture() -> (
     (core, api, store, tunnel)
 }
 
+#[cfg(not(target_os = "android"))]
+struct PendingRefreshAuth {
+    inner: Arc<dyn nelomai_client_core::RuntimeAuthProvider>,
+    pending: tokio::sync::Mutex<Option<AccessSnapshot>>,
+    refresh_available: AtomicBool,
+}
+
+#[cfg(not(target_os = "android"))]
+#[async_trait]
+impl nelomai_client_core::RuntimeAuthProvider for PendingRefreshAuth {
+    async fn state(&self) -> Result<nelomai_client_api::RuntimeAuthState, CoreError> {
+        if self.pending.lock().await.is_some() {
+            return Ok(nelomai_client_api::RuntimeAuthState::RecoveryRequired);
+        }
+        self.inner.state().await
+    }
+
+    async fn login(
+        &self,
+        request: nelomai_client_api::RuntimeLogin,
+    ) -> Result<AccessSnapshot, CoreError> {
+        self.inner.login(request).await
+    }
+
+    async fn logout(&self) -> Result<(), CoreError> {
+        self.inner.logout().await
+    }
+
+    async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+        let mut pending = self.pending.lock().await;
+        if let Some(stale) = stale {
+            *pending = Some(stale.clone());
+        }
+        let Some(stale) = pending.as_ref() else {
+            return self.inner.access(None).await;
+        };
+        if !self.refresh_available.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable.into());
+        }
+        let refreshed = self.inner.access(Some(stale)).await?;
+        *pending = None;
+        Ok(refreshed)
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(start_paused = true)]
+async fn desktop_local_stop_remains_pending_until_authorization_and_server_cleanup_recover() {
+    let (_, api, store, tunnel) = desktop_pair_fixture();
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(PendingRefreshAuth {
+        inner: Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        )),
+        pending: tokio::sync::Mutex::new(None),
+        refresh_available: AtomicBool::new(false),
+    });
+    let logger = Arc::new(MemoryLogger::default());
+    let core = PairCore::new(
+        api.clone(),
+        store.clone(),
+        owner.clone(),
+        local,
+        logger.clone(),
+    );
+    let epoch = core.begin_start_attempt();
+    core.desktop_connection_intent_attempt_with_cancellation_epoch(
+        options(),
+        1_700_000_000,
+        true,
+        epoch,
+    )
+    .await
+    .unwrap();
+    core.finish_start_attempt();
+
+    core.stop_locally().await.unwrap();
+    let pending = store
+        .value
+        .lock()
+        .unwrap()
+        .pending_compensation_stop
+        .clone()
+        .unwrap();
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert!(core.local_stop_pending_cleanup().await);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+
+    api.redundant_stop_responses
+        .lock()
+        .unwrap()
+        .push_back(Err(CoreApiError::Unauthorized));
+    assert!(matches!(
+        core.retry_pending_stop_cleanup().await,
+        Err(CoreError::Api(CoreApiError::Retryable))
+    ));
+    assert!(owner.pending.lock().await.is_some());
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert!(core.local_stop_pending_cleanup().await);
+    assert_eq!(
+        store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .as_ref(),
+        Some(&pending)
+    );
+
+    // A stopped projection must still depend on positive native status.
+    *tunnel.legacy.status.lock().unwrap() = TunnelStatus::Failed;
+    assert!(!core.local_stop_pending_cleanup().await);
+    *tunnel.legacy.status.lock().unwrap() = TunnelStatus::Stopped;
+    let auth_scope = store.value.lock().unwrap().auth_scope.take();
+    assert!(!core.local_stop_pending_cleanup().await);
+    store.value.lock().unwrap().auth_scope = auth_scope;
+
+    assert!(matches!(
+        core.retry_pending_stop_cleanup().await,
+        Err(CoreError::Api(CoreApiError::Retryable))
+    ));
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+    assert!(core.local_stop_pending_cleanup().await);
+
+    owner.refresh_available.store(true, Ordering::SeqCst);
+    core.retry_pending_stop_cleanup().await.unwrap().unwrap();
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+    assert!(!core.local_stop_pending_cleanup().await);
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    let requests = api.redundant_stop_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0].operation_id, pending.operation_id);
+    assert_eq!(requests[0].lease_id, pending.lease_id);
+    assert_eq!(
+        Some(&requests[0].session_id),
+        pending.redundant_session_id.as_ref()
+    );
+    let events = logger.0.lock().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == "connection.stop_cleanup_pending"
+            && event.operation_id.as_deref() == Some(&pending.operation_id)));
+    assert!(!events
+        .iter()
+        .any(|event| event.kind == "connection.stop_failed"));
+}
+
 #[tokio::test]
 async fn desktop_pair_physical_poll_skips_legacy_fingerprint_and_reconnect() {
     use nelomai_client_storage::{

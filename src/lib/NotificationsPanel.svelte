@@ -9,6 +9,7 @@
     busy,
     error,
     onclose,
+    ondiagnostics,
     onread,
     onreadall,
     onloadmore,
@@ -19,6 +20,7 @@
     busy: boolean;
     error: string | null;
     onclose: () => void;
+    ondiagnostics?: () => void;
     onread: (messageId: number) => Promise<void>;
     onreadall: () => Promise<void>;
     onloadmore: () => Promise<void>;
@@ -56,7 +58,12 @@
         <p>События</p>
         <h2 id="notifications-title">Уведомления</h2>
       </div>
-      <button class="icon-button" type="button" onclick={onclose} aria-label="Закрыть">×</button>
+      <div class="header-buttons">
+        {#if ondiagnostics}
+          <button class="diagnostics-button" type="button" onclick={ondiagnostics}>Диагностика</button>
+        {/if}
+        <button class="icon-button" type="button" onclick={onclose} aria-label="Закрыть">×</button>
+      </div>
     </header>
 
     <div class="toolbar">
@@ -113,6 +120,17 @@
 </div>
 
 <style>
+  .header-buttons { display: flex; align-items: center; gap: 8px; }
+  .diagnostics-button {
+    border: 1px solid #61747877;
+    border-radius: 8px;
+    background: transparent;
+    padding: 7px 9px;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
   .notifications-overlay {
     position: fixed;
     inset: 0;

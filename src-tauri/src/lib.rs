@@ -33,6 +33,8 @@ pub mod runtime;
 mod runtime_control;
 mod runtime_startup;
 #[cfg(desktop)]
+mod support_diagnostics;
+#[cfg(desktop)]
 mod tray_update;
 #[path = "updates_remote.rs"]
 mod updates;
@@ -217,7 +219,10 @@ pub(crate) fn run_product(
         .plugin(tauri_plugin_tunnel_android::init())
         .plugin(tauri_plugin_updater_android::init());
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_notification::init());
+    let builder = builder
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .manage(support_diagnostics::SupportReportState::default());
     let builder = builder.setup(setup);
 
     let app = builder
@@ -245,6 +250,12 @@ pub(crate) fn run_product(
             commands::app_pin_stray,
             commands::app_unpin_stray,
             commands::app_send_diagnostics,
+            #[cfg(desktop)]
+            support_diagnostics::app_collect_support_diagnostics,
+            #[cfg(desktop)]
+            support_diagnostics::app_save_support_diagnostics,
+            #[cfg(desktop)]
+            support_diagnostics::app_send_support_diagnostics,
             commands::app_record_startup_stage,
             commands::app_release_history,
             commands::app_update_status,

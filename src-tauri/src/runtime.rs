@@ -150,6 +150,18 @@ pub(crate) fn native() -> io::Result<Arc<NativeClient>> {
 #[cfg(all(test, unix))]
 mod native_tests {
     use super::*;
+
+    #[test]
+    fn immutable_stable_poll_wire_format_is_unchanged() {
+        let frame = serde_json::json!({
+            "command": "poll",
+            "presentation": {"disconnect": false, "traffic": ""}
+        });
+        let poll = serde_json::from_value::<NativeControl>(frame.clone()).unwrap();
+        assert!(matches!(poll, NativeControl::Poll { .. }));
+        assert_eq!(serde_json::to_value(poll).unwrap(), frame);
+    }
+
     #[test]
     fn runtime_restart_is_an_explicit_full_common_exit_reason() {
         let encoded = serde_json::to_value(NativeControl::Exit {
@@ -365,6 +377,9 @@ fn setup_desktop(
     #[cfg(not(target_os = "macos"))]
     use nelomai_client_storage::ProtectedRecordFactory;
     let paths = bootstrap.runtime_paths()?;
+    app.manage(crate::support_diagnostics::SupportDataRoot(
+        bootstrap.data_root.clone(),
+    ));
     let selected = paths
         .iter()
         .find(|path| {
@@ -432,14 +447,17 @@ fn setup_desktop(
         ))
     });
     let api = ClientApi::new(PANEL_BASE)?.with_app_version(&bootstrap.target.container_version)?;
-    let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
-        selected
-            .operational_state
-            .parent()
-            .ok_or_else(|| io::Error::other("runtime diagnostics unavailable"))?
-            .join("diagnostics"),
-        resource_usage::ResourceSnapshot::capture(app.handle()),
-    )?);
+    let diagnostics = Arc::new(
+        diagnostics::AppDiagnostics::new(
+            selected
+                .operational_state
+                .parent()
+                .ok_or_else(|| io::Error::other("runtime diagnostics unavailable"))?
+                .join("diagnostics"),
+            resource_usage::ResourceSnapshot::capture(app.handle()),
+        )?
+        .with_update_log_directory(bootstrap.data_root.join("common")),
+    );
     let transport_diagnostics = diagnostics.clone();
     let api = api.with_control_diagnostics(move |code, ms| {
         transport_diagnostics.record_timed_named(

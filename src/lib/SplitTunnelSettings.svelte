@@ -16,6 +16,7 @@
     applications,
     busy,
     onclose,
+    ondiagnostics,
     onsave,
     onrefresh,
     onaddaddressrule = undefined,
@@ -25,6 +26,7 @@
     applications: InstalledApplication[];
     busy: boolean;
     onclose: () => void;
+    ondiagnostics?: () => void;
     onsave: (request: SplitTunnelSettingsUpdate) => Promise<boolean>;
     onrefresh: () => Promise<void>;
     onaddaddressrule?: (
@@ -181,7 +183,11 @@
         <p class="eyebrow">Подключение</p>
         <h2 id="split-tunnel-title">Split-tunnel</h2>
       </div>
-      <button
+      <div class="header-buttons">
+        {#if ondiagnostics}
+          <button class="diagnostics-button" type="button" onclick={ondiagnostics}>Диагностика</button>
+        {/if}
+        <button
         class="icon-button"
         type="button"
         aria-label="Закрыть"
@@ -190,6 +196,7 @@
       >
         ×
       </button>
+      </div>
     </header>
 
     {#if androidLegacy}
@@ -383,6 +390,17 @@
 </div>
 
 <style>
+  .header-buttons { display: flex; align-items: center; gap: 8px; }
+  .diagnostics-button {
+    border: 1px solid #61747877;
+    border-radius: 8px;
+    background: transparent;
+    padding: 7px 9px;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
   .settings-overlay {
     position: fixed;
     z-index: 30;

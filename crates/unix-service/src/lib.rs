@@ -566,6 +566,8 @@ pub enum ServiceError {
     InvalidRequest,
     #[error("IPC client is not authorized")]
     UnauthorizedClient,
+    #[error("IPC client is not authorized")]
+    BrokerRejected(nelomai_contracts::dispatcher::BrokerDenial),
     #[error("dispatcher exchange timed out")]
     DispatcherTimeout,
     #[error("dispatcher is busy")]
@@ -584,7 +586,7 @@ impl ServiceError {
             Self::FrameTooLarge => "frame_too_large",
             Self::TruncatedFrame => "truncated_frame",
             Self::InvalidRequest => "invalid_request",
-            Self::UnauthorizedClient => "unauthorized_client",
+            Self::UnauthorizedClient | Self::BrokerRejected(_) => "unauthorized_client",
             Self::DispatcherTimeout | Self::DispatcherBusy => "service_unavailable",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::InvalidConfiguration => "invalid_configuration",

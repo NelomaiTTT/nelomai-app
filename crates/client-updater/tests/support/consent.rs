@@ -47,6 +47,7 @@ struct Backend {
     started: Notify,
     release: Notify,
     fail_download: AtomicBool,
+    remove_after_prepare: AtomicBool,
     install_block: AtomicBool,
     install_started: Notify,
     install_release: Notify,
@@ -66,6 +67,7 @@ impl Backend {
             install_release: Notify::new(),
             release: Notify::new(),
             fail_download: AtomicBool::new(false),
+            remove_after_prepare: AtomicBool::new(false),
             dir: tempfile::tempdir().unwrap(),
             result: Mutex::new(None),
         }
@@ -96,7 +98,11 @@ impl UpdateBackend for Backend {
         }
         let path = self.dir.path().join("verified-package");
         std::fs::write(&path, b"verified-test-payload").unwrap();
-        PreparedUpdate::from_verified_file(resolved.clone(), path)
+        let prepared = PreparedUpdate::from_verified_file(resolved.clone(), path)?;
+        if self.remove_after_prepare.load(Ordering::SeqCst) {
+            std::fs::remove_file(prepared.path()).unwrap();
+        }
+        Ok(prepared)
     }
     async fn install_prepared(
         &self,

@@ -3160,12 +3160,20 @@ where
     }
 
     pub async fn local_stop_pending_cleanup(&self) -> bool {
-        if !matches!(self.auth.state().await, Ok(RuntimeAuthState::Active)) {
+        let auth = self.auth.state().await;
+        // The desktop broker reports a durable token refresh as recovery.
+        // Positive native status can still prove local closure during that wait.
+        let recovering_auth = cfg!(not(target_os = "android"))
+            && matches!(auth, Ok(RuntimeAuthState::RecoveryRequired));
+        if !matches!(auth, Ok(RuntimeAuthState::Active)) && !recovering_auth {
             return false;
         }
         let Ok(stored) = self.load_runtime() else {
             return false;
         };
+        if recovering_auth && stored.auth_scope.is_none() {
+            return false;
+        }
         let Some(pending) = stored.pending_compensation_stop else {
             return false;
         };
@@ -3684,17 +3692,24 @@ where
             Ok(response) => response,
             Err(error) => {
                 // A transient panel outage does not undo the confirmed local stop.
+                let desktop_cleanup_pending = desktop_stop
+                    && self.load_runtime().is_ok_and(|current| {
+                        current.auth_scope == stored.auth_scope
+                            && current.pending_compensation_stop.as_ref() == Some(&pending)
+                    });
                 if self.state.lock().await.phase == Phase::ServerUnavailable
-                    || desktop_stop
-                        && self.load_runtime().is_ok_and(|current| {
-                            current.auth_scope == stored.auth_scope
-                                && current.pending_compensation_stop.as_ref() == Some(&pending)
-                        })
+                    || desktop_cleanup_pending
                 {
                     self.set_phase(Phase::Stopping).await;
                 }
                 self.logger.record(CoreLogEvent {
-                    kind: "connection.stop_failed",
+                    kind: if desktop_cleanup_pending
+                        && matches!(error, CoreError::Api(CoreApiError::Retryable))
+                    {
+                        "connection.stop_cleanup_pending"
+                    } else {
+                        "connection.stop_failed"
+                    },
                     operation_id: Some(pending.operation_id.clone()),
                     request_id: None,
                     code: Some(error.to_string()),

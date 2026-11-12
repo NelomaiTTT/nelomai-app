@@ -1,7 +1,8 @@
 use super::{platform_error, wide};
 use crate::{
-    authorize_client, decode_response, encode_request, pipe_security_descriptor, ClientIdentity,
-    ClientPolicy, Request, Response, ServiceError, ServiceTransport, MAX_FRAME_SIZE, PIPE_NAME,
+    authorize_client_classified, decode_response, encode_request, pipe_security_descriptor,
+    ClientIdentity, ClientPolicy, Request, Response, ServiceError, ServiceTransport,
+    MAX_FRAME_SIZE, PIPE_NAME,
 };
 use async_trait::async_trait;
 use std::ffi::c_void;
@@ -155,27 +156,23 @@ impl PipeServer {
             // the server has read data from that client.
             let frame = read_frame(pipe)?;
             let identity = identity_for_pipe_client(pipe)?;
-            authorize_client(&self.policy, &identity).map_err(|_| {
-                ServiceError::Backend(format!(
-                    "authorize pipe client: actual SID {}, expected SID {}, actual path {}, expected path {}",
-                    identity.sid,
-                    self.policy.owner_sid,
-                    identity.process_path.display(),
-                    self.policy.installed_client_path.display()
-                ))
-            })?;
+            authorize_client_classified(&self.policy, &identity)
+                .map_err(ServiceError::BrokerRejected)?;
             self.broker_authorization
                 .lock()
                 .map_err(|_| ServiceError::UnauthorizedClient)?
-                .authorize(&self.broker, &self.broker.owner, &self.broker.executable)
-                .map_err(|_| ServiceError::UnauthorizedClient)?;
+                .authorize_classified(&self.broker, &self.broker.owner, &self.broker.executable)
+                .map_err(|error| ServiceError::BrokerRejected(error.reason))?;
             Ok(Some((frame, pipe)))
         })();
 
-        if result.is_err() {
+        if let Err(error) = &result {
             unsafe {
                 DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
+            }
+            if let ServiceError::BrokerRejected(reason) = error {
+                crate::broker_diagnostics::record(*reason);
             }
         }
         result

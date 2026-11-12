@@ -262,6 +262,8 @@ const MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES: usize = 48 * 1024;
 
 pub struct AppDiagnostics {
     directory: PathBuf,
+    #[cfg(desktop)]
+    update_log_directory: Option<PathBuf>,
     write_gate: Mutex<()>,
     resource_baseline: ResourceSnapshot,
     #[cfg(desktop)]
@@ -377,6 +379,8 @@ impl AppDiagnostics {
             #[cfg(desktop)]
             network_incidents,
             directory,
+            #[cfg(desktop)]
+            update_log_directory: None,
             write_gate: Mutex::new(()),
             resource_baseline,
         };
@@ -395,6 +399,44 @@ impl AppDiagnostics {
             );
         }
         Ok(diagnostics)
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn with_update_log_directory(mut self, directory: PathBuf) -> Self {
+        self.update_log_directory = Some(directory);
+        self
+    }
+
+    #[cfg(desktop)]
+    fn include_update_log(&self, application: String) -> String {
+        use crate::support_diagnostics::{checked_open, safe_event};
+
+        let Some(directory) = &self.update_log_directory else {
+            return application;
+        };
+        const BUDGET: usize = 8 * 1024;
+        let read = |name, maximum| {
+            checked_open(directory, Path::new(name), false)
+                .and_then(|file| read_file_tail(file, maximum))
+                .unwrap_or_default()
+        };
+        let previous = read("update-diagnostics.previous.jsonl", BUDGET / 2);
+        let current = read("update-diagnostics.jsonl", BUDGET);
+        let raw = tail_string(&format!("{previous}{current}"), BUDGET);
+        let mut update = String::new();
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value["kind"] == "update.operation.failed" {
+                if let Some(event) = safe_event(value) {
+                    update.push_str(&serde_json::Value::Object(event).to_string());
+                    update.push('\n');
+                }
+            }
+        }
+        let application = tail_string(&application, MAX_APPLICATION_REPORT_BYTES - update.len());
+        format!("{application}{update}")
     }
 
     pub fn record_named(
@@ -678,6 +720,8 @@ impl AppDiagnostics {
         application_log = include_android_startup_log(&self.directory, application_log);
         application_log = include_refresh_log(&self.directory, application_log);
         #[cfg(desktop)]
+        let application_log = self.include_update_log(application_log);
+        #[cfg(desktop)]
         let network_incident_device_id = self.network_incidents.current_device_id()?;
         #[cfg(desktop)]
         let network_incidents = self
@@ -908,6 +952,7 @@ impl AppDiagnostics {
                 format!("{previous}{current}")
             },
         );
+        let application_log = self.include_update_log(application_log);
         let resource_usage = self
             .automatic_resource_baseline
             .lock()
@@ -1171,17 +1216,19 @@ impl CoreLogger for AppDiagnostics {
 
 fn read_tail(path: &Path, maximum: usize) -> io::Result<String> {
     match File::open(path) {
-        Ok(mut file) => {
-            let length = file.metadata()?.len();
-            let read_length = length.min(maximum as u64) as usize;
-            file.seek(SeekFrom::Start(length.saturating_sub(read_length as u64)))?;
-            let mut bytes = vec![0; read_length];
-            file.read_exact(&mut bytes)?;
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        }
+        Ok(file) => read_file_tail(file, maximum),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error),
     }
+}
+
+fn read_file_tail(mut file: File, maximum: usize) -> io::Result<String> {
+    let length = file.metadata()?.len();
+    let read_length = length.min(maximum as u64) as usize;
+    file.seek(SeekFrom::Start(length.saturating_sub(read_length as u64)))?;
+    let mut bytes = vec![0; read_length];
+    file.read_exact(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(unix)]
@@ -1401,6 +1448,42 @@ mod tests {
             timestamp >= before && timestamp <= after,
             "marker must use epoch milliseconds: {timestamp}"
         );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn update_diagnostics_project_only_safe_failure_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let common = directory.path().join("common");
+        fs::create_dir(&common).unwrap();
+        fs::write(
+            common.join("update-diagnostics.jsonl"),
+            concat!(
+                "{\"timestamp_unix\":123,\"kind\":\"update.operation.failed\",",
+                "\"stage\":\"download\",\"code\":\"update_download_interrupted\",",
+                "\"downloaded_bytes\":512,\"expected_bytes\":1024,",
+                "\"raw\":\"private request details\"}\n",
+                "{\"kind\":\"auth.login.failed\",\"code\":\"retryable\"}\n",
+                "not a diagnostic event\n"
+            ),
+        )
+        .unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().join("runtime-diagnostics"),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap()
+        .with_update_log_directory(common);
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        let log = report.application_log;
+        assert!(log.contains("update_download_interrupted"));
+        assert!(log.contains("\"downloaded_bytes\":512"));
+        assert!(log.contains("\"expected_bytes\":1024"));
+        assert!(!log.contains("private request details"));
+        assert!(!log.contains("auth.login.failed"));
+        assert!(!log.contains("not a diagnostic event"));
     }
 
     #[test]

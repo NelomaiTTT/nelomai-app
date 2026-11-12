@@ -3,11 +3,14 @@ use nelomai_contracts::dispatcher::{
 };
 use nelomai_unix_service::{
     bind_listener, prepare_runtime_directory, run_timed_engine_channel, serve_dispatcher_one,
-    PlatformBackend, TunnelRequestHandler, DEFAULT_SOCKET_PATH, DISPATCHER_SOCKET_PATH,
+    PlatformBackend, ServiceError, TunnelRequestHandler, DEFAULT_SOCKET_PATH,
+    DISPATCHER_SOCKET_PATH,
 };
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[cfg(target_os = "linux")]
@@ -92,21 +95,20 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
     let dispatcher = Arc::new(Mutex::new(dispatcher));
     let private_owner = Arc::clone(&dispatcher);
     std::thread::spawn(move || {
-        let mut failures = 0_u64;
+        let mut failures = DispatcherFailureLog::default();
         loop {
             match serve_dispatcher_one(&private, &private_owner, true) {
-                Ok(()) => failures = 0,
+                Ok(()) => failures.success(),
                 Err(error) => {
-                    failures = failures.saturating_add(1);
-                    if failures == 1 || failures % 100 == 0 {
-                        eprintln!("private dispatcher request failed: {}", error.code());
+                    if failures.should_log(&error, Instant::now()) {
+                        log_dispatcher_failure("private", &error);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }
     });
-    let mut failures = 0_u64;
+    let mut failures = DispatcherFailureLog::default();
     loop {
         #[cfg(target_os = "linux")]
         let result =
@@ -114,17 +116,73 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         let result = serve_dispatcher_one(&lifecycle, &dispatcher, false);
         match result {
-            Ok(()) => failures = 0,
+            Ok(()) => failures.success(),
             Err(error) => {
-                failures = failures.saturating_add(1);
-                if failures == 1 || failures % 100 == 0 {
-                    eprintln!("lifecycle dispatcher request failed: {}", error.code());
+                if failures.should_log(&error, Instant::now()) {
+                    log_dispatcher_failure("lifecycle", &error);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
 }
+
+#[derive(Default)]
+struct DispatcherFailureLog {
+    consecutive: u64,
+    denied_at: BTreeMap<&'static str, Instant>,
+}
+
+impl DispatcherFailureLog {
+    fn success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    fn should_log(&mut self, error: &ServiceError, now: Instant) -> bool {
+        if let ServiceError::BrokerRejected(reason) = error {
+            let code = reason.code();
+            if self.denied_at.get(code).is_some_and(|previous| {
+                now.saturating_duration_since(*previous) < Duration::from_secs(60)
+            }) {
+                return false;
+            }
+            self.denied_at.insert(code, now);
+            return true;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive == 1 || self.consecutive % 100 == 0
+    }
+}
+
+fn log_dispatcher_failure(channel: &'static str, error: &ServiceError) {
+    if let ServiceError::BrokerRejected(reason) = error {
+        eprintln!("{channel} dispatcher broker rejected: {}", reason.code());
+    } else {
+        eprintln!("{channel} dispatcher request failed: {}", error.code());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn first_occurrence_of_each_broker_denial_survives_other_consecutive_failures() {
+    use nelomai_contracts::dispatcher::BrokerDenial;
+
+    let mut failures = DispatcherFailureLog::default();
+    let now = Instant::now();
+    let generic = ServiceError::InvalidRequest;
+    let uid = ServiceError::BrokerRejected(BrokerDenial::UidMismatch);
+    let path = ServiceError::BrokerRejected(BrokerDenial::PathMismatch);
+    assert!(failures.should_log(&generic, now));
+    assert!(!failures.should_log(&generic, now));
+    assert!(failures.should_log(&uid, now));
+    assert!(failures.should_log(&path, now));
+    assert!(!failures.should_log(&uid, now));
+    failures.success();
+    assert!(!failures.should_log(&path, now));
+    assert!(failures.should_log(&generic, now));
+    assert!(failures.should_log(&uid, now + Duration::from_secs(60)));
+}
+
 fn run_engine(root: &Path) -> std::io::Result<()> {
     let installation = Installation::production(root)?;
     let layout = installation.load_engine(&std::fs::canonicalize(std::env::current_exe()?)?)?;

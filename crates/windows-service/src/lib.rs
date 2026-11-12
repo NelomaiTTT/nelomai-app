@@ -6,6 +6,8 @@ use nelomai_client_tunnel::{
 };
 pub use nelomai_contracts::dispatcher;
 #[cfg(any(windows, test))]
+pub mod broker_diagnostics;
+#[cfg(any(windows, test))]
 mod install_recovery;
 pub mod member_actor;
 mod member_carrier;
@@ -1440,6 +1442,8 @@ pub enum ServiceError {
     InvalidRequest,
     #[error("IPC client is not authorized")]
     UnauthorizedClient,
+    #[error("IPC client is not authorized")]
+    BrokerRejected(nelomai_contracts::dispatcher::BrokerDenial),
     #[error("service path cannot be quoted safely")]
     UnsafePath,
     #[error("service protocol version is unsupported")]
@@ -1456,7 +1460,7 @@ impl ServiceError {
             Self::FrameTooLarge => "frame_too_large",
             Self::TruncatedFrame => "truncated_frame",
             Self::InvalidRequest => "invalid_request",
-            Self::UnauthorizedClient => "unauthorized_client",
+            Self::UnauthorizedClient | Self::BrokerRejected(_) => "unauthorized_client",
             Self::UnsafePath => "unsafe_path",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),
@@ -2127,15 +2131,23 @@ pub fn authorize_client(
     policy: &ClientPolicy,
     identity: &ClientIdentity,
 ) -> Result<(), ServiceError> {
-    let sid_matches = identity.sid == policy.owner_sid;
-    let path_matches = normalize_windows_path(&identity.process_path)
-        == normalize_windows_path(&policy.installed_client_path);
+    authorize_client_classified(policy, identity).map_err(|_| ServiceError::UnauthorizedClient)
+}
 
-    if sid_matches && path_matches {
-        Ok(())
-    } else {
-        Err(ServiceError::UnauthorizedClient)
+fn authorize_client_classified(
+    policy: &ClientPolicy,
+    identity: &ClientIdentity,
+) -> Result<(), nelomai_contracts::dispatcher::BrokerDenial> {
+    use nelomai_contracts::dispatcher::BrokerDenial;
+    if identity.sid != policy.owner_sid {
+        return Err(BrokerDenial::SidMismatch);
     }
+    if normalize_windows_path(&identity.process_path)
+        != normalize_windows_path(&policy.installed_client_path)
+    {
+        return Err(BrokerDenial::PathMismatch);
+    }
+    Ok(())
 }
 
 pub fn service_command_line(

@@ -19,13 +19,17 @@ struct Records {
     legacy: Legacy,
 }
 #[derive(Clone, Default)]
-struct Legacy(Arc<Mutex<Option<StoredAuth>>>);
+struct Legacy {
+    value: Arc<Mutex<Option<StoredAuth>>>,
+    reads: Arc<AtomicUsize>,
+}
 impl SecretStore for Legacy {
     fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
-        Ok(self.0.lock().unwrap().clone())
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.value.lock().unwrap().clone())
     }
     fn save(&self, value: &StoredAuth) -> Result<(), StorageError> {
-        *self.0.lock().unwrap() = Some(value.clone());
+        *self.value.lock().unwrap() = Some(value.clone());
         Ok(())
     }
     fn delete(&self) -> Result<(), StorageError> {
@@ -298,9 +302,14 @@ fn completed_legacy_anchor_is_retained_when_a_later_runtime_namespace_is_created
             MigrationOutcome::Complete
         );
 
+        let tombstone = records.legacy.value.lock().unwrap().clone().unwrap();
+        assert_eq!(tombstone.install_secret, legacy.install_secret);
+        let legacy_reads = records.legacy.reads.load(Ordering::SeqCst);
         let updated =
             prepare_runtime_storage(&lock, &manifest_for(version), RuntimeSlot::Latest, &records)
                 .unwrap();
+        assert_eq!(records.legacy.reads.load(Ordering::SeqCst), legacy_reads);
+        assert_eq!(*records.legacy.value.lock().unwrap(), Some(tombstone));
         assert_eq!(updated.auth.load().unwrap(), Some(auth));
         assert_eq!(updated.retained.len(), 1);
         assert_eq!(updated.retained[0].load().unwrap(), Some(runtime));

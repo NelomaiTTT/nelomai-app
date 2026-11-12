@@ -9,12 +9,44 @@
       body { max-width: 480px; margin: 36px auto; padding: 0 24px; }
       h1 { font-size: 24px; line-height: 1.25; color: #fff; }
       p { margin-top: 18px; }
+      button, input { font: inherit; color: inherit; background: #18252d; border: 1px solid #718b9455; border-radius: 8px; padding: 7px 11px; }
+      button:not(:disabled) { cursor: pointer; }
+      dialog { width: min(450px, calc(100vw - 54px)); box-sizing: border-box; max-height: 90vh; padding: 20px; overflow: auto; background: #101820; color: inherit; border: 1px solid #718b9477; border-radius: 10px; }
+      dialog::backdrop { background: #0a1119aa; }
+      dialog h2 { margin: 0; font-size: 21px; }
+      dialog label { display: grid; gap: 6px; margin: 14px 0; }
+      dialog header, .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      dialog header { justify-content: space-between; }
+      .send { background: #6bd3c5; color: #081719; }
     </style>
+    <script src="startup-failure.js" defer></script>
   </head>
   <body>
-    <h1>Не удалось запустить Nelomai</h1>
-    <p>Не удалось проверить компоненты приложения или получить доступ к его защищённым данным.</p>
-    <p>Закройте это окно, проверьте доступ к системному хранилищу паролей и откройте Nelomai снова. Если ошибка повторяется, обратитесь в поддержку.</p>
-    <p>Не удаляйте оставшиеся данные приложения: они могут понадобиться для восстановления.</p>
+    <main id="failure-copy">
+      <h1 id="failure-title">Не удалось запустить Nelomai</h1>
+      <p id="failure-reason">Не удалось проверить компоненты приложения или получить доступ к его защищённым данным.</p>
+      <p id="failure-retry">Закройте это окно, проверьте доступ к системному хранилищу паролей и откройте Nelomai снова. Если ошибка повторяется, обратитесь в поддержку.</p>
+      <p>Не удаляйте оставшиеся данные приложения: они могут понадобиться для восстановления.</p>
+      <button id="open-diagnostics" type="button">Диагностика</button>
+    </main>
+    <dialog id="diagnostics" aria-labelledby="diagnostics-title">
+      <header>
+        <h2 id="diagnostics-title">Диагностика</h2>
+        <button id="close-diagnostics" type="button" aria-label="Закрыть диагностику">×</button>
+      </header>
+      <p>Соберите отчёт о запуске и подключении. Его можно сохранить в файл или отправить в поддержку без входа.</p>
+      <button id="collect-report" type="button">Собрать отчёт</button>
+      <div id="report-actions" hidden>
+        <p id="report-details"></p>
+        <label>Код поддержки (если выдали)
+          <input id="support-code" type="password" autocomplete="off" spellcheck="false" maxlength="47" />
+        </label>
+        <div class="actions">
+          <button id="save-report" type="button">Сохранить файл</button>
+          <button id="send-report" class="send" type="button">Отправить отчёт</button>
+        </div>
+      </div>
+      <p id="report-status" role="status"></p>
+    </dialog>
   </body>
 </html>

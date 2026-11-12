@@ -268,7 +268,9 @@ pub(crate) struct HttpsFixture {
 pub(crate) enum Reply {
     Status(u16),
     Eof,
+    Truncated,
     Redirect(String),
+    HandshakeEof,
     HandshakeStall,
     Delayed(Duration),
 }
@@ -328,6 +330,9 @@ impl HttpsFixture {
                 thread::sleep(Duration::from_millis(1500));
                 return (None, None);
             }
+            if matches!(reply, Reply::HandshakeEof) {
+                return (None, None);
+            }
             let mut stream =
                 StreamOwned::new(ServerConnection::new(Arc::new(config)).unwrap(), socket);
             let mut request = Vec::new();
@@ -361,11 +366,20 @@ impl HttpsFixture {
                         stream.conn.server_name().map(str::to_owned),
                     )
                 }
+                Reply::Truncated => {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\n{\"part\":").unwrap();
+                    stream.conn.send_close_notify();
+                    stream.flush().unwrap();
+                    return (
+                        Some(String::from_utf8(request).unwrap()),
+                        stream.conn.server_name().map(str::to_owned),
+                    );
+                }
                 Reply::Delayed(delay) => {
                     thread::sleep(delay);
                     (200, String::new())
                 }
-                Reply::HandshakeStall => unreachable!(),
+                Reply::HandshakeStall | Reply::HandshakeEof => unreachable!(),
             };
             let sent = write!(
                 stream,

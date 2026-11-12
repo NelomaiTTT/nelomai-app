@@ -8,6 +8,20 @@ async fn prepare_never_calls_stop_or_installer() {
     assert_eq!(backend.installs.load(Ordering::SeqCst), 0);
     assert_eq!(barrier.stops.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn failure_revalidating_a_fresh_package_reports_verification() {
+    let (owner, backend, barrier, id) = setup();
+    owner.confirm(&id).unwrap();
+    backend.remove_after_prepare.store(true, Ordering::SeqCst);
+    let UpdateError::Backend(error) = owner.drive(&access(), true).await.unwrap_err() else {
+        panic!("expected cache failure");
+    };
+    assert_eq!(error.code(), "update_cache_invalid");
+    assert_eq!(error.stage(), Some("verification"));
+    assert_eq!(barrier.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.installs.load(Ordering::SeqCst), 0);
+}
 #[tokio::test]
 async fn automatic_off_resolves_metadata_without_artifact_get() {
     let (owner, backend, barrier, _) = setup();
@@ -322,7 +336,7 @@ async fn explicit_later_remains_deferred_on_android_return() {
 }
 
 #[test]
-fn notification_is_once_and_never_duplicates_a_user_decision() {
+fn notification_is_once_even_if_the_dialog_was_already_presented() {
     for action in ["present", "defer", "confirm", "none"] {
         let (owner, _, _, id) = setup();
         match action {
@@ -333,7 +347,7 @@ fn notification_is_once_and_never_duplicates_a_user_decision() {
         }
         assert_eq!(
             owner.take_notification().is_some(),
-            action == "none",
+            matches!(action, "none" | "present"),
             "{action}"
         );
         assert!(owner.take_notification().is_none());
