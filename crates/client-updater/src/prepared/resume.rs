@@ -113,15 +113,26 @@ pub(super) struct FileIdentity {
     volume: u64,
     index: u64,
     created: Option<(u64, u32)>,
+    #[cfg(windows)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    object_id: Option<[u8; 16]>,
 }
 
 impl FileIdentity {
     pub(super) fn matches(&self, file: &File) -> bool {
-        file_identity(file).is_ok_and(|identity| {
-            self.index == identity.index
-                && self.created == identity.created
-                && (cfg!(unix) || self.volume == identity.volume)
-        })
+        let Ok(Some(identity)) = file_stat_identity(file) else {
+            return false;
+        };
+        if self.index != identity.index || (!cfg!(unix) && self.volume != identity.volume) {
+            return false;
+        }
+        #[cfg(windows)]
+        if let Some(object_id) = self.object_id {
+            use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
+            return windows_object_id(file, FSCTL_GET_OBJECT_ID)
+                .is_ok_and(|actual| actual == Some(object_id));
+        }
+        self.created == identity.created
     }
 }
 
@@ -395,12 +406,12 @@ impl PreparedCache {
         resumed: ResumedDownload,
     ) -> Result<StagedFile, UpdateBackendError> {
         let ResumedDownload { saved } = resumed;
-        let placeholder = self.begin_staging_for(".package-", Some(&saved.file))?;
-        let path = placeholder.path().to_owned();
-        drop(placeholder);
         if self.check_partial_owner(&saved)?.len() != saved.validator().total() {
             return Err(cache_error());
         }
+        let placeholder = self.begin_staging_for(".package-", Some(&saved.file))?;
+        let path = placeholder.path().to_owned();
+        drop(placeholder);
         let data = self.claim_entry(&saved.path, &saved.file)?;
         if data.promote(&path).is_err() {
             data.restore();
@@ -957,10 +968,46 @@ fn read_owned_partial_metadata(file: &File) -> Result<Option<PartialMetadata>, U
 }
 
 pub(super) fn file_identity(file: &File) -> Result<FileIdentity, UpdateBackendError> {
-    durable_file_identity(file)?.ok_or_else(cache_error)
+    let identity = durable_file_identity(file)?.ok_or_else(cache_error)?;
+    #[cfg(windows)]
+    let identity = {
+        use windows_sys::Win32::System::Ioctl::FSCTL_CREATE_OR_GET_OBJECT_ID;
+
+        let mut identity = identity;
+        if identity.object_id.is_none() {
+            // Assign on an owned staging handle before the first publication.
+            // NTFS may tunnel the destination's creation time on rename, but
+            // preserves an object ID that the source already has.
+            identity.object_id = windows_object_id(file, FSCTL_CREATE_OR_GET_OBJECT_ID)?;
+            if identity.object_id.is_some() {
+                file.sync_all().map_err(|_| cache_error())?;
+                identity.created = None;
+            }
+        }
+        identity
+    };
+    Ok(identity)
 }
 
 fn durable_file_identity(file: &File) -> Result<Option<FileIdentity>, UpdateBackendError> {
+    let Some(identity) = file_stat_identity(file)? else {
+        return Ok(None);
+    };
+    #[cfg(windows)]
+    let identity = {
+        use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
+
+        let mut identity = identity;
+        identity.object_id = windows_object_id(file, FSCTL_GET_OBJECT_ID)?;
+        if identity.object_id.is_some() {
+            identity.created = None;
+        }
+        identity
+    };
+    Ok(Some(identity))
+}
+
+fn file_stat_identity(file: &File) -> Result<Option<FileIdentity>, UpdateBackendError> {
     let metadata = file.metadata().map_err(|_| cache_error())?;
     if !metadata.is_file() {
         return Err(cache_error());
@@ -1004,6 +1051,8 @@ fn durable_file_identity(file: &File) -> Result<Option<FileIdentity>, UpdateBack
         volume,
         index,
         created,
+        #[cfg(windows)]
+        object_id: None,
     }))
 }
 
@@ -1071,6 +1120,45 @@ fn windows_file_identity(file: &File) -> Result<(u32, u32, u32), UpdateBackendEr
         info.nFileIndexHigh,
         info.nFileIndexLow,
     ))
+}
+
+#[cfg(windows)]
+fn windows_object_id(file: &File, control: u32) -> Result<Option<[u8; 16]>, UpdateBackendError> {
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::System::Ioctl::{FILE_OBJECTID_BUFFER, FSCTL_GET_OBJECT_ID};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let mut object = FILE_OBJECTID_BUFFER::default();
+    let capacity = size_of::<FILE_OBJECTID_BUFFER>() as u32;
+    let mut written = 0;
+    // The cache opens synchronous handles. Both output buffers live until the call returns.
+    if unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            control,
+            null(),
+            0,
+            (&mut object as *mut FILE_OBJECTID_BUFFER).cast(),
+            capacity,
+            &mut written,
+            null_mut(),
+        )
+    } == 0
+    {
+        match unsafe { GetLastError() } {
+            ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED => return Ok(None),
+            ERROR_FILE_NOT_FOUND if control == FSCTL_GET_OBJECT_ID => return Ok(None),
+            _ => return Err(cache_error()),
+        }
+    }
+    if written != capacity || object.ObjectId == [0; 16] {
+        return Err(cache_error());
+    }
+    Ok(Some(object.ObjectId))
 }
 
 #[cfg(test)]
