@@ -3,7 +3,9 @@ import ts from "typescript";
 import { parse } from "svelte/compiler";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StartupRetry } from "./startup-retry";
-import { beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction } from "./connection-action";
+import { beginConnectionStop, beginRuntimeStateSync, initialConnectionActionState,
+  initialRuntimeStateSync, isCurrentConnectionAction } from "./connection-action";
+import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
 import { commandCode, commandMessage } from "./native-client";
 import { viewForAppState } from "./app-model";
 
@@ -12,7 +14,8 @@ import { viewForAppState } from "./app-model";
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
 const names = ["isAndroidRuntime", "restore", "retryPendingStartup", "applyBootstrap", "applyRuntimeChannelClosure",
-  "selectRuntime", "restartRuntime", "logout", "finishLogout", "observeUpdateStatus"];
+  "selectRuntime", "restartRuntime", "logout", "finishLogout", "observeUpdateStatus", "synchronizeRuntimeState",
+  "updateViewFromRuntimeState"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
@@ -48,11 +51,14 @@ const statusPhase = statusElement.attributes.find((attribute: any) => attribute.
 const headerPhase = new Function("context", `with (context) { return ${page.slice(statusPhase.start, statusPhase.end)}; }`);
 const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
   update: { required: false }, access: { can_connect: true }, binding: {}, device: { id: "own-device" } };
+const androidResponse = { ...response, device: { ...response.device, platform: "android" } };
 
 function fixture(bootstrap: () => Promise<unknown>) {
   const context: Record<string, any> = {
     navigator: {userAgent: "Android"}, busy: false, bootstrap: null, runtimeChannelClosed: false, runtimeSelectionBusy: false,
     connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(),
+    runtimeStateUnavailable: false, runtimeStateSync: initialRuntimeStateSync(), beginRuntimeStateSync, initialRuntimeStateSync,
+    clearOwnedConnectionIntentNotice,
     startupPending: false, restoringLogout: false, bootstrapPending: false, refreshPending: false, startupSlow: false, startupTimer: null,
     localStopPendingCleanup: false, diagnosticsStatus: null, error: null, view: "unavailable",
     phase: "server_unavailable", pinnedStray: null, selectedLayer: "tic", ticConnectionMode: "personal",
@@ -156,6 +162,153 @@ describe("bounded bootstrap recovery", () => {
       });
     }
   }
+
+  it.each(["error", "server_unavailable"])("follows Android state after a transient %s snapshot", async (phase) => {
+    const bootstrap = vi.fn().mockResolvedValue(androidResponse);
+    const f = fixture(bootstrap);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn()
+      .mockResolvedValueOnce({ ...ready, phase })
+      .mockResolvedValue(ready);
+
+    await f.page.restore();
+    expect(f.context.view).toBe("unavailable");
+    expect(f.context.phase).toBe(phase);
+    expect(f.context.busy).toBe(false);
+    expect(f.page.isAndroidRuntime()).toBe(true);
+    await f.page.synchronizeRuntimeState(false);
+
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+    expect(f.context.nativeClient.state).toHaveBeenCalledTimes(3);
+    expect(f.context.view).toBe("connection");
+    expect(f.context.phase).toBe("ready");
+  });
+
+  it("does not open Start if a returning Android runtime no longer passes admission", async () => {
+    const bootstrap = vi.fn().mockResolvedValueOnce(androidResponse)
+      .mockRejectedValueOnce({ code: "access_expired" });
+    const f = fixture(bootstrap);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn()
+      .mockResolvedValueOnce({ ...ready, phase: "server_unavailable" })
+      .mockResolvedValue(ready);
+
+    await f.page.restore();
+    await f.page.synchronizeRuntimeState(false);
+
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+    expect(f.context.view).toBe("access_expired");
+  });
+
+  it("keeps watching until Android is ready and cleanup has finished", async () => {
+    const bootstrap = vi.fn().mockResolvedValue(androidResponse);
+    const f = fixture(bootstrap);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn()
+      .mockResolvedValueOnce({ ...ready, phase: "error" })
+      .mockResolvedValueOnce({ ...ready, phase: "connecting", connectionIntentStatus: "recovering" })
+      .mockResolvedValueOnce({ ...ready, localStopPendingCleanup: true })
+      .mockResolvedValue(ready);
+
+    await f.page.restore();
+    for (let read = 0; read < 2; read++) {
+      await f.page.synchronizeRuntimeState(false);
+      expect(f.context.view).toBe("unavailable");
+      expect(bootstrap).toHaveBeenCalledTimes(1);
+    }
+    await f.page.synchronizeRuntimeState(false);
+
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+    expect(f.context.view).toBe("connection");
+    expect(f.context.phase).toBe("ready");
+  });
+
+  it("recovers when Stop invalidates the first Android state read after bootstrap", async () => {
+    const bootstrap = vi.fn().mockResolvedValue(androidResponse);
+    const f = fixture(bootstrap);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn()
+      .mockRejectedValueOnce({ code: "connection_intent_cancelled" })
+      .mockResolvedValue(ready);
+
+    await f.page.restore();
+    expect(f.context.view).toBe("unavailable");
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+    expect(f.context.nativeClient.state).toHaveBeenCalledTimes(2);
+    expect(f.context.view).toBe("connection");
+    expect(f.context.phase).toBe("ready");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not replace a failed bootstrap with a cached Android state", async () => {
+    const f = fixture(async () => { throw { code: "auth_recovery_required" }; });
+    f.context.bootstrap = androidResponse;
+    const state = vi.spyOn(f.context.nativeClient, "state");
+
+    await f.page.restore();
+    await f.page.synchronizeRuntimeState(false);
+
+    expect(state).not.toHaveBeenCalled();
+    expect(f.context.view).toBe("unavailable");
+  });
+
+  it("retires a pending recovery poll when a new bootstrap fails", async () => {
+    const f = fixture(async () => androidResponse);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn().mockResolvedValueOnce({ ...ready, phase: "server_unavailable" });
+    await f.page.restore();
+
+    let finish!: (value: unknown) => void;
+    f.context.nativeClient.state.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const polling = f.page.synchronizeRuntimeState(false);
+    f.context.nativeClient.bootstrap = async () => { throw { code: "auth_recovery_required" }; };
+    await f.page.restore();
+    finish(ready);
+    await polling;
+
+    expect(f.context.view).toBe("unavailable");
+  });
+
+  it("retires a pending recovery poll on runtime selection", async () => {
+    const bootstrap = vi.fn().mockResolvedValue(androidResponse);
+    const f = fixture(bootstrap);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn().mockResolvedValueOnce({ ...ready, phase: "error" });
+    await f.page.restore();
+
+    let finish!: (value: unknown) => void;
+    f.context.nativeClient.state.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const polling = f.page.synchronizeRuntimeState(false);
+    await f.page.selectRuntime(true);
+    finish(ready);
+    await polling;
+
+    expect(bootstrap).toHaveBeenCalledTimes(1);
+    expect(f.context.view).toBe("unavailable");
+  });
+
+  it("applies confirmed EOF from a recovery poll while a same-device bootstrap is pending", async () => {
+    const f = fixture(async () => androidResponse);
+    const ready = await f.context.nativeClient.state();
+    f.context.nativeClient.state = vi.fn().mockResolvedValueOnce({ ...ready, phase: "error" });
+    await f.page.restore();
+
+    let rejectState!: (error: unknown) => void;
+    f.context.nativeClient.state.mockImplementationOnce(() => new Promise((_, reject) => { rejectState = reject; }));
+    const polling = f.page.synchronizeRuntimeState(false);
+    let finishBootstrap!: (value: unknown) => void;
+    f.context.nativeClient.bootstrap = () => new Promise(resolve => { finishBootstrap = resolve; });
+    const retrying = f.page.restore();
+    rejectState({ code: "runtime_channel_closed" });
+    await polling;
+
+    expect(f.context.runtimeChannelClosed).toBe(true);
+    finishBootstrap(androidResponse);
+    await retrying;
+    expect(f.context.view).toBe("unavailable");
+  });
 
   it("does not let a pending startup hide confirmed owner channel closure", () => {
     const f = fixture(async () => response);

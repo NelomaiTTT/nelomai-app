@@ -12,7 +12,7 @@ import { viewForAppState } from "./app-model";
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
 const names = ["restore", "applyBootstrap", "retryPendingStartup", "wakeStartup", "isAndroidRuntime", "logout",
-  "finishLogout", "observeUpdateStatus", "applyRuntimeChannelClosure"];
+  "finishLogout", "observeUpdateStatus", "applyRuntimeChannelClosure", "updateViewFromRuntimeState"];
 const functions = ast.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text ?? ""))
   .map(node => node.getText(ast)).join("\n");
 const handlers: string[] = [];
@@ -44,7 +44,7 @@ function fixture(call: () => Promise<unknown>) {
   const listeners = new Map<string, () => void>();
   const context: Record<string, any> = {
     runtimeChannelClosed: false, bootstrapPending: false, ownedConnectionIntentNotice: null, busy: false, bootstrap: null, runtimeSelectionBusy: false, runtimeStatus: null,
-    connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(),
+    connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(), runtimeStateUnavailable: false,
     startupPending: false, restoringLogout: false, refreshPending: false, startupSlow: false, startupTimer: null,
     localStopPendingCleanup: false, diagnosticsStatus: null, error: null, view: "unavailable",
     phase: "server_unavailable", pinnedStray: null, selectedLayer: "tic", ticConnectionMode: "personal",

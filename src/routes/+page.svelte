@@ -48,6 +48,7 @@
     requiresServerProbes,
     viewForAppState,
     viewForPhase,
+    type AppState,
     type AppView,
     type AppPreferences,
     type BindPeerRequest,
@@ -95,6 +96,7 @@
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
+  let runtimeStateUnavailable = false;
   let localStopPendingCleanup = $state(false);
   // A private client cannot reopen a closed channel. Reset only on full launch,
   // never through mutable split warnings or a delayed successful state reply.
@@ -543,17 +545,28 @@
     }
   }
 
+  function updateViewFromRuntimeState(state: AppState, keepView = false) {
+    const nextView = viewForAppState(state);
+    runtimeStateUnavailable = nextView === "unavailable";
+    if (!keepView) view = nextView;
+  }
+
   async function synchronizeRuntimeState(foreground = true) {
+    // Only a native state snapshot can keep the recovery poll active.
+    // A failed bootstrap must not recover from cached state alone.
+    const observingUnavailable = runtimeStateUnavailable && isAndroidRuntime() &&
+      !runtimeSelectionBusy && (view === "unavailable" || view === "connection");
     if (
       runtimeChannelClosed || (busy && !connectionActionState.cancelBusy) ||
       !bootstrap?.binding ||
-      !["ready", "connecting", "connected", "stopping"].includes(phase)
+      (!observingUnavailable && !["ready", "connecting", "connected", "stopping"].includes(phase))
     ) {
       return;
     }
     const sync = beginRuntimeStateSync(runtimeStateSync, foreground);
     runtimeStateSync = sync.state;
     if (!sync.started) return;
+    const isRecoveryCurrent = observingUnavailable ? startupRetry.checkpoint() : null;
     try {
       const previous = phase;
       const observingStop = connectionActionState.cancelBusy;
@@ -564,11 +577,12 @@
         stateError = reason;
         return null;
       });
-      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
-        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
-      // A confirmed EOF outranks unrelated UI busy work, unlike a successful
-      // snapshot. Account/action retirement still protects newer user intent.
-      if (applyRuntimeChannelClosure(stateError)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      const sameBootstrap = bootstrap === observedBootstrap;
+      // A confirmed EOF for this device remains valid across a startup retry.
+      if ((sameBootstrap || (observingUnavailable && bootstrap?.device.id === observedBootstrap.device.id)) &&
+        applyRuntimeChannelClosure(stateError)) return;
+      if (!sameBootstrap || (isRecoveryCurrent !== null && !isRecoveryCurrent())) return;
       if (!current || (observingStop && !connectionActionState.cancelBusy)) return;
       if (connectionActionState.cancelBusy) {
         // Observe local closure while the same Stop still awaits server cleanup.
@@ -578,6 +592,15 @@
       }
       if (busy) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
+      if (observingUnavailable) {
+        if (current.phase !== "ready" || current.connectionIntentStatus !== "none") return;
+        if (view === "unavailable") {
+          // A local Ready observation wakes startup. Bootstrap still owns
+          // admission before the unavailable screen can expose Start.
+          if (!localStopPendingCleanup) await restore();
+          return;
+        }
+      }
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
@@ -591,13 +614,13 @@
         error = cleared.error;
         ownedConnectionIntentNotice = cleared.ownedNotice;
       }
-      if (current.phase === phase) {
+      if (current.phase === phase && !observingUnavailable) {
         connection = current.connection;
         return;
       }
       phase = current.phase;
       connection = current.connection;
-      view = viewForAppState(current);
+      updateViewFromRuntimeState(current);
       if (view === "sign_in") {
         void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       }
@@ -631,6 +654,7 @@
 
   async function restore(automaticRetry = false) {
     if (runtimeChannelClosed || runtimeSelectionBusy || (automaticRetry && busy)) return;
+    runtimeStateUnavailable = false;
     const actionEpoch = connectionActionState.epoch;
     let expectedBootstrap = bootstrap;
     startupRetry.cancel(!automaticRetry);
@@ -667,10 +691,13 @@
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
-      startupRetry.schedule(code, () => {
+      // A newer Android Stop can retire the first state read during startup.
+      const retryCode = code === "connection_intent_cancelled" && isAndroidRuntime()
+        ? "temporarily_unavailable" : code;
+      startupRetry.schedule(retryCode, () => {
         if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
           !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
-        retryPendingStartup(code);
+        retryPendingStartup(retryCode);
       });
       if (code === "signed_out" && restoringLogout) {
         finishLogout();
@@ -752,7 +779,7 @@
     connectionMetrics = state.metrics;
     reserveState = state.reserveState;
     runtimeWarning = state.warning;
-    view = viewForAppState(state);
+    updateViewFromRuntimeState(state);
     if (view === "sign_in") {
       void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
     }
@@ -852,6 +879,7 @@
       ? beginConnectionStop(connectionActionState)
       : beginConnectionStart(connectionActionState);
     connectionActionState = action.state;
+    runtimeStateUnavailable = false;
     let shouldReportStartFailure = !stopping;
     busy = true;
     error = null;
@@ -908,6 +936,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
+      if (stopping && isAndroidRuntime()) updateViewFromRuntimeState(current, true);
     } catch (reason) {
       if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       if (applyRuntimeChannelClosure(reason)) return;
@@ -940,6 +969,7 @@
       connectionMetrics = current?.metrics ?? connectionMetrics;
       reserveState = current?.reserveState ?? reserveState;
       runtimeWarning = current?.warning ?? runtimeWarning;
+      if (current && stopping && isAndroidRuntime()) updateViewFromRuntimeState(current, true);
       if (failureCode !== "connection_intent_cancelled") {
         error = commandMessage(reason, stopping ? "stop" : "start", {
           personalPeer:

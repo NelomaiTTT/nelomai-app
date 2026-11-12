@@ -9,7 +9,7 @@ import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
 import { commandCode, commandMessage, waitForSettlement,
   START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS } from "./native-client";
 import { bindingPreferenceUpdateRequest, connectionEgressMode, primaryAction,
-  type Phase, type ConnectionIntentStatus } from "./app-model";
+  viewForAppState, type Phase, type ConnectionIntentStatus } from "./app-model";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -18,7 +18,8 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "finishLogout", "isAndroidRuntime"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "finishLogout", "isAndroidRuntime",
+    "updateViewFromRuntimeState"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -72,7 +73,7 @@ function fixture() {
   const context = {
     busy: false, bootstrapPending: false, restoringLogout: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
-    runtimeChannelClosed: false, runtimeSelectionBusy: false,
+    runtimeChannelClosed: false, runtimeSelectionBusy: false, runtimeStateUnavailable: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
     splitTunnelOpen: false, splitTunnelState: null,
     splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],
@@ -148,6 +149,23 @@ describe("retired Start cancellation", () => {
     expect(context.phase).toBe(phase);
     expect(context.error).toBeNull();
     expect(context.busy).toBe(false);
+  });
+
+  it("retires the unavailable Stop observation when a new Start begins", async () => {
+    const { context, current } = startFixture();
+    context.phase = "server_unavailable";
+    context.runtimeStateUnavailable = true;
+    Object.assign(context.nativeClient, {
+      start: async () => ({ status: "connected", connection: current.connection }),
+    });
+    await toggle(context);
+    expect(context.phase).toBe("connected");
+
+    current.phase = "connecting";
+    await synchronize(context, false);
+
+    expect(context.phase).toBe("connecting");
+    expect(context.runtimeStateUnavailable).toBe(false);
   });
 
   it.each(["invalid_access_token", "preferences_unavailable"])(
@@ -330,6 +348,24 @@ describe("async Stop presentation", () => {
     expect(buttonLabel(context)).toBe("Выключаем");
     context.nativeClient.state = async () => ({ ...state, phase: "ready" });
     await synchronize(context, false);
+    expect(buttonLabel(context)).toBe("Старт");
+  });
+
+  it("returns to Start when Android recovers after an unavailable Stop snapshot", async () => {
+    const { context, reply, state } = stopFixture();
+    Object.assign(context, { viewForAppState });
+    Object.assign(context.nativeClient, { stop: async () => null });
+
+    const stopping = toggle(context);
+    reply({ ...state, phase: "server_unavailable" });
+    await stopping;
+    expect(context.view).toBe("connection");
+    expect(context.phase).toBe("server_unavailable");
+
+    context.nativeClient.state = async () => ({ ...state, phase: "ready" });
+    await synchronize(context, false);
+
+    expect(context.view).toBe("connection");
     expect(buttonLabel(context)).toBe("Старт");
   });
 
