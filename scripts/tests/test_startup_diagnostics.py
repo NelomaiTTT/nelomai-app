@@ -20,9 +20,19 @@ class StartupDiagnosticsTests(unittest.TestCase):
 use std::{io, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}};
 static OWNED: AtomicBool = AtomicBool::new(true);
 static RECOVERIES: AtomicUsize = AtomicUsize::new(0);
+static SUPPORT_ROOTS: AtomicUsize = AtomicUsize::new(0);
 const PANEL_BASE: &str = "fixture";
 #[derive(Clone)] struct App;
-impl App { fn handle(&self) -> &Self { self } }
+impl App {
+    fn handle(&self) -> &Self { self }
+    fn manage(&self, root: support_diagnostics::SupportDataRoot) -> bool {
+        assert_eq!(root.0, Path::new("fixture-data"));
+        assert_eq!(RECOVERIES.load(Ordering::SeqCst), 0);
+        SUPPORT_ROOTS.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+mod support_diagnostics { pub struct SupportDataRoot(pub std::path::PathBuf); }
 mod nelomai_client_api {
     #[derive(Clone)] pub struct ClientApi;
     impl ClientApi { pub fn new(_: &str) -> std::io::Result<Self> { Ok(Self) } }
@@ -53,14 +63,17 @@ struct HostNativePorts {
     storage: Option<()>, relaunch: Option<()>,
 }
 type HostError = io::Error;
+struct PreparedHost { owner: Owner }
+struct Owner(PathBuf);
+impl Owner { fn root(&self) -> &Path { &self.0 } }
 fn prepare_host(
-    _: &Path, _: &Path, _: Option<&[u8]>, _: &str, _: &str,
+    data: &Path, _: &Path, _: Option<&[u8]>, _: &str, _: &str,
     _: impl FnOnce() -> nelomai_client_storage::SystemRecordFactory,
-) -> io::Result<()> {
+) -> io::Result<PreparedHost> {
     if OWNED.swap(true, Ordering::SeqCst) {
         return Err(io::ErrorKind::WouldBlock.into());
     }
-    Ok(())
+    Ok(PreparedHost { owner: Owner(data.to_owned()) })
 }
 struct CommonHost;
 impl CommonHost {
@@ -73,7 +86,7 @@ impl CommonHost {
         Ok(Self)
     }
     fn from_prepared(
-        _: (), _: nelomai_client_api::ClientApi, _: RuntimeClientProfile, _: HostNativePorts,
+        _: PreparedHost, _: nelomai_client_api::ClientApi, _: RuntimeClientProfile, _: HostNativePorts,
     ) -> io::Result<Self> { Ok(Self) }
 }
 fn launch_common() -> io::Result<()> {
@@ -91,8 +104,10 @@ fn launch_common() -> io::Result<()> {
 fn main() {
     assert_eq!(launch_common().unwrap_err().kind(), io::ErrorKind::WouldBlock);
     assert_eq!(RECOVERIES.load(Ordering::SeqCst), 0, "duplicate Common touched updater cache");
+    assert_eq!(SUPPORT_ROOTS.load(Ordering::SeqCst), 0, "duplicate Common registered a diagnostics root");
     OWNED.store(false, Ordering::SeqCst);
     launch_common().unwrap();
+    assert_eq!(SUPPORT_ROOTS.load(Ordering::SeqCst), 1);
     assert_eq!(RECOVERIES.load(Ordering::SeqCst), 1);
 }
 """ % block
