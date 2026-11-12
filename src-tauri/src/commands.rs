@@ -877,6 +877,8 @@ fn runtime_readiness_error(error: nelomai_client_container::ipc::PrivateError) -
     // Only RuntimeReady uses this mapping: an unfinished admission is not an
     // authentication rejection. Access/refresh errors keep their own fencing.
     match error {
+        #[cfg(target_os = "android")]
+        PrivateError::OutcomeUnknown => CommandError::from_core(CoreError::AuthenticationOutcomeUnknown),
         PrivateError::RefreshPending => CommandError::new(
             "auth_refresh_pending",
             "Восстанавливаем соединение с аккаунтом. Повторим автоматически; данные входа сохранены",
@@ -2109,16 +2111,20 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
     }
 }
 
+fn runtime_channel_closed_error() -> CommandError {
+    CommandError::new(
+        "runtime_channel_closed",
+        "Потеряна связь со службой подключения",
+    )
+}
+
 async fn runtime_state_if_channel_open<T>(
     is_closed: impl Fn() -> bool,
     read: impl std::future::Future<Output = Result<T, CommandError>>,
 ) -> Result<T, CommandError> {
     let check = || {
         if is_closed() {
-            Err(CommandError::new(
-                "runtime_channel_closed",
-                "Потеряна связь со службой подключения",
-            ))
+            Err(runtime_channel_closed_error())
         } else {
             Ok(())
         }
@@ -2921,42 +2927,37 @@ pub async fn app_bootstrap(
 ) -> Result<Bootstrap, CommandError> {
     diagnostics.record_named("startup.bootstrap.begin", None, None, None);
     let bootstrap_started = Instant::now();
-    let response = match tokio::time::timeout(
-        STARTUP_BOOTSTRAP_TIMEOUT,
-        Box::pin(bootstrap_application_for_startup(
-            &app,
-            application.inner(),
-            diagnostics.inner(),
-            now_unix(),
-        )),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            diagnostics.record_timed_named(
-                "startup.bootstrap.failed",
-                None,
-                None,
-                Some(error.code()),
-                bootstrap_started.elapsed(),
-            );
-            return Err(error);
-        }
-        Err(_) => {
-            diagnostics.record_timed_named(
-                "startup.bootstrap.failed",
-                None,
-                None,
-                Some("startup_timeout"),
-                bootstrap_started.elapsed(),
-            );
-            return Err(CommandError::new(
+    let read = async {
+        tokio::time::timeout(
+            STARTUP_BOOTSTRAP_TIMEOUT,
+            Box::pin(bootstrap_application_for_startup(
+                &app,
+                application.inner(),
+                diagnostics.inner(),
+                now_unix(),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(CommandError::new(
                 "startup_timeout",
                 "Не удалось завершить запуск вовремя. Проверьте сеть и повторите попытку",
-            ));
-        }
+            ))
+        })
     };
+    #[cfg(target_os = "android")]
+    let result = runtime_state_if_channel_open(|| application.runtime_channel_closed(), read).await;
+    #[cfg(not(target_os = "android"))]
+    let result = read.await;
+    let response = result.inspect_err(|error| {
+        diagnostics.record_timed_named(
+            "startup.bootstrap.failed",
+            None,
+            None,
+            Some(error.code()),
+            bootstrap_started.elapsed(),
+        );
+    })?;
     diagnostics.record_timed_named(
         "startup.bootstrap.ready",
         None,
@@ -4414,6 +4415,26 @@ pub async fn app_register_push_token(
         .map_err(Into::into)
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn clear_android_logout_quick_plan(
+    app: &AppHandle,
+    diagnostics: &AppDiagnostics,
+) -> Result<(), nelomai_client_container::ipc::PrivateError> {
+    let (ticket, result) = ANDROID_UI_START_STOP_COORDINATOR
+        .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
+    if result.is_err() {
+        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(ticket);
+        diagnostics.record_named("native.logout.quick_plan_clear_failed", None, None, None);
+        return Err(nelomai_client_container::ipc::PrivateError::RecoveryRequired);
+    }
+    ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+        ticket,
+        &ANDROID_DESIRED_ACTIVE_PROJECTION,
+        false,
+    );
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn app_logout(
     app: AppHandle,
@@ -4435,37 +4456,34 @@ pub async fn app_logout(
     let logout_result = push_registration_scheduler
         .logout(application.logout())
         .await;
-    #[cfg(target_os = "android")]
-    let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
-        .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
     #[cfg(not(target_os = "android"))]
     let quick_plan_result = app.tunnel_android().clear_quick_plan();
     #[cfg(not(target_os = "android"))]
     let background_result = app.tunnel_android().clear_background();
-
-    if let Err(error) = logout_result {
-        #[cfg(target_os = "android")]
-        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
-        return Err(CommandError::from(error));
+    #[cfg(target_os = "android")]
+    if logout_result.is_err() {
+        // The old runtime can still persist an intent using its cached scope.
+        // Report EOF only after giving Logout a chance to do so.
+        if application.runtime_channel_closed() {
+            return Err(runtime_channel_closed_error());
+        }
+        // Wake the existing runtime worker to resume durable logout or cleanup.
+        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+            .request_recovery();
     }
+
+    logout_result.map_err(CommandError::from)?;
     #[cfg(desktop)]
     diagnostics.clear_automatic_device();
     #[cfg(not(desktop))]
     let _ = &diagnostics;
+    #[cfg(not(target_os = "android"))]
     if quick_plan_result.is_err() {
-        #[cfg(target_os = "android")]
-        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
         return Err(CommandError::new(
             "quick_state_persist_failed",
             "Не удалось очистить данные быстрого подключения",
         ));
     }
-    #[cfg(target_os = "android")]
-    ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
-        quick_clear_ticket,
-        &ANDROID_DESIRED_ACTIVE_PROJECTION,
-        false,
-    );
     #[cfg(not(target_os = "android"))]
     background_result.map_err(|_| {
         CommandError::new(

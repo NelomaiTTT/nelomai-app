@@ -149,6 +149,7 @@
   let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
+  let restoringLogout = false;
   let bootstrapPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
@@ -652,6 +653,7 @@
       const response = await nativeClient.bootstrap();
       if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      restoringLogout = false;
       const applying = applyBootstrap(response);
       isStartupCurrent = startupRetry.checkpoint();
       // Svelte may wrap the response; retain the assigned state identity.
@@ -670,7 +672,11 @@
           !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
         retryPendingStartup(code);
       });
-      if (code === "signed_out") {
+      if (code === "signed_out" && restoringLogout) {
+        finishLogout();
+      } else if (code === "signed_out" ||
+        (code === "authentication_outcome_unknown" && isAndroidRuntime())) {
+        if (code === "authentication_outcome_unknown") error = commandMessage(reason, "startup");
         reserveState = null;
         phase = "signed_out";
         view = "sign_in";
@@ -771,6 +777,7 @@
         platformVersion: null,
       };
       const response = await nativeClient.login(request);
+      restoringLogout = false;
       password = "";
       await applyBootstrap(response);
     } catch (reason) {
@@ -1089,52 +1096,63 @@
     }
   }
 
+  function finishLogout() {
+    restoringLogout = false;
+    error = null;
+    startupPending = false;
+    localStopPendingCleanup = false;
+    bootstrap = null;
+    connection = null;
+    pinnedStray = null;
+    peers = [];
+    selectedPeerId = "";
+    password = "";
+    diagnosticsStatus = null;
+    manualUpdatePending = null;
+    manualUpdateResult = null;
+    observeUpdateStatus(null);
+    updateDialogId = null;
+    splitTunnelState = null;
+    splitTunnelApplications = [];
+    splitTunnelOpen = false;
+    splitTunnelLoaded = false;
+    runtimeWarning = null;
+    notifications = [];
+    notificationUnreadCount = 0;
+    notificationNextCursor = null;
+    notificationHistoryExpanded = false;
+    notificationsOpen = false;
+    changelogOpen = false;
+    clearUpdateTimer();
+    // The confirmed sign-out clears the account above, but cannot reopen a
+    // closed owner channel or replace its mandatory relaunch presentation.
+    if (runtimeChannelClosed) {
+      applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
+    } else {
+      phase = "signed_out";
+      view = "sign_in";
+    }
+    void nativeClient.recordStartupStage("sign_in_logout_completed");
+  }
+
   async function logout() {
     if (busy) return;
     startupRetry.cancel();
+    const android = isAndroidRuntime();
     busy = true;
     error = null;
     try {
       await nativeClient.logout();
-      startupPending = false;
-      localStopPendingCleanup = false;
-      bootstrap = null;
-      connection = null;
-      pinnedStray = null;
-      peers = [];
-      selectedPeerId = "";
-      password = "";
-      diagnosticsStatus = null;
-      manualUpdatePending = null;
-      manualUpdateResult = null;
-      observeUpdateStatus(null);
-      updateDialogId = null;
-      splitTunnelState = null;
-      splitTunnelApplications = [];
-      splitTunnelOpen = false;
-      splitTunnelLoaded = false;
-      runtimeWarning = null;
-      notifications = [];
-      notificationUnreadCount = 0;
-      notificationNextCursor = null;
-      notificationHistoryExpanded = false;
-      notificationsOpen = false;
-      changelogOpen = false;
-      clearUpdateTimer();
-      // The confirmed sign-out clears the account above, but cannot reopen a
-      // closed owner channel or replace its mandatory relaunch presentation.
-      if (runtimeChannelClosed) {
-        applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
-      } else {
-        phase = "signed_out";
-        view = "sign_in";
-      }
-      void nativeClient.recordStartupStage("sign_in_logout_completed");
+      finishLogout();
     } catch (reason) {
       error = commandMessage(reason, "logout");
+      // Bootstrap waits for the owner to confirm any pending Logout. This
+      // also reconciles the account screen when no peer is bound to poll.
+      restoringLogout = android && !applyRuntimeChannelClosure(reason);
     } finally {
       busy = false;
-      if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+      if (restoringLogout) void restore();
+      else if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
     }
   }
 

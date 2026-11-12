@@ -657,6 +657,14 @@ impl LocalAuthStop for HostBridge {
         let native = self.native.stop.stop_local().await;
         runtime.and(native)
     }
+    async fn stop_local_until(&self, deadline: Instant) -> Result<(), BrokerError> {
+        let runtime = match self.peer() {
+            Ok(peer) => peer.stop_local_until(deadline - AUTH_REPLY_MARGIN).await,
+            Err(_) => Ok(()),
+        };
+        let native = self.native.stop.stop_local_until(deadline).await;
+        runtime.and(native)
+    }
 }
 #[async_trait::async_trait]
 impl RuntimeSwitchControl for HostBridge {

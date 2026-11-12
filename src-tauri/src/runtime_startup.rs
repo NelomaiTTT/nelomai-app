@@ -8,6 +8,13 @@ pub(crate) async fn request_ready(
     diagnostics: &crate::diagnostics::AppDiagnostics,
 ) -> Result<(), PrivateError> {
     use nelomai_client_container::host::{HostRequestV1, HostResponseV1};
+    #[cfg(target_os = "android")]
+    let result = match Box::pin(port.recover_pending_android_logout()).await {
+        Ok(true) => Ok(HostResponseV1::Done),
+        Ok(false) => Box::pin(port.owner_request(HostRequestV1::RuntimeReady)).await,
+        Err(error) => Err(error),
+    };
+    #[cfg(not(target_os = "android"))]
     let result = Box::pin(port.owner_request(HostRequestV1::RuntimeReady)).await;
     match result {
         Ok(HostResponseV1::Done) => Ok(()),
@@ -31,13 +38,30 @@ pub(crate) async fn request_ready(
     }
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn schedule_android_recovery(
+    startup: std::sync::Arc<RuntimeStartup>,
+    port: std::sync::Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>,
+    diagnostics: std::sync::Arc<crate::diagnostics::AppDiagnostics>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let _ = startup
+            .recover_on_request(|| request_ready(&port, &diagnostics))
+            .await;
+    });
+}
+
 pub(crate) struct RuntimeStartup {
     start: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(any(target_os = "android", test))]
+    recovery_requested: tokio::sync::Notify,
 }
 impl RuntimeStartup {
     pub fn new(start: impl FnOnce() + Send + 'static) -> Self {
         Self {
             start: Mutex::new(Some(Box::new(start))),
+            #[cfg(any(target_os = "android", test))]
+            recovery_requested: tokio::sync::Notify::new(),
         }
     }
     pub async fn ensure_ready(
@@ -65,12 +89,31 @@ impl RuntimeStartup {
                     | PrivateError::Service
                     | PrivateError::Timeout
                     | PrivateError::RefreshPending,
-                ) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                    delay = (delay * 2).min(30);
-                }
+                ) => {}
+                #[cfg(target_os = "android")]
+                Err(PrivateError::OutcomeUnknown) => {}
                 Err(error) => return Err(error),
             }
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            delay = (delay * 2).min(30);
+        }
+    }
+    #[cfg(any(target_os = "android", test))]
+    pub fn request_recovery(&self) {
+        self.recovery_requested.notify_one();
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    async fn recover_on_request<F, Fut>(&self, mut ready: F) -> Result<(), PrivateError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), PrivateError>>,
+    {
+        loop {
+            if matches!(self.recover(&mut ready).await, Err(PrivateError::Closed)) {
+                return Err(PrivateError::Closed);
+            }
+            self.recovery_requested.notified().await;
         }
     }
 }
@@ -147,6 +190,40 @@ mod tests {
         second.unwrap();
         assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
+    #[tokio::test]
+    async fn recovery_requested_during_startup_runs_after_success_or_terminal_error() {
+        for initial in [Ok(()), Err(PrivateError::RefreshRejected)] {
+            let (startup, starts) = fixture();
+            let mut attempts = 0;
+            let result = startup.recover_on_request(|| {
+                attempts += 1;
+                let attempt = attempts;
+                let startup = &startup;
+                async move {
+                    match attempt {
+                        1 => {
+                            startup.request_recovery();
+                            initial
+                        }
+                        2 => {
+                            startup.request_recovery();
+                            Ok(())
+                        }
+                        _ => Err(PrivateError::Closed),
+                    }
+                }
+            });
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), result)
+                    .await
+                    .unwrap(),
+                Err(PrivateError::Closed)
+            );
+            assert_eq!(attempts, 3);
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[tokio::test]
     async fn cancelled_wait_can_be_retried_without_losing_scheduler_launch() {
         let (startup, starts) = fixture();

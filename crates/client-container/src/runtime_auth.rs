@@ -352,7 +352,7 @@ impl OwnerRuntimeAuth {
             Some(_) => return Err(CoreError::AuthRecoveryRequired),
         }
         self.broker
-            .stop_runtime_logout_cleanup(&receipt)
+            .stop_runtime_logout_cleanup(&receipt, None)
             .await
             .map_err(map_error)?;
         self.admission.complete_logout(&receipt, &quiescence)?;

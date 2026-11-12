@@ -18,7 +18,7 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "finishLogout", "isAndroidRuntime"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -70,7 +70,7 @@ function fixture() {
   let reject!: (reason: unknown) => void;
   const response = new Promise((resolve, fail) => { reply = resolve; reject = fail; });
   const context = {
-    busy: false, bootstrapPending: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
+    busy: false, bootstrapPending: false, restoringLogout: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
     runtimeChannelClosed: false, runtimeSelectionBusy: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
@@ -94,6 +94,7 @@ function fixture() {
 function logoutFixture() {
   const result = fixture();
   Object.assign(result.context, {
+    bootstrap: { device: { platform: "android" }, binding: {} },
     startupRetry: { cancel: () => {}, schedule: () => {}, checkpoint: () => () => true }, startupPending: false,
     peers: [{ id: 1 }], selectedPeerId: "1", password: "test-password",
     diagnosticsStatus: null, updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0, notifications: [],
@@ -705,6 +706,49 @@ describe("foreground native state callback", () => {
     expect(context.phase).toBe("signed_out");
     expect(context.view).toBe("sign_in");
     expect(context.runtimeChannelClosed).toBe(false);
+    expect(context.busy).toBe(false);
+  });
+
+  it("shows the relaunch screen when Android Logout discovers EOF before a state poll", async () => {
+    const { context } = logoutFixture();
+    let restores = 0;
+    Object.assign(context, { restore: async () => { restores++; } });
+    Object.assign(context.nativeClient, {
+      logout: async () => { throw { code: "runtime_channel_closed" }; },
+    });
+    await executePageFunction("logout", context);
+    expect(context.bootstrap).not.toBeNull();
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.view).toBe("unavailable");
+    expect(context.phase).toBe("error");
+    expect(restores).toBe(0);
+  });
+
+  it("reconciles an Android logout from peer selection once the owner confirms it", async () => {
+    const { context } = logoutFixture();
+    let finish!: (reason: unknown) => void;
+    let restoring: Promise<void> | undefined;
+    Object.assign(context, {
+      bootstrap: { device: { platform: "android" }, binding: null },
+      phase: "needs_peer_binding", view: "peer_selection",
+      refreshPending: false, startupSlow: false, startupTimer: null,
+      window: { setTimeout: () => 1, clearTimeout: () => {} },
+      restore: () => restoring = executePageFunction("restore", context),
+    });
+    Object.assign(context.nativeClient, {
+      logout: async () => { throw { code: "temporarily_unavailable" }; },
+      bootstrap: () => new Promise((_resolve, reject) => { finish = reject; }),
+    });
+
+    await executePageFunction("logout", context);
+    expect(restoring).toBeDefined();
+    expect(context.bootstrap).not.toBeNull();
+    expect(context.view).toBe("peer_selection");
+    finish({ code: "signed_out" });
+    await restoring;
+    expect(context.bootstrap).toBeNull();
+    expect(context.phase).toBe("signed_out");
+    expect(context.view).toBe("sign_in");
     expect(context.busy).toBe(false);
   });
 

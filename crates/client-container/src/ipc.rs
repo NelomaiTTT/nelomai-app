@@ -6,6 +6,8 @@ use nelomai_client_storage::RuntimeAuthScope;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout_at, Duration, Instant};
+#[cfg(any(target_os = "android", test))]
+mod android_logout;
 mod child_admission;
 pub use child_admission::{ChildAdmission, RuntimeRecordInventory, ScopeAdmission};
 mod remote;

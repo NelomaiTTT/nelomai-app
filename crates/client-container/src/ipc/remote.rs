@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use nelomai_client_api::{LoginRequest, RuntimeTarget};
 use nelomai_client_core::{CoreError, RuntimeAuthProvider};
 use nelomai_client_storage::BrokerRequestV1;
+use nelomai_contracts::Platform;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
@@ -576,7 +577,11 @@ impl RemoteOwner {
         coordinator: &crate::SwitchCoordinator,
         deadline: Instant,
     ) -> Result<(), PrivateError> {
-        let _execution = coordinator.lock_logout_cleanup().await;
+        let io_deadline = self.android_logout_io_deadline(deadline);
+        let control_deadline = io_deadline.unwrap_or(deadline);
+        let _execution = timeout_at(control_deadline, coordinator.lock_logout_cleanup())
+            .await
+            .map_err(|_| PrivateError::Timeout)?;
         let Some(receipt) = broker
             .completed_runtime_logout()
             .await
@@ -584,14 +589,14 @@ impl RemoteOwner {
         else {
             return Ok(());
         };
-        let lease = self.prepare(deadline).await?;
+        let lease = self.prepare(control_deadline).await?;
         let _held = AdmissionLease {
             owner: self,
             lease: lease.clone(),
             granted: false,
         };
         broker
-            .stop_runtime_logout_cleanup(&receipt)
+            .stop_runtime_logout_cleanup(&receipt, io_deadline)
             .await
             .map_err(broker_error)?;
         match self
@@ -600,7 +605,7 @@ impl RemoteOwner {
                     lease,
                     receipt: receipt.clone(),
                 },
-                deadline,
+                control_deadline,
             )
             .await?
         {
@@ -616,6 +621,12 @@ impl RemoteOwner {
             .await
             .map_err(broker_error)
     }
+    fn android_logout_io_deadline(&self, deadline: Instant) -> Option<Instant> {
+        (self.profile.platform == Platform::Android
+            && self.binding.target.runtime_slot == nelomai_contracts::RuntimeSlot::Latest)
+            .then(|| deadline - AUTH_REPLY_MARGIN)
+    }
+
     pub(super) async fn request(
         &self,
         broker: &AuthBroker,
@@ -861,10 +872,19 @@ impl RemoteOwner {
                         .filter(|(original, _)| original == &stamp)
                         .and_then(|(_, ticket)| ticket.clone())
                 };
-                broker
-                    .logout_pending_login_fenced(&stamp, pending.as_ref())
-                    .await
-                    .map_err(broker_error)?;
+                let io_deadline = self.android_logout_io_deadline(deadline);
+                let logout =
+                    broker.logout_pending_login_fenced(&stamp, pending.as_ref(), io_deadline);
+                let result = if io_deadline.is_some() {
+                    // Let the broker persist any HTTP confirmation after its
+                    // parallel I/O deadlines, then reserve time for the reply.
+                    timeout_at(deadline - AUTH_REPLY_MARGIN / 2, logout)
+                        .await
+                        .map_err(|_| PrivateError::Timeout)?
+                } else {
+                    logout.await
+                };
+                result.map_err(broker_error)?;
                 if let Some(commands) = &self.commands {
                     commands
                         .dispatch(
@@ -1054,6 +1074,13 @@ impl LocalAuthStop for RemoteOwner {
             _ => Err(BrokerError::RecoveryRequired),
         }
     }
+    async fn stop_local_until(&self, deadline: Instant) -> Result<(), BrokerError> {
+        match self.control(ControlV1::Stop, deadline).await {
+            Ok(ControlAckV1::Done) => Ok(()),
+            Err(PrivateError::Timeout) => Err(BrokerError::Timeout),
+            _ => Err(BrokerError::RecoveryRequired),
+        }
+    }
 }
 
 impl RemoteOwner {
@@ -1095,6 +1122,8 @@ pub struct PrivateRuntimeAuthClient {
     pub(super) pending_login: Mutex<Option<u64>>,
     child: Arc<ChildAdmission>,
     login_failure_observer: Option<LoginFailureObserver>,
+    #[cfg(any(target_os = "android", test))]
+    pub(super) android_logout: Option<android_logout::AndroidLogout>,
 }
 impl Drop for PrivateRuntimeAuthClient {
     fn drop(&mut self) {
@@ -1234,6 +1263,14 @@ impl PrivateRuntimeAuthClient {
                         }
                     }
                     MessageV1::Control(control) => {
+                        // The latest Android child returns a bounded error
+                        // before the owner's control deadline. A missing ACK
+                        // still closes the transport through RequestLifetime.
+                        let reply_deadline = if cfg!(any(target_os = "android", test)) {
+                            deadline - AUTH_REPLY_MARGIN / 2
+                        } else {
+                            deadline
+                        };
                         let ack = match control {
                             ControlV1::Prepare { incarnation } => {
                                 if controls.len() >= MAX_PENDING {
@@ -1246,12 +1283,16 @@ impl PrivateRuntimeAuthClient {
                                 let child = client_child.clone();
                                 let outbox = client_box.clone();
                                 controls.spawn(async move {
-                                    let ack =
-                                        match child.prepare(frame.id, &incarnation, deadline).await
-                                        {
-                                            Ok(lease) => ControlAckV1::Prepared { lease },
-                                            Err(error) => ControlAckV1::Error { error },
-                                        };
+                                    let ack = match timeout_at(
+                                        reply_deadline,
+                                        child.prepare(frame.id, &incarnation, deadline),
+                                    )
+                                    .await
+                                    .unwrap_or(Err(PrivateError::Timeout))
+                                    {
+                                        Ok(lease) => ControlAckV1::Prepared { lease },
+                                        Err(error) => ControlAckV1::Error { error },
+                                    };
                                     let _ = outbox.enqueue(
                                         FrameV1::new(frame.id, MessageV1::Ack(ack)),
                                         deadline,
@@ -1328,12 +1369,16 @@ impl PrivateRuntimeAuthClient {
                                 let stop = stop.clone();
                                 let outbox = client_box.clone();
                                 controls.spawn(async move {
-                                    let ack = match timeout_at(deadline, stop.stop_local()).await {
-                                        Ok(Ok(())) => ControlAckV1::Done,
-                                        _ => ControlAckV1::Error {
-                                            error: PrivateError::RecoveryRequired,
-                                        },
-                                    };
+                                    let ack =
+                                        match timeout_at(reply_deadline, stop.stop_local()).await {
+                                            Ok(Ok(())) => ControlAckV1::Done,
+                                            Ok(Err(_)) => ControlAckV1::Error {
+                                                error: PrivateError::RecoveryRequired,
+                                            },
+                                            Err(_) => ControlAckV1::Error {
+                                                error: PrivateError::Timeout,
+                                            },
+                                        };
                                     let _ = outbox.enqueue(
                                         FrameV1::new(frame.id, MessageV1::Ack(ack)),
                                         deadline,
@@ -1430,6 +1475,8 @@ impl PrivateRuntimeAuthClient {
             pending_login: Mutex::new(None),
             child,
             login_failure_observer: None,
+            #[cfg(any(target_os = "android", test))]
+            android_logout: None,
         }
     }
     pub(super) async fn request(
@@ -1550,7 +1597,10 @@ impl PrivateRuntimeAuthClient {
             }
         }
     }
-    async fn stamp(&self, deadline: Instant) -> Result<Option<ScopeStamp>, PrivateError> {
+    pub(super) async fn stamp(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<ScopeStamp>, PrivateError> {
         let current = self
             .stamp
             .lock()
@@ -1614,11 +1664,27 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
         }
     }
     async fn login(&self, request: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+        #[cfg(any(target_os = "android", test))]
+        let unknown_logout = if let Some(recovery) = &self.android_logout {
+            self.prepare_android_login(recovery)
+                .await
+                .map_err(|error| self.login_error(PrivateLoginStage::State, error))?
+        } else {
+            None
+        };
         let deadline = Instant::now() + REQUEST_BUDGET;
         let stamp = self
             .stamp(deadline)
             .await
             .map_err(|error| self.login_error(PrivateLoginStage::State, error))?;
+        #[cfg(any(target_os = "android", test))]
+        if unknown_logout.is_none() {
+            if let Some(recovery) = &self.android_logout {
+                recovery
+                    .check_login()
+                    .map_err(|error| self.login_error(PrivateLoginStage::State, error))?;
+            }
+        }
         match self
             .request(
                 AuthRequestV1::Login {
@@ -1673,12 +1739,27 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
         }
     }
     async fn logout(&self) -> Result<(), CoreError> {
+        #[cfg(any(target_os = "android", test))]
+        if let Some(recovery) = &self.android_logout {
+            return self.logout_android(recovery).await.map_err(core_error);
+        }
+
         let deadline = Instant::now() + REQUEST_BUDGET;
         let stamp = self.stamp(deadline).await.map_err(core_error)?;
+        self.send_logout(stamp, deadline).await.map_err(core_error)
+    }
+}
+
+impl PrivateRuntimeAuthClient {
+    pub(super) async fn send_logout(
+        &self,
+        stamp: Option<ScopeStamp>,
+        deadline: Instant,
+    ) -> Result<(), PrivateError> {
         let cancel_login_request = *self
             .pending_login
             .lock()
-            .map_err(|_| core_error(PrivateError::Closed))?;
+            .map_err(|_| PrivateError::Closed)?;
         match self
             .request(
                 AuthRequestV1::Logout {
@@ -1687,11 +1768,10 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
                 },
                 deadline,
             )
-            .await
-            .map_err(core_error)?
+            .await?
         {
             AuthResponseV1::Done => Ok(()),
-            _ => Err(core_error(PrivateError::Protocol)),
+            _ => Err(PrivateError::Protocol),
         }
     }
 }

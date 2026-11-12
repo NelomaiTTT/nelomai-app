@@ -743,7 +743,7 @@ async fn legacy_logout_recovers_empty_orphan_scope_but_preserves_operational_sta
     let lease = fixture.parent.prepare(deadline).await.unwrap();
     fixture
         .broker
-        .stop_runtime_logout_cleanup(&receipt)
+        .stop_runtime_logout_cleanup(&receipt, None)
         .await
         .unwrap();
     let mut nonempty = empty.clone();
@@ -918,7 +918,14 @@ impl ProtectedRecordStore for Record {
     }
 }
 #[derive(Default)]
-struct Tunnel(AtomicUsize, AtomicUsize, AtomicBool, AtomicBool, AtomicBool);
+struct Tunnel(
+    AtomicUsize,
+    AtomicUsize,
+    AtomicBool,
+    AtomicBool,
+    AtomicBool,
+    AtomicBool,
+);
 #[async_trait::async_trait]
 impl TunnelController for Tunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
@@ -931,6 +938,9 @@ impl TunnelController for Tunnel {
     }
     async fn stop(&self) -> Result<(), TunnelError> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        if self.5.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.2.load(Ordering::SeqCst) {
             return Err(TunnelError::Backend("redundant_stop_pending".into()));
         }
@@ -1171,14 +1181,59 @@ impl Fixture {
         background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
         pause: Option<Arc<AdmissionPause>>,
     ) -> Self {
+        Self::from_records_with_commands(
+            root,
+            api,
+            auth_backend,
+            runtime_backend,
+            background,
+            pause,
+            None,
+        )
+    }
+
+    fn from_records_with_commands(
+        root: tempfile::TempDir,
+        api: ClientApi,
+        auth_backend: Record,
+        runtime_backend: Record,
+        background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
+        pause: Option<Arc<AdmissionPause>>,
+        android_commands: Option<Arc<dyn crate::host::PrivateOwnerCommands>>,
+    ) -> Self {
+        let (platform, slot) = if android_commands.is_some() {
+            (Platform::Android, RuntimeSlot::Latest)
+        } else {
+            (Platform::Macos, RuntimeSlot::Stable)
+        };
         let target = RuntimeTarget {
             container_version: "0.2.16".into(),
             runtime_version: "0.2.16".into(),
             runtime_contract_version: 1,
-            runtime_slot: RuntimeSlot::Stable,
+            runtime_slot: slot,
         };
         let auth = Arc::new(ProtectedAuthStore::new(auth_backend.clone()));
-        let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+        let paths = RuntimePaths::new(root.path(), slot, "0.2.16").unwrap();
+        if slot == RuntimeSlot::Latest {
+            let mut saved = auth.load().unwrap().unwrap();
+            if let Some(identity) = &mut saved.confirmed_identity {
+                if identity.slot != slot {
+                    identity.slot = slot;
+                    auth.save(&saved).unwrap();
+                    let stable =
+                        RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+                    let mut operational =
+                        ProtectedRuntimeStore::new(runtime_backend.clone(), stable)
+                            .load()
+                            .unwrap()
+                            .unwrap();
+                    operational.slot = slot;
+                    ProtectedRuntimeStore::new(runtime_backend.clone(), paths.clone())
+                        .save(&operational)
+                        .unwrap();
+                }
+            }
+        }
         let store = ProtectedRuntimeStore::new(runtime_backend.clone(), paths);
         let record = RuntimeRecordOwner::new(store);
         let tunnel = Arc::new(Tunnel::default());
@@ -1192,15 +1247,16 @@ impl Fixture {
             Some(pause) => pause.sockets(),
             None => private_socketpair().unwrap(),
         };
-        let parent = RemoteOwner::new_with_background(
+        let parent = RemoteOwner::new_with_owner(
             parent_socket,
             LaunchBinding::fixture(target, "fixture-child"),
             RuntimeClientProfile {
-                platform: Platform::Macos,
+                platform,
                 platform_version: None,
                 architecture: "aarch64".into(),
             },
             background,
+            android_commands,
         )
         .unwrap();
         let broker = Arc::new(AuthBroker::new(api, auth.clone(), parent.clone()).unwrap());
@@ -3153,6 +3209,553 @@ async fn logout_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle
     (api, calls, server)
 }
 
+impl Fixture {
+    fn enable_android_logout(
+        &mut self,
+        path: &std::path::Path,
+        clear: impl Fn() -> Result<(), PrivateError> + Send + Sync + 'static,
+    ) {
+        Arc::get_mut(&mut self.client)
+            .unwrap()
+            .enable_android_logout_recovery(path.into(), clear);
+    }
+}
+
+#[tokio::test]
+async fn android_logout_replays_after_eof_before_broker_receives_request() {
+    android_logout_replay_after_replacement(false).await;
+}
+
+#[tokio::test]
+async fn android_logout_resumes_the_brokers_pending_revocation() {
+    android_logout_replay_after_replacement(true).await;
+}
+
+async fn android_logout_replay_after_replacement(broker_persisted: bool) {
+    let (api, calls, server) = logout_panel().await;
+    let state = tempfile::tempdir().unwrap();
+    let marker = state.path().join("logout-intent-v1.json");
+    let mut original = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    original.enable_android_logout(&marker, || panic!("clear before confirmation"));
+    original.client.state().await.unwrap();
+    original.parent.revoke_peer();
+    original.client.wait_for_channel_close().await;
+
+    assert!(original.client.logout().await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(marker.is_file(), "the request must survive the old runtime");
+    assert_eq!(
+        original.broker.auth_state().await.unwrap(),
+        crate::BrokerAuthState::Active
+    );
+
+    if broker_persisted {
+        // Simulate a broker that persisted its logout fence before losing
+        // panel access. The new broker gets the same protected record.
+        assert!(original.broker.logout().await.is_err());
+        assert_eq!(
+            original.broker.auth_state().await.unwrap(),
+            crate::BrokerAuthState::LogoutPending
+        );
+    }
+    let mut replacement = Fixture::from_records(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+    );
+    drop(original);
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    replacement.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(replacement
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(
+        replacement.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    assert!(!replacement
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    server.abort();
+}
+
+#[derive(Default)]
+struct LogoutReady {
+    entered: tokio::sync::Notify,
+    hold: bool,
+    cancel_once: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::host::PrivateOwnerCommands for LogoutReady {
+    async fn dispatch(
+        &self,
+        _target: &RuntimeTarget,
+        request: crate::host::HostRequestV1,
+        _deadline: Instant,
+    ) -> Result<crate::host::HostResponseV1, PrivateError> {
+        assert!(matches!(request, crate::host::HostRequestV1::RuntimeReady));
+        self.entered.notify_one();
+        if self.hold {
+            std::future::pending::<()>().await;
+        }
+        if self.cancel_once.swap(false, Ordering::SeqCst) {
+            return Err(PrivateError::Cancelled);
+        }
+        Ok(crate::host::HostResponseV1::Done)
+    }
+}
+
+#[tokio::test]
+async fn android_logout_lost_reply_retries_quick_clear_without_reissuing_logout() {
+    let (api, calls, server) = logout_panel().await;
+    let state = tempfile::tempdir().unwrap();
+    let marker = state.path().join("logout-intent-v1.json");
+    let initial = Fixture::new(api.clone(), true);
+    let pause = Arc::new(LogoutReady {
+        hold: true,
+        ..LogoutReady::default()
+    });
+    let mut original = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api.clone(),
+        initial.auth_backend.clone(),
+        initial.runtime_backend.clone(),
+        None,
+        None,
+        Some(pause.clone()),
+    );
+    drop(initial);
+    original.enable_android_logout(&marker, || panic!("clear before confirmation"));
+    let client = original.client.clone();
+    let logout = tokio::spawn(async move { client.logout().await });
+    tokio::time::timeout(REQUEST_BUDGET, pause.entered.notified())
+        .await
+        .unwrap();
+    let confirmed = original.auth.load().unwrap().unwrap();
+    assert_eq!(confirmed.logout_state, LogoutState::LoggedOut);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    original.parent.revoke_peer();
+    assert!(logout.await.unwrap().is_err());
+
+    let mut replacement = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+        Some(Arc::new(LogoutReady {
+            cancel_once: AtomicBool::new(true),
+            ..LogoutReady::default()
+        })),
+    );
+    drop(original);
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    replacement.enable_android_logout(&marker, move || {
+        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        Ok(())
+    });
+    assert_eq!(
+        replacement.client.recover_pending_android_logout().await,
+        Err(PrivateError::RecoveryRequired)
+    );
+    assert!(marker.is_file());
+    assert_eq!(
+        clears.load(Ordering::SeqCst),
+        0,
+        "cancelled readiness must retain the intent"
+    );
+    assert_eq!(
+        replacement.client.recover_pending_android_logout().await,
+        Err(PrivateError::RecoveryRequired)
+    );
+    assert!(marker.is_file());
+    assert!(replacement
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(clears.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        replacement.auth.load().unwrap().unwrap().auth_epoch,
+        confirmed.auth_epoch + 2
+    );
+    assert!(!marker.exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_retries_a_slow_panel_on_the_same_replacement_channel() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let received = operations.clone();
+    let server = tokio::spawn(async move {
+        let router = axum::Router::new().route(
+            "/api/client/v1/auth/logout-runtime",
+            axum::routing::post(move |axum::Json(request): axum::Json<nelomai_client_api::RuntimeLogoutRequest>| {
+                let first = {
+                    let mut ids = received.lock().unwrap();
+                    ids.push(request.operation_id);
+                    ids.len() == 1
+                };
+                async move {
+                    if first {
+                        std::future::pending::<()>().await;
+                    }
+                    axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted"}))
+                }
+            }),
+        );
+        axum::serve(listener, router).await.unwrap();
+    });
+    let original = Fixture::new(api.clone(), true);
+    let marker = original._root.path().join("logout-intent-v1.json");
+    let mut replacement = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+        Some(Arc::new(LogoutReady::default())),
+    );
+    let (scope, _) = replacement.broker.observe_stamped().await.unwrap();
+    crate::selection::atomic_nonsecret_write(
+        &marker,
+        &serde_json::to_vec(&serde_json::json!({"scope": scope, "confirmed": false})).unwrap(),
+    )
+    .unwrap();
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    replacement.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+
+    assert_eq!(
+        replacement.client.recover_pending_android_logout().await,
+        Err(PrivateError::Timeout)
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    assert!(marker.is_file());
+    assert_eq!(
+        replacement.client.state().await.unwrap(),
+        RuntimeAuthState::LogoutPending
+    );
+    assert!(replacement
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(
+        replacement.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    let ids = operations.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "repeat the protected operation");
+    assert!(!marker.exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_retries_a_slow_stop_after_confirmed_panel_logout() {
+    use nelomai_client_core::{CoreApiError, CoreError};
+    let (api, calls, server) = logout_panel().await;
+    let original = Fixture::new(api.clone(), true);
+    let marker = original._root.path().join("logout-intent-v1.json");
+    let mut runtime = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+        Some(Arc::new(LogoutReady::default())),
+    );
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    runtime.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    runtime.tunnel.5.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        runtime.client.logout().await,
+        Err(CoreError::Api(CoreApiError::Retryable))
+    ));
+    assert_eq!(
+        runtime.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    runtime.tunnel.5.store(false, Ordering::SeqCst);
+    assert!(runtime
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_requires_stop_ack_even_if_already_logged_out_without_receipt() {
+    let (api, calls, server) = logout_panel().await;
+    let mut runtime = Fixture::new(api, true);
+    runtime.broker.logout().await.unwrap();
+    assert!(runtime
+        .broker
+        .completed_runtime_logout()
+        .await
+        .unwrap()
+        .is_none());
+    let journal = tempfile::tempdir().unwrap();
+    let marker = journal.path().join("logout-intent-v1.json");
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    runtime.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    runtime.tunnel.2.store(true, Ordering::SeqCst);
+    assert!(runtime.client.logout().await.is_err());
+    assert_eq!(
+        runtime.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+    assert!(runtime
+        .client
+        .recover_pending_android_logout()
+        .await
+        .is_err());
+    assert!(marker.is_file());
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    runtime.tunnel.2.store(false, Ordering::SeqCst);
+    assert!(runtime
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_keeps_intent_while_cancelled_login_outcome_is_unknown() {
+    use nelomai_client_core::CoreError;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new()
+        .route("/api/client/v1/auth/login", axum::routing::post({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"late-access","access_expires_in":900,"refresh_token":"late-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}}))
+                }
+            }
+        }))
+        .route("/api/client/v1/auth/logout-runtime", axum::routing::post(|| async { axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted"})) }));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut runtime = Fixture::new(api, false);
+    let journal = tempfile::tempdir().unwrap();
+    let marker = journal.path().join("logout-intent-v1.json");
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    runtime.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    let client = runtime.client.clone();
+    let login = tokio::spawn(async move { client.login(password_login()).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime.client.logout().await,
+        Err(CoreError::AuthenticationOutcomeUnknown)
+    ));
+    assert_eq!(
+        runtime.client.recover_pending_android_logout().await,
+        Err(PrivateError::OutcomeUnknown)
+    );
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+    assert!(marker.is_file());
+    release.notify_one();
+    assert!(login.await.unwrap().is_err());
+    assert!(runtime
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_recovers_after_two_epoch_steps_in_the_same_family() {
+    let (api, calls, server) = logout_panel().await;
+    let original = Fixture::new(api.clone(), true);
+    let marker = original._root.path().join("logout-intent-v1.json");
+    let mut runtime = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+        Some(Arc::new(LogoutReady::default())),
+    );
+    let (source, _) = runtime.broker.observe_stamped().await.unwrap();
+    crate::selection::atomic_nonsecret_write(
+        &marker,
+        &serde_json::to_vec(&serde_json::json!({"scope": source, "confirmed": false})).unwrap(),
+    )
+    .unwrap();
+    let mut saved = runtime.auth.load().unwrap().unwrap();
+    saved.auth_epoch += 1;
+    runtime.auth.save(&saved).unwrap();
+    runtime.broker.logout().await.unwrap();
+    assert_eq!(
+        runtime.auth.load().unwrap().unwrap().auth_epoch,
+        saved.auth_epoch + 1
+    );
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    runtime.enable_android_logout(&marker, move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    assert!(runtime
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_retries_failed_quick_clear_before_next_login() {
+    use nelomai_client_core::{CoreApiError, CoreError};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let logout_calls = Arc::new(AtomicUsize::new(0));
+    let received = logout_calls.clone();
+    let server = tokio::spawn(async move {
+        let router = axum::Router::new()
+            .route("/api/client/v1/auth/logout-runtime", axum::routing::post(move || {
+                received.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted"})) }
+            }))
+            .route("/api/client/v1/auth/login", axum::routing::post(|| async {
+                (axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({
+                    "request_id":"synthetic","code":"invalid_credentials","message":"synthetic"
+                })))
+            }));
+        axum::serve(listener, router).await.unwrap();
+    });
+    let original = Fixture::new(api.clone(), true);
+    let marker = original._root.path().join("logout-intent-v1.json");
+    let mut runtime = Fixture::from_records_with_commands(
+        tempfile::tempdir().unwrap(),
+        api,
+        original.auth_backend.clone(),
+        original.runtime_backend.clone(),
+        None,
+        None,
+        Some(Arc::new(LogoutReady::default())),
+    );
+    let clears = Arc::new(AtomicUsize::new(0));
+    let count = clears.clone();
+    runtime.enable_android_logout(&marker, move || {
+        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(PrivateError::RecoveryRequired)
+        } else {
+            Ok(())
+        }
+    });
+
+    assert!(matches!(
+        runtime.client.logout().await,
+        Err(CoreError::AuthRecoveryRequired)
+    ));
+    assert!(marker.is_file());
+    let result = runtime.client.login(password_login()).await;
+    assert!(
+        matches!(result, Err(CoreError::Api(CoreApiError::Rejected { ref code, .. })) if code == "invalid_credentials"),
+        "{result:?}"
+    );
+    assert!(!marker.exists());
+    assert_eq!(clears.load(Ordering::SeqCst), 2);
+    assert_eq!(logout_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn android_logout_does_not_touch_a_new_authenticated_scope() {
+    let (api, calls, server) = logout_panel().await;
+    let state = tempfile::tempdir().unwrap();
+    let marker = state.path().join("logout-intent-v1.json");
+    let mut original = Fixture::new(api.clone(), true);
+    original.enable_android_logout(&marker, || panic!("clear before confirmation"));
+    original.client.state().await.unwrap();
+    original.parent.revoke_peer();
+    original.client.wait_for_channel_close().await;
+    assert!(original.client.logout().await.is_err());
+    assert!(marker.is_file());
+
+    let mut replacement = Fixture::new(api, true);
+    let before = replacement.auth.load().unwrap();
+    replacement.enable_android_logout(&marker, || panic!("clear of a newer login"));
+    assert!(!replacement
+        .client
+        .recover_pending_android_logout()
+        .await
+        .unwrap());
+    assert_eq!(replacement.auth.load().unwrap(), before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!marker.exists());
+    server.abort();
+}
+
 #[tokio::test]
 async fn owner_originated_logout_revokes_real_child_latch() {
     use nelomai_client_core::{ClientCore, NoopLogger, Phase};
@@ -4763,7 +5366,7 @@ async fn durable_logout_cancels_old_native_wait_before_runtime_cleanup() {
             .unwrap();
         let cleanup = tokio::time::timeout(
             Duration::from_millis(200),
-            fixture.broker.stop_runtime_logout_cleanup(&receipt),
+            fixture.broker.stop_runtime_logout_cleanup(&receipt, None),
         )
         .await;
         assert!(
