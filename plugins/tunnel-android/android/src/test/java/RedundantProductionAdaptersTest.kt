@@ -1246,7 +1246,7 @@ class RedundantProductionAdaptersTest {
                     break
                 }
             }
-            assertEquals(57_000L, stalledAt)
+            assertEquals(60_000L, stalledAt)
         }
     }
 
@@ -1316,13 +1316,12 @@ class RedundantProductionAdaptersTest {
     @Test
     fun staleReadyStandbyCannotReceiveTrafficWhenBothPathsFail() {
         val fixture = pairFixture(0)
-        var decision = FailoverDecision(null, false)
-        for (now in 30_000L..37_000L step 1_000L) {
-            decision = fixture.tick(now) { _, _ -> false }
+        for (now in 30_000L..40_000L step 1_000L) {
+            val decision = fixture.tick(now) { _, _ -> false }
             assertEquals(null, decision.switchTo)
-            if (now < 37_000L) assertFalse(decision.sessionStalled)
+            assertEquals("time=$now", now == 40_000L, decision.sessionStalled)
         }
-        assertTrue(decision.sessionStalled)
+        assertFalse(fixture.backend.probeLaunches.contains(40_000L to 1))
     }
 
     @Test
@@ -1339,12 +1338,33 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun oneFailedStandbyProbeDoesNotStallFailoverInEitherSlotOrder() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            for (now in 30_000L..38_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, started ->
+                    val succeeded = slot != primary && started != 35_000L
+                    if (succeeded) fixture.backend.recordProbeReply(slot)
+                    succeeded
+                }
+                assertFalse("primary=$primary, time=$now", decision.sessionStalled)
+                assertEquals(if (now == 38_000L) 1 - primary else null, decision.switchTo)
+                decision.switchTo?.let { slot ->
+                    assertTrue(fixture.native.activate(if (slot == 0) "lease-a" else "lease-b"))
+                }
+            }
+            assertTrue(fixture.backend.probeLaunches.contains(37_000L to (1 - primary)))
+            assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
+        }
+    }
+
+    @Test
     fun failedLatestStandbyCheckOverridesEarlierSuccess() {
         val fixture = pairFixture(0)
-        for (now in 30_000L..37_000L step 1_000L) {
+        for (now in 30_000L..40_000L step 1_000L) {
             val decision = fixture.tick(now) { slot, started -> slot == 1 && started < 35_000L }
             assertEquals(null, decision.switchTo)
-            assertEquals(now == 37_000L, decision.sessionStalled)
+            assertEquals("time=$now", now == 40_000L, decision.sessionStalled)
         }
     }
 
@@ -1408,7 +1428,7 @@ class RedundantProductionAdaptersTest {
                 val fixture = pairFixture(primary)
                 fixture.backend.failedProbeSendSlots += primary
                 var decision = FailoverDecision(null, false)
-                for (now in 30_000L..38_000L step 1_000L) {
+                for (now in 30_000L..42_000L step 1_000L) {
                     decision = fixture.tick(now) { slot, _ -> slot != primary && reserveHealthy }
                     if (decision.switchTo != null || decision.sessionStalled) break
                 }
@@ -2451,6 +2471,10 @@ internal class RecordingSessionBackend(
     var latestProbeToken: Long? = null
     var countProbeSend = true
     var decryptedReceivePackets = 0L
+    private val slotProbeReplies = mutableMapOf<Int, Long>()
+    fun recordProbeReply(slot: Int) {
+        slotProbeReplies[slot] = (slotProbeReplies[slot] ?: 0L) + 1L
+    }
     var metricsOverride: (() -> String?)? = null
     private val admitted = mutableSetOf<Int>()
     private var nextToken = 1L
@@ -2525,7 +2549,8 @@ internal class RecordingSessionBackend(
             postfix = "]}",
         ) { slot ->
             val sent = if (useSlotCounters) slotSendPackets[slot] ?: 0L else udpSendPackets
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_send_errors":${sendErrorsBySlot[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
+            val received = decryptedReceivePackets + (slotProbeReplies[slot] ?: 0L)
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$received,"udp_send_packets":$sent,"udp_send_errors":${sendErrorsBySlot[slot] ?: 0L},"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 

@@ -359,6 +359,300 @@ impl nelomai_client_container::ipc::PrivateBackgroundDispatcher for NoNativeWork
 
 #[cfg(unix)]
 #[tokio::test]
+async fn signed_out_android_upgrade_admits_login_without_authorizing_vpn() {
+    use axum::{routing::post, Json, Router};
+    use nelomai_client_container::{
+        host::*, ipc::*, BrokerAuthState, RuntimeClientProfile, UnavailableRuntimeForceStop,
+    };
+    use nelomai_client_core::{RuntimeAuthProvider, RuntimeStartPreflight, RuntimeWriterGates};
+    use nelomai_client_storage::*;
+    use serde_json::json;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new().route(
+        "/api/client/v1/auth/login",
+        post(|| async {
+            Json(json!({
+                "api_version":"1", "request_id":"fixture", "token_type":"Bearer",
+                "access_token":"test-access", "access_expires_in":900,
+                "refresh_token":"test-refresh", "refresh_expires_in":3600,
+                "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                "device":{"id":"device","name":"fixture","platform":"android",
+                    "container_version":"0.3.15","runtime_version":"0.3.15",
+                    "runtime_contract_version":1,"runtime_slot":"latest","session_generation":8}
+            }))
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+    for (confirmed_logout, push_pending, terminal_transition, login_interrupted) in [
+        (false, false, None, false),
+        (true, false, None, false),
+        (true, false, Some(true), false),
+        (true, false, Some(false), false),
+        (true, true, None, false),
+        (false, false, None, true),
+        (true, false, Some(true), true),
+    ] {
+        let data = tempfile::tempdir().unwrap();
+        let resources = tempfile::tempdir().unwrap();
+        let key = install_manifest_platform(resources.path(), "0.3.14", true, "android", "aarch64");
+        let records = Records::default();
+        let open = || {
+            CommonHost::open(
+                data.path(),
+                resources.path(),
+                Some(&key),
+                "android",
+                "aarch64",
+                || records.clone(),
+                nelomai_client_api::ClientApi::new(&api_url).unwrap(),
+                RuntimeClientProfile {
+                    platform: nelomai_contracts::Platform::Android,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                },
+                HostNativePorts {
+                    stop: Arc::new(NoNativeWork),
+                    force: Arc::new(UnavailableRuntimeForceStop),
+                    background: Arc::new(NoNativeWork),
+                    updater: None,
+                    storage: None,
+                    relaunch: None,
+                },
+            )
+        };
+        let old = open().unwrap();
+        let identity = old.native_target().identity(Some(7)).unwrap();
+        drop(old);
+        let auth = ProtectedAuthStore::new(records.record("auth-v1"));
+        let mut previous_auth = auth.load().unwrap().unwrap();
+        if confirmed_logout {
+            previous_auth.auth_epoch = 2;
+            previous_auth.session_generation = Some(7);
+            previous_auth.confirmed_identity = Some(identity.clone());
+            previous_auth.logout_state = LogoutState::LoggedOut;
+            let metadata = previous_auth.broker.as_mut().unwrap();
+            metadata.next_attempt = 2;
+            metadata.confirmed_device_id = Some("previous-device".into());
+            metadata.pending_push_cleanup_epoch = push_pending.then_some(previous_auth.auth_epoch);
+            if let Some(terminal) = terminal_transition {
+                metadata
+                    .transition_authorities
+                    .push(previous_android_transition(
+                        identity,
+                        &metadata.family,
+                        terminal,
+                    ));
+            }
+            auth.save(&previous_auth).unwrap();
+        }
+
+        if login_interrupted {
+            previous_auth.auth_epoch += 1;
+            previous_auth.logout_state = LogoutState::Active;
+            let metadata = previous_auth.broker.as_mut().unwrap();
+            metadata.next_attempt += 1;
+            metadata.pending_login_account = Some("synthetic".into());
+            metadata.authentication_outcome_unknown = true;
+            metadata.pending_request = Some(BrokerRequestV1 {
+                refresh: None,
+                kind: BrokerRequestKind::Login,
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                attempt: metadata.next_attempt,
+                auth_epoch: previous_auth.auth_epoch,
+                source_identity: previous_auth.confirmed_identity.clone(),
+                source_device_id: metadata.confirmed_device_id.clone(),
+                prior_login_outcome_unknown: false,
+                resume: None,
+            });
+            auth.save(&previous_auth).unwrap();
+        }
+
+        install_manifest_platform(resources.path(), "0.3.15", true, "android", "aarch64");
+        let paths = RuntimePaths::new(data.path(), RuntimeSlot::Latest, "0.3.15").unwrap();
+        if terminal_transition == Some(false) {
+            assert!(open()
+                .unwrap()
+                .coordinator()
+                .before_tunnel_start()
+                .await
+                .is_err());
+            assert_eq!(auth.load().unwrap().unwrap(), previous_auth);
+            continue;
+        }
+        if confirmed_logout && !push_pending && terminal_transition.is_none() {
+            // Simulate an interrupted upgrade with unresolved Logout in the old namespace.
+            let old = RuntimePaths::new(data.path(), RuntimeSlot::Latest, "0.3.14").unwrap();
+            let intent = old
+                .operational_state
+                .with_file_name("logout-intent-v1.json");
+            std::fs::create_dir_all(intent.parent().unwrap()).unwrap();
+            std::fs::write(&intent, b"unresolved logout").unwrap();
+            let blocked = open().unwrap();
+            assert!(blocked.coordinator().before_tunnel_start().await.is_err());
+            let quarantined =
+                ProtectedRuntimeStore::new(records.record(paths.namespace()), paths.clone());
+            assert!(quarantined.load().unwrap().unwrap().cleanup_only);
+            drop(blocked);
+            assert_eq!(std::fs::read(&intent).unwrap(), b"unresolved logout");
+            std::fs::remove_file(intent).unwrap();
+
+            *records.fail_once.lock().unwrap() = Some(paths.namespace().into());
+            assert!(open().is_err());
+            assert!(quarantined.load().unwrap().unwrap().cleanup_only);
+        }
+
+        for _ in 0..2 {
+            let host = open().unwrap();
+            let expected = if login_interrupted {
+                BrokerAuthState::AuthenticationOutcomeUnknown
+            } else {
+                BrokerAuthState::LoggedOut
+            };
+            assert_eq!(host.broker().auth_state().await.unwrap(), expected);
+            host.coordinator().before_tunnel_start().await.unwrap();
+            assert_eq!(auth.load().unwrap().unwrap(), previous_auth);
+        }
+        let host = open().unwrap();
+        let view = host.selection().await.unwrap();
+        assert_eq!(view.target.container_version, "0.3.15");
+        let runtime = RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
+            records.record(paths.namespace()),
+            paths,
+        ));
+        let child = Arc::new(ChildAdmission::new(
+            view.incarnation.clone(),
+            Arc::new(RuntimeWriterGates::default()),
+            Arc::new(RuntimeRecordInventory::new(runtime, vec![])),
+        ));
+        let (parent, socket) = private_socketpair().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        host.attach_android(
+            parent,
+            std::process::id(),
+            uid,
+            uid,
+            &RuntimeAttachRequest {
+                target: view.target,
+                session_generation: view.session_generation,
+                incarnation: view.incarnation,
+            },
+        )
+        .await
+        .unwrap();
+        let client = PrivateRuntimeAuthClient::new(socket, child, Arc::new(NoNativeWork));
+        assert!(matches!(
+            client.owner_request(HostRequestV1::RuntimeReady).await,
+            Ok(HostResponseV1::Done)
+        ));
+        assert!(client.access(None).await.is_err());
+        assert!(client.check_start_barrier().is_err());
+        if login_interrupted {
+            assert!(client
+                .login(nelomai_client_api::RuntimeLogin {
+                    login: "another-account".into(),
+                    password: "synthetic".into(),
+                    device_name: "fixture".into(),
+                })
+                .await
+                .is_err());
+            assert_eq!(auth.load().unwrap().unwrap(), previous_auth);
+        }
+        let access = client
+            .login(nelomai_client_api::RuntimeLogin {
+                login: "synthetic".into(),
+                password: "synthetic".into(),
+                device_name: "fixture".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(access.identity().session_generation, Some(8));
+        client.check_start_barrier().unwrap();
+    }
+    server.abort();
+}
+
+#[cfg(unix)]
+fn previous_android_transition(
+    identity: nelomai_contracts::RuntimeIdentity,
+    family: &str,
+    terminal: bool,
+) -> nelomai_client_storage::TransitionAuthorityV1 {
+    use nelomai_client_storage::*;
+    let reconcile_id = uuid::Uuid::new_v4().to_string();
+    let resume_id = uuid::Uuid::new_v4().to_string();
+    let target = nelomai_contracts::RuntimeIdentity {
+        session_generation: None,
+        ..identity.clone()
+    };
+    let source = nelomai_contracts::RuntimeIdentity {
+        session_generation: Some(6),
+        runtime_version: "0.3.13".into(),
+        container_version: "0.3.13".into(),
+        ..identity.clone()
+    };
+    TransitionAuthorityV1 {
+        schema_version: 1,
+        reconcile_operation_id: reconcile_id.clone(),
+        request_fingerprint: "a".repeat(64),
+        source_auth_epoch: 1,
+        source_family: family.into(),
+        source_identity: Some(source.clone()),
+        source_device_id: "previous-device".into(),
+        source_scope_fingerprint: "b".repeat(64),
+        expected_session_generation: Some(6),
+        target_identity: target.clone(),
+        cleanup_contract_version: 1,
+        cleanup_access_proof: "old-test-access".into(),
+        resume_refresh_proof: "old-test-refresh".into(),
+        legacy_refresh_completed: false,
+        superseded_by: None,
+        dispatch_state: if terminal {
+            TransitionDispatchStateV1::ResponseKnown
+        } else {
+            TransitionDispatchStateV1::OutcomeUnknown
+        },
+        reconcile_receipt: terminal.then(|| TransitionReconcileReceiptV1 {
+            state: "clean".into(),
+            operation_id: reconcile_id.clone(),
+            retired_lease_ids: Vec::new(),
+            retired_session_ids: Vec::new(),
+            retired_operation_ids: Vec::new(),
+            retry_after_seconds: None,
+        }),
+        resume_ticket: terminal.then(|| BrokerRequestV1 {
+            refresh: None,
+            kind: BrokerRequestKind::Resume,
+            operation_id: resume_id.clone(),
+            attempt: 1,
+            auth_epoch: 1,
+            source_identity: Some(source),
+            source_device_id: Some("previous-device".into()),
+            prior_login_outcome_unknown: false,
+            resume: Some(StoredResumeArgumentsV1 {
+                reconcile_operation_id: reconcile_id.clone(),
+                decision: "apply".into(),
+                target: target.clone(),
+                expected_session_generation: Some(6),
+            }),
+        }),
+        resume_evidence: terminal.then(|| TransitionResumeEvidenceV1 {
+            operation_id: resume_id,
+            reconcile_operation_id: reconcile_id,
+            decision: "apply".into(),
+            target_identity: target,
+            identity,
+            access_token: "old-test-resumed-access".into(),
+            token_type: "Bearer".into(),
+            access_expires_in: 900,
+        }),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn common_owner_is_ready_without_loading_product_runtime_and_rejects_foreign_uid() {
     use nelomai_client_container::host::{CommonHost, HostNativePorts, RuntimeAttachRequest};
     let data = tempfile::tempdir().unwrap();

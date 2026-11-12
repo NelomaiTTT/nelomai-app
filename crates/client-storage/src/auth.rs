@@ -64,6 +64,30 @@ pub struct BrokerMetadataV1 {
     pub transition_authorities: Vec<TransitionAuthorityV1>,
 }
 
+impl BrokerMetadataV1 {
+    pub fn terminal_transition_operations(&self) -> HashSet<&str> {
+        let mut terminal: HashSet<&str> = self
+            .transition_authorities
+            .iter()
+            .filter(|entry| entry.resume_evidence.is_some())
+            .map(|entry| entry.reconcile_operation_id.as_str())
+            .collect();
+        // Supersession is terminal only when the chain reaches a known resume.
+        for _ in 0..self.transition_authorities.len() {
+            for entry in &self.transition_authorities {
+                if entry
+                    .superseded_by
+                    .as_deref()
+                    .is_some_and(|id| terminal.contains(id))
+                {
+                    terminal.insert(&entry.reconcile_operation_id);
+                }
+            }
+        }
+        terminal
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionDispatchStateV1 {
@@ -342,6 +366,84 @@ impl fmt::Debug for AuthStoreV1 {
 }
 
 impl AuthStoreV1 {
+    fn has_no_runtime_auth(&self) -> bool {
+        self.access_token.is_none()
+            && self.refresh_token.is_none()
+            && self.pending_resume.is_none()
+            && self.completed_runtime_logout.is_none()
+            && self.pending_runtime_supersede.is_none()
+    }
+
+    fn has_no_auth_recovery(&self) -> bool {
+        self.has_no_runtime_auth()
+            && self.broker.as_ref().is_none_or(|meta| {
+                meta.pending_request.is_none()
+                    && meta.completed_resume.is_none()
+                    && meta.pending_logout.is_none()
+                    && meta.pending_recovery.is_none()
+                    && meta.cancelled_login.is_none()
+                    && !meta.authentication_outcome_unknown
+                    && meta.pending_login_account.is_none()
+            })
+    }
+
+    pub fn is_pristine(&self) -> bool {
+        self.auth_epoch == 0
+            && self.session_generation.is_none()
+            && self.confirmed_identity.is_none()
+            && self.broker.as_ref().is_none_or(|meta| {
+                meta.next_attempt == 0
+                    && meta.confirmed_device_id.is_none()
+                    && meta.pending_push_cleanup_epoch.is_none()
+                    && meta.transition_authorities.is_empty()
+            })
+            && self.has_no_auth_recovery()
+    }
+
+    fn has_only_retired_transitions(&self, meta: &BrokerMetadataV1) -> bool {
+        meta.transition_authorities
+            .iter()
+            .all(|entry| entry.source_auth_epoch < self.auth_epoch)
+            && meta.terminal_transition_operations().len() == meta.transition_authorities.len()
+    }
+
+    fn has_recoverable_login(&self) -> bool {
+        // Keep the original account fence, including after a confirmed Logout
+        // that retained historical identity but revoked all live credentials.
+        self.has_no_runtime_auth()
+            && self.broker.as_ref().is_some_and(|meta| {
+                meta.pending_login_account.is_some()
+                    && meta.completed_resume.is_none()
+                    && meta.pending_logout.is_none()
+                    && meta.pending_recovery.is_none()
+                    && meta.cancelled_login.is_none()
+                    && self.has_only_retired_transitions(meta)
+                    && meta.pending_request.as_ref().is_some_and(|request| {
+                        request.kind == BrokerRequestKind::Login
+                            && request.attempt == meta.next_attempt
+                            && request.auth_epoch == self.auth_epoch
+                            && request.source_identity == self.confirmed_identity
+                            && request.source_device_id == meta.confirmed_device_id
+                    })
+            })
+    }
+
+    pub(crate) fn is_signed_out_without_cleanup(&self) -> bool {
+        match self.logout_state {
+            LogoutState::Active => self.is_pristine() || self.has_recoverable_login(),
+            LogoutState::Pending => false,
+            // Push delivery cleanup has its own replay after RuntimeReady.
+            // Completed transition evidence remains available for exact replay.
+            LogoutState::LoggedOut => {
+                self.has_no_auth_recovery()
+                    && self
+                        .broker
+                        .as_ref()
+                        .is_none_or(|meta| self.has_only_retired_transitions(meta))
+            }
+        }
+    }
+
     pub fn validate_transition_write_budget(&self) -> Result<(), StorageError> {
         if encode_record(self, "auth-v1")?.len() > MAX_AUTH_RECORD_WITH_TRANSITION_BYTES {
             return Err(StorageError::RecoveryRequired(

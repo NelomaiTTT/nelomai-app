@@ -1612,24 +1612,7 @@ impl AuthBroker {
             return Ok(());
         }
         let authorities = &meta.transition_authorities;
-        let mut terminal: std::collections::HashSet<&str> = authorities
-            .iter()
-            .filter(|entry| entry.resume_evidence.is_some())
-            .map(|entry| entry.reconcile_operation_id.as_str())
-            .collect();
-        // A superseded predecessor is terminal only if its successor chain has
-        // a known resume result. Cycles/unknown outcomes are never evicted.
-        for _ in 0..authorities.len() {
-            for entry in authorities {
-                if entry
-                    .superseded_by
-                    .as_deref()
-                    .is_some_and(|id| terminal.contains(id))
-                {
-                    terminal.insert(&entry.reconcile_operation_id);
-                }
-            }
-        }
+        let terminal = meta.terminal_transition_operations();
         let completed_reconcile = meta
             .completed_resume
             .as_ref()
@@ -2019,7 +2002,7 @@ impl AuthBroker {
         Ok(match auth.logout_state {
             LogoutState::Pending => BrokerAuthState::LogoutPending,
             LogoutState::LoggedOut => BrokerAuthState::LoggedOut,
-            LogoutState::Active if Self::is_pristine_auth(auth, meta) => BrokerAuthState::LoggedOut,
+            LogoutState::Active if auth.is_pristine() => BrokerAuthState::LoggedOut,
             // A persisted password attempt has an unknown outcome until commit,
             // including when its caller future was dropped in this process.
             LogoutState::Active
@@ -2040,28 +2023,6 @@ impl AuthBroker {
             }
             LogoutState::Active => BrokerAuthState::Active,
         })
-    }
-
-    fn is_pristine_auth(auth: &AuthStoreV1, meta: &BrokerMetadataV1) -> bool {
-        auth.auth_epoch == 0
-            && auth.access_token.is_none()
-            && auth.refresh_token.is_none()
-            && auth.session_generation.is_none()
-            && auth.confirmed_identity.is_none()
-            && auth.pending_resume.is_none()
-            && auth.completed_runtime_logout.is_none()
-            && auth.pending_runtime_supersede.is_none()
-            && meta.next_attempt == 0
-            && meta.pending_request.is_none()
-            && meta.completed_resume.is_none()
-            && meta.pending_logout.is_none()
-            && meta.pending_recovery.is_none()
-            && meta.cancelled_login.is_none()
-            && !meta.authentication_outcome_unknown
-            && meta.pending_login_account.is_none()
-            && meta.confirmed_device_id.is_none()
-            && meta.pending_push_cleanup_epoch.is_none()
-            && meta.transition_authorities.is_empty()
     }
 
     /// Container-only password ingress. Install identity is read from protected

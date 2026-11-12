@@ -86,6 +86,13 @@ fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
 }
 
 fn manifest_for(version: &str) -> nelomai_contracts::VerifiedContainerManifest {
+    manifest_for_platform(version, None)
+}
+
+fn manifest_for_platform(
+    version: &str,
+    platform_arch: Option<(&str, &str)>,
+) -> nelomai_contracts::VerifiedContainerManifest {
     let mut value: serde_json::Value = serde_json::from_str(include_str!(
         "../../../contracts/fixtures/runtime/container-manifest-v1.json"
     ))
@@ -93,6 +100,12 @@ fn manifest_for(version: &str) -> nelomai_contracts::VerifiedContainerManifest {
     value["container_version"] = version.into();
     value["release_set_id"] = format!("runtime-{version}").into();
     value["slots"][0]["manifest"]["runtime_version"] = version.into();
+    if let Some((platform, arch)) = platform_arch {
+        for slot in value["slots"].as_array_mut().unwrap() {
+            slot["manifest"]["platform"] = platform.into();
+            slot["manifest"]["architecture"] = arch.into();
+        }
+    }
     let bytes = serde_json::to_vec(&value).unwrap();
     let key = SigningKey::from_bytes(&[83; 32]);
     let mut message = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
@@ -306,6 +319,59 @@ fn completed_legacy_anchor_is_retained_when_a_later_runtime_namespace_is_created
         assert_eq!(updated.retained[0].load().unwrap(), Some(runtime));
         assert!(updated.runtime.load().unwrap().unwrap().cleanup_only);
     }
+}
+
+#[test]
+fn signed_out_android_upgrade_accepts_a_completed_legacy_anchor() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    let mut legacy = StoredAuth::new_install();
+    legacy.access_token = Some("synthetic-access".into());
+    legacy.refresh_token = Some("synthetic-refresh".into());
+    records.legacy.save(&legacy).unwrap();
+    let android = Some(("android", "aarch64"));
+    let old_manifest = manifest_for_platform("0.3.14", android);
+    let old = prepare_runtime_storage(&lock, &old_manifest, RuntimeSlot::Latest, &records).unwrap();
+    let mut auth = old.auth.load().unwrap().unwrap();
+    auth.session_generation = Some(1);
+    auth.confirmed_identity = Some(old_manifest.identity(RuntimeSlot::Latest, Some(1)).unwrap());
+    old.auth.save(&auth).unwrap();
+    let mut runtime = old.runtime.load().unwrap().unwrap();
+    runtime.complete_legacy_cleanup();
+    old.runtime.save(&runtime).unwrap();
+    let journal = FileMigrationJournal::new(root.path().join("common/auth-migration-v1.json"));
+    assert_eq!(
+        acknowledge_migration_bootstrap(
+            &LegacyMigrationSource::new(records.legacy(), &FileSplitTunnelStore::new(root.path())),
+            &old.auth,
+            &old.runtime,
+            &journal,
+        )
+        .unwrap(),
+        MigrationOutcome::Complete
+    );
+
+    auth.auth_epoch += 1;
+    auth.logout_state = LogoutState::LoggedOut;
+    auth.access_token = None;
+    auth.refresh_token = None;
+    old.auth.save(&auth).unwrap();
+
+    let updated = prepare_runtime_storage(
+        &lock,
+        &manifest_for_platform("0.3.15", android),
+        RuntimeSlot::Latest,
+        &records,
+    )
+    .unwrap();
+    assert!(updated.can_admit_signed_out_android);
+    assert_eq!(updated.auth.load().unwrap(), Some(auth));
+    assert_eq!(updated.retained[0].load().unwrap(), Some(runtime));
+    assert_eq!(
+        journal.load().unwrap().unwrap().phase,
+        MigrationPhase::Complete
+    );
 }
 
 #[test]

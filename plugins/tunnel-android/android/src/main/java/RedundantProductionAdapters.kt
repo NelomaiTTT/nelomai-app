@@ -540,11 +540,14 @@ internal class ServiceRedundantConnectionNative(
         } else clearStandbyCheckLocked()
         val activeConfirmed = activeHardFailure || (active?.urgentEvidence == true &&
             active.urgentCorroboratedFailures >= REQUIRED_URGENT_FAILURES)
+        // An established session can retry a failed reserve probe in the same check window.
+        val retryFailedStandbyProbe = !initialReadiness
         slots.values.filter { it.slot != activeSlot }.forEach { runtime ->
             val metrics = metricsBySlot.getValue(runtime.slot.index)
             advanceProbeLocked(nativeSession, runtime, elapsedNow,
                 metrics.txPackets, metrics.rxPackets, metrics.sendErrors,
                 holdCompletedStandby = activeConfirmed || initialColdFallback || startupSwitchNeedsProof,
+                retryFailedStandbyProbe = retryFailedStandbyProbe,
                 initialWarmup = initialWarmup)
         }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
@@ -578,7 +581,7 @@ internal class ServiceRedundantConnectionNative(
                 // evidence. The next tick starts the confirmed member's fresh check.
                 standbyProbeState = if (initialReadiness && runtime.slot != activeSlot &&
                     runtime.leaseId != committedStandbyLeaseId
-                ) StandbyProbeState.PENDING else standbyProbeStateLocked(runtime, elapsedNow),
+                ) StandbyProbeState.PENDING else standbyProbeStateLocked(runtime, elapsedNow, retryFailedStandbyProbe),
                 successfulProbeValidThroughElapsedMs = if (runtime.consecutiveProbeSuccesses > 0) {
                     probeResultValidThroughElapsedMs(runtime, elapsedNow)
                 } else null,
@@ -681,6 +684,7 @@ internal class ServiceRedundantConnectionNative(
         currentRxPackets: Long,
         currentSendErrors: Long,
         holdCompletedStandby: Boolean = false,
+        retryFailedStandbyProbe: Boolean = false,
         initialWarmup: Boolean = false,
     ) {
         if (!networkAvailable) return
@@ -695,7 +699,9 @@ internal class ServiceRedundantConnectionNative(
             clearUrgentFailureLocked(runtime)
         }
         val urgentRxPacketsAtStart = runtime.urgentRxPacketsAtStart
-        if (runtime.urgentEvidence && urgentRxPacketsAtStart != null &&
+        // The reserve's own DNS reply advances the native receive counter.
+        // During a reserve check only its probe status can prove that reply.
+        if (checkStarted == null && runtime.urgentEvidence && urgentRxPacketsAtStart != null &&
             currentRxPackets > urgentRxPacketsAtStart
         ) {
             cancelProbeLocked(runtime)
@@ -750,6 +756,7 @@ internal class ServiceRedundantConnectionNative(
             if (runtime.probeToken != null) return
         }
         if (checkStarted != null && holdCompletedStandby &&
+            (!retryFailedStandbyProbe || !runtime.probeFailed) &&
             runtime.lastCompletedProbeStartedAtMs >= checkStarted &&
             recentProbeResult(runtime, elapsedNow)
         ) return
@@ -873,14 +880,18 @@ internal class ServiceRedundantConnectionNative(
         standbyCheckFirstProbeAtMs = null
     }
 
-    private fun standbyProbeStateLocked(runtime: SlotRuntime, elapsedNow: Long): StandbyProbeState {
+    private fun standbyProbeStateLocked(
+        runtime: SlotRuntime,
+        elapsedNow: Long,
+        retryFailedStandbyProbe: Boolean,
+    ): StandbyProbeState {
         val since = standbyCheckStartedAtMs?.takeIf { runtime.slot != activeSlot }
             ?: return StandbyProbeState.NOT_REQUIRED
         if (standbyCheckExpired(elapsedNow)) return StandbyProbeState.FAILED
         if (runtime.probe == null || runtime.hardFailure) return StandbyProbeState.FAILED
         if (runtime.probeToken != null) return StandbyProbeState.PENDING
         if (runtime.lastCompletedProbeStartedAtMs >= since && runtime.probeFailed) {
-            return StandbyProbeState.FAILED
+            return if (retryFailedStandbyProbe) StandbyProbeState.PENDING else StandbyProbeState.FAILED
         }
         return if (runtime.lastCompletedProbeStartedAtMs >= since &&
             runtime.consecutiveProbeSuccesses > 0 && recentProbeResult(runtime, elapsedNow)

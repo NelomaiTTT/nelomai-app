@@ -772,14 +772,6 @@ impl CommonHost {
             architecture,
             create_records,
         )?;
-        let requires_transition = matches!(
-            selection.recovery(),
-            Some(SelectionRecovery::ContainerVersionChanged)
-        ) || storage
-            .runtime
-            .load()
-            .map_err(BrokerError::from)?
-            .is_some_and(|state| state.cleanup_only);
         if let Some(native_storage) = &native.storage {
             // Native migration adapters are runtime classes too. Verify their
             // selected payload before a JNI callback can load any such class.
@@ -849,8 +841,31 @@ impl CommonHost {
         let mut coordinator = SwitchCoordinator::open(owner.clone(), selection.manifest().clone())
             .map_err(|_| HostError::RecoveryRequired)?
             .attach(broker.clone(), bridge.clone());
+        let runtime = storage.runtime.load().map_err(BrokerError::from)?;
+        let requires_transition = matches!(
+            selection.recovery(),
+            Some(SelectionRecovery::ContainerVersionChanged)
+        ) || runtime.as_ref().is_some_and(|state| state.cleanup_only);
         if requires_transition {
-            coordinator = coordinator.require_initial_transition(selection.state().selected_slot);
+            if storage.can_admit_signed_out_android
+                && !crate::update_barrier_pending(&owner)
+                    .map_err(|_| HostError::RecoveryRequired)?
+                && coordinator
+                    .snapshot()
+                    .map_err(|_| HostError::RecoveryRequired)?
+                    .is_none_or(|journal| journal.phase() == crate::SwitchPhase::Complete)
+            {
+                // No account or tunnel to reconcile. Admit the empty local
+                // record while the owner is exclusive, before publishing IPC.
+                let mut state = runtime.ok_or(HostError::RecoveryRequired)?;
+                if state.cleanup_only {
+                    state.cleanup_only = false;
+                    storage.runtime.save(&state).map_err(BrokerError::from)?;
+                }
+            } else {
+                coordinator =
+                    coordinator.require_initial_transition(selection.state().selected_slot);
+            }
         }
         let coordinator = Arc::new(coordinator);
         crate::startup_diagnostics::stage("host.updater");

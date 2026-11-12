@@ -139,6 +139,13 @@ private data class ActivatedStartupStandbyCheck(
     val deadlineElapsedMs: Long,
 )
 
+private data class PendingStandbyActivation(
+    val startOperationId: String,
+    val leaseId: String,
+    val deadlineElapsedMs: Long,
+    var activated: Boolean = false,
+)
+
 private data class PendingPrimaryReadiness(
     val activeLeaseId: String,
     val activeIndex: Int,
@@ -279,6 +286,7 @@ internal class RedundantConnectionCoordinator(
     @Volatile private var failoverActive = false
     private var totalLossCommandEmitted = false
     private var pendingPrimaryReadiness: PendingPrimaryReadiness? = null
+    private var pendingStandbyActivation: PendingStandbyActivation? = null
     private var primaryReadinessFailed = false
     private var recoveryRetryAtUnix: Long? = null
     private var recoveryRetryAttempt = 0
@@ -299,6 +307,7 @@ internal class RedundantConnectionCoordinator(
         standbyWorkPending = true
         val epoch = standbyWorkEpoch
         var completed: Boolean? = null
+        var submitted = false
         try {
             standbyExecutor.execute {
                 val response = runCatching(request)
@@ -328,14 +337,23 @@ internal class RedundantConnectionCoordinator(
                         response.getOrNull()?.let(dispose)
                         standbyWorkPending = false
                     }
+                    if (submitted && completed == true && recoveryStarted && pendingPrimaryReadiness == null &&
+                        transaction.candidateLeaseId != null && status()?.candidateLeaseId == null
+                    ) {
+                        // A reply can arrive after the last tick observed a pending
+                        // probe. Recheck now under the owner gate after membership commits.
+                        val observations = runCatching { native.healthObservations() }.getOrNull()
+                        if (!observations.isNullOrEmpty()) onHealthObservations(observations)
+                    }
                 }
             }
+            submitted = true
         } catch (error: java.util.concurrent.RejectedExecutionException) {
             standbyWorkPending = false
             return false
         }
         // Direct executors make the same transition deterministic in unit tests.
-        // Production returns immediately; the next health tick sees its result.
+        // Production returns immediately; async failover rechecks on commit.
         return completed ?: true
     }
 
@@ -670,7 +688,12 @@ internal class RedundantConnectionCoordinator(
                     revoke()
                     return@synchronized false
                 }
-                val refreshed = transaction.withRecoveredCanonical(response.session)
+                var refreshed = transaction.withRecoveredCanonical(response.session)
+                if (refreshed.retry.pendingNativeRequiresProbe) {
+                    // The live check cannot survive native process death. Rebuild
+                    // the source and reserve through ordinary startup readiness.
+                    refreshed = refreshed.copy(retry = refreshed.retry.clearPendingNativeSwitch())
+                }
                 // Startup proof is process-local. Rebuild the source and reserve
                 // and let the readiness tick resolve their durable switch.
                 val replayStartupSwitch = refreshed.retry.pendingNativeSwitchReason == STARTUP_SWITCH_REASON
@@ -1263,6 +1286,11 @@ internal class RedundantConnectionCoordinator(
         val decision = healthMonitor.evaluateHealth(elapsedNow(), bounded)
         val switchIndex = decision.switchTo
         if (switchIndex != null) {
+            val standby = bounded.single { it.index == switchIndex }
+            val checkDeadline = standby.standbyCheckDeadlineElapsedMs
+            if (checkDeadline != null && !standbyHasFailoverProof(standby, checkDeadline)) {
+                return@synchronized true
+            }
             val candidate = transaction.candidateLeaseId
             val candidateIndex = transaction.candidateSlot?.let {
                 if (it == RedundantSlot.A) 0 else 1
@@ -1272,7 +1300,10 @@ internal class RedundantConnectionCoordinator(
                 // identity before switching; never activate the stale canonical lease.
                 val committed = advanceCandidateLocked(transaction, bounded, forFailover = true)
                 val current = status() ?: return@synchronized false
-                if (current.candidateLeaseId != null && standbyWorkPending) return@synchronized true
+                if (current.candidateLeaseId != null &&
+                    (committed || standbyWorkPending ||
+                        (checkDeadline != null && !standbyHasFailoverProof(standby, checkDeadline)))
+                ) return@synchronized true
                 if (!committed || current.candidateLeaseId != null ||
                     current.leaseIdAt(switchIndex) != candidate
                 ) {
@@ -1281,6 +1312,7 @@ internal class RedundantConnectionCoordinator(
                 }
                 return@synchronized switchActiveLocked(
                     current, candidate, requireNotNull(current.localActiveLeaseId), HEALTH_FAILOVER_REASON,
+                    healthStandby = standby,
                 )
             }
             val target = transaction.leaseIdAt(switchIndex) ?: return@synchronized false
@@ -1291,6 +1323,7 @@ internal class RedundantConnectionCoordinator(
                 target = target,
                 failed = failed,
                 reason = HEALTH_FAILOVER_REASON,
+                healthStandby = standby,
             )
         }
         if (decision.sessionStalled) {
@@ -1366,9 +1399,9 @@ internal class RedundantConnectionCoordinator(
         if (primaryReadinessFailed) return@synchronized false
         if (recoveryRetryAtUnix != null) return@synchronized recover()
         if (transaction.retry.hasPendingNativeSwitch()) {
-            if (transaction.retry.pendingNativeSwitchReason == STARTUP_SWITCH_REASON) {
-                return@synchronized recover()
-            }
+            if (transaction.retry.pendingNativeSwitchReason == STARTUP_SWITCH_REASON ||
+                (transaction.retry.pendingNativeRequiresProbe && pendingStandbyActivation == null)
+            ) return@synchronized recover()
             return@synchronized drainPendingNativeSwitchLocked(transaction)
         }
         val observations = try {
@@ -1785,6 +1818,10 @@ internal class RedundantConnectionCoordinator(
             ))
         }
         val candidateIndex = if (candidateSlot == RedundantSlot.A) 0 else 1
+        val candidateObservation = observations?.singleOrNull { it.index == candidateIndex }
+        val freshForFailover = forFailover && candidateObservation?.standbyCheckDeadlineElapsedMs?.let {
+            standbyHasFailoverProof(candidateObservation, it)
+        } == true
         // Reusing a CURRENT member does not change membership. Fresh health from
         // this process's successful restart is enough for emergency local failover;
         // an unavailable commit endpoint must not turn it into total loss.
@@ -1793,11 +1830,10 @@ internal class RedundantConnectionCoordinator(
             candidateLeaseId != transaction.localActiveLeaseId &&
             transaction.slotIndex(candidateLeaseId) == candidateIndex &&
             candidateWarmupLeaseId == candidateLeaseId &&
-            observations?.singleOrNull { it.index == candidateIndex }?.let {
-                healthMonitor.ready(elapsedNow(), it)
-            } == true
+            candidateObservation != null &&
+            (freshForFailover || healthMonitor.ready(elapsedNow(), candidateObservation))
         ) {
-            return completeCandidateReadinessLocked(transaction, transaction, observations)
+            return completeCandidateReadinessLocked(transaction, transaction, requireNotNull(observations))
         }
         val dueAtUnix = transaction.retry.nextRetryAtUnix
         if (dueAtUnix != null && currentUnixSeconds() < dueAtUnix) {
@@ -1894,7 +1930,7 @@ internal class RedundantConnectionCoordinator(
         }
         val snapshot = observations ?: runCatching { native.healthObservations() }.getOrNull()
         val observation = snapshot?.singleOrNull { it.index == candidateIndex } ?: return true
-        if (!healthMonitor.ready(elapsedNow(), observation)) return true
+        if (!freshForFailover && !healthMonitor.ready(elapsedNow(), observation)) return true
         return standbyWorkLocked(
             transaction,
             forFailover = forFailover,
@@ -2150,22 +2186,35 @@ internal class RedundantConnectionCoordinator(
             result.value.redundantTransaction == transaction
     }
 
+    private fun standbyHasFailoverProof(observation: SlotObservation, deadline: Long): Boolean {
+        val now = elapsedNow()
+        return now < deadline && healthMonitor.networkReady(now) &&
+            observation.standbyCheckDeadlineElapsedMs == deadline &&
+            observation.standbyProbeState == StandbyProbeState.SUCCEEDED &&
+            observation.hasFreshSuccessfulProbe(now) &&
+            healthMonitor.usableCandidate(now, observation)
+    }
+
     private fun switchActiveLocked(
         transaction: AndroidRedundantTransaction,
         target: String,
         failed: String,
         reason: String,
         startupStandby: SlotObservation? = null,
+        healthStandby: SlotObservation? = null,
     ): Boolean {
         if (transaction.retry.hasPendingNativeSwitch()) {
             return drainPendingNativeSwitchLocked(transaction, startupStandby)
         }
         val targetSlot = transaction.slot(target) ?: return false
         val startup = pendingPrimaryReadiness
-        // Cancel only a scheduled repair of the proven current reserve, in the
-        // same write as its switch intent. A staged candidate still blocks it.
-        val retry = if (startup != null && transaction.candidateLeaseId == null &&
-            transaction.retry.acquirePending && transaction.retry.acquireReplaceLeaseId == target
+        val checkDeadline = healthStandby?.standbyCheckDeadlineElapsedMs
+        // Acquire does not change CURRENT membership. Promote the proven
+        // current reserve and fence the late response with this journal write.
+        // The panel expires an unused candidate; a locally staged one still needs commit.
+        val retry = if ((startup != null || checkDeadline != null) &&
+            transaction.candidateLeaseId == null && transaction.retry.acquirePending &&
+            transaction.retry.acquireReplaceLeaseId == target
         ) transaction.retry.cancelAcquire() else transaction.retry
         if (transaction.localActiveLeaseId != failed || target == failed ||
             !transaction.containsCurrentLease(target) ||
@@ -2181,19 +2230,27 @@ internal class RedundantConnectionCoordinator(
                 pendingNativeMembershipGeneration = transaction.membershipGeneration,
                 pendingNativeSwitchReason = reason,
                 pendingNativeSwitchAttempt = 0,
+                pendingNativeRequiresProbe = checkDeadline != null,
             ),
         )
+        // A failed synchronous write may still publish its value in memory.
+        pendingStandbyActivation = checkDeadline?.let {
+            PendingStandbyActivation(pending.startOperationId, target, it)
+        }
         if (!persistExactTransaction(transaction, pending) {
-                startup == null || startupSwitchHasProof(startup, startupStandby, firstActivation = true)
+                (startup == null || startupSwitchHasProof(startup, startupStandby, firstActivation = true)) &&
+                    (checkDeadline == null || standbyHasFailoverProof(requireNotNull(healthStandby), checkDeadline))
             }
         ) return false
-        return drainPendingNativeSwitchLocked(pending, startupStandby, firstActivation = true)
+        return drainPendingNativeSwitchLocked(pending, startupStandby, firstActivation = true,
+            healthStandby = healthStandby)
     }
 
     private fun drainPendingNativeSwitchLocked(
         pending: AndroidRedundantTransaction,
         startupStandby: SlotObservation? = null,
         firstActivation: Boolean = false,
+        healthStandby: SlotObservation? = null,
     ): Boolean {
         val retry = pending.retry
         val source = retry.pendingNativeSourceLeaseId ?: return true
@@ -2216,7 +2273,24 @@ internal class RedundantConnectionCoordinator(
         if (startup != null && (attempts >= MAX_PENDING_NATIVE_SWITCH_ATTEMPTS ||
                 !startupSwitchHasProof(startup, startupStandby, firstActivation))
         ) return false
-        val activated = mutateNative(pending) {
+        val healthActivation = pendingStandbyActivation?.takeIf {
+            it.startOperationId == pending.startOperationId && it.leaseId == target
+        }
+        if (retry.pendingNativeRequiresProbe && healthActivation == null) return false
+        val healthProof = if (healthActivation != null && !healthActivation.activated) {
+            healthStandby ?: runCatching { native.healthObservations() }.getOrNull()?.singleOrNull {
+                it.index == pending.slotIndex(target)
+            }
+        } else null
+        if (healthActivation != null && !healthActivation.activated &&
+            (healthProof == null || !standbyHasFailoverProof(healthProof, healthActivation.deadlineElapsedMs))
+        ) {
+            if (elapsedNow() >= healthActivation.deadlineElapsedMs &&
+                persistPendingNativeSwitchExact(pending, pending.copy(retry = retry.clearPendingNativeSwitch()))
+            ) pendingStandbyActivation = null
+            return false
+        }
+        val activated = healthActivation?.activated == true || mutateNative(pending) {
             runCatching { native.activate(target) }.getOrDefault(false)
         }
         if (!activated) {
@@ -2234,8 +2308,12 @@ internal class RedundantConnectionCoordinator(
                 )
                 return false
             }
-            return resolveFailedPendingNativeSwitchLocked(pending)
+            return resolveFailedPendingNativeSwitchLocked(pending).also {
+                if (status()?.retry?.hasPendingNativeSwitch() == false) pendingStandbyActivation = null
+            }
         }
+        // A completed native activation needs only its durable role update on retry.
+        healthActivation?.activated = true
         // Activation clears the native standby window even if journal I/O fails.
         // Keep the original window attached to this proof until a new probe succeeds.
         if (startup != null && startupStandby != null) {
@@ -2266,6 +2344,7 @@ internal class RedundantConnectionCoordinator(
                 accepted
             }
         ) return false
+        pendingStandbyActivation = null
         failoverActive = true
         publishReserveStateLocked(committed, emptyList())
         onDiagnosticEvent(RedundantDiagnosticEvent.FAILOVER)
@@ -2505,15 +2584,6 @@ private fun AndroidRedundantRetryState.cancelAcquire(): AndroidRedundantRetrySta
 private fun AndroidRedundantRetryState.hasPendingNativeSwitch(): Boolean =
     pendingNativeActiveLeaseId != null
 
-private fun AndroidRedundantRetryState.clearPendingNativeSwitch(): AndroidRedundantRetryState = copy(
-    pendingNativeSourceLeaseId = null,
-    pendingNativeActiveLeaseId = null,
-    pendingNativeActiveSlot = null,
-    pendingNativeMembershipGeneration = null,
-    pendingNativeSwitchReason = null,
-    pendingNativeSwitchAttempt = 0,
-)
-
 private fun AndroidRedundantTransaction.samePendingNativeSwitch(
     other: AndroidRedundantTransaction,
 ): Boolean = startOperationId == other.startOperationId &&
@@ -2529,7 +2599,8 @@ private fun AndroidRedundantTransaction.samePendingNativeSwitch(
     retry.pendingNativeActiveSlot == other.retry.pendingNativeActiveSlot &&
     retry.pendingNativeMembershipGeneration == other.retry.pendingNativeMembershipGeneration &&
     retry.pendingNativeSwitchReason == other.retry.pendingNativeSwitchReason &&
-    retry.pendingNativeSwitchAttempt == other.retry.pendingNativeSwitchAttempt
+    retry.pendingNativeSwitchAttempt == other.retry.pendingNativeSwitchAttempt &&
+    retry.pendingNativeRequiresProbe == other.retry.pendingNativeRequiresProbe
 
 private fun AndroidRedundantTransaction.matchesPendingNativeMembership(
     session: BackgroundRedundantSession,

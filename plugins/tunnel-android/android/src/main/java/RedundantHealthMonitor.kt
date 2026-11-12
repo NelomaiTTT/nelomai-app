@@ -148,7 +148,7 @@ internal class RedundantHealthMonitor(
         return slot.health
     }
 
-    private fun usableCandidate(nowMs: Long, slot: SlotObservation): Boolean =
+    fun usableCandidate(nowMs: Long, slot: SlotObservation): Boolean =
         (slot.standbyProbeState == StandbyProbeState.NOT_REQUIRED ||
             slot.standbyProbeState == StandbyProbeState.SUCCEEDED) &&
         when (classify(nowMs, slot)) {
