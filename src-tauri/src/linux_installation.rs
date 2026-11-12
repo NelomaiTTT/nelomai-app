@@ -16,10 +16,17 @@ pub(super) fn run(
     archive: &Path,
     sha: &str,
     status: impl FnOnce(&mut Command) -> io::Result<ExitStatus>,
-) -> io::Result<ExitStatus> {
+) -> io::Result<bool> {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt};
     let mut command = Command::new("/usr/bin/pkexec");
-    command.arg("/bin/sh");
+    // pkexec forwards the authorized child's status. Normalize installer
+    // failures so exit 126 only identifies a dismissed authorization prompt.
+    command.args([
+        "/bin/sh",
+        "-c",
+        r#"/bin/sh "$@" || exit 1"#,
+        "install-common-linux.sh",
+    ]);
     if protected(installed) {
         command.arg(installed);
     } else {
@@ -28,13 +35,24 @@ pub(super) fn run(
         let code = OsString::from_vec(std::fs::read(candidate)?);
         command.arg("-c").arg(code).arg("install-common-linux.sh");
     }
-    status(command.arg(archive).arg(sha))
+    match status(command.arg(archive).arg(sha))?.code() {
+        Some(0) => Ok(true),
+        Some(126) => Ok(false),
+        _ => Err(io::Error::other("common installation failed")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{ffi::OsStr, fs, os::unix::fs::symlink};
+    use std::{
+        ffi::OsStr,
+        fs,
+        os::unix::{
+            fs::symlink,
+            process::{CommandExt, ExitStatusExt},
+        },
+    };
 
     // Only elevation/FUSE access is simulated. Command argument construction,
     // candidate reads and the child /bin/sh are real.
@@ -74,7 +92,7 @@ mod tests {
                         "attacker",
                     ])
                     .arg(&candidate);
-                if let Some(path) = command.get_args().nth(1).filter(|arg| *arg != "-c") {
+                if let Some(path) = command.get_args().nth(4).filter(|arg| *arg != "-c") {
                     attacker.arg(path);
                 }
                 assert!(attacker.status()?.success());
@@ -95,7 +113,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let installed = root.path().join("missing");
         let candidate = root.path().join("installer.sh");
-        for (exit, wait_error) in [(126, false), (1, false), (0, true), (0, false)] {
+        for (exit, dismissed, wait_error, expected) in [
+            (126, true, false, Some(false)),
+            (126, false, false, None),
+            (1, false, false, None),
+            (127, false, false, None),
+            (0, false, true, None),
+            (0, false, false, Some(true)),
+        ] {
             fs::write(&candidate, format!("exit {exit}\n")).unwrap();
             let result = run(
                 &installed,
@@ -105,17 +130,16 @@ mod tests {
                 |command| {
                     // Model the source FUSE mount becoming inaccessible to root.
                     fs::remove_file(&candidate)?;
+                    if dismissed {
+                        return Ok(ExitStatus::from_raw(126 << 8));
+                    }
                     if wait_error {
                         return Err(io::Error::other("simulated installer wait failure"));
                     }
                     shell(command).status()
                 },
             );
-            if wait_error {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(result.unwrap().code(), Some(exit));
-            }
+            assert_eq!(result.ok(), expected, "exit {exit}, dismissed={dismissed}");
         }
     }
 
@@ -139,19 +163,21 @@ mod tests {
         let candidate = root.path().join("installer.sh");
         fs::write(&candidate, b"printf ready > \"$1\"; exec /bin/sleep 30\n").unwrap();
         let marker = root.path().join("ready");
-        let status = run(&installed, &candidate, &marker, "digest", |command| {
-            let mut child = shell(command).spawn()?;
+        let result = run(&installed, &candidate, &marker, "digest", |command| {
+            let mut child = shell(command).process_group(0).spawn()?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !marker.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            child.kill()?;
+            assert_eq!(
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) },
+                0
+            );
             let status = child.wait()?;
             assert!(marker.exists(), "child did not run the candidate");
             Ok(status)
-        })
-        .unwrap();
-        assert!(!status.success());
+        });
+        assert!(result.is_err());
         fs::write(&candidate, b"exit 0\n").unwrap();
         assert!(
             run(&installed, &candidate, &marker, "digest", |command| shell(
@@ -159,7 +185,6 @@ mod tests {
             )
             .status())
             .unwrap()
-            .success()
         );
     }
 
@@ -177,6 +202,9 @@ mod tests {
                     command.get_args().collect::<Vec<_>>(),
                     [
                         OsStr::new("/bin/sh"),
+                        OsStr::new("-c"),
+                        OsStr::new(r#"/bin/sh "$@" || exit 1"#),
+                        OsStr::new("install-common-linux.sh"),
                         protected.as_os_str(),
                         OsStr::new("archive"),
                         OsStr::new("digest"),
@@ -203,7 +231,6 @@ mod tests {
                 |command| shell(command).status(),
             )
             .unwrap()
-            .success()
         };
         assert!(install());
         fs::write(&installed, b"exit 42\n").unwrap();

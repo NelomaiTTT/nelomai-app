@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       source_sha:
-        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable macOS 0.4.2 candidate
+        description: Full 40-hex HEAD of Future/desktop-0.4.0; nonpublishable macOS 0.4.3 candidate
         type: string
         required: true
 

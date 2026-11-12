@@ -5,9 +5,13 @@
   let {
     history,
     onclose,
+    ondiagnostics,
+    diagnosticsOpen = false,
   }: {
     history: ReleaseHistory;
     onclose: () => void;
+    ondiagnostics?: () => void;
+    diagnosticsOpen?: boolean;
   } = $props();
 
   let dialog: HTMLDivElement;
@@ -41,6 +45,7 @@
   });
 
   function handleKeydown(event: KeyboardEvent) {
+    if (diagnosticsOpen) return;
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -89,7 +94,11 @@
         <p>История версий</p>
         <h2 id="changelog-title">Что нового</h2>
       </div>
-      <button
+      <div class="header-buttons">
+        {#if ondiagnostics}
+          <button class="diagnostics-button" type="button" onclick={ondiagnostics}>Диагностика</button>
+        {/if}
+        <button
         bind:this={closeButton}
         class="icon-button"
         type="button"
@@ -98,6 +107,7 @@
       >
         ×
       </button>
+      </div>
     </header>
 
     <div class="version-list">
@@ -117,6 +127,17 @@
 </div>
 
 <style>
+  .header-buttons { display: flex; align-items: center; gap: 8px; }
+  .diagnostics-button {
+    border: 1px solid #61747877;
+    border-radius: 8px;
+    background: transparent;
+    padding: 7px 9px;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
   .changelog-overlay {
     position: fixed;
     inset: 0;

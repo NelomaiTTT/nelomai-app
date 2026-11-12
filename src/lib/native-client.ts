@@ -86,6 +86,14 @@ export interface SafePeerBindingResponse {
   binding: PeerBinding | null;
 }
 
+export interface SupportReportSummary {
+  reportId: string;
+  bytes: number;
+  logSources: number;
+  incompleteSources: number;
+  serviceAvailable: boolean;
+}
+
 export interface DiagnosticUploadResponse {
   api_version: "1";
   request_id: string;
@@ -188,6 +196,12 @@ export function createNativeClient(
       }) as Promise<Connection>,
     sendDiagnostics: () =>
       invoke("app_send_diagnostics") as Promise<DiagnosticUploadResponse>,
+    collectSupportDiagnostics: () =>
+      invoke("app_collect_support_diagnostics") as Promise<SupportReportSummary>,
+    saveSupportDiagnostics: (reportId: string) =>
+      invoke("app_save_support_diagnostics", { reportId }) as Promise<boolean>,
+    sendSupportDiagnostics: (reportId: string, supportCode: string | null) =>
+      invoke("app_send_support_diagnostics", { reportId, supportCode }) as Promise<string>,
     recordStartupStage: (stage: StartupStage) =>
       invoke("app_record_startup_stage", { stage }) as Promise<void>,
     notifications: (cursor: number | null = null) =>

@@ -41,7 +41,7 @@ class LinuxWorkflowTest(unittest.TestCase):
                          ({'event_name': 'pull_request'}, False),
                          ({'repository': 'foreign/nelomai-app'}, False), ({'ref': 'refs/heads/main'}, False),
                          ({'ref': 'refs/heads/Future/unrelated'}, False),
-                         ({'ref': 'refs/tags/v0.4.2'}, False), ({'sha': 'b' * 40}, False)):
+                         ({'ref': 'refs/tags/v0.4.3'}, False), ({'sha': 'b' * 40}, False)):
             with self.subTest(override=override):
                 context = {
                     'github': SimpleNamespace(**{**allowed, **override}),
@@ -56,7 +56,7 @@ class LinuxWorkflowTest(unittest.TestCase):
         self.assertEqual(checkout['with']['fetch-depth'], 0)
         uploads = [step for step in job['steps'] if step.get('uses', '').startswith('actions/upload-artifact@')]
         self.assertEqual(len(uploads), 1)
-        self.assertEqual(uploads[0]['with']['name'], 'nelomai-test-0.4.2-linux-x86_64-${{ env.SOURCE_SHA }}')
+        self.assertEqual(uploads[0]['with']['name'], 'nelomai-test-0.4.3-linux-x86_64-${{ env.SOURCE_SHA }}')
         self.assertEqual(uploads[0]['with']['path'], '${{ env.RUN_ROOT }}/packages-linux/')
         self.assertNotIn('secrets.', yaml.safe_dump(workflow))
 
@@ -125,7 +125,7 @@ class LinuxWorkflowTest(unittest.TestCase):
             self.assertEqual(command[command.index('--source-sha') + 1], '$SOURCE_SHA')
         self.assertEqual(build[build.index('--platform') + 1], 'linux')
         self.assertEqual(build[build.index('--mode') + 1], 'build_only')
-        self.assertEqual(source[source.index('--version') + 1], '0.4.2')
+        self.assertEqual(source[source.index('--version') + 1], '0.4.3')
         self.assertEqual(source[source.index('--mode') + 1], 'build_only')
         trust = next(command for command in commands if command[1] == 'scripts/prepare-release-trust.py')
         self.assertEqual(trust[trust.index('--mode') + 1], 'build_only')

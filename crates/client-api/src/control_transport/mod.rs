@@ -482,9 +482,18 @@ impl Slot {
         Ok(client)
     }
 
+    #[cfg(test)]
     pub async fn execute(
         &self,
         request: reqwest::Request,
+    ) -> Result<reqwest::Response, super::ClientApiError> {
+        self.execute_with_primary(request, None).await
+    }
+
+    pub(super) async fn execute_with_primary(
+        &self,
+        request: reqwest::Request,
+        primary_temporary: Option<&mut bool>,
     ) -> Result<reqwest::Response, super::ClientApiError> {
         let mut request = request;
         let budget = request
@@ -509,6 +518,12 @@ impl Slot {
                 let remaining = budget.saturating_sub(started.elapsed());
                 match backup {
                     Some(mut alternate) if !remaining.is_zero() => {
+                        if let Some(temporary) = primary_temporary {
+                            // Keep the primary failure classification for the update
+                            // check even if the backup fails at a different layer.
+                            *temporary =
+                                error.is_timeout() || super::is_transient_http_io_failure(&error);
+                        }
                         let client = self.client_for(&self.backup, alternate.url())?;
                         let remaining = budget.saturating_sub(started.elapsed());
                         if remaining.is_zero() {

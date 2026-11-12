@@ -372,6 +372,21 @@ describe("native client", () => {
     expect(response.report_id).toBe("report-1");
   });
 
+  it("uses the frozen report ID for both desktop support actions", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createNativeClient(invoke);
+
+    await client.collectSupportDiagnostics();
+    await client.saveSupportDiagnostics("opaque-id");
+    await client.sendSupportDiagnostics("opaque-id", null);
+
+    expect(invoke.mock.calls).toEqual([
+      ["app_collect_support_diagnostics"],
+      ["app_save_support_diagnostics", { reportId: "opaque-id" }],
+      ["app_send_support_diagnostics", { reportId: "opaque-id", supportCode: null }],
+    ]);
+  });
+
   it("records only a named startup stage through the native layer", async () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
     const client = createNativeClient(invoke);

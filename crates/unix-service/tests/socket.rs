@@ -20,10 +20,13 @@ fn production_dispatcher_socket_uses_verified_identity_and_rejects_foreign_peer(
     let server_owner = std::sync::Arc::clone(&owner);
     let server = std::thread::spawn(move || {
         nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false).unwrap();
+        let rejection = nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false)
+            .unwrap_err();
         assert_eq!(
-            nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false),
-            Err(ServiceError::UnauthorizedClient)
+            rejection,
+            ServiceError::BrokerRejected(d::BrokerDenial::PathMismatch)
         );
+        assert_eq!(rejection.code(), "unauthorized_client");
     });
     let mut stream = UnixStream::connect(&path).unwrap();
     stream
@@ -43,7 +46,14 @@ fn production_dispatcher_socket_uses_verified_identity_and_rejects_foreign_peer(
         Some(&owner.lock().unwrap().layout.identity)
     );
     drop(stream);
-    let status = std::process::Command::new("/usr/bin/python3").args(["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]);\ntry: s.recv(1024)\nexcept ConnectionResetError: pass"] ).arg(path).status().unwrap();
+    let status = std::process::Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]);\ntry: assert s.recv(1024) == b''\nexcept ConnectionResetError: pass",
+        ])
+        .arg(path)
+        .status()
+        .unwrap();
     assert!(status.success());
     server.join().unwrap();
     assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());

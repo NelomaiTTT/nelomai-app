@@ -499,8 +499,8 @@ fn reply_dispatcher_busy(
 ) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
     broker
-        .authorize(&identity.uid.to_string(), &identity.process_path)
-        .map_err(|_| ServiceError::UnauthorizedClient)?;
+        .authorize_classified(&identity.uid.to_string(), &identity.process_path)
+        .map_err(|error| ServiceError::BrokerRejected(error.reason))?;
 
     // Drain the authorized request before closing the socket so the peer
     // receives the negative reply. The retry passes normal dispatch checks.
@@ -530,7 +530,7 @@ fn serve_dispatcher_stream(
     })?;
     dispatcher
         .authorize_broker(&identity.uid.to_string(), &identity.process_path)
-        .map_err(|_| ServiceError::UnauthorizedClient)?;
+        .map_err(|error| ServiceError::BrokerRejected(error.reason))?;
     let frame = d::read_frame(
         stream,
         if private {
@@ -759,21 +759,28 @@ mod dispatcher_response_tests {
     #[test]
     fn persisted_diagnostics_still_require_verified_broker_and_protocol() {
         let (root, owner) = super::dispatcher_test_support::owned_dispatcher();
-        for peer in [
-            ClientIdentity {
-                uid: unsafe { libc::geteuid() } + 1,
-                process_path: std::env::current_exe().unwrap(),
-            },
-            ClientIdentity {
-                uid: unsafe { libc::geteuid() },
-                process_path: PathBuf::from("/untrusted-client"),
-            },
+        use d::BrokerDenial;
+        for (peer, reason) in [
+            (
+                ClientIdentity {
+                    uid: unsafe { libc::geteuid() } + 1,
+                    process_path: std::env::current_exe().unwrap(),
+                },
+                BrokerDenial::UidMismatch,
+            ),
+            (
+                ClientIdentity {
+                    uid: unsafe { libc::geteuid() },
+                    process_path: PathBuf::from("/untrusted-client"),
+                },
+                BrokerDenial::PathMismatch,
+            ),
         ] {
             let mut stream = io::Cursor::new(encode_request(&Request::diagnostics()).unwrap());
-            assert_eq!(
-                serve_dispatcher_stream(&mut stream, &peer, &owner, true, root.path()),
-                Err(ServiceError::UnauthorizedClient)
-            );
+            let error =
+                serve_dispatcher_stream(&mut stream, &peer, &owner, true, root.path()).unwrap_err();
+            assert_eq!(error.code(), "unauthorized_client");
+            assert_eq!(error, ServiceError::BrokerRejected(reason));
             assert_eq!(
                 stream.position(),
                 0,
@@ -862,9 +869,11 @@ mod dispatcher_response_tests {
         broker.sha256 = "0".repeat(64);
         let mut stream = io::Cursor::new(Vec::<u8>::new());
 
+        let error = reply_dispatcher_busy(&mut stream, &identity, &broker).unwrap_err();
+        assert_eq!(error.code(), "unauthorized_client");
         assert_eq!(
-            reply_dispatcher_busy(&mut stream, &identity, &broker),
-            Err(ServiceError::UnauthorizedClient),
+            error,
+            ServiceError::BrokerRejected(d::BrokerDenial::ExecutableDigestMismatch),
         );
         assert!(stream.into_inner().is_empty());
     }

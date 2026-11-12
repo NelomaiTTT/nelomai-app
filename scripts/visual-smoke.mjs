@@ -115,7 +115,12 @@ try {
     executablePath,
     headless: true,
   });
-  if(process.env.UPDATE_RESTART_RECOVERY_SMOKE){
+  if (process.env.SUPPORT_DIAGNOSTICS_SMOKE) {
+    for (const scenario of ["support-loading", "signed_out", "support-preparing", "server-unavailable", "peers", "connection", "update-consent", "startup-failure"]) {
+      await capture(`support-${scenario}`, { width: 1280, height: 800 }, scenario);
+    }
+    await capture("support-android-hidden", { width: 390, height: 844 }, "signed_out");
+  } else if(process.env.UPDATE_RESTART_RECOVERY_SMOKE){
     for(const outcome of ["installed", "not-installed"]){
       await capture(`update-restart-recovery-${outcome}`,{width:1280,height:800},`update-restart-recovery-${outcome}`);
     }
@@ -171,7 +176,12 @@ async function capture(name, viewport, scenario) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
   await page.addInitScript(
-    ({ fixture, peerFixture, currentScenario, desktop }) => {
+    ({ fixture, peerFixture, currentScenario, desktop, supportSmoke }) => {
+      if (supportSmoke) {
+        window.isTauri = true;
+        if (!desktop) Object.defineProperty(navigator, "userAgent", { value: "Android" });
+      }
+      let supportAttempts = 0;
       fixture.device.platform = desktop ? "macos" : "android";
       let connection = null;
       let update={supported:true,automatic:true,protocol:2,phase:"downloading",version:"0.4.1",notes:null,required:false,downloaded:1024,total:2048,errorCode:null,offerId:"fixture-offer",promptPending:true,updateAvailable:true};
@@ -187,6 +197,14 @@ async function capture(name, viewport, scenario) {
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
+          if (command === "app_collect_support_diagnostics") {
+            return { reportId: "c4271792-2992-4765-af15-57745d2a835c", bytes: 1024, logSources: 3, incompleteSources: 1, serviceAvailable: false };
+          }
+          if (command === "app_save_support_diagnostics") return true;
+          if (command === "app_send_support_diagnostics") {
+            if (++supportAttempts === 1) throw "support_network_unavailable";
+            return args.reportId;
+          }
           if(currentScenario.startsWith("update-restart-recovery-")){
             if(command==="app_bootstrap")throw {code:"runtime_startup_pending",message:"Preparation pending"};
             if(command==="app_update_status")return {...update,
@@ -233,6 +251,10 @@ async function capture(name, viewport, scenario) {
             return update;
           }
           if (command === "app_bootstrap") {
+            if (currentScenario === "support-loading") await new Promise(() => {});
+            if (currentScenario === "support-preparing") {
+              throw { code: "runtime_startup_pending", message: "Подготовка подключения" };
+            }
             if (currentScenario.startsWith("runtime-pending") &&
                 window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === 1) {
               throw { code: "runtime_startup_pending", message: "Подготовка подключения; повторим автоматически" };
@@ -283,6 +305,9 @@ async function capture(name, viewport, scenario) {
               };
             }
             return fixture;
+          }
+          if (command === "app_notifications") {
+            return { api_version: "1", request_id: "support-notifications", notifications: [], unread_count: 0, next_cursor: null };
           }
           if (command === "app_release_history") {
             if (window.__RELEASE_HISTORY_OFFLINE__) throw { code: "release_history_unavailable" };
@@ -402,10 +427,16 @@ async function capture(name, viewport, scenario) {
       peerFixture: peers,
       currentScenario: scenario,
       desktop: viewport.width >= 600,
+      supportSmoke: Boolean(process.env.SUPPORT_DIAGNOSTICS_SMOKE),
     },
   );
 
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
+  await page.goto(scenario === "startup-failure" ? `${baseUrl}/startup-failure.html` : baseUrl, { waitUntil: "networkidle" });
+  if (process.env.SUPPORT_DIAGNOSTICS_SMOKE) {
+    await verifySupportDiagnostics(page, scenario, viewport.width >= 600);
+    await context.close();
+    return;
+  }
   await page.waitForTimeout(100);
   if(scenario.startsWith("update-restart-recovery-")){
     await page.waitForFunction(()=>window.__TAURI_CALLS__.some(c=>c.command==="app_update_status"),{},{timeout:3000});
@@ -678,6 +709,73 @@ async function capture(name, viewport, scenario) {
     fullPage: true,
   });
   await context.close();
+}
+
+async function verifySupportDiagnostics(page, scenario, desktop) {
+  const buttonName = { name: "Диагностика", exact: true };
+  if (!desktop) {
+    await page.getByRole("heading", { name: "Вход в Nelomai" }).waitFor();
+    if (await page.getByRole("button", buttonName).count()) throw Error("Desktop diagnostics appeared on Android");
+    return;
+  }
+
+  const dialog = page.getByRole("dialog", { name: "Диагностика", exact: true });
+  async function open(button) {
+    await button.focus();
+    await page.keyboard.press("Enter");
+    await dialog.waitFor();
+  }
+  async function close() {
+    await page.keyboard.press("Escape");
+    await dialog.waitFor({ state: "hidden" });
+  }
+
+  if (scenario === "update-consent") {
+    const update = page.getByRole("dialog", { name: "Установить новую версию" });
+    await open(update.getByRole("button", buttonName));
+    await close();
+    await update.waitFor();
+    return;
+  }
+
+  await open(page.getByRole("button", buttonName));
+  const collect = dialog.getByRole("button", { name: "Собрать отчёт", exact: true });
+  await collect.click();
+  await dialog.getByRole("status").getByText("Отчёт готов.").waitFor();
+  if (await lastCall(page, "app_send_support_diagnostics")) throw Error("Diagnostics sent without consent");
+  const send = dialog.getByRole("button", { name: "Отправить отчёт" });
+  const save = dialog.getByRole("button", { name: "Сохранить файл" });
+  await send.click();
+  await dialog.getByText("Нет связи с панелью.", { exact: false }).waitFor();
+  await save.click();
+  await dialog.getByText("Отчёт сохранён.").waitFor();
+  await send.click();
+  await dialog.getByText("Отчёт отправлен. Номер для поддержки: c4271792.").waitFor();
+  const sendCall = await lastCall(page, "app_send_support_diagnostics");
+  const saveCall = await lastCall(page, "app_save_support_diagnostics");
+  if (sendCall.args.reportId !== saveCall.args.reportId || sendCall.args.supportCode !== null) {
+    throw Error("Save and explicit retry must use the same report ID");
+  }
+  await close();
+
+  if (scenario === "connection") {
+    await page.getByRole("button", { name: /Старт/ }).click();
+    await page.getByRole("button", { name: /Стоп/ }).waitFor();
+    await open(page.getByRole("button", buttonName));
+    await close();
+    for (const label of ["Что нового", "Уведомления", "Split-tunnel"]) {
+      await page.getByRole("button", { name: label, exact: true }).click();
+      const overlay = page.getByRole("dialog", { name: label, exact: true });
+      await open(overlay.getByRole("button", buttonName));
+      await page.keyboard.press("Tab");
+      if (!(await dialog.evaluate((element) => element.contains(document.activeElement)))) {
+        throw Error(`Focus escaped diagnostics from ${label}`);
+      }
+      await close();
+      await overlay.getByRole("button", { name: "Закрыть", exact: true }).click();
+      await overlay.waitFor({ state: "hidden" });
+    }
+  }
 }
 
 async function verifyChangelogLifecycle(page) {

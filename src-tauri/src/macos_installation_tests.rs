@@ -5,6 +5,29 @@ use nelomai_contracts::{
 };
 use std::{path::Path, process::Command};
 
+#[test]
+fn pre_auth_installer_distinguishes_cancellation_from_shell_failure() {
+    let long_cancel = format!("error \"{}\" number -128", "cancel ".repeat(256));
+    for (script, expected) in [
+        ("error number -128", Some(false)),
+        (&long_cancel, Some(false)),
+        (r#"do shell script "/bin/sh -c 'exit 17'""#, None),
+        (r#"error "synthetic text (-128)" number 17"#, None),
+        (r#"do shell script "/usr/bin/true""#, Some(true)),
+    ] {
+        let mut command = Command::new("/usr/bin/osascript");
+        command.args(["-e", script]);
+        let result = super::run_macos_pre_auth_installer(&mut command);
+        match expected {
+            Some(outcome) => assert_eq!(result.unwrap(), outcome),
+            None => assert_eq!(
+                result.unwrap_err().to_string(),
+                "common installation failed"
+            ),
+        }
+    }
+}
+
 fn manifest_value(version: &str) -> serde_json::Value {
     let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
         "../../contracts/fixtures/runtime/container-manifest-v1.json"

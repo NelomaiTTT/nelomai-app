@@ -38,7 +38,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.draft = self.root / 'draft'
         self.stable = self.root / 'stable'
         self.signed = self.root / 'signed'
-        self.runtime(self.draft / 'latest', '0.4.2', self.sha, self.old_key)
+        self.runtime(self.draft / 'latest', '0.4.3', self.sha, self.old_key)
         shutil.copyfile(self.old_public, self.draft / 'draft-public-key.raw')
         shutil.copyfile(self.public, self.draft / 'runtime-public-key.raw')
         self.runtime(self.stable, '0.2.20', self.old_sha, self.old_key)
@@ -100,7 +100,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.sign()
         doc, files = self.c.verified(self.signed, self.sha, self.public, self.old_public)
         self.assertEqual([(s['slot'], s['manifest']['runtime_version']) for s in doc['slots']],
-                         [('latest', '0.4.2'), ('stable', '0.2.20')])
+                         [('latest', '0.4.3'), ('stable', '0.2.20')])
         self.assertEqual(doc['release_set_id'], 'macos-candidate-' + self.sha)
         self.assertEqual(before, (self.c.snapshot(self.draft), self.c.snapshot(self.stable)))
         self.assertFalse(any('/release/' in n or any(p in n for p in ('linux', 'windows', 'android')) for n in files))
@@ -116,9 +116,9 @@ class MacosCandidateTest(unittest.TestCase):
         with patch.object(self.c.verifier, 'inspect', side_effect=native_inspect):
             self.c.stage(self.signed, staged, self.sha, self.public, self.old_public)
         service = b'structural service fixture; never executed'
-        self.assertEqual(inspected, [('0.4.2', service), ('0.2.20', service)])
+        self.assertEqual(inspected, [('0.4.3', service), ('0.2.20', service)])
         self.assertEqual((staged / 'dispatcher/1/nelomai-unix-service').read_bytes(), service)
-        for slot, version in (('latest', '0.4.2'), ('stable', '0.2.20')):
+        for slot, version in (('latest', '0.4.3'), ('stable', '0.2.20')):
             path = staged / 'runtime/engines' / slot / version / 'nelomai-unix-service'
             self.assertEqual(path.read_bytes(), service)
             self.assertEqual(path.stat().st_mode & 0o777, 0o755)
@@ -195,7 +195,7 @@ class MacosCandidateTest(unittest.TestCase):
         self.assertIn(self.c.PACKAGE + '.sig', inventory['assets'])
         self.assertEqual(inventory['assets'][self.c.DMG], self.digest(image))
         self.assertIn(self.c.DMG + '.sig', inventory['assets'])
-        self.assertFalse(any('0.4.2-release-set' in n or 'release-manifest' in n for n in inventory['assets']))
+        self.assertFalse(any('0.4.3-release-set' in n or 'release-manifest' in n for n in inventory['assets']))
         self.assertEqual(before, self.c.snapshot(packages))
         self.assertEqual(len(calls), 4)
 

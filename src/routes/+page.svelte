@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { isTauri } from "@tauri-apps/api/core";
+  import SupportDiagnostics from "$lib/SupportDiagnostics.svelte";
   import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import UpdatePrompt from "$lib/UpdatePrompt.svelte";
@@ -91,6 +93,11 @@
     updateRefreshDiagnosticStage,
     updateStatusNeedsPolling,
   } from "$lib/update-diagnostics";
+
+  let supportAvailable = $state(false);
+  let supportOpen = $state(false);
+  let supportDialog: { show(): void } | undefined = $state();
+  const openSupportDiagnostics = () => supportDialog?.show();
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -264,6 +271,7 @@
   };
 
   onMount(() => {
+    supportAvailable = isTauri() && !/Android/i.test(navigator.userAgent);
     updateUiVisible=document.visibilityState === "visible";
     let disposed = false;
     void nativeClient.recordStartupStage("frontend_mounted");
@@ -1586,6 +1594,11 @@
           Что нового
         </button>
       {/if}
+      {#if supportAvailable}
+        <button class="quiet-button" type="button" onclick={openSupportDiagnostics}>
+          Диагностика
+        </button>
+      {/if}
       {#if view !== "loading" && view !== "sign_in"}
         <button
           class="quiet-button notification-button"
@@ -1658,7 +1671,9 @@
     <p class="diagnostics-status" role="status">{defenderRepairMessage}</p>
   {/if}
   {#if updateDialogId && updateStatus && updateDialogId===updateStatus.offerId}
-    <UpdatePrompt status={updateStatus} visible={updateUiVisible} busy={updateBusy} onconfirm={installUpdate} onlater={deferUpdate} onpresented={markUpdatePresented}/>
+    <UpdatePrompt status={updateStatus} visible={updateUiVisible} busy={updateBusy} onconfirm={installUpdate} onlater={deferUpdate} onpresented={markUpdatePresented}
+      diagnosticsOpen={supportOpen} ondiagnostics={supportAvailable ? openSupportDiagnostics : undefined}
+    />
   {/if}
   {#if updateStatus && updateStatus.phase !== "idle" && view !== "sign_in"}
     <section class="update-banner" aria-live="polite">
@@ -2206,6 +2221,7 @@
     state={splitTunnelState}
     applications={splitTunnelApplications}
     busy={splitTunnelBusy}
+    ondiagnostics={supportAvailable ? openSupportDiagnostics : undefined}
     onclose={() => closeOverlay("split_tunnel")}
     onsave={saveSplitTunnel}
     onrefresh={() => loadSplitTunnel(true)}
@@ -2221,6 +2237,7 @@
     nextCursor={notificationNextCursor}
     busy={notificationsBusy}
     error={notificationsError}
+    ondiagnostics={supportAvailable ? openSupportDiagnostics : undefined}
     onclose={() => closeOverlay("notifications")}
     onread={markNotificationRead}
     onreadall={markAllNotificationsRead}
@@ -2231,8 +2248,15 @@
 {#if changelogOpen}
   <ChangelogPanel
     history={getReleaseHistory()}
+    ondiagnostics={supportAvailable ? openSupportDiagnostics : undefined}
+    diagnosticsOpen={supportOpen}
     onclose={() => closeOverlay("changelog")}
   />
+{/if}
+
+
+{#if supportAvailable}
+  <SupportDiagnostics bind:this={supportDialog} bind:open={supportOpen} />
 {/if}
 
 <style>

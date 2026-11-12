@@ -2,7 +2,7 @@
 //! never Bearer tokens, artifact URLs, installer paths or signing authority.
 use crate::ipc::PrivateError;
 use crate::{AuthBroker, SwitchCoordinator, UpdateBarrier, UpdatePrepare};
-use nelomai_client_api::{AccessSnapshot, ClientApi};
+use nelomai_client_api::{AccessSnapshot, ClientApi, UpdateBootstrapFailure};
 use nelomai_client_updater::{
     DownloadProgress, FileUpdatePreferenceStore, InstallResult, PreparedUpdate, ResolvedUpdate,
     UpdateBackend, UpdateBackendError, UpdateBarrierError, UpdateBarrierPhase, UpdateCoordinator,
@@ -13,6 +13,11 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+
+enum RefreshOutcome {
+    Complete,
+    TemporarilyUnavailable,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -165,6 +170,7 @@ pub(crate) struct HostUpdater {
     operation: Mutex<UpdateOperation>,
     install_recovery_gate: Arc<tokio::sync::Mutex<()>>,
     refresh_error: Mutex<Option<String>>,
+    update_diagnostics_directory: std::path::PathBuf,
     prompt_path: std::path::PathBuf,
     prompt_session: Mutex<PromptSession>,
     startup_checked: std::sync::atomic::AtomicBool,
@@ -272,6 +278,7 @@ impl HostUpdater {
             operation: Mutex::new(UpdateOperation::Idle),
             install_recovery_gate: gate,
             refresh_error: Mutex::new(None),
+            update_diagnostics_directory: root.join("common"),
             prompt_path,
             prompt_session: Mutex::new(prompt_session),
             startup_checked: std::sync::atomic::AtomicBool::new(false),
@@ -408,7 +415,8 @@ impl HostUpdater {
             offer_id: coordinator.and_then(|c| c.offer_id()),
             prompt_pending: coordinator.is_some_and(|c| c.prompt_pending()),
             update_available: coordinator.and_then(|c| c.offer_id()).is_some()
-                && !matches!(v2_phase, "ready_to_restart" | "awaiting_installation"),
+                && (!self.android_policy
+                    || !matches!(v2_phase, "ready_to_restart" | "awaiting_installation")),
         })
     }
     pub fn set_automatic(
@@ -428,7 +436,33 @@ impl HostUpdater {
         self.timer_reset.notify_one();
         self.status()
     }
-    async fn refresh(&self) -> Result<(), PrivateError> {
+    async fn retain_offer_after_temporary_failure(
+        &self,
+        access: &AccessSnapshot,
+        expected_version: Option<&str>,
+    ) -> Result<RefreshOutcome, PrivateError> {
+        self.broker
+            .with_current_access_scope(access, || {
+                if let Some(coordinator) = &self.coordinator {
+                    let offer = self
+                        .offer
+                        .lock()
+                        .map_err(|_| crate::BrokerError::RecoveryRequired)?;
+                    if expected_version.is_some_and(|version| {
+                        offer.as_ref().is_none_or(|offer| offer.version != version)
+                    }) {
+                        coordinator.invalidate();
+                    } else {
+                        coordinator.retain_scope(access);
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| PrivateError::Cancelled)?;
+        Ok(RefreshOutcome::TemporarilyUnavailable)
+    }
+    async fn refresh(&self) -> Result<RefreshOutcome, PrivateError> {
         let access = self
             .broker
             .access_token(None)
@@ -439,16 +473,35 @@ impl HostUpdater {
             .clone()
             .with_access_snapshot(&access)
             .map_err(|_| PrivateError::RecoveryRequired)?
-            .bootstrap(access.access_token())
-            .await
-            .map_err(|_| PrivateError::Service)?;
+            .bootstrap_for_update(access.access_token())
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if self.android_policy || error != UpdateBootstrapFailure::Temporary {
+                    return Err(PrivateError::Service);
+                }
+                return self
+                    .retain_offer_after_temporary_failure(&access, None)
+                    .await;
+            }
+        };
         let mut offer =
             UpdateOffer::from_state(&response.update).map_err(|_| PrivateError::Protocol)?;
         let resolved = if let (Some(offer), Some(backend)) = (&offer, &self.backend) {
-            backend
-                .resolve(&access, &offer.version)
-                .await
-                .map_err(|_| PrivateError::Service)?
+            match backend.resolve(&access, &offer.version).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    let temporary = error.is_manifest_temporarily_unavailable();
+                    self.record_update_failure(&error.at_stage("manifest").into());
+                    if !self.android_policy && temporary {
+                        return self
+                            .retain_offer_after_temporary_failure(&access, Some(&offer.version))
+                            .await;
+                    }
+                    return Err(PrivateError::Service);
+                }
+            }
         } else {
             None
         };
@@ -472,7 +525,8 @@ impl HostUpdater {
                 Ok(())
             })
             .await
-            .map_err(|_| PrivateError::Cancelled)
+            .map_err(|_| PrivateError::Cancelled)?;
+        Ok(RefreshOutcome::Complete)
     }
     pub fn start_refresh(self: &Arc<Self>) -> Result<HostUpdateStatusV1, PrivateError> {
         self.check(UpdateCheckReason::Manual)?;
@@ -598,8 +652,8 @@ impl HostUpdater {
             .map_err(|_| PrivateError::Closed)? = None;
         let owner = self.clone();
         tokio::spawn(async move {
-            match owner.refresh().await {
-                Ok(()) => {
+            let refreshed = match owner.refresh().await {
+                Ok(RefreshOutcome::Complete) => {
                     owner
                         .startup_checked
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -618,6 +672,15 @@ impl HostUpdater {
                             owner.record_refresh_error(error);
                         }
                     }
+                    true
+                }
+                Ok(RefreshOutcome::TemporarilyUnavailable) => {
+                    *owner
+                        .manual_pending
+                        .lock()
+                        .expect("update manual request poisoned") = false;
+                    owner.record_refresh_error(PrivateError::Service);
+                    false
                 }
                 Err(error) => {
                     *owner
@@ -628,10 +691,13 @@ impl HostUpdater {
                     if let Some(c) = &owner.coordinator {
                         c.invalidate();
                     }
+                    false
                 }
-            }
+            };
             owner.reset_operation();
-            if !owner.resume_pending_check() {
+            if !owner.resume_pending_check()
+                && (refreshed || owner.coordinator.as_ref().is_some_and(|c| c.has_consent()))
+            {
                 let _ = owner.start_drive();
             }
         });
@@ -667,7 +733,9 @@ impl HostUpdater {
                 (&owner.coordinator, owner.broker.access_token(None).await)
             {
                 let automatic = owner.current.lock().map(|p| p.automatic).unwrap_or(false);
-                let _ = coordinator.drive(&access, automatic).await;
+                if let Err(error) = coordinator.drive(&access, automatic).await {
+                    owner.record_update_failure(&error);
+                }
             } else if let Some(coordinator) = &owner.coordinator {
                 coordinator.invalidate();
             }
@@ -877,7 +945,7 @@ impl HostUpdater {
     pub(crate) fn take_notification(&self) -> Option<UpdateOffer> {
         if self.android_policy
             || !self.current.lock().ok()?.automatic
-            || *self.desktop_ui_visible.lock().ok()? != Some(false)
+            || self.desktop_ui_visible.lock().ok()?.is_none()
             || *self.manual_pending.lock().ok()?
         {
             return None;
@@ -931,6 +999,41 @@ impl HostUpdater {
         if let Ok(mut slot) = self.refresh_error.lock() {
             *slot = Some(refresh_error_code(error).into());
         }
+    }
+
+    fn record_update_failure(&self, error: &nelomai_client_updater::UpdateError) {
+        use nelomai_client_updater::UpdateError;
+        if self.android_policy {
+            return;
+        }
+        let (stage, code, progress) = match error {
+            UpdateError::Backend(error) => (
+                error.stage().unwrap_or("transition"),
+                error.code(),
+                error.progress(),
+            ),
+            UpdateError::Barrier(error) => ("transition", error.code(), None),
+        };
+        let code = if nelomai_client_updater::is_diagnostic_error_code(code) {
+            code
+        } else {
+            "update_operation_failed"
+        };
+        let timestamp_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = crate::refresh_diagnostics::append_update_failure(
+            &self.update_diagnostics_directory,
+            &crate::refresh_diagnostics::UpdateFailure {
+                timestamp_unix,
+                kind: "update.operation.failed",
+                stage,
+                code,
+                downloaded_bytes: progress.map(|progress| progress.downloaded),
+                expected_bytes: progress.and_then(|progress| progress.total),
+            },
+        );
     }
     fn resume_pending_check(self: &Arc<Self>) -> bool {
         if self
@@ -1096,6 +1199,9 @@ mod tests {
             version: &str,
         ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
             if let Some(panel) = &self.panel {
+                if let Some(code) = *panel.manifest_failure.lock().unwrap() {
+                    return Err(UpdateBackendError::new(code));
+                }
                 if panel.fail.load(Ordering::SeqCst) {
                     return Err(UpdateBackendError::new("manifest_unavailable"));
                 }
@@ -1174,6 +1280,8 @@ mod tests {
     struct Panel {
         calls: AtomicUsize,
         fail: AtomicBool,
+        malformed_bootstrap: AtomicBool,
+        manifest_failure: Mutex<Option<&'static str>>,
         version: Mutex<String>,
         release: Notify,
         reconciles: AtomicUsize,
@@ -1225,6 +1333,9 @@ mod tests {
         panel.release.notified().await;
         if panel.fail.swap(false, Ordering::SeqCst) {
             return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if panel.malformed_bootstrap.load(Ordering::SeqCst) {
+            return Ok(Json(json!({"unexpected": "bootstrap response"})));
         }
         let version = panel.version.lock().unwrap().clone();
         Ok(Json(json!({
@@ -1278,6 +1389,8 @@ mod tests {
         let panel = Arc::new(Panel {
             calls: AtomicUsize::new(0),
             fail: AtomicBool::new(fail_first),
+            malformed_bootstrap: AtomicBool::new(false),
+            manifest_failure: Mutex::new(None),
             version: Mutex::new("0.2.21".into()),
             release: Notify::new(),
             reconciles: AtomicUsize::new(0),
@@ -1372,7 +1485,7 @@ mod tests {
         });
         let updater = Arc::new(
             HostUpdater::new(
-                root.path(),
+                &root.path().canonicalize().unwrap(),
                 api,
                 broker,
                 coordinator,
@@ -1383,6 +1496,52 @@ mod tests {
         );
         updater.set_automatic(false).unwrap();
         (updater, panel, backend, tunnel, server, root)
+    }
+
+    #[tokio::test]
+    async fn update_failure_journal_records_stage_and_byte_counts_without_error_details() {
+        let (updater, _, _, _, server, root) = updater(false).await;
+        let error = UpdateBackendError::new("update_download_interrupted")
+            .at_stage("download")
+            .with_progress(DownloadProgress {
+                downloaded: 512,
+                total: Some(1024),
+            });
+        updater.record_update_failure(&error.into());
+        updater.record_update_failure(
+            &UpdateBackendError::new("Bearer secret")
+                .at_stage("installer")
+                .into(),
+        );
+        let known_failures = [
+            ("installer", "common_installer_untrusted"),
+            ("manifest", "unsupported_update_package"),
+            ("installer", "helper_owner_is_root"),
+            ("transition", "installed_update_version_mismatch"),
+        ];
+        for (stage, code) in known_failures {
+            updater.record_update_failure(&UpdateBackendError::new(code).at_stage(stage).into());
+        }
+        let log =
+            std::fs::read_to_string(root.path().join("common/update-diagnostics.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2 + known_failures.len());
+        assert_eq!(events[0]["kind"], "update.operation.failed");
+        assert_eq!(events[0]["stage"], "download");
+        assert_eq!(events[0]["code"], "update_download_interrupted");
+        assert_eq!(events[0]["downloaded_bytes"], 512);
+        assert_eq!(events[0]["expected_bytes"], 1024);
+        assert_eq!(events[1]["stage"], "installer");
+        assert_eq!(events[1]["code"], "update_operation_failed");
+        for (event, (stage, code)) in events[2..].iter().zip(known_failures) {
+            assert_eq!(event["stage"], stage);
+            assert_eq!(event["code"], code);
+        }
+        assert!(!log.contains("Bearer secret"));
+        server.abort();
     }
 
     #[tokio::test]
@@ -1602,6 +1761,7 @@ mod tests {
         wait_for_idle(&updater).await;
         assert_eq!(backend.versions.lock().unwrap().as_slice(), ["0.2.21"]);
         assert_eq!(updater.status().unwrap().phase, "ready_to_restart");
+        assert!(updater.status_v2().unwrap().update_available);
         let path = root.path().join("common/update-journal-v1.json");
         let before = std::fs::read(&path).unwrap();
         let proof = updater
@@ -2309,7 +2469,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_notification_requires_hidden_admitted_ui_and_automatic() {
+    async fn desktop_offer_remains_actionable_after_temporary_panel_failure() {
+        let (owner, panel, backend, _, server, _root) = updater(false).await;
+        owner.set_automatic(true).unwrap();
+        discover(&owner, &panel).await;
+        let before = owner.status_v2().unwrap();
+        assert!(before.update_available);
+        assert!(before.offer_id.is_some());
+
+        panel.fail.store(true, Ordering::SeqCst);
+        owner.check(UpdateCheckReason::Timer).unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+
+        let after = owner.status_v2().unwrap();
+        assert!(
+            after.update_available,
+            "a temporary failure must not clear the tray badge"
+        );
+        assert_eq!(
+            after.offer_id, before.offer_id,
+            "the user can still open the offer"
+        );
+        assert!(
+            after.status.error_code.is_some(),
+            "the failed check is still reported"
+        );
+        assert!(backend.versions.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_offer_survives_503_but_clears_on_invalid_bootstrap() {
+        let (owner, panel, backend, tunnel, server, _root) = updater(false).await;
+        discover(&owner, &panel).await;
+        let offer = owner.status_v2().unwrap().offer_id.unwrap();
+
+        panel.fail.store(true, Ordering::SeqCst);
+        discover(&owner, &panel).await;
+        assert_eq!(
+            owner.status_v2().unwrap().offer_id.as_deref(),
+            Some(offer.as_str())
+        );
+
+        panel.malformed_bootstrap.store(true, Ordering::SeqCst);
+        discover(&owner, &panel).await;
+        assert!(owner.status_v2().unwrap().offer_id.is_none());
+        assert!(owner
+            .request_v2(UpdateRequestV2::Confirm { offer_id: offer })
+            .await
+            .is_err());
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert!(backend.versions.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_offer_survives_temporary_manifest_failure_and_clears_on_definite_failure() {
+        let (owner, panel, backend, _, server, _root) = updater(false).await;
+        owner.set_automatic(true).unwrap();
+        discover(&owner, &panel).await;
+        let before = owner.status_v2().unwrap();
+        assert!(before.update_available);
+
+        *panel.manifest_failure.lock().unwrap() = Some("update_manifest_temporarily_unavailable");
+        owner.check(UpdateCheckReason::Timer).unwrap();
+        wait_for_calls(&panel, 2).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        let after = owner.status_v2().unwrap();
+        assert!(after.update_available);
+        assert_eq!(after.offer_id, before.offer_id);
+        assert!(after.status.error_code.is_some());
+
+        *panel.manifest_failure.lock().unwrap() = Some("untrusted_update_artifact");
+        owner.check(UpdateCheckReason::Timer).unwrap();
+        wait_for_calls(&panel, 3).await;
+        panel.release.notify_one();
+        wait_for_idle(&owner).await;
+        assert!(owner.status_v2().unwrap().offer_id.is_none());
+        assert!(backend.versions.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_notification_allows_visible_admitted_ui_and_requires_automatic() {
         let (owner, _, _, _, server, _root) = updater(false).await;
         let connected = Arc::new(AtomicBool::new(true));
         let probe = connected.clone();
@@ -2342,46 +2587,34 @@ mod tests {
             .request_v2_for(Some(generation), visible(true))
             .await
             .unwrap();
-        assert!(
-            owner.take_notification().is_none(),
-            "visible UI already presents the offer"
-        );
+        let offer_id = owner.status_v2().unwrap().offer_id.unwrap();
         owner
-            .request_v2_for(Some(generation), visible(false))
+            .request_v2_for(Some(generation), UpdateRequestV2::Presented { offer_id })
             .await
             .unwrap();
         connected.store(false, Ordering::SeqCst);
         assert!(
             owner.take_notification().is_none(),
-            "native disconnect before lifecycle delivery"
+            "native peer disconnected"
         );
         connected.store(true, Ordering::SeqCst);
-        owner.ui_disconnected();
-        assert!(
-            owner.take_notification().is_none(),
-            "disconnected peer cannot provide visibility"
-        );
-        let current = owner.attach_ui();
-        assert!(owner
-            .request_v2_for(Some(generation), visible(false))
-            .await
-            .is_err());
-        assert!(
-            owner.take_notification().is_none(),
-            "stale peer cannot restore visibility"
-        );
-        owner
-            .request_v2_for(Some(current), visible(false))
-            .await
-            .unwrap();
         owner.set_automatic(false).unwrap();
         assert!(owner.take_notification().is_none());
         owner.set_automatic(true).unwrap();
-        assert!(owner.take_notification().is_some());
+        assert_eq!(owner.take_notification().unwrap().version, "0.2.21");
+        owner
+            .request_v2_for(Some(generation), visible(false))
+            .await
+            .unwrap();
         assert!(
             owner.take_notification().is_none(),
             "one banner per version"
         );
+        let current = owner.attach_ui();
+        assert!(owner
+            .request_v2_for(Some(generation), visible(true))
+            .await
+            .is_err());
         assert!(
             owner
                 .request_v2_for(

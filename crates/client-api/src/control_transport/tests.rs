@@ -770,6 +770,67 @@ async fn native_panel_uses_independent_backup_tls_identity_after_pre_http_failur
 }
 
 #[tokio::test]
+async fn update_bootstrap_keeps_primary_tls_failure_when_backup_is_temporary() {
+    use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
+    use crate::{ClientApi, UpdateBootstrapFailure};
+
+    for (wrong_certificate, primary_reply, expected, attempts) in [
+        (
+            false,
+            Reply::Truncated,
+            UpdateBootstrapFailure::Temporary,
+            1,
+        ),
+        (
+            false,
+            Reply::HandshakeEof,
+            UpdateBootstrapFailure::Temporary,
+            2,
+        ),
+        (
+            true,
+            Reply::Status(200),
+            UpdateBootstrapFailure::Definite,
+            2,
+        ),
+    ] {
+        let primary = HttpsFixture::start_with(wrong_certificate, primary_reply);
+        let backup = (attempts == 2).then(|| HttpsFixture::start_with(true, Reply::Status(503)));
+        let _roots = DnsScope::new(DnsAnswer::Success, primary.address).with_roots(true);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let origin = Url::parse("https://nelomai.ru").unwrap();
+        let mut api = ClientApi::new(origin.as_str()).unwrap();
+        api.http.control = Some(Arc::new(Slot::new(
+            origin,
+            Arc::new(PanelRoute {
+                primary: primary.address,
+                backup: backup
+                    .as_ref()
+                    .map_or(primary.address, |fixture| fixture.address),
+                calls: calls.clone(),
+            }),
+        )));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            api.bootstrap_for_update("synthetic"),
+        )
+        .await
+        .unwrap();
+        let (primary_request, _) = primary.server.join().unwrap();
+        assert_eq!(primary_request.is_some(), attempts == 1);
+        if let Some(backup) = backup {
+            let (backup_request, sni) = backup.server.join().unwrap();
+            assert_eq!(sni.as_deref(), Some("nelomai.top"));
+            assert!(backup_request
+                .unwrap()
+                .starts_with("GET /api/client/v1/bootstrap "));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), attempts);
+        assert_eq!(result.unwrap_err(), expected);
+    }
+}
+
+#[tokio::test]
 async fn native_panel_never_replays_after_eof_http_error_or_same_origin_redirect() {
     use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
     for mode in 0..3 {

@@ -853,6 +853,67 @@ pub enum ClientApiError {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateBootstrapFailure {
+    Temporary,
+    Definite,
+}
+
+impl UpdateBootstrapFailure {
+    fn classify(error: ClientApiError) -> Self {
+        let temporary = match error {
+            ClientApiError::Transport(error) => {
+                error.is_timeout() || is_transient_http_io_failure(&error)
+            }
+            ClientApiError::ControlTransportUnavailable => true,
+            ClientApiError::Api { status, .. }
+            | ClientApiError::InvalidErrorResponse { status } => status.is_server_error(),
+            _ => false,
+        };
+        if temporary {
+            Self::Temporary
+        } else {
+            Self::Definite
+        }
+    }
+}
+
+/// Identifies an interrupted HTTP exchange or unavailable network path.
+/// An interruption does not prove that the request is safe to replay.
+pub fn is_transient_http_io_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::{Error, ErrorKind};
+
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        let io_error = error.downcast_ref::<Error>();
+        if error
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message)
+            || io_error.is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    ErrorKind::ConnectionRefused
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::HostUnreachable
+                        | ErrorKind::NetworkUnreachable
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                )
+            })
+        {
+            return true;
+        }
+        // Some connectors wrap the concrete I/O error in ErrorKind::Other.
+        // io::Error::source can skip the wrapper's inner I/O error itself.
+        cause = io_error
+            .and_then(Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
+    }
+    false
+}
+
 /// Definitive password-login refusals: the panel issued no session for this
 /// attempt. Only these fixed codes may cross private auth IPC, never panel text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -990,11 +1051,18 @@ impl ResettableHttpClient {
         Ok(())
     }
 
-    async fn execute(&self, request: reqwest::Request) -> Result<Response, ClientApiError> {
+    async fn execute(
+        &self,
+        request: reqwest::Request,
+        primary_temporary: Option<&mut bool>,
+    ) -> Result<Response, ClientApiError> {
         #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         if let Some(control) = &self.control {
-            return control.execute(request).await;
+            return control
+                .execute_with_primary(request, primary_temporary)
+                .await;
         }
+        let _ = primary_temporary;
         Ok(execute_panel_request(&self.client(), request, HTTP_REQUEST_TIMEOUT).await?)
     }
 
@@ -1390,6 +1458,60 @@ impl ClientApi {
         .await
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    pub async fn upload_support_diagnostics(
+        &self,
+        report_bytes: &[u8],
+        support_code: Option<&str>,
+    ) -> Result<DiagnosticUploadResponse, ClientApiError> {
+        const REQUEST_LIMIT: usize = 384 * 1024;
+        if report_bytes.is_empty() {
+            return Err(ClientApiError::InvalidPayload {
+                code: "support_report_invalid",
+            });
+        }
+        if report_bytes.len() > REQUEST_LIMIT {
+            return Err(ClientApiError::PayloadTooLarge {
+                code: "support_report_too_large",
+                limit_bytes: REQUEST_LIMIT,
+            });
+        }
+
+        let mut request = self
+            .http
+            .post(self.endpoint("diagnostics/support")?)
+            .header(CONTENT_TYPE, "application/json")
+            .body(report_bytes.to_vec());
+        if let Some(code) = support_code {
+            let valid = code.strip_prefix("nld_").is_some_and(|suffix| {
+                suffix.len() == 43
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            });
+            let mut header = HeaderValue::from_str(code).ok().filter(|_| valid).ok_or(
+                ClientApiError::InvalidPayload {
+                    code: "support_code_invalid",
+                },
+            )?;
+            header.set_sensitive(true);
+            request = request.header("X-Nelomai-Diagnostics-Code", header);
+        }
+
+        let response = self.send_request(request).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ClientApiError::InvalidErrorResponse { status });
+        }
+        Self::read_limited_json(
+            response,
+            16 * 1024,
+            "support_receipt_too_large",
+            "support_receipt_invalid",
+        )
+        .await
+    }
+
     pub async fn split_tunnel_revision(
         &self,
         access_token: &str,
@@ -1531,6 +1653,29 @@ impl ClientApi {
 
     pub async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, ClientApiError> {
         self.send_json(self.bootstrap_request(access_token)?).await
+    }
+
+    pub async fn bootstrap_for_update(
+        &self,
+        access_token: &str,
+    ) -> Result<Bootstrap, UpdateBootstrapFailure> {
+        let mut primary_temporary = true;
+        let result = async {
+            let request = self.scoped_request(self.bootstrap_request(access_token)?)?;
+            let response = self
+                .http
+                .execute(request, Some(&mut primary_temporary))
+                .await?;
+            Self::json_response(response).await
+        }
+        .await;
+        result.map_err(|error| {
+            if primary_temporary {
+                UpdateBootstrapFailure::classify(error)
+            } else {
+                UpdateBootstrapFailure::Definite
+            }
+        })
     }
 
     /// Owner-only legacy observation. This deliberately strips every app and
@@ -2103,7 +2248,7 @@ impl ClientApi {
         })
     }
 
-    async fn send_request(&self, builder: RequestBuilder) -> Result<Response, ClientApiError> {
+    fn scoped_request(&self, builder: RequestBuilder) -> Result<reqwest::Request, ClientApiError> {
         let mut request = builder.build()?;
         if let Some(token) = request
             .headers()
@@ -2158,14 +2303,23 @@ impl ClientApi {
                 }
             }
         }
-        self.http.execute(request).await
+        Ok(request)
+    }
+
+    async fn send_request(&self, builder: RequestBuilder) -> Result<Response, ClientApiError> {
+        self.http.execute(self.scoped_request(builder)?, None).await
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, ClientApiError> {
-        let response = self.send_request(request).await?;
+        Self::json_response(self.send_request(request).await?).await
+    }
+
+    async fn json_response<T: for<'de> Deserialize<'de>>(
+        response: Response,
+    ) -> Result<T, ClientApiError> {
         let status = response.status();
         if status.is_success() {
             return Ok(response.json().await?);

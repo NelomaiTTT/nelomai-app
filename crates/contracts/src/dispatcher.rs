@@ -295,6 +295,64 @@ fn broker_file_identity(file: &File) -> io::Result<BrokerFileIdentity> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerDenial {
+    UidMismatch,
+    SidMismatch,
+    PathMismatch,
+    ExecutableDigestMismatch,
+    ExecutableUnavailableOrChanged,
+}
+
+impl BrokerDenial {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::UidMismatch => "uid_mismatch",
+            Self::SidMismatch => "sid_mismatch",
+            Self::PathMismatch => "path_mismatch",
+            Self::ExecutableDigestMismatch => "executable_digest_mismatch",
+            Self::ExecutableUnavailableOrChanged => "executable_unavailable_or_changed",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct BrokerAuthorizationError {
+    pub reason: BrokerDenial,
+    error: io::Error,
+}
+
+impl BrokerAuthorizationError {
+    fn denied(reason: BrokerDenial) -> Self {
+        Self {
+            reason,
+            error: blocked(),
+        }
+    }
+
+    fn unavailable(error: io::Error) -> Self {
+        Self {
+            reason: BrokerDenial::ExecutableUnavailableOrChanged,
+            error,
+        }
+    }
+}
+
+fn authorize_broker_identity(
+    policy: &BrokerPolicy,
+    owner: &str,
+    kernel_executable: &Path,
+) -> Result<(), BrokerAuthorizationError> {
+    if owner != policy.owner {
+        return Err(BrokerAuthorizationError::denied(BrokerDenial::UidMismatch));
+    }
+    // Never canonicalize an untrusted peer path into an allowed alias.
+    if kernel_executable != policy.executable {
+        return Err(BrokerAuthorizationError::denied(BrokerDenial::PathMismatch));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct BrokerAuthorizationCache {
     verified: Option<(BrokerPolicy, BrokerFileIdentity)>,
@@ -308,11 +366,20 @@ impl BrokerAuthorizationCache {
         owner: &str,
         kernel_executable: &Path,
     ) -> io::Result<()> {
-        if owner != policy.owner || kernel_executable != policy.executable {
-            return Err(blocked());
-        }
-        let mut file = open_regular(kernel_executable)?;
-        let before = broker_file_identity(&file)?;
+        self.authorize_classified(policy, owner, kernel_executable)
+            .map_err(|error| error.error)
+    }
+
+    pub fn authorize_classified(
+        &mut self,
+        policy: &BrokerPolicy,
+        owner: &str,
+        kernel_executable: &Path,
+    ) -> Result<(), BrokerAuthorizationError> {
+        authorize_broker_identity(policy, owner, kernel_executable)?;
+        let mut file =
+            open_regular(kernel_executable).map_err(BrokerAuthorizationError::unavailable)?;
+        let before = broker_file_identity(&file).map_err(BrokerAuthorizationError::unavailable)?;
         if self
             .verified
             .as_ref()
@@ -326,16 +393,25 @@ impl BrokerAuthorizationCache {
         let mut hash = Sha256::new();
         let mut buffer = [0; 65536];
         loop {
-            let count = file.read(&mut buffer)?;
+            let count = file
+                .read(&mut buffer)
+                .map_err(BrokerAuthorizationError::unavailable)?;
             if count == 0 {
                 break;
             }
             hash.update(&buffer[..count]);
         }
-        let after = broker_file_identity(&file)?;
-        if before != after || format!("{:x}", hash.finalize()) != policy.sha256 {
+        let after = broker_file_identity(&file).map_err(BrokerAuthorizationError::unavailable)?;
+        let denial = if before != after {
+            Some(BrokerDenial::ExecutableUnavailableOrChanged)
+        } else if format!("{:x}", hash.finalize()) != policy.sha256 {
+            Some(BrokerDenial::ExecutableDigestMismatch)
+        } else {
+            None
+        };
+        if let Some(reason) = denial {
             self.verified = None;
-            return Err(blocked());
+            return Err(BrokerAuthorizationError::denied(reason));
         }
         self.verified = Some((policy.clone(), after));
         Ok(())
@@ -347,12 +423,22 @@ impl BrokerAuthorizationCache {
 }
 impl BrokerPolicy {
     pub fn authorize(&self, owner: &str, kernel_executable: &Path) -> io::Result<()> {
-        // Never canonicalize an untrusted peer path into an allowed alias.
-        if owner != self.owner
-            || kernel_executable != self.executable
-            || file_digest(kernel_executable)? != self.sha256
-        {
-            return Err(blocked());
+        self.authorize_classified(owner, kernel_executable)
+            .map_err(|error| error.error)
+    }
+
+    pub fn authorize_classified(
+        &self,
+        owner: &str,
+        kernel_executable: &Path,
+    ) -> Result<(), BrokerAuthorizationError> {
+        authorize_broker_identity(self, owner, kernel_executable)?;
+        let digest =
+            file_digest(kernel_executable).map_err(BrokerAuthorizationError::unavailable)?;
+        if digest != self.sha256 {
+            return Err(BrokerAuthorizationError::denied(
+                BrokerDenial::ExecutableDigestMismatch,
+            ));
         }
         Ok(())
     }
@@ -1377,9 +1463,13 @@ impl ProcessDispatcher {
             broker_authorization: BrokerAuthorizationCache::default(),
         })
     }
-    pub fn authorize_broker(&mut self, owner: &str, executable: &Path) -> io::Result<()> {
+    pub fn authorize_broker(
+        &mut self,
+        owner: &str,
+        executable: &Path,
+    ) -> Result<(), BrokerAuthorizationError> {
         self.broker_authorization
-            .authorize(&self.layout.broker, owner, executable)
+            .authorize_classified(&self.layout.broker, owner, executable)
     }
     pub fn handle(
         &mut self,

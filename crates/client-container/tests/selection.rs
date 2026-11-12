@@ -204,6 +204,74 @@ fn common_host_rejects_second_owner_before_constructing_secret_backend() {
     assert!(result.is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn duplicate_owner_cannot_recover_live_updater_staging() {
+    use nelomai_client_container::host::{prepare_host, CommonHost, HostNativePorts};
+    use nelomai_client_container::SelectionStartupError;
+    use nelomai_client_updater::PreparedCache;
+    use std::io::{self, Write};
+
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest(resources.path(), "0.4.0", false);
+    let records = Records::default();
+    let prepare = || {
+        prepare_host(
+            data.path(),
+            resources.path(),
+            Some(&key),
+            "linux",
+            "x86_64",
+            || records.clone(),
+        )
+    };
+    let primary = prepare().unwrap();
+    let cache_path = data.path().join("prepared-updates");
+    let cache = PreparedCache::open(cache_path.clone()).unwrap();
+    let mut staging = cache.begin().unwrap();
+    staging.write_all(b"active download").unwrap();
+    let recover = || -> Result<(), Box<dyn std::error::Error>> {
+        let _prepared = prepare()?;
+        PreparedCache::open(cache_path.clone())?.recover("0.4.0")?;
+        Ok(())
+    };
+    let assert_duplicate_rejected = || {
+        let failure = recover().unwrap_err();
+        assert!(matches!(
+            failure.downcast_ref::<SelectionStartupError>(),
+            Some(SelectionStartupError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(std::fs::read(staging.path()).unwrap(), b"active download");
+    };
+    assert_duplicate_rejected();
+    let host = CommonHost::from_prepared(
+        primary,
+        nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+        nelomai_client_container::RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Linux,
+            platform_version: None,
+            architecture: "x86_64".into(),
+        },
+        HostNativePorts {
+            stop: Arc::new(NoNativeWork),
+            force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+            background: Arc::new(NoNativeWork),
+            updater: None,
+            storage: None,
+            relaunch: None,
+        },
+    )
+    .unwrap();
+    assert_duplicate_rejected();
+    drop(host);
+    recover().unwrap();
+    assert!(
+        !staging.path().exists(),
+        "a new owner can recover stale staging"
+    );
+}
+
 #[test]
 fn common_host_preserves_runtime_record_across_version_rollback() {
     use nelomai_client_storage::{AuthStore, RuntimeStateStore};

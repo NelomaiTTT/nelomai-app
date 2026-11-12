@@ -7,7 +7,7 @@ use crate::{
 };
 use nelomai_client_container::startup_diagnostics as startup;
 use nelomai_client_container::{
-    host::{CommonHost, HostNativePorts},
+    host::{prepare_host, CommonHost, HostError, HostNativePorts},
     ipc::{BackgroundAction, PrivateBackgroundDispatcher},
     BrokerError, LocalAuthStop, NativeAuthFailure, NativeAuthRequest, RuntimeClientProfile,
     RuntimeForceStop,
@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
 };
 use tauri::Manager;
@@ -138,6 +138,32 @@ fn macos_installer_command(
         command.arg("--repair-download-metadata");
     }
     command
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_pre_auth_installer(command: &mut std::process::Command) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut stderr = tempfile::tempfile()?;
+    command.stderr(stderr.try_clone()?);
+    let status = platform::unix::installer_status(command)
+        .map_err(|_| io::Error::other("common installation failed"))?;
+    if status.success() {
+        return Ok(true);
+    }
+    if status.code() == Some(1) {
+        // osascript uses exit 1 for both cancellation and script failures.
+        // Its final numeric error is stable across locales. Keep stderr private.
+        const TAIL_BYTES: u64 = 128;
+        let size = stderr.metadata()?.len();
+        stderr.seek(SeekFrom::Start(size.saturating_sub(TAIL_BYTES)))?;
+        let mut tail = Vec::new();
+        stderr.take(TAIL_BYTES).read_to_end(&mut tail)?;
+        if tail.trim_ascii_end().ends_with(b" (-128)") {
+            return Ok(false);
+        }
+    }
+    Err(io::Error::other("common installation failed"))
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -420,9 +446,18 @@ pub(crate) struct CommonState {
     presentation: Mutex<TraySnapshot>,
     actions: Mutex<VecDeque<RuntimeAction>>,
     finishing: AtomicBool,
+    // Set after unexpected EOF cleanup is attempted. The native pump has gone,
+    // and a successful stop receipt remains valid through the window's Close.
+    runtime_failure_cleanup: OnceLock<bool>,
+}
+#[derive(Clone, Copy)]
+enum CommonFinish {
+    Quit,
+    Restart,
+    RuntimeFailure,
 }
 impl CommonState {
-    async fn finish(self: Arc<Self>, app: tauri::AppHandle, restart: bool) {
+    async fn finish(self: Arc<Self>, app: tauri::AppHandle, reason: CommonFinish) {
         if self.finishing.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -433,29 +468,42 @@ impl CommonState {
         if operation.exit_requested {
             return;
         }
-        let stopped = nelomai_client_container::desktop::stop_runtime_before_helper(
-            &self.stop.child,
-            async {
-                if operation.restart_proof(&self.host).is_ok() {
-                    return Ok(());
-                }
-                #[cfg(target_os = "macos")]
-                operation.check_request()?;
-                stop_helper_for_exit(&self.stop.tunnel)
-                    .await
-                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))
-            },
-        )
-        .await;
-        if stopped.is_err() {
-            self.finishing.store(false, Ordering::Release);
+        let mut stopped_for_replacement = false;
+        let stopped = self.runtime_failure_cleanup.get() == Some(&true)
+            || nelomai_client_container::desktop::stop_runtime_before_helper(
+                &self.stop.child,
+                async {
+                    if operation.restart_proof(&self.host).is_ok() {
+                        stopped_for_replacement = true;
+                        return Ok(());
+                    }
+                    #[cfg(target_os = "macos")]
+                    operation.check_request()?;
+                    stop_helper_for_exit(&self.stop.tunnel)
+                        .await
+                        .map_err(|_| io::Error::other("helper stop receipt unavailable"))
+                },
+            )
+            .await
+            .is_ok();
+        if !stopped {
             if let Ok(mut presentation) = self.presentation.lock() {
                 presentation.disconnect = true;
                 presentation.traffic = "Остановка VPN требует повторной попытки".into();
             }
+        }
+        if matches!(reason, CommonFinish::RuntimeFailure) && !stopped_for_replacement {
+            let _ = self.runtime_failure_cleanup.set(stopped);
+            self.finishing.store(false, Ordering::Release);
+            drop(operation);
+            present_runtime_failure(&app);
             return;
         }
-        if restart {
+        if !stopped {
+            self.finishing.store(false, Ordering::Release);
+            return;
+        }
+        if matches!(reason, CommonFinish::Restart) {
             #[cfg(target_os = "macos")]
             {
                 if crate::macos_launch::restart_after_exit(Path::new(
@@ -496,21 +544,38 @@ impl CommonState {
     }
 }
 pub(crate) fn queue_action(app: &tauri::AppHandle, action: RuntimeAction) -> bool {
+    if matches!(action, RuntimeAction::Show) {
+        if let Some(window) = app.get_webview_window("startup-failure") {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            return true;
+        }
+    }
     let Some(state) = app.try_state::<Arc<CommonState>>() else {
         return false;
     };
     let state = state.inner().clone();
-    let alive = state
-        .stop
-        .child
-        .lock()
-        .ok()
-        .and_then(|mut child| child.as_mut().map(|child| !child.exited().unwrap_or(true)))
-        .unwrap_or(false);
-    if !alive && matches!(action, RuntimeAction::Quit) {
+    let alive = || {
+        state
+            .stop
+            .child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.as_mut().map(|child| !child.exited().unwrap_or(true)))
+            .unwrap_or(false)
+    };
+    // The failure window may belong to Common while its child is still alive
+    // and unable to poll. Its Quit must go straight to guarded shutdown.
+    if matches!(action, RuntimeAction::Quit)
+        && (app
+            .try_state::<crate::support_diagnostics::CommonFailureStage>()
+            .is_some()
+            || state.runtime_failure_cleanup.get().is_some()
+            || !alive())
+    {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            state.finish(app, false).await;
+            state.finish(app, CommonFinish::Quit).await;
         });
         return true;
     }
@@ -531,21 +596,22 @@ pub(crate) fn tray_snapshot(app: &tauri::AppHandle) -> Option<TraySnapshot> {
     })
 }
 
+pub(crate) fn diagnostic_runtime_identity(
+    app: &tauri::AppHandle,
+) -> Option<nelomai_contracts::RuntimeIdentity> {
+    let state = app.try_state::<Arc<CommonState>>()?;
+    let child = state.stop.child.try_lock().ok()?;
+    child.as_ref()?;
+    // launch_desktop verifies the child's target against this frozen identity.
+    state.host.native_target().identity(None).ok()
+}
+
 pub(crate) fn update_presentation(app: &tauri::AppHandle) -> bool {
     let Some(state) = app.try_state::<Arc<CommonState>>() else {
         return false;
     };
     if let Some(offer) = state.host.take_update_notification() {
-        use tauri_plugin_notification::NotificationExt;
-        let _ = app
-            .notification()
-            .builder()
-            .title("Доступно обновление Nelomai")
-            .body(format!(
-                "Найдена версия {}. Откройте приложение для установки.",
-                offer.version
-            ))
-            .show();
+        desktop::notify_update(app, offer.version);
     }
     state
         .host
@@ -554,6 +620,7 @@ pub(crate) fn update_presentation(app: &tauri::AppHandle) -> bool {
         .unwrap_or(false)
 }
 pub fn run() {
+    const PRE_AUTH_STAGE: &str = "common.pre_auth_handoff";
     startup::stage("common.entry");
     if std::env::args().nth(1).as_deref() == Some("--verify-runtime-layout") {
         let result = (|| -> io::Result<()> {
@@ -583,33 +650,70 @@ pub fn run() {
         })();
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
-    startup::stage("common.pre_auth_handoff");
-    if pre_auth_handoff().unwrap_or_else(|error| {
-        startup::error("common.pre_auth_handoff", &error);
-        std::process::exit(1)
-    }) {
-        return;
+    startup::stage(PRE_AUTH_STAGE);
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        startup::error(
+            PRE_AUTH_STAGE,
+            &io::Error::other("product cannot run as root"),
+        );
+        std::process::exit(1);
     }
+    let pre_auth_reason = match pre_auth_handoff() {
+        Ok(PreAuthHandoff::Continue) => None,
+        #[cfg(target_os = "macos")]
+        Ok(PreAuthHandoff::Complete) => return,
+        #[cfg(unix)]
+        Ok(PreAuthHandoff::Declined(error)) => {
+            startup::error(PRE_AUTH_STAGE, &error);
+            std::process::exit(1);
+        }
+        Err(failure) => {
+            let reason = failure.code();
+            startup::error(PRE_AUTH_STAGE, &io::Error::other(reason));
+            Some(reason)
+        }
+    };
+    let diagnostics_only = pre_auth_reason.is_some();
     let builder = tauri::Builder::default();
-    #[cfg(windows)]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
-        queue_action(app, RuntimeAction::Show);
-    }));
+    let builder = if diagnostics_only {
+        builder
+    } else {
+        #[cfg(windows)]
+        let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+            queue_action(app, RuntimeAction::Show);
+        }));
+        builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_notification::init())
+    };
     let builder = builder
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_dialog::init())
+        .manage(crate::support_diagnostics::SupportReportState::default())
+        .invoke_handler(tauri::generate_handler![
+            crate::support_diagnostics::app_collect_support_diagnostics,
+            crate::support_diagnostics::app_save_support_diagnostics,
+            crate::support_diagnostics::app_send_support_diagnostics,
+        ])
+        .setup(move |app| {
+            let mut stage = PRE_AUTH_STAGE;
             let result = startup::setup(|| {
+                if diagnostics_only {
+                    return Ok(());
+                }
                 use base64::Engine;
-                startup::stage("common.resources");
+                stage = "common.resources";
+                startup::stage(stage);
                 let resources = installed_resources(app)?;
                 let data = app.path().app_data_dir()?;
                 // Establish the installed dispatcher identity before protected auth is
                 // initialized. This also gives shutdown an actual native stop peer on
                 // the first launch, before the user ever connects a tunnel.
-                startup::stage("native.prepare");
+                stage = "native.prepare";
+                startup::stage(stage);
                 tauri::async_runtime::block_on(prepare_native(app.handle().clone(), true))?;
-                startup::stage("common.public_key");
+                stage = "common.public_key";
+                startup::stage(stage);
                 let key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
                     .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
                     .transpose()?
@@ -634,20 +738,29 @@ pub fn run() {
                 #[cfg(not(target_os = "linux"))]
                 let fallback = None;
                 let api = nelomai_client_api::ClientApi::new(PANEL_BASE)?;
-                let updater = platform::updater::DesktopUpdateBackend::from_build(
-                    app.handle().clone(),
-                    api.clone(),
-                )
-                .ok()
-                .map(|backend| Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>);
-                startup::stage("common.open_host");
-                let host = Arc::new(CommonHost::open(
+                stage = "common.open_host";
+                startup::stage(stage);
+                let prepared = prepare_host(
                     &data,
                     &resources.join("runtime"),
                     Some(&key),
                     std::env::consts::OS,
                     std::env::consts::ARCH,
                     || nelomai_client_storage::SystemRecordFactory::new("primary", fallback),
+                )
+                .map_err(HostError::from)?;
+                app.manage(crate::support_diagnostics::SupportDataRoot(
+                    prepared.owner.root().to_owned(),
+                ));
+                // Updater cache recovery assumes this process is the only owner.
+                let updater = platform::updater::DesktopUpdateBackend::from_build(
+                    app.handle().clone(),
+                    api.clone(),
+                )
+                .ok()
+                .map(|backend| Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>);
+                let host = Arc::new(CommonHost::from_prepared(
+                    prepared,
                     api,
                     RuntimeClientProfile {
                         platform: crate::commands::current_platform(),
@@ -663,7 +776,8 @@ pub fn run() {
                         relaunch: None,
                     },
                 )?);
-                startup::stage("native.bind_identity");
+                stage = "native.bind_identity";
+                startup::stage(stage);
                 let target = host.native_target();
                 let runtime_resources = resources.join("runtime");
                 let installation =
@@ -694,9 +808,11 @@ pub fn run() {
                     })?;
                 }
                 native_binding.bind(engine)?;
-                startup::stage("runtime.launch");
+                stage = "runtime.launch";
+                startup::stage(stage);
                 let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
-                startup::stage("runtime.native_channel");
+                stage = "runtime.native_channel";
+                startup::stage(stage);
                 let native = child.take_native()?;
                 stop.exit_owner.runtime_launched();
                 *stop
@@ -710,6 +826,7 @@ pub fn run() {
                     presentation: Mutex::new(TraySnapshot::default()),
                     actions: Mutex::new(VecDeque::new()),
                     finishing: AtomicBool::new(false),
+                    runtime_failure_cleanup: OnceLock::new(),
                 });
                 app.manage(state.clone());
                 let scheduler = state.host.clone();
@@ -718,18 +835,18 @@ pub fn run() {
                 });
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
-                // A tray failure still needs the native pump to process Quit
-                // from the failure window and complete guarded child cleanup.
-                startup::stage("common.tray");
+                // Let the child finish native bootstrap while the tray starts.
+                stage = "common.tray";
+                startup::stage(stage);
                 desktop::setup_tray(app)?;
                 Ok(())
             });
-            if result.is_err() {
+            if diagnostics_only || result.is_err() {
                 // Tauri panics on setup Err inside macOS didFinishLaunching;
                 // unwinding across that Objective-C callback aborts the process.
                 // Keep protected records intact and show a separate, inert UI.
-                if let Err(error) = show_startup_failure(app) {
-                    startup::error("common.failure_window", error.as_ref());
+                if let Err(error) = show_startup_failure(app.handle(), stage, pre_auth_reason) {
+                    startup::error("common.failure_window", &error);
                     std::process::exit(1);
                 }
             }
@@ -768,14 +885,31 @@ pub fn run() {
     });
 }
 
-fn show_startup_failure(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let handle = app.handle().clone();
+fn show_startup_failure(
+    app: &tauri::AppHandle,
+    stage: &'static str,
+    reason: Option<&'static str>,
+) -> tauri::Result<()> {
+    if !app.manage(crate::support_diagnostics::CommonFailureStage(
+        stage, reason,
+    )) {
+        return Ok(());
+    }
+    let handle = app.clone();
+    let (asset, title) = if stage == "runtime.native_exit" {
+        (
+            "startup-failure.html#interrupted",
+            "Работа Nelomai прервана",
+        )
+    } else {
+        ("startup-failure.html", "Nelomai — ошибка запуска")
+    };
     let window = tauri::WebviewWindowBuilder::new(
-        &*app,
+        app,
         "startup-failure",
-        tauri::WebviewUrl::App("startup-failure.html".into()),
+        tauri::WebviewUrl::App(asset.into()),
     )
-    .title("Nelomai — ошибка запуска")
+    .title(title)
     .inner_size(560.0, 320.0)
     .resizable(false)
     .build()?;
@@ -790,6 +924,64 @@ fn show_startup_failure(app: &mut tauri::App) -> Result<(), Box<dyn std::error::
         }
     });
     Ok(())
+}
+
+fn present_runtime_failure(app: &tauri::AppHandle) {
+    startup::error(
+        "runtime.native_exit",
+        &io::Error::other("runtime native channel closed unexpectedly"),
+    );
+    // Tauri dispatches the build to its UI thread from this blocking worker.
+    // Creating WebView2 in an event handler can deadlock on Windows.
+    if let Err(error) = show_startup_failure(app, "runtime.native_exit", None) {
+        startup::error("common.failure_window", &error);
+        queue_action(app, RuntimeAction::Quit);
+    }
+}
+
+pub(crate) fn show_support_diagnostics(app: tauri::AppHandle) {
+    const LABEL: &str = "support-diagnostics";
+    static OPENING: Mutex<()> = Mutex::new(());
+
+    // The tray callback must return before creating a WebView2 window.
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(_opening) = OPENING.try_lock() else {
+            return;
+        };
+        let window = match app.get_webview_window(LABEL) {
+            Some(window) => window,
+            None => {
+                let built = tauri::WebviewWindowBuilder::new(
+                    &app,
+                    LABEL,
+                    tauri::WebviewUrl::App("startup-failure.html#support".into()),
+                )
+                .title("Nelomai — диагностика")
+                .inner_size(560.0, 380.0)
+                .visible(false)
+                .build();
+                let window = match built {
+                    Ok(window) => window,
+                    Err(error) => {
+                        startup::error("common.support_window", &error);
+                        return;
+                    }
+                };
+                let handle = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        // Closing Common's last window would ask the runtime to quit.
+                        api.prevent_close();
+                        let _ = handle.hide();
+                    }
+                });
+                window
+            }
+        };
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    });
 }
 
 fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: NativeStream) {
@@ -874,8 +1066,8 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                             NativeReply::Actions { actions }
                         }
                         NativeControl::Exit { reason } => {
-                            match reason {
-                                NativeExitReason::Shutdown => {}
+                            exit = Some(match reason {
+                                NativeExitReason::Shutdown => CommonFinish::Quit,
                                 NativeExitReason::Update => {
                                     if state
                                         .host
@@ -888,6 +1080,7 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                                     }
                                     tauri::async_runtime::block_on(state.stop.runtime_operation())?
                                         .restart_proof(&state.host)?;
+                                    CommonFinish::Restart
                                 }
                                 NativeExitReason::RuntimeSwitch => {
                                     if !state.host.runtime_restart_ready().map_err(|_| {
@@ -895,9 +1088,9 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                                     })? {
                                         return Err(io::Error::other("runtime switch not ready"));
                                     }
+                                    CommonFinish::Restart
                                 }
-                            }
-                            exit = Some(!matches!(reason, NativeExitReason::Shutdown));
+                            });
                             NativeReply::Done
                         }
                         #[cfg(windows)]
@@ -931,7 +1124,13 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
             Ok(body) => (tag, body),
             Err(_) => (255, b"common operation failed".to_vec()),
         };
-        if write_native_frame(&mut stream, response_tag, &response).is_err() {
+        let sent = write_native_frame(&mut stream, response_tag, &response);
+        // Once validated, explicit shutdown/restart still owns a closed reply.
+        if let Some(reason) = exit {
+            tauri::async_runtime::block_on(state.finish(app, reason));
+            return;
+        }
+        if sent.is_err() {
             break;
         }
         #[cfg(target_os = "macos")]
@@ -940,16 +1139,12 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                 break;
             }
         }
-        if let Some(restart) = exit {
-            tauri::async_runtime::block_on(state.finish(app, restart));
-            return;
-        }
     }
     // Intentional termination leaves the active transition in control through
     // helper acknowledgement and durable journal completion. Unsolicited EOF
     // still needs ordered finish; neither kind of EOF is a helper stop receipt.
     if state.stop.exit_owner.finish_on_native_eof() {
-        tauri::async_runtime::block_on(state.finish(app, false));
+        tauri::async_runtime::block_on(state.finish(app, CommonFinish::RuntimeFailure));
     }
 }
 async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>> {
@@ -1230,32 +1425,84 @@ fn protected_executable(path: &Path) -> bool {
     path.ancestors()
         .all(|path| nelomai_contracts::dispatcher::trusted(path, 0).is_ok())
 }
-fn pre_auth_handoff() -> io::Result<bool> {
-    let original = std::env::current_exe()?;
+enum PreAuthHandoff {
+    Continue,
+    #[cfg(target_os = "macos")]
+    Complete,
+    #[cfg(unix)]
+    Declined(io::Error),
+}
+
+enum PreAuthFailure {
+    CommonExecutableUnavailable,
     #[cfg(windows)]
-    nelomai_client_container::desktop::verify_protected_path(&original)?;
+    CommonExecutableUntrusted,
     #[cfg(unix)]
-    let executable = std::fs::canonicalize(original)?;
+    CandidateLayoutRejected,
     #[cfg(unix)]
-    {
-        if unsafe { libc::geteuid() } == 0 {
-            return Err(io::Error::other("product cannot run as root"));
+    InstalledLayoutRejected,
+    #[cfg(unix)]
+    InstallationPlanUnavailable,
+    #[cfg(target_os = "linux")]
+    InstallerInputUnavailable,
+    #[cfg(unix)]
+    InstallationFailed,
+    #[cfg(unix)]
+    InstalledCommonUntrusted,
+    #[cfg(unix)]
+    RelaunchFailed,
+}
+
+impl PreAuthFailure {
+    fn code(self) -> &'static str {
+        match self {
+            Self::CommonExecutableUnavailable => "common_executable_unavailable",
+            #[cfg(windows)]
+            Self::CommonExecutableUntrusted => "common_executable_untrusted",
+            #[cfg(unix)]
+            Self::CandidateLayoutRejected => "candidate_layout_rejected",
+            #[cfg(unix)]
+            Self::InstalledLayoutRejected => "installed_layout_rejected",
+            #[cfg(unix)]
+            Self::InstallationPlanUnavailable => "installation_plan_unavailable",
+            #[cfg(target_os = "linux")]
+            Self::InstallerInputUnavailable => "installer_input_unavailable",
+            #[cfg(unix)]
+            Self::InstallationFailed => "installation_failed",
+            #[cfg(unix)]
+            Self::InstalledCommonUntrusted => "installed_common_untrusted",
+            #[cfg(unix)]
+            Self::RelaunchFailed => "relaunch_failed",
         }
     }
+}
+
+fn pre_auth_handoff() -> Result<PreAuthHandoff, PreAuthFailure> {
+    use PreAuthFailure as Failure;
+
+    let original = std::env::current_exe().map_err(|_| Failure::CommonExecutableUnavailable)?;
+    #[cfg(windows)]
+    nelomai_client_container::desktop::verify_protected_path(&original)
+        .map_err(|_| Failure::CommonExecutableUntrusted)?;
+    #[cfg(unix)]
+    let executable =
+        std::fs::canonicalize(original).map_err(|_| Failure::CommonExecutableUnavailable)?;
     #[cfg(target_os = "macos")]
     {
         let source = executable
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
-            .ok_or_else(|| io::Error::other("common app bundle unavailable"))?;
+            .ok_or(Failure::CandidateLayoutRejected)?;
         let installed = Path::new("/Library/Application Support/Nelomai/common/Nelomai.app");
         let installed_exe = installed.join("Contents/MacOS/nelomai-app");
-        let candidate = verify_layout(&source.join("Contents/Resources/runtime"))?;
+        let candidate = verify_layout(&source.join("Contents/Resources/runtime"))
+            .map_err(|_| Failure::CandidateLayoutRejected)?;
         let existing = if installed.exists() {
-            Some(verify_layout(
-                &installed.join("Contents/Resources/runtime"),
-            )?)
+            Some(
+                verify_layout(&installed.join("Contents/Resources/runtime"))
+                    .map_err(|_| Failure::InstalledLayoutRejected)?,
+            )
         } else {
             None
         };
@@ -1269,9 +1516,10 @@ fn pre_auth_handoff() -> io::Result<bool> {
             protected,
             &executable,
             installed,
-        )?;
+        )
+        .map_err(|_| Failure::InstallationPlanUnavailable)?;
         if action == InstallationAction::Continue {
-            return Ok(false);
+            return Ok(PreAuthHandoff::Continue);
         }
         if action != InstallationAction::LaunchInstalled {
             if action == InstallationAction::InstallCandidate && existing.is_some() {
@@ -1279,28 +1527,34 @@ fn pre_auth_handoff() -> io::Result<bool> {
                     crate::macos_launch::require_closed_before_replacement(installed)
                 {
                     if error.kind() == io::ErrorKind::WouldBlock {
-                        crate::macos_launch::show_replacement_notice()?;
+                        let error = crate::macos_launch::show_replacement_notice()
+                            .err()
+                            .unwrap_or(error);
+                        return Ok(PreAuthHandoff::Declined(error));
                     }
-                    return Err(error);
+                    return Err(Failure::InstallationPlanUnavailable);
                 }
             }
-            let status = platform::unix::installer_status(&mut macos_installer_command(
+            if !run_macos_pre_auth_installer(&mut macos_installer_command(
                 action,
                 source,
                 installed,
                 unsafe { libc::getuid() },
             ))
-            .map_err(|_| io::Error::other("common installation failed"))?;
-            if !status.success() {
-                return Err(io::Error::other("common installation cancelled"));
+            .map_err(|_| Failure::InstallationFailed)?
+            {
+                return Ok(PreAuthHandoff::Declined(io::Error::other(
+                    "common installation cancelled",
+                )));
             }
         }
         if !protected_executable(&installed_exe) {
-            return Err(io::Error::other("installed common broker required"));
+            return Err(Failure::InstalledCommonUntrusted);
         }
-        verify_layout(&installed.join("Contents/Resources/runtime"))?;
-        crate::macos_launch::launch_application(installed)?;
-        Ok(true)
+        verify_layout(&installed.join("Contents/Resources/runtime"))
+            .map_err(|_| Failure::InstalledLayoutRejected)?;
+        crate::macos_launch::launch_application(installed).map_err(|_| Failure::RelaunchFailed)?;
+        Ok(PreAuthHandoff::Complete)
     }
     #[cfg(target_os = "linux")]
     {
@@ -1312,11 +1566,15 @@ fn pre_auth_handoff() -> io::Result<bool> {
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
-            .ok_or_else(|| io::Error::other("AppImage layout unavailable"))?;
+            .ok_or(Failure::CandidateLayoutRejected)?;
         let source_resources = source_dir.join("usr/lib/Nelomai");
-        let candidate = verify_layout(&source_resources.join("runtime"))?;
+        let candidate = verify_layout(&source_resources.join("runtime"))
+            .map_err(|_| Failure::CandidateLayoutRejected)?;
         let existing = if installed_resources.join("runtime").exists() {
-            Some(verify_layout(&installed_resources.join("runtime"))?)
+            Some(
+                verify_layout(&installed_resources.join("runtime"))
+                    .map_err(|_| Failure::InstalledLayoutRejected)?,
+            )
         } else {
             None
         };
@@ -1329,23 +1587,24 @@ fn pre_auth_handoff() -> io::Result<bool> {
             existing.as_ref().map(|runtime| runtime.container_version()),
             protected,
             executable == installed_exe,
-        )?;
+        )
+        .map_err(|_| Failure::InstallationPlanUnavailable)?;
         if action == InstallationAction::Continue {
-            return Ok(false);
+            return Ok(PreAuthHandoff::Continue);
         }
         if action != InstallationAction::LaunchInstalled {
             let archive = if action == InstallationAction::RepairInstalled {
                 installed.join("Nelomai.AppImage")
             } else {
                 PathBuf::from(
-                    std::env::var_os("APPIMAGE")
-                        .ok_or_else(|| io::Error::other("whole AppImage required"))?,
+                    std::env::var_os("APPIMAGE").ok_or(Failure::InstallerInputUnavailable)?,
                 )
             };
             let installed_script = installed.join("install-common-linux.sh");
             let candidate_script = source_resources.join("install-common-linux.sh");
-            let sha = nelomai_contracts::dispatcher::file_digest(&archive)?;
-            let status = linux_installation::run(
+            let sha = nelomai_contracts::dispatcher::file_digest(&archive)
+                .map_err(|_| Failure::InstallerInputUnavailable)?;
+            if !linux_installation::run(
                 &installed_script,
                 &candidate_script,
                 &archive,
@@ -1354,22 +1613,27 @@ fn pre_auth_handoff() -> io::Result<bool> {
                     platform::unix::installer_status(command)
                         .map_err(|_| io::Error::other("common installation failed"))
                 },
-            )?;
-            if !status.success() {
-                return Err(io::Error::other("common installation cancelled"));
+            )
+            .map_err(|_| Failure::InstallationFailed)?
+            {
+                return Ok(PreAuthHandoff::Declined(io::Error::other(
+                    "common installation cancelled",
+                )));
             }
         }
         if !protected_executable(&installed_exe) {
-            return Err(io::Error::other("installed common broker required"));
+            return Err(Failure::InstalledCommonUntrusted);
         }
-        verify_layout(&installed_resources.join("runtime"))?;
-        Err(std::process::Command::new(installed.join("AppDir/AppRun"))
+        verify_layout(&installed_resources.join("runtime"))
+            .map_err(|_| Failure::InstalledLayoutRejected)?;
+        let _ = std::process::Command::new(installed.join("AppDir/AppRun"))
             .env("APPIMAGE", installed.join("Nelomai.AppImage"))
             .env("APPDIR", installed.join("AppDir"))
-            .exec())
+            .exec();
+        Err(Failure::RelaunchFailed)
     }
     #[cfg(windows)]
-    Ok(false)
+    Ok(PreAuthHandoff::Continue)
 }
 
 #[cfg(test)]

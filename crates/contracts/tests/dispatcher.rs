@@ -454,6 +454,53 @@ fn broker_authorization_hashes_an_unchanged_file_once_and_rechecks_replacement()
 }
 
 #[test]
+fn broker_classifies_identity_digest_and_unavailable_denials() {
+    let directory = tempfile::tempdir().unwrap();
+    let broker = directory.path().join("broker");
+    fs::write(&broker, b"verified").unwrap();
+    let policy = BrokerPolicy {
+        owner: "501".into(),
+        executable: broker.clone(),
+        sha256: digest(b"verified"),
+        manifest_sha256: "a".repeat(64),
+    };
+    let mut cache = BrokerAuthorizationCache::default();
+    assert!(cache.authorize_classified(&policy, "501", &broker).is_ok());
+    for (owner, path, reason) in [
+        ("502", broker.as_path(), BrokerDenial::UidMismatch),
+        ("501", Path::new("/elsewhere"), BrokerDenial::PathMismatch),
+    ] {
+        assert_eq!(
+            cache
+                .authorize_classified(&policy, owner, path)
+                .unwrap_err()
+                .reason,
+            reason
+        );
+        assert_eq!(
+            policy.authorize_classified(owner, path).unwrap_err().reason,
+            reason
+        );
+    }
+    fs::write(&broker, b"different length").unwrap();
+    assert_eq!(
+        cache
+            .authorize_classified(&policy, "501", &broker)
+            .unwrap_err()
+            .reason,
+        BrokerDenial::ExecutableDigestMismatch
+    );
+    fs::remove_file(&broker).unwrap();
+    assert_eq!(
+        cache
+            .authorize_classified(&policy, "501", &broker)
+            .unwrap_err()
+            .reason,
+        BrokerDenial::ExecutableUnavailableOrChanged
+    );
+}
+
+#[test]
 fn inherited_scm_primitive_rejects_paths_and_unknown_operations() {
     for value in [
         serde_json::json!({"engine_primitive":"start_wireguard","executable":"C:/evil.exe"}),

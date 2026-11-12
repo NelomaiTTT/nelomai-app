@@ -299,10 +299,7 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
             return None;
         }
         let offer = state.offer.as_ref()?.offer.clone();
-        if state.consent
-            || state.presented.contains(&offer.version)
-            || state.deferred.as_ref() == Some(&offer.version)
-        {
+        if state.consent || state.deferred.as_ref() == Some(&offer.version) {
             return None;
         }
         state
@@ -412,7 +409,10 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
             .prepared
             .clone();
         let prepared = if let Some(prepared) = cached {
-            prepared.revalidate_async().await?;
+            prepared
+                .revalidate_async()
+                .await
+                .map_err(|error| error.at_stage("verification"))?;
             prepared
         } else {
             {
@@ -454,7 +454,10 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
                 return Err(UpdateBackendError::new("update_offer_changed").into());
             }
             self.authority(offer, access).await?;
-            prepared.revalidate_async().await?;
+            prepared
+                .revalidate_async()
+                .await
+                .map_err(|error| error.at_stage("verification"))?;
             let mut state = self.state.lock().expect("update state poisoned");
             state.prepared = Some(prepared.clone());
             prepared
@@ -472,7 +475,11 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         }
         // The package named by Yes must still be offered by the authenticated
         // server. Cached bytes or matching version alone are not fresh authority.
-        let fresh = self.backend.resolve(access, &offer.offer.version).await?;
+        let fresh = self
+            .backend
+            .resolve(access, &offer.offer.version)
+            .await
+            .map_err(|error| error.at_stage("manifest"))?;
         if fresh.as_ref() != Some(&offer.resolved) {
             return Err(UpdateBackendError::new("update_offer_changed").into());
         }
@@ -480,7 +487,10 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         // The owned operation retains the gate and journal through their result.
         let installation = self.installation_gate.clone().lock_owned().await;
         self.authority(offer, access).await?;
-        prepared.revalidate_async().await?;
+        prepared
+            .revalidate_async()
+            .await
+            .map_err(|error| error.at_stage("verification"))?;
         let foreground = self.ui_foreground();
         {
             let mut state = self.state.lock().expect("update state poisoned");
@@ -509,7 +519,10 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
             let result: Result<UpdatePhase, UpdateError> = async {
                 let stopped = barrier.prepare(&offer.offer.version).await?;
                 let result = async {
-                    prepared.revalidate_async().await?;
+                    prepared
+                        .revalidate_async()
+                        .await
+                        .map_err(|error| error.at_stage("verification"))?;
                     barrier.validate_authority(&access).await?;
                     let (current, foreground) = {
                         let state = state.lock().expect("update state poisoned");
@@ -528,6 +541,7 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
                     backend
                         .install_prepared(&prepared, stopped)
                         .await
+                        .map_err(|error| error.at_stage("installer"))
                         .map_err(UpdateError::from)
                 }
                 .await;

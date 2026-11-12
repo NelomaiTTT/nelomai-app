@@ -147,6 +147,7 @@ pub fn run_manager_service() -> Result<(), ServiceError> {
 }
 
 fn manager_service_entry(_arguments: Vec<OsString>) {
+    crate::broker_diagnostics::start();
     record_service_message(
         "manager lifecycle",
         &format!(

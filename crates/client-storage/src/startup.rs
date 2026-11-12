@@ -238,7 +238,6 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error.into()),
     };
-    let legacy = records.legacy().load()?;
     let staging = ProtectedTransactionStore::new(
         records.record(&format!("{}:pending-write-v1", selected_paths.namespace())),
         selected_paths.clone(),
@@ -256,7 +255,9 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     if migration_complete && split_exists {
         return recovery();
     }
-    if !migration_complete && (legacy.is_some() || migration_record.is_some()) {
+    // The completed migration leaves the legacy identity for pre-split rollback.
+    // Modern startup no longer needs to read that Keychain item.
+    if !migration_complete && (records.legacy().load()?.is_some() || migration_record.is_some()) {
         // A legacy source is not provenance for another occupied runtime.
         // Only a committed common inventory can anchor those retained records.
         if occupied.iter().any(|namespace| {

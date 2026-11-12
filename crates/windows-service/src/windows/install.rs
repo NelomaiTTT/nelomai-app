@@ -749,7 +749,12 @@ pub(crate) fn slot_config_path(slot: TunnelSlot) -> Result<PathBuf, ServiceError
 }
 
 pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
-    record_service_message(context, &error.to_string());
+    match error {
+        ServiceError::BrokerRejected(reason) => {
+            record_service_message(context, &format!("broker rejected: {}", reason.code()))
+        }
+        _ => record_service_message(context, &error.to_string()),
+    }
 }
 
 pub(crate) fn read_service_diagnostics() -> Result<String, ServiceError> {

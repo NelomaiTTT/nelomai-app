@@ -30,9 +30,9 @@ class DesktopReleaseTest(ArtifactFixture):
         gates = module("release-candidate-gates")
         self.assertEqual(set(gates.PACKAGE_NAMES), {"linux", "windows", "macos"})
         self.assertEqual(len(gates.PUBLISH_ASSETS), 17)
-        self.assertIn("nelomai-0.4.2-macos-aarch64.dmg", gates.PUBLISH_ASSETS)
-        self.assertIn("nelomai-0.4.2-macos-aarch64.dmg.sig", gates.PUBLISH_ASSETS)
-        self.assertNotIn("nelomai-0.4.2-macos-aarch64.app.tar.gz", gates.PUBLISH_ASSETS)
+        self.assertIn("nelomai-0.4.3-macos-aarch64.dmg", gates.PUBLISH_ASSETS)
+        self.assertIn("nelomai-0.4.3-macos-aarch64.dmg.sig", gates.PUBLISH_ASSETS)
+        self.assertNotIn("nelomai-0.4.3-macos-aarch64.app.tar.gz", gates.PUBLISH_ASSETS)
         self.assertFalse(any("android" in name for name in gates.PUBLISH_ASSETS))
 
     def test_required_bullet_changelog_rejects_empty_prose_and_preserves_shell_text(self):
@@ -80,7 +80,7 @@ class DesktopReleaseTest(ArtifactFixture):
         environment = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
             "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REPOSITORY": "NelomaiTTT/nelomai-app",
             "GITHUB_REF": "refs/heads/Future/desktop-0.4.0", "SOURCE_SHA": source, "GITHUB_SHA": source,
-            "RELEASE_VERSION": "0.4.2", "RELEASE_NOTES": "- Исправлена ошибка"}
+            "RELEASE_VERSION": "0.4.3", "RELEASE_NOTES": "- Исправлена ошибка"}
         def run(changes):
             return subprocess.run(["bash", "-c", program], cwd=repo,
                 env={**environment, **changes}, capture_output=True).returncode

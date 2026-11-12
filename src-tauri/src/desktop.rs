@@ -21,6 +21,7 @@ use tauri::{
 
 const SHOW_ID: &str = "tray-show";
 const TOGGLE_ID: &str = "tray-toggle";
+const DIAGNOSTICS_ID: &str = "tray-diagnostics";
 const QUIT_ID: &str = "tray-quit";
 const TRAY_ID: &str = "nelomai-main-tray";
 const TRAY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -63,8 +64,9 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
         false,
         None::<&str>,
     )?;
+    let diagnostics = MenuItem::with_id(app, DIAGNOSTICS_ID, "Диагностика", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, QUIT_ID, "Выйти", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &toggle, &traffic, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &toggle, &traffic, &diagnostics, &quit])?;
     let menu_state = Arc::new(TrayMenuState {
         toggle: toggle.clone(),
         traffic: traffic.clone(),
@@ -86,6 +88,7 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             SHOW_ID => show_window(app),
             TOGGLE_ID => toggle_connection(app.clone()),
+            DIAGNOSTICS_ID => crate::container::show_support_diagnostics(app.clone()),
             QUIT_ID => quit_application(app.clone()),
             _ => {}
         })
@@ -135,8 +138,7 @@ fn tray_disconnect_action(
 }
 
 pub(crate) async fn runtime_presentation(app: &AppHandle) -> crate::runtime::TraySnapshot {
-    // Report native visibility through the admitted V2 channel. An unavailable
-    // window query suppresses banners; it must not be interpreted as hidden.
+    // Report native visibility through the admitted V2 channel.
     let visible = app
         .get_webview_window("main")
         .and_then(|window| {
@@ -195,6 +197,69 @@ pub(crate) async fn runtime_presentation(app: &AppHandle) -> crate::runtime::Tra
     crate::runtime::TraySnapshot {
         disconnect: presentation.toggle_text == "Отключить VPN",
         traffic: presentation.traffic_text,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn notify_update(app: &AppHandle, version: String) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let _ = app
+        .notification()
+        .builder()
+        .title("Доступно обновление Nelomai")
+        .body(format!(
+            "Найдена версия {version}. Откройте приложение для установки."
+        ))
+        .show();
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn notify_update(app: &AppHandle, version: String) {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSBundle, NSError, NSString};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+        UNUserNotificationCenter,
+    };
+
+    let scheduled = app.run_on_main_thread(move || {
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            eprintln!("Nelomai update notification: application bundle unavailable");
+            return;
+        }
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let authorized = RcBlock::new(move |granted: Bool, error: *mut NSError| {
+            if !granted.as_bool() || !error.is_null() {
+                eprintln!("Nelomai update notification: macOS did not grant alert authorization");
+                return;
+            }
+            let content = UNMutableNotificationContent::new();
+            content.setTitle(&NSString::from_str("Доступно обновление Nelomai"));
+            content.setBody(&NSString::from_str(&format!(
+                "Найдена версия {version}. Откройте приложение для установки."
+            )));
+            let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+                &NSString::from_str(&format!("nelomai-update-{version}")),
+                &content,
+                None,
+            );
+            let submitted = RcBlock::new(|error: *mut NSError| {
+                if !error.is_null() {
+                    eprintln!("Nelomai update notification: macOS rejected the request");
+                }
+            });
+            UNUserNotificationCenter::currentNotificationCenter()
+                .addNotificationRequest_withCompletionHandler(&request, Some(&submitted));
+        });
+        center.requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert,
+            &authorized,
+        );
+    });
+    if scheduled.is_err() {
+        eprintln!("Nelomai update notification: main thread unavailable");
     }
 }
 

@@ -36,9 +36,9 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
     def test_android_shipping_requires_current_latest_and_pinned_stable(self):
         checker = module("android/check-container-apk")
         gates = module("release-candidate-gates")
-        manifest = dict(container_version="0.4.2", stable_release_set_sha256=gates.STABLE_ROOT_SHA256,
+        manifest = dict(container_version="0.4.3", stable_release_set_sha256=gates.STABLE_ROOT_SHA256,
             stable_platform_manifest_sha256="d" * 64,
-            slots=[dict(slot="latest", manifest=dict(runtime_version="0.4.2")),
+            slots=[dict(slot="latest", manifest=dict(runtime_version="0.4.3")),
                    dict(slot="stable", manifest=dict(runtime_version=STABLE_VERSION, source_commit=gates.STABLE_SOURCE))])
         checker.verify_slots(manifest, root_digest=gates.STABLE_ROOT_SHA256, stable_digest="d" * 64)
         for change in ({"slots": manifest["slots"][:1]}, {"stable_release_set_sha256": "0" * 64}):
@@ -58,19 +58,19 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         for path in (self.root / "root-index").iterdir():
             shutil.copyfile(path, stable / path.name)
         drafts = self.root / "drafts"
-        for platform, architecture in module("verify-runtime-artifact").release_targets("0.4.2"):
+        for platform, architecture in module("verify-runtime-artifact").release_targets("0.4.3"):
             folder = drafts / platform
             folder.mkdir(parents=True)
             for keyname in ("draft-public-key.raw", "runtime-public-key.raw"):
                 shutil.copyfile(self.public, folder / keyname)
             old = f"nelomai-runtime-{STABLE_VERSION}-{platform}-{architecture}"
-            new = f"nelomai-runtime-0.4.2-{platform}-{architecture}"
+            new = f"nelomai-runtime-0.4.3-{platform}-{architecture}"
             for slot in ("stable", "latest"):
                 target = folder / slot
                 target.mkdir()
                 shutil.copyfile(stable / (old + ".zip"), target / (new + ".zip"))
                 doc = json.loads((stable / (old + ".manifest.json")).read_bytes())
-                doc.update(runtime_version="0.4.2", source_commit="b" * 40)
+                doc.update(runtime_version="0.4.3", source_commit="b" * 40)
                 raw = aggregate.canonical(doc)
                 (target / (new + ".manifest.json")).write_bytes(raw)
                 (target / (new + ".manifest.sig")).write_bytes(
@@ -85,12 +85,12 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         with patch.object(signer.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(signer.gates, "STABLE_ROOT_SHA256", digest):
             current_digest = signer.sign(drafts, signed, "b" * 40, self.keyfile, self.public,
-                version="0.4.2", confirmed_stable=stable, stable_public_key=self.public)
+                version="0.4.3", confirmed_stable=stable, stable_public_key=self.public)
         with patch.object(stage.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(stage.gates, "STABLE_ROOT_SHA256", digest):
             output = self.root / "staged"
             stage.stage_signed(signed, current_digest, output, self.public, "linux", "x86_64", "b" * 40, "shipping")
-            for slot, version in (("latest", "0.4.2"), ("stable", STABLE_VERSION)):
+            for slot, version in (("latest", "0.4.3"), ("stable", STABLE_VERSION)):
                 for path in self.payload.rglob("*"):
                     if path.is_file():
                         self.assertEqual(path.read_bytes(),
@@ -109,18 +109,18 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         with patch.object(signer.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(signer.gates, "STABLE_ROOT_SHA256", digest):
             signer.sign(drafts, self.root / "signed", "b" * 40, self.keyfile, self.public,
-                        version="0.4.2", confirmed_stable=stable, stable_public_key=self.public)
+                        version="0.4.3", confirmed_stable=stable, stable_public_key=self.public)
         archived = self.root / "signed/confirmed-stable"
         self.assertEqual(before, {p.name: p.read_bytes() for p in archived.iterdir()})
         verifier = module("verify-runtime-artifact")
-        for platform, arch in verifier.release_targets("0.4.2"):
+        for platform, arch in verifier.release_targets("0.4.3"):
             folder = self.root / "signed/containers" / platform / "shipping"
             container = verifier.authenticated("container", folder / "container-manifest-v1.json",
                 folder / "container-manifest-v1.sig", self.public, platform, arch)
-            self.assertEqual(container["container_version"], "0.4.2")
+            self.assertEqual(container["container_version"], "0.4.3")
             self.assertEqual([(s["slot"], s["manifest"]["runtime_version"], s["manifest"]["source_commit"])
                               for s in container["slots"]],
-                             [("latest", "0.4.2", "b" * 40), ("stable", STABLE_VERSION, SOURCE)])
+                             [("latest", "0.4.3", "b" * 40), ("stable", STABLE_VERSION, SOURCE)])
             self.assertEqual(container["stable_release_set_sha256"], digest)
             name = f"nelomai-runtime-{STABLE_VERSION}-{platform}-{arch}.manifest.json"
             self.assertEqual(container["stable_platform_manifest_sha256"], hashlib.sha256(before[name]).hexdigest())
@@ -131,16 +131,16 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         signer = module("sign-runtime-candidate")
         with self.assertRaisesRegex(ValueError, "confirmed stable"):
             signer.sign(drafts, self.root / "missing", "b" * 40, self.keyfile, self.public,
-                        version="0.4.2")
+                        version="0.4.3")
         with patch.object(signer.gates, "STABLE_SOURCE", SOURCE), \
              patch.object(signer.gates, "STABLE_ROOT_SHA256", "0" * 64):
             with self.assertRaises(Exception):
                 signer.sign(drafts, self.root / "wrong-root", "b" * 40, self.keyfile, self.public,
-                            version="0.4.2", confirmed_stable=stable, stable_public_key=self.public)
+                            version="0.4.3", confirmed_stable=stable, stable_public_key=self.public)
         with patch.object(signer.gates, "STABLE_SOURCE", "c" * 40), \
              patch.object(signer.gates, "STABLE_ROOT_SHA256", digest):
             with self.assertRaisesRegex(ValueError, "identity"):
                 signer.sign(drafts, self.root / "wrong-source", "b" * 40, self.keyfile, self.public,
-                            version="0.4.2", confirmed_stable=stable, stable_public_key=self.public)
+                            version="0.4.3", confirmed_stable=stable, stable_public_key=self.public)
         for name in ("missing", "wrong-root", "wrong-source"):
             self.assertFalse((self.root / name).exists())

@@ -4,7 +4,10 @@ mod prepared;
 pub use android::{AndroidApkInstaller, AndroidUpdateBackend};
 use nelomai_client_api::AccessSnapshot;
 use nelomai_contracts::UpdateState;
-pub use prepared::{PreparedCache, PreparedUpdate, ResolvedUpdate};
+pub use prepared::{
+    DownloadValidator, PartialDownload, PreparedCache, PreparedUpdate, ResolvedUpdate,
+    ResumedDownload, StagedFile,
+};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -253,15 +256,49 @@ pub enum InstallResult {
 #[error("update backend failed: {code}")]
 pub struct UpdateBackendError {
     code: String,
+    stage: Option<&'static str>,
+    progress: Option<DownloadProgress>,
 }
 
 impl UpdateBackendError {
     pub fn new(code: impl Into<String>) -> Self {
-        Self { code: code.into() }
+        Self {
+            code: code.into(),
+            stage: None,
+            progress: None,
+        }
     }
 
     pub fn code(&self) -> &str {
         &self.code
+    }
+
+    pub fn manifest_temporarily_unavailable() -> Self {
+        Self::new("update_manifest_temporarily_unavailable")
+    }
+
+    pub fn is_manifest_temporarily_unavailable(&self) -> bool {
+        self.code == "update_manifest_temporarily_unavailable"
+    }
+
+    pub fn at_stage(mut self, stage: &'static str) -> Self {
+        if self.stage.is_none() {
+            self.stage = Some(stage);
+        }
+        self
+    }
+
+    pub fn stage(&self) -> Option<&'static str> {
+        self.stage
+    }
+
+    pub fn with_progress(mut self, progress: DownloadProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn progress(&self) -> Option<DownloadProgress> {
+        self.progress
     }
 }
 
@@ -344,6 +381,63 @@ pub enum UpdateError {
     Backend(#[from] UpdateBackendError),
     #[error(transparent)]
     Barrier(#[from] UpdateBarrierError),
+}
+
+/// Fixed error codes that may be recorded and attached to support reports.
+pub fn is_diagnostic_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "common_installer_untrusted"
+            | "helper_owner_is_root"
+            | "installed_update_version_mismatch"
+            | "invalid_update_endpoint"
+            | "untrusted_update_artifact"
+            | "unsupported_update_package"
+            | "unsupported_update_target"
+            | "update_auth_changed"
+            | "update_authority_unavailable"
+            | "update_cache_invalid"
+            | "update_cache_unavailable"
+            | "update_check_failed"
+            | "update_consent_required"
+            | "update_download_encoding_invalid"
+            | "update_download_failed"
+            | "update_download_http_rejected"
+            | "update_download_http_server_error"
+            | "update_download_http_unauthorized"
+            | "update_download_http_unavailable"
+            | "update_download_incomplete"
+            | "update_download_interrupted"
+            | "update_download_length_invalid"
+            | "update_download_range_invalid"
+            | "update_download_request_failed"
+            | "update_download_timeout"
+            | "update_hash_mismatch"
+            | "update_identity_invalid"
+            | "update_install_failed"
+            | "update_install_in_progress"
+            | "update_install_outcome_unknown"
+            | "update_journal_failed"
+            | "update_manifest_temporarily_unavailable"
+            | "update_offer_changed"
+            | "update_operation_failed"
+            | "update_package_in_use"
+            | "update_package_too_large"
+            | "update_protocol_unsupported"
+            | "update_recovery_failed"
+            | "update_shutdown_failed"
+            | "update_signature_invalid"
+            | "update_staging_failed"
+            | "update_stop_proof_changed"
+            | "update_stop_proof_unavailable"
+            | "update_transport_unavailable"
+            | "update_ui_background"
+            | "update_verification_failed"
+            | "update_version_changed"
+            | "updater_authorization_failed"
+            | "updater_configuration_failed"
+            | "updater_public_key_missing"
+    )
 }
 
 mod coordinator;
