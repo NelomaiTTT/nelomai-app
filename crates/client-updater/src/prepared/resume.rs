@@ -9,6 +9,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(windows)]
+mod windows_identity;
 #[cfg(any(windows, test))]
 mod windows_security;
 
@@ -115,7 +117,7 @@ pub(super) struct FileIdentity {
     created: Option<(u64, u32)>,
     #[cfg(windows)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    object_id: Option<[u8; 16]>,
+    windows_token: Option<[u8; 16]>,
 }
 
 impl FileIdentity {
@@ -127,10 +129,8 @@ impl FileIdentity {
             return false;
         }
         #[cfg(windows)]
-        if let Some(object_id) = self.object_id {
-            use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
-            return windows_object_id(file, FSCTL_GET_OBJECT_ID)
-                .is_ok_and(|actual| actual == Some(object_id));
+        if let Some(token) = self.windows_token {
+            return windows_identity::read(file).is_ok_and(|actual| actual == Some(token));
         }
         self.created == identity.created
     }
@@ -844,8 +844,6 @@ fn recover_claim(
         || (super::is_staging_entry(&record.original)
             && !super::staging_file_has_no_other_writers(&file))
     {
-        #[cfg(all(test, windows))]
-        tests::trace_claim_identity(&record, &file, &path);
         return;
     }
     let slot = CHECKPOINTS
@@ -973,16 +971,10 @@ pub(super) fn file_identity(file: &File) -> Result<FileIdentity, UpdateBackendEr
     let identity = durable_file_identity(file)?.ok_or_else(cache_error)?;
     #[cfg(windows)]
     let identity = {
-        use windows_sys::Win32::System::Ioctl::FSCTL_CREATE_OR_GET_OBJECT_ID;
-
         let mut identity = identity;
-        if identity.object_id.is_none() {
-            // Assign on an owned staging handle before the first publication.
-            // NTFS may tunnel the destination's creation time on rename, but
-            // preserves an object ID that the source already has.
-            identity.object_id = windows_object_id(file, FSCTL_CREATE_OR_GET_OBJECT_ID)?;
-            if identity.object_id.is_some() {
-                file.sync_all().map_err(|_| cache_error())?;
+        if identity.windows_token.is_none() {
+            identity.windows_token = windows_identity::create(file).map_err(|_| cache_error())?;
+            if identity.windows_token.is_some() {
                 identity.created = None;
             }
         }
@@ -997,11 +989,9 @@ fn durable_file_identity(file: &File) -> Result<Option<FileIdentity>, UpdateBack
     };
     #[cfg(windows)]
     let identity = {
-        use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
-
         let mut identity = identity;
-        identity.object_id = windows_object_id(file, FSCTL_GET_OBJECT_ID)?;
-        if identity.object_id.is_some() {
+        identity.windows_token = windows_identity::read(file).map_err(|_| cache_error())?;
+        if identity.windows_token.is_some() {
             identity.created = None;
         }
         identity
@@ -1054,7 +1044,7 @@ fn file_stat_identity(file: &File) -> Result<Option<FileIdentity>, UpdateBackend
         index,
         created,
         #[cfg(windows)]
-        object_id: None,
+        windows_token: None,
     }))
 }
 
@@ -1122,50 +1112,6 @@ fn windows_file_identity(file: &File) -> Result<(u32, u32, u32), UpdateBackendEr
         info.nFileIndexHigh,
         info.nFileIndexLow,
     ))
-}
-
-#[cfg(windows)]
-fn windows_object_id(file: &File, control: u32) -> Result<Option<[u8; 16]>, UpdateBackendError> {
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED,
-    };
-    use windows_sys::Win32::System::Ioctl::{FILE_OBJECTID_BUFFER, FSCTL_GET_OBJECT_ID};
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-
-    let mut object = FILE_OBJECTID_BUFFER::default();
-    let capacity = size_of::<FILE_OBJECTID_BUFFER>() as u32;
-    let mut written = 0;
-    // The cache opens synchronous handles. Both output buffers live until the call returns.
-    if unsafe {
-        DeviceIoControl(
-            file.as_raw_handle(),
-            control,
-            null(),
-            0,
-            (&mut object as *mut FILE_OBJECTID_BUFFER).cast(),
-            capacity,
-            &mut written,
-            null_mut(),
-        )
-    } == 0
-    {
-        match unsafe { GetLastError() } {
-            ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED => return Ok(None),
-            ERROR_FILE_NOT_FOUND if control == FSCTL_GET_OBJECT_ID => return Ok(None),
-            error => {
-                #[cfg(test)]
-                eprintln!("cache object id query control={control} code={error}");
-                let _ = error;
-                return Err(cache_error());
-            }
-        }
-    }
-    if written != capacity || object.ObjectId == [0; 16] {
-        return Err(cache_error());
-    }
-    Ok(Some(object.ObjectId))
 }
 
 #[cfg(test)]
@@ -1557,43 +1503,6 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(windows)]
-    pub(super) fn trace_claim_identity(record: &ClaimRecord, file: &File, path: &Path) {
-        use windows_sys::Win32::System::Ioctl::FSCTL_GET_OBJECT_ID;
-
-        let stat = file_stat_identity(file).ok().flatten();
-        let object = windows_object_id(file, FSCTL_GET_OBJECT_ID);
-        eprintln!(
-            "cache claim refused name={} acl={} stat={} same_file={} has_id={} id_result={} same_id={} path={}",
-            record.original,
-            windows_security::private_file(file),
-            stat.is_some(),
-            stat.as_ref().is_some_and(|stat| stat.volume == record.identity.volume && stat.index == record.identity.index),
-            record.identity.object_id.is_some(),
-            match &object { Ok(Some(_)) => "present", Ok(None) => "missing", Err(_) => "error" },
-            object.is_ok_and(|id| id == record.identity.object_id),
-            open_partial_metadata(file, path).is_ok()
-        );
-    }
-
-    #[cfg(windows)]
-    fn trace_collision_data(stage: &str, claim: &ClaimedEntry, data_path: &Path) {
-        let record: ClaimRecord =
-            serde_json::from_slice(&fs::read(claim.directory.join(CLAIM_IDENTITY)).unwrap())
-                .unwrap();
-        let claimed_path = claim.entry();
-        let file = open_partial(&claimed_path, false).unwrap();
-        eprintln!(
-            "cache collision phase={stage} claim_private={}",
-            private_directory(&claim.directory).unwrap()
-        );
-        trace_claim_identity(&record, &file, &claimed_path);
-        if let Ok(foreign) = open_partial(data_path, false) {
-            eprintln!("cache collision canonical object");
-            trace_claim_identity(&record, &foreign, data_path);
-        }
-    }
-
     #[test]
     fn startup_preserves_a_checkpoint_claim_until_the_foreign_sidecar_is_gone() {
         let (root, cache, descriptor) = partial_fixture();
@@ -1736,11 +1645,7 @@ mod tests {
         let sidecar = cache.root.join(PARTIAL_METADATA);
         let checkpoint = fs::read(&sidecar).unwrap();
         assert!(!data_path.exists());
-        #[cfg(windows)]
-        trace_collision_data("before-occupant", &claim, &data_path);
         fs::write(&data_path, b"foreign data").unwrap();
-        #[cfg(windows)]
-        trace_collision_data("after-occupant", &claim, &data_path);
         drop((claim, resumed, cache));
 
         let cache = PreparedCache::open(root.path().join("packages")).unwrap();

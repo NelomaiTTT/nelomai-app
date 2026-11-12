@@ -458,6 +458,8 @@ impl PreparedCache {
             let record_path = staging_record_path(file.path()).ok_or_else(cache_error)?;
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
+            #[cfg(windows)]
+            options.read(true); // Query the ownership record's extended attribute.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
