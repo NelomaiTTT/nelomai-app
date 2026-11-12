@@ -11,7 +11,8 @@ import { viewForAppState } from "./app-model";
 // as controller errors; the test does not implement its own restore loop.
 const script = page.match(/<script lang="ts">([\s\S]*?)<\/script>/)![1];
 const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true);
-const names = ["restore", "applyBootstrap", "retryPendingStartup", "wakeStartup", "isAndroidRuntime", "logout", "applyRuntimeChannelClosure"];
+const names = ["restore", "applyBootstrap", "retryPendingStartup", "wakeStartup", "isAndroidRuntime", "logout",
+  "finishLogout", "observeUpdateStatus", "applyRuntimeChannelClosure"];
 const functions = ast.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text ?? ""))
   .map(node => node.getText(ast)).join("\n");
 const handlers: string[] = [];
@@ -44,7 +45,7 @@ function fixture(call: () => Promise<unknown>) {
   const context: Record<string, any> = {
     runtimeChannelClosed: false, bootstrapPending: false, ownedConnectionIntentNotice: null, busy: false, bootstrap: null, runtimeSelectionBusy: false, runtimeStatus: null,
     connectionActionState: initialConnectionActionState(), startupRetry: new StartupRetry(),
-    startupPending: false, refreshPending: false, startupSlow: false, startupTimer: null,
+    startupPending: false, restoringLogout: false, refreshPending: false, startupSlow: false, startupTimer: null,
     localStopPendingCleanup: false, diagnosticsStatus: null, error: null, view: "unavailable",
     phase: "server_unavailable", pinnedStray: null, selectedLayer: "tic", ticConnectionMode: "personal",
     routeMode: "via_tak", connection: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
@@ -59,7 +60,8 @@ function fixture(call: () => Promise<unknown>) {
     synchronizeRuntimeState: async () => {}, clearUpdateTimer: () => {},
     nativeClient: {bootstrap: call, state: async () => readyState, wakeConnectionIntent: async () => {},
       recordStartupStage: () => {}, logout: async () => {}},
-    peers: [], selectedPeerId: "", password: "", updateStatus: null, splitTunnelState: null,
+    peers: [], selectedPeerId: "", password: "", updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0,
+    manualUpdatePending: null, manualUpdateResult: null, updateDialogId: null, splitTunnelState: null,
     splitTunnelApplications: [], splitTunnelOpen: false, splitTunnelLoaded: false, notifications: [],
     notificationUnreadCount: 0, notificationNextCursor: null, notificationHistoryExpanded: false,
     notificationsOpen: false, changelogOpen: false,
@@ -162,7 +164,10 @@ describe("Android bootstrap recovery through lifecycle events", () => {
     const before = attempts;
     if (mode === "hidden") f.context.document.visibilityState = "hidden";
     if (mode === "switching") f.context.runtimeSelectionBusy = true;
-    if (mode === "logout") await f.page.logout();
+    if (mode === "logout") {
+      await f.page.logout();
+      expect(f.context.view).toBe("sign_in");
+    }
     if (mode === "disposed") f.context.startupRetry.dispose();
     if (mode === "cleanup") f.context.localStopPendingCleanup = true;
     f.page.handleOnline(); f.page.handleVisibility();
