@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod auth;
+#[cfg(target_os = "macos")]
+pub mod macos_vault;
 mod migration;
 mod owner_lock;
 pub use owner_lock::ContainerOwnerLock;

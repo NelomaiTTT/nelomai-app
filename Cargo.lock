@@ -3010,18 +3010,23 @@ version = "0.1.0"
 dependencies = [
  "android-native-keyring-store",
  "base64 0.22.1",
+ "chacha20poly1305",
  "ed25519-dalek",
  "keyring",
  "keyring-core",
  "libc",
  "nelomai-contracts",
  "rand 0.9.5",
+ "rustix",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
