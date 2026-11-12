@@ -61,21 +61,19 @@ their operational namespaces remain distinct.
    embedded stable 0.3.11 with the vault-aware Common and verify that a
    complete latest → stable → latest cycle preserves auth and cleanup
    ownership.
-5. Separately support downgrade of the entire Common installation. The old
-   Common reads and writes its Keychain records directly. Preserving those
-   records only gives it a snapshot from before activation. Once refresh or a
-   cleanup transaction advances, that snapshot may be stale. Activation
-   requires either a rollback-capable previous Common, or a tested export of
-   the latest authoritative state to the old backend under the Common lock
-   before the controlled downgrade. Reinstalling an arbitrary older DMG
-   cannot be made safe by a marker its code never reads. Continuous writes to
-   both stores retain the Keychain prompt problem and need atomic ordering
-   across two backends.
+5. Keep the previous Common from resuming pre-migration Keychain records.
+   Common 0.4.3 rejects the vault authority field in the inventory before
+   opening protected records. An older installer that predates this inventory
+   format is outside the supported downgrade path. Downgrading all of Common
+   would need a controlled export of the current vault records under the
+   Common lock. Switching to the embedded stable runtime uses the current
+   Common and the same vault.
 
-The storage primitive is isolated from startup until the downgrade contract
-and activation transaction are settled. It does not delete any records or
-provide a rollback-resistant counter. With the same installation key an
-old authenticated record can be replayed for its original namespace even
-when the other records remain current. The first migration may
-prompt separately for each legacy item; the prompt count on subsequent signed
-updates must be measured in a VM through real Keychain access.
+Startup publishes a staging authority before writing to the vault. After
+verifying the copy, it writes an authenticated activation record to the vault
+and publishes active authority in the inventory. A crash between those last
+two writes resumes from the authenticated activation record. The previous
+Keychain items are preserved. The first migration may prompt separately for
+each legacy item. Measure subsequent updates in a VM with real Keychain
+access. The vault authenticates individual records and has no counter to
+reject replay of an older authenticated record for the same namespace.

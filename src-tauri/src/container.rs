@@ -5,9 +5,13 @@ use crate::{
     runtime::{NativeControl, NativeExitReason, NativeReply, RuntimeAction, TraySnapshot},
     PANEL_BASE,
 };
+#[cfg(not(target_os = "macos"))]
+use nelomai_client_container::host::prepare_host;
+#[cfg(target_os = "macos")]
+use nelomai_client_container::host::prepare_macos_host;
 use nelomai_client_container::startup_diagnostics as startup;
 use nelomai_client_container::{
-    host::{prepare_host, CommonHost, HostError, HostNativePorts},
+    host::{CommonHost, HostError, HostNativePorts},
     ipc::{BackgroundAction, PrivateBackgroundDispatcher},
     BrokerError, LocalAuthStop, NativeAuthFailure, NativeAuthRequest, RuntimeClientProfile,
     RuntimeForceStop,
@@ -442,6 +446,8 @@ impl PrivateBackgroundDispatcher for DesktopBackground {
 }
 pub(crate) struct CommonState {
     host: Arc<CommonHost>,
+    #[cfg(target_os = "macos")]
+    records: nelomai_client_storage::MacosRecordFactory,
     stop: Arc<NativeStop>,
     presentation: Mutex<TraySnapshot>,
     actions: Mutex<VecDeque<RuntimeAction>>,
@@ -735,11 +741,12 @@ pub fn run() {
                 });
                 #[cfg(target_os = "linux")]
                 let fallback = Some(data.join("credentials"));
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(windows)]
                 let fallback = None;
                 let api = nelomai_client_api::ClientApi::new(PANEL_BASE)?;
                 stage = "common.open_host";
                 startup::stage(stage);
+                #[cfg(not(target_os = "macos"))]
                 let prepared = prepare_host(
                     &data,
                     &resources.join("runtime"),
@@ -749,6 +756,11 @@ pub fn run() {
                     || nelomai_client_storage::SystemRecordFactory::new("primary", fallback),
                 )
                 .map_err(HostError::from)?;
+                #[cfg(target_os = "macos")]
+                let prepared = prepare_macos_host(&data, &resources.join("runtime"), &key)
+                    .map_err(HostError::from)?;
+                #[cfg(target_os = "macos")]
+                let records = prepared.records.clone();
                 app.manage(crate::support_diagnostics::SupportDataRoot(
                     prepared.owner.root().to_owned(),
                 ));
@@ -822,6 +834,8 @@ pub fn run() {
                     Some(child);
                 let state = Arc::new(CommonState {
                     host,
+                    #[cfg(target_os = "macos")]
+                    records,
                     stop,
                     presentation: Mutex::new(TraySnapshot::default()),
                     actions: Mutex::new(VecDeque::new()),
@@ -1013,11 +1027,9 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                             let paths = selection
                                 .runtime_paths()
                                 .map_err(|_| io::Error::other("storage selection invalid"))?;
-                            let records =
-                                nelomai_client_storage::SystemRecordFactory::new("primary", None);
                             let records: Vec<_> = paths
                                 .iter()
-                                .map(|path| records.record(path.namespace()))
+                                .map(|path| state.records.record(path.namespace()))
                                 .collect();
                             let (server, client) = std::os::unix::net::UnixStream::pair()?;
                             std::thread::Builder::new()

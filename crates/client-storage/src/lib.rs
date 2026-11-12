@@ -233,6 +233,8 @@ pub struct SystemSecretStore {
     account: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     linux_fallback_dir: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    user_keychain: Option<security_framework::os::macos::keychain::SecKeychain>,
 }
 
 impl SystemSecretStore {
@@ -240,6 +242,21 @@ impl SystemSecretStore {
         Self {
             account: account.into(),
             linux_fallback_dir,
+            #[cfg(target_os = "macos")]
+            user_keychain: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn in_user_keychain(
+        account: String,
+        keychain: security_framework::os::macos::keychain::SecKeychain,
+    ) -> Self {
+        debug_assert!(!account.is_empty());
+        Self {
+            account,
+            linux_fallback_dir: None,
+            user_keychain: Some(keychain),
         }
     }
 
@@ -268,6 +285,16 @@ impl SystemSecretStore {
 
     #[cfg(not(any(windows, target_os = "android")))]
     fn load_native(&self) -> Result<Option<Vec<u8>>, NativeStoreError> {
+        #[cfg(target_os = "macos")]
+        if let Some(keychain) = self.user_keychain.as_ref() {
+            return match keychain.find_generic_password(SERVICE_NAME, &self.account) {
+                Ok((bytes, _)) => Ok(Some(bytes.to_owned())),
+                Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
+                    Ok(None)
+                }
+                Err(error) => Err(macos_keychain_error(error)),
+            };
+        }
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
         match entry.get_secret() {
@@ -279,6 +306,12 @@ impl SystemSecretStore {
 
     #[cfg(not(any(windows, target_os = "android")))]
     fn save_native(&self, bytes: &[u8]) -> Result<(), NativeStoreError> {
+        #[cfg(target_os = "macos")]
+        if let Some(keychain) = self.user_keychain.as_ref() {
+            return keychain
+                .set_generic_password(SERVICE_NAME, &self.account, bytes)
+                .map_err(macos_keychain_error);
+        }
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
         entry.set_secret(bytes).map_err(NativeStoreError::from)
@@ -286,6 +319,24 @@ impl SystemSecretStore {
 
     #[cfg(not(any(windows, target_os = "android")))]
     fn delete_native(&self) -> Result<(), NativeStoreError> {
+        #[cfg(target_os = "macos")]
+        if let Some(keychain) = self.user_keychain.as_ref() {
+            return match keychain.find_generic_password(SERVICE_NAME, &self.account) {
+                Ok((_, item)) => {
+                    item.delete();
+                    match self.load_native()? {
+                        None => Ok(()),
+                        Some(_) => Err(NativeStoreError::Fatal(StorageError::RecoveryRequired(
+                            "legacy Keychain item could not be deleted",
+                        ))),
+                    }
+                }
+                Err(error) if error.code() == security_framework_sys::base::errSecItemNotFound => {
+                    Ok(())
+                }
+                Err(error) => Err(macos_keychain_error(error)),
+            };
+        }
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
         match entry.delete_credential() {
@@ -453,6 +504,14 @@ enum NativeStoreError {
     #[cfg(target_os = "linux")]
     Unavailable,
     Fatal(StorageError),
+}
+
+#[cfg(target_os = "macos")]
+fn macos_keychain_error(error: security_framework::base::Error) -> NativeStoreError {
+    NativeStoreError::Fatal(StorageError::Keyring(format!(
+        "native Keychain status {}",
+        error.code()
+    )))
 }
 
 #[cfg(not(target_os = "android"))]

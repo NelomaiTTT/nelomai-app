@@ -155,6 +155,11 @@ impl InstalledRuntimeSelection {
 }
 
 impl PreparedInstalledRuntimeSelection {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn manifest(&self) -> &VerifiedContainerManifest {
+        &self.manifest
+    }
+
     pub fn storage_slot(&self) -> RuntimeSlot {
         self.state.selected_slot
     }
@@ -176,18 +181,28 @@ impl PreparedInstalledRuntimeSelection {
         records: &F,
     ) -> Result<(InstalledRuntimeSelection, PreparedRuntimeStorage<F::Record>), SelectionStartupError>
     {
-        if owner.root() != self.root {
-            return Err(io::Error::other("runtime selection owner changed").into());
-        }
+        self.check_owner(owner)?;
         let storage =
             prepare_runtime_storage(owner, &self.manifest, self.state.selected_slot, records)?;
+        Ok((self.commit(owner)?, storage))
+    }
+
+    pub(crate) fn check_owner(&self, owner: &ContainerOwnerLock) -> io::Result<()> {
+        if owner.root() != self.root {
+            return Err(io::Error::other("runtime selection owner changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit(
+        self,
+        owner: &ContainerOwnerLock,
+    ) -> Result<InstalledRuntimeSelection, SelectionStartupError> {
+        self.check_owner(owner)?;
         if self.persist_after_storage {
             atomic_nonsecret_write(&self.path, &self.state.to_persisted_bytes()?)?;
         }
-        Ok((
-            from_verified(self.manifest, self.state, self.recovery)?,
-            storage,
-        ))
+        Ok(from_verified(self.manifest, self.state, self.recovery)?)
     }
 }
 

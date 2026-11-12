@@ -154,6 +154,16 @@ pub(super) fn open_record(directory: &File, name: &str) -> Result<Option<File>, 
     Ok(Some(file))
 }
 
+pub(super) fn remove_record(directory: &File, name: &str) -> Result<(), StorageError> {
+    let Some(file) = open_record(directory, name)? else {
+        return Ok(());
+    };
+    verify_entry(directory, name, &file)?;
+    fs::unlinkat(directory, name, AtFlags::empty())?;
+    directory.sync_all()?;
+    Ok(())
+}
+
 pub(super) fn write_record(directory: &File, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
     remove_owned_file(directory, STAGED_RECORD)?;
     let mut file = File::from(fs::openat(

@@ -18,7 +18,17 @@ pub trait ProtectedRecordFactory {
     type Record: ProtectedRecordStore;
     fn record(&self, namespace: &str) -> Self::Record;
     fn legacy(&self) -> &dyn SecretStore;
+    #[cfg(target_os = "macos")]
+    fn active_macos_vault(&self) -> Option<uuid::Uuid> {
+        None
+    }
 }
+
+#[cfg(target_os = "macos")]
+#[path = "macos_startup.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::{MacosRecord, MacosRecordFactory};
 pub struct SystemRecordFactory {
     legacy: SystemSecretStore,
     account: String,
@@ -37,10 +47,12 @@ impl SystemRecordFactory {
 impl ProtectedRecordFactory for SystemRecordFactory {
     type Record = SystemSecretStore;
     fn record(&self, namespace: &str) -> Self::Record {
-        SystemSecretStore::new(
-            format!("{}:{namespace}", self.account),
-            self.fallback.clone(),
-        )
+        let account = format!("{}:{namespace}", self.account);
+        #[cfg(target_os = "macos")]
+        if let Some(keychain) = self.legacy.user_keychain.as_ref() {
+            return SystemSecretStore::in_user_keychain(account, keychain.clone());
+        }
+        SystemSecretStore::new(account, self.fallback.clone())
     }
     fn legacy(&self) -> &dyn SecretStore {
         &self.legacy
@@ -62,6 +74,9 @@ struct Inventory {
     install_sha256: String,
     fresh_transaction_id: Option<String>,
     committed: bool,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_authority: Option<macos::VaultAuthority>,
 }
 fn recovery<T>() -> Result<T, StorageError> {
     Err(StorageError::RecoveryRequired(
@@ -80,6 +95,15 @@ fn read_inventory(root: &Path) -> Result<Option<Inventory>, StorageError> {
         Err(error) => return Err(error.into()),
     };
     let marker: Inventory = decode_record(&bytes, "runtime-inventory-v1")?;
+    #[cfg(target_os = "macos")]
+    if let Some(authority) = marker.vault_authority.as_ref() {
+        if !marker.committed
+            || authority.installation.is_nil()
+            || !authority.valid_for(&marker.namespaces)
+        {
+            return recovery();
+        }
+    }
     if marker.schema_version != 1
         || marker.namespaces.is_empty()
         || marker.namespaces.len() > 64
@@ -142,6 +166,20 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     let journal = FileMigrationJournal::new(root.join("common/auth-migration-v1.json"));
     let migration_record = journal.load()?;
     let marker = read_inventory(root)?;
+    #[cfg(target_os = "macos")]
+    let vault_active = {
+        let active = marker
+            .as_ref()
+            .and_then(|inventory| inventory.vault_authority.as_ref())
+            .filter(|authority| authority.phase == macos::VaultPhase::Active)
+            .map(|authority| authority.installation);
+        if active != records.active_macos_vault() {
+            return recovery();
+        }
+        active.is_some()
+    };
+    #[cfg(not(target_os = "macos"))]
+    let vault_active = false;
     let mut known = BTreeSet::new();
     // 0.2.16 is the first shipped runtime-v1 storage schema. These accounts
     // remain reachable even if a later manifest omits that maintenance version.
@@ -209,6 +247,16 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         let paths = paths_from_namespace(root, namespace)?;
         let state = ProtectedRuntimeStore::new(records.record(namespace), paths.clone());
         let loaded = state.load()?;
+        #[cfg(target_os = "macos")]
+        if vault_active
+            && loaded.is_none()
+            && marker
+                .as_ref()
+                .and_then(|inventory| inventory.vault_authority.as_ref())
+                .is_some_and(|authority| authority.required_namespaces.contains(namespace))
+        {
+            return recovery();
+        }
         if loaded.is_some() {
             occupied.push(namespace.clone());
         }
@@ -257,7 +305,13 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     }
     // The completed migration leaves the legacy identity for pre-split rollback.
     // Modern startup no longer needs to read that Keychain item.
-    if !migration_complete && (records.legacy().load()?.is_some() || migration_record.is_some()) {
+    if !migration_complete && migration_record.is_some() && vault_active {
+        return recovery();
+    }
+    if !vault_active
+        && !migration_complete
+        && (records.legacy().load()?.is_some() || migration_record.is_some())
+    {
         // A legacy source is not provenance for another occupied runtime.
         // Only a committed common inventory can anchor those retained records.
         if occupied.iter().any(|namespace| {
@@ -306,6 +360,8 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                 install_sha256: digest(&install.install_secret)?,
                 fresh_transaction_id: None,
                 committed: true,
+                #[cfg(target_os = "macos")]
+                vault_authority: None,
             },
         )?;
         return Ok(PreparedRuntimeStorage {
@@ -380,13 +436,21 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                     runtime.save(&state)?;
                 }
             }
-            write_inventory(
-                root,
-                &Inventory {
-                    namespaces,
-                    ..marker.clone()
-                },
-            )?;
+            let next = Inventory {
+                namespaces,
+                ..marker.clone()
+            };
+            #[cfg(target_os = "macos")]
+            let next = {
+                let mut next = next;
+                if let Some(authority) = next.vault_authority.as_mut().filter(|_| vault_active) {
+                    authority
+                        .required_namespaces
+                        .insert(selected_paths.namespace().to_owned());
+                }
+                next
+            };
+            write_inventory(root, &next)?;
             return Ok(PreparedRuntimeStorage {
                 auth,
                 runtime,
@@ -469,6 +533,8 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         install_sha256,
         fresh_transaction_id: Some(transaction.transaction_id.clone()),
         committed: false,
+        #[cfg(target_os = "macos")]
+        vault_authority: None,
     };
     write_inventory(root, &marker)?;
     auth.save(&transaction.auth)?;
@@ -505,4 +571,36 @@ fn retained_runtime_stores<F: ProtectedRecordFactory>(
             ))
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod vault_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn macos_reads_durable_vault_authority_in_the_existing_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let namespace = "runtime/latest/state/0.4.3/state-v1.json";
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "namespaces": [namespace],
+            "install_sha256": "a".repeat(64),
+            "fresh_transaction_id": null,
+            "committed": true,
+            "vault_authority": {
+                "installation": "00112233-4455-6677-8899-aabbccddeeff",
+                "phase": "active",
+                "required_namespaces": [namespace]
+            }
+        });
+        atomic_private_write(
+            &inventory_path(root.path()),
+            &encode_record(&payload, "runtime-inventory-v1").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_inventory(root.path()).unwrap().unwrap().namespaces,
+            [namespace]
+        );
+    }
 }

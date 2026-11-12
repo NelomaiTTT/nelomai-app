@@ -71,6 +71,38 @@ pub fn prepare_host<F: ProtectedRecordFactory>(
     })
 }
 
+#[cfg(target_os = "macos")]
+pub fn prepare_macos_host(
+    data_root: &Path,
+    resource_root: &Path,
+    pinned_key: &[u8],
+) -> Result<PreparedHost<nelomai_client_storage::MacosRecordFactory>, SelectionStartupError> {
+    use nelomai_client_storage::MacosRecordFactory;
+    crate::startup_diagnostics::stage("host.owner_lock");
+    let owner = Arc::new(ContainerOwnerLock::try_acquire_for_macos_vault(data_root)?);
+    crate::startup_diagnostics::stage("host.runtime_selection");
+    let prepared = InstalledRuntimeSelection::prepare(
+        resource_root,
+        &owner,
+        Some(pinned_key),
+        "macos",
+        std::env::consts::ARCH,
+    )?;
+    prepared.check_owner(&owner)?;
+    crate::startup_diagnostics::stage("host.prepare_storage");
+    let (records, storage) =
+        MacosRecordFactory::prepare(&owner, prepared.manifest(), prepared.storage_slot())?;
+    let selection = prepared.commit(&owner)?;
+    crate::startup_diagnostics::stage("host.storage_ready");
+    Ok(PreparedHost {
+        owner,
+        selection,
+        storage,
+        records,
+        resource_root: resource_root.to_owned(),
+    })
+}
+
 pub struct HostNativePorts {
     pub stop: Arc<dyn LocalAuthStop>,
     pub force: Arc<dyn RuntimeForceStop>,

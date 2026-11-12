@@ -9,7 +9,7 @@ use chacha20poly1305::{
 };
 use filesystem::{
     check_common, check_directory, create_vault, open_private_directory, open_record,
-    recover_directory, write_record,
+    recover_directory, remove_record, write_record,
 };
 use rand::{rngs::OsRng, TryRngCore};
 use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
@@ -31,17 +31,17 @@ const NONCE_LEN: usize = 24;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = MAGIC.len() + NONCE_LEN + MAX_RECORD_BYTES + 16;
 
-type VaultKey = Zeroizing<[u8; 32]>;
+pub(crate) type VaultKey = Zeroizing<[u8; 32]>;
 
-trait VaultKeychain {
+pub(crate) trait VaultKeychain {
     fn load(&self, installation: Uuid) -> Result<Option<VaultKey>, StorageError>;
     fn add(&self, installation: Uuid, key: &[u8; 32]) -> Result<(), StorageError>;
 }
 
-struct UserKeychain(SecKeychain);
+pub(crate) struct UserKeychain(pub(crate) SecKeychain);
 
 impl UserKeychain {
-    fn open() -> Result<Self, StorageError> {
+    pub(crate) fn open() -> Result<Self, StorageError> {
         SecKeychain::default_for_domain(SecPreferencesDomain::User)
             .map(Self)
             .map_err(|_| StorageError::RecoveryRequired("user Keychain unavailable"))
@@ -112,7 +112,7 @@ impl MacosVault {
         Self::initialize_with_keychain(owner, installation, &UserKeychain::open()?)
     }
 
-    fn open_with_keychain(
+    pub(crate) fn open_with_keychain(
         owner: Arc<ContainerOwnerLock>,
         installation: Uuid,
         keychain: &impl VaultKeychain,
@@ -142,7 +142,7 @@ impl MacosVault {
         vault.finish_open()
     }
 
-    fn initialize_with_keychain(
+    pub(crate) fn initialize_with_keychain(
         owner: Arc<ContainerOwnerLock>,
         installation: Uuid,
         keychain: &impl VaultKeychain,
@@ -201,6 +201,27 @@ impl MacosVault {
         let sealed = seal(&self.cipher, self.installation, namespace, bytes)?;
         write_record(&self.directory, &name, &sealed)?;
         self.check_live()
+    }
+
+    pub(crate) fn delete(&self, namespace: &str) -> Result<(), StorageError> {
+        let name = record_name(namespace)?;
+        let _gate = self.owner.lock_vault()?;
+        self.check_live()?;
+        if self.read_record(&name, namespace)?.is_some() {
+            remove_record(&self.directory, &name)?;
+        }
+        self.check_live()
+    }
+
+    /// A vault directory without a matching inventory cannot select legacy storage.
+    pub(crate) fn has_directory(owner: &ContainerOwnerLock) -> Result<bool, StorageError> {
+        let _gate = owner.lock_vault()?;
+        check_common(owner)?;
+        match open_private_directory(&owner.vault_directories()?.common, DIRECTORY) {
+            Ok(_) => Ok(true),
+            Err(StorageError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn check_location(&self) -> Result<(), StorageError> {

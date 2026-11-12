@@ -63,17 +63,32 @@ struct HostNativePorts {
     storage: Option<()>, relaunch: Option<()>,
 }
 type HostError = io::Error;
-struct PreparedHost { owner: Owner }
+struct PreparedHost {
+    owner: Owner,
+    #[cfg(target_os = "macos")]
+    records: Arc<()>,
+}
 struct Owner(PathBuf);
 impl Owner { fn root(&self) -> &Path { &self.0 } }
 fn prepare_host(
     data: &Path, _: &Path, _: Option<&[u8]>, _: &str, _: &str,
     _: impl FnOnce() -> nelomai_client_storage::SystemRecordFactory,
 ) -> io::Result<PreparedHost> {
+    claim_owner(data)
+}
+#[cfg(target_os = "macos")]
+fn prepare_macos_host(data: &Path, _: &Path, _: &[u8]) -> io::Result<PreparedHost> {
+    claim_owner(data)
+}
+fn claim_owner(data: &Path) -> io::Result<PreparedHost> {
     if OWNED.swap(true, Ordering::SeqCst) {
         return Err(io::ErrorKind::WouldBlock.into());
     }
-    Ok(PreparedHost { owner: Owner(data.to_owned()) })
+    Ok(PreparedHost {
+        owner: Owner(data.to_owned()),
+        #[cfg(target_os = "macos")]
+        records: Arc::new(()),
+    })
 }
 struct CommonHost;
 impl CommonHost {
@@ -94,6 +109,7 @@ fn launch_common() -> io::Result<()> {
     let data = PathBuf::from("fixture-data");
     let resources = PathBuf::from("fixture-resources");
     let key = [];
+    #[cfg(not(target_os = "macos"))]
     let fallback = None;
     let stop = Arc::new(());
     let stage;
