@@ -223,6 +223,14 @@ pub(crate) fn run_product(
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(support_diagnostics::SupportReportState::default());
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(desktop::macos_runtime_menu)
+        .on_menu_event(|app, event| {
+            if event.id().as_ref() == desktop::MACOS_QUIT_ID {
+                desktop::quit_application(app.clone());
+            }
+        });
     let builder = builder.setup(setup);
 
     let app = builder

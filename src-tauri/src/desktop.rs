@@ -23,6 +23,8 @@ const SHOW_ID: &str = "tray-show";
 const TOGGLE_ID: &str = "tray-toggle";
 const DIAGNOSTICS_ID: &str = "tray-diagnostics";
 const QUIT_ID: &str = "tray-quit";
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_QUIT_ID: &str = "app-quit";
 const TRAY_ID: &str = "nelomai-main-tray";
 const TRAY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(target_os = "macos")]
@@ -52,6 +54,30 @@ struct TrayMenuState {
 struct NativeConnectionChangedEvent {
     error: Option<commands::CommandError>,
     action: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_runtime_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::default(app)?;
+    let items = menu.items()?;
+    let app_menu = items
+        .first()
+        .and_then(|item| item.as_submenu())
+        .ok_or_else(|| std::io::Error::other("missing macOS application menu"))?;
+    // The predefined Quit dispatches terminate: directly, bypassing Common.
+    let quit = tauri::menu::PredefinedMenuItem::quit(app, None)?;
+    let entries = app_menu.items()?;
+    let original = entries
+        .last()
+        .and_then(|item| item.as_predefined_menuitem())
+        .ok_or_else(|| std::io::Error::other("missing macOS Quit menu item"))?;
+    if original.text()? != quit.text()? {
+        return Err(std::io::Error::other("unexpected macOS Quit menu item").into());
+    }
+    let quit = MenuItem::with_id(app, MACOS_QUIT_ID, "Завершить Nelomai", true, Some("Cmd+Q"))?;
+    app_menu.remove(original)?;
+    app_menu.append(&quit)?;
+    Ok(menu)
 }
 
 pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
