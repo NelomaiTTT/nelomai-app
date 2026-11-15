@@ -577,15 +577,27 @@ mod nelomai_client_container { pub mod desktop {
     fn blocked() -> io::Error { io::Error::other("blocked") }
     pub async fn stop_runtime_before_helper(%s
 } }
-struct Operation { exit_requested: bool, replacement_verified: bool }
+#[cfg(target_os = "linux")]
+struct StableProbe;
+#[cfg(target_os = "linux")]
+impl StableProbe { fn cancel(&mut self) { event("cancel_probe"); } }
+struct Operation {
+    exit_requested: bool,
+    replacement_verified: bool,
+    #[cfg(target_os = "linux")]
+    stable_probe: StableProbe,
+}
 impl Operation {
-    async fn lock(&self) -> &Self { self }
     fn restart_proof(&self, _: &()) -> io::Result<()> {
         if self.replacement_verified { Ok(()) } else { Err(io::Error::other("no update")) }
     }
     fn check_request(&self) -> io::Result<()> { Ok(()) }
 }
-struct Stop { child: Mutex<Option<VerifiedChild>>, tunnel: AtomicBool, operation: Operation }
+struct OperationGate(Mutex<Operation>);
+impl OperationGate {
+    async fn lock(&self) -> std::sync::MutexGuard<'_, Operation> { self.0.lock().unwrap() }
+}
+struct Stop { child: Mutex<Option<VerifiedChild>>, tunnel: AtomicBool, operation: OperationGate }
 async fn stop_helper_for_exit(tunnel: &AtomicBool) -> io::Result<()> {
     event("stop_helper");
     if tunnel.load(Ordering::Acquire) { Ok(()) } else { Err(io::Error::other("retry")) }
@@ -607,6 +619,11 @@ fn complete(future: impl Future<Output = ()>) {
     let mut future = std::pin::pin!(future);
     assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready());
 }
+fn append_finish_events(expected: &mut Vec<&'static str>, events: &[&'static str]) {
+    #[cfg(target_os = "linux")]
+    expected.push("cancel_probe");
+    expected.extend_from_slice(events);
+}
 fn main() {
     for (initially_stopped, replacement_verified) in [(true, false), (false, false), (true, true)] {
         EVENTS.lock().unwrap().clear();
@@ -615,26 +632,35 @@ fn main() {
             stop: Stop {
                 child: Mutex::new(Some(VerifiedChild(false))),
                 tunnel: AtomicBool::new(initially_stopped),
-                operation: Operation { exit_requested: false, replacement_verified },
+                operation: OperationGate(Mutex::new(Operation {
+                    exit_requested: false,
+                    replacement_verified,
+                    #[cfg(target_os = "linux")]
+                    stable_probe: StableProbe,
+                })),
             },
             presentation: Mutex::new(Presentation::default()),
             finishing: AtomicBool::new(false),
             runtime_failure_cleanup: OnceLock::new(),
         });
         complete(state.clone().finish(tauri::AppHandle, CommonFinish::RuntimeFailure));
+        let mut expected = Vec::new();
         if replacement_verified {
-            assert_eq!(*EVENTS.lock().unwrap(), ["reap", "exit"]);
+            append_finish_events(&mut expected, &["reap", "exit"]);
+            assert_eq!(*EVENTS.lock().unwrap(), expected);
             continue;
         }
-        assert_eq!(*EVENTS.lock().unwrap(), ["reap", "stop_helper", "show_window"]);
+        append_finish_events(&mut expected, &["reap", "stop_helper", "show_window"]);
+        assert_eq!(*EVENTS.lock().unwrap(), expected);
         assert_eq!(state.presentation.lock().unwrap().disconnect, !initially_stopped);
         state.stop.tunnel.store(true, Ordering::Release);
         complete(state.finish(tauri::AppHandle, CommonFinish::Quit));
-        let expected = if initially_stopped {
-            &["reap", "stop_helper", "show_window", "exit"][..]
+        let closing = if initially_stopped {
+            &["exit"][..]
         } else {
-            &["reap", "stop_helper", "show_window", "stop_helper", "exit"][..]
+            &["stop_helper", "exit"][..]
         };
+        append_finish_events(&mut expected, closing);
         assert_eq!(*EVENTS.lock().unwrap(), expected);
     }
 }
