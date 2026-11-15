@@ -38,6 +38,59 @@ class ServiceTunRetentionTest {
     private fun tun(): ParcelFileDescriptor = RetentionDescriptor.create()
     private fun establish(owner: Any = this.owner) = requireNotNull(retention.establish(owner, ::tun))
 
+    @Test fun newEstablishmentInvalidatesOnlyCompletedStopReceipts() {
+        val cache = java.nio.file.Files.createTempDirectory("stop-receipts-test").toFile()
+        try {
+            val serviceReceipts = LocalStopReceipts(cache)
+            val clientReceipts = LocalStopReceipts(cache)
+            retention = ServiceTunRetention(true, beforeEstablish = serviceReceipts::invalidateConfirmed)
+            val engine = establish()
+            assertTrue(retention.ready(owner))
+            val priorStop = requireNotNull(clientReceipts.create())
+            val awaitingStop = requireNotNull(clientReceipts.create())
+            engine.close()
+            retention.stop()
+            assertTrue(retention.retryStop(retention.ticket()) {
+                serviceReceipts.confirm(priorStop)
+                true
+            })
+
+            retention.allowStart()
+            establish()
+            assertFalse(clientReceipts.consume(priorStop))
+            retention.stop()
+            assertTrue(retention.retryStop(retention.ticket()) {
+                serviceReceipts.confirm(awaitingStop)
+                true
+            })
+            assertTrue(clientReceipts.consume(awaitingStop))
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test fun missingOrConsumedStopReceiptsCannotConfirmALaterRequest() {
+        val cache = java.nio.file.Files.createTempDirectory("stop-receipts-test").toFile()
+        try {
+            val serviceReceipts = LocalStopReceipts(cache)
+            val clientReceipts = LocalStopReceipts(cache)
+            val first = requireNotNull(clientReceipts.create())
+            val second = requireNotNull(clientReceipts.create())
+            val unfinished = requireNotNull(clientReceipts.create())
+            serviceReceipts.confirm(first)
+            serviceReceipts.confirm(second)
+            assertFalse(clientReceipts.consume(unfinished))
+            serviceReceipts.confirm(unfinished)
+            assertFalse(clientReceipts.consume(unfinished))
+            assertTrue(clientReceipts.consume(first))
+            assertTrue(clientReceipts.consume(second))
+            assertFalse(clientReceipts.consume(first))
+            assertFalse(clientReceipts.consume(second))
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
     @Test fun healthyEnableDisableDoesNotCloseEngineOrReconnect() {
         retention = ServiceTunRetention(false)
         val engine = establish()

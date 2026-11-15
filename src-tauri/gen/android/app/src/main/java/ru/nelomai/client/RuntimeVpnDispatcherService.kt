@@ -47,20 +47,12 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
     @Volatile private var revokedByAndroid = false
     private val watchdogLock = Any()
     private var vpnWatchdog: Handler? = null
-    private var retirementTimeoutArmed = false
     private var forwardedLogoutEpoch: Long? = null
     private var logoutRetryAt = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val verifySelection = object : Runnable {
         override fun run() {
             if (destroyed) return
-            val now = SystemClock.uptimeMillis()
-            if (RuntimeProcessSelection.hasVpnOwner() && !retirementStarted &&
-                now - lastBrokerVerificationAt >= BROKER_RECOVERY_MILLIS
-            ) {
-                beginRetirement()
-                engine?.revoke()
-            }
             if (!selectionVerificationInFlight) {
                 selectionVerificationInFlight = true
                 selection.read { result ->
@@ -201,7 +193,6 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
                         return@read
                     }
                     RuntimeProcessSelection.rememberVpnOwner(active)
-                    if (RuntimeProcessSelection.hasVpnOwner()) superviseTransport()
                     startEngine(selectedEngine, intent, flags, startId)
                 } catch (_: SecurityException) {
                     rejectStart(intent, "vpn_permission_required")
@@ -368,46 +359,25 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         if (retirementStarted) return false
         retirementStarted = true
         invalidateQueuedVpnStarts()
-        superviseTransport(retiring = true)
+        armRetirementWatchdog()
         // A read rejected before retirement may already have advanced AMS's ID.
         settleRetiredStartIds()
         return true
     }
 
-    private fun superviseTransport(retiring: Boolean = false) {
+    private fun armRetirementWatchdog() {
         val transport = engine as? RuntimeVpnTransportV1 ?: return
         synchronized(watchdogLock) {
-            val watchdog = vpnWatchdog ?: Handler(
-                HandlerThread("nelomai-vpn-watchdog").apply { start() }.looper,
-            ).also { handler ->
-                vpnWatchdog = handler
-                if (!retiring) {
-                    // Allow a verification budget and a cleanup budget even
-                    // when the main Looper blocks before calling revoke.
-                    val budget = BROKER_RECOVERY_MILLIS * 2
-                    handler.postDelayed(object : Runnable {
-                        override fun run() {
-                            val remaining = lastBrokerVerificationAt + budget - SystemClock.uptimeMillis()
-                            if (remaining <= 0 && closeUnverifiedProcess(transport)) return
-                            handler.postDelayed(this, if (remaining > 0) remaining else BROKER_RECOVERY_MILLIS)
-                        }
-                    }, budget)
+            if (vpnWatchdog != null) return
+            val watchdog = Handler(HandlerThread("nelomai-vpn-watchdog").apply { start() }.looper)
+            vpnWatchdog = watchdog
+            watchdog.postDelayed({
+                if (!runCatching(transport::localTransportClosed).getOrDefault(false)) {
+                    Process.killProcess(Process.myPid())
                 }
-            }
-            if (retiring && !retirementTimeoutArmed) {
-                retirementTimeoutArmed = true
-                watchdog.postDelayed({
-                    closeUnverifiedProcess(transport)
-                    watchdog.looper.quitSafely()
-                }, BROKER_RECOVERY_MILLIS)
-            }
+                watchdog.looper.quitSafely()
+            }, BROKER_RECOVERY_MILLIS)
         }
-    }
-
-    private fun closeUnverifiedProcess(transport: RuntimeVpnTransportV1): Boolean {
-        if (runCatching(transport::localTransportClosed).getOrDefault(false)) return false
-        Process.killProcess(Process.myPid())
-        return true
     }
 
     private fun retryBrokerLogout() {
@@ -431,13 +401,23 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
             beforeEstablish(this)
             check(vpnAuthorityCurrent()) { "runtime_vpn_authority_retired" }
             val tun = super.establish() ?: return null
-            if (vpnAuthorityCurrent()) return tun
+            // The system may already have moved routing to this descriptor.
+            // Proof expiry fences later admission, but only actual retirement
+            // can discard a successful handover before retention sees it.
+            if (vpnOwnerNotRetired()) return tun
             tun.close()
             return null
         }
     }
 
-    override fun vpnAuthorityCurrent(): Boolean = !revokedByAndroid && !retirementStarted && !destroyed
+    private fun vpnOwnerNotRetired(): Boolean = !revokedByAndroid && !retirementStarted && !destroyed
+
+    // Broker silence fences new work. The verified session's existing transport
+    // and retained TUN stay owned until Stop, confirmed retirement, or Android revoke.
+    override fun vpnAuthorityCurrent(): Boolean =
+        vpnOwnerNotRetired() &&
+            (!RuntimeProcessSelection.hasVpnOwner() ||
+                SystemClock.uptimeMillis() - lastBrokerVerificationAt < BROKER_RECOVERY_MILLIS)
     override fun invalidateQueuedVpnStarts() { stopRevision++ }
     override fun retireVpnAuthority() { beginRetirement() }
 
@@ -445,7 +425,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         // Android may deliver revocation from a Binder thread. Retire admission
         // immediately, then serialize the native cleanup with service commands.
         revokedByAndroid = true
-        superviseTransport(retiring = true)
+        armRetirementWatchdog()
         if (Looper.myLooper() == Looper.getMainLooper()) revokeOnMain()
         else handler.post(::revokeOnMain)
     }

@@ -789,7 +789,11 @@ class NelomaiVpnService(
     GoBackend.VpnService(runtimeHost.service) {
     // Native transport keeps a short-lived source for toggling on a healthy VPN.
     private val killSwitchPreference by lazy { KillSwitchPreference(applicationContext) }
-    private val tunRetention = ServiceTunRetention(retainTunDescriptor ?: KillSwitchPreference(runtimeHost.service).enabled) {
+    private val localStopReceipts by lazy { LocalStopReceipts.open(applicationContext) }
+    private val tunRetention = ServiceTunRetention(
+        retainTunDescriptor ?: KillSwitchPreference(runtimeHost.service).enabled,
+        beforeEstablish = { localStopReceipts.invalidateConfirmed() },
+    ) {
         restoreHandler.post { updateKillSwitchNotification() }
     }
     private val killSwitchNotice = KillSwitchNotice()
@@ -846,8 +850,16 @@ class NelomaiVpnService(
         false
     }
 
-    private fun finishProtectionStop(ticket: Long): Boolean = try {
-        tunRetention.retryStop(ticket)
+    private fun finishProtectionStop(ticket: Long, receipt: String?): Boolean = try {
+        tunRetention.retryStop(ticket) {
+            // Order receipt publication with creation of a replacement service.
+            // If publication wins, the replacement's TUN invalidates the receipt.
+            synchronized(VPN_PROCESS_SERVICE_GENERATION) {
+                val currentOwner = serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get()
+                if (currentOwner && receipt != null) localStopReceipts.confirm(receipt)
+                currentOwner
+            }
+        }
     } catch (error: java.io.IOException) {
         TunnelLog.warning("service.tun_release_unconfirmed", error = error)
         false
@@ -996,7 +1008,9 @@ class NelomaiVpnService(
         } else apply()
     }
 
-    private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
+    private val serviceGeneration = synchronized(VPN_PROCESS_SERVICE_GENERATION) {
+        VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
+    }
     private val statusSelectionDelegate = lazy {
         ru.nelomai.client.RuntimeSelectionStore(applicationContext, readOffMain = true)
     }
@@ -3320,6 +3334,7 @@ class NelomaiVpnService(
             handleLegacyOnlyClientStop(apiVersion, receiver, intent.getStringExtra(EXTRA_FAILED_START_OPERATION_ID))
             return
         }
+        val receipt = intent.getStringExtra(EXTRA_LOCAL_STOP_RECEIPT)
         val pendingOperationId = redundantStartOperation.cancelPending()
         val installedOwner = redundantVpnOwnerSlot.snapshot()
         val inMemoryOperationId = inMemoryRedundantStopOperationId(
@@ -3328,7 +3343,7 @@ class NelomaiVpnService(
             ownerStartOperationId = installedOwner?.startOperationId,
         )
         if (inMemoryOperationId != null) {
-            beginClientRedundantStop(inMemoryOperationId, installedOwner, receiver)
+            beginClientRedundantStop(inMemoryOperationId, installedOwner, receiver, receipt)
             return
         }
         resolveRedundantStopFromMemoryOrRecovery(
@@ -3342,11 +3357,11 @@ class NelomaiVpnService(
         ) { lookup ->
             val currentOwner = redundantVpnOwnerSlot.snapshot()
             if (lookup.operationId != null) {
-                beginClientRedundantStop(lookup.operationId, currentOwner, receiver)
+                beginClientRedundantStop(lookup.operationId, currentOwner, receiver, receipt)
             } else if (lookup.recovery is RecoveryStoreResult.Failure) {
                 receiver.sendError("redundant_stop_fence_failed")
             } else {
-                beginLegacyClientStop(apiVersion, receiver)
+                beginLegacyClientStop(apiVersion, receiver, receipt = receipt)
             }
         }
     }
@@ -3392,6 +3407,7 @@ class NelomaiVpnService(
         redundantOperationId: String,
         installedOwner: InstalledRedundantVpnOwner?,
         receiver: ResultReceiver?,
+        receipt: String?,
     ) {
         releaseProtection()
         val tunTicket = tunRetention.ticket()
@@ -3404,7 +3420,7 @@ class NelomaiVpnService(
             if (!result.fenced) {
                 receiver.sendError("redundant_stop_fence_failed")
             } else if (result.stopped) {
-                if (finishProtectionStop(tunTicket)) receiver.sendOperation(SessionState.STOPPED, 0)
+                if (finishProtectionStop(tunTicket, receipt)) receiver.sendOperation(SessionState.STOPPED, 0)
                 else receiver.sendError("tunnel_cleanup_failed")
             } else {
                 receiver.sendError("redundant_stop_pending")
@@ -3424,6 +3440,7 @@ class NelomaiVpnService(
         receiver: ResultReceiver?,
         disarmProtection: Boolean = true,
         failedStartOperationId: String? = null,
+        receipt: String? = null,
     ) {
         // CLIENT_REBIND_UDP and this admission both run on the service main
         // thread. A rejected Stop must leave an active lease and its intent intact.
@@ -3453,7 +3470,7 @@ class NelomaiVpnService(
         TunnelRuntime.stop(
             apiVersion,
             { state, duration ->
-                if (disarmProtection && !finishProtectionStop(tunTicket)) {
+                if (disarmProtection && !finishProtectionStop(tunTicket, receipt.takeIf { state == SessionState.STOPPED })) {
                     receiver.sendError("tunnel_cleanup_failed")
                     return@stop
                 }

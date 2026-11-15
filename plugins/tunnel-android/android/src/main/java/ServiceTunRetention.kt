@@ -4,7 +4,11 @@ import android.os.ParcelFileDescriptor
 import java.io.IOException
 
 /** Descriptor ownership only. Intent, recovery and readiness stay with their existing owners. */
-internal class ServiceTunRetention(private var enabled: Boolean, private val changed: () -> Unit = {}) {
+internal class ServiceTunRetention(
+    private var enabled: Boolean,
+    private val beforeEstablish: () -> Unit = {},
+    private val changed: () -> Unit = {},
+) {
     private val gate = Any()
     private var epoch = 0L
     private var accepting = true
@@ -52,6 +56,7 @@ internal class ServiceTunRetention(private var enabled: Boolean, private val cha
     fun establish(owner: Any, establish: () -> ParcelFileDescriptor?): ParcelFileDescriptor? {
         val expected = synchronized(gate) {
             checkAccepting()
+            beforeEstablish()
             epoch
         }
         // Android establishment may block. Stop fences its result without waiting for it.
@@ -182,10 +187,10 @@ internal class ServiceTunRetention(private var enabled: Boolean, private val cha
 
     fun hasTun(): Boolean = synchronized(gate) { owned.isNotEmpty() }
 
-    fun retryStop(expectedEpoch: Long): Boolean = synchronized(gate) {
+    fun retryStop(expectedEpoch: Long, confirm: () -> Boolean = { true }): Boolean = synchronized(gate) {
         if (epoch != expectedEpoch || accepting) return@synchronized false
         release(owned.toList())
-        owned.isEmpty()
+        owned.isEmpty() && confirm()
     }
 
     fun stop(permanent: Boolean = false) = synchronized(gate) {

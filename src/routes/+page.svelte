@@ -2108,9 +2108,6 @@
             </label>
           {/if}
           {#if updateStatus?.supported}
-            {#if protectionStatus}
-              <p class="hint">Приложение проверяет обновления в фоне. Установка начинается после вашего подтверждения.</p>
-            {:else}
             <label class="update-preference">
               <span>
                 <strong>Проверять и скачивать обновления</strong>
@@ -2122,7 +2119,6 @@
                 onchange={setAutomaticUpdates}
               />
             </label>
-            {/if}
           {/if}
           {#if updateStatus?.supported || (updateStatus === null && manualUpdateResult !== null)}
             <button class="secondary-button" type="button" onclick={()=>refreshUpdateOffer("manual")} disabled={updateStatus?.phase==="checking"}>Проверить обновления</button>

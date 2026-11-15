@@ -35,6 +35,10 @@ function executePageFunction(name: string, context: unknown, ...args: unknown[])
     return ${name}(...args); }`)(context, args);
 }
 
+it("offers background update preferences on Android regardless of protection status", () => {
+  expect(page).toMatch(/\{#if updateStatus\?\.supported\}\s*<label class="update-preference">[\s\S]*?checked=\{updateStatus\.automatic\}\s*onchange=\{setAutomaticUpdates\}/);
+});
+
 // Evaluate the real Svelte rendering condition, not a copied UI predicate.
 const template = parse(page, { modern: true });
 const modalBlock = template.fragment.nodes.filter((node) => node.type === "IfBlock")

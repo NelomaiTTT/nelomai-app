@@ -24,6 +24,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowProcess
+import org.robolectric.shadows.ShadowSystemClock
 import org.robolectric.shadows.ShadowPausedSystemClock
 import org.robolectric.shadows.ShadowVpnService
 import org.robolectric.util.ReflectionHelpers
@@ -33,11 +34,13 @@ import ru.nelomai.runtime.v1.RuntimeVpnAuthorityV1
 import ru.nelomai.runtime.v1.RuntimeVpnEngineV1
 import ru.nelomai.runtime.v1.RuntimeVpnHostV1
 import ru.nelomai.runtime.v1.RuntimeVpnTransportV1
+import ru.nelomai.tunnel.LatestRuntimeVpnEngineV1
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], application = Application::class, shadows = [
     BrokerRecoverySelectionShadow::class, BrokerRecoveryAdaptersShadow::class,
     BrokerRecoveryBuilderShadow::class, LoggingTileServiceShadow::class,
+    BrokerRecoveryNativeLibraryShadow::class,
 ])
 class RuntimeVpnBrokerRecoveryTest {
     private fun selection(
@@ -57,6 +60,7 @@ class RuntimeVpnBrokerRecoveryTest {
 
     @Before fun setup() {
         ReflectionHelpers.setStaticField(RuntimeProcessSelection::class.java, "loaded", null)
+        ReflectionHelpers.setStaticField(Class.forName("ru.nelomai.tunnel.TunnelStatusTransport"), "session", null)
         ShadowVpnService.setPrepareResult(null)
         BrokerRecoverySelectionShadow.selected = original
         BrokerRecoverySelectionShadow.unavailable = false
@@ -74,6 +78,7 @@ class RuntimeVpnBrokerRecoveryTest {
         BrokerRecoveryAdaptersShadow.beforeSystemEstablish = null
         BrokerRecoveryAdaptersShadow.transportClosed = true
         BrokerRecoveryAdaptersShadow.onRevoke = null
+        BrokerRecoveryBuilderShadow.onEstablished = null
     }
 
     private fun connectedService() =
@@ -89,12 +94,14 @@ class RuntimeVpnBrokerRecoveryTest {
     }
 
     private fun advanceWatchdog(service: RuntimeVpnDispatcherService, seconds: Long) {
-        val watchdog = ReflectionHelpers.getField<Handler>(service, "vpnWatchdog")
+        val watchdog = ReflectionHelpers.getField<Handler?>(service, "vpnWatchdog") ?: return
         try {
             shadowOf(watchdog.looper).idleFor(Duration.ofSeconds(seconds))
         } catch (error: IllegalStateException) {
             // The simulated kill returns and the watchdog quits its Looper.
-            if (error.message != "Looper is quitting" || !ShadowProcess.wasKilled(Process.myPid())) throw error
+            val loopStopped = error.message == "Looper is quitting" ||
+                error.message?.endsWith("Is handler thread dead?") == true
+            if (!loopStopped || !ShadowProcess.wasKilled(Process.myPid())) throw error
         }
     }
 
@@ -232,18 +239,331 @@ class RuntimeVpnBrokerRecoveryTest {
         old.destroy()
     }
 
-    @Test fun unrecoveredBrokerCannotKeepTheVpnPastItsVerificationBudget() {
+    @Test fun brokerTimeoutKeepsTunAndRestoresIpcForTheVerifiedSession() {
         val old = connectedService()
-        BrokerRecoverySelectionShadow.pending = mutableListOf()
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-        assertEquals(1, BrokerRecoverySelectionShadow.pending?.size)
-        old.get().onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STOP"), 0, 2)
-        assertEquals("ru.nelomai.tunnel.CLIENT_STOP", BrokerRecoveryAdaptersShadow.actions.last())
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(8))
-        assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
-        assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
-        old.destroy()
+        val vpn = old.get()
+        vpn.getSharedPreferences("nelomai-kill-switch-device-v1", 0)
+            .edit().putBoolean("enabled", true).putBoolean("disclosed", true).commit()
+        val adapter = LatestRuntimeVpnEngineV1(vpn)
+        adapter.create()
+        // Use the production adapter and retention code. The pipe substitutes for Android's TUN.
+        val native = ReflectionHelpers.getField<Any>(adapter, "engine")
+        val retention = ReflectionHelpers.getField<Any>(native, "tunRetention")
+        val (original, writer) = ParcelFileDescriptor.createPipe()
+        val retainedFd = original.fileDescriptor
+        val owner = Any()
+        val factory: () -> ParcelFileDescriptor? = { original }
+        val transport = retention.javaClass.getMethod("establish", Any::class.java, Function0::class.java)
+            .invoke(retention, owner, factory) as ParcelFileDescriptor
+        val ticket = retention.javaClass.getMethod("ticket").invoke(retention)
+        val state = retention.javaClass.getMethod("state")
+        try {
+            assertEquals(true, retention.javaClass.getMethod("ready", Any::class.java, Long::class.javaPrimitiveType)
+                .invoke(retention, owner, ticket))
+            assertEquals("armed", state.invoke(retention))
+            BrokerRecoveryAdaptersShadow.onRevoke = adapter::revoke
+            BrokerRecoveryAdaptersShadow.transportClosed = false
+            BrokerRecoverySelectionShadow.unavailable = true
+            val main = shadowOf(Looper.getMainLooper())
+            main.idleFor(Duration.ofSeconds(9))
+            assertTrue(vpn.vpnAuthorityCurrent())
+            main.idleFor(Duration.ofSeconds(1))
+            assertTrue("broker expiry must not close the retained descriptor", retainedFd.valid())
+            assertEquals("armed", state.invoke(retention))
+            assertFalse(vpn.vpnAuthorityCurrent())
+
+            // Match the native path-health callback when encrypted traffic stops flowing.
+            retention.javaClass.getMethod("unavailable", Any::class.java).invoke(retention, owner)
+            main.idleFor(Duration.ofSeconds(16))
+            advanceWatchdog(vpn, 20)
+            assertTrue(retainedFd.valid())
+            assertEquals("blocked", state.invoke(retention))
+            assertFalse(ShadowProcess.wasKilled(Process.myPid()))
+            assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
+            vpn.onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STATUS"), 0, 2)
+            assertFalse(BrokerRecoveryAdaptersShadow.actions.contains("ru.nelomai.tunnel.CLIENT_STATUS"))
+
+            BrokerRecoverySelectionShadow.selected = selection("new-broker")
+            BrokerRecoverySelectionShadow.unavailable = false
+            reconcileNewOwner()
+            assertTrue(vpn.vpnAuthorityCurrent())
+            vpn.onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STATUS"), 0, 3)
+            assertEquals("ru.nelomai.tunnel.CLIENT_STATUS", BrokerRecoveryAdaptersShadow.actions.last())
+            assertEquals(1, BrokerRecoveryAdaptersShadow.established)
+            assertTrue(retainedFd.valid())
+            assertEquals("blocked", state.invoke(retention))
+
+            vpn.onRevoke()
+            assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
+            assertFalse(retainedFd.valid())
+        } finally {
+            transport.close()
+            adapter.destroy()
+            original.close()
+            writer.close()
+            old.destroy()
+        }
+    }
+
+    @Test fun brokerExpiryInsideEstablishRetainsTheReplacementTun() {
+        val old = connectedService()
+        val vpn = old.get()
+        vpn.getSharedPreferences("nelomai-kill-switch-device-v1", 0)
+            .edit().putBoolean("enabled", true).putBoolean("disclosed", true).commit()
+        val adapter = LatestRuntimeVpnEngineV1(vpn)
+        adapter.create()
+        val native = ReflectionHelpers.getField<Any>(adapter, "engine")
+        val retention = ReflectionHelpers.getField<Any>(native, "tunRetention")
+        val owner = Any()
+        val establish = retention.javaClass.getMethod("establish", Any::class.java, Function0::class.java)
+        val state = retention.javaClass.getMethod("state")
+        val builder = vpn.builder {}
+        val factory: () -> ParcelFileDescriptor? = builder::establish
+        var establishedFd: java.io.FileDescriptor? = null
+        BrokerRecoveryBuilderShadow.onEstablished = { establishedFd = it.fileDescriptor }
+        val first = requireNotNull(establish.invoke(retention, owner, factory) as? ParcelFileDescriptor)
+        val firstFd = checkNotNull(establishedFd)
+        var next: ParcelFileDescriptor? = null
+        try {
+            val ticket = retention.javaClass.getMethod("ticket").invoke(retention)
+            assertEquals(true, retention.javaClass.getMethod("ready", Any::class.java, Long::class.javaPrimitiveType)
+                .invoke(retention, owner, ticket))
+            assertEquals("armed", state.invoke(retention))
+
+            ShadowSystemClock.advanceBy(Duration.ofMillis(9999))
+            BrokerRecoveryBuilderShadow.onEstablished = {
+                establishedFd = it.fileDescriptor
+                BrokerRecoverySelectionShadow.unavailable = true
+                ShadowSystemClock.advanceBy(Duration.ofMillis(2))
+            }
+            next = establish.invoke(retention, owner, factory) as? ParcelFileDescriptor
+            assertNotNull("expiry after Android's handover must return the new TUN to retention", next)
+            assertFalse(firstFd.valid())
+            assertTrue(establishedFd!!.valid())
+            assertEquals("blocked", state.invoke(retention))
+            assertFalse(vpn.vpnAuthorityCurrent())
+            BrokerRecoverySelectionShadow.unavailable = false
+            BrokerRecoverySelectionShadow.selected = selection("new-broker")
+            reconcileNewOwner()
+            assertTrue(vpn.vpnAuthorityCurrent())
+            assertTrue(establishedFd!!.valid())
+        } finally {
+            next?.close()
+            first.close()
+            adapter.destroy()
+            old.destroy()
+        }
+    }
+
+    @Test fun androidRevokeInsideEstablishStillClosesTheNewDescriptor() {
+        val old = connectedService()
+        val vpn = old.get()
+        var establishedFd: java.io.FileDescriptor? = null
+        BrokerRecoveryBuilderShadow.onEstablished = {
+            establishedFd = it.fileDescriptor
+            vpn.onRevoke()
+        }
+        try {
+            assertNull(vpn.builder {}.establish())
+            assertFalse(checkNotNull(establishedFd).valid())
+            assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
+        } finally {
+            old.destroy()
+        }
+    }
+
+    @Test fun completedStopSurvivesLostAckAndVpnServiceExitWithBrokerOffline() {
+        val old = connectedService()
+        val vpn = old.get()
+        vpn.getSharedPreferences("nelomai-kill-switch-device-v1", 0)
+            .edit().putBoolean("enabled", true).putBoolean("disclosed", true).commit()
+        val encryptedBackend = Class.forName("ru.nelomai.tunnel.EncryptedRecordBackend")
+        val bootIdentity = Class.forName("ru.nelomai.tunnel.BootIdentityProvider")
+        val storage = Class.forName("ru.nelomai.tunnel.AndroidRecoveryStores")
+        var encoded: ByteArray? = null
+        val backend = java.lang.reflect.Proxy.newProxyInstance(encryptedBackend.classLoader, arrayOf(encryptedBackend)) { _, method, args ->
+            when (method.name) {
+                "read" -> encoded?.copyOf()
+                "write" -> true.also { encoded = (args!![0] as ByteArray).copyOf() }
+                else -> error(method.name)
+            }
+        }
+        val boot = java.lang.reflect.Proxy.newProxyInstance(bootIdentity.classLoader, arrayOf(bootIdentity)) { _, method, _ ->
+            check(method.name == "bootCount")
+            7L
+        }
+        val records = Class.forName("ru.nelomai.tunnel.AndroidRecoveryStore").getConstructor(encryptedBackend, bootIdentity)
+            .newInstance(backend, boot)
+        ReflectionHelpers.setStaticField(storage, "instance", records)
+        val adapter = LatestRuntimeVpnEngineV1(vpn)
+        adapter.create()
+        ReflectionHelpers.setField(vpn, "engine", adapter)
+        val body = ReflectionHelpers.getField<Any>(adapter, "engine")
+        val retention = ReflectionHelpers.getField<Any>(body, "tunRetention")
+        val state = retention.javaClass.getMethod("state")
+        val (prior, writer) = ParcelFileDescriptor.createPipe()
+        val retainedFd = prior.fileDescriptor
+        val owner = Any()
+        val factory: () -> ParcelFileDescriptor? = { prior }
+        val transport = retention.javaClass.getMethod("establish", Any::class.java, Function0::class.java)
+            .invoke(retention, owner, factory) as ParcelFileDescriptor
+        val main = shadowOf(Looper.getMainLooper())
+        var destroyed = false
+        try {
+            val ticket = retention.javaClass.getMethod("ticket").invoke(retention)
+            assertEquals(true, retention.javaClass.getMethod("ready", Any::class.java, Long::class.javaPrimitiveType)
+                .invoke(retention, owner, ticket))
+            retention.javaClass.getMethod("unavailable", Any::class.java).invoke(retention, owner)
+            BrokerRecoverySelectionShadow.unavailable = true
+            main.idleFor(Duration.ofSeconds(12))
+            assertEquals("blocked", state.invoke(retention))
+            assertFalse(vpn.vpnAuthorityCurrent())
+
+            var droppedAck: Int? = null
+            val context = object : android.content.ContextWrapper(RuntimeEnvironment.getApplication()) {
+                override fun getApplicationContext(): Context = this
+                override fun bindService(intent: Intent, connection: android.content.ServiceConnection, flags: Int): Boolean = false
+                override fun startService(intent: Intent): android.content.ComponentName? {
+                    val actual = Intent(intent)
+                    // Drop only the reply to the caller, leaving the native Stop intact.
+                    if (intent.action == RuntimeServiceIntents.CLIENT_STOP) {
+                        actual.putExtra("result_receiver", object : ResultReceiver(Handler(Looper.getMainLooper())) {
+                            override fun onReceiveResult(code: Int, payload: android.os.Bundle?) {
+                                droppedAck = code
+                            }
+                        })
+                        vpn.onStartCommand(actual, 0, 2)
+                        return intent.component
+                    }
+                    error("Confirmation attempted the broker-dependent status path")
+                }
+            }
+            val results = mutableListOf<String>()
+            requestFullStop(context, results)
+            val end = System.nanoTime() + 3_000_000_000L
+            while (droppedAck == null && System.nanoTime() < end) {
+                main.idle()
+                Thread.sleep(2)
+            }
+            assertEquals(1, droppedAck)
+            assertEquals("off", state.invoke(retention))
+            assertFalse(retainedFd.valid())
+            assertTrue(results.isEmpty())
+            old.destroy()
+            destroyed = true
+            main.idleFor(Duration.ofSeconds(45))
+            assertEquals(listOf("STOPPED"), results)
+            assertTrue(BrokerRecoverySelectionShadow.unavailable)
+        } finally {
+            transport.close()
+            if (!destroyed) old.destroy()
+            prior.close()
+            writer.close()
+            ReflectionHelpers.setStaticField(storage, "instance", null)
+        }
+    }
+
+    @Test fun destroyedServiceCannotConfirmStopAfterANewTun() =
+        assertOldStopCannotConfirmAfterReplacement(destroyOldFirst = true)
+
+    @Test fun supersededServiceCannotConfirmStopAfterANewTun() =
+        assertOldStopCannotConfirmAfterReplacement(destroyOldFirst = false)
+
+    private fun assertOldStopCannotConfirmAfterReplacement(destroyOldFirst: Boolean) {
+        val old = connectedService()
+        val snapshot = BrokerRecoverySelectionShadow.selected
+        val previous = LatestRuntimeVpnEngineV1(old.get())
+        previous.create()
+        ReflectionHelpers.setField(old.get(), "engine", previous)
+        val oldEngine = ReflectionHelpers.getField<Any>(previous, "engine")
+        var id: String? = null
+        var readStatus: ((Intent) -> Unit)? = null
+        val context = object : android.content.ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun getApplicationContext(): Context = this
+            override fun bindService(intent: Intent, connection: android.content.ServiceConnection, flags: Int): Boolean = false
+            override fun startService(intent: Intent): android.content.ComponentName? {
+                when (intent.action) {
+                    RuntimeServiceIntents.CLIENT_STOP -> id = intent.getStringExtra("local_stop_receipt")
+                    "ru.nelomai.tunnel.CLIENT_STATUS" -> checkNotNull(readStatus)(intent)
+                    else -> error("Unexpected service action")
+                }
+                return intent.component
+            }
+        }
+        val results = mutableListOf<String>()
+        requestFullStop(context, results)
+        assertNotNull(id)
+        val release = oldEngine.javaClass.getDeclaredMethod("releaseProtection", Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+        val finish = oldEngine.javaClass.getDeclaredMethod("finishProtectionStop", Long::class.javaPrimitiveType, String::class.java)
+            .apply { isAccessible = true }
+        assertEquals(true, release.invoke(oldEngine, false))
+        val stopOwner = ReflectionHelpers.getField<Any>(oldEngine, "tunRetention")
+        val ticket = stopOwner.javaClass.getMethod("ticket").invoke(stopOwner)
+        if (destroyOldFirst) old.destroy()
+
+        BrokerRecoverySelectionShadow.selected = snapshot
+        val current = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        readStatus = { intent -> current.get().onStartCommand(intent, 0, 2) }
+        val currentAdapter = LatestRuntimeVpnEngineV1(current.get())
+        currentAdapter.create()
+        ReflectionHelpers.setField(current.get(), "engine", currentAdapter)
+        val newEngine = ReflectionHelpers.getField<Any>(currentAdapter, "engine")
+        val newOwner = ReflectionHelpers.getField<Any>(newEngine, "tunRetention")
+        val owner = Any()
+        val (read, write) = ParcelFileDescriptor.createPipe()
+        val descriptor = read.fileDescriptor
+        val factory: () -> ParcelFileDescriptor? = { read }
+        val installed = newOwner.javaClass.getMethod("establish", Any::class.java, Function0::class.java)
+            .invoke(newOwner, owner, factory) as ParcelFileDescriptor
+        try {
+            // Deliver the completed Stop callback after the new service replaced the TUN.
+            assertTrue(descriptor.valid())
+            val completed = finish.invoke(oldEngine, ticket, id)
+            BrokerRecoverySelectionShadow.unavailable = true
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(45))
+            assertEquals(listOf("tunnel_stop_unconfirmed"), results)
+            assertEquals(false, completed)
+            assertTrue("the replacement TUN must remain open", descriptor.valid())
+        } finally {
+            installed.close()
+            write.close()
+            current.destroy()
+            if (!destroyOldFirst) old.destroy()
+            read.close()
+        }
+    }
+
+    @Test fun lostAckWithNoConfirmedStopDoesNotAssumeVpnIsOff() {
+        BrokerRecoverySelectionShadow.unavailable = true
+        val cold = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        val context = object : android.content.ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun getApplicationContext(): Context = this
+            override fun bindService(intent: Intent, connection: android.content.ServiceConnection, flags: Int): Boolean = false
+            override fun startService(intent: Intent): android.content.ComponentName? {
+                // Neither a reply nor a service-side completion was received.
+                if (intent.action == "ru.nelomai.tunnel.CLIENT_STATUS") cold.get().onStartCommand(intent, 0, 1)
+                return intent.component
+            }
+        }
+        try {
+            val results = mutableListOf<String>()
+            requestFullStop(context, results)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(45))
+            assertEquals(listOf("tunnel_stop_unconfirmed"), results)
+        } finally {
+            cold.destroy()
+        }
+    }
+
+    private fun requestFullStop(context: Context, results: MutableList<String>) {
+        val client = Class.forName("ru.nelomai.tunnel.TunnelServiceClient")
+        val success: (Any, Long) -> Unit = { state, _ -> results += state.toString() }
+        val failed: (String) -> Unit = { results += it }
+        client.getMethod("stop", Context::class.java, Int::class.javaPrimitiveType,
+            Function2::class.java, Function1::class.java, Boolean::class.javaPrimitiveType, String::class.java)
+            .invoke(client.getField("INSTANCE").get(null), context, RuntimeServiceIntents.VPN_API_VERSION,
+                success, failed, false, null)
     }
 
     @Test fun deviceSleepDoesNotConsumeTheBrokerVerificationBudget() {
@@ -260,7 +580,8 @@ class RuntimeVpnBrokerRecoveryTest {
         val old = connectedService()
         BrokerRecoverySelectionShadow.pending = mutableListOf()
         reconcileNewOwner()
-        assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
+        assertFalse(old.get().vpnAuthorityCurrent())
+        assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
         old.destroy()
     }
 
@@ -395,15 +716,16 @@ class RuntimeVpnBrokerRecoveryTest {
         old.destroy()
     }
 
-    @Test fun watchdogExpiresUnverifiedTransportEvenIfMainCannotStartRetirement() {
+    @Test fun expiredBrokerProofFencesAuthorityWithoutRevokingWhenMainIsBlocked() {
         val old = connectedService()
+        val vpn = old.get()
         BrokerRecoveryAdaptersShadow.transportClosed = false
         BrokerRecoverySelectionShadow.unavailable = true
-        advanceWatchdog(old.get(), 19)
-        assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
+        ShadowSystemClock.advanceBy(Duration.ofSeconds(20))
+        advanceWatchdog(vpn, 1)
+        assertFalse(vpn.vpnAuthorityCurrent())
         assertFalse(ShadowProcess.wasKilled(Process.myPid()))
-        advanceWatchdog(old.get(), 1)
-        assertTrue(ShadowProcess.wasKilled(Process.myPid()))
+        assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
         old.destroy()
     }
 
@@ -481,18 +803,20 @@ class RuntimeVpnBrokerRecoveryTest {
         old.destroy()
     }
 
-    @Test fun retirementReconcilesAStatusRejectedBeforeTheBrokerDeadline() {
+    @Test fun confirmedAuthorizationChangeRetiresAfterBrokerTimeout() {
         val old = connectedService()
         BrokerRecoverySelectionShadow.unavailable = true
         old.get().onStartCommand(Intent("ru.nelomai.tunnel.CLIENT_STATUS"), 0, 2)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(11))
         assertTrue(BrokerRecoveryAdaptersShadow.rejectedStartIds.isEmpty())
         assertEquals(0, BrokerRecoveryAdaptersShadow.revoked)
-        BrokerRecoveryAdaptersShadow.onRevoke = {
-            assertEquals(listOf(2), BrokerRecoveryAdaptersShadow.rejectedStartIds)
-        }
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(11))
+
+        BrokerRecoverySelectionShadow.unavailable = false
+        BrokerRecoverySelectionShadow.selected = selection("new-broker", scope = "b".repeat(64))
+        reconcileNewOwner()
         assertEquals(1, BrokerRecoveryAdaptersShadow.revoked)
         assertEquals(listOf(2), BrokerRecoveryAdaptersShadow.rejectedStartIds)
+        assertFalse(old.get().vpnAuthorityCurrent())
         old.destroy()
     }
 
@@ -636,5 +960,19 @@ class BrokerRecoveryAdaptersShadow {
 @Implements(VpnService.Builder::class)
 class BrokerRecoveryBuilderShadow {
     @Implementation fun establish(): ParcelFileDescriptor =
-        ParcelFileDescriptor.createPipe().let { (read, write) -> write.close(); read }
+        ParcelFileDescriptor.createPipe().let { (read, write) ->
+            write.close()
+            onEstablished?.invoke(read)
+            read
+        }
+    companion object {
+        var onEstablished: ((ParcelFileDescriptor) -> Unit)? = null
+    }
+}
+
+@Implements(className = "org.amnezia.awg.util.SharedLibraryLoader", isInAndroidSdk = false)
+class BrokerRecoveryNativeLibraryShadow {
+    companion object {
+        @JvmStatic @Implementation fun loadSharedLibrary(context: Context, name: String) = Unit
+    }
 }

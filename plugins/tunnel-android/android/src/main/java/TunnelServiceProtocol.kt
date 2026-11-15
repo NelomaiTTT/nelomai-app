@@ -20,6 +20,7 @@ internal fun androidServiceDispatchErrorCode(): String =
 internal const val EXTRA_RESULT_RECEIVER = "result_receiver"
 internal const val EXTRA_API_VERSION = "api_version"
 internal const val EXTRA_FAILED_START_OPERATION_ID = "failed_start_operation_id"
+internal const val EXTRA_LOCAL_STOP_RECEIPT = "local_stop_receipt"
 internal const val EXTRA_LEGACY_STOP_ONLY = "legacy_stop_only"
 internal const val EXTRA_START_SOURCE = "start_source"
 internal const val EXTRA_CONFIGURATION = "configuration"
@@ -327,30 +328,38 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
         legacyOnly: Boolean = false,
         failedStartOperationId: String? = null,
-    ) = requestBundle(
-        context,
-        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
-            .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
-            .putExtra(EXTRA_API_VERSION, apiVersion)
-            .putExtra(EXTRA_LEGACY_STOP_ONLY, legacyOnly)
-            .putExtra(EXTRA_FAILED_START_OPERATION_ID, failedStartOperationId),
-        { result ->
-            val state = SessionState.values().firstOrNull {
-                it.wireName == result.getString(EXTRA_STATE)
-            } ?: SessionState.FAILED
-            onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
-        },
-        { code ->
-            if (legacyOnly || code != SERVICE_REQUEST_TIMEOUT_ERROR) onError(code)
-            else TunnelStatusTransport.request(context, apiVersion, { status ->
-                // Re-observe after the owner's 40s fallback. IPC EOF is never proof.
-                if (status.getString(EXTRA_STATE) == SessionState.STOPPED.wireName &&
-                    status.getString("kill_switch_state") == "off") onSuccess(SessionState.STOPPED, 45_000)
-                else onError("tunnel_stop_unconfirmed")
-            }, { onError("tunnel_stop_unconfirmed") })
-        },
-        timeoutMillis = if (legacyOnly) SERVICE_REQUEST_TIMEOUT_MILLIS else 45_000L,
-    )
+    ) {
+        val receipts = LocalStopReceipts.open(context.applicationContext)
+        val receipt = if (legacyOnly) null else receipts.create()
+        requestBundle(
+            context,
+            ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+                .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
+                .putExtra(EXTRA_API_VERSION, apiVersion)
+                .putExtra(EXTRA_LEGACY_STOP_ONLY, legacyOnly)
+                .putExtra(EXTRA_FAILED_START_OPERATION_ID, failedStartOperationId)
+                .putExtra(EXTRA_LOCAL_STOP_RECEIPT, receipt),
+            { result ->
+                receipts.consume(receipt)
+                val state = SessionState.values().firstOrNull {
+                    it.wireName == result.getString(EXTRA_STATE)
+                } ?: SessionState.FAILED
+                onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
+            },
+            { code ->
+                val stopped = receipts.consume(receipt)
+                if (legacyOnly || code != SERVICE_REQUEST_TIMEOUT_ERROR) onError(code)
+                else if (stopped) onSuccess(SessionState.STOPPED, 45_000)
+                else TunnelStatusTransport.request(context, apiVersion, { status ->
+                    // Re-observe after the owner's 40s fallback. IPC EOF is never proof.
+                    if (status.getString(EXTRA_STATE) == SessionState.STOPPED.wireName &&
+                        status.getString("kill_switch_state") == "off") onSuccess(SessionState.STOPPED, 45_000)
+                    else onError("tunnel_stop_unconfirmed")
+                }, { onError("tunnel_stop_unconfirmed") })
+            },
+            timeoutMillis = if (legacyOnly) SERVICE_REQUEST_TIMEOUT_MILLIS else 45_000L,
+        )
+    }
 
     fun status(
         context: Context,
