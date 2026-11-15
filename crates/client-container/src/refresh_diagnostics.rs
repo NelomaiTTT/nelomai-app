@@ -47,6 +47,58 @@ pub(crate) fn append_update_failure(directory: &Path, event: &UpdateFailure<'_>)
     )
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StableTunnelProbeOutcome {
+    Succeeded,
+    Failed,
+    OutsideTunnel,
+    RouteUnavailable,
+}
+
+#[cfg(target_os = "linux")]
+impl StableTunnelProbeOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::OutsideTunnel => "skipped_outside_tunnel",
+            Self::RouteUnavailable => "route_unavailable",
+        }
+    }
+
+    fn succeeded(self) -> Option<bool> {
+        match self {
+            Self::Succeeded => Some(true),
+            Self::Failed => Some(false),
+            Self::OutsideTunnel | Self::RouteUnavailable => None,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn record_stable_tunnel_probe(
+    directory: &Path,
+    latest_handshake_epoch_millis: u64,
+    outcome: StableTunnelProbeOutcome,
+) -> io::Result<()> {
+    append_named(
+        directory,
+        &serde_json::json!({
+            "timestamp_unix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            "kind": "tunnel.stable_interface_probe",
+            "latest_handshake_epoch_millis": latest_handshake_epoch_millis,
+            "probe_succeeded": outcome.succeeded(),
+            "probe_outcome": outcome.as_str(),
+        }),
+        "tunnel-probe.jsonl",
+        "tunnel-probe.previous.jsonl",
+    )
+}
+
 fn append_named(
     directory: &Path,
     event: &impl serde::Serialize,

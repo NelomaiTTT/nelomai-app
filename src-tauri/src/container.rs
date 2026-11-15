@@ -204,6 +204,8 @@ impl NativeStop {
 struct NativeOperationState {
     replacement: Option<(nelomai_client_container::UpdateStopProof, bool)>,
     observed_helper_stop: bool,
+    #[cfg(target_os = "linux")]
+    stable_probe: crate::linux_stable_probe::StableProbe,
     #[cfg(target_os = "macos")]
     broker_replaced: bool,
     #[cfg(target_os = "macos")]
@@ -390,6 +392,8 @@ impl NativeStop {
                 return Err(BrokerError::RecoveryRequired);
             }
             operation.observed_helper_stop = false;
+            #[cfg(target_os = "linux")]
+            operation.stable_probe.cancel();
             let result = if for_transition || cfg!(target_os = "macos") {
                 stop_helper_for_exit(&tunnel).await
             } else {
@@ -446,6 +450,8 @@ impl PrivateBackgroundDispatcher for DesktopBackground {
 }
 pub(crate) struct CommonState {
     host: Arc<CommonHost>,
+    #[cfg(target_os = "linux")]
+    stable_probe_directory: Option<PathBuf>,
     #[cfg(target_os = "macos")]
     records: nelomai_client_storage::MacosRecordFactory,
     stop: Arc<NativeStop>,
@@ -470,6 +476,12 @@ impl CommonState {
         // A full process exit is acknowledged only after actual runtime exit
         // and independent helper stop; a closed window never enters here.
         let operation = self.stop.operation.lock().await;
+        #[cfg(target_os = "linux")]
+        let operation = {
+            let mut operation = operation;
+            operation.stable_probe.cancel();
+            operation
+        };
         #[cfg(target_os = "macos")]
         if operation.exit_requested {
             return;
@@ -764,6 +776,8 @@ pub fn run() {
                 app.manage(crate::support_diagnostics::SupportDataRoot(
                     prepared.owner.root().to_owned(),
                 ));
+                #[cfg(target_os = "linux")]
+                let probe_directory = prepared.owner.root().join("common");
                 // Updater cache recovery assumes this process is the only owner.
                 let updater = platform::updater::DesktopUpdateBackend::from_build(
                     app.handle().clone(),
@@ -833,6 +847,11 @@ pub fn run() {
                     .map_err(|_| io::Error::other("common process state unavailable"))? =
                     Some(child);
                 let state = Arc::new(CommonState {
+                    #[cfg(target_os = "linux")]
+                    stable_probe_directory: crate::linux_stable_probe::StableProbe::supports(
+                        host.native_target(),
+                    )
+                    .then_some(probe_directory),
                     host,
                     #[cfg(target_os = "macos")]
                     records,
@@ -1200,13 +1219,20 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let response = state
-            .stop
-            .tunnel
-            .transport()
-            .exchange(request)
-            .await
-            .map_err(|_| io::Error::other("engine unavailable"))?;
+        let transport = state.stop.tunnel.transport();
+        #[cfg(target_os = "linux")]
+        let response = match &state.stable_probe_directory {
+            Some(directory) => {
+                operation
+                    .stable_probe
+                    .exchange(transport, request, directory, PANEL_BASE)
+                    .await
+            }
+            None => transport.exchange(request).await,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let response = transport.exchange(request).await;
+        let response = response.map_err(|_| io::Error::other("engine unavailable"))?;
         serde_json::to_vec(&response).map_err(Into::into)
     }
 }

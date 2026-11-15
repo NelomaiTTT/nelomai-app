@@ -11,6 +11,8 @@ pub mod container;
 #[cfg(desktop)]
 mod desktop;
 mod diagnostics;
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+mod linux_stable_probe;
 #[cfg(target_os = "macos")]
 mod macos_identity;
 #[cfg(target_os = "macos")]

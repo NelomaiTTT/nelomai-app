@@ -17,6 +17,8 @@ mod switch;
 mod update;
 pub use auth_broker::*;
 pub use cleanup::*;
+#[cfg(target_os = "linux")]
+pub use refresh_diagnostics::{record_stable_tunnel_probe, StableTunnelProbeOutcome};
 pub use runtime_auth::*;
 pub use selection::*;
 pub use switch::*;

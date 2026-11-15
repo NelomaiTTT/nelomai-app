@@ -310,6 +310,18 @@ fn collect_with_native(
         } else {
             MAX_SOURCE_BYTES
         };
+        #[cfg(target_os = "linux")]
+        for name in ["tunnel-probe.jsonl", "tunnel-probe.previous.jsonl"] {
+            let path = Path::new("common").join(name);
+            let limit = 1024;
+            let data = checked_open(data_dir, &path, false).and_then(|file| read_tail(file, limit));
+            if !data
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                log.source("common", None, name, limit, data);
+            }
+        }
         for name in [
             "update-diagnostics.jsonl",
             "update-diagnostics.previous.jsonl",
@@ -687,6 +699,7 @@ pub(super) fn safe_event(value: Value) -> Option<Map<String, Value>> {
             | "runtime.status"
             | "tunnel.recovery.power_gate"
             | "tunnel.data_plane_snapshot"
+            | "tunnel.stable_interface_probe"
             | "tunnel.stall.classified"
             | "tunnel.stall.direct_probe_fallback"
             | "tunnel.stall.recovery_skipped"
@@ -750,6 +763,17 @@ pub(super) fn safe_event(value: Value) -> Option<Map<String, Value>> {
     }
     if let Some(ok) = value["probe_succeeded"].as_bool() {
         event.insert("probe_succeeded".into(), json!(ok));
+    }
+    if kind == "tunnel.stable_interface_probe" {
+        if let Some(handshake) = value["latest_handshake_epoch_millis"].as_u64() {
+            event.insert("latest_handshake_epoch_millis".into(), json!(handshake));
+        }
+        if let Some(
+            outcome @ ("succeeded" | "failed" | "skipped_outside_tunnel" | "route_unavailable"),
+        ) = value["probe_outcome"].as_str()
+        {
+            event.insert("probe_outcome".into(), json!(outcome));
+        }
     }
     for field in ["operation_id", "request_id", "switch_id"] {
         if let Some(id) = value[field].as_str().and_then(|v| Uuid::parse_str(v).ok()) {
@@ -1021,6 +1045,44 @@ mod tests {
     use super::*;
     use serde_json::Value;
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_tunnel_check_is_available_in_the_support_report() {
+        let root = tempfile::tempdir().unwrap();
+        let common = root.path().join("common");
+        use nelomai_client_container::{
+            record_stable_tunnel_probe, StableTunnelProbeOutcome as Outcome,
+        };
+
+        record_stable_tunnel_probe(&common, 12345, Outcome::Succeeded).unwrap();
+        record_stable_tunnel_probe(&common, 23456, Outcome::Failed).unwrap();
+        record_stable_tunnel_probe(&common, 34567, Outcome::OutsideTunnel).unwrap();
+        let report = collect_desktop_support_report(Some(root.path()), false).unwrap();
+        let value: Value = serde_json::from_slice(&report.bytes).unwrap();
+        let events: Vec<_> = value["application_log"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry["kind"] == "tunnel.stable_interface_probe")
+            .map(|entry| {
+                (
+                    entry["latest_handshake_epoch_millis"].as_u64().unwrap(),
+                    entry["probe_succeeded"].as_bool(),
+                    entry["probe_outcome"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (12345, Some(true), "succeeded".into()),
+                (23456, Some(false), "failed".into()),
+                (34567, None, "skipped_outside_tunnel".into()),
+            ]
+        );
+    }
 
     #[test]
     fn support_snapshot_without_runtime_keeps_current_and_previous_events() {
