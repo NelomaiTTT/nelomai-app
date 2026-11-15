@@ -261,6 +261,8 @@ pub struct UpdateBackendError {
 }
 
 impl UpdateBackendError {
+    const ARTIFACT_ACCESS_REJECTED: &'static str = "update_download_http_unauthorized";
+
     pub fn new(code: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -279,6 +281,14 @@ impl UpdateBackendError {
 
     pub fn is_manifest_temporarily_unavailable(&self) -> bool {
         self.code == "update_manifest_temporarily_unavailable"
+    }
+
+    pub fn artifact_access_rejected() -> Self {
+        Self::new(Self::ARTIFACT_ACCESS_REJECTED)
+    }
+
+    pub fn is_artifact_access_rejected(&self) -> bool {
+        self.code == Self::ARTIFACT_ACCESS_REJECTED
     }
 
     pub fn at_stage(mut self, stage: &'static str) -> Self {
@@ -369,6 +379,14 @@ pub trait UpdateInstallBarrier: Send + Sync {
         Err(UpdateBarrierError::new("update_authority_unavailable"))
     }
 
+    /// Renew a rejected artifact credential within the same authenticated scope.
+    async fn refresh_download_access(
+        &self,
+        _access: &AccessSnapshot,
+    ) -> Result<Option<AccessSnapshot>, UpdateBackendError> {
+        Ok(None)
+    }
+
     async fn prepare(&self, target_version: &str)
         -> Result<UpdateBarrierPhase, UpdateBarrierError>;
     async fn installer_opened(&self) -> Result<(), UpdateBarrierError>;
@@ -400,8 +418,10 @@ pub fn is_diagnostic_error_code(code: &str) -> bool {
             | "update_cache_unavailable"
             | "update_check_failed"
             | "update_consent_required"
+            | "update_download_access_refresh_failed"
             | "update_download_encoding_invalid"
             | "update_download_failed"
+            | "update_download_http_forbidden"
             | "update_download_http_rejected"
             | "update_download_http_server_error"
             | "update_download_http_unauthorized"

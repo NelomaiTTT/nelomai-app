@@ -338,6 +338,15 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         let state = self.state.lock().expect("update state poisoned");
         state.offer.as_ref().is_some_and(|o| o.id == offer.id) && (state.automatic || state.consent)
     }
+    fn cancel_download(&self, offer: &BoundOffer) -> UpdatePhase {
+        let mut state = self.state.lock().expect("update state poisoned");
+        if state.offer.as_ref().is_some_and(|o| o.id == offer.id)
+            && matches!(state.phase, UpdatePhase::Downloading { .. })
+        {
+            state.phase = UpdatePhase::Available(offer.offer.clone());
+        }
+        state.phase.clone()
+    }
     fn fail(&self, offer: &BoundOffer, code: &str) {
         let mut state = self.state.lock().expect("update state poisoned");
         if state.offer.as_ref().is_some_and(|o| o.id == offer.id) {
@@ -383,7 +392,18 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         let Some(offer) = offer else {
             return Ok(self.phase());
         };
-        let result = self.drive_offer(&offer, access).await;
+        let mut result = self.drive_offer(&offer, access).await;
+        if matches!(&result, Err(UpdateError::Backend(error)) if error.is_artifact_access_rejected())
+            && self.wanted(&offer)
+        {
+            // Keep the original offer and consent through one authenticated GET retry.
+            match self.barrier.refresh_download_access(access).await {
+                _ if !self.wanted(&offer) => result = Ok(self.cancel_download(&offer)),
+                Ok(Some(refreshed)) => result = self.drive_offer(&offer, &refreshed).await,
+                Ok(None) => {}
+                Err(error) => result = Err(error.into()),
+            }
+        }
         if let Err(error) = &result {
             let code = match error {
                 UpdateError::Backend(e) => e.code(),
@@ -399,7 +419,7 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
         access: &AccessSnapshot,
     ) -> Result<UpdatePhase, UpdateError> {
         if !self.wanted(offer) {
-            return Ok(self.phase());
+            return Ok(self.cancel_download(offer));
         }
         self.authority(offer, access).await?;
         let cached = self
@@ -443,9 +463,7 @@ impl<B: UpdateBackend + 'static> UpdateCoordinator<B> {
                     result = &mut download => break result?,
                     _ = self.changed.notified() => {
                         if !self.wanted(offer) {
-                            let mut state = self.state.lock().expect("update state poisoned");
-                            if state.offer.as_ref().is_some_and(|o| o.id == offer.id) { state.phase = UpdatePhase::Available(offer.offer.clone()); }
-                            return Ok(state.phase.clone());
+                            return Ok(self.cancel_download(offer));
                         }
                     }
                 }

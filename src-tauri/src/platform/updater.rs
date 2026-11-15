@@ -137,6 +137,13 @@ async fn download_response(
 ) -> Result<(StagedFile, OwnedMutexGuard<()>), UpdateBackendError> {
     use reqwest_updater::{header, StatusCode};
 
+    match response.status() {
+        StatusCode::UNAUTHORIZED => return Err(UpdateBackendError::artifact_access_rejected()),
+        StatusCode::FORBIDDEN => {
+            return Err(UpdateBackendError::new("update_download_http_forbidden"))
+        }
+        _ => {}
+    }
     let header_value = |name: header::HeaderName| {
         response
             .headers()
@@ -188,9 +195,6 @@ async fn download_response(
         }
         status => {
             let code = match status {
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    "update_download_http_unauthorized"
-                }
                 StatusCode::NOT_FOUND | StatusCode::GONE => "update_download_http_unavailable",
                 status if status.is_server_error() => "update_download_http_server_error",
                 _ => "update_download_http_rejected",
@@ -1786,6 +1790,16 @@ mod prepared_signature_tests {
             (
                 "416 Range Not Satisfiable\r\nContent-Length: 0\r\n\r\n",
                 Some("update_download_range_invalid"),
+                Replacement::Data,
+            ),
+            (
+                "401 Unauthorized\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n",
+                Some("update_download_http_unauthorized"),
+                Replacement::Data,
+            ),
+            (
+                "403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+                Some("update_download_http_forbidden"),
                 Replacement::Data,
             ),
             (

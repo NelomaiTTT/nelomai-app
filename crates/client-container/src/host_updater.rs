@@ -117,6 +117,20 @@ impl UpdateInstallBarrier for Barrier {
             .await
             .map_err(|_| UpdateBarrierError::new("update_auth_changed"))
     }
+    #[cfg(not(target_os = "android"))]
+    async fn refresh_download_access(
+        &self,
+        access: &AccessSnapshot,
+    ) -> Result<Option<AccessSnapshot>, UpdateBackendError> {
+        self.broker
+            .access_token_fenced(&crate::ScopeStamp::from_access(access), Some(access))
+            .await
+            .map(Some)
+            .map_err(|_| {
+                UpdateBackendError::new("update_download_access_refresh_failed")
+                    .at_stage("download")
+            })
+    }
     async fn prepare(&self, target: &str) -> Result<UpdateBarrierPhase, UpdateBarrierError> {
         match self
             .barrier
@@ -783,14 +797,9 @@ impl HostUpdater {
         }
         // Observation reads current protected state without issuing a refresh;
         // a slow network operation must not block pause/disconnect on this IPC.
-        let access = self
-            .broker
-            .observe()
-            .await
-            .ok()
-            .and_then(|observation| observation.access);
+        let access = self.broker.observe_update_scope().await;
         if let Some(coordinator) = &self.coordinator {
-            if let Some(access) = &access {
+            if let Ok(access) = &access {
                 coordinator.retain_scope(access);
             } else {
                 coordinator.invalidate();
@@ -1111,6 +1120,7 @@ mod tests {
     };
     use serde_json::json;
     use std::{
+        collections::VecDeque,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
@@ -1166,6 +1176,8 @@ mod tests {
         versions: Mutex<Vec<String>>,
         files: Mutex<Vec<tempfile::NamedTempFile>>,
         panel: Option<Arc<Panel>>,
+        download_failures: Mutex<VecDeque<&'static str>>,
+        download_tokens: Mutex<Vec<String>>,
     }
     fn test_descriptor(version: &str) -> ResolvedUpdate {
         ResolvedUpdate {
@@ -1213,10 +1225,17 @@ mod tests {
         }
         async fn prepare(
             &self,
-            _: &AccessSnapshot,
+            access: &AccessSnapshot,
             resolved: &ResolvedUpdate,
             _: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
         ) -> Result<PreparedUpdate, UpdateBackendError> {
+            self.download_tokens
+                .lock()
+                .unwrap()
+                .push(access.access_token().to_owned());
+            if let Some(code) = self.download_failures.lock().unwrap().pop_front() {
+                return Err(UpdateBackendError::new(code).at_stage("download"));
+            }
             Ok(test_prepared(resolved, &self.files))
         }
         async fn install_prepared(
@@ -1279,6 +1298,9 @@ mod tests {
 
     struct Panel {
         calls: AtomicUsize,
+        refreshes: AtomicUsize,
+        hold_refresh: AtomicBool,
+        release_refresh: Notify,
         fail: AtomicBool,
         malformed_bootstrap: AtomicBool,
         manifest_failure: Mutex<Option<&'static str>>,
@@ -1288,6 +1310,24 @@ mod tests {
         resumes: AtomicUsize,
         fail_resume: AtomicBool,
         retry_reconcile: AtomicUsize,
+    }
+
+    async fn refresh_access(State(panel): State<Arc<Panel>>) -> Json<serde_json::Value> {
+        panel.refreshes.fetch_add(1, Ordering::SeqCst);
+        if panel.hold_refresh.load(Ordering::SeqCst) {
+            panel.release_refresh.notified().await;
+        }
+        Json(json!({
+            "api_version": "1", "request_id": "synthetic", "token_type": "Bearer",
+            "access_token": "refreshed-access", "access_expires_in": 900,
+            "refresh_token": "refreshed-refresh", "refresh_expires_in": 3600,
+            "access": {"state": "active", "can_login": true, "can_connect": true, "expires_at": null},
+            "device": {
+                "id": "device-a", "name": "Mac", "platform": "macos", "container_version": "0.2.20",
+                "runtime_version": "0.2.20", "runtime_contract_version": 1,
+                "runtime_slot": "latest", "session_generation": 1
+            }
+        }))
     }
 
     async fn reconcile(
@@ -1388,6 +1428,9 @@ mod tests {
     ) {
         let panel = Arc::new(Panel {
             calls: AtomicUsize::new(0),
+            refreshes: AtomicUsize::new(0),
+            hold_refresh: AtomicBool::new(false),
+            release_refresh: Notify::new(),
             fail: AtomicBool::new(fail_first),
             malformed_bootstrap: AtomicBool::new(false),
             manifest_failure: Mutex::new(None),
@@ -1405,6 +1448,10 @@ mod tests {
             .unwrap();
         let router = Router::new()
             .route("/api/client/v1/bootstrap", get(bootstrap))
+            .route(
+                "/api/client/v1/auth/refresh-recoverable",
+                post(refresh_access),
+            )
             .route(
                 "/api/client/v1/connections/runtime-switch/reconcile",
                 post(reconcile),
@@ -2177,6 +2224,108 @@ mod tests {
         panel.release.notify_one();
         wait_for_refresh(&updater).await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn desktop_timer_retries_unauthorized_download_without_a_window() {
+        const UNAUTHORIZED: &str = "update_download_http_unauthorized";
+        const FORBIDDEN: &str = "update_download_http_forbidden";
+        for (failures, expected_tokens, expected_phase) in [
+            (
+                &[UNAUTHORIZED][..],
+                &["access", "refreshed-access"][..],
+                UpdatePhase::ReadyToInstall {
+                    version: "0.2.21".into(),
+                },
+            ),
+            (
+                &[UNAUTHORIZED, UNAUTHORIZED],
+                &["access", "refreshed-access"],
+                UpdatePhase::Failed {
+                    version: "0.2.21".into(),
+                    code: UNAUTHORIZED.into(),
+                },
+            ),
+            (
+                &[FORBIDDEN],
+                &["access"],
+                UpdatePhase::Failed {
+                    version: "0.2.21".into(),
+                    code: FORBIDDEN.into(),
+                },
+            ),
+        ] {
+            let (updater, panel, backend, tunnel, server, _root) = updater(false).await;
+            backend.download_failures.lock().unwrap().extend(failures);
+            updater.set_automatic(true).unwrap();
+            tokio::time::pause();
+            updater.start_desktop_scheduler();
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(30 * 60)).await;
+            tokio::time::resume();
+            wait_for_calls(&panel, 1).await;
+            panel.release.notify_one();
+            wait_for_idle(&updater).await;
+            server.abort();
+
+            let coordinator = updater.coordinator.as_ref().unwrap();
+            assert!(!coordinator.ui_connected());
+            assert!(!coordinator.ui_foreground());
+            assert_eq!(coordinator.phase(), expected_phase);
+            assert_eq!(*backend.download_tokens.lock().unwrap(), expected_tokens);
+            assert_eq!(
+                panel.refreshes.load(Ordering::SeqCst),
+                expected_tokens.len() - 1
+            );
+            assert!(backend.versions.lock().unwrap().is_empty());
+            assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_during_refresh_keeps_the_offer_and_disabling_cancels_the_retry() {
+        for (disable, expected_state, expected_tokens) in [
+            (
+                false,
+                "ready_to_install",
+                &["access", "refreshed-access"][..],
+            ),
+            (true, "available", &["access"][..]),
+        ] {
+            let (updater, panel, backend, _, server, _root) = updater(false).await;
+            backend
+                .download_failures
+                .lock()
+                .unwrap()
+                .push_back("update_download_http_unauthorized");
+            panel.hold_refresh.store(true, Ordering::SeqCst);
+            updater.set_automatic(true).unwrap();
+            updater.check(UpdateCheckReason::Timer).unwrap();
+            wait_for_calls(&panel, 1).await;
+            panel.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while panel.refreshes.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let offer = updater.status_v2().unwrap().offer_id.unwrap();
+            let observed = updater
+                .request_v2(UpdateRequestV2::Status {})
+                .await
+                .unwrap();
+            assert_eq!(observed.offer_id.as_deref(), Some(offer.as_str()));
+            assert_eq!(observed.phase, "downloading");
+            if disable {
+                updater.set_automatic(false).unwrap();
+            }
+            panel.release_refresh.notify_one();
+            wait_for_idle(&updater).await;
+            server.abort();
+            assert_eq!(updater.status_v2().unwrap().phase, expected_state);
+            assert_eq!(*backend.download_tokens.lock().unwrap(), expected_tokens);
+        }
     }
 
     #[tokio::test]

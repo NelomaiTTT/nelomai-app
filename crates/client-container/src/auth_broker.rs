@@ -2008,8 +2008,24 @@ impl AuthBroker {
     pub(crate) async fn pending_refresh_access(&self) -> Result<AccessSnapshot, BrokerError> {
         let _state = self.state.lock().await;
         let auth = self.load()?;
-        Self::active(&auth)?;
-        Self::ensure_transition_issuance_allowed(&auth, None)?;
+        Self::pending_refresh_snapshot(&auth)
+    }
+
+    /// Compare updater offer scopes while a recoverable refresh is pending.
+    /// The snapshot is not used to issue requests or authorize installation.
+    pub(crate) async fn observe_update_scope(&self) -> Result<AccessSnapshot, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        match Self::observed_state(&auth)? {
+            BrokerAuthState::Active => Self::snapshot(&auth),
+            BrokerAuthState::RecoveryRequired => Self::pending_refresh_snapshot(&auth),
+            _ => Err(BrokerError::Cancelled),
+        }
+    }
+
+    fn pending_refresh_snapshot(auth: &AuthStoreV1) -> Result<AccessSnapshot, BrokerError> {
+        Self::active(auth)?;
+        Self::ensure_transition_issuance_allowed(auth, None)?;
         let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
         let ticket = meta
             .pending_request
@@ -2017,13 +2033,13 @@ impl AuthBroker {
             .ok_or(BrokerError::RecoveryRequired)?;
         if cfg!(target_os = "android")
             || ticket.kind != BrokerRequestKind::Refresh
-            || !Self::owns_ticket(&auth, ticket)
+            || !Self::owns_ticket(auth, ticket)
             || meta.pending_recovery.is_some()
             || meta.pending_logout.is_some()
         {
             return Err(BrokerError::RecoveryRequired);
         }
-        Self::snapshot(&auth)
+        Self::snapshot(auth)
     }
 
     fn observed_state(auth: &AuthStoreV1) -> Result<BrokerAuthState, BrokerError> {
